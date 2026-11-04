@@ -27,7 +27,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[cfg(unix)]
 pub(crate) mod support_health;
 
-mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
 #[cfg(test)]
@@ -813,104 +812,6 @@ impl ClaudeApiEvidenceRead {
         })
     }
 
-    /// The optional root loader has prepaid destination nodes and keys. Move
-    /// one disjoint decoded cohort without BTreeMap::append's merge workspace
-    /// or a second row graph. Ordinary evidence consumers are unchanged.
-    pub(crate) fn move_disjoint_paid_root(&mut self, mut root: Self) {
-        while let Some((key, value)) = root.evidence.pop_first() {
-            assert!(!self.evidence.contains_key(&key), "disjoint paid root");
-            self.evidence.insert(key, value);
-        }
-        while let Some((key, value)) = root.reads.pop_first() {
-            assert!(!self.reads.contains_key(&key), "disjoint paid root");
-            self.reads.insert(key, value);
-        }
-    }
-
-    pub(crate) fn paid_root_map_storage(
-        roots: usize,
-        cost: &mut crate::heap_layout_bound::Counter,
-    ) -> Option<()> {
-        crate::heap_layout_bound::tree_nodes::<String, Vec<ClaudeLocalOtelEvidence>>(roots, cost)?;
-        crate::heap_layout_bound::tree_nodes::<String, ApiReadWitness>(roots, cost)
-    }
-
-    pub(crate) fn load_paid_for_roots(
-        support_dir: &Path,
-        roots: &BTreeSet<String>,
-        paid: &mut crate::source_rotation::PaidReservation,
-        occupied: usize,
-    ) -> Option<Self> {
-        use crate::heap_layout_bound::{self, HeapLayoutBound};
-        if !heap_layout_bound::layout_supported() {
-            return None;
-        }
-        let mut infrastructure = heap_layout_bound::Counter::new(usize::MAX);
-        heap_layout_bound::tree_nodes::<String, Vec<ClaudeLocalOtelEvidence>>(
-            roots.len(),
-            &mut infrastructure,
-        )?;
-        heap_layout_bound::tree_nodes::<String, ApiReadWitness>(roots.len(), &mut infrastructure)?;
-        for root in roots {
-            infrastructure.add(root.len())?; // evidence map key
-            infrastructure.add(root.len())?; // read-witness key
-        }
-        let paths = bounded_read::path_workspace(support_dir)?;
-        let fixed = occupied
-            .checked_add(infrastructure.bytes)?
-            .checked_add(paths)?;
-        if !paid.grow_for(fixed) {
-            return None;
-        }
-        let mut read = Self::default();
-        let mut retained_rows = 0usize;
-        for root in roots {
-            let path = evidence_path(support_dir, root);
-            let (rows, witness) =
-                if fs::metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-                    (
-                        Vec::new(),
-                        ApiReadWitness {
-                            health: ClaudeLocalOtelLoadHealth {
-                                missing_files: 1,
-                                ..Default::default()
-                            },
-                            generation: None,
-                        },
-                    )
-                } else {
-                    bounded_read::api(&path, root, paid, fixed.checked_add(retained_rows)?)?
-                };
-            let mut row_storage = heap_layout_bound::Counter::new(usize::MAX);
-            rows.completed_heap_bound(&mut row_storage)?;
-            witness.completed_heap_bound(&mut row_storage)?;
-            retained_rows = retained_rows.checked_add(row_storage.bytes)?;
-            if !paid.permits(fixed.checked_add(retained_rows)?) {
-                return None;
-            }
-            if !rows.is_empty() {
-                read.evidence.insert(root.clone(), rows);
-            }
-            read.reads.insert(root.clone(), witness);
-        }
-        let retained = heap_layout_bound::completed_bound(&read, usize::MAX)?;
-        paid.record_allocated(occupied.checked_add(retained)?)
-            .then_some(read)
-    }
-
-    pub(crate) fn permissive_readset_is_current(&self, support_dir: &Path) -> bool {
-        self.reads.iter().all(|(root, witness)| {
-            if witness.generation.is_some() {
-                return self.strict_generation_matches(support_dir, root);
-            }
-            // A witnessed absence contributes no effort rows. Reappearance,
-            // unreadability or an incomplete nonempty read requires base load.
-            witness.health.missing_files == 1
-                && fs::metadata(evidence_path(support_dir, root))
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        })
-    }
-
     pub(crate) fn load(
         support_dir: &Path,
         session_ids: impl IntoIterator<Item = String>,
@@ -925,51 +826,6 @@ impl ClaudeApiEvidenceRead {
             read.reads.insert(session_id, witness);
         }
         Ok(read)
-    }
-
-    /// Complete an early subset at the ordinary consumer's exact cohort. No
-    /// omitted root is absence/health/uniqueness evidence. A current early row
-    /// moves once; changed/unknown reads use the canonical baseline loader.
-    pub(crate) fn complete_permissive(
-        &mut self,
-        support_dir: &Path,
-        session_ids: &BTreeSet<String>,
-    ) -> Result<Self> {
-        if !self.permissive_readset_is_current(support_dir) {
-            // Drop before reread; don't retain an obsolete row graph alongside
-            // its replacement. The final whole-map open-error veto is intact.
-            *self = Self::default();
-        }
-        let mut complete = Self::default();
-        for session_id in session_ids {
-            let (rows, witness) = match self.reads.remove(session_id) {
-                Some(witness) => (
-                    self.evidence.remove(session_id).unwrap_or_default(),
-                    witness,
-                ),
-                None => decode_api_sidecar(support_dir, session_id)?,
-            };
-            if !rows.is_empty() {
-                complete.evidence.insert(session_id.clone(), rows);
-            }
-            complete.reads.insert(session_id.clone(), witness);
-        }
-        // Leave early roots outside the effort cohort owned here. The later
-        // strict usage cohort can consume them without an extra healthy read;
-        // they must not silently expand effort enrichment in the meantime.
-        Ok(complete)
-    }
-
-    pub(crate) fn move_remaining_for_strict(&mut self, early: &mut Self, roots: &BTreeSet<String>) {
-        early.retain_roots(roots);
-        // The effort consumer has priority if a future caller supplies an
-        // intersecting cohort. Strict consumption still checks its generation.
-        for root in self.reads.keys() {
-            early.evidence.remove(root);
-            early.reads.remove(root);
-        }
-        self.evidence.append(&mut early.evidence);
-        self.reads.append(&mut early.reads);
     }
 
     pub(crate) fn retain_roots(&mut self, roots: &BTreeSet<String>) {
@@ -1021,45 +877,6 @@ impl ClaudeApiEvidenceRead {
         drop(rows);
         load_claude_api_request_evidence_report(support_dir, [session_id.to_string()])
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ClaudeTraceReadGeneration {
-    opened: ApiFileGeneration,
-}
-
-pub(crate) fn claude_trace_read_generation(
-    support_dir: &Path,
-    session_id: &str,
-) -> Option<ClaudeTraceReadGeneration> {
-    fs::metadata(trace_evidence_path(support_dir, session_id))
-        .ok()
-        .and_then(|metadata| api_file_generation(&metadata))
-        .map(|opened| ClaudeTraceReadGeneration { opened })
-}
-
-pub(crate) fn load_claude_trace_paid(
-    support_dir: &Path,
-    root: &str,
-    paid: &mut crate::source_rotation::PaidReservation,
-    occupied: usize,
-) -> Option<(ClaudeTraceOwnershipLoadReport, ClaudeTraceReadGeneration)> {
-    let paths = bounded_read::path_workspace(support_dir)?;
-    let occupied_with_path = occupied.checked_add(paths)?;
-    if !crate::heap_layout_bound::layout_supported() || !paid.grow_for(occupied_with_path) {
-        return None;
-    }
-    let path = trace_evidence_path(support_dir, root);
-    let result = bounded_read::trace(&path, root, paid, occupied_with_path)?;
-    let current = fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| api_file_generation(&metadata));
-    if Some(&result.1.opened) != current.as_ref() {
-        return None;
-    }
-    let retained = crate::heap_layout_bound::completed_bound(&result.0, usize::MAX)?;
-    paid.record_allocated(occupied.checked_add(retained)?)
-        .then_some(result)
 }
 
 #[cfg(test)]
@@ -1213,7 +1030,6 @@ fn decode_api_rows(
     rows
 }
 
-// Both whole-file and paid-input readers use this same state transition.
 impl ApiSidecarDecoder<'_> {
     fn push_line(&mut self, line: &[u8]) {
         let Ok(line) = std::str::from_utf8(line) else {
@@ -3398,23 +3214,11 @@ mod tests {
     }
 
     #[test]
-    fn native_comparison_paid_decoder_reuses_canonical_real_derived_rows() {
-        if !crate::heap_layout_bound::layout_supported() {
-            eprintln!("UNEXECUTED paid canonical evidence: unsupported layout");
-            return;
-        }
-        let (dir, rows) = decode_reuse_fixture("paid-canonical");
-        let allowance = crate::source_rotation::PARKED_BUDGET;
-        let mut paid =
-            crate::source_rotation::PaidReservation::from_remainder(Some(allowance), allowance, 0)
-                .unwrap();
-        let path = evidence_path(&dir, "sess-mixed");
-        let (base_rows, base_witness) = decode_api_sidecar(&dir, "sess-mixed").unwrap();
-        let (actual, witness) = bounded_read::api(&path, "sess-mixed", &mut paid, 0)
-            .expect("existing real-derived parent/subagent fixture qualifies without editing rows");
-        assert_eq!(actual, base_rows);
-        assert_eq!(witness.health, base_witness.health);
-        assert_eq!(witness.generation, base_witness.generation);
+    fn sidecar_decoder_preserves_canonical_real_derived_rows() {
+        let (dir, rows) = decode_reuse_fixture("canonical");
+        let (actual, witness) = decode_api_sidecar(&dir, "sess-mixed").unwrap();
+        assert_eq!(actual, rows);
+        assert!(witness.health.is_complete());
         for (ordinal, row) in rows.iter().enumerate() {
             append_trace_ownership_evidence(
                 &dir,
@@ -3429,31 +3233,21 @@ mod tests {
             )
             .unwrap();
         }
-        let ordinary = load_claude_trace_ownership_evidence(&dir, ["sess-mixed".to_owned()]);
-        let (actual, generation) = bounded_read::trace(
-            &trace_evidence_path(&dir, "sess-mixed"),
-            "sess-mixed",
-            &mut paid,
-            0,
-        )
-        .unwrap();
-        assert_eq!(actual, ordinary);
-        assert_eq!(
-            Some(generation),
-            claude_trace_read_generation(&dir, "sess-mixed")
-        );
-        eprintln!("paid evidence eligibility: existing real-derived API={} trace={} rejected=0; exact rows/identity/diagnostics equal ordinary", base_rows.len(), actual.evidence["sess-mixed"].len());
+        let trace = load_claude_trace_ownership_evidence(&dir, ["sess-mixed".to_owned()]);
+        assert!(trace.is_complete());
+        assert_eq!(trace.evidence["sess-mixed"].len(), rows.len());
+        for (actual, expected) in trace.evidence["sess-mixed"].iter().zip(&rows) {
+            assert_eq!(actual.session_id, expected.session_id);
+            assert_eq!(actual.request_id, expected.request_id);
+            assert_eq!(actual.observed_at, expected.observed_at);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn native_comparison_paid_decoder_escaped_unicode_refusal_keeps_base_rows() {
-        if !crate::heap_layout_bound::layout_supported() {
-            eprintln!("UNEXECUTED paid lexical BASE parity: unsupported layout");
-            return;
-        }
+    fn sidecar_decoder_preserves_escaped_and_unicode_rows() {
         for (ordinal, model) in ["contains\\slash", "containsé"].into_iter().enumerate() {
-            let (dir, mut rows) = decode_reuse_fixture(&format!("paid-base-{ordinal}"));
+            let (dir, mut rows) = decode_reuse_fixture(&format!("lexical-{ordinal}"));
             rows[0].model = model.into();
             let path = evidence_path(&dir, "sess-mixed");
             let mut encoded = Vec::new();
@@ -3462,32 +3256,16 @@ mod tests {
                 encoded.push(b'\n');
             }
             fs::write(&path, encoded).unwrap();
-            let allowance = crate::source_rotation::PARKED_BUDGET;
-            let mut paid = crate::source_rotation::PaidReservation::from_remainder(
-                Some(allowance),
-                allowance,
-                0,
-            )
-            .unwrap();
-            assert!(bounded_read::api(&path, "sess-mixed", &mut paid, 0).is_none());
             let (ordinary, health) = decode_api_sidecar(&dir, "sess-mixed").unwrap();
-            assert_eq!(
-                ordinary, rows,
-                "optional refusal cannot drop/rewrite base usage or identity"
-            );
+            assert_eq!(ordinary, rows, "decoder preserves usage and identity");
             assert!(health.health.is_complete());
-            eprintln!("paid evidence eligibility: lexical rejection={model:?}; BASE rows={} complete=true", ordinary.len());
             fs::remove_dir_all(dir).unwrap();
         }
     }
 
     #[test]
-    fn native_comparison_paid_decoder_identity_replay_and_conflict_match_base() {
-        if !crate::heap_layout_bound::layout_supported() {
-            eprintln!("UNEXECUTED paid identity replay: unsupported layout");
-            return;
-        }
-        let dir = crate::test_scratch::private_dir("paid-identity-replay");
+    fn sidecar_decoder_identity_replay_and_conflict_keep_canonical_rows() {
+        let dir = crate::test_scratch::private_dir("identity-replay");
         let richer = api_evidence_from_json(&identity_json(
             &[],
             &[
@@ -3511,100 +3289,18 @@ mod tests {
             write_identity_replays(&dir, &rows);
             let (ordinary, ordinary_witness) =
                 decode_api_sidecar(&dir, "identity-session").unwrap();
-            let allowance = crate::source_rotation::PARKED_BUDGET;
-            let mut paid = crate::source_rotation::PaidReservation::from_remainder(
-                Some(allowance),
-                allowance,
-                0,
-            )
-            .unwrap();
-            let (actual, witness) = bounded_read::api(
-                &evidence_path(&dir, "identity-session"),
-                "identity-session",
-                &mut paid,
-                0,
-            )
-            .unwrap();
-            assert_eq!(actual, ordinary);
-            assert_eq!(witness.health, ordinary_witness.health);
-            assert_eq!(witness.generation, ordinary_witness.generation);
+            let strict = load_claude_api_request_evidence_report(&dir, ["identity-session".into()]);
+            let permissive =
+                load_claude_effort_evidence(&dir, ["identity-session".into()]).unwrap();
+            assert_eq!(strict.evidence["identity-session"], ordinary);
+            assert_eq!(permissive, strict.evidence);
+            assert_eq!(strict.health, ordinary_witness.health);
+            assert!(ordinary.iter().any(|row| row.request_identity.is_some()));
+            assert_eq!(
+                ordinary.len(),
+                if strict.health.is_complete() { 1 } else { 2 }
+            );
         }
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_lazy_strict_only_early_root_never_expands_effort_cohort() {
-        let (dir, rows) = decode_reuse_fixture("lazy-strict-only");
-        for row in &rows {
-            let mut other = row.clone();
-            other.session_id = "ordinary-root".into();
-            append_evidence(&dir, &with_canonical_fingerprint(other)).unwrap();
-        }
-        reset_evidence_read_counts_for_test();
-        let mut early = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
-        let pointer = early.evidence["sess-mixed"].as_ptr();
-        let cohort = BTreeSet::from(["ordinary-root".to_owned()]);
-        let mut final_read = early.complete_permissive(&dir, &cohort).unwrap();
-        assert!(
-            !final_read.evidence.contains_key("sess-mixed"),
-            "a retained proof's rows cannot silently join permissive effort"
-        );
-        assert!(early.evidence.contains_key("sess-mixed"));
-        final_read.move_remaining_for_strict(
-            &mut early,
-            &BTreeSet::from(["sess-mixed".into(), "ordinary-root".into()]),
-        );
-        let strict = final_read.take_strict_report(&dir, "sess-mixed");
-        assert_eq!(strict.evidence["sess-mixed"], rows);
-        assert_eq!(strict.evidence["sess-mixed"].as_ptr(), pointer);
-        assert!(strict.health.is_complete());
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            2,
-            "strict-only current early root must not open twice"
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_comparison_paid_cohort_uses_existing_credit_and_moves_without_reread() {
-        if !crate::heap_layout_bound::layout_supported() {
-            eprintln!("UNEXECUTED paid cohort resource control: unsupported layout");
-            return;
-        }
-        let (dir, rows) = decode_reuse_fixture("paid-cohort");
-        let cohort = BTreeSet::from(["sess-mixed".to_owned(), "missing".to_owned()]);
-        let allowance = crate::source_rotation::PARKED_BUDGET;
-        let mut paid =
-            crate::source_rotation::PaidReservation::from_remainder(Some(allowance), allowance, 0)
-                .unwrap();
-        reset_evidence_read_counts_for_test();
-        assert!(ClaudeApiEvidenceRead::load_paid_for_roots(
-            &dir,
-            &cohort,
-            &mut paid,
-            allowance - 1
-        )
-        .is_none());
-        assert_eq!(
-            evidence_read_counts_for_test().0,
-            0,
-            "sibling/other-owner occupation refuses before path opens"
-        );
-        let mut early =
-            ClaudeApiEvidenceRead::load_paid_for_roots(&dir, &cohort, &mut paid, 0).unwrap();
-        assert_eq!(early.evidence["sess-mixed"], rows);
-        assert_eq!(early.reads["missing"].health.missing_files, 1);
-        let pointer = early.evidence["sess-mixed"].as_ptr();
-        let completed = early.complete_permissive(&dir, &cohort).unwrap();
-        assert_eq!(completed.evidence["sess-mixed"].as_ptr(), pointer);
-        assert_eq!(evidence_read_counts_for_test().0, 1);
-        assert_eq!(
-            API_READ_RECEIPT.with(|receipt| receipt.get().1),
-            fs::metadata(evidence_path(&dir, "sess-mixed"))
-                .unwrap()
-                .len() as usize
-        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3732,7 +3428,6 @@ mod tests {
 crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);
 crate::heap_layout_bound::fields!(ApiReadWitness; health, generation);
 crate::heap_layout_bound::fields!(ApiFileGeneration; device, inode, bytes, modified, changed);
-crate::heap_layout_bound::fields!(ClaudeTraceReadGeneration; opened);
 crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadHealth; missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
 crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity, fingerprint_check);
 crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);

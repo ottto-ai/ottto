@@ -248,18 +248,14 @@ impl Page {
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
-                try_apply_claude_local_evidence_to_scan_with_comparison(
+                apply_claude_local_evidence_to_scan_with_retained(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    None,
-                    None,
-                    None,
                     Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
                     wire_budget,
                 )
-                .unwrap()
             });
         if let Some(accepted) = accepted.as_deref_mut() {
             accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
@@ -2161,7 +2157,6 @@ fn retry_case(conflict: bool) {
             &index_path,
             &progress_path,
             || Ok(()),
-            None,
             None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
             None,

@@ -135,11 +135,6 @@ impl ContinuationFixture {
     fn preparation(&self, attribution: bool) -> SourcePreparation {
         let status = test_agent_status(SourceKind::Codex);
         SourcePreparation {
-            native_comparison_reservation: None,
-            native_comparison_lease: None,
-            prepared_claude_evidence: None,
-            terminal_native_traversal: None,
-            native_comparison_controller: None,
             retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
@@ -382,7 +377,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert!(prepared.legacy_reconciliation_pending.is_empty());
     assert!(prepared.active_legacy_reconciliation.is_empty());
     assert!(prepared.claude_scan_roots.is_none());
-    assert!(prepared.native_comparison_lease.is_none());
     assert!(prepared.scan.is_some());
 
     // The ordinary tail on the same loaded state (no hint, budget, save or

@@ -170,11 +170,6 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             }))
             .unwrap();
         Ok(Some(SourcePreparation {
-            native_comparison_reservation: None,
-            native_comparison_lease: None,
-            prepared_claude_evidence: None,
-            terminal_native_traversal: None,
-            native_comparison_controller: None,
             retry_authority: None,
             source,
             claude_scan_roots: None,
@@ -229,9 +224,8 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
     fn step(
         &mut self,
         mut frame: SourcePreparation,
-        remaining: Option<usize>,
+        _remaining: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
-        frame.accept_native_rotation_turn(remaining);
         let pi = frame.source == SnapshotSource::Pi;
         let before = frame.scan.as_ref().unwrap().test_active_physical_lines();
         match frame.step() {

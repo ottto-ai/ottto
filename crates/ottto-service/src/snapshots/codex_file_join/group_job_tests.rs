@@ -1542,7 +1542,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     let replay = active.parser.accumulator.codex_tier_replay.take();
     let aliases = std::mem::take(&mut active.aliases);
     let receipts = std::mem::take(&mut active.applied_receipts);
-    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
     let cursor = active.cursor.take();
     assert!(active.group.is_some());
     assert!(!sampled_scan::borrows_only_retained_reduction(active));
@@ -1567,7 +1566,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     active.parser.accumulator.codex_tier_replay = replay;
     active.aliases = aliases;
     active.applied_receipts = receipts;
-    active.comparison_target = comparison_target;
     active.cursor = cursor;
     fs::remove_dir_all(root).unwrap();
 }

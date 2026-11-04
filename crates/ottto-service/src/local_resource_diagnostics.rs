@@ -1697,92 +1697,6 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
-/// One preparation/page observation, never a permit or authority input.
-/// None means that boundary was not reached, not a known false/zero result.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub(crate) struct NativeComparisonDecision {
-    pub(crate) layout_supported: bool,
-    pub(crate) lease_generation: Option<u64>,
-    pub(crate) fold_index_generation: Option<u64>,
-    pub(crate) allowed_at_bind: Option<bool>,
-    pub(crate) controller_created: bool,
-    pub(crate) controller_current_at_finish: Option<bool>,
-    pub(crate) selected_save: bool,
-    pub(crate) upload_fully_settled: Option<bool>,
-    pub(crate) clean_at_finish: Option<bool>,
-    pub(crate) retained_permit: Option<bool>,
-    pub(crate) revoke_calls: usize,
-    pub(crate) admission_refusal_calls: usize,
-    pub(crate) hit_policy_calls: usize,
-    pub(crate) deferred_decisions: usize,
-    pub(crate) latched_base_decisions: usize,
-    pub(crate) other_base_decisions: usize,
-    pub(crate) correction_mint: Option<NativeMint>,
-    pub(crate) outcome: NativeDecisionOutcome,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NativeDecisionOutcome {
-    #[default]
-    Abandoned,
-    CadenceWait,
-    Finished,
-    DisabledBeforeLease,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub(crate) struct NativeMint {
-    pub(crate) window_available: bool,
-    pub(crate) candidates: usize,
-    pub(crate) insertions: usize,
-    /// This is before later window staging/retirement, not a retained grant.
-    pub(crate) receipts_after_mint: usize,
-}
-/// Inline Cell permits the final read-only negative view to report decisions.
-/// It owns no graph and is included in its lease's existing layout charge.
-pub(crate) struct NativeDecision(
-    pub(crate) std::cell::Cell<NativeComparisonDecision>,
-    std::cell::Cell<claude_reread::Counts>,
-);
-impl NativeDecision {
-    pub(crate) fn new() -> Self {
-        Self(
-            std::cell::Cell::new(NativeComparisonDecision {
-                layout_supported: crate::heap_layout_bound::layout_supported(),
-                ..Default::default()
-            }),
-            std::cell::Cell::new(Default::default()),
-        )
-    }
-    pub(crate) fn update(&self, update: impl FnOnce(&mut NativeComparisonDecision)) {
-        let mut value = self.0.get();
-        update(&mut value);
-        self.0.set(value);
-    }
-    pub(crate) fn add_page_events(&self, counts: claude_reread::Counts) {
-        let mut value = self.1.get();
-        value.merge(counts);
-        self.1.set(value);
-    }
-    pub(crate) fn emit(&self) {
-        #[derive(Serialize)]
-        struct Counts {
-            #[serde(flatten)]
-            decision: NativeComparisonDecision,
-            #[serde(flatten)]
-            events: claude_reread::Counts,
-        }
-        traversal_point(
-            "native_comparison_decision",
-            "claude_code",
-            &Counts {
-                decision: self.0.get(),
-                events: self.1.get().with_current(),
-            },
-        );
-    }
-}
-crate::heap_layout_bound::no_heap!(false; NativeDecision);
-
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
@@ -2561,97 +2475,6 @@ mod tests {
     }
 
     #[test]
-    fn native_comparison_decision_distinguishes_unreached_saved_and_retained() {
-        use crate::snapshots::claude_native_comparison::lifecycle::{Lifecycle, Scope};
-        let owner = std::sync::Arc::new(Lifecycle::default());
-        let (_, rows) = capture(|| {
-            let mut abandoned = owner.begin();
-            abandoned.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            drop(abandoned);
-            // Logical lifecycle fixture: the native conjunction is supplied to
-            // the existing settlement seam, not a supported native-path claim.
-            let mut saved = owner.begin();
-            saved.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            saved.note_selected_save(true);
-            saved.finish(true);
-            let mut retained = owner.begin();
-            retained.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            assert!(retained.allowed());
-            retained.note_selected_save(false);
-            retained.finish(true);
-        });
-        assert_eq!(rows.len(), 3);
-        let a = &rows[0]["counts"];
-        assert_eq!(a["outcome"], "abandoned");
-        assert_eq!(a["allowed_at_bind"], false);
-        assert_eq!(a["selected_save"], false);
-        assert_eq!(a["retained_permit"], false);
-        for unknown in [
-            "correction_mint",
-            "controller_current_at_finish",
-            "upload_fully_settled",
-        ] {
-            assert!(a[unknown].is_null(), "unreached {unknown} is unknown");
-        }
-        let b = &rows[1]["counts"];
-        assert_eq!(b["allowed_at_bind"], false);
-        assert_eq!(b["selected_save"], true);
-        assert_eq!(b["retained_permit"], true);
-        assert_eq!(rows[2]["counts"]["allowed_at_bind"], true);
-        for row in rows {
-            assert_eq!(row["stage"], "native_comparison_decision");
-            assert_eq!(row["counts"]["deferred_decisions"], 0);
-            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
-            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
-            let text = serde_json::to_string(&row).unwrap();
-            assert!(!text.contains("private-synthetic-scope"));
-        }
-    }
-
-    #[test]
-    fn native_comparison_decision_maximum_width_is_bounded() {
-        let diagnostic = NativeDecision::new();
-        diagnostic.update(|d| {
-            *d = NativeComparisonDecision {
-                layout_supported: true,
-                lease_generation: Some(u64::MAX),
-                fold_index_generation: Some(u64::MAX),
-                allowed_at_bind: Some(false),
-                controller_created: false,
-                controller_current_at_finish: Some(false),
-                selected_save: false,
-                upload_fully_settled: Some(false),
-                clean_at_finish: Some(false),
-                retained_permit: Some(false),
-                revoke_calls: usize::MAX,
-                admission_refusal_calls: usize::MAX,
-                hit_policy_calls: usize::MAX,
-                deferred_decisions: usize::MAX,
-                latched_base_decisions: usize::MAX,
-                other_base_decisions: usize::MAX,
-                correction_mint: Some(NativeMint {
-                    window_available: false,
-                    candidates: usize::MAX,
-                    insertions: usize::MAX,
-                    receipts_after_mint: usize::MAX,
-                }),
-                outcome: NativeDecisionOutcome::DisabledBeforeLease,
-            }
-        });
-        let (_, rows) = capture(|| diagnostic.emit());
-        assert_eq!(rows.len(), 1);
-        let text = serde_json::to_string(&rows[0]).unwrap();
-        assert!(text.len() < 4096);
-        println!("NATIVE_COMPARISON_DECISION_MAX_WIDTH bytes={} inline_bytes={} no_resource_samples=true", text.len(), std::mem::size_of::<NativeDecision>());
-    }
-
-    #[test]
     fn census_fence_events_have_closed_fields_and_bounded_encoding() {
         use crate::codex_scan_diagnostics::{
             CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
@@ -2902,8 +2725,7 @@ mod tests {
             );
             let scope = claude_reread::Scope::begin(true);
             claude_reread::restored(true, false, true);
-            NativeDecision::new().emit();
-            drop(scope);
+            claude_reread::emit_without_lease(scope.finish());
         });
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["source"], "claude_code");
@@ -2920,7 +2742,7 @@ mod tests {
             rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
             1
         );
-        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["stage"], "native_collection_page");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
             1

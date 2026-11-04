@@ -1,154 +1,10 @@
-// Nonshipping boundary experiment. This module is compiled only in tests.
-// Uses the real native parser, usage/owner fold, candidate decision, selected
-// checkpoint and locked save/load. It is NOT the complete two-phase scanner.
+// Ordinary scan, selected-save, recovery and acknowledgement controls retained
+// after retiring the optional comparison experiment. Synthetic fixtures only.
 use super::*;
 use crate::snapshots::disappearance_diagnostics::tests::finish;
 
-/// Physical positive preparation needs the validated container layout.
-/// Unsupported runs retain the separate BASE/refusal checks, never pretend
-/// that zero certificates exercised a positive path.
-fn native_positive_layout_for_test(name: &str) -> bool {
-    let supported = crate::heap_layout_bound::layout_supported();
-    if !supported {
-        writeln!(std::io::stderr().lock(), "native_comparison_layout: test={name} supported_positive=UNEXECUTED layout_supported=false no_guard_override=true").unwrap();
-    }
-    supported
-}
-
 type Api = crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 type Trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport;
-
-#[test]
-fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once() {
-    if !crate::heap_layout_bound::layout_supported() {
-        eprintln!("UNEXECUTED paid native window import: unsupported layout");
-        return;
-    }
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    for one_byte_short in [false, true] {
-        let fixture = NativePreparationFixture::new();
-        let NativeWindowPage {
-            index,
-            scan,
-            window,
-            ..
-        } = native_window_page(&fixture);
-        let mut phase = claude_native_comparison::NativePhase::default();
-        let extra = phase.window_import_extra_for_test(&window, &index).unwrap();
-        let mut old = Counter::new(usize::MAX);
-        window.heap_bound(&mut old).unwrap();
-        let external = 137;
-        let recovery = 256;
-        let occupied = phase.owned_capture_bytes().unwrap() + old.bytes + external;
-        let limit = occupied + extra + recovery - usize::from(one_byte_short);
-        let mut paid = Some(
-            crate::source_rotation::PaidReservation::from_remainder(
-                Some(limit),
-                occupied,
-                occupied,
-            )
-            .unwrap(),
-        );
-        assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
-        let unchanged = serde_json::to_vec(&index).unwrap();
-        // Synchronous on this thread (no spawn, channel or pool in the call
-        // chain). The import drops the pre-existing window, so keep
-        // born-in-scope accounting (that free cannot hide a later peak) but
-        // charge only this thread, excluding parallel tests' allocations.
-        let (imported, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
-            phase.import_window_paid(Some(window), &index, &scan.census_window_end, &mut paid)
-        });
-        assert_eq!(imported, !one_byte_short);
-        assert_eq!(serde_json::to_vec(&index).unwrap(), unchanged);
-        assert!(allocations.requested_peak_with_overlap <= extra);
-        assert!(paid
-            .as_ref()
-            .unwrap()
-            .permits_recovery_peak(external + recovery));
-        if one_byte_short {
-            assert!(phase.disabled_for_test());
-            assert_eq!(allocations.allocations, 0);
-            assert_eq!(paid.as_ref().unwrap().allocated(), external);
-        } else {
-            assert_eq!(phase.capture_count_for_test(), 1);
-            assert_eq!(
-                paid.as_ref().unwrap().allocated(),
-                external + phase.owned_capture_bytes().unwrap()
-            );
-        }
-        eprintln!("native paid import: one_byte_short={one_byte_short} imported={imported} planned_extra={extra} measured_incremental_peak={} index_unchanged=true recovery_preserved=true", allocations.requested_peak_with_overlap);
-    }
-}
-
-#[test]
-fn native_comparison_selected_restore_membership_matches_canonical_without_global_set() {
-    let mut index = ScanIndex::default();
-    for ordinal in 0..2048 {
-        let key = format!("file-{ordinal}");
-        index.files.insert(
-            key.clone(),
-            manifest_index_entry(Some(&format!("legacy-{ordinal}"))),
-        );
-        if ordinal % 3 == 0 {
-            index.file_snapshot_fingerprints.insert(
-                key,
-                BTreeSet::from([format!("exact-{ordinal}"), "shared".into()]),
-            );
-        }
-    }
-    index
-        .files
-        .insert("empty".into(), manifest_index_entry(Some("shadowed-empty")));
-    index
-        .file_snapshot_fingerprints
-        .insert("empty".into(), BTreeSet::new());
-    let queries = [
-        "exact-0",
-        "legacy-0",
-        "legacy-1",
-        "exact-2046",
-        "legacy-2047",
-        "shared",
-        "shadowed-empty",
-        "absent",
-    ];
-    let (canonical, old) =
-        crate::retry_allocation_probe::measure(|| index.current_snapshot_fingerprints());
-    let expected = queries
-        .iter()
-        .filter(|fp| !canonical.contains(**fp))
-        .map(|fp| (*fp).to_owned())
-        .collect::<BTreeSet<_>>();
-    let ((unreferenced, visits), borrowed) = crate::retry_allocation_probe::measure(|| {
-        let mut affected = queries
-            .iter()
-            .map(|fp| (*fp).to_owned())
-            .collect::<BTreeSet<_>>();
-        let mut visits = 0usize;
-        for current in index.current_snapshot_fingerprint_refs() {
-            visits += 1;
-            affected.remove(current);
-        }
-        (affected, visits)
-    });
-    assert_eq!(unreferenced, expected);
-    let expected_visits = index
-        .file_snapshot_fingerprints
-        .values()
-        .map(BTreeSet::len)
-        .sum::<usize>()
-        + index
-            .files
-            .keys()
-            .filter(|key| !index.file_snapshot_fingerprints.contains_key(*key))
-            .count();
-    assert_eq!(
-        visits, expected_visits,
-        "one universe pass, not affected bodies times the full index"
-    );
-    assert!(borrowed.requested_peak_with_overlap < old.requested_peak_with_overlap);
-    eprintln!("native comparison selected restore: unrelated_files=2048 affected_queries={} universe_visits={visits} old_global_requested_peak={} selected_set_requested_peak={} one_universe_pass=true exact_empty_overrides_legacy=true not_RSS=true", queries.len(), old.requested_peak_with_overlap, borrowed.requested_peak_with_overlap);
-}
 
 fn reports(root: &str, extra: bool) -> (Api, Trace) {
     let mut api = (1..=5)
@@ -188,15 +44,6 @@ fn reports(root: &str, extra: bool) -> (Api, Trace) {
     )
 }
 
-fn raw_hashes(item: &SnapshotItem) -> BTreeSet<String> {
-    item.claude_usage_request_ids
-        .iter()
-        .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
-        .collect()
-}
-
-// Phase 2 uses actual constructor priority and the real locked partial-save
-// seam. Controls remain scoped/cfg(test); no shipping eligibility is added.
 struct SelectionFixture {
     _scratch: crate::test_scratch::ScratchDir,
     roots: [PathBuf; 1],
@@ -277,20 +124,16 @@ impl SelectionFixture {
     }
 }
 
-/// Restores a file's original mode at teardown, also when an assertion panics.
-// Carried from #587; the tests below exercise the new moving preparation seam,
-// not the synthetic permit/rearm controls above. No reuse is activated.
-struct NativePreparationFixture {
+struct BodyFixture {
     dir: PathBuf,
     parent: String,
     /// The parent's own scanned item: the evidence loaders open the pairs of
     /// the roots the page's items name.
-    native: Vec<SnapshotItem>,
     index: ScanIndex,
     api: Api,
     trace: Trace,
 }
-impl NativePreparationFixture {
+impl BodyFixture {
     fn new() -> Self {
         let (dir, parent, _) = claude_account_family_fixture(false);
         let native = OwnedSourceScan::new_with_identity_capture(
@@ -318,13 +161,6 @@ impl NativePreparationFixture {
         ));
         apply_claude_reported_usage_with_index(&mut scan.snapshots, &api, &trace, &mut index);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        let native = scan
-            .snapshots
-            .iter()
-            .filter(|item| item.source_session_id == parent)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(native.len(), 1);
         index.active_upload_context_fingerprint = Some("native-preparation-test".into());
         // Model delivered history: each file holds its receipt in this context.
         let context = index.active_upload_context_fingerprint.clone().unwrap();
@@ -340,272 +176,19 @@ impl NativePreparationFixture {
         Self {
             dir,
             parent,
-            native,
             index,
             api,
             trace,
         }
     }
-    fn paused(&self) -> OwnedSourceScan {
-        self.paused_with_limit(8)
-    }
-    fn paused_with_limit(&self, limit: usize) -> OwnedSourceScan {
-        let mut state = OwnedSourceScan::new_with_identity_capture(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&self.dir),
-            self.index.clone(),
-            WINDOW,
-            30,
-            limit,
-            None,
-            &[],
-            false,
-            false,
-        );
-        state.enable_native_comparison();
-        for _ in 0..1024 {
-            if state.native_comparison_ready() {
-                return state;
-            }
-            match state.step(None) {
-                OwnedSourceScanStep::Pending(next) => state = next,
-                OwnedSourceScanStep::Complete { .. } => {
-                    panic!("finalized before native preparation")
-                }
-            }
-        }
-        panic!("native preparation did not reach bounded pause");
-    }
 }
-impl Drop for NativePreparationFixture {
+impl Drop for BodyFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
-#[test]
-fn native_comparison_actual_skip_freezes_retained_proof_before_body_fold() {
-    if !native_positive_layout_for_test(
-        "native_comparison_actual_skip_freezes_retained_proof_before_body_fold",
-    ) {
-        return;
-    }
-    let fixture = NativePreparationFixture::new();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 0);
-    let before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 2);
-    assert_eq!(
-        serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
-        before
-    );
-    assert!(state.snapshots.is_empty());
-    let (_, scan) = finish(state);
-    assert_eq!(scan.scanned_file_count, 0);
-    writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: actual_skip_certificates=2 retained_proof_unchanged=true body_mutations=0 reuse_activated=false").unwrap();
-}
-
-#[test]
-fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
-    let fixture = NativePreparationFixture::new();
-    let mut phase = claude_native_comparison::NativePhase::default();
-    assert!(phase.pause_before_finalization());
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = phase.qualify(
-        &fixture.index,
-        &[],
-        WINDOW,
-        claude_native_comparison::PairedRows {
-            api: &fixture.api.evidence,
-            trace: &fixture.trace.evidence,
-            healthy_roots: &healthy,
-        },
-    );
-    assert_eq!(qualification.certified_member_count(), 0);
-}
-
-#[test]
-fn native_comparison_current_nonreported_member_withdraws_whole_family() {
-    // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to native grains.
-
-    let mut fixture = NativePreparationFixture::new();
-    fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(
-        &mut fixture.index,
-    ));
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
-    writeln!(file, "{{\"timestamp\":\"2026-08-02T07:00:08Z\",\"type\":\"assistant\",\"sessionId\":\"{}\",\"requestId\":\"new_native_request\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}", fixture.parent).unwrap();
-    drop(file);
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    assert!(!state.snapshots.is_empty());
-    let native_before = serde_json::to_vec(&state.snapshots).unwrap();
-    let proof_before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 0);
-    assert_eq!(serde_json::to_vec(&state.snapshots).unwrap(), native_before);
-    assert_eq!(
-        serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
-        proof_before
-    );
-    let (mut index, mut scan) = finish(state);
-    let disposition = apply_claude_reported_usage_with_index(
-        &mut scan.snapshots,
-        &fixture.api,
-        &fixture.trace,
-        &mut index,
-    );
-    assert!(disposition
-        .quarantined_source_session_ids
-        .contains(&fixture.parent));
-    writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: nonreported_native_member=true qualified_family_members=0 authoritative_demotion_agrees=true preflight_body_mutations=0").unwrap();
-}
-
-fn write_native_preparation_pair(support: &Path, root: &str, api: &Api, trace: &Trace) {
-    let name = format!("{:x}.jsonl", Sha256::digest(root.as_bytes()));
-    for (folder, rows) in [
-        (
-            "claude-code-effort",
-            api.evidence[root]
-                .iter()
-                .map(|row| serde_json::to_string(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "claude-code-trace-ownership",
-            trace.evidence[root]
-                .iter()
-                .map(|row| serde_json::to_string(row).unwrap())
-                .collect::<Vec<_>>(),
-        ),
-    ] {
-        let path = support.join("local-otel").join(folder).join(&name);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let replacement = path.with_extension("replacement");
-        fs::write(&replacement, rows.join("\n") + "\n").unwrap();
-        fs::rename(replacement, path).unwrap();
-    }
-}
-
-fn native_preparation_pair_roundtrip(replace: bool) {
-    let fixture = NativePreparationFixture::new();
-    let support = crate::test_scratch::ScratchDir::new("native-preparation-pairs");
-    write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
-    crate::claude_local_otel::reset_evidence_read_counts_for_test();
-    let (api, trace, healthy, permissive_rows) =
-        crate::snapshot_sync::prepared_claude_pair_for_test(
-            &support,
-            &fixture.native,
-            &fixture.parent,
-            || {
-                assert_eq!(
-                    crate::claude_local_otel::evidence_read_counts_for_test(),
-                    (1, 1)
-                );
-                if replace {
-                    let (api, trace) = reports(&fixture.parent, true);
-                    write_native_preparation_pair(&support, &fixture.parent, &api, &trace);
-                }
-            },
-        );
-    assert!(healthy);
-    assert!(api.health.is_complete() && trace.is_complete());
-    let rows = if replace { 6 } else { 5 };
-    assert_eq!(
-        permissive_rows, rows,
-        "effort fold must also receive current rows after the pause"
-    );
-    assert_eq!(api.evidence[&fixture.parent].len(), rows);
-    assert_eq!(trace.evidence[&fixture.parent].len(), rows);
-    let reads = if replace { 2 } else { 1 };
-    assert_eq!(
-        crate::claude_local_otel::evidence_read_counts_for_test(),
-        (reads, reads)
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: paired_rows_replace={replace} api_opens={reads} trace_opens={reads} final_rows={rows} stale_rows_consumed=false").unwrap();
-}
-
-#[test]
-fn native_comparison_paired_rows_move_once_without_reloading_unchanged_files() {
-    native_preparation_pair_roundtrip(false);
-}
-
-#[test]
-fn native_comparison_paired_rows_replaced_after_preflight_use_fresh_strict_load() {
-    native_preparation_pair_roundtrip(true);
-}
-
-#[test]
-fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
-    let fixture = NativePreparationFixture::new();
-    let required = BTreeSet::from([fixture.parent.clone()]);
-    // Same-byte object replacement must still withdraw a frozen negative;
-    // neither API nor trace generation can be inferred from the other.
-    for changed in [
-        None,
-        Some("claude-code-effort"),
-        Some("claude-code-trace-ownership"),
-    ] {
-        let support = crate::test_scratch::ScratchDir::new("native-negative-generation");
-        write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
-        crate::claude_local_otel::reset_evidence_read_counts_for_test();
-        let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
-            &support,
-            &fixture.native,
-            &required,
-            || {
-                if let Some(folder) = changed {
-                    let path = support.join("local-otel").join(folder).join(format!(
-                        "{:x}.jsonl",
-                        Sha256::digest(fixture.parent.as_bytes())
-                    ));
-                    let replacement = path.with_extension("replacement");
-                    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-                    fs::rename(replacement, path).unwrap();
-                }
-            },
-        );
-        assert!(before);
-        assert_eq!(after, changed.is_none());
-        assert_eq!(
-            crate::claude_local_otel::evidence_read_counts_for_test(),
-            (1, 1),
-            "negative validation must not silently reload P or decode another graph"
-        );
-    }
-    writeln!(std::io::stderr().lock(), "native_comparison_generation: unchanged_pair_reusable=true same_bytes_api_or_trace_replacement_withdraws=true validation_decodes=0 controller_unproved=true").unwrap();
-}
-
-#[test]
-fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
-    let fixture = NativePreparationFixture::new();
-    let support = crate::test_scratch::ScratchDir::new("native-negative-missing-root");
-    write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
-    let required = BTreeSet::from([fixture.parent.clone(), "unknown-predecessor".to_owned()]);
-    let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
-        &support,
-        &fixture.native,
-        &required,
-        || {},
-    );
-    assert!(
-        !before && !after,
-        "one healthy root cannot certify missing predecessor rows"
-    );
-}
-
-fn native_recovery_priority_scan(
+fn recovery_priority_scan(
     fixture: &SelectionFixture,
     index: ScanIndex,
     limit: usize,
@@ -628,1367 +211,130 @@ fn native_recovery_priority_scan(
 }
 
 #[test]
-fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_page() {
+fn recovery_selection_preserves_ordinary_audit_order_and_page_limit() {
     let fixture = SelectionFixture::new();
     let mut rearmed = fixture.previous.clone();
+    let key = local_index_key(&fixture.paths[0]);
     rearmed
-        .files
-        .get_mut(&local_index_key(&fixture.paths[0]))
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    rearmed.save(&fixture.index_path).unwrap();
-    let rearmed = ScanIndex::load(&fixture.index_path).unwrap();
-    assert!(rearmed.files[&local_index_key(&fixture.paths[0])]
-        .source_file_fingerprint
-        .is_empty());
-    let base = fixture.prepare(rearmed.clone(), 1);
-    assert_eq!(base.identified_candidates.len(), 1);
-    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
-    let _scope = claude_native_comparison::enable_for_test();
-    let native = native_recovery_priority_scan(&fixture, rearmed, 1, &fixture.paths[..1]);
-    assert_eq!(native.identified_candidates.len(), 1);
-    assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
-    let (index, scan) = finish(native);
-    assert_eq!(scan.scanned_file_count, 1);
-    assert_eq!(scan.snapshots.len(), 1);
-    assert!(index.files[&local_index_key(&fixture.paths[1])]
-        .audit_requires_full(sampled_scan::now_seconds()));
-    assert!(
-        index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .any(|entry| entry.path == fixture.paths[1]),
-        "unselected audit remains queued"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_recovery_priority: real_constructor=true actual_index_save_reload=true base_selects_audit=true recovery_selected_first=true native_reads=1 page_limit=1 audit_debt_and_queue_preserved=true selected_save_and_lifecycle_unproved=true").unwrap();
-}
-
-#[test]
-fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_budget() {
-    let fixture = SelectionFixture::new();
-    let mut rearmed = fixture.previous.clone();
-    rearmed
-        .files
-        .get_mut(&local_index_key(&fixture.paths[0]))
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    let inactive = native_recovery_priority_scan(&fixture, rearmed.clone(), 1, &fixture.paths[..1]);
-    assert_eq!(
-        inactive.identified_candidates[0].path, fixture.paths[1],
-        "ordinary construction stays on base with no process test opt-in"
-    );
-    let _scope = claude_native_comparison::enable_for_test();
-    let no_debt =
-        native_recovery_priority_scan(&fixture, fixture.previous.clone(), 1, &fixture.paths[..1]);
-    assert_eq!(no_debt.identified_candidates[0].path, fixture.paths[1]);
-    let unknown = fixture.roots[0].join("unknown-recovery.jsonl");
-    let missing = native_recovery_priority_scan(&fixture, rearmed.clone(), 1, &[unknown]);
-    assert_eq!(
-        missing.identified_candidates[0].path, fixture.paths[1],
-        "missing path cannot become a synthetic queued candidate"
-    );
-    let zero = native_recovery_priority_scan(&fixture, rearmed, 0, &fixture.paths[..1]);
-    assert!(zero.identified_candidates.is_empty());
-}
-
-fn complete_native_with_terminal_owner(
-    mut state: OwnedSourceScan,
-) -> (
-    ScanIndex,
-    SourceScanResult,
-    Option<Box<claude_native_comparison::TerminalTraversal>>,
-) {
-    for _ in 0..1024 {
-        if state.native_comparison_ready() {
-            state.resume_native_comparison_base();
-        }
-        match state.step(None) {
-            OwnedSourceScanStep::Pending(next) => state = next,
-            OwnedSourceScanStep::Complete {
-                index,
-                scan,
-                terminal_native_traversal,
-            } => {
-                return (index, scan, terminal_native_traversal);
-            }
-        }
-    }
-    panic!("bounded native scan did not complete");
-}
-
-#[test]
-fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
-    let fixture = SelectionFixture::new();
-    let mut incomplete = fixture.prepare(fixture.previous.clone(), 1);
-    incomplete.enable_native_comparison();
-    let (index, scan, terminal) = complete_native_with_terminal_owner(incomplete);
-    assert!(!scan.census_complete);
-    assert!(index.traversal.is_some());
-    assert!(
-        terminal.is_none(),
-        "incomplete traversal stays under its existing index owner"
-    );
-    let fixture = NativePreparationFixture::new();
-    let state = fixture.paused();
-    for (source, active, complete, window) in [
-        (SnapshotSource::Codex, true, true, WINDOW),
-        (SnapshotSource::ClaudeCode, false, true, WINDOW),
-        (SnapshotSource::ClaudeCode, true, false, WINDOW),
-        (SnapshotSource::ClaudeCode, true, true, "different-census"),
-    ] {
-        let mut index = state.index.clone();
-        let before = serde_json::to_value(&index).unwrap();
-        assert!(claude_native_comparison::TerminalTraversal::take(
-            &mut index, source, active, complete, window
-        )
-        .is_none());
-        assert_eq!(
-            serde_json::to_value(&index).unwrap(),
-            before,
-            "failed capture guard must not consume or alter the existing traversal"
-        );
-    }
-}
-
-#[test]
-fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-lifecycle");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut first = owner.begin();
-    first.bind("synthetic-source-destination-context".into());
-    assert!(!first.allowed());
-    fixture.index.save(&scratch.join("index.json")).unwrap();
-    first.note_selected_save(true);
-    first.finish(true);
-    let mut next = owner.begin();
-    next.bind("synthetic-source-destination-context".into());
-    assert!(next.allowed());
-    next.finish(true);
-    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let reloaded = ScanIndex::load(&scratch.join("index.json")).unwrap();
-    assert_eq!(reloaded.generation, fixture.index.generation);
-    let mut restart_lease = restarted.begin();
-    restart_lease.bind("synthetic-source-destination-context".into());
-    assert!(
-        !restart_lease.allowed(),
-        "retained index is not process bootstrap"
-    );
-    drop(restart_lease);
-    let mut changed = owner.begin();
-    changed.bind("different-source-destination-context".into());
-    assert!(!changed.allowed());
-    drop(changed);
-    let mut original = owner.begin();
-    original.bind("synthetic-source-destination-context".into());
-    assert!(
-        !original.allowed(),
-        "context rollback cannot revive a process grant"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_lifecycle: native_save=true actual_index_save=true next_cycle_allowed=true retained_index_restart_base=true context_change_and_drop_revoke=true").unwrap();
-}
-
-#[test]
-fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-cas");
-    let path = scratch.join("index.json");
-    let mut stale = fixture.index.clone();
-    fixture.index.save(&path).unwrap();
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut failed = owner.begin();
-    failed.bind("synthetic-source-destination-context".into());
-    assert!(!failed.allowed());
-    let result = stale.save(&path);
-    assert!(result.is_err());
-    // Same ordering as finish: save failure exits before note_selected_save.
-    drop(failed);
-    let mut next = owner.begin();
-    next.bind("synthetic-source-destination-context".into());
-    assert!(!next.allowed());
-    writeln!(
-        std::io::stderr().lock(),
-        "native_comparison_lifecycle: actual_failed_index_cas=true process_grant=false"
-    )
-    .unwrap();
-}
-
-fn native_comparison_quiet_bounded_page(
-    fixture: &NativePreparationFixture,
-) -> (ScanIndex, SourceScanResult) {
-    let native = OwnedSourceScan::new_with_identity_capture(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&fixture.dir),
-        fixture.index.clone(),
-        WINDOW,
-        30,
-        1,
-        None,
-        &[],
-        false,
-        false,
-    );
-    let (mut index, mut scan) = finish(native);
-    assert!(!scan.census_complete);
-    assert_eq!(scan.scanned_file_count, 0);
-    assert!(scan.snapshots.is_empty(), "no new body needs an ACK");
-    apply_claude_reported_usage_with_index(
-        &mut scan.snapshots,
-        &fixture.api,
-        &fixture.trace,
-        &mut index,
-    );
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    (index, scan)
-}
-
-#[test]
-fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() {
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-save");
-    let path = scratch.join("index.json");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("page-source-destination-context".into());
-    fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-
-    let mut page = owner.begin();
-    page.bind("page-source-destination-context".into());
-    assert!(page.allowed());
-    let (mut index, scan) = native_comparison_quiet_bounded_page(&fixture);
-    assert!(claude_native_comparison::selected_page_is_clean(
-        &scan, &index
-    ));
-    index.save(&path).unwrap();
-    page.note_selected_save(false); // A partial census cannot bootstrap.
-    page.finish(claude_native_comparison::selected_page_is_clean(
-        &scan, &index,
-    ));
-    let mut next = owner.begin();
-    next.bind("page-source-destination-context".into());
-    assert!(next.allowed());
-    drop(next);
-
-    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut fresh = restarted.begin();
-    fresh.bind("page-source-destination-context".into());
-    assert!(!fresh.allowed());
-    index.save(&path).unwrap();
-    fresh.note_selected_save(false);
-    fresh.finish(true);
-    let mut after_restart = restarted.begin();
-    after_restart.bind("page-source-destination-context".into());
-    assert!(
-        !after_restart.allowed(),
-        "saved partial page is not bootstrap"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: actual_native_bootstrap_save=true actual_quiet_bounded_page_save=true prior_grant_retained=true partial_page_cannot_mint=true certificate_carry_unwired=true").unwrap();
-}
-
-#[test]
-fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-loss");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("page-source-destination-context".into());
-    fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-    let mut no_save = owner.begin();
-    no_save.bind("page-source-destination-context".into());
-    assert!(no_save.allowed());
-    no_save.finish(true);
-    let mut next = owner.begin();
-    next.bind("page-source-destination-context".into());
-    assert!(
-        !next.allowed(),
-        "clean boolean cannot replace selected save"
-    );
-
-    let (index, scan) = native_comparison_quiet_bounded_page(&fixture);
-    assert!(claude_native_comparison::selected_page_is_clean(
-        &scan, &index
-    ));
-    let mut loss = scan.clone();
-    loss.unreadable_path_count = 1;
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &loss, &index
-    ));
-    let mut sidecar = scan.clone();
-    sidecar.sidecar_census_complete = false;
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &sidecar, &index
-    ));
-    let mut unknown = index.clone();
-    unknown.traversal = None;
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan, &unknown
-    ));
-    let mut unsettled = index.clone();
-    unsettled.mark_bounded_sweep_unsettled();
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan, &unsettled
-    ));
-    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: no_selected_save_revokes=true unreadable_sidecar_unknown_unsettled_rejected=true certificate_carry_unwired=true").unwrap();
-}
-
-fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
-    for _ in 0..1024 {
-        if state.native_comparison_ready() {
-            return state;
-        }
-        match state.step(None) {
-            OwnedSourceScanStep::Pending(next) => state = next,
-            OwnedSourceScanStep::Complete { .. } => {
-                panic!("target phase finalized before comparison")
-            }
-        }
-    }
-    panic!("target phase did not reach bounded pause");
-}
-
-#[test]
-fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
-    if !native_positive_layout_for_test(
-        "native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
-    fixture
-        .index
         .files
         .get_mut(&key)
         .unwrap()
         .source_file_fingerprint
         .clear();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    let native = state
-        .snapshots
-        .iter()
-        .find(|item| item.source_session_id == fixture.parent)
+    rearmed.save(&fixture.index_path).unwrap();
+    let rearmed = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(rearmed.files[&key].source_file_fingerprint.is_empty());
+    let base = fixture.prepare(rearmed, 1);
+    assert_eq!(base.identified_candidates.len(), 1);
+    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
+    let (index, scan) = finish(base);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(scan.snapshots.len(), 1);
+    assert!(index.files[&key].source_file_fingerprint.is_empty());
+    assert!(index
+        .traversal
+        .as_ref()
         .unwrap()
-        .clone();
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(
-        qualification.certified_member_count(),
-        0,
-        "an actual family parse withdraws sibling negatives, not the exact Q5 native prior"
-    );
-    assert!(qualification.new_native_hashes(&native).unwrap().is_empty());
-    // Changing the live index proof after qualification cannot turn P_new into
-    // the old prior. This immutable plan never consults the live proof map.
-    state.index.claude_usage_family_witnesses.clear();
-    assert!(qualification.new_native_hashes(&native).unwrap().is_empty());
-    let mut changed = native.clone();
-    changed.source_file_fingerprint = Some(hex64('d'));
-    assert_eq!(
-        qualification.new_native_hashes(&changed).unwrap(),
-        raw_hashes(&changed)
-    );
-    changed = native.clone();
-    changed
-        .claude_usage_occurrences
-        .values_mut()
-        .next()
+        .pending_candidates
+        .iter()
+        .any(|entry| entry.path == fixture.paths[0]));
+}
+
+#[test]
+fn recovery_priority_requires_scope_queued_debt_and_remaining_budget() {
+    let fixture = SelectionFixture::new();
+    let mut rearmed = fixture.previous.clone();
+    rearmed
+        .files
+        .get_mut(&local_index_key(&fixture.paths[0]))
         .unwrap()
-        .usage
-        .input_tokens += 1;
+        .source_file_fingerprint
+        .clear();
+    let inactive = recovery_priority_scan(&fixture, rearmed.clone(), 1, &fixture.paths[..1]);
+    assert_eq!(inactive.identified_candidates[0].path, fixture.paths[1]);
+    let no_debt =
+        recovery_priority_scan(&fixture, fixture.previous.clone(), 1, &fixture.paths[..1]);
+    assert_eq!(no_debt.identified_candidates[0].path, fixture.paths[1]);
+    let unknown = fixture.roots[0].join("unknown-recovery.jsonl");
+    let missing = recovery_priority_scan(&fixture, rearmed.clone(), 1, &[unknown]);
     assert_eq!(
-        qualification.new_native_hashes(&changed).unwrap(),
-        raw_hashes(&changed)
+        missing.identified_candidates[0].path, fixture.paths[1],
+        "missing path cannot become a synthetic queued candidate"
     );
-    changed = native;
-    changed
-        .claude_usage_request_ids
-        .insert("novel-after-freeze".into());
-    changed.request_count += 1;
-    assert_eq!(
-        qualification.new_native_hashes(&changed).unwrap(),
-        raw_hashes(&changed)
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_q5: frozen_old_p=true live_proof_replacement_ignored=true changed_revision_or_occurrence_or_request_set_uses_all=true").unwrap();
-}
-
-fn native_comparison_positive_hit_fixture() -> (
-    NativePreparationFixture,
-    OwnedSourceScan,
-    claude_native_comparison::Qualification,
-) {
-    let fixture = NativePreparationFixture::new();
-    let c = "c3333333-3333-4333-8333-333333333333";
-    fs::write(fixture.dir.join(format!("{c}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    assert_eq!(state.snapshots.len(), 1);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 2);
-    assert_eq!(
-        qualification.possible_targets(&state.snapshots[0]).unwrap(),
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    (fixture, state, qualification)
+    let zero = recovery_priority_scan(&fixture, rearmed, 0, &fixture.paths[..1]);
+    assert!(zero.identified_candidates.is_empty());
 }
 
 #[test]
-fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold() {
-    if !native_positive_layout_for_test(
-        "native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold",
-    ) {
-        return;
-    }
-    let (_fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let scope_before = state.native_comparison_context().unwrap().to_owned();
-    let requested_layout_bytes =
-        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX);
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(requested_layout_bytes.is_some_and(|bytes| bytes > 0));
-    } else {
-        assert!(
-            requested_layout_bytes.is_none(),
-            "unvalidated compiler layouts must remain unavailable"
-        );
-    }
-    let limit = state.file_limit;
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(selection.matched_roots, 1);
-    assert_eq!(selection.queued, 2);
-    assert!(selection.unresolved_sources.is_empty());
-    assert_eq!(
-        qualification.certified_member_count(),
-        0,
-        "positive hit withdraws S"
-    );
-    assert_eq!(
-        state.scanned_file_count, 1,
-        "enqueue is not a successful read"
-    );
-    let mut state = pause_native_comparison(state);
-    assert_eq!(state.scanned_file_count, 3);
-    assert_eq!(state.snapshots.len(), 3);
-    assert_eq!(state.pending_finalization.len(), 3);
-    assert!(state
-        .pending_finalization
-        .iter()
-        .all(|entry| entry.parse_complete));
-    assert_eq!(
-        state.native_comparison_context(),
-        Some(scope_before.as_str())
-    );
-    assert_eq!(state.file_limit, limit);
-    assert!(state.scanned_file_count <= limit);
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    let again = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(
-        again.queued, 0,
-        "withdrawn family cannot target twice in a pass"
-    );
-    state.resume_native_comparison_base();
-    let (_, scan) = finish(state);
-    assert_eq!(scan.scanned_file_count, 3);
-    writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes:?} rss_measured=false").unwrap();
-}
-
-#[test]
-fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
-    if !native_positive_layout_for_test(
-        "native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved",
-    ) {
-        return;
-    }
-    let (_fixture, state, mut qualification) = native_comparison_positive_hit_fixture();
-    let before = state.scanned_file_count;
-    let (candidates, selection) = qualification.take_target_candidates(&state.snapshots, 1);
-    assert!(candidates.is_empty());
-    assert_eq!(selection.matched_roots, 1);
-    assert_eq!(selection.queued, 0);
-    assert_eq!(
-        selection.unresolved_sources,
-        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
-    );
-    assert_eq!(qualification.certified_member_count(), 0);
-    assert_eq!(state.scanned_file_count, before);
-}
-
-#[test]
-fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
-    if !native_positive_layout_for_test(
-        "native_comparison_replaced_target_keeps_safe_open_failure_visible",
-    ) {
-        return;
-    }
-    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(selection.queued, 2);
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    let replacement = fixture.dir.join("replacement.tmp");
-    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(&replacement, &path).unwrap();
-    let base_bodies = state
-        .snapshots
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.clone(),
-                serde_json::to_vec(item).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let target_key = local_index_key(&path);
-    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
-    let file_limit = state.file_limit;
-    let sidecar_complete = state.sidecar_census_complete;
-    let (mut state, disappearance_events) =
-        disappearance_diagnostics::observe(|| pause_native_comparison(state));
-    assert_eq!(
-        disappearance_events,
-        [[0; 4], [0, 0, 0, 1], [0; 4]],
-        "a real reopened replacement reaches the frozen revision comparison"
-    );
-    assert_eq!(
-        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
-        target_entry,
-        "a mismatched target cannot refresh the frozen index entry"
-    );
-    assert_eq!(state.file_limit, file_limit);
-    assert_eq!(state.sidecar_census_complete, sidecar_complete);
-    for (session, bytes) in base_bodies {
-        let retained = state
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == session)
-            .unwrap();
-        assert_eq!(
-            serde_json::to_vec(retained).unwrap(),
-            bytes,
-            "target failure preserves already parsed native bodies"
-        );
-    }
-
-    assert!(
-        state.census.disappeared_file_count + state.census.unreadable_path_count > 0,
-        "the existing safe open must reject a replaced frozen object"
-    );
-    assert!(
-        state.scanned_file_count < 3,
-        "failed target is not a successful native read"
-    );
-    assert_eq!(qualification.certified_member_count(), 0);
-    state.resume_native_comparison_base();
-    let (_, scan) = finish(state);
+fn incomplete_census_keeps_its_existing_traversal_owner() {
+    let fixture = SelectionFixture::new();
+    let (index, scan) = finish(fixture.prepare(fixture.previous.clone(), 1));
     assert!(!scan.census_complete);
+    assert!(index.traversal.is_some());
 }
 
-#[test]
-fn native_comparison_acquisition_requires_actual_completed_target_reads() {
-    if !native_positive_layout_for_test(
-        "native_comparison_acquisition_requires_actual_completed_target_reads",
-    ) {
-        return;
-    }
-    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(selection.queued, 2);
-    let mut state = pause_native_comparison(state);
-    let acquired = state.take_native_comparison_acquisition(&mut qualification);
-    assert_eq!(acquired.completed_target_files, 2);
-    assert_eq!(
-        acquired.acquired_roots,
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    assert_eq!(
-        acquired.ready_for_fold_sources,
-        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
-    );
-    assert!(acquired.unresolved_sources.is_empty());
-    assert!(acquired.rearm_roots.is_empty());
-    assert!(acquired.known_rearm_candidates.is_empty());
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    let consumed = state.take_native_comparison_acquisition(&mut qualification);
-    assert_eq!(
-        consumed.completed_target_files, 0,
-        "actual acquisition receipt is consumed once"
-    );
-    assert!(consumed.ready_for_fold_sources.is_empty());
-    state.resume_native_comparison_base();
-    finish(state);
-    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
-}
-
-#[test]
-fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
-    if !native_positive_layout_for_test(
-        "native_comparison_controller_moves_frozen_plan_across_native_target_yields",
-    ) {
-        return;
-    }
-    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert_eq!(
-        controller.required_roots(),
-        &BTreeSet::from([fixture.parent.clone()])
-    );
-    let context = state.native_comparison_context().unwrap().to_owned();
-    assert!(controller.advance(&mut state, true));
-    assert_eq!(state.scanned_file_count, 1, "queueing is not acquisition");
-    let mut state = pause_native_comparison(state);
-    assert_eq!(state.scanned_file_count, 3);
-    assert_eq!(state.native_comparison_context(), Some(context.as_str()));
-    assert!(controller.advance(&mut state, true));
-    let (receipt, frontier) = controller.receipt_for_test();
-    assert_eq!(frontier, 3, "only the two newly acquired bodies extend H");
-    assert_eq!(receipt.completed_target_files, 2);
-    assert_eq!(
-        receipt.acquired_roots,
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    assert_eq!(receipt.ready_for_fold_sources.len(), 1);
-    assert!(receipt.unresolved_sources.is_empty());
-    assert!(state.identified_candidates.is_empty());
-    assert!(!state.native_comparison_ready());
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    let (_, scan) = finish(state);
-    assert_eq!(scan.scanned_file_count, 3);
-    assert_eq!(
-        scan.snapshots.len(),
-        3,
-        "no emission filtering is activated"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: initial_native=1 completed_targets=2 frontier=3 same_owner_context=true repeated_targets=0 pre_fold_bodies=3 selected_deferral_and_rearm_suppression=false").unwrap();
-}
-
-#[test]
-fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
-    if !native_positive_layout_for_test(
-        "native_comparison_controller_generation_loss_or_insufficient_budget_uses_base",
-    ) {
-        return;
-    }
-    for changed_pair in [true, false] {
-        let (_fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
-        if !changed_pair {
-            state.file_limit = state.scanned_file_count + 1;
-        }
-        let mut controller = claude_native_comparison::Controller::new(qualification);
-        assert!(!controller.advance(&mut state, !changed_pair));
-        assert!(
-            state
-                .native_comparison
-                .as_ref()
-                .is_some_and(|phase| phase.disabled_for_test()),
-            "no eligibility remains; only terminal-traversal custody survives"
-        );
-        assert!(
-            !controller.advance(&mut state, true),
-            "generation rollback or a later positive boolean cannot revive the controller"
-        );
-        assert!(state.identified_candidates.is_empty());
-        let (_, scan) = finish(state);
-        assert_eq!(scan.scanned_file_count, 1);
-        assert_eq!(
-            scan.snapshots.len(),
-            1,
-            "base native body remains available"
-        );
-        assert!(scan.snapshots[0].usage_accounting_contract.is_none());
-    }
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: changed_generation_base=true insufficient_remaining_budget_base=true no_extra_target_reads=true no_body_suppression=true actual_process_bootstrap_unproved=true").unwrap();
-}
-
-#[test]
-fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
-    if !native_positive_layout_for_test(
-        "native_comparison_controller_replaced_target_cannot_complete_comparison",
-    ) {
-        return;
-    }
-    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert!(controller.advance(&mut state, true));
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    let replacement = fixture.dir.join("controller-replacement.tmp");
+fn replace_candidate(state: &OwnedSourceScan) -> PathBuf {
+    let path = state.identified_candidates[0].path.clone();
+    let replacement = path.with_extension("replacement");
     fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
     fs::rename(replacement, &path).unwrap();
-    let base_bodies = state
-        .snapshots
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.clone(),
-                serde_json::to_vec(item).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let target_key = local_index_key(&path);
-    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
-    let file_limit = state.file_limit;
-    let sidecar_complete = state.sidecar_census_complete;
-    let (mut state, disappearance_events) =
-        disappearance_diagnostics::observe(|| pause_native_comparison(state));
-    assert_eq!(
-        disappearance_events,
-        [[0; 4], [0, 0, 0, 1], [0; 4]],
-        "a real reopened replacement reaches the frozen revision comparison"
-    );
-    assert_eq!(
-        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
-        target_entry,
-        "a mismatched target cannot refresh the frozen index entry"
-    );
-    assert_eq!(state.file_limit, file_limit);
-    assert_eq!(state.sidecar_census_complete, sidecar_complete);
-    for (session, bytes) in base_bodies {
-        let retained = state
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == session)
-            .unwrap();
-        assert_eq!(
-            serde_json::to_vec(retained).unwrap(),
-            bytes,
-            "target failure preserves already parsed native bodies"
-        );
-    }
+    path
+}
 
-    assert!(!controller.advance(&mut state, true));
-    assert!(
-        state
-            .native_comparison
-            .as_ref()
-            .is_some_and(|phase| phase.disabled_for_test()),
-        "no eligibility remains; only terminal-traversal custody survives"
+#[test]
+fn replaced_selected_file_keeps_safe_open_failure_visible() {
+    let fixture = SelectionFixture::new();
+    let state = fixture.prepare(fixture.previous.clone(), 1);
+    let path = replace_candidate(&state);
+    let key = local_index_key(&path);
+    let old = serde_json::to_vec(&state.index.files[&key]).unwrap();
+    let (index, scan) = finish(state);
+    assert_eq!(
+        serde_json::to_vec(&index.files[&key]).unwrap(),
+        old,
+        "a replaced frozen object cannot refresh the index entry"
     );
-    assert!(controller.receipt_for_test().0.acquired_roots.is_empty());
-    let (_, scan) = finish(state);
+    assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
+    assert_eq!(
+        scan.scanned_file_count, 0,
+        "failed read is not successful work"
+    );
+    assert!(scan.snapshots.is_empty());
     assert!(!scan.census_complete);
+}
+
+#[test]
+fn failed_selected_file_keeps_dependent_source_unresolved() {
+    let fixture = SelectionFixture::new();
+    let state = fixture.prepare(fixture.previous.clone(), 2);
+    let path = replace_candidate(&state);
+    let key = local_index_key(&path);
+    let old = serde_json::to_vec(&state.index.files[&key]).unwrap();
+    let (index, scan) = finish(state);
+    assert_eq!(
+        scan.scanned_file_count, 1,
+        "only the unchanged sibling completed"
+    );
+    assert_eq!(serde_json::to_vec(&index.files[&key]).unwrap(), old);
     assert!(scan
         .snapshots
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: actual_target_replacement_base=true current_native_census_incomplete=true no_acquired_owner_posture=true").unwrap();
-}
-
-#[test]
-fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
-    if !native_positive_layout_for_test(
-        "native_comparison_failed_target_keeps_dependent_source_unresolved",
-    ) {
-        return;
-    }
-    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    assert_eq!(
-        state
-            .acquire_native_comparison_targets(&mut qualification)
-            .queued,
-        2
-    );
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    let replacement = fixture.dir.join("acquisition-replacement.tmp");
-    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(replacement, path).unwrap();
-    let mut state = pause_native_comparison(state);
-    let acquired = state.take_native_comparison_acquisition(&mut qualification);
-    assert_eq!(
-        acquired.completed_target_files, 1,
-        "only the unchanged child completed"
-    );
-    assert!(acquired.acquired_roots.is_empty());
-    assert!(acquired.ready_for_fold_sources.is_empty());
-    assert_eq!(
-        acquired.unresolved_sources,
-        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
-    );
-    assert_eq!(
-        acquired.rearm_roots,
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    assert_eq!(acquired.known_rearm_candidates.len(), 2);
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    state.resume_native_comparison_base();
-    let (_, scan) = finish(state);
     assert!(!scan.census_complete);
-    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
 }
 
 #[test]
-fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
-    let fixture = NativePreparationFixture::new();
-    let mut state = fixture.paused();
-    let original = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
-    let duplicate = fixture
-        .dir
-        .join("other-project")
-        .join(format!("{}.jsonl", fixture.parent));
-    fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
-    fs::write(&duplicate, fs::read(&original).unwrap()).unwrap();
-    // Model an indexed duplicate from an earlier bounded page. The genuine
-    // normal-Skip certificates above cannot make ambiguous member paths unique.
-    state.index.files.insert(
-        local_index_key(&duplicate),
-        state.index.files[&original].clone(),
-    );
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualified = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualified.certified_member_count(), 0);
-    assert!(state.snapshots.is_empty());
-}
-
-#[test]
-fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
-    if !native_positive_layout_for_test(
-        "native_comparison_family_parse_withdraws_skips_before_and_after_attempt",
-    ) {
-        return;
-    }
-    for parse_child in [false, true] {
-        let mut fixture = NativePreparationFixture::new();
-        let path = if parse_child {
-            fixture
-                .dir
-                .join(&fixture.parent)
-                .join("subagents/agent-a4d1585d310070d0f.jsonl")
-        } else {
-            fixture.dir.join(format!("{}.jsonl", fixture.parent))
-        };
-        // Existing durable rearm debt forces a real unchanged native parse.
-        // No revision, request, occurrence or retained proof is fabricated.
-        fixture
-            .index
-            .files
-            .get_mut(&local_index_key(&path))
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-        let mut state = fixture.paused();
-        assert_eq!(state.scanned_file_count, 1);
-        assert_eq!(state.snapshots.len(), 1);
-        let native_before = serde_json::to_vec(&state.snapshots).unwrap();
-        let proof_before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
-        let healthy = BTreeSet::from([fixture.parent.clone()]);
-        let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-            api: &fixture.api.evidence,
-            trace: &fixture.trace.evidence,
-            healthy_roots: &healthy,
-        });
-        assert_eq!(qualification.certified_member_count(), 0);
-        assert!(
-            qualification
-                .new_native_hashes(&state.snapshots[0])
-                .unwrap()
-                .is_empty(),
-            "revoking negatives must preserve the independently verified pre-mutation Q5 prior"
-        );
-        assert_eq!(serde_json::to_vec(&state.snapshots).unwrap(), native_before);
-        assert_eq!(
-            serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
-            proof_before
-        );
-        writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_unchanged_parse=1 parse_child={parse_child} sibling_negative_members=0 exact_q5_prior_retained=true native_and_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
-    }
-}
-
-#[test]
-fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
-    let fixture = NativePreparationFixture::new();
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    fs::write(&path, "").unwrap();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    assert!(
-        state.snapshots.is_empty(),
-        "the actual parse emitted no body"
-    );
-    assert_eq!(state.pending_finalization.len(), 1);
-    assert!(state.pending_finalization[0].parse_complete);
-    let proof_before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(
-        qualification.certified_member_count(),
-        0,
-        "absence of a native body cannot hide the family's actual parse"
-    );
-    assert_eq!(
-        serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
-        proof_before
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_empty_parse=1 native_bodies=0 sibling_negative_members=0 retained_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
-}
-
-struct NativeWindowPage {
-    index: ScanIndex,
-    scan: SourceScanResult,
-    window: Box<claude_native_comparison::WindowEligibility>,
-    clean: bool,
-}
-
-fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
-    let mut state = fixture.paused_with_limit(1);
-    assert_eq!(state.scanned_file_count, 0);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 1);
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert!(controller.advance(&mut state, true));
-    let mut window = controller.into_window(&state.census_window_end).unwrap();
-    let (mut index, mut scan) = finish(state);
-    assert!(!scan.census_complete);
-    assert!(scan.snapshots.is_empty());
-    apply_claude_reported_usage_with_index(
-        &mut scan.snapshots,
-        &fixture.api,
-        &fixture.trace,
-        &mut index,
-    );
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    window.retain_current(&index);
-    assert_eq!(window.certified_member_count(), 1);
-    let clean = claude_native_comparison::selected_page_is_clean(&scan, &index);
-    assert!(clean);
-    NativeWindowPage {
-        index,
-        scan,
-        window,
-        clean,
-    }
-}
-
-#[test]
-fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_saved_graph_obeys_real_layout_gate",
-    ) {
-        // Exercise the actual closed qualifier on this layout, rather than
-        // fabricating a positive window merely to price it afterwards.
-        let fixture = NativePreparationFixture::new();
-        let mut state = fixture.paused_with_limit(1);
-        let before = serde_json::to_vec(&state.index).unwrap();
-        let healthy = BTreeSet::from([fixture.parent.clone()]);
-        let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-            api: &fixture.api.evidence,
-            trace: &fixture.trace.evidence,
-            healthy_roots: &healthy,
-        });
-        assert_eq!(
-            qualification.certified_member_count(),
-            0,
-            "unsupported layout mints no certificate"
-        );
-        assert_eq!(
-            serde_json::to_vec(&state.index).unwrap(),
-            before,
-            "closed qualification adds no persistent debt or selected mutation"
-        );
-        let owner = claude_native_comparison::lifecycle::Lifecycle::default();
-        assert!(!owner.retained_valid_for_test());
-        assert_eq!(owner.retained_bound(usize::MAX), Some(0));
-        writeln!(std::io::stderr().lock(), "native_comparison_unsupported_BASE: actual_qualification=true certificates=0 selected_index_unchanged=true grant=false empty_retained_bytes=0 positive_window=UNEXECUTED").unwrap();
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-window-layout");
-    let path = scratch.join("index.json");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("window-source-destination-context".into());
-    fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-    let mut lease = owner.begin();
-    lease.bind("window-source-destination-context".into());
-    assert!(lease.allowed());
-    let mut page = native_window_page(&fixture);
-    let pointer = page.window.as_ref() as *const _ as usize;
-    page.index.save(&path).unwrap();
-    lease.note_selected_save(false);
-    lease.stage_window_after_save(Some(page.window), &page.index, page.scan.census_complete);
-    lease.finish(page.clean);
-    let bound = owner.retained_bound(crate::source_rotation::PARKED_BUDGET);
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.is_some_and(|bytes| bytes > 0));
-        let mut next = owner.begin();
-        next.bind("window-source-destination-context".into());
-        assert!(next.allowed());
-        assert_eq!(
-            owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
-            Some(0),
-            "the moved graph is now frame-owned, not external retention"
-        );
-        let graph = next.take_window().unwrap();
-        assert_eq!(graph.as_ref() as *const _ as usize, pointer);
-        assert_eq!(graph.certified_member_count(), 1);
-        drop(next);
-    } else {
-        assert_eq!(
-            bound,
-            Some(0),
-            "unsupported window was dropped before retention; no alternate layout admitted"
-        );
-        assert!(!owner.retained_valid_for_test());
-        owner.discard_retained();
-        let mut next = owner.begin();
-        next.bind("window-source-destination-context".into());
-        assert!(!next.allowed());
-        assert!(next.take_window().is_none());
-    }
-    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_partial_skip=1 actual_selected_save=true requested_layout={bound:?} supported_move_exercised={} full_driver_proved=false", crate::heap_layout_bound::layout_supported()).unwrap();
-}
-
-#[test]
-fn native_comparison_window_component_reconstructs_same_census_current_rows() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_component_reconstructs_same_census_current_rows",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let page = native_window_page(&fixture);
-    fixture.index = page.index;
-    let mut next = fixture.paused_with_limit(1);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = next
-        .prepare_native_comparison_with_window(
-            claude_native_comparison::PairedRows {
-                api: &fixture.api.evidence,
-                trace: &fixture.trace.evidence,
-                healthy_roots: &healthy,
-            },
-            Some(page.window),
-        )
-        .unwrap();
-    assert_eq!(qualification.certified_member_count(), 2);
-    assert!(next.snapshots.is_empty());
-    // A source-component check before lifecycle/budget admission. This cannot
-    // establish that the original optimized pipeline or a layout gate passes.
-    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_skip_pages=2 current_rows_reconstructed=true component_members=2 lifecycle_budget_admission_proved=false original_oracle_passed=false").unwrap();
-}
-
-#[test]
-fn native_comparison_window_later_parse_withdraws_carried_sibling() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_later_parse_withdraws_carried_sibling",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let page = native_window_page(&fixture);
-    let old_key = page.window.first_key_for_test().unwrap().to_owned();
-    fixture.index = page.index;
-    let next_key = fixture
-        .index
-        .files
-        .keys()
-        .find(|key| **key != old_key)
-        .unwrap()
-        .clone();
-    fixture
-        .index
-        .files
-        .get_mut(&next_key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    let mut next = fixture.paused_with_limit(1);
-    assert_eq!(next.scanned_file_count, 1);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = next
-        .prepare_native_comparison_with_window(
-            claude_native_comparison::PairedRows {
-                api: &fixture.api.evidence,
-                trace: &fixture.trace.evidence,
-                healthy_roots: &healthy,
-            },
-            Some(page.window),
-        )
-        .unwrap();
-    assert_eq!(qualification.certified_member_count(), 0);
-    let window = claude_native_comparison::Controller::new(qualification)
-        .into_window(&next.census_window_end)
-        .unwrap();
-    assert!(window.root_revoked_for_test(&fixture.parent));
-    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_later_member_parse=1 carried_sibling_members=0 sticky_tombstone=true full_driver_proved=false").unwrap();
-}
-
-#[test]
-fn native_comparison_window_proof_membership_empty_or_context_change_withdraws() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_proof_membership_empty_or_context_change_withdraws",
-    ) {
-        return;
-    }
-    for control in 0..4 {
-        let fixture = NativePreparationFixture::new();
-        let mut page = native_window_page(&fixture);
-        let key = page.window.first_key_for_test().unwrap().to_owned();
-        match control {
-            0 => {
-                page.index
-                    .claude_usage_family_witnesses
-                    .get_mut(&fixture.parent)
-                    .unwrap()
-                    .evidence_fingerprint = hex64('f')
-            }
-            1 => {
-                let other = fixture
-                    .dir
-                    .join(&fixture.parent)
-                    .join("subagents/agent-3333333333333333.jsonl");
-                page.index
-                    .files
-                    .insert(local_index_key(&other), page.index.files[&key].clone());
-            }
-            2 => {
-                page.index.confirmed_empty_files.insert(key);
-            }
-            _ => page.index.active_upload_context_fingerprint = Some("changed-context".into()),
-        }
-        let certified = page.window.certified_member_count();
-        page.window.retain_current(&page.index);
-        if control == 3 {
-            // A delivery context selects no read: the certified skips stay.
-            assert!(certified > 0);
-            assert_eq!(page.window.certified_member_count(), certified);
-            assert!(!page.window.root_revoked_for_test(&fixture.parent));
-            continue;
-        }
-        assert_eq!(page.window.certified_member_count(), 0);
-        assert!(page.window.root_revoked_for_test(&fixture.parent));
-    }
-}
-
-#[test]
-fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let page = native_window_page(&fixture);
-    let mut phase = claude_native_comparison::NativePhase::default();
-    assert!(!phase.import_window(Some(page.window), &page.index, "different-window"));
-    let scratch = crate::test_scratch::ScratchDir::new("native-window-scope");
-    let path = scratch.join("index.json");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("original-scope".into());
-    fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-    let page = native_window_page(&fixture);
-    let mut no_save = owner.begin();
-    no_save.bind("original-scope".into());
-    no_save.stage_window_after_save(Some(page.window), &page.index, false);
-    no_save.finish(true);
-    assert_eq!(
-        owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
-        Some(0)
-    );
-    let mut changed = owner.begin();
-    changed.bind("other-scope".into());
-    assert!(!changed.allowed());
-    assert!(changed.take_window().is_none());
-    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut fresh = restarted.begin();
-    fresh.bind("original-scope".into());
-    assert!(!fresh.allowed());
-    assert!(fresh.take_window().is_none());
-}
-
-#[test]
-fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-window-valid-scope");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("original-scope".into());
-    fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-    let mut valid = owner.begin();
-    valid.bind("original-scope".into());
-    assert!(valid.allowed(), "control starts with a valid saved grant");
-    valid.note_selected_save(false);
-    valid.finish(true);
-    let mut changed = owner.begin();
-    changed.bind("other-scope".into());
-    assert!(!changed.allowed());
-    assert!(changed.take_window().is_none());
-    changed.note_selected_save(false);
-    changed.finish(true);
-    let mut rolled_back = owner.begin();
-    rolled_back.bind("original-scope".into());
-    assert!(
-        !rolled_back.allowed(),
-        "scope rollback cannot revive permission"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: independently_valid_scope_control=true changed_scope_base=true rolled_back_scope_base=true").unwrap();
-}
-
-#[test]
-fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_unknown_lock_and_stale_generation_revoke",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let scratch = crate::test_scratch::ScratchDir::new("native-window-lock-generation");
-    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut bootstrap = owner.begin();
-    bootstrap.bind("scope".into());
-    fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(true);
-    bootstrap.finish(true);
-    let mut outstanding = owner.begin();
-    outstanding.bind("scope".into());
-    assert!(outstanding.allowed());
-    let page = native_window_page(&fixture);
-    outstanding.note_selected_save(false);
-    outstanding.stage_window_after_save(Some(page.window), &page.index, false);
-    owner.with_state_locked_for_test(|| {
-        assert_eq!(
-            owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
-            None
-        );
-    });
-    // Exactly the rotation refusal action, after the failed nonblocking query
-    // releases its lock. This also invalidates a graph already moved to a frame.
-    owner.discard_retained();
-    assert!(!outstanding.allowed());
-    assert!(outstanding.take_window().is_none());
-    outstanding.note_selected_save(true);
-    outstanding.finish(true);
-    let mut next = owner.begin();
-    next.bind("scope".into());
-    assert!(!next.allowed(), "stale finish must not republish a grant");
-    assert!(next.take_window().is_none());
-    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: held_lock_bound=None whole_window_discard=true stale_generation_cannot_republish=true").unwrap();
-}
-
-#[test]
-fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_missing_current_rows_withdraws_until_window_end",
-    ) {
-        return;
-    }
-    for control in 0..3 {
-        let mut fixture = NativePreparationFixture::new();
-        let page = native_window_page(&fixture);
-        fixture.index = page.index;
-        let mut next = fixture.paused_with_limit(1);
-        let healthy = if control == 2 {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([fixture.parent.clone()])
-        };
-        let mut api = fixture.api.evidence.clone();
-        let mut trace = fixture.trace.evidence.clone();
-        if control == 0 {
-            api.remove(&fixture.parent);
-        }
-        if control == 1 {
-            trace.remove(&fixture.parent);
-        }
-        let qualification = next
-            .prepare_native_comparison_with_window(
-                claude_native_comparison::PairedRows {
-                    api: &api,
-                    trace: &trace,
-                    healthy_roots: &healthy,
-                },
-                Some(page.window),
-            )
-            .unwrap();
-        assert_eq!(qualification.certified_member_count(), 0);
-        let window = claude_native_comparison::Controller::new(qualification)
-            .into_window(&next.census_window_end)
-            .unwrap();
-        assert!(window.root_revoked_for_test(&fixture.parent));
-        let mut retry = fixture.paused_with_limit(1);
-        let healthy = BTreeSet::from([fixture.parent.clone()]);
-        let recovered_rows = retry
-            .prepare_native_comparison_with_window(
-                claude_native_comparison::PairedRows {
-                    api: &fixture.api.evidence,
-                    trace: &fixture.trace.evidence,
-                    healthy_roots: &healthy,
-                },
-                Some(window),
-            )
-            .unwrap();
-        assert_eq!(
-            recovered_rows.certified_member_count(),
-            0,
-            "a later healthy reconstruction cannot undo a same-window withdrawal"
-        );
-    }
-    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: current_api_missing_base=true current_trace_missing_base=true unhealthy_pair_base=true later_rows_cannot_revive=true").unwrap();
-}
-
-#[test]
-fn native_comparison_window_any_authority_quarantine_withdraws() {
-    if !native_positive_layout_for_test(
-        "native_comparison_window_any_authority_quarantine_withdraws",
-    ) {
-        return;
-    }
+fn authority_quarantine_preserves_body_and_correction_debt() {
     for corrected in [false, true] {
-        let fixture = NativePreparationFixture::new();
-        let mut page = native_window_page(&fixture);
-        let witness = &page.index.claude_usage_family_witnesses[&fixture.parent];
+        let fixture = BodyFixture::new();
+        let mut index = fixture.index.clone();
+        let witness = &index.claude_usage_family_witnesses[&fixture.parent];
         let digest = claude_usage_family_witness_fingerprint(witness);
         let members = witness
             .member_request_id_fingerprints
             .keys()
             .map(|member| {
-                let key = page
-                    .index
+                let key = index
                     .files
                     .keys()
                     .find(|key| {
@@ -1998,11 +344,11 @@ fn native_comparison_window_any_authority_quarantine_withdraws() {
                     .unwrap();
                 (
                     member.clone(),
-                    page.index.files[key].source_file_fingerprint.clone(),
+                    index.files[key].source_file_fingerprint.clone(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        page.index.claude_usage_authority_quarantine.insert(
+        index.claude_usage_authority_quarantine.insert(
             fixture.parent.clone(),
             ClaudeUsageAuthorityQuarantineRecord {
                 contract: if corrected {
@@ -2025,250 +371,137 @@ fn native_comparison_window_any_authority_quarantine_withdraws() {
                 }),
             },
         );
-        page.window.retain_current(&page.index);
-        assert_eq!(page.window.certified_member_count(), 0);
-        assert!(page.window.root_revoked_for_test(&fixture.parent));
+        let held = index.current_snapshot_fingerprints();
+        let selected =
+            index.with_locally_held_keys_reverted(&fixture.index, &held, &BTreeSet::new());
+        assert_eq!(
+            serde_json::to_value(&selected.files).unwrap(),
+            serde_json::to_value(&fixture.index.files).unwrap()
+        );
+        assert_eq!(
+            selected.accepted_snapshot_fingerprints,
+            fixture.index.accepted_snapshot_fingerprints
+        );
+        assert_eq!(
+            serde_json::to_value(&selected.claude_usage_authority_quarantine).unwrap(),
+            serde_json::to_value(&index.claude_usage_authority_quarantine).unwrap()
+        );
     }
-    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: terminal_quarantine_base=true proof_correction_quarantine_base=true accepted_body_or_debt_unchanged=true").unwrap();
 }
 
-// The same actual scanner/controller and selected-save seams used by finish.
-// A/D share an exact native ID; the healthy C body has independent requests.
-const FALLBACK_COPY: &str = "c3333333-3333-4333-8333-333333333333";
-const FALLBACK_PEER: &str = "d4444444-4444-4444-8444-444444444444";
-const FALLBACK_HEALTHY: &str = "e5555555-5555-4555-8555-555555555555";
-fn native_comparison_selected_fallback_fixture() -> (
-    NativePreparationFixture,
-    ScanIndex,
-    SourceScanResult,
-    claude_native_comparison::SelectedFallback,
-    ScanIndex,
-    PathBuf,
-) {
-    let mut fixture = NativePreparationFixture::new();
-    for (session, request) in [
-        (FALLBACK_COPY, "req_1"),
-        (FALLBACK_PEER, "req_1"),
-        (FALLBACK_HEALTHY, "req_healthy"),
-    ] {
-        fs::write(fixture.dir.join(format!("{session}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
-    }
-    let copy_key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
-    let mut old = fixture.index.files.values().next().unwrap().clone();
-    let old_head = format!("{:064x}", 58801);
-    old.source_file_fingerprint = format!("{:064x}", 58802);
-    old.last_snapshot_fingerprint = Some(old_head.clone());
-    old.last_upload_body_witness = Some(format!("{:064x}", 58803));
-    fixture.index.files.insert(copy_key.clone(), old);
-    fixture
-        .index
-        .file_snapshot_fingerprints
-        .insert(copy_key, BTreeSet::from([old_head.clone()]));
-    fixture
-        .index
-        .accepted_snapshot_fingerprints
-        .insert(old_head.clone());
-    fixture
-        .index
-        .snapshot_activity_at
-        .insert(old_head, Some(WINDOW.to_owned()));
-    let path = fixture.dir.join("selected-index.json");
-    fixture.index.save(&path).unwrap();
-    fixture.index = ScanIndex::load(&path).unwrap();
-    // The selected upload context is runtime-only. Real preparation activates
-    // it after load; a missing context correctly reparses both proven members.
-    fixture
-        .index
-        .activate_upload_context("native-preparation-test".to_owned());
-    let previous = fixture.index.clone();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 3);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 2);
-    // Exhaust the existing page budget, without changing any scope or cap.
-    state.file_limit = state.scanned_file_count;
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert!(!controller.advance(&mut state, true));
-    let (mut index, mut scan, terminal) = loop {
-        match state.step(None) {
-            OwnedSourceScanStep::Pending(next) => state = next,
-            OwnedSourceScanStep::Complete {
-                index,
-                scan,
-                terminal_native_traversal,
-            } => break (index, scan, terminal_native_traversal),
-        }
-    };
-    assert!(scan.census_complete);
-    assert!(
-        terminal.is_some(),
-        "failed comparison still MOVES the actual terminal traversal"
-    );
-    let completion = controller.complete(&scan, terminal, false).unwrap();
-    assert!(completion.window.is_none());
-    let fallback = completion.fallback.unwrap();
-    fallback.withhold(&mut scan);
-    assert!(scan
-        .snapshots
-        .iter()
-        .all(|item| item.source_session_id == FALLBACK_HEALTHY));
-    apply_claude_reported_usage_to_scan_with_identity(
-        &mut scan,
-        &fixture.api,
-        &fixture.trace,
-        &mut index,
+fn selected_fixture() -> (SelectionFixture, ScanIndex, SourceScanResult, ScanIndex) {
+    let fixture = SelectionFixture::new();
+    let previous = fixture.previous.clone();
+    let (mut index, mut scan) = finish(OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &fixture.roots,
+        previous.clone(),
+        WINDOW,
+        30,
+        2,
         None,
-    );
-    fallback.after_native_fold(&mut scan, &mut index);
+        &fixture.paths[2..3],
+        false,
+        false,
+    ));
     assert!(!scan.census_complete);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    (fixture, index, scan, fallback, previous, path)
+    (fixture, index, scan, previous)
 }
 
 #[test]
-fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies() {
-    if !native_positive_layout_for_test(
-        "native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies",
-    ) {
-        return;
-    }
-    let (fixture, mut index, scan, mut fallback, previous, path) =
-        native_comparison_selected_fallback_fixture();
-    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+fn selected_restore_preserves_prior_body_and_queued_debt() {
+    let (fixture, index, _scan, previous) = selected_fixture();
+    let key = local_index_key(&fixture.paths[1]);
     let old = serde_json::to_vec(&previous.files[&key]).unwrap();
-    fallback.restore_selected(&mut index, &previous).unwrap();
-    assert_eq!(serde_json::to_vec(&index.files[&key]).unwrap(), old);
+    let mut selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(serde_json::to_vec(&selected.files[&key]).unwrap(), old);
     assert_eq!(
-        index.file_snapshot_fingerprints[&key],
+        selected.file_snapshot_fingerprints[&key],
         previous.file_snapshot_fingerprints[&key]
     );
-    let traversal = index.traversal.as_ref().unwrap();
-    let queued = traversal
-        .pending_candidates
-        .iter()
-        .map(|p| local_index_key(&p.path))
-        .collect::<Vec<_>>();
-    assert_eq!(queued.len(), 4);
-    assert!(queued[..2]
-        .iter()
-        .all(|key| claude_index_path_family_member(Path::new(key)).unwrap().0 == fixture.parent));
-    assert!(queued[2..].iter().any(|k| k == &key));
-    assert!(index.bounded_sweep_had_unsettled_upload());
-    index.save(&path).unwrap();
-    let restored = ScanIndex::load(&path).unwrap();
+    assert!(selected.accepted_snapshot_fingerprints.contains(
+        previous.files[&key]
+            .last_snapshot_fingerprint
+            .as_ref()
+            .unwrap()
+    ));
+    let queued = &selected.traversal.as_ref().unwrap().pending_candidates;
+    assert!(queued.iter().any(|entry| entry.path == fixture.paths[0]));
+    selected.mark_bounded_sweep_unsettled();
+    selected.save(&fixture.index_path).unwrap();
+    let restored = ScanIndex::load(&fixture.index_path).unwrap();
     assert_eq!(serde_json::to_vec(&restored.files[&key]).unwrap(), old);
-    assert!(scan
-        .snapshots
-        .iter()
-        .all(|item| item.source_session_id == FALLBACK_HEALTHY));
-    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+    assert!(restored.bounded_sweep_had_unsettled_upload());
 }
 
-/// Diagnostics only: the comparison fallback's fold and its selected restore
-/// each mark the sweep without naming a path, so both name `unattributed`,
-/// also beside a named page cause and across a reload.
 #[test]
-fn native_comparison_fallback_marks_name_unattributed() {
-    if !native_positive_layout_for_test("native_comparison_fallback_marks_name_unattributed") {
-        return;
-    }
-    let (_fixture, mut index, _scan, mut fallback, previous, path) =
-        native_comparison_selected_fallback_fixture();
-    assert!(index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(
-        index.bounded_sweep_unsettled_cause_names(),
-        ["unattributed"]
+fn selected_restore_keeps_invalidated_census_record_absent() {
+    let (fixture, mut index, _scan, mut previous) = selected_fixture();
+    let key = local_index_key(&fixture.paths[1]);
+    let record = claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+        &"a".repeat(64),
+        1,
+        claude_request_census::ClaudeRequestCensusShape::Exact,
+        vec![1],
     );
-    // Isolate the restore's own mark.
-    index.bounded_sweep_had_unsettled_upload = false;
-    index.bounded_sweep_unsettled_causes = 0;
-    fallback.restore_selected(&mut index, &previous).unwrap();
-    assert!(index.bounded_sweep_had_unsettled_upload());
-    assert_eq!(
-        index.bounded_sweep_unsettled_cause_names(),
-        ["unattributed"]
-    );
-    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
-    index.save(&path).unwrap();
-    let restored = ScanIndex::load(&path).unwrap();
-    assert_eq!(
-        restored.bounded_sweep_unsettled_cause_names(),
-        ["shed", "unattributed"]
-    );
-}
-
-/// A selected restore (#588) reverts the withheld key
-/// to `previous` and REMOVES its request-census record. No record of the
-/// withheld revision, and none restored from `previous`, survives.
-#[test]
-fn native_comparison_selected_restore_removes_the_withheld_census_record() {
-    if !native_positive_layout_for_test(
-        "native_comparison_selected_restore_removes_the_withheld_census_record",
-    ) {
-        return;
-    }
-    let (fixture, mut index, _scan, mut fallback, mut previous, _path) =
-        native_comparison_selected_fallback_fixture();
-    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
-    let record = |seed: char| {
-        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
-            &seed.to_string().repeat(64),
-            1,
-            claude_request_census::ClaudeRequestCensusShape::Exact,
-            vec![1],
-        )
-    };
     index
         .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record('a'));
+        .insert_for_test(&key, record);
     previous
         .claude_request_census_mut_for_test()
-        .insert_for_test(&key, record('b'));
-    fallback.restore_selected(&mut index, &previous).unwrap();
-    assert_eq!(
-        serde_json::to_vec(&index.files[&key]).unwrap(),
-        serde_json::to_vec(&previous.files[&key]).unwrap()
-    );
-    assert!(index.claude_request_census_for_test().get(&key).is_none());
-}
-
-#[test]
-fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
-    if !native_positive_layout_for_test(
-        "native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt",
-    ) {
-        return;
-    }
-    let (fixture, index, scan, mut fallback, previous, path) =
-        native_comparison_selected_fallback_fixture();
-    let progress = fixture.dir.join("partial-progress.json");
-    let selected = crate::snapshot_sync::comparison_partial_fallback_for_test(
-        &index,
-        &previous,
-        &scan,
-        &mut fallback,
-        &path,
-        &progress,
-    )
-    .unwrap();
-    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+        .insert_for_test(
+            &key,
+            claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+                &"b".repeat(64),
+                1,
+                claude_request_census::ClaudeRequestCensusShape::Exact,
+                vec![1],
+            ),
+        );
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(1);
+    assert!(index.retire_vanished_claude_audit_debt_entry(&key));
+    let selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert_eq!(
         serde_json::to_vec(&selected.files[&key]).unwrap(),
         serde_json::to_vec(&previous.files[&key]).unwrap()
     );
-    let new_key = local_index_key(&fixture.dir.join(format!("{FALLBACK_PEER}.jsonl")));
-    assert!(
-        !selected.files.contains_key(&new_key),
-        "never-accepted copy has no committed entry or empty marker"
+    assert!(selected
+        .claude_request_census_for_test()
+        .get(&key)
+        .is_none());
+}
+
+#[test]
+fn partial_locked_save_and_restart_keep_exact_debt() {
+    let (fixture, index, scan, previous) = selected_fixture();
+    let progress = fixture._scratch.join("partial-progress.json");
+    let selected = crate::snapshot_sync::checkpoint_unselected_for_test(
+        &index,
+        &previous,
+        &scan,
+        &fixture.index_path,
+        &progress,
+    )
+    .unwrap();
+    let key = local_index_key(&fixture.paths[1]);
+    assert_eq!(
+        serde_json::to_vec(&selected.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
     );
+    let new_key = local_index_key(&fixture.paths[2]);
+    assert!(!selected.files.contains_key(&new_key));
     assert!(!selected.confirmed_empty_files.contains(&new_key));
     assert!(selected.bounded_sweep_had_unsettled_upload());
-    let restarted = ScanIndex::load(&path).unwrap();
+    let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restarted.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
+    );
     assert_eq!(
         restarted
             .traversal
@@ -2276,40 +509,29 @@ fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exac
             .unwrap()
             .pending_candidates
             .len(),
-        4
+        index.traversal.as_ref().unwrap().pending_candidates.len()
     );
-    assert!(!claude_native_comparison::lifecycle::Lifecycle::default().retained_valid_for_test());
-    writeln!(std::io::stderr().lock(), "native_comparison_partial_fallback: actual_progress_lock_selected_restore_CAS_save=true old_accepted_body_preserved=true new_copy_uncommitted=true no_empty_or_fake_hold=true native_priority_survives_reload=true restart_base=true").unwrap();
 }
 
 #[test]
-fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() {
-    if !native_positive_layout_for_test(
-        "native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit",
-    ) {
-        return;
-    }
-    let (_fixture, mut index, _scan, mut fallback, previous, path) =
-        native_comparison_selected_fallback_fixture();
+fn selected_save_cas_loser_never_commits() {
+    let (fixture, index, scan, previous) = selected_fixture();
     let mut winner = previous.clone();
-    winner.save(&path).unwrap();
-    let durable = fs::read(&path).unwrap();
-    fallback.restore_selected(&mut index, &previous).unwrap();
-    assert!(index.save(&path).is_err());
-    assert_eq!(fs::read(&path).unwrap(), durable);
-    index.traversal.as_mut().unwrap().census_window_end = "different-window".into();
-    assert!(fallback.restore_selected(&mut index, &previous).is_err());
-    assert_eq!(fs::read(&path).unwrap(), durable);
-    writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
+    winner.save(&fixture.index_path).unwrap();
+    let durable = fs::read(&fixture.index_path).unwrap();
+    let progress = fixture._scratch.join("cas-progress.json");
+    assert!(crate::snapshot_sync::checkpoint_unselected_for_test(
+        &index,
+        &previous,
+        &scan,
+        &fixture.index_path,
+        &progress
+    )
+    .is_err());
+    assert_eq!(fs::read(&fixture.index_path).unwrap(), durable);
 }
 
-/// Complete only the remaining physical cursor before a SECOND component
-/// parse. The first corrective page selected the parent with limit1; the child
-/// is still queued. Clearing the parent's debt does not inject it into that
-/// older queue. Use the real unchanged child traversal, never reset its fields
-/// or assert a second parent read before it can actually be selected. This
-/// data-level helper mints no proof, native receipt, ACK or lifecycle grant.
-fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture) {
+fn finish_component_cursor(fixture: &mut BodyFixture) {
     for _ in 0..8 {
         if fixture.index.traversal.is_none() {
             return;
@@ -2342,54 +564,41 @@ fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture
         );
         fixture.index = index;
     }
-    panic!("native receipt component cursor did not terminate");
+    panic!("component cursor did not terminate");
 }
 
-fn native_comparison_corrected_native_receipt_fixture(
-    mode: &str,
-) -> (
-    NativePreparationFixture,
-    ScanIndex,
-    Option<Box<claude_native_comparison::WindowEligibility>>,
-) {
-    let mut fixture = if mode == "noop" {
-        let (mut fixture, accepted, _) =
-            native_comparison_corrected_native_receipt_fixture("exact_ack");
-        fixture.index = accepted; // Actual prior validated ACK and durable save.
-        finish_native_receipt_component_cursor(&mut fixture);
+fn corrected_body_fixture(mode: &str) -> (BodyFixture, ScanIndex) {
+    let fixture = if mode == "noop" {
+        let (mut fixture, accepted) = corrected_body_fixture("exact_ack");
+        fixture.index = accepted;
+        finish_component_cursor(&mut fixture);
         fixture
     } else {
-        NativePreparationFixture::new()
+        BodyFixture::new()
     };
-    fixture.index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(std::mem::take(
-        &mut fixture.index,
-    ));
+    let mut previous =
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(fixture.index.clone());
     let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
-    fixture
-        .index
+    previous
         .files
         .get_mut(&key)
         .unwrap()
         .source_file_fingerprint
         .clear();
-    let previous = fixture.index.clone();
-    let mut state = fixture.paused_with_limit(1);
-    assert_eq!(
-        state.scanned_file_count, 1,
-        "actual native correction read, not a seeded Skip"
-    );
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert!(controller.advance(&mut state, true));
-    let (mut index, mut scan) = finish(state);
-    assert!(!scan.census_complete, "an earlier bounded page");
-    let mut completion = controller.complete(&scan, None, true).unwrap();
-    let disposition = apply_claude_reported_usage_to_scan_with_identity(
+    let (mut index, mut scan) = finish(OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.dir),
+        previous.clone(),
+        WINDOW,
+        30,
+        1,
+        None,
+        &[],
+        false,
+        false,
+    ));
+    assert_eq!(scan.scanned_file_count, 1);
+    apply_claude_reported_usage_to_scan_with_identity(
         &mut scan,
         &fixture.api,
         &fixture.trace,
@@ -2401,44 +610,10 @@ fn native_comparison_corrected_native_receipt_fixture(
         scan.snapshots[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
     );
-    if mode == "credit_refused" {
-        completion.attach_reservation(crate::source_rotation::PaidReservation::from_remainder(
-            Some(0),
-            0,
-            0,
-        ));
-        // Synchronous on this thread (no spawn, channel or pool in the call
-        // chain): thread-local accounting counts the same allocation events
-        // and excludes unrelated tests' allocations in parallel hosted runs.
-        let (_, allocation) = crate::retry_allocation_probe::measure(|| {
-            completion.prepare_native_corrections(&scan, &previous, &disposition)
-        });
-        assert_eq!(
-            allocation.allocations, 0,
-            "declined optional correction metadata allocates nothing"
-        );
-        assert_eq!(completion.pending_native_correction_count_for_test(), 0);
-    } else {
-        completion.prepare_native_corrections(&scan, &previous, &disposition);
-    }
     for item in &mut scan.snapshots {
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     }
-    assert_eq!(
-        completion.native_correction_count_for_test(),
-        0,
-        "parse/capture never mints a receipt"
-    );
     let offered = scan.snapshots.clone();
-    let witnesses = offered
-        .iter()
-        .map(|item| {
-            (
-                item.snapshot_fingerprint.clone(),
-                snapshot_upload_body_witness(item),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut baseline_scan = scan.clone();
     let mut baseline_index = index.clone();
     let mut baseline_projections = 0;
@@ -2446,27 +621,22 @@ fn native_comparison_corrected_native_receipt_fixture(
         SnapshotSource::ClaudeCode,
         &mut baseline_scan,
         &mut baseline_index,
-        |snapshot| {
+        |item| {
             baseline_projections += 1;
-            snapshot_upload_body_witness(snapshot)
+            snapshot_upload_body_witness(item)
         },
     );
-    let mut observed_projections = 0;
+    let mut projections = 0;
     finalize_scan_after_policy_with_body_witness(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
-        |snapshot| {
-            observed_projections += 1;
-            let witness = snapshot_upload_body_witness(snapshot);
-            completion.observe_native_correction(snapshot, &witness);
-            witness
+        |item| {
+            projections += 1;
+            snapshot_upload_body_witness(item)
         },
     );
-    assert_eq!(
-        observed_projections, baseline_projections,
-        "native receipts add no upload-body serialization"
-    );
+    assert_eq!(projections, baseline_projections);
     assert_eq!(
         serde_json::to_vec(&scan.snapshots).unwrap(),
         serde_json::to_vec(&baseline_scan.snapshots).unwrap()
@@ -2475,208 +645,125 @@ fn native_comparison_corrected_native_receipt_fixture(
         serde_json::to_vec(&index).unwrap(),
         serde_json::to_vec(&baseline_index).unwrap()
     );
-
-    if mode == "capture_only" {
-        return (fixture, index, completion.window);
-    }
-    if matches!(mode, "exact_ack" | "wrong_witness" | "credit_refused") {
+    if matches!(mode, "exact_ack" | "wrong_witness") {
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: "claude_code".to_owned(),
-            machine_id: "otm_native_receipt".to_owned(),
+            source: "claude_code".into(),
+            machine_id: "otm_receipt".into(),
             collector_version: None,
             snapshots: offered,
             upload_policy: SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
-        let refs=request.snapshots.iter().map(|item| {
-            let version=crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("production public ACK mapping");
-            serde_json::json!({"source_session_id":item.source_session_id,
-                "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
-                "body_witness_version":version,
-                "body_witness_digest":version.map(|_|if mode=="wrong_witness" {"f".repeat(64)}else{snapshot_upload_body_witness(item)}),
-            })
+        let refs = request.snapshots.iter().map(|item| {
+            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).expect("public ACK mapping");
+            json!({"source_session_id":item.source_session_id, "snapshot_fingerprint":item.snapshot_fingerprint,
+                "occurrence_count":1,"body_witness_version":version,
+                "body_witness_digest":version.map(|_| if mode == "wrong_witness" { "f".repeat(64) } else { snapshot_upload_body_witness(item) })})
         }).collect::<Vec<_>>();
-        let response:crate::snapshot_client::SnapshotBatchResponse=serde_json::from_value(serde_json::json!({
-            "accepted":request.snapshots.len(),"sessions_reconciled":request.snapshots.len(),
+        let response: crate::snapshot_client::SnapshotBatchResponse = serde_json::from_value(json!({
+            "accepted": request.snapshots.len(), "sessions_reconciled":request.snapshots.len(),
             "session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
-            "accepted_entities":refs,"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[],
+            "accepted_entities":refs,"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]
         })).unwrap();
         let validation = response.validate_entity_ack(&request);
         if mode == "wrong_witness" {
             assert!(
                 validation.is_err(),
-                "same fp with a different body witness is not an ACK"
+                "same fingerprint with another body witness is not an ACK"
             );
         } else {
             validation.unwrap();
-            let accepted = witnesses.keys().cloned().collect();
-            index.record_accepted_snapshot_fingerprints(&accepted);
+            index.record_accepted_snapshot_fingerprints(
+                &request
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect(),
+            );
         }
     }
     if mode == "noop" {
         assert_eq!(
             previous.files[&key].last_upload_body_witness,
             index.files[&key].last_upload_body_witness,
-            "no-op must be the exact previously ACKed grouped body"
+            "no-op must be the exact previously acknowledged body"
         );
     }
-    let path = fixture.dir.join("native-correction-selected.json");
+    let path = fixture.dir.join("correction-selected.json");
     index.save(&path).unwrap();
-    completion.note_native_corrections_after_save(&index, &previous, |fp, witness| match mode {
-        "refused" => None,
-        "exact_ack" | "credit_refused" => {
-            Some(witnesses.get(fp).is_some_and(|actual| actual == witness))
-        }
-        _ => Some(false),
-    });
-    let expected = usize::from(matches!(mode, "exact_ack" | "noop"));
-    assert_eq!(completion.native_correction_count_for_test(), expected);
-    assert!(serde_json::to_value(&index)
-        .unwrap()
-        .get("native_corrections")
-        .is_none());
-    writeln!(std::io::stderr().lock(),"native_comparison_native_receipt: mode={mode} actual_native_read=true frozen_proof=true body_ACK_validator_executed={} prior_exact_ACK={} selected_save=true minted={expected} Skip_or_envelope=false layout_admission=false", matches!(mode,"exact_ack"|"wrong_witness"),mode=="noop").unwrap();
-    (fixture, index, completion.window)
+    (fixture, index)
 }
 
 #[test]
-fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
-    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
-
-    if !native_positive_layout_for_test(
-        "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
-    ) {
-        return;
-    }
-    for mode in [
-        "capture_only",
-        "credit_refused",
-        "pending",
-        "wrong_witness",
-        "refused",
-        "exact_ack",
-        "noop",
-    ] {
-        native_comparison_corrected_native_receipt_fixture(mode);
+fn receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    for mode in ["pending", "wrong_witness", "refused", "exact_ack", "noop"] {
+        corrected_body_fixture(mode);
     }
 }
 
 #[test]
-fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
-    // Legacy reported-body proof/delivery; `e2` publishes a request-owned literal instead.
-
-    if !native_positive_layout_for_test(
-        "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
-    ) {
-        return;
-    }
+fn proof_revision_reparse_and_restart_preserve_body_custody() {
     for change in ["proof", "revision"] {
-        let (fixture, mut index, window) =
-            native_comparison_corrected_native_receipt_fixture("exact_ack");
-        let mut window = window.unwrap();
-        assert_eq!(window.native_correction_count_for_test(), 1);
+        let (fixture, mut index) = corrected_body_fixture("exact_ack");
+        let accepted = index.accepted_snapshot_fingerprints.clone();
         if change == "proof" {
             index
                 .claude_usage_family_witnesses
                 .get_mut(&fixture.parent)
                 .unwrap()
-                .evidence_fingerprint = "a different proof".to_owned();
+                .evidence_fingerprint = "changed-proof".into();
         } else {
             let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
             index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
         }
-        window.retain_current(&index);
-        assert_eq!(window.native_correction_count_for_test(), 0);
+        let path = fixture.dir.join("restart-index.json");
+        index.save(&path).unwrap();
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
     }
-    let (mut fixture, index, window) =
-        native_comparison_corrected_native_receipt_fixture("exact_ack");
-    fixture.index = index;
-    finish_native_receipt_component_cursor(&mut fixture);
-    let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
-    fixture
-        .index
+}
+
+#[test]
+fn default_constructor_keeps_durable_recovery_debt_under_ordinary_census_order() {
+    let fixture = SelectionFixture::new();
+    let mut index = fixture.previous.clone();
+    let key = local_index_key(&fixture.paths[0]);
+    index
         .files
         .get_mut(&key)
         .unwrap()
         .source_file_fingerprint
         .clear();
-    let mut state = fixture.paused_with_limit(1);
-    assert_eq!(state.scanned_file_count, 1);
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let qualification = state
-        .prepare_native_comparison_with_window(
-            claude_native_comparison::PairedRows {
-                api: &fixture.api.evidence,
-                trace: &fixture.trace.evidence,
-                healthy_roots: &healthy,
-            },
-            window,
-        )
-        .unwrap();
-    let controller = claude_native_comparison::Controller::new(qualification);
-    let window = controller.into_window(&state.census_window_end).unwrap();
-    assert_eq!(
-        window.native_correction_count_for_test(),
-        0,
-        "even same-revision native reparse revokes the old receipt"
-    );
-    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut lease = restarted.begin();
-    lease.bind("same-source-destination-context".to_owned());
-    assert!(!lease.allowed());
-    assert!(lease.take_window().is_none());
-    writeln!(std::io::stderr().lock(),"native_comparison_native_receipt_revocation: changed_P_base=true changed_R_base=true same_R_reparse_drops=true restart_no_disk_receipt=true no_Skip_or_coverage_claim=true").unwrap();
-}
-
-#[test]
-fn native_comparison_default_constructor_honors_durable_queue_debt_prefix_before_audits() {
-    let fixture = SelectionFixture::new();
-    let mut index = fixture.previous.clone();
-    index
-        .files
-        .get_mut(&local_index_key(&fixture.paths[0]))
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
     index.save(&fixture.index_path).unwrap();
     let index = ScanIndex::load(&fixture.index_path).unwrap();
-    let base = fixture.prepare(index.clone(), 1);
+    let base = fixture.prepare(index, 1);
     assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
-    let _scope = claude_native_comparison::enable_for_test();
-    let native = fixture.prepare(index, 1); // ordinary constructor, NO supplied recovery list
-    assert_eq!(native.identified_candidates.len(), 1);
-    assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
-    let (index, scan) = finish(native);
+    let (mut index, scan) = finish(base);
     assert_eq!(scan.scanned_file_count, 1);
-    assert!(index.files[&local_index_key(&fixture.paths[1])]
-        .audit_requires_full(sampled_scan::now_seconds()));
+    assert!(index.files[&key].source_file_fingerprint.is_empty());
     assert!(index
         .traversal
         .as_ref()
         .unwrap()
         .pending_candidates
         .iter()
-        .any(|p| p.path == fixture.paths[1]));
-    writeln!(std::io::stderr().lock(),"native_comparison_default_recovery_priority: actual_save_reload=true ordinary_constructor=true no_process_recovery_list=true known_empty_fp_queue_prefix_before_audits=true same_page_cap=true audit_debt_preserved=true no_new_native_eligibility=true").unwrap();
+        .any(|p| p.path == fixture.paths[0]));
+    index.save(&fixture.index_path).unwrap();
+    let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(restarted.files[&key].source_file_fingerprint.is_empty());
+    assert!(restarted
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|p| p.path == fixture.paths[0]));
 }
 
 #[test]
-fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
-    if !native_positive_layout_for_test(
-        "native_comparison_deferred_policy_unknown_native_is_base_without_new_debt",
-    ) {
-        return;
-    }
-    let fixture = NativePreparationFixture::new();
-    let mut state = fixture.paused();
-    let healthy = BTreeSet::from([fixture.parent.clone()]);
-    let mut qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 2);
+fn unknown_input_creates_no_false_credit_or_new_debt() {
+    let fixture = BodyFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let mut generic = parse_claude_code_jsonl_file(&path, WINDOW, hex64('e'))
         .unwrap()
@@ -2686,58 +773,27 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
     assert!(generic.request_count > 0);
     let before_body = serde_json::to_vec(&generic).unwrap();
     let before_index = serde_json::to_value(&fixture.index).unwrap();
-    let owner = std::sync::Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut lease = owner.begin();
-    lease.bind("logical-policy-decision-only".into());
+    let family = reconstruct_claude_usage_family(
+        &fixture.parent,
+        &fixture.index.claude_usage_family_witnesses[&fixture.parent],
+        &fixture.api,
+        &fixture.trace,
+        None,
+    )
+    .unwrap();
     assert!(
-        !lease.allowed(),
-        "this regression never fabricates a bootstrap grant"
+        claude_reported_usage_inputs(&generic, &family).is_none(),
+        "positive request counts without witnessed IDs cannot acquire reported rows"
     );
-    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
-        Some(crate::source_rotation::PARKED_BUDGET),
-        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
-            - std::mem::size_of_val(&qualification),
-        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
-            - std::mem::size_of_val(&qualification),
-    );
-    let (targets, selection) = qualification
-        .take_target_candidates_after(
-            std::slice::from_ref(&generic),
-            0,
-            0,
-            &[],
-            8,
-            Some(&mut claude_native_comparison::RecoveryBudget {
-                previous: &fixture.index,
-                credit: &mut credit,
-                lease: &mut lease,
-            }),
-        )
-        .unwrap();
-    assert!(selection.requires_base);
-    assert!(targets.is_empty() && selection.unresolved_sources.is_empty());
-    assert_eq!(owner.status().deferred_family_count, Some(0));
     assert_eq!(serde_json::to_vec(&generic).unwrap(), before_body);
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
-    eprintln!("native_comparison_deferred_unknown: decision_only=true unknown_ids_not_positive=true BASE_required=true new_debt=0 body_index_unchanged=true bootstrap_grant=false physical_liveness_claim=false");
 }
 
 #[test]
-fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
-    if !native_positive_layout_for_test(
-        "account_audit_release_waits_for_cache_heads_and_native_selected_restore",
-    ) {
-        return;
-    }
+fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
     for partial in [false, true] {
-        let (fixture, mut index, mut scan, mut fallback, mut previous, path) =
-            native_comparison_selected_fallback_fixture();
-        assert!(
-            index.traversal.is_none(),
-            "terminal is held by SelectedFallback"
-        );
-        let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_HEALTHY}.jsonl")));
-        assert!(index.files.contains_key(&key));
+        let (fixture, mut index, mut scan, mut previous) = selected_fixture();
+        let key = local_index_key(&fixture.paths[2]);
         let entry = index.files[&key].clone();
         previous.files.insert(key.clone(), entry.clone());
         previous
@@ -2756,19 +812,16 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
             index.files.insert(audit_key.clone(), audit_entry.clone());
             previous.files.insert(audit_key, audit_entry);
         }
-        // No optional copy remains: the same release path must preserve
-        // unknown acquisition custody without touching the retained terminal.
         let cache = sampled_scan::SharedCache::default();
         let selected = if partial {
-            let progress = fixture.dir.join("released-fallback-progress.json");
+            let progress = fixture._scratch.join("released-progress.json");
             crate::snapshot_sync::checkpoint_account_release_for_test(
                 index,
                 &previous,
                 &mut scan,
                 &cache,
-                std::slice::from_ref(&fixture.dir),
-                &mut fallback,
-                (&path, &progress),
+                &fixture.roots,
+                (&fixture.index_path, &progress),
             )
             .unwrap()
         } else {
@@ -2777,10 +830,9 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
                 &previous,
                 &mut scan,
                 &cache,
-                std::slice::from_ref(&fixture.dir),
-                Some(&mut fallback),
+                &fixture.roots,
             );
-            selected.save(&path).unwrap();
+            selected.save(&fixture.index_path).unwrap();
             selected
         };
         assert!(!selected.claude_account_deferred_holds.contains_key(&key));
@@ -2793,13 +845,16 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
                 .count(),
             crate::transcript_cache::CACHE_ENTRIES
         );
-        let copy = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+        let copy = local_index_key(&fixture.paths[0]);
         assert_eq!(
             serde_json::to_value(&selected.files[&copy]).unwrap(),
-            serde_json::to_value(&previous.files[&copy]).unwrap(),
-            "fallback retains prior copy"
+            serde_json::to_value(&previous.files[&copy]).unwrap()
         );
-        let restarted = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            selected.file_snapshot_fingerprints[&copy],
+            previous.file_snapshot_fingerprints[&copy]
+        );
+        let restarted = ScanIndex::load(&fixture.index_path).unwrap();
         assert!(restarted.files[&key].source_file_fingerprint.is_empty());
         assert!(restarted
             .traversal
@@ -2815,32 +870,22 @@ fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
 }
 
 #[test]
-fn ownership_diagnostics_preserve_real_claude_terminal_completed_heap_and_paid_completion() {
-    let fixture = NativePreparationFixture::new();
-    let (_, scan, terminal) = complete_native_with_terminal_owner(fixture.paused());
+fn completed_census_drops_finished_traversal_with_empty_diagnostic_causes() {
+    let fixture = BodyFixture::new();
+    let state = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.dir),
+        fixture.index.clone(),
+        WINDOW,
+        30,
+        8,
+        None,
+        &[],
+        false,
+        false,
+    );
+    let (index, scan) = finish(state);
     assert!(scan.census_complete);
     assert!(scan.causes.is_empty(), "exercise the empty diagnostic case");
-    let terminal = terminal.expect("actual clean Claude terminal traversal");
-    use crate::heap_layout_bound::HeapLayoutBound;
-    let mut bound = crate::heap_layout_bound::Counter::new(usize::MAX);
-    assert!(terminal.completed_heap_bound(&mut bound).is_some());
-    if !crate::heap_layout_bound::layout_supported() {
-        return; // full paid-completion layout qualification remains a native CI check
-    }
-    assert!(crate::heap_layout_bound::completed_bound(&terminal, usize::MAX).is_some());
-    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
-        Some(crate::source_rotation::PARKED_BUDGET),
-        0,
-        0,
-    );
-    let controller = claude_native_comparison::Controller::new_paid(
-        claude_native_comparison::Qualification::default(),
-        &mut credit,
-    )
-    .unwrap();
-    let completion = controller
-        .complete_paid(&scan, Some(terminal), true, &mut credit)
-        .expect("empty diagnostic metadata cannot refuse real Claude terminal completion");
-    assert!(completion.fallback.is_none());
-    assert!(crate::heap_layout_bound::completed_bound(&completion, usize::MAX).is_some());
+    assert!(index.traversal.is_none());
 }

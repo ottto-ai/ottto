@@ -455,12 +455,6 @@ fn r0_non_f_shapes_keep_clear_other_active() {
         assert_eq!(release(&mut scan), Counts::default(), "{source:?}");
 
         let active = scan.active_file.as_deref_mut().unwrap();
-        active.comparison_target = true;
-        assert!(!shape_f(&scan), "comparison target {source:?}");
-        assert_eq!(release(&mut scan).clear_other_active, 1, "{source:?}");
-        scan.active_file.as_deref_mut().unwrap().comparison_target = false;
-
-        let active = scan.active_file.as_deref_mut().unwrap();
         let plan = active.parser.reader.acquisition.take();
         assert!(!shape_f(&scan), "no acquisition {source:?}");
         assert_eq!(release(&mut scan).clear_other_active, 1, "{source:?}");

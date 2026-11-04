@@ -562,8 +562,8 @@ written. Counts saturate at `u64::MAX`.
 
 `counts.line_delivery` is keyed by the fixed name of the page's one registered
 line observer, for example `{"footprint": {...}}`. The observer receives the
-physical lines the page's primary reads already consumed; group,
-native-comparison and one-shot reads deliver nothing. All values are
+physical lines the page's primary reads already consumed; group and
+one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
 
 - `lines`: newline-complete physical lines delivered, including blank,
@@ -825,10 +825,9 @@ owner's process-retained bound using a conservative layout-independent allowance
 (1,536 bytes per entry for a possible B-tree node, boxed content witness and
 pinned absence witness, plus a
 root and state header).
-Codex-version, native-comparison and continuation graphs are admitted first;
+Codex-version and continuation graphs are admitted first;
 this memo is charged only from the remainder. Its own refusal drops only the
-memo details and cannot discard those admitted sibling graphs or BASE-exit
-native comparison. An unsupported sibling alone does not discard a memo that
+memo details and cannot discard those admitted sibling graphs. An unsupported sibling alone does not discard a memo that
 fits the available allowance. Persistently refused memo details remain unknown
 and require the existing counted recovery path until they can be retained.
 An empty memo releases its B-tree root and optional heap charge. The existing
@@ -1274,8 +1273,8 @@ canonical digests, not collected content.
 
 ## Claude Re-read Attribution Counters
 
-Schema 2's existing `native_collection_page` and `native_comparison_decision`
-records can include two sparse, counts-only objects for `source: claude_code`:
+Schema 2's existing `native_collection_page`
+record can include two sparse, counts-only objects for `source: claude_code`:
 `counts.claude_reread` and `counts.retained_cache_page_events`. A
 `native_collection_page` for any other source can carry
 `counts.retained_cache_page_events` only. Missing keys
@@ -1287,15 +1286,14 @@ always-on link scrape tokenized, and `links_over_limit`, links left off an
 upload because their value exceeds the receiver's 512-character limit.
 
 Collection counters cover initialization and all cooperative steps of one page,
-including steps before a pause or a move to another worker thread. Comparison
-counters cover preparation (including load normalization) and post-collection
-finalization/save. These are disjoint event intervals: sum their events for the
+including steps before a pause or a move to another worker thread. Additional
+collection records cover preparation (including load normalization) and
+post-collection finalization/save. These are disjoint event intervals: sum their events for the
 page; neither object is a gauge or a count of distinct files across pages.
 Nested operations, other sources and other threads cannot contribute to the
 active interval. Abandoned collection pages have no completed collection line.
-With comparison disabled, the existing `disabled_before_lease` decision still
-reports the gate; additional rows on that same decision stage report nonzero
-preparation/save events after work, without creating a comparison permit.
+The same collection stage reports nonzero preparation/save events after work,
+including early preparation failures when no page is collected.
 
 A due terminal that skips whole-index re-arm can additionally emit
 `counts.rearm_veto_ignored`, a sparse object with the closed keys
@@ -1472,13 +1470,13 @@ if the final combined cancellation funding refuses them.
 
 ### Claude Contract Debt Counters (schema 2 additive)
 
-The existing `native_collection_page` / `native_comparison_decision` carrier
+The existing `native_collection_page` carrier
 also includes sparse, counts-only `identity_contract_transition`
 (`from_empty`, `to_empty`, `collector_e2_grouping`, `mid_traversal_placeholder`)
 and `identity_contract_latch` (`set`, `cleared`). The existing synchronous
 preparation, collection and finish scopes own these deltas: merge disjoint
 scopes, never sum a repeated scope twice. Relay-token and activity-hint errors
-retain the last contract and reach the existing early decision/unwind carrier,
+retain the last contract and reach the existing early collection/unwind carrier,
 including when no page is collected. There is no new event stream or wire
 check-in payload.
 
