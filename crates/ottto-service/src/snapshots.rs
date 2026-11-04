@@ -39364,6 +39364,28 @@ impl ScanIndex {
             == CandidateDecision::Skip
     }
 
+    /// Whether an unindexed member's family holds an authority record (a held
+    /// body the committed index does not keep) whose gate would skip it as an
+    /// indexed member: its revision unchanged, its witness binding unmoved,
+    /// its retry not due and no correction owing it.
+    fn claude_unindexed_member_waits_for_authority(&self, candidate: &CandidateFile) -> bool {
+        let Some((root_session_id, member)) = claude_index_path_family_member(&candidate.path)
+        else {
+            return false;
+        };
+        self.claude_usage_authority_quarantine
+            .get(&root_session_id)
+            .is_some_and(|record| {
+                !record
+                    .proof_correction
+                    .as_ref()
+                    .is_some_and(|correction| correction.owed_member_ids.contains(&member))
+                    && self
+                        .claude_usage_authority_candidate_requires_family_reparse(candidate)
+                        .is_none()
+            })
+    }
+
     /// The candidate decision plus, for `Parse`, the first gate that selected
     /// the file. The reason is a count-only diagnostic; only the adoption
     /// page budget reads it. `body_witness_adoption: false` evaluates the
@@ -39410,7 +39432,9 @@ impl ScanIndex {
             );
         }
         let Some(entry) = self.files.get(&key) else {
-            if self.withheld_account_unchanged(&key, candidate) {
+            if self.claude_unindexed_member_waits_for_authority(candidate)
+                || self.withheld_account_unchanged(&key, candidate)
+            {
                 return (CandidateDecision::Skip, None);
             }
             return (

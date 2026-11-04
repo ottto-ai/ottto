@@ -176,6 +176,37 @@ const PARSE_FOR_AUTHORITY: (CandidateDecision, Option<CandidateParseReason>) = (
     Some(CandidateParseReason::AuthorityQuarantine),
 );
 
+/// [regress] An unindexed member of a family with an authority record (a
+/// held body the committed index does not keep) waits like an indexed member
+/// instead of a new-file read every pass; a changed or owed member, or one
+/// whose family has no record, is still read as a new file.
+#[test]
+fn an_unchanged_unindexed_member_waits_for_its_family_authority() {
+    const NEW_FILE: (CandidateDecision, Option<CandidateParseReason>) = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::NewFile),
+    );
+    let mut index = apc_terminal_fixture();
+    let candidates = [0, 1].map(|slot| apc_candidate(&index, slot));
+    for key in apc_keys() {
+        index.files.remove(&key);
+    }
+    for candidate in &candidates {
+        assert_eq!(
+            apc_decision(&index, candidate),
+            (CandidateDecision::Skip, None),
+            "an unchanged held member waits for its record"
+        );
+    }
+    let mut changed = candidates[0].clone();
+    changed.source_file_fingerprint = apc_hex('9');
+    assert_eq!(apc_decision(&index, &changed), NEW_FILE);
+    apc_prove(&mut index, &apc_witness('f'));
+    assert_eq!(apc_decision(&index, &candidates[1]), NEW_FILE, "owed");
+    index.claude_usage_authority_quarantine.remove(APC_ROOT);
+    assert_eq!(apc_decision(&index, &candidates[0]), NEW_FILE, "no record");
+}
+
 /// A persisted grant over a bounded terminal record is a valid v2 record:
 /// every owed member bypasses the terminal gate, and the grant survives a
 /// save and reload.
