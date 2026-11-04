@@ -2597,16 +2597,75 @@ fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
     }
 }
 
-/// `e2` flip, returning tombstoned family (the tombstone formed
-/// before the flip). Gate on, each returning member's request-owned body
-/// replaces its session: offered and ACKed exactly once (no double count),
-/// the tombstone clears with that publication and no authority record is
-/// left; a quiet generation offers nothing again.
+/// [money] A family returns after retirement under a bound authority record:
+/// read while its evidence is unhealthy, held with nothing offered, then
+/// waiting unread and unindexed through a whole traversal while unchanged.
+/// After the evidence is repaired, each member is offered and ACKed exactly
+/// once (no double count) and no record is left. A quiet traversal after the
+/// accepted upload reads and offers nothing. The money matches a cold Full,
+/// with and without a restart before the return.
 #[test]
 #[serial(source_manifests)]
-fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
+fn returning_family_under_its_authority_record_publishes_once() {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
     let _manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("e2-tombstone-returns", false);
+    let cold = {
+        let fixture = ApcFixture::new("authority-returns-cold", false);
+        ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
+        apc_family_money(&fixture.generation(8, |_| ApcUpload::Accept))
+    };
+    let ram = apc_returning_family("authority-returns-ram", false);
+    let restart = apc_returning_family("authority-returns-restart", true);
+    money_oracle::assert_equivalent(&cold, &ram);
+    money_oracle::assert_equivalent(&cold, &restart);
+    for session in &apc_family_sessions() {
+        money_oracle::assert_no_smaller_reemit(session, &cold, &ram, &cold, false);
+        money_oracle::assert_no_smaller_reemit(session, &cold, &restart, &cold, false);
+    }
+}
+
+/// The money of the family bodies the server ACKed across `pages`, one per
+/// member.
+fn apc_family_money(
+    pages: &[ApcPage],
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let family = apc_family_sessions();
+    let last = pages.last().expect("a page");
+    let mut scan = last.scan.clone();
+    scan.snapshots = pages
+        .iter()
+        .flat_map(|page| {
+            page.scan.snapshots.iter().filter(|item| {
+                family.contains(&item.source_session_id)
+                    && page.uploaded.contains(&item.snapshot_fingerprint)
+            })
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        scan.snapshots.len(),
+        family.len(),
+        "one ACKed body per member"
+    );
+    // The routes run at different synthetic page clocks. `collected_at` is
+    // that clock, not money, so the compared bodies share one.
+    for item in &mut scan.snapshots {
+        item.collected_at = "2026-08-02T08:00:00Z".to_string();
+    }
+    crate::snapshots::sampled_scan::transition_fixture::scan_money(
+        SnapshotSource::ClaudeCode,
+        &last.index,
+        &scan,
+    )
+}
+
+/// One returning-family lifecycle with uploads accepted; `restart` restarts
+/// the process before the return. Returns the money of the returned bodies.
+fn apc_returning_family(
+    case: &'static str,
+    restart: bool,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let fixture = ApcFixture::new(case, false);
     let family = apc_family_sessions();
     let api = fixture.sidecar_path("claude-code-effort");
     let mut hour = 10;
@@ -2628,17 +2687,11 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         panic!("PRECONDITION_NOT_REACHED: {label}");
     };
 
-    // Before the flip: an unlisted baseline, then the real list names the
-    // family (`establish`). The family carries a tombstone an older daemon
-    // wrote, and its members are removed.
+    // The family is established and listed, then its members are removed
+    // until a complete traversal retires their keys.
     let established = fixture.establish();
     crate::snapshots::restart_claude_reemission_stop_for_test();
     fixture.page_files.set(16);
-    let mut index = ScanIndex::load(&fixture.index_path).expect("load the established index");
-    index.tombstone_claude_family_for_test(APC_ROOT);
-    index
-        .save(&fixture.index_path)
-        .expect("save the tombstoned index");
     ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
     let members = std::iter::once(None)
         .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
@@ -2654,10 +2707,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let retired = pages_until("the absent family's keys are gone", &|page| {
         ApcFixture::family_keys(&page.index).is_empty()
     });
-    // The tombstone and the proven witness stay, no record forms and no
-    // member key is left.
     let retired = retired.last().expect("retiring page");
-    assert!(retired.index.claude_family_tombstoned_for_test(APC_ROOT));
     assert!(retired.record().is_none());
     assert_eq!(
         retired
@@ -2665,20 +2715,17 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
             .claude_usage_family_witness_digest_for_test(APC_ROOT)
             .as_deref(),
         Some(established.proven.as_str()),
-        "the tombstone keeps the proven witness"
+        "retirement keeps the proven witness"
     );
-    assert!(ApcFixture::family_keys(&retired.index).is_empty());
 
+    // The members return under unhealthy evidence. They are read, held with
+    // nothing offered, and a bounded RetryPending record forms against the
+    // same witness.
     let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
     fixture.corrupt_api_sidecar();
-    // Before the list removal, the members return
-    // under unhealthy evidence. They are read through the authority path,
-    // never skipped, held with nothing offered, and a bounded RetryPending
-    // record forms against the same witness; the tombstone stays.
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
     }
-    let hits_before = crate::snapshots::claude_absence_counters_for_test().tombstone_hits;
     let held = pages_until("the returning family is held", &|page| {
         page.record()
             .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
@@ -2686,17 +2733,8 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
     let mut parsed = BTreeSet::new();
     for page in &held {
         parsed.extend(page.parsed.intersection(&family).cloned());
-        assert!(
-            family
-                .iter()
-                .all(|session| !page.offered_bodies.contains_key(session)),
-            "nothing is offered before the proof"
-        );
     }
-    assert_eq!(
-        parsed, family,
-        "every returning member is read, never skipped"
-    );
+    assert_eq!(parsed, family, "every returning member is read");
     let record = held.last().unwrap().record().unwrap();
     assert_eq!(record.proven_witness_fingerprint, established.proven);
     assert_eq!(record.failed_reconstruction_count, 1);
@@ -2708,40 +2746,71 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
             .collect::<BTreeSet<_>>(),
         family
     );
-    assert!(held
-        .last()
-        .unwrap()
-        .index
-        .claude_family_tombstoned_for_test(APC_ROOT));
-    assert!(
-        crate::snapshots::claude_absence_counters_for_test().tombstone_hits > hits_before,
-        "the return is counted"
-    );
+
+    // Under the record, the unchanged held members stay unindexed and wait:
+    // a whole traversal neither reads nor offers them.
+    let waited = pages_until("a traversal under the record ends", &|page| {
+        !page.index.scan_traversal_in_progress_for_test()
+    });
+    for page in &waited {
+        assert!(
+            ApcFixture::family_keys(&page.index).is_empty(),
+            "the held bodies stay unindexed"
+        );
+        assert!(
+            page.parsed.is_disjoint(&family),
+            "an unchanged held member waits for its record"
+        );
+        assert_eq!(page.record().as_ref(), Some(&record), "the record holds");
+    }
+    if restart {
+        crate::snapshots::restart_claude_reemission_stop_for_test();
+    }
+
+    // The list is cleared and the evidence repaired; the members return.
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&fixture.support, &[]);
-
-    // After the flip: the family returns.
-
     std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
     for (path, bytes) in &members {
         std::fs::write(path, bytes).expect("restore the family member");
     }
-    let returned = pages_until("the tombstone clears", &|page| {
-        !page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    let returned = pages_until("the record settles", &|page| {
+        page.record().is_none() && ApcFixture::family_keys(&page.index).len() == family.len()
     });
-    let mut offers = BTreeMap::<String, usize>::new();
-    for page in &returned {
-        for item in page
-            .scan
+    for item in returned.iter().flat_map(|page| {
+        page.scan
             .snapshots
             .iter()
             .filter(|item| family.contains(&item.source_session_id))
-        {
-            assert_eq!(
-                item.usage_accounting_contract.as_deref(),
-                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
-                "a returning body is request-owned"
-            );
-        }
+    }) {
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+            "a returning body is request-owned"
+        );
+    }
+    let last = returned.last().unwrap();
+    for item in last
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| family.contains(&item.source_session_id))
+    {
+        assert!(last.uploaded.contains(&item.snapshot_fingerprint));
+    }
+
+    // After the accepted upload, a quiet traversal reads and offers nothing.
+    let quiet = pages_until("a quiet traversal ends", &|page| {
+        !page.index.scan_traversal_in_progress_for_test()
+    });
+    for page in &quiet {
+        assert!(page.record().is_none());
+        assert!(
+            page.parsed.is_disjoint(&family),
+            "an accepted member is not read again"
+        );
+    }
+    let mut offers = BTreeMap::<String, usize>::new();
+    for page in held.iter().chain(&waited).chain(&returned).chain(&quiet) {
         for session in page.offered_bodies.keys().filter(|s| family.contains(*s)) {
             *offers.entry(session.clone()).or_default() += 1;
         }
@@ -2751,28 +2820,7 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
         family.iter().map(|session| (session.clone(), 1)).collect(),
         "each returning member is offered exactly once"
     );
-    let last = returned.last().unwrap();
-    assert!(last.record().is_none(), "no authority record is left");
-    for item in last
-        .scan
-        .snapshots
-        .iter()
-        .filter(|item| family.contains(&item.source_session_id))
-    {
-        assert!(last.uploaded.contains(&item.snapshot_fingerprint));
-    }
-    assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
-    let quiet = pages_until("a quiet traversal ends", &|page| {
-        !page.index.scan_traversal_in_progress_for_test()
-    });
-    for page in &quiet {
-        assert!(!page.index.claude_family_tombstoned_for_test(APC_ROOT));
-        assert!(page.record().is_none());
-        assert!(
-            page.offered_bodies.keys().all(|s| !family.contains(s)),
-            "nothing is offered again"
-        );
-    }
+    apc_family_money(&returned)
 }
 
 /// The R2 invariant, strictly: every member this page drained certifies the

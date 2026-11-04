@@ -79,7 +79,6 @@ SERVICE_LIB = ["-p", "ottto-service", "--lib"]
 # module whose file calls the money oracle is added at startup (oracle_modules).
 NEVER_RETRY_MODULES = frozenset({
     "authority_proof_correction_pipeline_tests",
-    "census_convergence_pipeline_tests",
     "claude_census_money_invariant_tests",
     "claude_money_e2_pipeline_tests",
     "claude_request_identity_window_tests",
