@@ -1,4 +1,4 @@
-use crate::snapshots::{paths_from_events, transcript_path_admitted, SnapshotSource};
+use crate::snapshots::{paths_from_events, SnapshotSource};
 use anyhow::Result;
 use notify::event::{EventKind, ModifyKind};
 use notify::RecursiveMode;
@@ -6,7 +6,7 @@ use notify_debouncer_full::{
     new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -31,20 +31,12 @@ pub(crate) enum ListingTrigger {
     /// A non-transcript path under a root was renamed (a moved directory
     /// reports no events for the transcripts inside it).
     DirectoryRename,
-    /// A fresh traversal replaced an active one with another context.
-    FreshTraversal,
 }
 
-const LISTING_TRIGGERS: usize = ListingTrigger::FreshTraversal as usize + 1;
+const LISTING_TRIGGERS: usize = ListingTrigger::DirectoryRename as usize + 1;
 
-const LISTING_TRIGGER_LABELS: [&str; LISTING_TRIGGERS] = [
-    "start",
-    "watcher",
-    "overflow",
-    "rescan",
-    "directory_rename",
-    "fresh_traversal",
-];
+const LISTING_TRIGGER_LABELS: [&str; LISTING_TRIGGERS] =
+    ["start", "watcher", "overflow", "rescan", "directory_rename"];
 
 /// One source's listing request: how often each trigger fired since the
 /// last listing began. Any count requests one listing of every root.
@@ -139,29 +131,46 @@ fn record_raw_watcher_overflow() {
     request_listing_all(ListingTrigger::Overflow);
 }
 
-/// The listing requests one batch carries, checked before the transcript
-/// filter drops their events: a Rescan for every source, and a renamed
-/// non-transcript path for the source whose root holds it. notify gives
-/// renames no folder kind, so a moved directory shows up only as that path,
-/// with no event for the transcripts inside it.
-fn record_listing_requests(roots: &[(SnapshotSource, PathBuf)], events: &[DebouncedEvent]) {
+/// Records one batch: each root's transcript paths as hints, and the
+/// listings it requests. A Rescan requests every source, before the
+/// transcript filter drops it. notify gives renames no folder kind, so a
+/// moved directory shows up only as a renamed path the filter drops, with no
+/// event for the transcripts inside it; that requests its own source.
+fn record_watcher_events(
+    roots: &[(SnapshotSource, PathBuf)],
+    events: &[DebouncedEvent],
+    event_tx: &mpsc::SyncSender<SnapshotFileEvent>,
+) {
     if events.iter().any(|event| event.need_rescan()) {
         request_listing_all(ListingTrigger::Rescan);
     }
-    let renamed = |source: SnapshotSource, root: &Path| {
-        events.iter().any(|event| {
+    for (source, root) in roots {
+        let paths = paths_from_events(
+            *source,
+            events
+                .iter()
+                .flat_map(|event| event.paths.iter())
+                .filter(|path| path.starts_with(root))
+                .cloned(),
+        );
+        if events.iter().any(|event| {
             matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
                 && event
                     .paths
                     .iter()
-                    .any(|path| path.starts_with(root) && !transcript_path_admitted(source, path))
-        })
-    };
-    let mut state = lock_pending_snapshot_paths();
-    for (source, root) in roots {
-        if renamed(*source, root) {
-            state.list_all[source.slot()].record(ListingTrigger::DirectoryRename);
+                    .any(|path| path.starts_with(root) && !paths.contains(path))
+        }) {
+            lock_pending_snapshot_paths().list_all[source.slot()]
+                .record(ListingTrigger::DirectoryRename);
         }
+        if paths.is_empty() {
+            continue;
+        }
+        record_pending_snapshot_paths(*source, &paths);
+        let _ = event_tx.try_send(SnapshotFileEvent {
+            source: *source,
+            paths: paths.into_iter().collect(),
+        });
     }
 }
 
@@ -276,25 +285,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
             let Some(events) = complete_debounce_events(result) else {
                 continue;
             };
-            record_listing_requests(&roots, &events);
-            for (source, root) in &roots {
-                let paths = paths_from_events(
-                    *source,
-                    events
-                        .iter()
-                        .flat_map(|event| event.paths.iter())
-                        .filter(|path| path.starts_with(root))
-                        .cloned(),
-                );
-                if paths.is_empty() {
-                    continue;
-                }
-                record_pending_snapshot_paths(*source, &paths);
-                let _ = event_tx.try_send(SnapshotFileEvent {
-                    source: *source,
-                    paths: paths.into_iter().collect(),
-                });
-            }
+            record_watcher_events(&roots, &events, &event_tx);
         }
     });
 
@@ -514,19 +505,30 @@ mod tests {
                 std::time::Instant::now(),
             )
         };
-        record_listing_requests(
+        let (event_tx, event_rx) = mpsc::sync_channel(SNAPSHOT_WATCH_SIGNAL_CAPACITY);
+        let transcript = root("pi").join("session.jsonl");
+        record_watcher_events(
             &roots,
             &[
                 renamed(root("claude").join("moved-project")),
-                renamed(root("pi").join("session.jsonl")),
+                renamed(transcript.clone()),
             ],
+            &event_tx,
         );
-        record_listing_requests(
+        record_watcher_events(
             &roots,
             &[DebouncedEvent::new(
                 Event::new(EventKind::Other).set_flag(Flag::Rescan),
                 std::time::Instant::now(),
             )],
+            &event_tx,
+        );
+        assert_eq!(
+            event_rx.try_iter().collect::<Vec<_>>(),
+            vec![SnapshotFileEvent {
+                source: SnapshotSource::Pi,
+                paths: vec![transcript],
+            }]
         );
         let rescan = requested(&[ListingTrigger::Rescan]);
         let moved = requested(&[ListingTrigger::DirectoryRename, ListingTrigger::Rescan]);

@@ -4,6 +4,7 @@
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::local_resource_diagnostics::capture;
+use crate::snapshot_watcher::ListingTrigger;
 
 const SESSION: &str = "5e551011-0000-4000-8000-00000000d171";
 
@@ -978,11 +979,11 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
     }
 }
 
-/// [behaviour] A listing request lists every root of a kept generation at
-/// once, for every source: the downtime writes are read and no generation
-/// starts. A request while that walk runs neither restarts nor drops it: it
-/// stays unserved for the pass after the walk. A context change records a
-/// fresh-traversal request; a generation start from nothing does not.
+/// [behaviour] A walk that starts in the requesting page serves the request
+/// without a second listing. A listing request lists every root of a kept
+/// generation at once, for every source: the downtime writes are read and no
+/// generation starts. A request while that walk runs neither restarts nor
+/// drops it: it stays unserved for the pass after the walk.
 #[test]
 fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
     for source in [
@@ -994,8 +995,15 @@ fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
         let roots = std::slice::from_ref(&f.root);
         let mut first = ListingRequest::default();
         first.record(ListingTrigger::Start);
-        let (_, _, _, unserved) = f.page_requesting(source, roots, ScanIndex::default(), first);
-        assert_eq!(unserved, first, "{source:?}: the first walk runs");
+        let (index, _, _, unserved) = f.page_requesting(source, roots, ScanIndex::default(), first);
+        assert!(!unserved.requested(), "{source:?}: the new walk serves it");
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .map_or(true, |walk| walk.counts.listing_generations == 0),
+            "{source:?}: no second listing"
+        );
 
         let index = kept_generation(&f, source, false);
         append_records(
@@ -1043,15 +1051,6 @@ fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
             assert_eq!(read, expected, "{source:?}");
             assert_eq!(starts, 0, "{source:?}: no new generation");
         });
-
-        let f = Fixture::new();
-        let index = kept_generation(&f, source, false);
-        let nested = [f.root.join("nested")];
-        let (_, _, _, unserved) =
-            f.page_requesting(source, &nested, index, ListingRequest::default());
-        let mut fresh = ListingRequest::default();
-        fresh.record(ListingTrigger::FreshTraversal);
-        assert_eq!(unserved, fresh, "{source:?}: kept behind the fresh walk");
     }
 }
 
@@ -1092,7 +1091,13 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
             if !hinted {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-                start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
+                start_due_listing_pass(
+                    source,
+                    walked.traversal.as_mut().unwrap(),
+                    &now,
+                    false,
+                    &mut ListingRequest::default(),
+                );
                 advance_bounded_directory_traversal(source, &mut walked, 7, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
@@ -1190,7 +1195,13 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     let traversal = index.traversal.as_mut().unwrap();
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
-    start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
+    start_due_listing_pass(
+        source,
+        traversal,
+        &now.format(&Rfc3339).unwrap(),
+        false,
+        &mut ListingRequest::default(),
+    );
     advance_bounded_directory_traversal(source, index, 7, None);
     assert!(index
         .traversal

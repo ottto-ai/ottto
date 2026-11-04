@@ -11,7 +11,7 @@ use crate::local_resource_diagnostics::rearm_cause;
 use crate::local_resource_diagnostics::{
     line_delivery_unselected, page_selection, CapCounts, PageSelection, UnselectedReason,
 };
-use crate::snapshot_watcher::{ListingRequest, ListingTrigger};
+use crate::snapshot_watcher::ListingRequest;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -26656,22 +26656,8 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
-        let prior_context = index
-            .traversal
-            .as_ref()
-            .map(|traversal| traversal.context_fingerprint.clone());
         let progress =
             ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
-        if progress == TraversalProgress::Started
-            && prior_context.is_some_and(|prior| {
-                index
-                    .traversal
-                    .as_ref()
-                    .is_some_and(|traversal| traversal.context_fingerprint != prior)
-            })
-        {
-            list_all.record(ListingTrigger::FreshTraversal);
-        }
         if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
             evidence_owed::start_contract_window(index, collected_at);
@@ -26692,8 +26678,13 @@ impl OwnedSourceScan {
                 Some(&resource_probe.discovery_growth),
             );
             let traversal = index.traversal.as_mut().expect("traversal initialized");
-            start_requested_listing_pass(source, traversal, collected_at, list_all);
-            start_due_listing_pass(traversal, collected_at);
+            start_due_listing_pass(
+                source,
+                traversal,
+                collected_at,
+                progress == TraversalProgress::Started,
+                list_all,
+            );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
@@ -43658,56 +43649,51 @@ fn codex_fresh_data_pending(
 
 // One boundary for fresh, persisted and held work. Admission is scheduling only:
 // archive decoding still requires live power, work/byte budget and a funded reader.
-pub(crate) fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
+fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("jsonl")
         || (source == SnapshotSource::Codex && codex_archive_path(path))
 }
 
 /// Once a kept generation's latest walk has finished, re-list its roots
-/// every `LISTING_INTERVAL_SECONDS`, metadata only. The pass queues only
+/// every `LISTING_INTERVAL_SECONDS`, metadata only, or at once when the
+/// watcher cannot vouch for what changed (`list_all`). The pass queues only
 /// changed or owed files (`ScanIndex::listing_unchanged`) and never starts a
 /// generation, so it re-arms nothing; it can only delay this generation's
-/// discovery, never complete it.
-fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
-    let Some(now) = rfc3339_unix_seconds(collected_at) else {
-        return;
-    };
-    if !traversal.pending_directories.is_empty() {
-        return;
-    }
-    let Some(started) = traversal.listing_started_unix_seconds else {
-        traversal.listing_started_unix_seconds = Some(now);
-        return;
-    };
-    if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
-        return;
-    }
-    push_listing_roots(traversal, Some(now));
-}
-
-/// Lists every root now, metadata only like the timed pass, when the watcher
-/// cannot vouch for what changed. A walk already running is never restarted:
-/// the request stays in `list_all` and the first pass after that walk lists
-/// once for all of it.
-fn start_requested_listing_pass(
+/// discovery, never complete it. A walk this page started has passed no
+/// directory yet, so it serves the request itself; any other running walk is
+/// never restarted, and the request stays in `list_all` for after it.
+fn start_due_listing_pass(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     collected_at: &str,
+    walk_started: bool,
     list_all: &mut ListingRequest,
 ) {
-    if !list_all.requested() || !traversal.pending_directories.is_empty() {
+    let Some(now) = rfc3339_unix_seconds(collected_at) else {
+        return;
+    };
+    let requested =
+        list_all.requested() && (walk_started || traversal.pending_directories.is_empty());
+    if requested {
+        let request = std::mem::take(list_all);
+        eprintln!(
+            "local snapshot listing for {}: {request}",
+            source.api_slug()
+        );
+    }
+    if !traversal.pending_directories.is_empty() {
         return;
     }
-    let request = std::mem::take(list_all);
-    eprintln!(
-        "local snapshot listing for {}: {request}",
-        source.api_slug()
-    );
-    push_listing_roots(traversal, rfc3339_unix_seconds(collected_at));
-}
-
-fn push_listing_roots(traversal: &mut ScanTraversalCheckpoint, started: Option<u64>) {
-    traversal.listing_started_unix_seconds = started;
+    if !requested {
+        let Some(started) = traversal.listing_started_unix_seconds else {
+            traversal.listing_started_unix_seconds = Some(now);
+            return;
+        };
+        if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
+            return;
+        }
+    }
+    traversal.listing_started_unix_seconds = Some(now);
     traversal.counts.listing_generations += 1;
     let roots = traversal.scan_roots.clone();
     traversal
