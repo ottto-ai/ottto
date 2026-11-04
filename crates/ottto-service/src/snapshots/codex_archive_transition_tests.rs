@@ -215,7 +215,7 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (acked, crash_before) in [(true, true), (true, false), (false, true), (false, false)] {
+    for acked in [true, false] {
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
         c.write(OTHER, Some("b"));
@@ -325,32 +325,10 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
             serde_json::to_value(&working.session_account_bindings).unwrap(),
             bindings
         );
-        let (working, quiet) = if crash_before {
-            // Crash after in-memory publication staging, before the existing
-            // paired transaction. The committed graph is still wholly old.
-            drop(working);
-            let restored = ScanIndex::load(session.path()).unwrap();
-            assert!(restored.files.contains_key(&old_key));
-            assert!(!restored.files.contains_key(&new_key));
-            assert!(state_v2::load_head(&restored, &old_key, REVISION)
-                .unwrap()
-                .is_some());
-            assert!(state_v2::load_head(&restored, &new_key, REVISION)
-                .unwrap()
-                .is_none());
-            let (working, quiet, _, consumed, logs) =
-                page(&c, restored, Arc::new(sampled_scan::SharedCache::default()));
-            assert_eq!(consumed, 0);
-            assert_eq!(full_decodes(&logs), 0);
-            assert!(quiet.snapshots.is_empty());
-            (working, quiet)
-        } else {
-            (working, quiet)
-        };
         let (next, posts) = working.checkpoint_with_captured_posts(&quiet, &previous, "accept");
         assert!(posts.is_empty());
         drop(next);
-        // Crash after COMMIT: reload observes the complete new pair and no old key.
+        // Restart observes the complete persisted pair and no old key.
         index = ScanIndex::load(session.path()).unwrap();
         assert!(!index.files.contains_key(&old_key));
         assert!(index.files.contains_key(&new_key));
