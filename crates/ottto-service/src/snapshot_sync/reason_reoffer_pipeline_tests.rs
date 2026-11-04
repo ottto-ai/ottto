@@ -1267,7 +1267,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             String::as_str,
             |_| body.clone(),
             |_| Some("synthetic-session"),
-            |_| false,
+            |_| 0,
             |_| None,
             &mut budget,
             |items| {

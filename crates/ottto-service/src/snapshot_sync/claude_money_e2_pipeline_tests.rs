@@ -852,7 +852,9 @@ fn upload_under(
         |s| s.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |s| Some(s.source_session_id.as_str()),
-        |_| false,
+        // The production main-upload class: patched and unpatched bodies
+        // never share a request.
+        |s| snapshot_upload_batch_class(s, false),
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {

@@ -923,6 +923,11 @@ fn default_occurrence_count() -> u64 {
     1
 }
 
+/// A body that carries a cache patch declares head CAS for its whole request.
+pub(crate) fn declares_head_cas(item: &crate::snapshots::SnapshotItem) -> bool {
+    item.cache_observations.is_some()
+}
+
 /// The existing public ACK version for additive body evidence. Keep synthetic
 /// transport responses on the same contract as the production ACK validator;
 /// internal envelope versions are not public ACK versions.
@@ -1015,11 +1020,7 @@ impl SnapshotBatchResponse {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<()> {
-        let enforce_head_cas = enforce_head_cas
-            || request
-                .snapshots
-                .iter()
-                .any(|item| item.cache_observations.is_some());
+        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -2349,11 +2350,7 @@ impl SnapshotApiClient {
         )>,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
-        let enforce_head_cas = enforce_head_cas
-            || request
-                .snapshots
-                .iter()
-                .any(|item| item.cache_observations.is_some());
+        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
         let body = if retry.is_some() && enforce_head_cas {
             crate::snapshot_retry::encode_json(
                 &request.wire_with_head_cas(),
