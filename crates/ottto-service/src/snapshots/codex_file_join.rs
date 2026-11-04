@@ -600,38 +600,28 @@ impl HeaderInventory {
                     })
                     .transpose()?
                     .flatten();
-            let mut reused = stored_head
-                .filter(|head| !head.metadata_only)
-                .and_then(|head| {
-                    let facts = head.common.inventory.clone();
-                    let current = open_candidate_beneath_root(&candidate)
-                        .ok()?
-                        .metadata()
-                        .ok()?;
-                    let stamp = FileStamp::capture(current.clone()).ok()?;
-                    if !codex_rollout_carry::physical_matches(&head, &current) {
-                        return None;
-                    }
-                    let owner = facts
-                        .as_ref()
-                        .map(|facts| facts.owner.clone())
-                        .or_else(|| {
-                            tail_source::codex::header_facts(head.revision, &head.body)
-                                .ok()
-                                .and_then(|(_, owner)| owner)
-                        })?;
-                    Some((
-                        CachedHeader {
-                            stamp,
-                            owner,
-                            created_unix_ms: facts.as_ref().and_then(|facts| facts.created_unix_ms),
-                            read_bytes: facts.as_ref().map_or(0, |facts| {
-                                usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
-                            }),
-                        },
-                        metadata_witness(&current),
-                    ))
-                });
+            // Only carries persist current owning-header facts. Ordinary
+            // heads keep the existing HeaderCache/header opener path.
+            let mut reused = stored_head.and_then(|head| {
+                let facts = head.common.inventory?;
+                let current = open_candidate_beneath_root(&candidate)
+                    .ok()?
+                    .metadata()
+                    .ok()?;
+                let stamp = FileStamp::capture(current.clone()).ok()?;
+                if !facts.stamp.matches_acquisition(&stamp) {
+                    return None;
+                }
+                Some((
+                    CachedHeader {
+                        stamp,
+                        owner: facts.owner,
+                        created_unix_ms: facts.created_unix_ms,
+                        read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
+                    },
+                    metadata_witness(&current),
+                ))
+            });
             if let Some((facts, _)) = &reused {
                 self.reuse_hits += 1;
                 self.reuse_misses -= 1;

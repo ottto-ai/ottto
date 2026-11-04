@@ -68,9 +68,8 @@ impl ScanIndex {
         let head = state_v2::load_head(self, &key, revision)?.context("codex_carry_certificate")?;
         let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
             .filter(|value| !value.is_empty());
-        if tail_source::codex::header_facts(head.revision, &head.body)
+        if tail_source::codex::sidecar_binding(head.revision, &head.body)
             .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
-            .0
             != binding
         {
             return Ok(None);
