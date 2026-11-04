@@ -1044,6 +1044,58 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
     }
 }
 
+/// [regress] Fail toward reading: an archive replaced after its read by a
+/// grown object (another stamp and size) is identified and read again, and
+/// its new money posts once, equal to a cold run.
+#[test]
+fn replaced_archive_after_its_read_is_identified_and_read() {
+    const CONTEXT: &str = "archive-replaced-context";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::snapshots::money_freshness::restart_for_test();
+    let c = Corpus::new();
+    let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
+    let first_body = rollout(MAIN, Some("a"));
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(&first_body[..], 1).unwrap(),
+    )
+    .unwrap();
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let (index, _, first) = observed_pass(&c, &compressed, prior, CONTEXT);
+    let grown = [first_body, turn(3).into_bytes()].concat();
+    let replacement = c.scratch.join("replacement.jsonl.zst");
+    fs::write(
+        &replacement,
+        zstd::stream::encode_all(&grown[..], 1).unwrap(),
+    )
+    .unwrap();
+    fs::rename(&replacement, &compressed).unwrap();
+    let (_, replaced_route, replaced) = observed_pass(&c, &compressed, index, CONTEXT);
+    let (cold_index, cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    let facts = format!("first: {first}\nreplaced: {replaced}");
+    assert!(first.zst_decoded_bytes > 0 && first.posts == 1, "{facts}");
+    assert!(!replaced.stamp_matches, "{facts}");
+    assert!(replaced.identity_samples > 0, "re-identified\n{facts}");
+    assert!(
+        replaced.zst_decoded_bytes >= grown.len() as u64 && replaced.consumed > 0,
+        "read again\n{facts}"
+    );
+    assert_eq!(replaced.snapshots, 1, "{facts}");
+    assert_eq!(replaced.posts, 1, "{facts}");
+    money_oracle::assert_equivalent(&emitted(&cold_index, &cold), &replaced_route);
+    drop(session);
+}
+
 /// [regress] The ordinary first-seen predicate excludes never-seen old input
 /// equally for both encodings, while unrelated placed money still emits.
 #[test]
