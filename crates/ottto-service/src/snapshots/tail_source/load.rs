@@ -393,7 +393,7 @@ fn stored<S: TailSource>(
     });
     if pages.is_err() {
         return Err(match failed {
-            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible)) => {
+            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible(_))) => {
                 Miss::FutureFact
             }
             Some((_, cause)) => Miss::Reconstruct(cause),

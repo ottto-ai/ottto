@@ -248,8 +248,10 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// Bytes that do not decode, or decoded facts that contradict each other.
     Corrupt,
     /// A capture mode, page geometry or revision this build does not read
-    /// this way.
-    Incompatible,
+    /// this way, or live evidence the stored state cannot continue under.
+    /// Carries its counter label: `incompatible` for the shared checks
+    /// (`INCOMPATIBLE`), or the name of the source's own failed check.
+    Incompatible(&'static str),
     /// A required collection, or some of its elements, is missing.
     Incomplete,
     /// The head was written for another route, scan root or path.
@@ -260,10 +262,13 @@ pub(in crate::snapshots) enum ReconstructCause {
     KeyEpoch,
 }
 impl ReconstructCause {
+    /// The shared checks' incompatibility, counted as `incompatible`.
+    pub(in crate::snapshots) const INCOMPATIBLE: Self = Self::Incompatible("incompatible");
+
     pub(in crate::snapshots) fn label(self) -> &'static str {
         match self {
             Self::Corrupt => "corrupt",
-            Self::Incompatible => "incompatible",
+            Self::Incompatible(label) => label,
             Self::Incomplete => "incomplete",
             Self::Identity => "identity",
             Self::KeyEpoch => "key_epoch",
@@ -350,7 +355,7 @@ impl HeadIdentity {
             return Err(ReconstructCause::Identity);
         }
         if stored.capture != self.capture {
-            return Err(ReconstructCause::Incompatible);
+            return Err(ReconstructCause::INCOMPATIBLE);
         }
         match (stored.key_epoch, self.key_epoch) {
             (Some(stored), Some(current)) if stored != current => Err(ReconstructCause::KeyEpoch),
@@ -481,7 +486,7 @@ pub(in crate::snapshots) trait TailSource {
                 continue;
             };
             if meta.shape != spec.shape || meta.elements_per_page != spec.g {
-                return Err(ReconstructCause::Incompatible);
+                return Err(ReconstructCause::INCOMPATIBLE);
             }
             if meta.elements != Self::elements(acc, spec.collection) {
                 return Err(ReconstructCause::Incomplete);
@@ -530,7 +535,7 @@ fn decode_envelope<S: TailSource, L, T>(
     trailer: impl FnOnce(&mut Dec<'_>) -> Result<T, Corrupt>,
 ) -> Result<(SnapshotAccumulator, L, T, DecodedHead), ReconstructCause> {
     if revision != S::REDUCTION_REVISION {
-        return Err(ReconstructCause::Incompatible);
+        return Err(ReconstructCause::INCOMPATIBLE);
     }
     let mut d = Dec::new(head);
     HeadIdentity::take(&mut d)?;
@@ -876,13 +881,13 @@ impl Fact {
         let fact = usize::try_from(page)
             .ok()
             .and_then(|at| FACTS.get(at).copied())
-            .ok_or(ReconstructCause::Incompatible)?;
+            .ok_or(ReconstructCause::INCOMPATIBLE)?;
         let mut d = Dec::new(bytes);
         if d.varint()? != page {
             return Err(ReconstructCause::Corrupt);
         }
         if d.varint()? != FACT_VERSION {
-            return Err(ReconstructCause::Incompatible);
+            return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
             Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
