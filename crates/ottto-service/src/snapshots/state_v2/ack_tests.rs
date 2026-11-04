@@ -8,67 +8,70 @@ fn progress(generation: u64, body: &str) -> Vec<u8> {
 fn write(path: &Path, bytes: &[u8]) {
     ottto_core::write_owner_only_file_atomic(path, bytes).unwrap();
 }
-/// [money] receipt first replaces only exact predecessor and replays idempotently.
-#[test]
-fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
+/// Crash after the durable receipt, before progress replacement: restart
+/// replays the exact successor once and a second recovery is quiet. Returns
+/// the encoded receipt size.
+fn receipt_first_case(source: Source, old: &[u8], new: &[u8]) -> u64 {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-receipt-first");
     let index = scratch.join("index");
     let path = scratch.join("progress");
-    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 10);
-    let old = progress(4, "old");
-    let new = progress(5, "new");
-    write(&path, &old);
-    binding.adopt(Some(&old)).unwrap();
-    binding.before_progress_save(Some(&old), &new).unwrap();
+    let mut binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 10);
+    binding.scope.identity.binding.source = source;
+    write(&path, old);
+    binding.adopt(Some(old)).unwrap();
+    binding.before_progress_save(Some(old), new).unwrap();
+    let receipt = std::fs::metadata(&binding.path).unwrap().len();
     // Crash: exact receipt durable, neither progress replacement nor DB save.
+    let _ = telemetry::take_thread_event_for_test("ack_receipt_reconciled");
     binding.recover(&path).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), new);
+    assert!(std::fs::read(&path).unwrap() == new, "{source:?}");
+    assert_eq!(
+        telemetry::take_thread_event_for_test("ack_receipt_reconciled"),
+        Some(serde_json::json!(1))
+    );
     binding.recover(&path).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), new);
+    assert!(std::fs::read(&path).unwrap() == new, "{source:?}");
+    assert_eq!(
+        telemetry::take_thread_event_for_test("ack_receipt_reconciled"),
+        None,
+        "second recovery is quiet"
+    );
+    receipt
 }
-/// [money] progress past the former 11,182,080 B bound with a receipt past
-/// 64 MiB adopts, saves receipt-first and replays exactly for every source;
-/// a second recovery is quiet and a same-generation fork still holds.
+/// [money] receipt first replaces only exact predecessor and replays idempotently.
 #[test]
-fn oversized_progress_and_receipt_replay_exactly_for_every_source() {
+fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
+    receipt_first_case(Source::Claude, &progress(4, "old"), &progress(5, "new"));
+}
+/// [money] the same receipt-first replay holds past the former 11,182,080 B
+/// bound for every source: real-shaped progress, and progress whose encoded
+/// receipt exceeds 64 MiB.
+#[test]
+fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
+    use crate::snapshots::SnapshotSource;
     // Each newline is one progress byte and two escaped receipt bytes.
-    let large = |generation: u64, body: &str| {
+    let padded = |generation: u64| {
         let mut bytes = format!("{{\"generation\":{generation},").into_bytes();
         bytes.resize(bytes.len() + 34 * 1024 * 1024, b'\n');
-        bytes.extend_from_slice(format!("\"body\":\"{body}\"}}").as_bytes());
+        bytes.extend_from_slice(b"\"body\":\"padded\"}");
         bytes
     };
-    let old = large(4, "old");
-    let new = large(5, "new");
-    assert!(old.len() as u64 > 11_182_080);
-    for source in [Source::Claude, Source::Codex, Source::Pi] {
-        let scratch = crate::test_scratch::ScratchDir::new("v2-ack-oversized");
-        let path = scratch.join("progress");
-        let mut binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 10);
-        binding.scope.identity.binding.source = source;
-        write(&path, &old);
-        binding.adopt(Some(&old)).unwrap();
-        binding.before_progress_save(Some(&old), &new).unwrap();
-        assert!(std::fs::metadata(&binding.path).unwrap().len() > 64 * 1024 * 1024);
-        // Crash: exact receipt durable, progress replacement lost.
-        let _ = telemetry::take_thread_event_for_test("ack_receipt_reconciled");
-        binding.recover(&path).unwrap();
-        assert!(std::fs::read(&path).unwrap() == new, "{source:?}");
-        assert_eq!(
-            telemetry::take_thread_event_for_test("ack_receipt_reconciled"),
-            Some(serde_json::json!(1))
-        );
-        binding.recover(&path).unwrap();
-        assert!(std::fs::read(&path).unwrap() == new, "{source:?}");
-        assert_eq!(
-            telemetry::take_thread_event_for_test("ack_receipt_reconciled"),
-            None,
-            "second recovery is quiet"
-        );
-        let fork = large(5, "fork");
-        write(&path, &fork);
-        assert!(binding.recover(&path).is_err());
-        assert!(std::fs::read(&path).unwrap() == fork, "{source:?}");
+    let (old_padded, new_padded) = (padded(4), padded(5));
+    let namespace = "a".repeat(64);
+    for (source, snapshot) in [
+        (Source::Claude, SnapshotSource::ClaudeCode),
+        (Source::Codex, SnapshotSource::Codex),
+        (Source::Pi, SnapshotSource::Pi),
+    ] {
+        let real = |generation| {
+            crate::snapshot_sync::above_old_bound_progress_for_test(
+                snapshot, &namespace, generation,
+            )
+        };
+        let old = real(4);
+        assert!(old.len() as u64 > 11_182_080, "{source:?}");
+        receipt_first_case(source, &old, &real(5));
+        assert!(receipt_first_case(source, &old_padded, &new_padded) > 67_108_864);
     }
 }
 /// [money] mismatched identity generation and same generation forks hold without changes.

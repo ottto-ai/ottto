@@ -5,8 +5,7 @@ use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-// Total size of the preserved failed-import copies. Receipts and progress
-// carry exact bytes of any size; no ACK custody is pruned or held for size.
+// Total size of the preserved failed-import copies.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
