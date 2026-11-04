@@ -685,8 +685,9 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
         // A hint selects both files so complete envelopes can be compared.
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let replay = read(prior, &[path, sibling]);
-        assert_eq!(replay.modes.0, 0);
-        assert!(replay.modes.1 > 0);
+        // The saved loss selects TerminalDisposition, which main's existing
+        // reuse gate sends to Full. The durable seal above still survived.
+        assert_eq!(replay.modes, (1, 0, 0));
         assert_eq!(
             replay
                 .scan

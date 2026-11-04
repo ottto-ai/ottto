@@ -811,8 +811,12 @@ fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
         content(full_body(&base.fixture, CLAUDE))
     );
     append_raw(&base.path, &row_bytes(CLAUDE, 6..7));
+    let now = sampled_scan::now_seconds();
+    sampled_scan::set_test_now(Some(now + LISTING_INTERVAL_SECONDS + 1));
     let (_, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
-    assert_eq!(seen.modes, (0, 1, 0));
+    sampled_scan::set_test_now(None);
+    // A changed recorded-loss disposition follows main's existing Full gate.
+    assert_eq!(seen.modes, (1, 0, 0));
     assert_eq!(
         content(production_body(CLAUDE, next)),
         content(full_body(&base.fixture, CLAUDE))

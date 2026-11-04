@@ -795,7 +795,25 @@ fn codex_occurrences() {
         );
     }
     write(&path, &rows);
-    let (_, native) = full::<Codex>(&route, &path);
+    // Native records require the configured production counting factory.
+    let _cutover = TestCutover::set(0);
+    let candidate = candidate(&path);
+    let metadata = CodexTitleMetadata::default();
+    let mut p = sampled_scan::new_source_parser(
+        File::open(&path).unwrap(),
+        &candidate,
+        &ScanIndex::default(),
+        sampled_scan::ParserOptions {
+            source: SnapshotSource::Codex,
+            metadata: &metadata,
+            traces: None,
+            identity_capture: false,
+            cache: None,
+        },
+    )
+    .unwrap();
+    p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+    let (_, native) = finish::<Codex>(&route, &path, p, None);
     assert!(native.progress_complete());
     assert_eq!(
         (
@@ -839,7 +857,14 @@ fn claude_responses() {
         (17, 5, 2)
     );
     assert_eq!(parsed.recognized_usage_drop_count, 0);
-    assert_eq!(parsed.snapshots[0].resolver_conflict_count, Some(1));
+    assert_eq!(
+        parsed.snapshots[0]
+            .claude_money
+            .as_ref()
+            .unwrap()
+            .resolver_conflicts,
+        1
+    );
     let cold = emitted::<Claude>(Mode::ColdFull, &route, &parsed.snapshots);
     commit::<Claude>(&mut route, &path, tail, parsed);
     route.index = ScanIndex::load(&route.path).unwrap();

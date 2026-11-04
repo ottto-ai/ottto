@@ -2657,11 +2657,19 @@ pub(super) mod tests {
         let path = root.join("sessions/b.jsonl");
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str(&(serde_json::to_string(&bad).unwrap() + "\n"));
+        // A valid new occurrence makes this a new body, rather than an
+        // unchanged accepted300 body that policy correctly suppresses.
+        for row in member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-c", 100, 400)
+            .into_iter()
+            .skip(1)
+        {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
         fs::write(&path, text).unwrap();
         let (mut after, mut current) = scan(&root, previous.clone(), 2);
         let (mut cold_index, mut cold) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(current.snapshots.len(), 2, "one alias per physical member");
-        assert!(current.snapshots.iter().all(|s| s.input_tokens == 300));
+        assert!(current.snapshots.iter().all(|s| s.input_tokens == 400));
         assert_eq!(current.recognized_usage_drop_count, 1);
         assert_eq!(current.ownership_incomplete_file_count, 0);
         current
