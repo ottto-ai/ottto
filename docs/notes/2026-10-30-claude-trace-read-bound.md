@@ -46,9 +46,8 @@ Counters: the trace report carries `rows_discarded` (`cap`, `generation`,
 `cap_rows`, `generation_rows`), summed into the Claude local evidence counts
 line as `trace_rows_discarded`. The key is absent while empty, so ordinary
 counts lines and snapshot-audit output are unchanged. The same counts line
-also carries `trace_discard_no_fallback_requests`, the number of requests placed
-at None by this rule, and `trace_discard_deferred_items`, the number of items
-whose upload the page deferred. Both are omitted while zero.
+also carries `trace_discard_deferred_items`, the number of items whose upload
+the page deferred, omitted while zero.
 
 No persisted field, upload body format, ACK or checkpoint format changes. The
 pre-paid bounded reader is unchanged.

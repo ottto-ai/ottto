@@ -9394,10 +9394,6 @@ pub struct ClaudeLocalEvidenceStats {
     /// Strict trace reads dropped as grown or replaced; absent while empty.
     #[serde(skip_serializing_if = "crate::claude_local_otel::ClaudeTraceRowsDiscarded::is_empty")]
     pub trace_rows_discarded: crate::claude_local_otel::ClaudeTraceRowsDiscarded,
-    /// Requests placed Unknown because this page discarded their strict trace:
-    /// `unhealthy_root_no_fallback_requests.discarded`, kept for #932 readers.
-    #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
-    pub trace_discard_no_fallback_requests: u64,
     /// Items whose upload this page deferred because it discarded their
     /// family's strict trace read.
     #[serde(skip_serializing_if = "trace_discard_count_is_zero")]
@@ -9415,12 +9411,6 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
-    /// `e2` requests left Unknown because their family's strict read failed;
-    /// absent from the line while empty.
-    #[serde(
-        skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
-    )]
-    pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     /// Request-census shadow of a complete Claude terminal scan; absent
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9909,7 +9899,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
-    let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
     let originals = scan_result
@@ -10019,15 +10008,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
-    // The strongest cause per unhealthy root, for its no-fallback counter.
-    let mut unhealthy_reasons = BTreeMap::new();
-    let mut note_unhealthy =
-        |root: &str, reason: crate::snapshots::claude_request_identity::UnhealthyRootReason| {
-            unhealthy_reasons
-                .entry(root.to_owned())
-                .and_modify(|known| *known = reason.min(*known))
-                .or_insert(reason);
-        };
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
@@ -10051,25 +10031,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     .is_some_and(|read| !read.complete)
             {
                 identity_unhealthy_roots.insert(session_id.clone());
-                note_unhealthy(
-                    session_id,
-                    crate::snapshots::claude_request_identity::UnhealthyRootReason::Incomplete,
-                );
             }
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired
-                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
-                && (builds_evidence || request_owned(session_id))
+            if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 identity_unhealthy_roots.insert(session_id.clone());
-                let (oversized, unreadable) =
-                    crate::claude_local_otel::claude_sidecar_pair_faults(support_dir, session_id);
-                note_unhealthy(
-                    session_id,
-                    crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
-                        oversized, unreadable, 0,
-                    ),
-                );
             }
             paired
         })
@@ -10146,31 +10112,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     veto_api_rows.insert(root_session_id.clone(), rows);
                 }
             }
-            if builds_evidence || request_owned(&root_session_id) {
-                use crate::snapshots::claude_request_identity::UnhealthyRootReason;
-                let api_reason = (!api.health.is_complete()).then(|| {
-                    UnhealthyRootReason::of(
-                        api.health.oversized_files,
-                        api.health.unreadable_lines,
-                        api.health.malformed_lines,
-                    )
-                });
-                let trace_reason = (!trace.is_complete()).then(|| {
-                    if trace.rows_discarded.is_empty() {
-                        UnhealthyRootReason::of(
-                            trace.oversized_files,
-                            trace.unreadable_lines,
-                            trace.malformed_lines,
-                        )
-                    } else {
-                        UnhealthyRootReason::Discarded
-                    }
-                });
-                if let Some(reason) = api_reason.into_iter().chain(trace_reason).min() {
-                    note_unhealthy(&root_session_id, reason);
-                }
-                identity_unhealthy_roots.insert(root_session_id);
-            }
+            identity_unhealthy_roots.insert(root_session_id);
             continue;
         }
         stats.complete_sidecar_root_count += 1;
@@ -10267,7 +10209,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     };
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
-    let identity_evidence = builds_evidence.then(|| {
+    let identity_evidence = {
         let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -10278,17 +10220,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             None => evidence.with_cross_root(&cross),
         };
         evidence
-            .with_unhealthy_reasons(unhealthy_reasons)
+            .with_trace_discarded_roots(trace_discarded_roots)
             .with_native_originals(&originals)
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
-    });
+    };
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
         &trace_report,
         index,
-        identity_evidence.as_ref(),
+        Some(&identity_evidence),
         comparison
             .as_deref()
             .map(|comparison| comparison.fold_view(lease))
@@ -10310,23 +10252,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
-    if let Some(evidence) = &identity_evidence {
-        let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
-            &mut scan_result.snapshots,
-            evidence,
-        );
-        // #932's scalar stays, equal to its reason in the map.
-        stats.trace_discard_no_fallback_requests = no_fallback.discarded;
-        stats.unhealthy_root_no_fallback_requests = no_fallback;
-    }
+    crate::snapshots::claude_request_identity::reconcile_request_accounts(
+        &mut scan_result.snapshots,
+        &identity_evidence,
+    );
 
-    let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
+    let request_owned_activity =
         crate::snapshots::claude_request_identity::stage_request_owned_activity(
             &scan_result.snapshots,
-            evidence,
+            &identity_evidence,
             &request_owned_originals,
-        )
-    });
+        );
     // `e2` bodies are final before any identity owner runs: contract 5, transcript ownership and
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
@@ -10378,45 +10314,31 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // upload tuple, and it stays owed for a later page.
         index.hold_claude_history_for_unread_telemetry();
     }
-    if let Some(evidence) = &identity_evidence {
-        // Contract 5 first: the ownership step below leaves new-collector items untouched.
-        let request_identity = crate::snapshots::claude_request_identity::apply_scan_page(
-            &mut scan_result.snapshots,
-            evidence,
-            std::mem::take(&mut disposition.request_groupings),
-        );
-        disposition.copy_invalidated = request_identity.copy_invalidated;
-        if !request_identity.held.is_empty() {
-            if let (Some((cache, committed)), Some(withheld)) =
-                (retained, identity_custody.as_mut())
-            {
-                withheld.extend(request_identity.held.iter().cloned());
-                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
-            }
-            disposition.hold_request_owned(request_identity.held);
+    // Contract 5 first: the ownership step below leaves new-collector items untouched.
+    let request_identity = crate::snapshots::claude_request_identity::apply_scan_page(
+        &mut scan_result.snapshots,
+        &identity_evidence,
+        std::mem::take(&mut disposition.request_groupings),
+    );
+    disposition.copy_invalidated = request_identity.copy_invalidated;
+    if !request_identity.held.is_empty() {
+        if let (Some((cache, committed)), Some(withheld)) = (retained, identity_custody.as_mut()) {
+            withheld.extend(request_identity.held.iter().cloned());
+            cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
         }
-        if let Some(activity) = request_owned_activity {
-            crate::snapshots::claude_request_identity::publish_request_owned_activity(
-                &scan_result.snapshots,
-                activity,
-            );
-        }
+        disposition.hold_request_owned(request_identity.held);
     }
-    let qualification = match &identity_evidence {
-        Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
-            &mut scan_result.snapshots,
-            &api_report,
-            &trace_report,
-            &originals,
-            evidence,
-        ),
-        None => crate::snapshots::claude_request_accounts::apply_with_originals(
-            &mut scan_result.snapshots,
-            &api_report,
-            &trace_report,
-            &originals,
-        ),
-    };
+    crate::snapshots::claude_request_identity::publish_request_owned_activity(
+        &scan_result.snapshots,
+        request_owned_activity,
+    );
+    let qualification = crate::snapshots::claude_request_accounts::apply_with_shared_index(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+        &originals,
+        &identity_evidence,
+    );
     drop(identity_evidence);
     drop(cross);
     let _account_coverage = qualification.coverage;
@@ -24324,8 +24246,6 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
-        // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
         use crate::claude_local_otel::ClaudeIdentityDisposition;

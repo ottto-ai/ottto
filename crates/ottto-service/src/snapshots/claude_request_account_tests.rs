@@ -795,8 +795,6 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, root, api, trace) = h296_root_evidence();

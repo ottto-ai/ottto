@@ -115,37 +115,6 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
     matches!(source, SnapshotSource::ClaudeCode)
 }
 
-/// Every Claude sync cycle builds contract-5 evidence. A test may model a
-/// pre-cutover daemon's unpermitted page, or pin the legacy account path
-/// (own-request account qualification, mixed bodies, owner holds) that production now
-/// reaches only for bodies contract 5 leaves untagged.
-pub(crate) fn builds_evidence() -> bool {
-    #[cfg(test)]
-    if PRE_CUTOVER.with(std::cell::Cell::get) {
-        return false;
-    }
-    true
-}
-#[cfg(test)]
-thread_local! { static PRE_CUTOVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-/// Runs this thread's sync evidence stage without contract-5 evidence until
-/// dropped, as every unpermitted cycle did before the cutover. Only for
-/// fixtures that model that daemon or whose subject is the legacy path.
-#[cfg(test)]
-pub(crate) struct PreCutoverEvidenceForTest(bool);
-#[cfg(test)]
-impl PreCutoverEvidenceForTest {
-    pub(crate) fn enter() -> Self {
-        Self(PRE_CUTOVER.with(|v| v.replace(true)))
-    }
-}
-#[cfg(test)]
-impl Drop for PreCutoverEvidenceForTest {
-    fn drop(&mut self) {
-        PRE_CUTOVER.with(|v| v.set(self.0));
-    }
-}
-
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
@@ -251,36 +220,6 @@ pub(crate) enum Refusal {
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
-}
-
-/// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
-/// label only; declaration order is precedence when several causes apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum UnhealthyRootReason {
-    /// The strict trace read was discarded (it grew or was replaced mid-read).
-    /// The family is also withheld (`e2::hold_trace_discarded`).
-    Discarded,
-    Oversized,
-    Unreadable,
-    Malformed,
-    /// A missing pair member, failed permissive read, invalid or missing
-    /// request ids, or conflicting ids.
-    Incomplete,
-}
-
-impl UnhealthyRootReason {
-    /// The strongest cause among one read's health counters.
-    pub(crate) fn of(oversized: u64, unreadable: u64, malformed: u64) -> Self {
-        if oversized > 0 {
-            Self::Oversized
-        } else if unreadable > 0 {
-            Self::Unreadable
-        } else if malformed > 0 {
-            Self::Malformed
-        } else {
-            Self::Incomplete
-        }
-    }
 }
 
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
@@ -3613,13 +3552,9 @@ impl RequestAccounts {
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
-/// requests stay Unknown, counted per reason in the returned totals.
-pub(crate) fn reconcile_request_accounts(
-    items: &mut [SnapshotItem],
-    evidence: &ScanEvidence<'_>,
-) -> super::ClaudeUnhealthyRootNoFallbackCounts {
+/// requests stay Unknown.
+pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
     use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
-    let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -3640,19 +3575,10 @@ pub(crate) fn reconcile_request_accounts(
             // evidence for requests whose own proof could not be read: collapse
             // the partitions in place so tokens, costs, side calls and id-less
             // shares survive with no account. Durable bindings are untouched.
-            let reason = evidence.unhealthy_reason(root);
-            no_fallback.add(
-                reason,
-                fold.entity
-                    .grains
-                    .values()
-                    .map(|grain| grain.requests)
-                    .fold(0_u64, u64::saturating_add),
-            );
             fold.entity.repartition(None);
             accounts.unhealthy_no_fallback = true;
             // A discard keeps #932's hold: nothing to admit.
-            accounts.unhealthy_cleared_account = (reason != UnhealthyRootReason::Discarded)
+            accounts.unhealthy_cleared_account = (!evidence.trace_discarded_roots.contains(root))
                 .then(|| super::exact_session_account_hash(item))
                 .flatten();
             accounts.starting = None;
@@ -3908,7 +3834,6 @@ pub(crate) fn reconcile_request_accounts(
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
-    no_fallback
 }
 
 /// The account this page cleared from `item` for
@@ -4218,9 +4143,9 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
-    /// Why each unhealthy root failed, for its no-fallback counter only.
-    /// A root missing here counts as `Incomplete`.
-    unhealthy_reasons: BTreeMap<String, UnhealthyRootReason>,
+    /// Unhealthy roots whose strict trace read this pass discarded (it grew
+    /// or was replaced mid-read); #932's hold withholds their family.
+    trace_discarded_roots: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the
     /// verdict, and a passing row's login is its `account_identifier_hash`.
@@ -4356,19 +4281,9 @@ impl<'a> ScanEvidence<'a> {
         })
     }
 
-    pub(crate) fn with_unhealthy_reasons(
-        mut self,
-        reasons: BTreeMap<String, UnhealthyRootReason>,
-    ) -> Self {
-        self.unhealthy_reasons = reasons;
+    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.trace_discarded_roots = roots;
         self
-    }
-
-    fn unhealthy_reason(&self, root: &str) -> UnhealthyRootReason {
-        self.unhealthy_reasons
-            .get(root)
-            .copied()
-            .unwrap_or(UnhealthyRootReason::Incomplete)
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {

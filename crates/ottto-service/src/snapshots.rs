@@ -4290,46 +4290,6 @@ fn sha256_hex_is_well_formed(value: &str) -> bool {
 // clean follow-up generation and never settles a traversal undisclosed.
 const MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS: usize = 4_096;
 
-/// `e2` requests left Unknown because their family's strict sidecar read was
-/// unhealthy this page (`unhealthy_root_no_fallback_requests{reason}`): no
-/// retained, creator, start or inherited account filled them. Content-free
-/// counts; nothing reads them into a decision. Absent from the line while zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct ClaudeUnhealthyRootNoFallbackCounts {
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub discarded: u64,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub oversized: u64,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub unreadable: u64,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub malformed: u64,
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub incomplete: u64,
-}
-
-impl ClaudeUnhealthyRootNoFallbackCounts {
-    pub(crate) fn is_empty(&self) -> bool {
-        self == &Self::default()
-    }
-
-    pub(crate) fn add(
-        &mut self,
-        reason: claude_request_identity::UnhealthyRootReason,
-        requests: u64,
-    ) {
-        use claude_request_identity::UnhealthyRootReason as Reason;
-        let count = match reason {
-            Reason::Discarded => &mut self.discarded,
-            Reason::Oversized => &mut self.oversized,
-            Reason::Unreadable => &mut self.unreadable,
-            Reason::Malformed => &mut self.malformed,
-            Reason::Incomplete => &mut self.incomplete,
-        };
-        *count = count.saturating_add(requests);
-    }
-}
-
 /// The request-census shadow, measured by the scan on a complete
 /// Claude terminal and reported on the local evidence line. Content-free counts; nothing reads them into a decision.
 /// `would_open` is whether every indexed Claude family-member key (not

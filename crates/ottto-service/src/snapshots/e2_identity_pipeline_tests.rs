@@ -1300,17 +1300,12 @@ fn e2_bound_trace_case(
             "this arm bypasses contract-5 identity grouping"
         );
     }
-    assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert_eq!(stats.trace_discard_deferred_items, 0);
-    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
-    for key in [
-        "trace_discard_no_fallback_requests",
-        "trace_discard_deferred_items",
-        "unhealthy_root_no_fallback_requests",
-    ] {
-        assert!(line.get(key).is_none(), "{key} is absent while zero");
-    }
+    assert!(
+        line.get("trace_discard_deferred_items").is_none(),
+        "absent while zero"
+    );
     let totals = e2_bound_trace_totals(&clean);
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     match mode {
@@ -1386,24 +1381,6 @@ fn e2_bound_trace_case(
         usize::from(discarded || matches!(mode, "malformed" | "oversized")),
         "only unreadable and incomplete pairs skip the strict read"
     );
-    // Root 4 + child 1 requests, under this cause only; a listed family has
-    // no `e2` fold to count.
-    let reason = if discarded { "discarded" } else { mode };
-    let requests = if listed { 0 } else { 5 };
-    let expected = if listed {
-        json!({})
-    } else {
-        json!({ reason: requests })
-    };
-    assert_eq!(
-        serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(),
-        expected
-    );
-    assert_eq!(
-        stats.trace_discard_no_fallback_requests,
-        if discarded { requests } else { 0 },
-        "#932's scalar equals the discarded reason"
-    );
     // The production account owner after this page: a body with no login on
     // the session bound to A is held unless this scan admitted it.
     let mut bound = items.clone();
@@ -1430,11 +1407,6 @@ fn e2_bound_trace_case(
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["trace_discard_deferred_items"], 2);
-        assert_eq!(
-            line.get("unhealthy_root_no_fallback_requests"),
-            (!listed).then_some(&expected),
-            "absent while empty"
-        );
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
         assert_eq!(
             stats.trace_rows_discarded.generation,
@@ -1462,8 +1434,6 @@ fn e2_bound_trace_case(
             stats.trace_rows_discarded.is_empty(),
             "{mode} is not a discard"
         );
-        let line = serde_json::to_value(&stats).unwrap();
-        assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
         if mode == "malformed" {
             // The same paired read: money is unchanged, only the account moves.
             assert_eq!(
@@ -1521,7 +1491,6 @@ fn e2_bound_trace_case(
         totals,
         "no usage is dropped"
     );
-    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     assert_eq!(stats.trace_discard_deferred_items, 0);
     assert!(stats.trace_rows_discarded.is_empty());
     fs::remove_dir_all(dir).unwrap();
@@ -1556,8 +1525,8 @@ fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", true, "subscription", false, false);
 }
 
-/// [money] Reason counts: split B/C on every other unhealthy read is
-/// Unknown, never retained A, and counted under its own reason.
+/// [money] Split B/C on every other unhealthy read is Unknown, never
+/// retained A.
 /// guard: unseen live (0 of 3,614 evidence pages)
 #[test]
 fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() {

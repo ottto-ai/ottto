@@ -1698,8 +1698,6 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 #[test]
 #[serial(source_manifests)]
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; `e2` literals never demote to native.
 
     let _source_manifests = SourceManifestTestGuard::new();
@@ -3056,8 +3054,6 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-r2-held", true);
     let grant = fixture.pre_flip_grant();
@@ -3291,8 +3287,6 @@ fn apc_f1_redrain(
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-last", true);
     let grant = fixture.pre_flip_grant();
@@ -3346,8 +3340,6 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-owed", true);
     let grant = fixture.pre_flip_grant();
@@ -3421,8 +3413,6 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 // A rejected entity records Poisoned in the shared client_report counters.
 #[serial(client_report)]
 fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-f1-permanent", true);
     let grant = fixture.pre_flip_grant();
