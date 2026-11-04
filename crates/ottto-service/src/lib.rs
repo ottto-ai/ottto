@@ -787,6 +787,7 @@ impl LocalDaemon {
             api_base_url: default_connection_api_base_url(),
         });
         clear_setup_run_read_rejection(&mut state);
+        clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -930,6 +931,7 @@ impl LocalDaemon {
             api_base_url: default_connection_api_base_url(),
         });
         clear_setup_run_read_rejection(&mut state);
+        clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -2675,11 +2677,15 @@ fn latest_local_health_upload_in(events: &[LocalHealthEventV1]) -> Option<Latest
         .filter(|event| {
             event.event_type == "LocalHealthUploadFailed"
                 || event.event_type == "LocalHealthUploadSucceeded"
+                || event.event_type == LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED
         })
         .max_by_key(|event| event.sequence)
         .and_then(|event| {
             if event.event_type == "LocalHealthUploadSucceeded" {
                 return Some(LatestLocalHealthUpload::Succeeded);
+            }
+            if event.event_type == LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED {
+                return None;
             }
             let kind = event
                 .payload
@@ -2758,6 +2764,34 @@ fn clear_setup_run_read_rejection(state: &mut DaemonState) {
         serde_json::json!({
             "kind": "setup_run_binding_replaced",
             "message": "the rejected setup-run binding was replaced or removed",
+            "current": true
+        }),
+    );
+}
+
+/// A completed sign-in claim installs credentials Ottto has just accepted, so
+/// a local-health upload rejected under the previous credentials no longer
+/// describes this Mac. Without this, status kept answering
+/// `reconnect_required` after a successful `ottto login` until the next
+/// local-health upload, which can be minutes away. The next upload re-checks
+/// the new credentials and records a fresh rejection if Ottto refuses them.
+const LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED: &str = "LocalHealthUploadRejectionCleared";
+
+fn clear_local_health_upload_auth_rejection(state: &mut DaemonState) {
+    if !matches!(
+        latest_local_health_upload_in(&state.local_health_events),
+        Some(LatestLocalHealthUpload::AuthRejected { .. })
+    ) {
+        return;
+    }
+    push_local_health_event(
+        state,
+        LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED,
+        "local_health_upload_rejection_cleared",
+        LocalHealthAuthority::Setup,
+        serde_json::json!({
+            "kind": "sign_in_completed",
+            "message": "a completed sign-in replaced the rejected credentials; the next upload checks them again",
             "current": true
         }),
     );
@@ -6376,6 +6410,95 @@ mod tests {
         let effective = effective_account_binding(&status);
         assert_eq!(effective.state, LocalAccountState::ClaimPending);
         assert_eq!(effective, status.account);
+    }
+
+    #[test]
+    fn completed_sign_in_supersedes_an_older_upload_auth_rejection() {
+        // Observed 2026-11-04: the Mac's account was deleted, its local-health
+        // uploads were rejected, then `ottto login` bound a new account. Status
+        // kept answering reconnect_required (and the app kept "Reconnect this
+        // Mac") until the next local-health upload, minutes later.
+        let daemon = daemon().with_account(account("user_1", "old@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon.mark_account_not_found().expect("account gone");
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_new", "nonce_new"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_new",
+                "nonce_new",
+                account("user_2", "new@example.com"),
+                "setup_new".to_string(),
+                "2026-11-04T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete auth");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status.canonical_health.as_ref().expect("canonical health");
+        assert_eq!(health.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(health.account.device_state, LocalDeviceState::Active);
+        assert_eq!(health.account.setup_run_state, LocalSetupRunState::Complete);
+        assert_eq!(
+            health.account.setup_token_state,
+            LocalSetupTokenState::Valid
+        );
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "auth_missing"));
+        assert_eq!(
+            effective_account_binding(&status).state,
+            LocalAccountState::Connected
+        );
+        assert!(!daemon
+            .connected_setup_run_needs_reconnect()
+            .expect("needs reconnect"));
+
+        // The new credentials are checked again by the next upload: a fresh
+        // rejection still trips the reconnect.
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record second upload failure");
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+    }
+
+    #[test]
+    fn confirmed_account_switch_supersedes_an_older_upload_auth_rejection() {
+        let daemon = daemon().with_account(account("user_1", "old@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon
+            .install_switched_account(
+                account("user_2", "new@example.com"),
+                "setup_new".to_string(),
+                "2026-11-04T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+                "claim_new",
+            )
+            .expect("install switched account");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .state,
+            LocalHealthAccountState::Connected
+        );
     }
 
     #[test]

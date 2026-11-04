@@ -1560,6 +1560,10 @@ fn setup_error_should_start_browser_claim(error: &CliError) -> bool {
         .message
         .to_ascii_lowercase()
         .contains("attach an active setup run")
+        || matches!(
+            error.details.get("reason_code"),
+            Some(RedactedValue::String(reason)) if reason == "mac_disconnected"
+        )
 }
 
 fn browser_claim_from_payload(payload: &serde_json::Value) -> Result<BrowserClaimState, CliError> {
@@ -3724,6 +3728,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Replace it on the browser claim page"));
+    }
+
+    #[test]
+    fn setup_rejected_disconnected_mac_starts_fresh_browser_claim() {
+        let disconnected = CliError {
+            code: CliErrorCode::BackendRejected,
+            message:
+                "This Mac was disconnected from its Ottto account. Sign in to connect it again."
+                    .to_string(),
+            retryable: false,
+            details: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    RedactedValue::String("/api/v1/agent-status/snapshots".to_string()),
+                ),
+                ("status".to_string(), RedactedValue::Number(401)),
+                (
+                    "reason_code".to_string(),
+                    RedactedValue::String("mac_disconnected".to_string()),
+                ),
+            ]),
+        };
+
+        assert!(setup_error_should_start_browser_claim(&disconnected));
     }
 
     #[test]

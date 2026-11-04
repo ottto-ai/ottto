@@ -8946,6 +8946,11 @@ fn cli_error(error: LocalApiError) -> CliError {
                     "reason_code".to_string(),
                     RedactedValue::String(reason_code.clone()),
                 );
+            } else if backend_error_means_mac_disconnected(&error) {
+                details.insert(
+                    "reason_code".to_string(),
+                    RedactedValue::String(MAC_DISCONNECTED_REASON_CODE.to_string()),
+                );
             }
             match backend.kind {
                 BackendErrorKind::Unreachable => CliErrorCode::BackendUnreachable,
@@ -8992,8 +8997,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if body.contains("revoked_cross_account_predecessor") {
-                return "This Mac belonged to another Ottto account whose device is revoked. The new signed-in owner must choose Replace it on the browser claim page; Ottto will start local history at the prior revocation cutoff."
-                    .to_string();
+                return MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE.to_string();
             }
             if body.contains("cross-account takeover requires the exact active predecessor") {
                 return "This Mac still has a live registration for another Ottto account. Complete the takeover from that live installation with its exact saved device credential, or have the prior owner revoke it before the new owner approves Replace it."
@@ -9039,15 +9043,15 @@ fn cli_error_message(error: &LocalApiError) -> String {
             {
                 return "Setup run expired. Run `ottto login` to reconnect this Mac.".to_string();
             }
-            if terminal_refresh_rejection(error) == Some(TerminalRefreshRejection::DeviceRejected) {
-                return "Ottto no longer accepts this Mac's device credential. Run `ottto login` to reconnect this Mac.".to_string();
-            }
             if backend.status == Some(401) || backend.status == Some(403) {
                 if diagnostics_upload {
                     return "Ottto rejected the diagnostics upload. Sign in again or use a fresh support claim.".to_string();
                 }
                 if logout_disconnect {
                     return "Ottto rejected the cloud logout for this Mac. Sign in from the Ottto app or use `ottto logout --local-only` only to clear local state.".to_string();
+                }
+                if backend_error_means_mac_disconnected(error) {
+                    return MAC_DISCONNECTED_MESSAGE.to_string();
                 }
                 return "Ottto rejected the local setup request. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
@@ -9089,6 +9093,51 @@ fn backend_error_detail(backend: &BackendErrorDetails) -> Option<String> {
         .get("detail")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// Plain guidance when Ottto refuses this Mac because its device was revoked
+/// or its account was deleted. The generic "rejected the local setup request"
+/// line told the user neither what happened nor what to do.
+const MAC_DISCONNECTED_MESSAGE: &str =
+    "This Mac was disconnected from its Ottto account. Sign in to connect it again.";
+
+/// The new owner's sign-in found this Mac's revoked device from another Ottto
+/// account (`revoked_cross_account_predecessor`). Replace it on the browser
+/// claim page is still the step that binds it to the new account.
+const MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE: &str = "This Mac was disconnected from its earlier Ottto account. To connect it to your account, choose Replace it on the sign-in page in your browser.";
+
+/// Typed signal for the same case in the error details, so the app and the CLI
+/// act on it without matching message text.
+const MAC_DISCONNECTED_REASON_CODE: &str = "mac_disconnected";
+
+/// Exact backend `detail` strings that mean Ottto no longer accepts this Mac's
+/// device or account. A compatibility path until the backend types them.
+const MAC_DISCONNECTED_DETAILS: [&str; 7] = [
+    "Telemetry device is not active",
+    "Telemetry device is revoked",
+    "Telemetry device not found",
+    "Telemetry device secret is invalid",
+    "Telemetry device was revoked during registration",
+    "Setup run owner not found",
+    "Setup run organization not found",
+];
+
+/// Ottto refused this Mac (401/403) because its device was revoked or its
+/// account no longer exists. Diagnostics uploads and cloud logout keep their
+/// own guidance.
+fn backend_error_means_mac_disconnected(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(backend) = error else {
+        return false;
+    };
+    if !matches!(backend.status, Some(401 | 403))
+        || backend.endpoint.contains("/diagnostics/")
+        || backend.endpoint.contains("/local-client/disconnect")
+    {
+        return false;
+    }
+    backend_error_indicates_account_gone(error)
+        || backend_error_detail(backend)
+            .is_some_and(|detail| MAC_DISCONNECTED_DETAILS.contains(&detail.as_str()))
 }
 
 const SETUP_RUN_EXPIRED_DETAIL: &str = "Setup run expired";
@@ -9198,17 +9247,17 @@ fn reattach_required_state(error: &LocalApiError) -> Option<ReattachRequiredStat
         .and_then(|object| object.get("can_reconnect"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    let action = if can_reconnect {
-        "Reconnect it with the saved credential, or approve Replace it in the browser."
+    let text = if can_reconnect {
+        format!(
+            "This Mac is already registered as {device_name}{last_seen_text}. Reconnect it with the saved credential, or approve Replace it in the browser."
+        )
     } else {
-        "The predecessor was revoked. Approve Replace it in the browser to bind the new owner without importing pre-revocation history."
+        MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE.to_string()
     };
     Some(ReattachRequiredState {
         message: StableMessage {
             code: format!("reattach_required:{reason}"),
-            text: format!(
-                "This Mac is already registered as {device_name}{last_seen_text}. {action}"
-            ),
+            text,
         },
         can_reconnect,
     })
@@ -29633,6 +29682,113 @@ X-API-Key = "otel_redacted"
         );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
+    }
+
+    fn backend_rejection(endpoint: &str, status: u16, body: &str) -> LocalApiError {
+        LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: endpoint.to_string(),
+            status: Some(status),
+            body_excerpt: Some(body.to_string()),
+            reason_code: None,
+        })
+    }
+
+    #[test]
+    fn revoked_or_deleted_mac_gets_plain_sign_in_guidance() {
+        // Observed 2026-11-04: a Mac whose account was deleted showed "Ottto
+        // rejected the local setup request. Open the Ottto app from Ottto to
+        // attach an active setup run. (HTTP 401)".
+        for (endpoint, body) in [
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":"Telemetry device is not active"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/refresh",
+                r#"{"detail":"Telemetry device not found"}"#,
+            ),
+            (
+                "/api/v1/agent-status/snapshots",
+                r#"{"detail":"Telemetry device is revoked"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":"Setup run owner not found"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":{"code":"account_not_found"}}"#,
+            ),
+        ] {
+            let error = cli_error(backend_rejection(endpoint, 401, body));
+            assert_eq!(error.message, MAC_DISCONNECTED_MESSAGE, "{endpoint} {body}");
+            assert_eq!(
+                error.details.get("reason_code"),
+                Some(&RedactedValue::String("mac_disconnected".to_string())),
+                "{endpoint} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_rejections_keep_their_guidance_and_no_disconnected_reason() {
+        let expired = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/scan-result",
+            401,
+            r#"{"detail":"Setup run expired"}"#,
+        ));
+        assert_eq!(
+            expired.message,
+            "Setup run expired. Run `ottto login` to reconnect this Mac."
+        );
+        assert!(!expired.details.contains_key("reason_code"));
+
+        let unknown = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/scan-result",
+            401,
+            r#"{"detail":"Setup run companion token expired"}"#,
+        ));
+        assert!(unknown.message.contains("attach an active setup run"));
+        assert!(!unknown.details.contains_key("reason_code"));
+
+        let diagnostics = cli_error(backend_rejection(
+            "/api/v1/diagnostics/bundles",
+            401,
+            r#"{"detail":"Telemetry device is not active"}"#,
+        ));
+        assert!(diagnostics.message.contains("diagnostics upload"));
+        assert!(!diagnostics.details.contains_key("reason_code"));
+
+        let logout = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/disconnect",
+            401,
+            r#"{"detail":"Telemetry device is not active"}"#,
+        ));
+        assert!(logout.message.contains("cloud logout"));
+        assert!(!logout.details.contains_key("reason_code"));
+    }
+
+    #[test]
+    fn revoked_cross_account_predecessor_gets_plain_replace_it_guidance() {
+        let body = r#"{"detail":{"code":"reattach_required","reason":"revoked_cross_account_predecessor","device_name":"Test Mac","can_reconnect":false}}"#;
+        let endpoint = "/api/v1/setup-claims/[claim]/local-client/complete";
+        let message = cli_error(backend_rejection(endpoint, 409, body)).message;
+        assert_eq!(message, MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE);
+        assert!(message.contains("Replace it"));
+        assert!(!message.contains("predecessor"));
+
+        let state = reattach_required_state(&backend_rejection(endpoint, 409, body))
+            .expect("reattach state");
+        assert_eq!(
+            state.message.code,
+            "reattach_required:revoked_cross_account_predecessor"
+        );
+        assert_eq!(
+            state.message.text,
+            MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE
+        );
+        assert!(!state.can_reconnect);
     }
 
     #[test]
