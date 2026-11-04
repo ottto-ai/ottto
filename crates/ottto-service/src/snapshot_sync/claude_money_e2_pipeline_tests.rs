@@ -3214,11 +3214,11 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
-/// Stopgap, demo chain: the copy-only resume `COPY` repeats requests its
-/// original `ROOT` still holds. When both records are past 35 days, a
-/// complete terminal keeps both (they share ids), so a later re-read of the
-/// copy still proves its copies against the original instead of counting
-/// them again (as a retired original would:
+/// [money] The copy-only resume `COPY` repeats requests its original `ROOT`
+/// holds. A complete terminal 36 days after both were last written keeps
+/// every request id (a record lives while its file is indexed), so a later
+/// re-read of the copy still proves its copies against the original instead
+/// of counting them again (as an older release's retired original would:
 /// `e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses`).
 #[test]
 fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
@@ -3254,27 +3254,17 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
             .format(&Rfc3339)
             .unwrap();
         let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
-        // The retirement decision reads 0 transcript bytes: transcript I/O
-        // is denied and no transcript is opened.
+        // The terminal reads 0 transcript bytes: transcript I/O is denied
+        // and no transcript is opened.
         let opens = crate::snapshots::all_transcript_opens_for_test();
-        let (_, rows) = crate::snapshots::with_transcript_io_denied(|| {
-            crate::local_resource_diagnostics::capture(|| {
-                crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-                    &mut prior,
-                    &keys,
-                    &BTreeSet::new(),
-                    &window,
-                )
-            })
+        crate::snapshots::with_transcript_io_denied(|| {
+            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                &mut prior,
+                &BTreeSet::new(),
+                &window,
+            )
         });
         assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
-        let kept = rows
-            .iter()
-            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
-            .expect("the terminal reports the kept records");
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
-        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
-        assert_eq!(kept["counts"]["census_retire_kept_overflow"], 0);
         let census = prior.claude_request_census_for_test();
         let record = |session: &str| {
             let name = format!("{session}.jsonl");
@@ -3976,51 +3966,6 @@ fn e2_pipeline_stored_copy_removal_is_dropped_when_its_holder_no_longer_holds_it
             (3, Some(2))
         );
         assert_eq!(copy_diag(&PREFIX_KEYS), [1, 1, 0, 1, 0]);
-    });
-}
-
-#[test]
-fn e2_pipeline_copy_removal_capacity_preserves_old_decisions_and_removes_unrecorded() {
-    with_e2(|| {
-        use crate::snapshots::claude_money_birth_store::location_key;
-        use crate::snapshots::claude_request_money::copy_removals::MAX_BYTES;
-        let mut c = Corpus::new("e2-pipeline-copy-family-capacity");
-        c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let old = ScanIndex::default();
-        let original = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
-        let mut prior = settle(&c, &old, original, &mut e2_progress());
-        let root = location_key(&c.root.join(file(ROOT)).to_string_lossy());
-        // Saturate storage with an indexed file's already-recorded decisions.
-        // A later decision must never evict them or publish without custody.
-        let groups = BTreeMap::from([(
-            root,
-            (0..((MAX_BYTES - 40 - 32) / 8) as u64).collect::<BTreeSet<_>>(),
-        )]);
-        assert_eq!(prior.claude_copy_removals.store(root, groups).overflow, 0);
-        let stored = prior.claude_copy_removals.clone();
-        c.write_at(
-            &file(COPY),
-            &resumed(COPY, &[A, B, C]),
-            "2026-08-02T07:03:00Z",
-        );
-        e2::take_diag();
-        let mut page = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
-        page.enrich(&c);
-        let copy = body(&page, COPY).expect("own turns emit at capacity");
-        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (1, Some(2))
-        );
-        assert_eq!(page.index.claude_copy_removals, stored);
-        assert_eq!(
-            copy_diag(&[
-                "copy_removal_store_overflow",
-                "copy_removed_unrecorded",
-                "copy_prefix_unproven"
-            ]),
-            [2, 2, 0]
-        );
     });
 }
 

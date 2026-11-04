@@ -4716,7 +4716,6 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                     index_key: &key,
                     source_file_fingerprint: &fingerprint,
                     census_window_end: window,
-                    held_index_keys: &BTreeSet::new(),
                     complete: true,
                     lossy: false,
                     source_verified: true,
@@ -4724,7 +4723,6 @@ fn owed_identity_incomplete_restamp_equals_a_full() {
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 0,
-                    accepted_recovery_member: false,
                 },
                 &items,
             )

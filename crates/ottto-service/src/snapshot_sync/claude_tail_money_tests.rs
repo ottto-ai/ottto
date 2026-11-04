@@ -1170,14 +1170,6 @@ fn pi_grow(path: &Path, value: Value) {
     input_clock(path);
 }
 
-/// Every arm's next prior: the restart arm's committed index, as Claude's
-/// rows use. Pi keeps no RAM reduction on its Tail route, so the retained
-/// owner continues from the committed heads too, and the cold arm's own
-/// lineage would hold a growth claim bound to the old graph.
-fn pi_committed(next: ScanIndex) -> [ScanIndex; 3] {
-    [next.clone(), next.clone(), next]
-}
-
 #[derive(Clone, Copy, Debug)]
 enum PiLedgerStep {
     Emit(u64, u64),
@@ -1308,9 +1300,10 @@ impl PiPageExpect<'_> {
     }
 }
 
-// Return each arm's own finished index. Callers continue every arm from the
-// restart arm's committed index (`pi_committed`): on the Tail route the arms
-// share one saved graph and differ in what they recompute from it.
+// Every arm reads from the same committed `prior`: Pi keeps no RAM reduction
+// on its Tail route, so the retained owner continues from the committed heads
+// too, and the arms differ only in what they recompute from that one saved
+// graph. Returns the restart arm's index, which callers commit.
 // Quarantined files have no emitted body; compare their disposition and
 // retryability instead of inventing a successful upload.
 fn pi_pages(
@@ -1318,9 +1311,9 @@ fn pi_pages(
     c: &Corpus,
     retained: &E2ScanFixture,
     restart: &E2ScanFixture,
-    priors: [ScanIndex; 3],
+    prior: ScanIndex,
     expect: PiPageExpect<'_>,
-) -> ([ScanIndex; 3], SourceScanResult) {
+) -> (ScanIndex, SourceScanResult) {
     let PiPageExpect {
         ram_mode,
         disk_mode,
@@ -1331,16 +1324,15 @@ fn pi_pages(
         Some(check) => check.page(c, scanner, prior),
         None => other_page(c, scanner, SnapshotSource::Pi, prior),
     };
-    let [tail_prior, full_prior, disk_prior] = priors;
-    let (tail_index, tail, mode) = page(retained, tail_prior);
+    let (tail_index, tail, mode) = page(retained, prior.clone());
     assert_eq!(
         mode,
         if proof.sampled { ram_mode } else { (0, 0, 0) },
         "Pi retained acquisition"
     );
-    let (full_index, full, mode) = page(&E2ScanFixture::default(), full_prior);
+    let (full_index, full, mode) = page(&E2ScanFixture::default(), prior.clone());
     assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
-    let (disk_index, restored, mode) = page(restart, disk_prior);
+    let (disk_index, restored, mode) = page(restart, prior);
     // A new owner continues from the same committed Tail heads.
     assert_eq!(
         mode,
@@ -1378,7 +1370,7 @@ fn pi_pages(
         assert_eq!(disk_index.files.len(), full_index.files.len());
     }
     proof.capture(&full);
-    ([tail_index, full_index, disk_index], full)
+    (disk_index, full)
 }
 
 macro_rules! pi_row {
@@ -1390,22 +1382,20 @@ macro_rules! pi_row {
 }
 
 fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> SourceScanResult {
-    let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
-    let mut priors = [prior.clone(), prior.clone(), prior];
+    let (c, mut disk, path, scanner, mut prior, mut proof) = pi_disk_corpus(name, prefix);
     let mut last = None;
     for value in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let ([_, _, mut restored], scan) = pi_pages(
+        let (mut restored, scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
-            priors,
+            prior.clone(),
             PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
         );
-        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = pi_committed(next);
+        prior = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         last = Some(scan);
     }
     let scan = last.expect("fixture must cross a seal");
@@ -1425,7 +1415,7 @@ fn pi_ledger_splits(
     suffix: Vec<(Value, PiLedgerStep)>,
     final_totals: (u64, u64),
 ) {
-    let (c, mut disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
+    let (c, mut disk, path, scanner, mut prior, mut proof) = pi_disk_corpus(name, prefix);
     assert!(matches!(initial, PiLedgerStep::Emit(..)));
     let mut accepted = proof.bodies[0].items.clone();
     assert_eq!(pi_ledger_totals(&accepted), initial.totals());
@@ -1439,18 +1429,17 @@ fn pi_ledger_splits(
     }
     .page(&c, &E2ScanFixture::default(), ScanIndex::default());
     assert_eq!(other_wire(SnapshotSource::Pi, &scan), proof.bodies[0].raw);
-    let mut priors = [prior.clone(), prior.clone(), prior];
     // pi_pages compares the replayed suffix's emitted wire to cold Full. A
     // dropped conflict keeps its predecessor head: the next read Tails from it.
     for (value, step) in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let ([_, _, mut restored], scan) = pi_pages(
+        let (mut restored, scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
-            priors,
+            prior.clone(),
             PiPageExpect {
                 ledger: Some(&PiLedgerCheck {
                     step,
@@ -1462,8 +1451,7 @@ fn pi_ledger_splits(
         if matches!(step, PiLedgerStep::Emit(..)) {
             accepted = scan.snapshots;
         }
-        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = pi_committed(next);
+        prior = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     }
     assert_eq!(pi_ledger_totals(&accepted), final_totals, "{name}");
     proof.finish();
@@ -1823,7 +1811,7 @@ fn pi_cli_fork_preserves_double_count() {
         &c,
         &scanner,
         &restart,
-        [prior.clone(), prior.clone(), prior],
+        prior,
         PiPageExpect::modes((1, 1, 0), (1, 1, 0)),
     );
     assert_eq!(scan.snapshots.len(), 2);
@@ -1869,7 +1857,7 @@ fn pi_lifecycle_case(name: &str) {
         pi_seed()
     };
     let (c, mut disk, path, mut scanner, prior, mut proof) = pi_disk_corpus(name, &initial);
-    let mut priors = if downgrade {
+    let mut prior = if downgrade {
         drop(scanner);
         scanner = E2ScanFixture::default();
         pi_grow(
@@ -1896,16 +1884,16 @@ fn pi_lifecycle_case(name: &str) {
         let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut down);
         // The reupgraded build is a new process on the committed route.
         scanner = disk.owner(SnapshotSource::Pi);
-        [committed.clone(), committed.clone(), committed]
+        committed
     } else if rewrite {
-        [prior.clone(), prior.clone(), prior]
+        prior.clone()
     } else {
         disk.begin(&scanner, SnapshotSource::Pi);
         let (mut quiet, _, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior.clone());
         assert_eq!(mode.0 + mode.1, 0, "{name}");
         let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut quiet);
         assert!(committed.generation > prior.generation, "{name}");
-        [committed.clone(), committed.clone(), committed]
+        committed
     };
     for (step, &(response, input, at)) in turns.iter().enumerate() {
         let turn = pi_turn("message", Some(response), input, at);
@@ -1939,12 +1927,12 @@ fn pi_lifecycle_case(name: &str) {
         let restart = disk.owner(SnapshotSource::Pi);
         let ram_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
         let disk_mode = if migrating { (1, 0, 0) } else { (0, 1, 0) };
-        let ([_, _, mut restored], scan) = pi_pages(
+        let (mut restored, scan) = pi_pages(
             &mut proof,
             &c,
             &scanner,
             &restart,
-            priors,
+            prior.clone(),
             PiPageExpect::modes(ram_mode, disk_mode),
         );
         if migrating {
@@ -1953,8 +1941,7 @@ fn pi_lifecycle_case(name: &str) {
         if step + 1 == turns.len() {
             break;
         }
-        let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
-        priors = pi_committed(next);
+        prior = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     }
     proof.finish();
 }
@@ -2010,12 +1997,12 @@ fn pi_acquisition_metadata_changes() {
         modified
     );
     let restart = disk.owner(SnapshotSource::Pi);
-    let ([_, _, mut restored], _) = pi_pages(
+    let (mut restored, _) = pi_pages(
         &mut proof,
         &c,
         &scanner,
         &restart,
-        [prior.clone(), prior.clone(), prior],
+        prior,
         PiPageExpect::modes((0, 0, 0), (0, 0, 0)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
@@ -2026,12 +2013,12 @@ fn pi_acquisition_metadata_changes() {
         .set_modified(modified + std::time::Duration::from_secs(2))
         .unwrap();
     let restart = disk.owner(SnapshotSource::Pi);
-    let ([_, _, mut restored], _) = pi_pages(
+    let (mut restored, _) = pi_pages(
         &mut proof,
         &c,
         &scanner,
         &restart,
-        pi_committed(next),
+        next,
         PiPageExpect::modes((1, 0, 0), (1, 0, 0)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
@@ -2050,7 +2037,7 @@ fn pi_acquisition_metadata_changes() {
         &c,
         &scanner,
         &restart,
-        pi_committed(next),
+        next,
         PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
     );
     proof.finish();

@@ -106,8 +106,9 @@ or change their owner.
 
 The original-input lexical gate keeps scalar depth, quote/escape and number
 state, with no container stack. Main-document nesting above 256 refuses in
-place. Optional census evidence beyond that depth or its existing raw byte cap
-is drained and becomes unknown/null as a resource outcome. Only admitted input
+place. Optional census evidence beyond that depth is drained and becomes
+unknown/null as a resource outcome; its size never is, and the census field is
+read whole. Only admitted input
 reaches bounded grammar checks; syntax damage within admitted data retains the
 quarantine rule. The syntax-only census pass neither buffers nor interprets it.
 

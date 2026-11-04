@@ -4146,9 +4146,6 @@ pub struct ScanIndex {
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
-    /// Accepted intent members still owing revision debt; rebuilt each prepare.
-    #[serde(skip)]
-    pub(crate) copy_prefix_recovery_scope: BTreeSet<PathBuf>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4367,7 +4364,6 @@ impl Default for ScanIndex {
             copy_prefix_last_accepted_nonce: None,
             retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: TailDiscovery::default(),
-            copy_prefix_recovery_scope: BTreeSet::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -7756,7 +7752,6 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub records: usize,
     pub hashes: usize,
     pub hash_budget_usage_percent: usize,
-    pub hash_budget_warning: bool,
     pub transient_limited: bool,
     pub transient_peak_bytes: usize,
     pub duplicate_hashes: usize,
@@ -12818,6 +12813,10 @@ impl std::fmt::Debug for ClaudeLegacyRequestOwners {
 }
 
 impl ClaudeLegacyRequestOwners {
+    /// Owned request hashes so far; a diagnostics scalar.
+    pub(crate) fn owner_count(&self) -> usize {
+        self.owners.len()
+    }
     /// Adds one healthy root's rows. Call in sorted root order, once per root
     /// with API rows; after a refusal nothing more is added.
     pub(crate) fn add_root(
@@ -31093,8 +31092,6 @@ impl OwnedSourceScan {
                     } else if !held_progress_audit || (source_verified && parse_complete) {
                         // An unsuccessful virtual audit keeps its old hold:
                         // it has no sampled marker carrying the obligation.
-                        let accepted_recovery_member =
-                            index.copy_prefix_recovery_scope.contains(&candidate.path);
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -31102,7 +31099,6 @@ impl OwnedSourceScan {
                                 index_key: &index_key,
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
-                                held_index_keys: &residue_index_keys,
                                 complete: parse_complete,
                                 lossy: dropped_usage_record_count > 0
                                     || recognized_usage_drop_count > 0
@@ -31127,7 +31123,6 @@ impl OwnedSourceScan {
                                 itemless_request_hashes: claude_itemless_request_hashes,
                                 opened_birth: claude_opened_birth,
                                 modified_unix_seconds: candidate.modified_unix_seconds,
-                                accepted_recovery_member,
                             },
                             &parsed,
                         );
@@ -32154,7 +32149,6 @@ impl OwnedSourceScan {
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
                         claude_request_census::settle_claude_request_census_terminal(
                             index,
-                            &traversal_snapshot.observed_index_keys,
                             &traversal_snapshot.residue.index_keys,
                             &census_window_end,
                         )
@@ -34988,32 +34982,6 @@ pub fn parse_pi_jsonl_file(
     collected_at: &str,
     source_file_fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
-    parse_pi_jsonl_file_with_attribution(path, collected_at, source_file_fingerprint, None)
-}
-
-#[cfg(test)]
-fn parse_pi_jsonl_file_with_attribution(
-    path: &Path,
-    collected_at: &str,
-    source_file_fingerprint: String,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<Vec<SnapshotItem>> {
-    parse_pi_jsonl_file_with_diagnostics(
-        path,
-        collected_at,
-        source_file_fingerprint,
-        attribution_context,
-    )
-    .map(|parsed| parsed.snapshots)
-}
-
-#[cfg(test)]
-fn parse_pi_jsonl_file_with_diagnostics(
-    path: &Path,
-    collected_at: &str,
-    source_file_fingerprint: String,
-    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -35023,8 +34991,9 @@ fn parse_pi_jsonl_file_with_diagnostics(
         None,
         None,
         None,
-        attribution_context,
+        None,
     )
+    .map(|parsed| parsed.snapshots)
 }
 
 #[cfg(test)]
@@ -39410,22 +39379,14 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 /// `usage` entries name their model; summaries run on the session's current
 /// model, which `place_usage` falls back to when `model` is None.
 fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
-        // Copied spend is excluded, but its model remains the context for
-        // owned summary entries that do not repeat a model name.
-        accumulator.set_model(string_at(value, &["model"]));
+    let clock = value.get("timestamp");
+    let timestamp = pi_timestamp_value(clock);
+    if !pi_usage_gate(value, accumulator, &["model"], clock, timestamp.as_deref()) {
         return;
     }
     let Some(usage) = pi_message_usage(value) else {
         return;
     };
-    let timestamp = pi_timestamp_value(value.get("timestamp"));
-    if timestamp.is_none() && value.get("timestamp").is_some() {
-        if !usage.is_zero() {
-            accumulator.note_dropped_usage();
-        }
-        return;
-    }
     let mut selector = accumulator.current_selector.clone();
     selector.merge(pi_selector_from_usage_message(value));
     accumulator.add_usage_with_selector(
@@ -39559,42 +39520,58 @@ fn pi_timestamp_field(value: &Value) -> Option<String> {
         .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
 }
 
-/// One usage record (an assistant `message` or a `message_end`): a fork copy
-/// only sets the model; a valid or absent clock applies the usage; a present
-/// but invalid clock drops positive usage.
+/// The rule every Pi usage line passes first. A fork copy is the parent's
+/// spend: it only leaves its model (at `model_path`) as context. A present but
+/// invalid `clock` drops positive usage. True when the usage applies at
+/// `timestamp` (None when the clock is absent).
+fn pi_usage_gate(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    model_path: &[&str],
+    clock: Option<&Value>,
+    timestamp: Option<&str>,
+) -> bool {
+    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
+        accumulator.set_model(string_at(value, model_path));
+        false
+    } else if timestamp.is_none() && clock.is_some() {
+        if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+            accumulator.note_dropped_usage();
+        }
+        false
+    } else {
+        true
+    }
+}
+
+/// One usage record (an assistant `message` or a `message_end`), through the
+/// shared gate, then the dedup ledger.
 fn apply_pi_usage_record(
     value: &Value,
     accumulator: &mut SnapshotAccumulator,
     timestamp: Option<&str>,
     shape: PiUsageRecordShape,
 ) {
-    if accumulator.seen_pi_usage_keys.skip_fork_copy(value) {
-        accumulator.set_model(string_at(value, &["message", "model"]));
-    } else if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+    let clock = pi_usage_record_clock(value);
+    if pi_usage_gate(value, accumulator, &["message", "model"], clock, timestamp) {
         apply_pi_usage_line(value, accumulator, timestamp, shape);
-    } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
-        accumulator.note_dropped_usage();
     }
 }
 
 /// A usage record's occurrence clock. Current and transitional Pi records may
 /// carry a later envelope write time at the top level; provider response time
 /// is the usage occurrence clock and is also what historical `message_end`
-/// records use.
-fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
-    let provider_timestamp = value.pointer("/message/timestamp");
-    if provider_timestamp.is_some() {
-        // Present-but-invalid provider evidence is loss. Falling back to the
-        // envelope would silently turn a malformed occurrence clock into a
-        // different, often later, billable hour.
-        pi_timestamp_value(provider_timestamp)
-    } else {
-        pi_timestamp_value(value.get("timestamp"))
-    }
+/// records use. Present-but-invalid provider evidence is loss: falling back
+/// to the envelope would turn a malformed occurrence clock into a different,
+/// often later, billable hour.
+fn pi_usage_record_clock(value: &Value) -> Option<&Value> {
+    value
+        .pointer("/message/timestamp")
+        .or_else(|| value.get("timestamp"))
 }
 
-fn pi_message_timestamp_is_present(value: &Value) -> bool {
-    value.get("timestamp").is_some() || value.pointer("/message/timestamp").is_some()
+fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
+    pi_timestamp_value(pi_usage_record_clock(value))
 }
 
 fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
@@ -39720,8 +39697,6 @@ pub(crate) struct PiLedger {
 /// fork time. The fork owns only what happened at or after its header time.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct PiFork {
-    /// Persisted (N): the header named a parent.
-    has_parent: bool,
     /// Persisted (L): the local-only header time, unix nanos; `None` when the header
     /// time is missing or invalid, which counts every entry.
     header_nanos: Option<i128>,
@@ -39740,9 +39715,7 @@ impl std::fmt::Debug for PiLedger {
 
 impl std::fmt::Debug for PiFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PiFork")
-            .field("has_parent", &self.has_parent)
-            .finish()
+        f.debug_struct("PiFork").finish_non_exhaustive()
     }
 }
 
@@ -39784,11 +39757,11 @@ impl PiLedger {
         self.usage_keys.is_empty() && self.fork.is_none()
     }
 
-    /// The persisted fork values: (`has_parent`, header time).
+    /// The persisted fork values: (the header named a parent, header time).
     pub(crate) fn fork_parts(&self) -> (bool, Option<i128>) {
         self.fork
             .as_deref()
-            .map_or((false, None), |fork| (fork.has_parent, fork.header_nanos))
+            .map_or((false, None), |fork| (true, fork.header_nanos))
     }
 
     /// The ledger a Pi Tail head restores: no keys yet (its pages follow)
@@ -39800,12 +39773,7 @@ impl PiLedger {
     ) -> Self {
         Self {
             usage_keys,
-            fork: has_parent.then(|| {
-                Box::new(PiFork {
-                    has_parent,
-                    header_nanos,
-                })
-            }),
+            fork: has_parent.then(|| Box::new(PiFork { header_nanos })),
         }
     }
 
@@ -39816,7 +39784,6 @@ impl PiLedger {
             return;
         }
         self.fork = Some(Box::new(PiFork {
-            has_parent: true,
             header_nanos: pi_timestamp_value(value.get("timestamp"))
                 .as_deref()
                 .and_then(pi_timestamp_nanos),
@@ -45196,8 +45163,7 @@ fn reconcile_missing_index_entries_with_side(
             && codex_counting_version::tombstone_before_retire(index, key)
         {
             index.record_confirmed_absent_claude_account_member(key);
-            index.files.remove(key);
-            index.confirmed_empty_files.remove(key);
+            index.drop_file_entry(key);
             index.file_snapshot_fingerprints.remove(key);
             index.drop_codex_proof_items(key, codex_side_drop);
         }
@@ -51955,7 +51921,6 @@ impl ScanIndex {
                     persistence_v2: state.persistence_v2.clone(),
                     growth_claim_context: state.growth_claim_context.clone(),
                     growth_retention: sampled_audit::growth_subset(self, previous, &safe_keys),
-                    growth_checked: Default::default(),
                 })
             }),
             persistence_root: previous.persistence_root.clone(),
@@ -52049,7 +52014,6 @@ impl ScanIndex {
             copy_prefix_last_accepted_nonce: self.copy_prefix_last_accepted_nonce.clone(),
             retired_claude_folder_login_ledger: serde::de::IgnoredAny,
             tail_discovery: self.tail_discovery,
-            copy_prefix_recovery_scope: self.copy_prefix_recovery_scope.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -52334,7 +52298,8 @@ impl ScanIndex {
     /// key's snapshot fingerprints and account hold stay, because each
     /// removal path ends in the state main already reaches for the same key:
     /// main's reconciliation keeps an audit-debt entry and its fingerprints
-    /// forever, so this path drops only the entry and its marker, while a
+    /// forever, so this path drops only the entry with its lifetime facts
+    /// (`drop_file_entry`) and its marker, while a
     /// vanished entry without audit debt goes through `remove_file_entry`,
     /// which drops its fingerprints and hold just as main's reconciliation
     /// does at the next healthy terminal. The hold is later dropped by a
@@ -52350,10 +52315,8 @@ impl ScanIndex {
         }) {
             return false;
         }
-        self.files.remove(key);
+        self.drop_file_entry(key);
         self.terminal_jsonl_dispositions.remove(key);
-        self.confirmed_empty_files.remove(key);
-        self.claude_request_census.remove(key);
         true
     }
 
@@ -52462,11 +52425,20 @@ impl ScanIndex {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
         self.record_confirmed_absent_claude_account_member(key);
-        self.files.remove(key);
+        self.drop_file_entry(key);
         self.terminal_jsonl_dispositions.remove(key);
-        self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
         self.claude_account_deferred_holds.remove(key);
+    }
+
+    /// The one lifetime core of a positive-absence exit: the index entry and
+    /// the facts that live exactly as long as it (confirmed-empty mark,
+    /// request census, money marks, stored copy removals). Every exit calls
+    /// it after its own guards; dispositions, fingerprints, holds and Codex
+    /// proof stay with each caller. Nothing else ends a census record.
+    fn drop_file_entry(&mut self, key: &str) {
+        self.files.remove(key);
+        self.confirmed_empty_files.remove(key);
         self.claude_request_census.remove(key);
         self.claude_money_birth_store.set_money_marks(key, 0);
         self.claude_copy_removals
@@ -82652,7 +82624,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
         }
     }
 }
-crate::heap_layout_bound::fields!(PiFork; has_parent, header_nanos);
+crate::heap_layout_bound::fields!(PiFork; header_nanos);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,
@@ -83113,7 +83085,7 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, pending_occurrence_cap_alarm, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;

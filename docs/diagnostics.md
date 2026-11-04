@@ -68,6 +68,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | --- | --- |
 | `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
+| `retained_heap_bytes.active_graph.{census_hashes,census_occupancy_alarm}` | Request hashes the Claude census holds, and whether they reach 75% of 2,097,152. An alarm only: nothing is capped. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
@@ -169,6 +170,7 @@ accepting version 1 binaries; there is no version negotiation.
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
 | `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
+| `shutdown` | none (`counts` is `{}`) | Once when the process receives SIGTERM, after startup diagnostics. Unix only. Records that the stop signal arrived; it does not detect hangs or say who sent it. The process still dies by SIGTERM. A missing row proves nothing: SIGKILL, a crash, a signal before startup or a failed write leave none. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Claude page counters `claude_sidecar_reparse_files` and
@@ -348,8 +350,8 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
-Claude Code's local-evidence stage adds three such footprint records (empty
-counts, none on panic), v1 and v2 alike: `claude_local_evidence` wraps the
+Claude Code's local-evidence stage adds three such footprint records (none on
+panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
@@ -357,6 +359,16 @@ final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
 step) and no footprint fields. `evidence_cross_root` counts carry
 `demanded_requests`: the page's demanded request ids each root is joined against.
+Of the three footprint records, only `evidence_read` has counts: one
+`evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
+bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
+after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
+footprint at the first two points; the third is `stage_end_footprint_bytes`),
+`kept_rows` (API plus trace rows the pass keeps for the fold),
+`largest_root_rows` with `largest_root_kept` (the root with the most rows and
+whether the pass kept it), and `legacy_owners` (legacy request owners). Compare
+deltas between the points only; footprint also charges memory the allocator
+does not report.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
 around folding stored usage families into heads.
 
@@ -431,37 +443,17 @@ disappearing: where a failure stayed possible, its new counter is named.
 Not built, and so absent from the counters: `tail_candidate_owed`,
 `tail_set_aside_probe`.
 
-### Claude Census Retirement Overlap
+### Claude Census Holder Lifetime
 
-A complete Claude terminal retires transcript census records whose file was
-last modified more than 35 days before the census window. An aged record that
-shares a request id with another unretired census record is kept instead, so a
-resumed copy keeps its cross-session copy proof while both files stay indexed.
-The terminal then emits `claude_census_retire_kept_overlap` with
-`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes`,
-`census_retire_kept_overflow` and its two reasons,
-`census_retire_kept_overflow_occupancy` and
-`census_retire_kept_overflow_admission`, each with a `_total` process total,
-and `census_missing_over_budget`: the same terminal's census-full tombstone
-count (the shadow's `missing_over_budget`), so both read together.
-Kept records stay while the census, after the other aged records retire, is
-at most 90% full by both its hash budget and its serialized budget. Above
-that, the oldest kept records (equal ages in path order) retire until it is
-back at 90%, counted as occupancy overflow, so one index always yields one
-kept set. Kept records never cost another record its admission: a transcript
-record that does not fit whole first retires, oldest first, the records the
-age rule would retire at that window but that still hold their hashes, only
-as many as it needs; if retiring all of them would still not admit it, none
-retires and the record is tombstoned as before. Each such insert emits a row with zero kept counts, no
-`census_missing_over_budget`, and the records it retired as admission
-overflow. The census holds at most 65,536 records, live as on load: a new
-transcript key past that gets no record (read as missing) and emits a row
-with `census_record_limit_refused` = 1 and no `census_missing_over_budget`.
-Every row carries `census_record_limit_refused` and its `_total`. A positive
-overflow, by either reason, or a positive refusal also emits
-`claude_census_retire_kept_overlap_alarm` with the same counts. Each terminal
-decides again, so a kept record retires once its partner is pruned or
-retired. Counts only; no path, id or wire event.
+A Claude transcript census record lives while its file is indexed or is held
+new custody; it is dropped, with its file's money marks and stored copy
+removals, only when the file leaves the index. No age, overlap, occupancy or
+size rule retires, refuses or strips a record, and the census and the stored
+copy removals have no capacity limit. The one signal is the occupancy alarm on
+the retained-heap line: `census_hashes`, the request hashes the census holds,
+and `census_occupancy_alarm`, true once they reach 75% of 2,097,152. Records an
+older release stored retired (no request ids) or over budget keep that shape
+until their file is re-read. Counts only; no path, id or wire event.
 
 ## Credential File Cap Refusals
 
@@ -1320,8 +1312,8 @@ facts as well as telemetry. Native transcript duplicates retain a structural
 veto even under an unrelated invalid family. A stable native copy keeps vetoing every due terminal by design.
 `counts.rearm_structural_native_duplicate` counts due closed-fence terminals
 where this native-duplicate veto is present (other vetoes may coexist). It is
-sparse, saturating and count-only. Unique appends, unique new sessions/members
-and routine census retirement do not enter a scheduling projection: no such
+sparse, saturating and count-only. Unique appends and unique new
+sessions/members do not enter a scheduling projection: no such
 projection is added. Telemetry duplicate rows/multi-root claims alone do not
 activate this native veto. Strict loader/read-health failures remain retryable even when their malformed rows would also fail a
 semantic reducer. No extra reader, output stream or persisted diagnostic state
