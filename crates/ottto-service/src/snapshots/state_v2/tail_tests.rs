@@ -822,10 +822,11 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
     let index = load_with(&f.path, false).unwrap().unwrap();
     let new_roots: Vec<RowKey> = catalogue::LAYOUTS
         .iter()
-        .filter(|(_, _, layout)| *layout == 5)
+        // A retired kind is never written.
+        .filter(|(_, field, layout)| *layout == 5 && !field.starts_with("retired_"))
         .map(|(kind, _, _)| mapper::key(kind, "", 0).unwrap())
         .collect();
-    assert_eq!(new_roots.len(), 2);
+    assert_eq!(new_roots.len(), 1);
     with_session_db(&index, |db| {
         for key in &new_roots {
             sqlite::delete_row_for_test(db, key);
@@ -833,7 +834,6 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         db.control("catalogue_layout", &4_u32).unwrap();
     });
     let index = load_with(&f.path, false).unwrap().unwrap();
-    assert!(index.claude_folder_login_ledger.is_empty());
     assert_eq!(index.tail_discovery, Default::default());
     stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
     observe_tail(&f.path, FILE, observation(&[b"debt"])).unwrap();

@@ -414,7 +414,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         telemetry,
         accounts,
         prefix: _,
-        folder_trace,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -433,7 +432,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
-    *folder_trace = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -935,10 +933,8 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
-    /// Which file this fold read, for the folder ledger; set as it becomes an item.
-    pub(crate) folder_trace: Option<Box<crate::snapshots::claude_folder_login::FolderTrace>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, folder_trace]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1058,7 +1054,6 @@ impl FileFold {
             ambiguous,
             accounts,
             proof,
-            crate::snapshots::claude_folder_login::FolderTrace::finish_heap_bound(),
         ] {
             out = out.checked_add(bytes)?;
         }
@@ -1168,7 +1163,6 @@ impl FileFold {
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
-            folder_trace: None,
         };
         fold.spend(started);
         fold
@@ -1260,23 +1254,6 @@ impl FileFold {
         !occurrence.usage.is_zero()
             && self.money_birth.copied_with_slack(at, SLACK) == Some(true)
             && !self.is_skipped(occurrence.sequence)
-    }
-
-    /// Whether this file holds a prefix from elsewhere: a response older than
-    /// its birth, a held pre-birth range, or a birth inherited across a move.
-    pub(crate) fn copied_or_moved<'a>(
-        &self,
-        mut occurrences: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
-    ) -> bool {
-        !self.skipped.is_empty()
-            || matches!(
-                (self.money_birth.birth_nanos(), self.physical),
-                (Some(effective), Some(physical)) if effective != physical
-            )
-            || occurrences.any(|occurrence| {
-                let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
-                self.money_birth.copied_with_slack(at, SLACK) == Some(true)
-            })
     }
 
     /// `placed` is the native finalizer's own placement of this response
@@ -2145,25 +2122,16 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
 pub(crate) struct CopyRemovalUpdates {
     state: Option<super::copy_removals::CopyRemovals>,
     added: u64,
-    unrecorded: u64,
 }
 impl CopyRemovalUpdates {
-    /// The bounded replacement carries stored decisions and retry debt in the
-    /// same index save. A refused decision still removes proven copies.
+    /// The replacement carries stored decisions and retry debt in the same
+    /// index save.
     pub(crate) fn apply(self, index: &mut ScanIndex) {
         if let Some(state) = self.state {
             index.claude_copy_removals = state;
         }
         diag("copy_removal_stored", self.added);
-        diag("copy_removal_store_overflow", self.unrecorded);
-        diag("copy_removed_unrecorded", self.unrecorded);
-        if self.unrecorded > 0 {
-            eprintln!(
-                "local Claude money: alarm=copy_removal_store_full copy_removed_unrecorded={}",
-                self.unrecorded
-            );
-        }
-        record_counts(Counts::removal_store(self.added, self.unrecorded));
+        record_counts(Counts::removal_store(self.added));
     }
 }
 
@@ -2270,7 +2238,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
                 .claude_request_census
                 .get(root_key)
                 .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
-            record_counts(Counts::one(29, u64::from(deferred)));
+            record_counts(Counts::one(27, u64::from(deferred)));
             diag("family_copy_deferred", u64::from(deferred));
             false
         }
@@ -2719,14 +2687,12 @@ fn decide_holders(
         }
     }
     let pending = std::cell::OnceCell::new();
-    let mut updates = CopyRemovalUpdates::default();
-
-    {
-        let mut state = index.claude_copy_removals.clone();
-        let live = live.get_or_init(|| indexed_main_files(index));
-        state.retain_files(|file| live.contains_key(&file));
-        updates.state = Some(state);
-    }
+    let mut updates = CopyRemovalUpdates {
+        // Stored removals leave only with their file
+        // (`ScanIndex::drop_file_entry`); no page sweeps them.
+        state: Some(index.claude_copy_removals.clone()),
+        ..Default::default()
+    };
 
     for wanted in wanted {
         let decided =
@@ -2739,7 +2705,7 @@ fn decide_holders(
             .collect::<Vec<_>>();
         let twin_removed = wanted.twin_held.iter().filter(|&h| !decided(h)).count() as u64;
         diag("copy_prefix_twin_page_removed", twin_removed);
-        record_counts(Counts::one(30, twin_removed));
+        record_counts(Counts::one(28, twin_removed));
         let reused = wanted
             .stored
             .iter()
@@ -2752,7 +2718,7 @@ fn decide_holders(
             .count() as u64;
         if absent_kept > 0 {
             diag("copy_removal_holder_absent_kept", absent_kept);
-            record_counts(Counts::one(25, absent_kept));
+            record_counts(Counts::one(23, absent_kept));
         }
         // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
         if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
@@ -2762,13 +2728,11 @@ fn decide_holders(
                 .filter(|hash| !wanted.stored.contains(hash))
                 .count() as u64;
             diag("copy_prefix_late_origin_removed", late);
-            record_counts(Counts::one(26, late));
+            record_counts(Counts::one(24, late));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
-            let stored = state.store(wanted.order.1, groups);
-            updates.added += stored.added;
-            updates.unrecorded += stored.overflow;
+            updates.added += state.store(wanted.order.1, groups);
         }
         note_reused(&mut items[wanted.at], reused);
         // Only the unresolved prefix waits. Persisted retry debt reselects
@@ -2804,8 +2768,8 @@ fn decide_holders(
                 .is_some_and(|state| !state.pending(wanted.order.1));
             diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
             diag("copy_prefix_origin_unaccepted_passes", 1);
-            record_counts(Counts::one(27, u64::from(first)));
-            record_counts(Counts::one(28, 1));
+            record_counts(Counts::one(25, u64::from(first)));
+            record_counts(Counts::one(26, 1));
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -2991,13 +2955,13 @@ fn defer_prefix(
         fold.entity.held = true;
         if accepted_prefix {
             diag("copy_prefix_accepted_session_holds", 1);
-            record_counts(Counts::one(24, 1));
+            record_counts(Counts::one(22, 1));
         }
         // Whole-body undecided counters are otherwise suppressed at finish;
         // the held prefix must still be visible in production diagnostics.
         let mut held = Counts::default();
-        held.0[16] = fold.prefix.held_requests;
-        held.0[17] = u64::from(fold.prefix.held_requests > 0);
+        held.0[14] = fold.prefix.held_requests;
+        held.0[15] = u64::from(fold.prefix.held_requests > 0);
         record_counts(held);
     }
     fold.proof = None;
@@ -4086,7 +4050,7 @@ pub(crate) fn finish_page(
         );
         diag("copy_prefix_hold_expired", fold.prefix.hold_expired);
         session.decided.add(&Counts::prefix(&fold.prefix));
-        session.decided.0[22] += fold.own_requests;
+        session.decided.0[20] += fold.own_requests;
         diag(
             "copy_prefix_removed_priced_requests",
             fold.prefix.removed_priced_requests,
@@ -4189,7 +4153,7 @@ pub(crate) fn finish_page(
         if emitted {
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
-                counts.0[19] = marked.rows;
+                counts.0[17] = marked.rows;
                 record_counts(counts);
                 diag("copy_prefix_unproven_rows", marked.rows);
             }
@@ -4265,8 +4229,8 @@ pub(crate) fn finish_page(
             .collect::<BTreeSet<_>>();
         if !corrected_families.is_empty() {
             let mut counts = Counts::default();
-            counts.0[23] = corrected_families.len() as u64;
-            diag("copy_prefix_families_corrected", counts.0[23]);
+            counts.0[21] = corrected_families.len() as u64;
+            diag("copy_prefix_families_corrected", counts.0[21]);
             record_counts(counts);
         }
     }
@@ -4517,15 +4481,13 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copy-family fix, class N, diagnostics only: the
     // flagged copied-prefix requests and files, the matched priced share
     // with its reported cost, stored removals reused without a current
-    // holder, and stored-removal writes and cap refusals.
+    // holder, and stored-removal writes.
     "copy_prefix_unproven_requests",
     "copy_prefix_unproven_files",
     "copy_prefix_unproven_priced_requests",
     "copy_prefix_unproven_cost_micros",
     "copy_removal_reused",
     "copy_removal_stored",
-    "copy_removal_store_overflow",
-    "copy_removed_unrecorded",
     "copy_removal_metadata_lost",
     "copy_prefix_held_requests",
     "copy_prefix_held_files",
@@ -4550,7 +4512,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
 ];
-const COUNT_LEN: usize = 31;
+const COUNT_LEN: usize = 29;
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4609,22 +4571,20 @@ impl Counts {
             tally.cost_micros,
             tally.reused,
         ]);
-        all[15] = tally.metadata_lost;
-        all[16] = tally.held_requests;
-        all[17] = u64::from(tally.held_requests > 0);
-        all[18] = tally.hold_expired;
-        all[20] = tally.removed_priced_requests;
-        all[21] = tally.removed_cost_micros;
+        all[13] = tally.metadata_lost;
+        all[14] = tally.held_requests;
+        all[15] = u64::from(tally.held_requests > 0);
+        all[16] = tally.hold_expired;
+        all[18] = tally.removed_priced_requests;
+        all[19] = tally.removed_cost_micros;
         Self(all)
     }
-    fn removal_store(added: u64, overflow: u64) -> Self {
+    fn removal_store(added: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[12] = added;
-        all[13] = overflow;
-        all[14] = overflow;
         Self(all)
     }
-    /// One enable-readiness counter (index 24..30) by `n`.
+    /// One enable-readiness counter (index 22..28) by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;

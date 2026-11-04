@@ -47,7 +47,6 @@ pub(in crate::snapshots) fn add(
 /// the replay read. A replay is no failure after a head: it is not in
 /// `tail_reconstruct_after_head`. Its bytes are also in the page's
 /// `completed_full_native_bytes`, as every Full's.
-#[expect(dead_code, reason = "Codex's codec (S2b) counts its replays")]
 pub(in crate::snapshots) fn replay(
     source: SnapshotSource,
     cause: super::ReconstructCause,

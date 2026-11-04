@@ -13,6 +13,7 @@ use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDige
 use crate::transcript_acquisition::DurableCertificate;
 
 pub(in crate::snapshots) mod claude;
+pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
@@ -20,8 +21,7 @@ pub(in crate::snapshots) mod seam;
 
 /// The one list of sources with a Tail codec: `$s` names the source's codec
 /// type inside `$arm`; every other source takes `$none`. A source joins by
-/// adding its arm here, never through its `state_v2` registry flag (Codex has
-/// that flag before its codec exists).
+/// adding its arm here, never through its `state_v2` registry flag.
 macro_rules! with_codec {
     ($source:expr, $s:ident => $arm:expr, _ => $none:expr) => {
         match $source {
@@ -29,11 +29,14 @@ macro_rules! with_codec {
                 type $s = claude::Claude;
                 $arm
             }
+            SnapshotSource::Codex => {
+                type $s = codex::Codex;
+                $arm
+            }
             SnapshotSource::Pi => {
                 type $s = pi::Pi;
                 $arm
             }
-            SnapshotSource::Codex => $none,
         }
     };
 }
@@ -138,12 +141,43 @@ pub(in crate::snapshots) fn pending(
     )
 }
 
+/// A certified cursor job's Tail write, handed to the same staging path as an
+/// ordinary completion (`pending`, then the PRE encode and native verdict).
+/// A cursor certificate reports its completion unsealed (fail-closed,
+/// `CompletedNativeAcquisition::unsealed`); the job's own bit is whether the
+/// native EOF applied an unterminated final record past its sealed offset,
+/// so only that bit drops the publish. A withheld fragment is not applied:
+/// the reduction is the reduction through the sealed offset, and the next
+/// read tails from there.
+pub(in crate::snapshots) fn certified_job(
+    tail: seam::PendingTail,
+    eof_applied: bool,
+) -> seam::PendingTail {
+    tail.sealed_by_job(eof_applied)
+}
+
+/// `key`'s committed sealed offset on `source`'s Tail route: where its next
+/// read continues, read from the head's certificate without decoding the
+/// reduction. `None`: no codec, no route, no readable head, or a route that
+/// cannot be read now; the caller then plans the whole file.
+pub(in crate::snapshots) fn committed_sealed_offset(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    key: &str,
+) -> Option<u64> {
+    let revision = reduction_revision(source)?;
+    tail_route(source, index).ok()??;
+    let head = state_v2::load_head(index, key, revision).ok()??;
+    if head.metadata_only {
+        return None;
+    }
+    let mut d = Dec::new(&head.body);
+    HeadIdentity::take(&mut d).ok()?;
+    Some(DurableCertificate::take(&mut d).ok()?.sealed_offset)
+}
+
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Claude's live inputs join at finish; the next codec constructs these"
-)]
 pub(in crate::snapshots) enum LiveLoadError {
     /// The live input is not available now: the file holds with its debt.
     Unavailable,
@@ -186,12 +220,10 @@ pub(in crate::snapshots) enum ReconstructCause {
     KeyEpoch,
     /// A Codex group read from its first member (D168): a counted replay,
     /// never a load outcome or a failure after a head.
-    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
     GroupReplay,
     /// A file with a protected Codex receipt read from its start, so the
     /// receipt's prefix is reproduced (D168): a counted replay, never a load
     /// outcome or a failure after a head.
-    #[expect(dead_code, reason = "Codex's codec (S2b) counts it")]
     TierPrefixReplay,
 }
 impl ReconstructCause {
@@ -569,6 +601,53 @@ fn hour_pages<K: Durable, V: Durable>(
         .collect()
 }
 
+/// The hashed changed-file log shared by every source's codec. `G` is page
+/// geometry: additional keys create additional pages, never a total-data cap.
+mod changed_files {
+    use super::*;
+    pub(super) const G: u32 = 256;
+    pub(super) fn keys(acc: &SnapshotAccumulator) -> Vec<&String> {
+        acc.activity_changed_file_hashes.iter().collect()
+    }
+    pub(super) fn page(keys: &[&String]) -> Result<Vec<u8>, Refuse> {
+        page_bytes(keys.iter(), |hash, e| {
+            hash.put_h(e, "SnapshotAccumulator.activity_changed_file_hashes")
+        })
+    }
+    pub(super) fn page_keys(bytes: &[u8]) -> Result<Vec<String>, ReconstructCause> {
+        let mut keys = Vec::new();
+        read_page(bytes, G, |d| {
+            keys.push(String::take_h(d)?);
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+    pub(super) fn encode(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> {
+        keys(acc)
+            .chunks(G as usize)
+            .enumerate()
+            .map(|(n, keys)| Ok((n as u64, page(keys)?)))
+            .collect()
+    }
+    pub(super) fn decode(
+        bytes: &[u8],
+        into: &mut SnapshotAccumulator,
+    ) -> Result<(), ReconstructCause> {
+        read_page(bytes, G, |d| {
+            if into.activity_changed_file_hashes.insert(String::take_h(d)?) {
+                Ok(())
+            } else {
+                Err(ReconstructCause::Corrupt)
+            }
+        })
+    }
+}
+
+/// A capability bucket's start: the first part of its key.
+fn capability_hour(key: &(String, String, String)) -> &str {
+    &key.0
+}
+
 /// One stored `Hour` page into `map`. An entry off its own hour's page, or a
 /// key stored twice, is corrupt.
 fn read_hour_page<K: Durable + Ord, V: Durable>(
@@ -600,19 +679,27 @@ const SESSION_FACTS: CollectionSpec = CollectionSpec {
 /// The session facts (D168-1): content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. A kind or version this build does not
-/// know is incompatible: new ones come with a reduction revision.
+/// know is incompatible: new ones come with a reduction revision. Kinds are
+/// shared by every codec; a kind its source never sets is never stored (the
+/// Codex agent label and prelude on Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact {
     Title = 0,
     FirstPrompt = 1,
     Workspace = 2,
     OpeningSettings = 3,
+    /// Codex: the agent label (nickname or role) a subagent rollout carries.
+    AgentLabel = 4,
+    /// Codex: the session-start prelude parser, with its loaded texts.
+    CodexPrelude = 5,
 }
-const FACTS: [Fact; 4] = [
+const FACTS: [Fact; 6] = [
     Fact::Title,
     Fact::FirstPrompt,
     Fact::Workspace,
     Fact::OpeningSettings,
+    Fact::AgentLabel,
+    Fact::CodexPrelude,
 ];
 const FACT_VERSION: u64 = 1;
 
@@ -625,6 +712,8 @@ impl Fact {
             }
             Self::Workspace => acc.workspace_path.is_some(),
             Self::OpeningSettings => acc.session_start.has_opening_fact(),
+            Self::AgentLabel => acc.codex_agent_label.is_some(),
+            Self::CodexPrelude => acc.session_start.has_codex_prelude(),
         }
     }
 
@@ -650,6 +739,8 @@ impl Fact {
                 .transpose()?
                 .put(e),
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
+            Self::AgentLabel => acc.codex_agent_label.put(e),
+            Self::CodexPrelude => acc.session_start.put_codex_prelude_fact(e),
         }
     }
 
@@ -680,6 +771,8 @@ impl Fact {
                 into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
             }
             Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
+            Self::AgentLabel => into.codex_agent_label = <Option<String> as Durable>::take(&mut d)?,
+            Self::CodexPrelude => into.session_start.take_codex_prelude_fact(&mut d)?,
         }
         d.finish()?;
         // A stored slot holds its fact: an empty one is corrupt.
@@ -761,8 +854,8 @@ macro_rules! head_fields {
 // The head-field core every codec writes: each accumulator field by its Tail
 // home. Stored fields keep their record class, except that skill labels are
 // plain data and the fork parent and artifacts are stored. `X` fields are
-// content a codec keeps as session facts (Claude: `tail.page.session_facts`),
-// except the Codex agent label, which a Claude parse never sets. `I` marks a
+// content every codec keeps as session facts (`tail.page.session_facts`); the
+// Codex agent label is Codex's fact, and a Claude head refuses it. `I` marks a
 // field this walk does not store: a codec keeps its own `I` fields in its
 // pages or in a trailer after this walk, or never stores them (finish-only
 // and live fields, listed in its `finish_field_nonempty`). Claude's: pages
@@ -936,6 +1029,8 @@ head_fields! {
         I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
         L claude_compaction_link_tip: Option<(u64, String)>,
         D session_start: Box<session_start::SessionStartState>,
+        I codex_dictionary_slots: crate::snapshots::codex_dictionary_slots::CodexDictionarySlots,
+        I codex_sidecar_binding: Option<String>,
     }
 }
 

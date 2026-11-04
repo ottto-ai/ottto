@@ -25,6 +25,7 @@ pub(in crate::snapshots::tail_source) fn parse_lines(
     source: SnapshotSource,
     apply: fn(&serde_json::Value, &mut SnapshotAccumulator),
     lines: &[String],
+    name: &str,
 ) -> (
     crate::snapshots::sampled_jsonl::CachedJsonlReduction,
     DurableCertificate,
@@ -37,7 +38,7 @@ pub(in crate::snapshots::tail_source) fn parse_lines(
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("session.jsonl");
+    let path = dir.join(name);
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     let scope = scope();
     let mut parser = fixture::parser(source, &path, std::fs::File::open(&path).unwrap(), apply);
@@ -105,6 +106,11 @@ pub(in crate::snapshots::tail_source) struct Route {
 }
 
 pub(in crate::snapshots::tail_source) fn route() -> Route {
+    route_for(Source::Claude)
+}
+
+/// A state database route for `source` in a fresh directory.
+pub(in crate::snapshots::tail_source) fn route_for(source: Source) -> Route {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ottto-tail-seam-{}-{}",
@@ -113,7 +119,7 @@ pub(in crate::snapshots::tail_source) fn route() -> Route {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
-    let (session, index) = ColdSession::publish(Source::Claude, &ScanIndex::default(), &dir);
+    let (session, index) = ColdSession::publish(source, &ScanIndex::default(), &dir);
     Route {
         path: session.path().to_owned(),
         _session: session,
@@ -166,13 +172,24 @@ impl Route {
     pub(in crate::snapshots::tail_source) fn finish(
         &self,
         path: &Path,
-        mut parser: OwnedJsonlParser,
+        parser: OwnedJsonlParser,
         base: Option<TailBase>,
         at_pre: impl FnOnce(&mut SnapshotAccumulator),
     ) -> (PendingTail, Result<ParsedJsonlFile>) {
+        self.finish_under::<Claude>(path, parser, base, at_pre, &scope())
+    }
+    /// A native completion for any codec, under its acquisition scope.
+    pub(in crate::snapshots::tail_source) fn finish_under<S: TailSource>(
+        &self,
+        path: &Path,
+        mut parser: OwnedJsonlParser,
+        base: Option<TailBase>,
+        at_pre: impl FnOnce(&mut SnapshotAccumulator),
+        scope: &Scope,
+    ) -> (PendingTail, Result<ParsedJsonlFile>) {
         let completed = parser
             .retain_reduction(
-                &scope(),
+                scope,
                 NOW,
                 sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
             )
@@ -180,26 +197,18 @@ impl Route {
             .expect("a clean fixture is certified");
         at_pre(&mut parser.accumulator);
         let mut tail = PendingTail {
-            source: SnapshotSource::ClaudeCode,
+            source: S::SOURCE,
             route: self.path.clone(),
             key: local_index_key(path),
-            id: HeadIdentity::new(
-                &self.path,
-                SnapshotSource::ClaudeCode,
-                &self.dir,
-                path,
-                false,
-            ),
+            id: HeadIdentity::new(&self.path, S::SOURCE, &self.dir, path, false),
             certificate: completed.checkpoint.durable_certificate(0).unwrap(),
             unsealed: completed.unsealed,
             full: base.is_none(),
             base,
-            encode: tail_encode::<Claude>,
+            encode: tail_encode::<S>,
             encoded: None,
         };
-        let identity =
-            opened_object_identity(SnapshotSource::ClaudeCode, &mut File::open(path).unwrap())
-                .unwrap();
+        let identity = opened_object_identity(S::SOURCE, &mut File::open(path).unwrap()).unwrap();
         let request = FinishRequest {
             expected_opened_object_identity: &identity,
             path,

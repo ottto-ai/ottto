@@ -154,13 +154,13 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
         .clone();
     into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
+    into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
     into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
     into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
-    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
     into.withheld_memo = from.withheld_memo.clone();
 }
 
@@ -208,8 +208,12 @@ pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> 
 pub(crate) struct Continuation {
     audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
     last_full_verified: u64,
+    sealed_offset: u64,
 }
 impl Continuation {
+    pub(crate) fn sealed_offset(&self) -> u64 {
+        self.sealed_offset
+    }
     pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
         self.audit_debt
     }
@@ -230,12 +234,14 @@ pub(crate) fn continuation_for_test(
 ) -> Option<Continuation> {
     let certificate = match source {
         SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
-        SnapshotSource::Codex | SnapshotSource::Pi => {
+        SnapshotSource::Codex => head_certificate::<tail_source::codex::Codex>(index, key)?,
+        SnapshotSource::Pi => {
             return cache
                 .retained_checkpoint(key)
                 .map(|checkpoint| Continuation {
                     audit_debt: checkpoint.audit_debt(),
                     last_full_verified: checkpoint.last_full_verified(),
+                    sealed_offset: checkpoint.sealed_offset(),
                 })
         }
     };
@@ -244,6 +250,7 @@ pub(crate) fn continuation_for_test(
             .audit_debt_unix_seconds
             .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
         last_full_verified: certificate.verified_unix_seconds,
+        sealed_offset: certificate.sealed_offset,
     })
 }
 
@@ -823,4 +830,46 @@ pub(crate) fn pause_adoption(support: &Path) {
     let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b"malformed synthetic exclusion input").unwrap();
+}
+
+/// Telemetry retention dependency row: an account hold on `key`.
+pub(crate) fn hold_claude_account_for_test(index: &mut ScanIndex, key: &str) {
+    index
+        .claude_account_deferred_holds
+        .insert(key.to_owned(), "held-source".to_owned());
+}
+
+/// Telemetry retention dependency row: a Tail head for `key` (no pages) on
+/// `index`'s live route, committed by an ordinary save. True when the
+/// committed heads then hold it.
+pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> bool {
+    let route = route_of(index).expect("a routed index");
+    state_v2::stage_tail(
+        &route,
+        key,
+        state_v2::StagedFile {
+            revision: 1,
+            head: b"head".to_vec(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    index.save(&route).unwrap();
+    state_v2::tail_head_keys(index).unwrap().contains(key)
+}
+
+/// Telemetry retention dependency row: `owner` is a legacy owner root of
+/// `root`'s family witness, under a terminal (unproven) authority record.
+pub(crate) fn legacy_owner_of_terminal_family_for_test(
+    index: &mut ScanIndex,
+    root: &str,
+    owner: &str,
+) {
+    index.insert_unproven_terminal_claude_authority_for_test(root, &"1".repeat(64));
+    index
+        .claude_usage_family_witnesses
+        .get_mut(root)
+        .expect("the terminal record retains its witness")
+        .legacy_owner_roots
+        .insert(owner.to_owned());
 }

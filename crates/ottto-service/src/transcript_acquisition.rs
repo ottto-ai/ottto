@@ -417,7 +417,6 @@ impl Checkpoint {
 /// file's decision depends on: the stamp (length = sealed `s`), scope and
 /// verification time, with both samples kept only as SHA-256. Minted only by
 /// `Checkpoint::seal_as`, so only from a committed checkpoint.
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrefixSeal {
     stamp: FileStamp,
@@ -432,6 +431,25 @@ pub(crate) struct PrefixSeal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audit_debt_unix_seconds: Option<u64>,
 }
+#[cfg(unix)]
+crate::durable_tail_codec::durable_struct!(FileStamp {
+    N length: u64,
+    N device: u64,
+    N inode: u64,
+    N modified: (i64, i64),
+    N changed: (i64, i64),
+});
+#[cfg(unix)]
+crate::durable_tail_codec::durable_struct!(PrefixSeal {
+    D stamp: FileStamp,
+    N scope: String,
+    N sample_len: u32,
+    H head_sha256: String,
+    H boundary_sha256: String,
+    N verified_unix_seconds: u64,
+    N sealed_unix_seconds: u64,
+    N audit_debt_unix_seconds: Option<u64>,
+});
 
 #[cfg(test)]
 impl PrefixSeal {
@@ -611,6 +629,21 @@ pub(crate) enum ReadMode {
     Tail,
     Unchanged,
 }
+
+#[cfg(unix)]
+crate::durable_tail_codec::durable_enum!(FullReason {
+    0 => StateMissing,
+    1 => AuditDue,
+    2 => ClockChanged,
+    3 => ScopeChanged,
+    4 => InvalidCheckpoint,
+    5 => Replaced,
+    6 => Shrunk,
+    7 => SameSizeEdit,
+    8 => HeadChanged,
+    9 => BoundaryChanged,
+    10 => UnsupportedIdentity,
+});
 
 impl FullReason {
     pub(crate) fn slot(self) -> usize {
@@ -1305,7 +1338,7 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 /// a replacement; the samples, checked next, still decide its content. Linux
 /// keeps birth constant, so this never applies there.
 #[cfg(unix)]
-fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
+pub(crate) fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> bool {
     let modified = metadata
         .modified()
         .ok()

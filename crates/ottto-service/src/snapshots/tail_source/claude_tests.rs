@@ -53,7 +53,12 @@ pub(in crate::snapshots) fn lines(responses: usize) -> Vec<String> {
 }
 
 fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
-    parse_lines(SnapshotSource::ClaudeCode, apply_claude_code_line, lines)
+    parse_lines(
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        lines,
+        "session.jsonl",
+    )
 }
 
 fn identity(file: &str, capture: bool) -> HeadIdentity {

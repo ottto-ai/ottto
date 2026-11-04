@@ -4213,7 +4213,6 @@ fn collect_claude_status(
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
-    note_claude_folder_owner(&ClaudeConfigDirSlot::Default, &local, None);
     let mut login_state = local.state;
     let default_live = local.live_login();
     // "Keep my Claude accounts signed in": the default login gets the same
@@ -5986,8 +5985,6 @@ fn collect_registered_claude_slot_step(
         Ok(expected) => expected,
         Err(status) => {
             claude_oauth_end_slot_run(slot_id);
-            // Another account here is exactly what the folder ledger records.
-            note_refused_claude_slot(descriptor);
             return ClaudeSlotCollectionStep::PreGateRefused(status);
         }
     };
@@ -6000,13 +5997,6 @@ fn collect_registered_claude_slot_step(
     let local = network_enabled
         .then(|| read_registered_claude_slot_locally(descriptor))
         .flatten();
-    if let (Some(local), Some(binding), Some(slot)) = (
-        local.as_ref(),
-        expected_binding.as_ref(),
-        claude_config_slot_for_descriptor(descriptor),
-    ) {
-        note_claude_folder_owner(&slot, local, Some(binding));
-    }
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
@@ -6665,91 +6655,6 @@ fn claude_owner_call_allowed() -> bool {
     !claude_oauth_usage_network_disabled()
         && !claude_pass_saved_only()
         && !claude_background_read_withheld()
-}
-
-/// Reports one folder's login to the recorded-login ledger, in memory. Reads no
-/// extra file. At most one profile call per token on the default folder, only
-/// while the capability is on and the folder can still qualify, never a login
-/// change, and under the same background gates as every other Claude read.
-fn note_claude_folder_owner(
-    slot: &ClaudeConfigDirSlot,
-    local: &ClaudeSlotLocalRead,
-    registered: Option<&ClaudeSlotAccountBinding>,
-) {
-    use crate::claude_status_coverage as coverage;
-    use crate::snapshots::claude_folder_login as folder;
-    let config_dir = slot
-        .config_dir()
-        .map_or_else(|| home_dir().join(".claude"), PathBuf::from);
-    let home = folder::folder_key(&config_dir);
-    let strong = |account: &Option<ClaudeCliOauthAccount>| {
-        account
-            .as_ref()
-            .and_then(claude_strong_oauth_identity_hashes)
-    };
-    let cached = strong(&local.initial_oauth_account)
-        .filter(|pair| strong(&local.final_oauth_account).as_ref() == Some(pair));
-    let email = cached
-        .as_ref()
-        .and(local.final_oauth_account.as_ref())
-        .and_then(|account| account.email_address.as_deref())
-        .filter(|email| !email.trim().is_empty());
-    let report = match registered {
-        Some(binding) => {
-            let pair = (
-                binding.account_identifier_hash.clone(),
-                binding.organization_identifier_hash.clone(),
-            );
-            coverage::OwnerReport {
-                slot: true,
-                other_account: cached.as_ref().is_some_and(|cached| *cached != pair),
-                pair: cached.is_some().then_some(pair),
-                proven: None,
-                email: None,
-            }
-        }
-        None => {
-            let token = match &local.credential {
-                ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
-                _ => None,
-            };
-            let may_call = coverage::proof_wanted(&home)
-                && matches!(local.state, ClaudeLocalLoginState::AccessValid)
-                && claude_owner_call_allowed();
-            coverage::OwnerReport {
-                slot: false,
-                pair: cached,
-                proven: token
-                    .and_then(|token| claude_token_owner::proven_owner(token, may_call))
-                    .map(|owner| (owner.account_hash, owner.organization_hash)),
-                email: None,
-                other_account: false,
-            }
-        }
-    };
-    coverage::observe_with_email(home, report, email);
-}
-
-/// A refused slot: only another strong account in it reaches the ledger. An
-/// unreadable login or approval proves nothing.
-fn note_refused_claude_slot(descriptor: &ClaudeConfigSlotDescriptorV1) {
-    use crate::claude_status_coverage as coverage;
-    use crate::snapshots::claude_folder_login as folder;
-    if !claude_slot_login_unapproved(descriptor) || claude_slot_local_login(descriptor).is_none() {
-        return;
-    }
-    if let Some(config_dir) = claude_config_slot_for_descriptor(descriptor)
-        .and_then(|slot| slot.config_dir().map(PathBuf::from))
-    {
-        coverage::observe(
-            folder::folder_key(&config_dir),
-            coverage::OwnerReport {
-                slot: true,
-                other_account: true,
-                ..coverage::OwnerReport::default()
-            },
-        );
-    }
 }
 
 fn read_registered_claude_slot_locally(
@@ -15223,8 +15128,7 @@ fn percent_quota_status(used_percent: u8) -> AgentQuotaWindowStatus {
 }
 
 fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("pi") && !home_path(".pi").exists() && !pi_agent_dir(&home_dir()).exists()
-    {
+    if !crate::agent_configs::detection::source_present_locally(&SourceKind::Pi) {
         return not_installed_snapshot(SourceKind::Pi, "pi", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(

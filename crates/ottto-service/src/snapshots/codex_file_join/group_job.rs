@@ -1248,6 +1248,18 @@ pub(in crate::snapshots) fn end_group(
     let Some(group) = active.group.as_deref() else {
         return;
     };
+    // An ended group's replay counts with the bytes it read, as a completed
+    // one's does at its completion.
+    #[cfg(unix)]
+    if sampling.is_some() && crate::snapshots::tail_source::has_codec(SnapshotSource::Codex) {
+        crate::snapshots::tail_source::counters::replay(
+            SnapshotSource::Codex,
+            crate::snapshots::tail_source::ReconstructCause::GroupReplay,
+            group
+                .consumed_before
+                .saturating_add(active.parser.reader.consumed_bytes()),
+        );
+    }
     match end {
         // The chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
@@ -1259,9 +1271,6 @@ pub(in crate::snapshots) fn end_group(
             ..
         } if group.probe_bound => {
             if let Some(context) = sampling {
-                context
-                    .cache
-                    .note_join_refusal(JoinRefusal::ProbeBudgetOrder);
                 // Converge under stable inputs. An
                 // order the page's remaining singleton budget forced gets a
                 // page of its own next; one `PROBE_BYTES` forced (or forced
@@ -1303,7 +1312,6 @@ pub(in crate::snapshots) fn end_group(
             let disclosure = refusal_disclosure(&group.owner);
             let live_failed = position + 1 == group.members.len();
             if let Some(context) = sampling {
-                context.cache.note_join_refusal(reason);
                 // §d.4: growth of the live member may cure this refusal, so
                 // its entry matches only the exact recorded stamp: any
                 // append or touch wakes it, an unchanged group is not re-read.

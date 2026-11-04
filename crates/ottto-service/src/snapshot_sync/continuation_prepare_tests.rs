@@ -143,7 +143,6 @@ impl ContinuationFixture {
             retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
-            sole_login: false,
             account_witness: [3; 32],
             scan_started_at: "2026-10-24T00:00:00Z".into(),
             activity_hint: continuation_hint(true),
@@ -431,6 +430,39 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         serde_json::to_value(&prepared.backfill_state).unwrap(),
         serde_json::to_value(load_backfill_state(&fixture.support_dir)).unwrap()
     );
+}
+
+/// A continuation page loads the upload ledger afresh and mirrors its open
+/// head-CAS challenges into the page's index, as the ordinary prepare does,
+/// so a session that owes an answer never continues from Tail state there.
+#[test]
+fn a_continuation_page_mirrors_an_open_head_conflict() {
+    let fixture = ContinuationFixture::quiescent("continuation-head-conflict");
+    let key = cache_session_key("synthetic-conflicted-session");
+    let (mut progress, _) = fixture.load();
+    progress.head_conflict_challenges.insert(
+        key.clone(),
+        HeadConflictChallenge {
+            challenge: "c".repeat(64),
+            stale_revision_v2_hash: "d".repeat(64),
+            answer_attempts: 1,
+            last_answer_unix: 1,
+        },
+    );
+    progress.save(&fixture.upload_progress_path).unwrap();
+    let mut minted = fixture.preparation(true);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
+    let prepared = fixture
+        .prepare(&mut inputs)
+        .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
+    assert!(prepared.committed_index.head_conflict_owed(&key));
+    assert!(!prepared
+        .committed_index
+        .head_conflict_owed(&cache_session_key("synthetic-other-session")));
 }
 
 /// K1.1: a destination with a historical replay pending refuses before any

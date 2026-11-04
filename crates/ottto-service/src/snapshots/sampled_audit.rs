@@ -1924,12 +1924,6 @@ pub(super) struct GrowthRetention {
 }
 crate::heap_layout_bound::fields!(GrowthRetention; predecessor_size, uncertain_passes, checked_generation, last_growth_full_unix);
 
-/// Whether this graph generation already revalidated `key` (runtime-only memo).
-pub(super) fn growth_checked(index: &ScanIndex, key: &str) -> bool {
-    let (generation, keys) = &index.v2().growth_checked;
-    *generation == index.generation && keys.contains(key)
-}
-
 pub(super) fn growth_active(index: &ScanIndex) -> bool {
     crate::snapshots::state_v2::state_v2_growth_retention_active(index)
 }
@@ -2045,7 +2039,6 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
         .as_ref()
         .is_some_and(|walk| walk.residue.index_keys.contains(key));
     let v2 = index.v2_mut();
-    note_growth_checked(v2, generation, key);
     if uncertain {
         let state = v2.growth_retention.entry(key.to_owned()).or_default();
         if state.checked_generation != Some(generation) {
@@ -2123,54 +2116,18 @@ pub(super) fn defer_growth_read(
     }
 }
 
-/// Only witnessed growth debt excludes retirement. An undiscovered range or
-/// residue without a growth entry conveys no retention authority.
-pub(super) fn growth_excluded_parts(
-    key: &str,
-    growth: &BTreeMap<String, GrowthRetention>,
-    walk: Option<&ScanTraversalCheckpoint>,
-    terminal_residue: Option<&BTreeSet<String>>,
-) -> bool {
-    growth.get(key).is_some_and(|state| {
-        state.predecessor_size.is_some()
-            || state.checked_generation.is_none()
-                && (walk.is_some_and(|walk| walk.residue.index_keys.contains(key))
-                    || terminal_residue.is_some_and(|keys| keys.contains(key)))
-    })
-}
-
-pub(super) fn growth_retirement_excluded(index: &ScanIndex, key: &str) -> bool {
-    growth_active(index)
-        && growth_excluded_parts(
-            key,
-            &index.v2().growth_retention,
-            index.traversal.as_ref(),
-            None,
-        )
-}
-
 /// Only native completion calls this; opens, length equality, progress saves,
 /// audit retirement and delivery ACKs do not settle source growth.
 pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
     if growth_active(index) {
-        let _ = state_v2::save_read_completed(index, key);
         let generation = index.generation;
         let v2 = index.v2_mut();
         if let Some(state) = v2.growth_retention.get_mut(key) {
             state.predecessor_size = None;
             state.uncertain_passes = 0;
             state.checked_generation = Some(generation);
-            note_growth_checked(v2, generation, key);
         }
     }
-}
-
-/// Checked this generation: retirement must not revalidate (and re-retain) it.
-fn note_growth_checked(v2: &mut state_v2::IndexState, generation: u64, key: &str) {
-    if v2.growth_checked.0 != generation {
-        v2.growth_checked = (generation, BTreeSet::new());
-    }
-    v2.growth_checked.1.insert(key.to_owned());
 }
 
 pub(super) fn growth_subset(
@@ -2466,13 +2423,9 @@ pub(super) fn growth_read_admitted_at(
         return true;
     }
     let key = local_index_key(&candidate.path);
-    let oversize = match state_v2::save_oversize_active(index) {
-        Ok(held) => held,
-        Err(_) => return false,
-    };
     // A stale graph must not erase committed growth debt and bypass pacing.
     // Authenticate even rewrite Fulls before consulting working-page debt.
-    if index.v2().persistence_v2.is_some() && (oversize || matches!(mode, ReadMode::Full(_))) {
+    if index.v2().persistence_v2.is_some() && matches!(mode, ReadMode::Full(_)) {
         let valid = (|| -> Result<()> {
             let path = &index
                 .v2()
@@ -2489,8 +2442,7 @@ pub(super) fn growth_read_admitted_at(
         }
     }
     let held = index.decode_holds.contains("growth_retention", &key);
-    if !oversize
-        && !held
+    if !held
         && !index
             .v2()
             .growth_retention
@@ -2499,25 +2451,16 @@ pub(super) fn growth_read_admitted_at(
     {
         return true;
     }
-    if oversize
-        || matches!(
-            mode,
-            ReadMode::Full(
-                FullReason::StateMissing
-                    | FullReason::InvalidCheckpoint
-                    | FullReason::UnsupportedIdentity
-            )
+    if matches!(
+        mode,
+        ReadMode::Full(
+            FullReason::StateMissing
+                | FullReason::InvalidCheckpoint
+                | FullReason::UnsupportedIdentity
         )
-    {
+    ) {
         return match claim_growth_full(index, &key, now) {
-            Ok(admitted) => {
-                if oversize && admitted {
-                    crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
-                        "save_oversize_growth_full": 1
-                    }));
-                }
-                admitted
-            }
+            Ok(admitted) => admitted,
             Err(_) => {
                 if index.v2().persistence_v2.is_some() {
                     state_v2::growth_claim_refused("publication");
@@ -2736,9 +2679,9 @@ mod growth_tests {
         }
     }
 
-    /// [money] f2 progress restart terminal excludes debt until native settlement.
+    /// [money] Growth settlement keeps a progress restart's audit debt.
     #[test]
-    fn f2_progress_restart_terminal_excludes_debt_until_native_settlement() {
+    fn f2_progress_restart_growth_settlement_keeps_audit_debt() {
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2751,151 +2694,16 @@ mod growth_tests {
         index.files.get_mut(&fixture.key).unwrap().size_bytes = 11;
         let mut index = restart(&index);
         index.traversal.as_mut().unwrap().pending_candidates.clear();
-        let window = 40 * 86400;
-        assert_eq!(index.retire_claude_transcript_records_for_test(window).0, 0);
-        assert_eq!(index.claude_request_census.hash_total_for_test(), 1);
-        let state = index.files[&fixture.key].clone();
         index
             .files
             .get_mut(&fixture.key)
             .unwrap()
-            .set_unverified_deadline(window + 10);
+            .set_unverified_deadline(40 * 86400 + 10);
         settle_growth(&mut index, &fixture.key);
         assert!(
             index.files[&fixture.key].has_unverified_source(),
             "growth settlement does not erase audit debt"
         );
-        index.files.insert(fixture.key.clone(), state);
-        index.traversal.as_mut().unwrap().reconciliation_after = Some(fixture.key.clone());
-        // Native settlement's existing residue bookkeeping removes that key.
-        index
-            .traversal
-            .as_mut()
-            .unwrap()
-            .residue
-            .index_keys
-            .remove(&fixture.key);
-        assert_eq!(index.retire_claude_transcript_records_for_test(window).0, 1);
-        assert_eq!(index.claude_request_census.hash_total_for_test(), 0);
-    }
-
-    /// [money] f2 admission pressure keeps retained hashes and defers new record.
-    #[test]
-    fn f2_admission_pressure_keeps_retained_hashes_and_defers_new_record() {
-        let fixture = Fixture::new();
-        let mut index = fixture.index();
-        fixture.grow();
-        let cap = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES;
-        let record = ClaudeRequestCensusRecord::synthetic_for_test(
-            &"a".repeat(64),
-            1,
-            ClaudeRequestCensusShape::Exact,
-            (0..cap as u64).collect(),
-        )
-        .with_modified_for_test(Some(1));
-        index
-            .claude_request_census
-            .insert_for_test(&fixture.key, record);
-        let mut index = restart(&index);
-        let new_record = ClaudeRequestCensusRecord::synthetic_for_test(
-            &"b".repeat(64),
-            40 * 86400,
-            ClaudeRequestCensusShape::Exact,
-            vec![u64::MAX],
-        );
-        let outcome = index.insert_transcript_record_for_test("new-key", new_record, 40 * 86400);
-        assert_ne!(
-            outcome,
-            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-        );
-        assert_eq!(
-            index
-                .claude_request_census
-                .record_for_test(&fixture.key)
-                .unwrap()
-                .request_hashes_for_test()
-                .len(),
-            cap
-        );
-        // Occupancy release also excludes this key, even above 90%.
-        assert_eq!(
-            index
-                .retire_claude_transcript_records_for_test(40 * 86400)
-                .0,
-            0
-        );
-        assert_eq!(
-            index.claude_request_census.totals_for_test(),
-            index.claude_request_census.recounted_for_test()
-        );
-    }
-
-    /// [regress] retained same key rollback restores exact custody inside tombstone reserve.
-    #[test]
-    fn retained_same_key_rollback_restores_exact_custody_inside_tombstone_reserve() {
-        let fixture = Fixture::new();
-        let mut index = fixture.index();
-        fixture.grow();
-        revalidate_growth(
-            &mut index,
-            &fixture.key,
-            std::slice::from_ref(&fixture.root),
-        );
-        let whole = super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
-            - 1024 * 1024;
-        let padding = "x".repeat(3900);
-        let mut n = 0;
-        while index.claude_request_census.serialized_total_for_test() <= whole + 16384 {
-            let record = ClaudeRequestCensusRecord::synthetic_for_test(
-                &"b".repeat(64),
-                40 * 86400,
-                ClaudeRequestCensusShape::OverBudget,
-                vec![],
-            )
-            .with_modified_for_test(Some(40 * 86400));
-            assert_ne!(
-                index
-                    .claude_request_census
-                    .insert_for_test(&format!("reserve-{n:05}-{padding}"), record,),
-                super::super::claude_request_census::ClaudeRequestCensusInsert::Refused
-            );
-            n += 1;
-        }
-        let before = index
-            .claude_request_census
-            .get(&fixture.key)
-            .unwrap()
-            .clone();
-        let hashes = before.request_hashes_for_test().as_ptr();
-        let bytes = serde_json::to_vec(&before).unwrap();
-        let totals = index.claude_request_census.totals_for_test();
-        assert!(totals.1 > whole);
-        assert!(
-            totals.1
-                < super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
-        );
-        let outcome = index.insert_transcript_record_for_test(
-            &fixture.key,
-            before.clone().with_request_hashes_for_test(vec![7, 8]),
-            40 * 86400,
-        );
-        assert_ne!(
-            outcome,
-            super::super::claude_request_census::ClaudeRequestCensusInsert::Stored
-        );
-        let restored = index.claude_request_census.get(&fixture.key).unwrap();
-        assert_eq!(
-            serde_json::to_vec(restored).unwrap(),
-            bytes,
-            "exact old record"
-        );
-        assert_eq!(
-            restored.request_hashes_for_test().as_ptr(),
-            hashes,
-            "same shared hash buffer"
-        );
-        assert_eq!(index.claude_request_census.totals_for_test(), totals);
-        assert_eq!(index.claude_request_census.recounted_for_test(), totals);
     }
 
     /// [off=main] f3 off preserves v1 age and bytes.
@@ -2989,19 +2797,11 @@ mod growth_tests {
             0
         );
     }
-    /// [regress] N5: retirement revalidation persisted a growth row for every
-    /// unchanged aged candidate and rewrote debt rows every generation.
+    /// [regress] N5: revalidation rewrote debt rows every generation.
     #[test]
-    fn retirement_revalidation_persists_no_check_only_rows() {
+    fn growth_revalidation_records_checked_status_once() {
         let fixture = Fixture::new();
         let mut index = fixture.index();
-        assert_eq!(
-            index
-                .retire_claude_transcript_records_for_test(40 * 86400)
-                .0,
-            1
-        );
-        assert!(index.files.contains_key(&fixture.key));
         assert!(!index.v2().growth_retention.contains_key(&fixture.key));
         // A debt row records its checked status once, not every generation.
         fixture.grow();

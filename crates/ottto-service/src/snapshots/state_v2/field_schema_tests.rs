@@ -655,7 +655,9 @@ fn unwritten(kind: &str) -> bool {
         || kind.starts_with("raw_hold.")
         || matches!(
             kind,
-            "setting.upload_context_fingerprint" | "v1_field.claude_desktop_census_witness"
+            "setting.upload_context_fingerprint"
+                | "v1_field.claude_desktop_census_witness"
+                | "v1_field.claude_folder_login_ledger"
         )
 }
 

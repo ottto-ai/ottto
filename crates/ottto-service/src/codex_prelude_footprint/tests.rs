@@ -1419,3 +1419,42 @@ fn obsolete_index_cleanup_counts_once_and_never_sweeps_a_directory() {
         );
     }
 }
+
+#[test]
+fn prelude_fact_pads_shorter_block_arrays_and_refuses_longer_arrays() {
+    use crate::durable_tail_codec::{Dec, Durable, Enc, GrownArray};
+    let mut parser = CodexPreludeParser::default();
+    parser.prelude.block_chars = std::array::from_fn(|n| 1000 + n as u64);
+    let fact = Enc::count_write(1 << 20, |e| parser.put_fact(e)).unwrap();
+    let array = Enc::count_write(1 << 20, |e| parser.prelude.block_chars.put_grown(e)).unwrap();
+    let positions: Vec<_> = fact
+        .windows(array.len())
+        .enumerate()
+        .filter_map(|(at, bytes)| (bytes == array).then_some(at))
+        .collect();
+    assert_eq!(positions.len(), 1);
+    let at = positions[0];
+    for len in [BLOCK_KINDS - 1, BLOCK_KINDS + 1] {
+        let replacement = Enc::count_write(1 << 20, |e| {
+            e.varint(len as u64)?;
+            for n in 0..len {
+                (1000 + n as u64).put(e)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let edited = [&fact[..at], &replacement, &fact[at + array.len()..]].concat();
+        let mut d = Dec::new(&edited);
+        if len < BLOCK_KINDS {
+            let restored = CodexPreludeParser::take_fact(&mut d).unwrap();
+            d.finish().unwrap();
+            assert_eq!(
+                &restored.prelude.block_chars[..len],
+                &parser.prelude.block_chars[..len]
+            );
+            assert_eq!(restored.prelude.block_chars[len], 0);
+        } else {
+            assert!(CodexPreludeParser::take_fact(&mut d).is_err());
+        }
+    }
+}

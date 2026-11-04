@@ -440,6 +440,13 @@ pub(in crate::snapshots) struct OpenStamp {
     changed: (i64, i64),
 }
 crate::heap_layout_bound::fields!(OpenStamp; dev, ino, extent, modified, changed);
+crate::durable_tail_codec::durable_struct!(OpenStamp {
+    N dev: u64,
+    N ino: u64,
+    N extent: u64,
+    N modified: (i64, i64),
+    N changed: (i64, i64),
+});
 
 /// The cursor/acquisition content key, without metadata-only ctime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1225,26 +1232,9 @@ macro_rules! cursor_counters {
             $($(#[$doc])* pub(in crate::snapshots) $event: u64,)+
             /// Largest `now - due` of an `audit_overdue` completion, in seconds.
             pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
-            /// P2 (RAM only; not yet in the diagnostics projection): group cursor
-            /// jobs started, group memo hits, group attempts skipped by the
-            /// generation fence, groups whose probe hit `PROBE_BYTES` or the
-            /// boot's probe allowance
-            /// (chronological order kept), and group refusals by `JoinRefusal` slot
-            /// (§d.1.1; terminal debt except `ProbeBudgetOrder`, which is strict).
-            pub(in crate::snapshots) groups_started: u64,
-            pub(in crate::snapshots) group_memo_hits: u64,
-            pub(in crate::snapshots) groups_fenced: u64,
-            pub(in crate::snapshots) probe_bound: u64,
-            pub(in crate::snapshots) join_terminal_debt: [u64; codex_file_join::JOIN_REFUSALS],
-            /// Stage 1 guard (RAM/test only; not in the diagnostics projection): a
-            /// large ordinary start deferred before its last attempt's ordinary
-            /// equivalent (§6). Owed, like any deferral: never a waiter, a skip, a
-            /// loss or a completion, and no completeness meaning.
-            pub(in crate::snapshots) deferred_paced: u64,
+
         }
-        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds,
-            groups_started, group_memo_hits, groups_fenced, probe_bound, join_terminal_debt,
-            deferred_paced);
+        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds);
     };
 }
 crate::local_resource_diagnostics::codex_cursor_events!(cursor_counters);
@@ -3662,22 +3652,6 @@ impl SharedCache {
             .unwrap_or_default()
     }
 
-    /// Terminal group debt by reason (§d.1.1 S11 counter).
-    pub(in crate::snapshots) fn note_join_refusal(&self, reason: codex_file_join::JoinRefusal) {
-        self.with_cursor(|cursor| {
-            let slot = &mut cursor.counters.join_terminal_debt[reason.slot()];
-            *slot = slot.saturating_add(1);
-        });
-    }
-
-    pub(in crate::snapshots) fn note_group_memo_hit(&self) {
-        self.with_cursor(|cursor| cursor.counters.group_memo_hits += 1);
-    }
-
-    pub(in crate::snapshots) fn note_probe_bound(&self) {
-        self.with_cursor(|cursor| cursor.counters.probe_bound += 1);
-    }
-
     /// M-5: this group's attempt ended as terminal debt in generation
     /// `fence`; a later selection in the same generation is skipped.
     pub(in crate::snapshots) fn group_attempted(
@@ -3691,7 +3665,7 @@ impl SharedCache {
     }
 
     /// M-5 (b) at pop: the group's attempt already ended in this generation.
-    /// Counted in `groups_fenced`; its members are not processed again.
+    /// Its members are not processed again.
     pub(in crate::snapshots) fn group_fenced(
         &self,
         namespace: &Scope,
@@ -3699,14 +3673,8 @@ impl SharedCache {
         fence: Option<&str>,
     ) -> bool {
         let key = rotation_key(&namespace.0, key);
-        self.with_cursor(|cursor| {
-            let fenced = cursor.rotation.fenced(&key, fence);
-            if fenced {
-                cursor.counters.groups_fenced += 1;
-            }
-            fenced
-        })
-        .unwrap_or(false)
+        self.with_cursor(|cursor| cursor.rotation.fenced(&key, fence))
+            .unwrap_or(false)
     }
 
     /// §d.1.3: B blocked `owner` for a queued group of `members`. The exact
@@ -4000,7 +3968,7 @@ impl SharedCache {
     /// (`PaceTable::verdict`). A paced deferral is an ordinary `Defer`: the
     /// caller requeues the file, owed. It is never recorded as a waiter (it
     /// leaves `rotation.waiting`, so it blocks no turn) and is neither a
-    /// completion, a fence, a skip nor a loss; it counts `deferred_paced`.
+    /// completion, a fence, a skip nor a loss.
     /// The file's stamp is read before the cursor lock (no IO under it); an
     /// unreadable stamp plans as today (the start then refuses it).
     #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
@@ -4046,7 +4014,7 @@ impl SharedCache {
             if let Some((pace_key, rev)) = paced.as_ref() {
                 if cursor.pace.verdict(*pace_key, rev, pace_now()) == PaceVerdict::Defer {
                     cursor.rotation.waiting.remove(&key);
-                    cursor.counters.deferred_paced += 1;
+
                     return StartPlan::Defer;
                 }
             }
@@ -4249,7 +4217,7 @@ impl SharedCache {
                 cursor.slot_members = members;
                 cursor.rotation.waiting.remove(&waiter);
                 cursor.counters.jobs_started += 1;
-                cursor.counters.groups_started += 1;
+
                 Some(token)
             })
             .flatten()
@@ -4957,6 +4925,38 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     revalidate_decisions(job, traces)
 }
 
+/// What this cycle's traces say about a read's earlier priority decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum PriorityDecisions {
+    Hold,
+    /// Absent or incomplete traces cannot prove a decision changed.
+    Unavailable,
+    Changed,
+}
+
+/// The one comparison of earlier priority decisions with current traces,
+/// shared by a paused job's resume and a Tail load's LIVE install.
+pub(in crate::snapshots) fn priority_decisions(
+    observed: &BTreeMap<String, bool>,
+    traces: Option<&Arc<CodexTurnTraceMap>>,
+) -> PriorityDecisions {
+    if traces.is_none() && observed.values().any(|priority| *priority) {
+        return PriorityDecisions::Unavailable;
+    }
+    let decisions_hold = observed.iter().all(|(turn, priority)| {
+        *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
+    });
+    if decisions_hold {
+        PriorityDecisions::Hold
+    } else if traces.is_some_and(|traces| traces.is_incomplete()) {
+        // R2-H1: a failed or capped trace load cannot prove a decision
+        // changed; the read waits for complete evidence.
+        PriorityDecisions::Unavailable
+    } else {
+        PriorityDecisions::Changed
+    }
+}
+
 /// Every priority decision so far still holds under this cycle's traces;
 /// then this cycle's traces are installed.
 fn revalidate_decisions(
@@ -4971,21 +4971,10 @@ fn revalidate_decisions(
     else {
         return Resume::Changed;
     };
-    match traces.as_ref() {
-        None if observed.values().any(|priority| *priority) => return Resume::Unavailable,
-        traces => {
-            let decisions_hold = observed.iter().all(|(turn, priority)| {
-                *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
-            });
-            if !decisions_hold {
-                // R2-H1: a failed or capped trace load cannot prove a
-                // decision changed; the job waits for complete evidence.
-                if traces.is_some_and(|traces| traces.is_incomplete()) {
-                    return Resume::Unavailable;
-                }
-                return Resume::Changed;
-            }
-        }
+    match priority_decisions(observed, traces.as_ref()) {
+        PriorityDecisions::Hold => {}
+        PriorityDecisions::Unavailable => return Resume::Unavailable,
+        PriorityDecisions::Changed => return Resume::Changed,
     }
     job.parser.accumulator.codex_turn_traces = traces;
     Resume::Valid

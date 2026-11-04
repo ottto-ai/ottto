@@ -1585,9 +1585,187 @@ pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bo
         trace_evidence_path(support_dir, session_id),
     ]
     .iter()
-    .all(|path| {
-        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    .all(|path| matches!(telemetry_member(path), Ok(None)))
+}
+
+/// One telemetry pair (API + trace member) as read for retention. Each member
+/// is optional: `None` is a confirmed NotFound.
+pub(crate) struct TelemetryPair {
+    /// Every API and trace request id.
+    pub(crate) request_ids: BTreeSet<String>,
+    /// Earliest `observed_at` (unix seconds); `u64::MAX` for no rows.
+    pub(crate) first_observed: u64,
+    /// Latest mtime or ctime of a present member (unix seconds).
+    pub(crate) last_write: i64,
+    pub(crate) bytes: u64,
+    generations: [Option<ApiFileGeneration>; 2],
+}
+
+/// Every stem (`sha256(session id)`) in either telemetry directory. A missing
+/// directory has none.
+pub(crate) fn telemetry_stems(support_dir: &Path) -> std::io::Result<BTreeSet<String>> {
+    let mut stems = BTreeSet::new();
+    for dir in [STORE_DIR, TRACE_STORE_DIR] {
+        let entries = match fs::read_dir(support_dir.join(dir)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            entries => entries?,
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".jsonl")) {
+                stems.insert(stem.to_owned());
+            }
+        }
+    }
+    Ok(stems)
+}
+
+/// The one digest naming a session's telemetry members.
+pub(crate) fn telemetry_stem(session_id: &str) -> String {
+    format!("{:x}", Sha256::digest(session_id.as_bytes()))
+}
+
+/// The one layout of a stem's (API, trace) members.
+fn telemetry_member_paths(support_dir: &Path, stem: &str) -> [PathBuf; 2] {
+    let name = format!("{stem}.jsonl");
+    [
+        support_dir.join(STORE_DIR).join(&name),
+        support_dir.join(TRACE_STORE_DIR).join(name),
+    ]
+}
+
+/// `Ok(None)`: confirmed NotFound. A symlink, non-file or any other error is
+/// a read fault.
+fn telemetry_member(path: &Path) -> std::result::Result<Option<ApiFileGeneration>, ()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            api_file_generation(&metadata).map(Some).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// Read one pair with the existing decoders. `Err`: a read fault (symlink,
+/// unreadable, malformed row, session mismatch, or a member that changed while
+/// read); only this pair is held.
+pub(crate) fn read_telemetry_pair(
+    support_dir: &Path,
+    stem: &str,
+) -> std::result::Result<TelemetryPair, ()> {
+    let paths = telemetry_member_paths(support_dir, stem);
+    let generations = [telemetry_member(&paths[0])?, telemetry_member(&paths[1])?];
+    // The session id from the first row of a present member; it must hash to
+    // the stem.
+    let present = paths
+        .iter()
+        .zip(&generations)
+        .find_map(|(path, generation)| generation.as_ref().map(|_| path))
+        .ok_or(())?;
+    let mut first = String::new();
+    BufReader::new(open_strict(present).map_err(|_| ())?)
+        .read_line(&mut first)
+        .map_err(|_| ())?;
+    let session_id = serde_json::from_str::<Value>(&first)
+        .ok()
+        .and_then(|row| row.get("session_id")?.as_str().map(str::to_owned))
+        .filter(|id| telemetry_stem(id) == stem)
+        .ok_or(())?;
+    let mut request_ids = BTreeSet::new();
+    let mut observed = Vec::new();
+    if generations[0].is_some() {
+        let (rows, witness) = decode_api_sidecar(support_dir, &session_id).map_err(|_| ())?;
+        if !witness.health.is_complete() {
+            return Err(());
+        }
+        for row in rows {
+            request_ids.insert(row.request_id);
+            observed.push(row.observed_at);
+        }
+    }
+    if generations[1].is_some() {
+        let mut report = load_claude_trace_ownership_evidence(support_dir, [session_id.clone()]);
+        if !report.is_complete() {
+            return Err(());
+        }
+        for row in report.evidence.remove(&session_id).unwrap_or_default() {
+            request_ids.insert(row.request_id);
+            observed.push(row.observed_at);
+        }
+    }
+    request_ids.remove("");
+    let mut first_observed = u64::MAX;
+    for at in observed {
+        let at = OffsetDateTime::parse(&at, &Rfc3339).map_err(|_| ())?;
+        first_observed = first_observed.min(u64::try_from(at.unix_timestamp()).map_err(|_| ())?);
+    }
+    let present = generations.iter().flatten();
+    Ok(TelemetryPair {
+        request_ids,
+        first_observed,
+        last_write: present
+            .clone()
+            .map(|generation| generation.modified.0.max(generation.changed.0))
+            .max()
+            .unwrap_or(i64::MAX),
+        bytes: present.map(|generation| generation.bytes).sum(),
+        generations,
     })
+}
+
+/// Unlink a pair's present members under the relay's append lock, only while
+/// each member is still the one that was read (same generation, or still
+/// NotFound). `Ok(false)`: it changed and is kept. A pair left half-unlinked
+/// by a crash is a candidate again with one optional member.
+pub(crate) fn unlink_telemetry_pair(
+    support_dir: &Path,
+    stem: &str,
+    pair: &TelemetryPair,
+) -> std::io::Result<bool> {
+    let _guard = append_lock()
+        .lock()
+        .map_err(|_| std::io::Error::other("Claude local OTEL store lock poisoned"))?;
+    let paths = telemetry_member_paths(support_dir, stem);
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if telemetry_member(path).map_err(|_| std::io::Error::other("member unreadable"))?
+            != *generation
+        {
+            return Ok(false);
+        }
+    }
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if generation.is_some() {
+            #[cfg(test)]
+            if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+                return Err(std::io::Error::other("injected unlink failure"));
+            }
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Make a run's unlinks durable: one sync per telemetry directory.
+pub(crate) fn sync_telemetry_dirs(support_dir: &Path) -> std::io::Result<()> {
+    for dir in [STORE_DIR, TRACE_STORE_DIR] {
+        match crate::context_composition::sync_dir(&support_dir.join(dir)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            synced => synced?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_TELEMETRY_UNLINK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: the `n`th member unlink from now on this thread fails, as a
+/// crash between the two unlinks of a pair would leave it.
+#[cfg(test)]
+pub(crate) fn fail_telemetry_unlink_for_test(n: u32) {
+    FAIL_TELEMETRY_UNLINK.with(|slot| slot.set(n));
 }
 
 /// Counter label for a root whose sidecars do not pair: how many members are
@@ -1977,17 +2155,13 @@ fn append_evidence_bytes(writer: &mut impl Write, encoded: &[u8]) -> Result<()> 
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [api, _] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    api
 }
 
 fn trace_evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
-    let digest = Sha256::digest(session_id.as_bytes());
-    support_dir
-        .join(TRACE_STORE_DIR)
-        .join(format!("{digest:x}.jsonl"))
+    let [_, trace] = telemetry_member_paths(support_dir, &telemetry_stem(session_id));
+    trace
 }
 
 fn append_lock() -> &'static Mutex<()> {
@@ -2955,10 +3129,18 @@ mod tests {
         assert_eq!(row.cache_creation_5m_tokens, 2014);
         assert!(!row.account_identity_checked);
     }
+    /// One paired root (`sess-mixed`): two API rows, two trace rows and the
+    /// transcript that names them, scanned into a page.
     #[cfg(unix)]
-    #[test]
-    fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
-        let dir = crate::test_scratch::private_dir("ottto-decode-overlap");
+    fn mixed_scan_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        crate::snapshots::ScanIndex,
+        crate::snapshots::SourceScanResult,
+    ) {
+        let dir = crate::test_scratch::private_dir(label);
         let sessions = dir.join("projects");
         fs::create_dir_all(&sessions).unwrap();
         let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
@@ -2987,7 +3169,7 @@ mod tests {
         }
         fs::write(sessions.join("sess-mixed.jsonl"), transcript).unwrap();
         let mut index = crate::snapshots::ScanIndex::default();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
             crate::snapshots::SnapshotSource::ClaudeCode,
             std::slice::from_ref(&sessions),
             &mut index,
@@ -2997,6 +3179,65 @@ mod tests {
         )
         .unwrap();
         assert!(!scan.snapshots.is_empty());
+        (dir, sessions, index, scan)
+    }
+
+    /// [behaviour] The evidence_read record carries its memory checkpoints:
+    /// the kept rows, the largest root with its actual keep bit, and the
+    /// legacy owners; allocator in-use bytes only where the system reports them.
+    #[cfg(unix)]
+    #[test]
+    fn evidence_read_reports_memory_checkpoints() {
+        let (dir, _, mut index, mut scan) = mixed_scan_fixture("ottto-evidence-mem");
+        // Canonical trace fingerprints, so the legacy owner graph takes both
+        // requests instead of refusing the root.
+        let traces = load_claude_trace_ownership_evidence(&dir, ["sess-mixed".into()])
+            .evidence
+            .remove("sess-mixed")
+            .unwrap();
+        fs::remove_file(trace_evidence_path(&dir, "sess-mixed")).unwrap();
+        for mut row in traces {
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            append_trace_ownership_evidence(&dir, &row).unwrap();
+        }
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index)
+        });
+        let reads = records
+            .iter()
+            .filter(|record| record["stage"] == "evidence_read")
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1);
+        let mem = &reads[0]["counts"]["evidence_mem"];
+        assert_eq!(mem["kept_rows"], 4);
+        assert_eq!(mem["largest_root_rows"], 4);
+        assert_eq!(mem["largest_root_kept"], true);
+        assert_eq!(mem["legacy_owners"], 2);
+        let in_use = mem["in_use_bytes"].as_array().unwrap();
+        assert_eq!(in_use.len(), 3);
+        assert!(in_use
+            .iter()
+            .all(|bytes| bytes.is_u64() == cfg!(target_os = "macos")));
+        assert_eq!(mem["footprint_bytes"].as_array().unwrap().len(), 2);
+        // No other record carries the object.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| !record["counts"]["evidence_mem"].is_null())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
+        let (dir, sessions, mut index, mut scan) = mixed_scan_fixture("ottto-decode-overlap");
         let mut reference_scan = scan.clone();
         let mut reference_index = index.clone();
         API_READ_RECEIPT.with(|r| r.set((0, 0, true)));

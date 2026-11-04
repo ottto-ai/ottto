@@ -13,7 +13,7 @@ use serde_json::json;
 /// own suffix, is local. The copied usage may count twice with the parent's own
 /// file; that residual is disclosed. Nothing waits on, reads or restarts for the
 /// parent. A cold Full, a restarted owner over an older owner's quiet commit,
-/// and the warm RAM Tail emit the same totals and placement; the ACK lands; a
+/// and the warm owner Tail emit the same totals and placement; the ACK lands; a
 /// quiet restart reads no byte and re-emits nothing. Control: two sessions on
 /// two named accounts; swapped account tags fail the comparator.
 #[test]
@@ -46,7 +46,7 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
         )
     });
     let c = corpus("transition-codex-legacy-fork");
-    let mut disk = Disk::new(&c);
+    let mut disk = Disk::with_route(&c, source);
     let named = [ROOT, SECOND].map(|session| {
         let name = format!("rollout-2026-10-27T07-00-00-{session}.jsonl");
         (c.root.join(name), session)
@@ -177,15 +177,15 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     let (restart_index, restart_scan, restart_modes) = page(&owner, committed.clone());
     assert_eq!(
         restart_modes,
-        (3, 0, 0),
-        "a restarted Codex owner reads Full"
+        (0, 3, 0),
+        "a restarted Codex owner continues from its committed heads"
     );
     disk.begin(&scanner, source);
     let (mut ram_index, ram_scan, ram_modes) = page(&scanner, committed.clone());
     assert_eq!(ram_modes, (0, 3, 0), "the fork Tails like any file");
     for (scan, route) in [
         (&cold_scan, "cold Full"),
-        (&restart_scan, "restarted Full"),
+        (&restart_scan, "restarted Tail"),
         (&ram_scan, "RAM Tail"),
     ] {
         assert_page(scan, route);

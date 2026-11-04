@@ -707,11 +707,10 @@ impl SessionStartState {
     }
 
     /// Whether there is opening content a record body never carries (`X`:
-    /// instruction text, the Codex prelude, opening files with their paths,
-    /// config digests, each opening call's file paths).
+    /// instruction text, opening files with their paths, config digests, each
+    /// opening call's file paths). The Codex prelude is its own fact.
     pub(super) fn has_opening_fact(&self) -> bool {
         self.instructions.is_some()
-            || self.codex_prelude.is_some()
             || !self.files.is_empty()
             || self.config_digest.is_some()
             || self
@@ -723,15 +722,11 @@ impl SessionStartState {
 
     /// The opening-settings session fact (D168-1): that content, beside the
     /// record body that keeps its keys (blob and call ids, in key order).
-    /// The Codex prelude has no fact encoding yet: refused, never dropped.
     pub(super) fn put_opening_fact(
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::{Durable, Refuse};
-        if self.codex_prelude.is_some() {
-            return Err(Refuse::NonEmpty("SessionStartState.codex_prelude"));
-        }
+        use crate::durable_tail_codec::Durable;
         let digest = |digest: &Option<ConfigDigest>| digest.map(|d| (d.a, d.b, d.len));
         self.instructions.put(e)?;
         digest(&self.config_digest).put(e)?;
@@ -749,6 +744,34 @@ impl SessionStartState {
         for call in self.calls.values() {
             call.files.put(e)?;
         }
+        Ok(())
+    }
+
+    /// Whether the Codex prelude parser is held: content (`X`) a record body
+    /// never carries, stored as the Codex prelude session fact.
+    pub(super) fn has_codex_prelude(&self) -> bool {
+        self.codex_prelude.is_some()
+    }
+
+    /// The Codex prelude session fact (D168-1): the held parser, in full.
+    pub(super) fn put_codex_prelude_fact(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        match self.codex_prelude.as_deref() {
+            Some(parser) => parser.put_fact(e),
+            None => Err(crate::durable_tail_codec::Refuse::NonEmpty(
+                "SessionStartState.codex_prelude",
+            )),
+        }
+    }
+
+    /// Restores the Codex prelude fact into a decoded body.
+    pub(super) fn take_codex_prelude_fact(
+        &mut self,
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        self.codex_prelude = Some(Box::new(CodexPreludeParser::take_fact(d)?));
         Ok(())
     }
 
@@ -3411,9 +3434,17 @@ mod tests {
                 "{name}"
             );
             if name == "codex" {
-                // The prelude has no fact encoding yet: refused, never dropped.
-                assert!(Enc::count_write(1 << 20, |e| state.put_opening_fact(e)).is_err());
-                continue;
+                // The prelude is its own session fact: it round-trips in full.
+                assert!(state.has_codex_prelude(), "{name}");
+                assert!(decoded.codex_prelude.is_none(), "{name}: the body drops it");
+                let prelude =
+                    Enc::count_write(1 << 20, |e| state.put_codex_prelude_fact(e)).unwrap();
+                let mut d = Dec::new(&prelude);
+                decoded.take_codex_prelude_fact(&mut d).unwrap();
+                d.finish().unwrap();
+                let again =
+                    Enc::count_write(1 << 20, |e| decoded.put_codex_prelude_fact(e)).unwrap();
+                assert_eq!(again, prelude, "{name}");
             }
             assert!(state.has_opening_fact(), "{name}");
             let fact = Enc::count_write(1 << 20, |e| state.put_opening_fact(e)).unwrap();

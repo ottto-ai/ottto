@@ -179,6 +179,7 @@ pub(super) fn hydrate_txn(
         }
         after = page.last().map(|h| h.key.clone());
     }
+    super::telemetry::hydrate_checkpoint("hydrate_after_catalogue", 0, None);
     let mut index = ScanIndex::default();
     let mut cx = KindCx {
         binding: Some(binding),
@@ -189,6 +190,7 @@ pub(super) fn hydrate_txn(
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
+    super::telemetry::hydrate_checkpoint("hydrate_after_accounts", 0, None);
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
     cx.valid = true;
     Ok((index, cx))
