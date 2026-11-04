@@ -170,6 +170,10 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
             &["counts", "caps", "parent_signature_clear_events"],
             &["counts", "caps", "parent_ref_refusals"],
         ]
+    } else if row == type_name::<crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>>() {
+        // An older store marks a file whose census evidence was owed; that
+        // census is retired, so the bit is dropped.
+        &[&["evidence_owed"]]
     } else {
         &[]
     }
@@ -488,6 +492,30 @@ mod tests {
         let caps = &serde_json::to_value(&loaded).unwrap()["counts"]["caps"];
         assert_eq!(caps, &serde_json::json!({"price_trace_row_limit_hits": 5}));
     }
+    /// [format] A file.progress row an older build stored with the retired
+    /// `evidence_owed` bit loads without it and seeds the stored bytes, so the
+    /// next save rewrites the row; v1 import admits it too. An unknown sibling
+    /// still refuses.
+    #[test]
+    fn retired_evidence_owed_loads_and_reencodes_without_it() {
+        type Row = crate::snapshots::Shared<crate::snapshots::ScanIndexEntry>;
+        let current: Row =
+            crate::snapshots::tests::manifest_index_entry(Some(&"a".repeat(64))).into();
+        let mut row = serde_json::to_value(&current).unwrap();
+        row["evidence_owed"] = true.into();
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Row>(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&current).unwrap()
+        );
+        assert_eq!(seed, old);
+        let root = serde_json::json!({"files": {"/synthetic/owed.jsonl": row}});
+        let raw = serde_json::to_vec(&root).unwrap();
+        assert_eq!(inventory(raw.as_slice()), Ok(()));
+        row["future_unknown"] = 1.into();
+        assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
+    }
     /// [format] guard keeps u128 and intentional zero presence.
     #[test]
     fn guard_keeps_u128_and_intentional_zero_presence() {
@@ -525,13 +553,6 @@ pub(super) fn check_field<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned
     strict_json::<T>(raw.get().as_bytes())
         .map(|_| ())
         .map_err(|_| serde::de::Error::custom("state_v2_ignored_field"))
-}
-/// Usage pending keeps the v1 record-map check; only its RAM shape differs.
-pub(super) fn check_usage<'de, A: serde::de::MapAccess<'de>>(
-    map: &mut A,
-    _: &super::super::usage_pending::UsagePending,
-) -> std::result::Result<(), A::Error> {
-    check_map(map, &super::super::usage_pending::Families::new())
 }
 pub(super) fn check_map<'de, A: serde::de::MapAccess<'de>, T: DeserializeOwned + Serialize>(
     map: &mut A,
@@ -596,10 +617,9 @@ mod alias_tests {
             .unwrap();
             assert_eq!(inventory(raw.as_slice()), Ok(()));
         }
-        assert!(strict_json::<ScanIndex>(
-            br#"{"files":{},"claude_full_rearm_progress":{"future_owed":true}}"#
-        )
-        .is_err());
+        assert!(
+            strict_json::<ScanIndex>(br#"{"files":{},"traversal":{"future_owed":true}}"#).is_err()
+        );
     }
 
     /// [format] v1 import inventory admits each leaf a shipped writer stored

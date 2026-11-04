@@ -435,12 +435,6 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
             let mut traversal = claude_family_census_shadow_tests::traversal();
             traversal.context_fingerprint = stored.clone();
             f.index.traversal = Some(traversal);
-            f.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
-                context_fingerprint: stored.clone(),
-                process: 0,
-                full_rearm_window: false,
-                admission: None,
-            });
             adopt_legacy_traversal_fingerprint(source, &roots, &mut f.index, BACKFILL_WINDOW_DAYS);
             let expected = if adopted { &current } else { &stored };
             assert_eq!(
@@ -448,19 +442,8 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
                 expected,
                 "{source:?}/{adopted}"
             );
-            assert_eq!(
-                &f.index
-                    .claude_stale_family_carry
-                    .origin
-                    .as_ref()
-                    .unwrap()
-                    .context_fingerprint,
-                expected,
-                "{source:?}/{adopted}"
-            );
         }
         f.index.traversal = None;
-        f.index.claude_stale_family_carry.origin = None;
 
         f.flip(all(false));
         for name in ["synthetic-archive", "other-archive"] {
@@ -482,34 +465,6 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         }
         assert!(f.reads_nothing(), "{source:?}");
         f.assert_quiet();
-    }
-}
-
-/// [money] T7: upload-context debt never refuses an independently accepted
-/// member: for every flip, under whichever context or body its entities were
-/// stamped since, the member stays current (settings are forward-only). Its
-/// ACKs still decide: without them it is not accepted.
-#[test]
-fn context_only_debt_keeps_consumers_current() {
-    for bit in &FLIPS {
-        let mut f = settled(SnapshotSource::ClaudeCode, mode(false));
-        let key = f.key();
-        let accepted = |f: &Fixture| {
-            claude_stale_member_independently_accepted(&f.index, &key, &f.index.files[&key])
-        };
-        assert!(accepted(&f), "{}: positive control, exact ACK", bit.0);
-        f.flip_to(flipped(mode(false), bit));
-        assert!(accepted(&f), "{}", bit.0);
-        for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
-            stamp.context_fingerprint = "f".repeat(64);
-        }
-        assert!(accepted(&f), "{}: another context", bit.0);
-        for stamp in f.index.upload_context_proof.entity_stamps.values_mut() {
-            stamp.body_witness = "f".repeat(64);
-        }
-        assert!(accepted(&f), "{}: sent since with another body", bit.0);
-        f.index.accepted_snapshot_fingerprints.clear();
-        assert!(!accepted(&f), "{}: negative control, no ACK", bit.0);
     }
 }
 

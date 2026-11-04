@@ -80,10 +80,7 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
                 "../../tests/fixtures/scan_index/real-shaped-v1.json"
             ))
             .unwrap();
-            for field in [
-                "claude_account_family_pending",
-                "claude_usage_family_pending",
-            ] {
+            for field in ["claude_account_family_pending"] {
                 let mut pending = shaped["logical"][field]["synthetic-family"].clone();
                 assert!(pending.is_object(), "pending fixture must be present");
                 for member_field in ["members", "member_request_id_hashes", "member_occurrences"] {
@@ -461,7 +458,7 @@ macro_rules! classes {
 }
 classes! {
     v2_census_and_920_keep_emit_identical_next_body => "census_keep",
-    v2_account_and_usage_pending_emit_identical_next_body => "pending",
+    v2_account_pending_emits_identical_next_body => "pending",
     v2_option_ii_proved_rows_emit_identical_body_or_refusal => "proved_rows",
     v2_authority_quarantine_preserves_refusal_and_join_keys => "authority_quarantine",
     v2_accepted_ledger_and_ack_handoff_preserve_no_post => "accepted_ack",
@@ -667,9 +664,8 @@ pub(super) fn routed(
 }
 
 /// An `e2` money row from the same v1 bytes, resident and restored cold on a
-/// live session: stored usage pending loads as cold heads, the page loads
-/// its families by key and the stale-family carry loads the whole kind.
-/// Both arms emit the same bodies, totals and account placement.
+/// live session. Both arms emit the same bodies, totals and account
+/// placement.
 #[cfg(unix)]
 fn cold_row(name: &str) {
     if !crate::heap_layout_bound::layout_supported() {
@@ -698,10 +694,6 @@ fn cold_row(name: &str) {
         crate::snapshots::state_v2_stage_tail_for_test(custody.path());
         let v2 = custody.save_reload(&mut v2).0;
         assert!(crate::snapshots::state_v2_tail_published_for_test(&v2));
-        assert!(
-            crate::snapshots::state_v2_cold_usage_families(&v2).is_some_and(|n| n > 0),
-            "positive control: stored usage pending loads cold"
-        );
         v1.generation = v2.generation;
         let mut pages = [v1, v2].map(|prior| c.raw(&scanner(), prior, 100, false, &[]));
         for page in &mut pages {
@@ -713,12 +705,6 @@ fn cold_row(name: &str) {
         assert!(
             custody.claimed_ahead(&pages[1].index),
             "a claim-only save precedes the cold page"
-        );
-        // The cold page read ROOT's stored value: it is loaded (or removed
-        // by a decision that loaded it), never left as an unread head.
-        assert!(
-            !crate::snapshots::state_v2_usage_head_only(&pages[1].index, ROOT),
-            "the cold page loads its stored family"
         );
         // Account placement is per usage row and identity part; request
         // evidence carries only the organization.

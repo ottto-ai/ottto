@@ -83,16 +83,6 @@ pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
     assert!(index.claude_request_census.get(&key).is_none());
 }
 
-/// Requests the legacy fork-prefix exclusion assigns away from `member`.
-pub(crate) fn legacy_excluded(index: &ScanIndex, member: &str) -> usize {
-    index
-        .claude_usage_family_witnesses
-        .values()
-        .filter_map(|witness| witness.legacy_excluded_request_id_hashes.get(member))
-        .map(BTreeSet::len)
-        .sum()
-}
-
 /// Capture the counters of folds released by one real enrichment. This keeps
 /// acceptance assertions independent of fold lifetime, with no retained body.
 #[derive(Clone, Copy, Default)]

@@ -1276,16 +1276,16 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 100));
 }
-/// [behaviour] a usage.pending row past its 1 MiB target commits, decodes
+/// [behaviour] a mutable map row past its 1 MiB target commits, decodes
 /// byte-identical and alarms above 100%: the target never refuses the save.
 #[test]
-fn usage_pending_row_over_its_target_commits_and_alarms() {
+fn mutable_row_over_its_target_commits_and_alarms() {
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
-    let key = mapper::key("usage.pending", "synthetic-family", 1).unwrap();
-    // Residual family JSON once request-hash sets move to shared rows: ~1.5 MiB.
+    let key = mapper::key("proof.account", "synthetic-family", 1).unwrap();
+    // One family's proof JSON: ~1.5 MiB.
     let row = serde_json::json!({
-        "member_request_id_hashes": {},
+        "members": {},
         "occurrences": "x".repeat(1536 * 1024),
     });
     let (_, records) = crate::local_resource_diagnostics::capture(|| {
@@ -1294,7 +1294,7 @@ fn usage_pending_row_over_its_target_commits_and_alarms() {
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     });
     let latest = |r: &serde_json::Value| r["counts"]["latest"].clone();
-    let gauge = serde_json::json!({ "percent": 150, "kind": "usage.pending" });
+    let gauge = serde_json::json!({ "percent": 150, "kind": "proof.account" });
     assert!(records.iter().any(|r| latest(r)["row_cap_max"] == gauge));
     assert!(records.iter().any(|r| latest(r)["row_cap_alarm"] == 150));
     let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1457,7 +1457,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
             Fixed::None,
         ),
         (
-            RowKey::record("usage.pending", b"family".to_vec(), 0).unwrap(),
+            RowKey::record("proof.usage", b"family".to_vec(), 0).unwrap(),
             Fixed::None,
         ),
         (
@@ -1606,7 +1606,7 @@ fn mutable_values_require_segmentation_and_raw_holds_stay_exact() {
 fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
-    let rec = RowKey::record("family.requests", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
+    let rec = RowKey::record("account.current", 1_u64.to_be_bytes().to_vec(), 0).unwrap();
     let shared = RowKey::RequestSet(1);
     assert_ne!(
         sqlite::owner_for_test(&rec),

@@ -8,86 +8,7 @@ pub(crate) struct Completion {
     pub(crate) fallback: Option<SelectedFallback>,
     native_plans: BTreeMap<String, NativePlan>,
     pending_corrections: Vec<PendingNativeCorrection>,
-    target_charges: TargetChargeReceipts,
     native_terminal: Option<NativeCensusCompletion>,
-}
-
-/// Move-only accounting provenance, never evidence/ownership/Skip/coverage.
-/// The map is not exposed to billing or tagging decisions. A source match can
-/// ONLY select which added allocation must be paid, never what may be sent.
-#[derive(Default)]
-struct TargetChargeReceipts {
-    revisions: DescriptorMap<String>,
-}
-impl TargetChargeReceipts {
-    fn appended(scan: &SourceScanResult, frontier: Option<usize>) -> Option<&[SnapshotItem]> {
-        match frontier {
-            Some(frontier) => (scan.source == SnapshotSource::ClaudeCode)
-                .then(|| scan.snapshots.get(frontier..))
-                .flatten(),
-            None => {
-                #[cfg(test)]
-                {
-                    Some(&[])
-                } // explicit logical adapter, never runtime provenance
-                #[cfg(not(test))]
-                {
-                    None
-                } // a production caller cannot bypass the producer binding
-            }
-        }
-    }
-    fn construction_peak(scan: &SourceScanResult, frontier: Option<usize>) -> Option<usize> {
-        use crate::heap_layout_bound::Counter;
-        let appended = Self::appended(scan, frontier)?;
-        let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
-        cost.add(
-            appended
-                .len()
-                .checked_mul(std::mem::size_of::<(String, String)>())?,
-        )?;
-        // Count each possible output, even duplicate source ids: constructor
-        // replacement strings may coexist with the previous receipt.
-        for item in appended {
-            let revision = item
-                .source_file_fingerprint
-                .as_deref()
-                .filter(|fp| !fp.is_empty())?;
-            if item.source_session_id.is_empty() {
-                return None;
-            }
-            cost.add(item.source_session_id.len())?;
-            cost.add(revision.len())?;
-        }
-        Some(cost.bytes)
-    }
-    fn capture(scan: &SourceScanResult, frontier: Option<usize>) -> Result<Self, &'static str> {
-        let appended =
-            Self::appended(scan, frontier).ok_or("native target output frontier is unknown")?;
-        let mut revisions = DescriptorMap::default();
-        revisions
-            .reserve_merge(appended.len())
-            .ok_or("native target charge buffer is unavailable")?;
-        for item in appended {
-            let revision = item
-                .source_file_fingerprint
-                .as_deref()
-                .filter(|fp| !fp.is_empty())
-                .ok_or("native target output revision is unknown")?;
-            if item.source_session_id.is_empty()
-                || revisions
-                    .get(&item.source_session_id)
-                    .is_some_and(|saved| saved != revision)
-            {
-                return Err("native target output charge provenance conflicts");
-            }
-            revisions.insert(item.source_session_id.clone(), revision.to_owned());
-        }
-        if !revisions.accounted() {
-            return Err("native target output charge accounting is unknown");
-        }
-        Ok(Self { revisions })
-    }
 }
 
 pub(super) struct NativePlan {
@@ -168,7 +89,7 @@ impl NativeCorrection {
                     claude_usage_family_witness_fingerprint(witness) == self.proof
                 })
             && index.files.get(key).is_some_and(|entry| {
-                entry.observed_fingerprint() == self.revision
+                entry.source_file_fingerprint.as_str() == self.revision
                     && entry.scan_identity_version.as_deref()
                         == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
                     && entry.last_snapshot_fingerprint.as_ref() == Some(&self.selected_fingerprint)
@@ -189,252 +110,7 @@ impl NativeCorrection {
     }
 }
 
-/// A borrow of the SAME completion reservation and its immutable producer
-/// receipts. No allowance is created here. Only allocation provenance is
-/// consulted; callers cannot use this view as identity/coverage evidence.
-pub(crate) struct NativeBodyBudget<'a> {
-    paid: &'a mut crate::source_rotation::PaidReservation,
-    targets: &'a TargetChargeReceipts,
-}
-pub(in crate::snapshots) struct NativeObservationConstruction<'a> {
-    paid: &'a mut crate::source_rotation::PaidReservation,
-    old_allocated: usize,
-    old_ceiling: usize,
-    retained: usize,
-}
-impl NativeObservationConstruction<'_> {
-    pub(in crate::snapshots) fn finish(self) -> Result<(), crate::source_rotation::LocalRefusal> {
-        let refusal = crate::source_rotation::LocalRefusal(
-            "native observation ownership exceeded prepayment",
-        );
-        let owned = self
-            .old_allocated
-            .checked_add(self.retained)
-            .ok_or(refusal)?;
-        if !self.paid.record_allocated(owned) {
-            return Err(refusal);
-        }
-        self.paid.release_temporary_peak(self.old_ceiling);
-        Ok(())
-    }
-}
-impl NativeBodyBudget<'_> {
-    pub(in crate::snapshots) fn before_native_observation(
-        &mut self,
-        item: &SnapshotItem,
-        pending: &BTreeMap<String, ClaudeUsageFamilyPending>,
-        window: &str,
-    ) -> Result<Option<NativeObservationConstruction<'_>>, crate::source_rotation::LocalRefusal>
-    {
-        use crate::heap_layout_bound::{self, Counter};
-        let refusal = crate::source_rotation::LocalRefusal(
-            "native observation construction cannot be prepaid",
-        );
-        let Some(revision) = self.targets.revisions.get(&item.source_session_id) else {
-            // Ordinary bodies still use the same single canonical accumulator.
-            // No additional copy/retention is introduced for them by this call.
-            return Ok(None);
-        };
-        if item.source_file_fingerprint.as_ref() != Some(revision) {
-            return Err(refusal);
-        }
-        let root = claude_snapshot_family_root_ref(item);
-        let previous = pending.get(root);
-        let reset = previous.map_or(true, |previous| previous.census_window_end != window);
-        let mut retained = Counter::new(crate::source_rotation::PARKED_BUDGET);
-        if previous.is_none() {
-            restore_tree_insert_peak::<String, ClaudeUsageFamilyPending>(
-                pending.len().checked_add(1).ok_or(refusal)?,
-                1,
-                &mut retained,
-            )
-            .ok_or(refusal)?;
-            retained.add(root.len()).ok_or(refusal)?;
-        }
-        if reset {
-            retained.add(window.len()).ok_or(refusal)?;
-        }
-        let mut temporary = Counter::new(crate::source_rotation::PARKED_BUDGET);
-        temporary.add(root.len()).ok_or(refusal)?; // canonical root String before entry
-        if !previous.is_some_and(|previous| !reset && previous.invalid) {
-            let hash_count = item.claude_usage_request_ids.len();
-            let occurrence_count = item.claude_usage_occurrences.len();
-            // Installed pending member graphs, before replacing any old state.
-            heap_layout_bound::tree_nodes::<String, ()>(hash_count, &mut retained)
-                .ok_or(refusal)?;
-            heap_layout_bound::tree_nodes::<String, ClaudeTranscriptUsageOccurrenceWitness>(
-                occurrence_count,
-                &mut retained,
-            )
-            .ok_or(refusal)?;
-            retained
-                .add(
-                    hash_count
-                        .checked_add(occurrence_count)
-                        .and_then(|n| n.checked_mul(64))
-                        .ok_or(refusal)?,
-                )
-                .ok_or(refusal)?;
-            let text = item
-                .claude_usage_occurrences
-                .values()
-                .try_fold(0usize, |n, occurrence| {
-                    n.checked_add(occurrence.model.as_ref().map_or(0, String::len))?
-                        .checked_add(occurrence.reasoning_effort.as_ref().map_or(0, String::len))?
-                        .checked_add(
-                            occurrence
-                                .selector
-                                .context
-                                .get("speed_mode")
-                                .map_or(0, String::len),
-                        )
-                })
-                .ok_or(refusal)?;
-            retained.add(text).ok_or(refusal)?;
-            let members = previous.filter(|_| !reset).map_or(0, |p| {
-                p.member_occurrences
-                    .len()
-                    .max(p.member_request_id_hashes.len())
-            });
-            restore_tree_insert_peak::<String, BTreeSet<String>>(
-                members.checked_add(1).ok_or(refusal)?,
-                1,
-                &mut retained,
-            )
-            .ok_or(refusal)?;
-            restore_tree_insert_peak::<
-                String,
-                BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
-            >(members.checked_add(1).ok_or(refusal)?, 1, &mut retained)
-            .ok_or(refusal)?;
-            retained
-                .add(item.source_session_id.len().checked_mul(2).ok_or(refusal)?)
-                .ok_or(refusal)?;
-            // The unchanged canonical code keeps local maps while cloning its
-            // installed maps. Its equality check creates one more temporary
-            // hash set. Price those exact existing allocations, not a second
-            // observation fold or a projection of output bodies.
-            heap_layout_bound::tree_nodes::<String, ()>(hash_count, &mut temporary)
-                .ok_or(refusal)?;
-            heap_layout_bound::tree_nodes::<String, ()>(occurrence_count, &mut temporary)
-                .ok_or(refusal)?;
-            heap_layout_bound::tree_nodes::<String, ClaudeTranscriptUsageOccurrenceWitness>(
-                occurrence_count,
-                &mut temporary,
-            )
-            .ok_or(refusal)?;
-            temporary
-                .add(
-                    hash_count
-                        .checked_add(occurrence_count.checked_mul(2).ok_or(refusal)?)
-                        .and_then(|n| n.checked_mul(64))
-                        .ok_or(refusal)?,
-                )
-                .ok_or(refusal)?;
-            temporary.add(text).ok_or(refusal)?;
-            temporary.add(384).ok_or(refusal)?; // current digest formatting old/new buffers
-        }
-        let old_allocated = self.paid.allocated();
-        let old_ceiling = self.paid.allocation_ceiling();
-        let peak = old_allocated
-            .checked_add(retained.bytes)
-            .and_then(|n| n.checked_add(temporary.bytes))
-            .ok_or(refusal)?;
-        if !self.paid.grow_for(peak) {
-            return Err(refusal);
-        }
-        Ok(Some(NativeObservationConstruction {
-            paid: self.paid,
-            old_allocated,
-            old_ceiling,
-            retained: retained.bytes,
-        }))
-    }
-}
-
 impl Completion {
-    pub(crate) fn record_native_observations_paid(
-        &mut self,
-        scan: &SourceScanResult,
-        index: &mut ScanIndex,
-    ) -> Result<Option<ClaudeNativeObservations>, crate::source_rotation::LocalRefusal> {
-        if !index.persistence_available() {
-            return Err(crate::source_rotation::LocalRefusal(
-                "scan_index_map_unavailable",
-            ));
-        }
-
-        let active = self.fallback.is_some()
-            || !self.target_charges.revisions.is_empty()
-            || self
-                .window
-                .as_ref()
-                .is_some_and(|window| !window.roots.is_empty());
-        if !active {
-            // No emission filtering requires an early observation receipt.
-            // The unchanged final canonical fold performs this work once.
-            return Ok(None);
-        }
-        let Some(paid) = self.reservation.as_mut() else {
-            #[cfg(test)]
-            return Ok(Some(record_claude_native_observations(scan, index)));
-            #[cfg(not(test))]
-            return Err(crate::source_rotation::LocalRefusal(
-                "native observation reservation is missing",
-            ));
-        };
-        let refusal =
-            crate::source_rotation::LocalRefusal("native observation receipt cannot be prepaid");
-        let owned = paid
-            .allocated()
-            .checked_add(scan.census_window_end.len())
-            .ok_or(refusal)?;
-        if !paid.grow_for(owned) {
-            return Err(refusal);
-        }
-        let window = scan.census_window_end.clone();
-        if !paid.record_allocated(owned) {
-            return Err(refusal);
-        }
-        let mut budget = NativeBodyBudget {
-            paid,
-            targets: &self.target_charges,
-        };
-        // Cold usage pending: the page's families first; Unknown refuses.
-        let unknown = crate::source_rotation::LocalRefusal("usage_pending_unknown");
-        let roots = scan
-            .snapshots
-            .iter()
-            .map(|item| claude_snapshot_family_root_ref(item).to_owned())
-            .collect();
-        super::super::state_v2::load_usage(index, &roots).map_err(|_| unknown)?;
-        let counts = super::super::evidence_owed::stamped(
-            index,
-            &scan.snapshots,
-            &scan.census_window_end,
-            |index| {
-                let (families, retained) = claude_page_usage_families(
-                    &scan.snapshots,
-                    &mut index.claude_usage_family_pending,
-                )
-                .map_err(|_| unknown)?;
-                accumulate_claude_usage_family_pending_with_credit(
-                    &scan.snapshots,
-                    families,
-                    retained,
-                    &scan.census_window_end,
-                    MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                    Some(&mut budget),
-                )
-            },
-        )?;
-        Ok(Some(ClaudeNativeObservations {
-            counts,
-            census_window_end: window,
-            index_generation: index.generation,
-        }))
-    }
-
     /// Both real selected-save callers use the same moving credit. Recovery
     /// never requests new optional capacity after a body has been offered.
     pub(crate) fn restore_selected_paid(
@@ -504,30 +180,14 @@ impl Completion {
             fallback: None,
             native_plans: BTreeMap::new(),
             pending_corrections: Vec::new(),
-            target_charges: TargetChargeReceipts::default(),
             native_terminal: Some(terminal?.into_native_census()),
         })
-    }
-    pub(super) fn native_window(&self) -> Option<&str> {
-        self.native_terminal
-            .as_ref()
-            .map(|terminal| terminal.census_window_end.as_str())
-            .or_else(|| {
-                self.fallback
-                    .as_ref()
-                    .and_then(|fallback| fallback.terminal.as_deref())
-                    .map(|terminal| terminal.traversal.census_window_end.as_str())
-            })
     }
     /// Normal completion has already dropped the traversal graph, retaining
     /// only its moving window receipt through the native fold. A fallback has
     /// a different lifetime: both selected-save seams need its full traversal.
     pub(crate) fn retire_native_fold_owner(&mut self) {
         drop(self.native_terminal.take());
-    }
-    #[cfg(test)]
-    pub(crate) fn ordinary_terminal_retained_for_test(&self) -> bool {
-        self.native_terminal.is_some()
     }
     #[cfg(test)]
     pub(crate) fn native_correction_count_for_test(&self) -> usize {
@@ -581,7 +241,7 @@ impl Completion {
                     && previous
                         .files
                         .get(&pending.index_key)
-                        .is_some_and(ScanIndexEntry::rearmed)
+                        .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             }) else {
                 continue;
             };
@@ -661,23 +321,6 @@ impl Completion {
                     && candidate.body_witness == body_witness
             }
         });
-    }
-
-    /// Data-level primitive fixture has no physical source finalizer. The
-    /// actual pipeline and settlement regressions use its observer seam.
-    #[cfg(test)]
-    pub(crate) fn capture_native_corrections(
-        &mut self,
-        scan: &mut SourceScanResult,
-        previous: &ScanIndex,
-        disposition: &ClaudeUsageAuthorityDisposition,
-        body_witness: impl Fn(&SnapshotItem) -> String,
-    ) {
-        self.prepare_native_corrections(scan, previous, disposition);
-        for item in &mut scan.snapshots {
-            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-            self.observe_native_correction(item, &body_witness(item));
-        }
     }
 
     /// Called only after the actual normal selected save succeeds. Partial,
@@ -829,10 +472,6 @@ impl Controller {
                     .checked_add(std::mem::align_of::<WindowEligibility>())?,
             )?;
             cost.add(scan.census_window_end.len())?;
-            cost.add(TargetChargeReceipts::construction_peak(
-                scan,
-                self.ordinary_body_frontier,
-            )?)?;
             let pending = scan.pending_finalization.len();
             heap_layout_bound::tree_nodes::<String, ()>(pending, &mut cost)?; // withheld keys
             heap_layout_bound::tree_nodes::<String, ()>(pending, &mut cost)?; // resolved sources
@@ -907,11 +546,6 @@ impl Controller {
                     .extend(plan.candidates);
             }
         }
-        // This is the last append-only producer boundary. Capture actual
-        // source/revision ownership before withhold/filter/sort can shift it.
-        // Multiple outputs share a receipt only at the SAME exact revision;
-        // no-body targets add none, and dropped outputs grant no refund.
-        let target_charges = TargetChargeReceipts::capture(scan, self.ordinary_body_frontier)?;
         let mut withheld_keys = BTreeSet::new();
         let mut resolved_sources = BTreeSet::new();
         for pending in &scan.pending_finalization {
@@ -939,7 +573,6 @@ impl Controller {
                 window: None,
                 native_plans: BTreeMap::new(),
                 pending_corrections: Vec::new(),
-                target_charges,
                 native_terminal: None,
                 fallback: Some(SelectedFallback {
                     withheld_sources: self.acquisition.unresolved_sources,
@@ -974,7 +607,6 @@ impl Controller {
             reservation: None,
             native_plans,
             pending_corrections: Vec::new(),
-            target_charges,
             native_terminal,
             window: if current {
                 self.into_window(&scan.census_window_end)
@@ -1122,21 +754,6 @@ impl SelectedFallback {
                     value,
                     crate::source_rotation::PARKED_BUDGET,
                 )?)?;
-            }
-            if let Some(identity) = claude_index_path_member_ref(Path::new(key)) {
-                let (_, member) = identity.into_owned();
-                if let Some(value) = previous.claude_owned_start_census.get(&member) {
-                    restore_tree_insert_peak::<String, ClaudeOwnedStartCensusWitness>(
-                        index.claude_owned_start_census.len().checked_add(keys)?,
-                        1,
-                        &mut cost,
-                    )?;
-                    cost.add(key.len())?; // root/member construction and moved key
-                    cost.add(heap_layout_bound::completed_bound(
-                        value,
-                        crate::source_rotation::PARKED_BUDGET,
-                    )?)?;
-                }
             }
         }
         heap_layout_bound::tree_nodes::<String, ()>(affected, &mut cost)?;
@@ -1316,18 +933,6 @@ impl SelectedFallback {
             // first-seen birth of the same physical object stays (an in-place
             // stub every reader treats as no record; nothing is allocated).
             index.claude_request_census.invalidate_keeping_birth(key);
-            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
-                match previous.claude_owned_start_census.get(&member) {
-                    Some(value) => {
-                        index
-                            .claude_owned_start_census
-                            .insert(member, value.clone());
-                    }
-                    None => {
-                        index.claude_owned_start_census.remove(&member);
-                    }
-                }
-            }
         }
         index.restore_claude_empty_map_advances(empty_advances);
         for current in index.current_snapshot_fingerprint_refs() {
@@ -1431,10 +1036,8 @@ fn restore_vec_peak<T>(length: usize, cost: &mut crate::heap_layout_bound::Count
     )
 }
 
-crate::heap_layout_bound::fields!(Completion; reservation, window, fallback, native_plans, pending_corrections, target_charges, native_terminal);
+crate::heap_layout_bound::fields!(Completion; reservation, window, fallback, native_plans, pending_corrections, native_terminal);
 crate::heap_layout_bound::fields!(NativePlan; root, proof, revision);
 crate::heap_layout_bound::fields!(NativeCorrection; root, proof, revision, fingerprint, body_witness, selected_fingerprint, selected_body_witness);
 crate::heap_layout_bound::fields!(PendingNativeCorrection; key, plan, fingerprint, body_witness);
 crate::heap_layout_bound::fields!(SelectedFallback; withheld_sources, withheld_keys, targets, census_window_end, terminal);
-
-crate::heap_layout_bound::fields!(TargetChargeReceipts; revisions);

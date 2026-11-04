@@ -25,8 +25,7 @@ pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
-    idle, load_locked, load_usage, published, recovery_save_guard, runtime_path, save_locked,
-    settle_usage, visit_usage_ordered, SliceBudget, SliceEnd, UsageToken,
+    idle, load_locked, published, recovery_save_guard, runtime_path, save_locked,
 };
 mod catalogue;
 mod codec;

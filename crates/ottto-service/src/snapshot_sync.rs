@@ -645,10 +645,6 @@ fn exclude_held_effective_body_witness_revision(
 /// treat the still-present family as vanished. A never-committed member bound
 /// by its committed family's terminal quarantine settles with a delivery-free
 /// membership entry instead, so the family census stays complete.
-///
-/// `held_family_roots` names the Claude families of this page's held
-/// entities, when known. The mark is then scoped to them for the terminal
-/// unchanged-proof skip only; `None` keeps the sweep-wide mark.
 fn commit_completed_with_local_holds(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -656,7 +652,6 @@ fn commit_completed_with_local_holds(
     locally_held_fingerprints: &BTreeSet<String>,
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
-    held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
     if !progress_blocking {
         if index.locally_held_keys_restorable(
@@ -681,7 +676,7 @@ fn commit_completed_with_local_holds(
         locally_held_fingerprints,
         true,
     );
-    index.mark_bounded_sweep_held_by_families(held_family_roots);
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -697,10 +692,6 @@ struct LocalHoldSettlement {
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
     progress_blocking: bool,
-    /// Claude only: every family a held entity of this page could count
-    /// under (`held_family_roots`). `None` for other sources or when a held
-    /// session cannot be placed.
-    held_family_roots: Option<BTreeSet<String>>,
 }
 
 struct AccountAuditRelease<'a> {
@@ -749,11 +740,6 @@ impl LocalHoldSettlement {
             index,
             account_holds_recorded,
         );
-        let held_family_roots = if source == SnapshotSource::ClaudeCode && held_entity_count > 0 {
-            disposition.held_family_roots(&scan_result.snapshots, index)
-        } else {
-            None
-        };
         disposition.retain_uploadable(&mut scan_result.snapshots);
         crate::snapshots::record_lineage_parentless_while_incomplete(
             source,
@@ -767,7 +753,6 @@ impl LocalHoldSettlement {
             held_fingerprints,
             account_deferred_fingerprints,
             progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
-            held_family_roots,
         }
     }
 
@@ -898,7 +883,6 @@ fn settle_completed_upload(
         &holds.held_fingerprints,
         &holds.account_deferred_fingerprints,
         holds.progress_blocking,
-        holds.held_family_roots.as_ref(),
     );
     eprintln!(
         "local snapshot sync retained {} Claude usage family/families and {} revised \
@@ -1073,7 +1057,6 @@ fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
-    unsettled_roots: Option<&BTreeSet<String>>,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
         && holds.page_held()
@@ -1107,14 +1090,11 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled_in(
-            if resolved_permanent_rejections {
-                UnsettledUploadCause::RejectedWithHolds
-            } else {
-                UnsettledUploadCause::DeferredConflict
-            },
-            unsettled_roots,
-        );
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
@@ -3784,20 +3764,8 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     // After every selected-entry restore above: a drain whose entry this
     // save does not keep stays owed.
     committable.restore_unselected_claude_proof_body_drains(body_drains);
-    // Scope the stamp to the families of this page's entities that were not
-    // exact-ACKed, including local holds.
-    let unsettled_roots = index.claude_entity_family_roots(
-        &current_bodies
-            .keys()
-            .filter(|fingerprint| !accepted.contains(**fingerprint))
-            .map(|fingerprint| fingerprint.to_string())
-            .chain(locally_held.iter().cloned())
-            .collect(),
-    );
-    committable.mark_bounded_sweep_unsettled_in(
-        cause.unwrap_or(UnsettledUploadCause::Unattributed),
-        unsettled_roots.as_ref(),
-    );
+    committable
+        .mark_bounded_sweep_unsettled_by(cause.unwrap_or(UnsettledUploadCause::Unattributed));
     let census_absent = progress.complete_census_ack_retirements(
         index,
         correction_scan.is_some_and(|scan| scan.census_complete),
@@ -6239,7 +6207,6 @@ impl SourcePreparation {
                             }
                             match crate::snapshots::claude_native_comparison::Controller::new_paid(
                                 qualification,
-                                state.native_ordinary_body_frontier(),
                                 &mut self.native_comparison_reservation,
                             ) {
                                 Ok(controller) => {
@@ -7846,7 +7813,6 @@ fn finish_sync_source(
     // labels on the wire.
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-    let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
         crate::snapshots::claude_request_identity::retain_root_accounts(
@@ -7896,38 +7862,15 @@ fn finish_sync_source(
         {
             upload_progress.save(&upload_progress_path)?;
         }
-        #[cfg(test)]
-        tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
                 crate::snapshots::claude_api_cache_creation_rejection_count(),
-                stats.full_rearm_suppression.full_rearm_suppressed,
-                stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
             eprintln!("local snapshot sync: claude context basis counts={counts}");
-        }
-        actual_native_conjunction =
-            crate::snapshots::claude_native_comparison::actual_native_conjunction(&disposition)
-                && !census_withheld
-                && scan_result.census_complete;
-        if let Some(lease) = native_comparison_lease.as_ref() {
-            let c = &disposition.duplicate_census;
-            lease.diagnostic.update(|d| {
-                d.bootstrap = Some(crate::local_resource_diagnostics::NativeBootstrap {
-                    native_census_complete: c.census_complete,
-                    coverage_complete: c.coverage_complete,
-                    census_valid: !c.census_invalid,
-                    fence_open: !c.fence_after,
-                    pending_occurrences_present: c.pending_occurrence_count > 0,
-                    transcript_ownership_complete: disposition.transcript_ownership_complete,
-                    scan_census_complete: scan_result.census_complete,
-                    not_withheld: !census_withheld,
-                })
-            });
         }
         claude_authority_disposition = disposition;
         if census_withheld {
@@ -8659,34 +8602,12 @@ fn finish_sync_source(
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
-            // Scope the unsettled stamp to the families of this page's
-            // entities without an exact ACK of their body, and held ones.
-            // Codex and Pi scopes have no reader: their stamp stays sweep-wide.
-            let unsettled_roots = if source == SnapshotSource::ClaudeCode {
-                index.claude_entity_family_roots(
-                    &scan_result
-                        .snapshots
-                        .iter()
-                        .filter(|item| {
-                            upload_progress
-                                .accepted_body_witnesses
-                                .get(&item.snapshot_fingerprint)
-                                != Some(&snapshot_upload_body_witness(item))
-                        })
-                        .map(|item| item.snapshot_fingerprint.clone())
-                        .chain(local_holds.held_fingerprints.iter().cloned())
-                        .collect(),
-                )
-            } else {
-                None
-            };
             let settlement = settle_checkpointed_upload(
                 index,
                 &committed_index,
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
-                unsettled_roots.as_ref(),
             );
             index = settlement.index;
             if !settlement.fully_settled {
@@ -9108,13 +9029,11 @@ fn finish_sync_source(
                 && crate::snapshots::claude_native_comparison::selected_page_is_clean(
                     &scan_result,
                     &index,
-                    &claude_authority_disposition,
                 ),
-            claude_authority_disposition.duplicate_census.census_invalid,
+            false,
         );
-        lease.note_selected_save(
-            actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
-        );
+        // No fold proves a native census, so a save never bootstraps a permit.
+        lease.note_selected_save(false);
     }
     // Tail state staged after this pass's last full save commits here, once.
     // On error the guard's drop discards and counts it; the next read replays
@@ -9275,11 +9194,10 @@ fn finish_sync_source(
             || !crate::snapshots::claude_native_comparison::selected_page_is_clean(
                 &scan_result,
                 &index,
-                &claude_authority_disposition,
             )
-            || !native_comparison_lease.as_ref().is_some_and(|lease| {
-                lease.allowed() || (actual_native_conjunction && scan_result.census_complete)
-            })
+            || !native_comparison_lease
+                .as_ref()
+                .is_some_and(|lease| lease.allowed())
         {
             return Ok(());
         }
@@ -9319,7 +9237,6 @@ fn finish_sync_source(
                 && crate::snapshots::claude_native_comparison::selected_page_is_clean(
                     &scan_result,
                     &index,
-                    &claude_authority_disposition,
                 ),
         );
     }
@@ -9521,17 +9438,13 @@ pub struct ClaudeLocalEvidenceStats {
         skip_serializing_if = "crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts::is_empty"
     )]
     pub unhealthy_root_no_fallback_requests: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
-    pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
-    pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// Request-census shadow of a complete Claude terminal scan; absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_census: Option<crate::snapshots::ClaudeRequestCensusShadowCounts>,
     /// RetryPending families whose returning root retains a retirement
     /// tombstone, separate from all other RetryPending causes. Local only.
     pub returning_family_grown_held: usize,
-    /// Fix 1's skipped full re-arms; absent from the line while empty.
-    #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
-    pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
-    /// The streamed terminal's slices and the fence's age; absent while empty.
-    #[serde(skip_serializing_if = "crate::snapshots::ClaudeTerminalStreamCounts::is_empty")]
-    pub terminal_stream: crate::snapshots::ClaudeTerminalStreamCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -9701,10 +9614,9 @@ impl PreparedClaudeLocalEvidence {
     }
 
     #[cfg(test)]
-    fn load(support_dir: &Path, native: &[SnapshotItem], index: &ScanIndex) -> Self {
+    fn load(support_dir: &Path, native: &[SnapshotItem]) -> Self {
         let sessions = claude_evidence_session_ids(native)
             .into_iter()
-            .chain(crate::snapshots::claude_pending_family_session_ids(index))
             .collect::<BTreeSet<_>>();
         let loaded =
             crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone());
@@ -9712,7 +9624,6 @@ impl PreparedClaudeLocalEvidence {
         let api = loaded.unwrap_or_default();
         let roots = claude_evidence_root_session_ids(native)
             .into_iter()
-            .chain(crate::snapshots::claude_pending_family_session_ids(index))
             .collect::<BTreeSet<_>>();
         let mut trace_rows = BTreeMap::new();
         let mut traces = BTreeMap::new();
@@ -9840,11 +9751,11 @@ impl PreparedClaudeLocalEvidence {
 #[cfg(test)]
 pub(crate) fn prepared_claude_negative_rows_for_test(
     support_dir: &Path,
-    index: &ScanIndex,
+    native: &[SnapshotItem],
     required_roots: &BTreeSet<String>,
     after_load: impl FnOnce(),
 ) -> (bool, bool) {
-    let prepared = PreparedClaudeLocalEvidence::load(support_dir, &[], index);
+    let prepared = PreparedClaudeLocalEvidence::load(support_dir, native);
     let before = prepared.frozen_roots_are_current(support_dir, required_roots);
     after_load();
     let after = prepared.frozen_roots_are_current(support_dir, required_roots);
@@ -9855,7 +9766,6 @@ pub(crate) fn prepared_claude_negative_rows_for_test(
 pub(crate) fn prepared_claude_pair_for_test(
     support_dir: &Path,
     native: &[SnapshotItem],
-    index: &ScanIndex,
     root: &str,
     after_load: impl FnOnce(),
 ) -> (
@@ -9864,7 +9774,7 @@ pub(crate) fn prepared_claude_pair_for_test(
     bool,
     usize,
 ) {
-    let mut prepared = PreparedClaudeLocalEvidence::load(support_dir, native, index);
+    let mut prepared = PreparedClaudeLocalEvidence::load(support_dir, native);
     let healthy = prepared.rows().healthy_roots.contains(root);
     after_load();
     let mut api = prepared.take_api(support_dir).expect("synthetic API read");
@@ -9991,7 +9901,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
     mut prepared: Option<PreparedClaudeLocalEvidence>,
-    mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
@@ -10004,12 +9914,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
-    // Actual native occurrences are recorded once BEFORE emission filtering.
-    // The authoritative fold still sees the actual terminal census decision.
-    let observations = match comparison.as_deref_mut() {
-        Some(comparison) => comparison.record_native_observations_paid(scan_result, index)?,
-        None => None,
-    };
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -10033,12 +9937,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::snapshots::claude_request_identity::capture_request_owned_originals(
             &scan_result.snapshots,
         );
-    let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
+    let session_ids = claude_evidence_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if census_complete {
-        session_ids.extend(crate::snapshots::claude_pending_family_session_ids(index));
-    }
     let mut stats = ClaudeLocalEvidenceStats {
         requested_session_count: session_ids.len(),
         ..Default::default()
@@ -10061,7 +9962,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
     let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
-    let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
         Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
@@ -10084,7 +9984,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
         Err(_) => {
             stats.effort_evidence_load_failed = true;
-            full_rearm_evidence_complete = false;
         }
     }
     evidence_mem.sample(0);
@@ -10097,7 +9996,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
-        .chain(crate::snapshots::claude_pending_family_session_ids(index))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -10137,7 +10035,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     .session_report(session_id)
                     .is_some_and(|read| !read.complete)
             {
-                full_rearm_evidence_complete = false;
                 identity_unhealthy_roots.insert(session_id.clone());
                 note_unhealthy(
                     session_id,
@@ -10145,31 +10042,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 );
             }
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            if !paired
+                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+                && (builds_evidence || request_owned(session_id))
             {
-                full_rearm_evidence_complete = false;
-                if builds_evidence || request_owned(session_id) {
-                    identity_unhealthy_roots.insert(session_id.clone());
-                    let (oversized, unreadable) =
-                        crate::claude_local_otel::claude_sidecar_pair_faults(
-                            support_dir,
-                            session_id,
-                        );
-                    note_unhealthy(
-                        session_id,
-                        crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
-                            oversized, unreadable, 0,
-                        ),
-                    );
-                }
+                identity_unhealthy_roots.insert(session_id.clone());
+                let (oversized, unreadable) =
+                    crate::claude_local_otel::claude_sidecar_pair_faults(support_dir, session_id);
+                note_unhealthy(
+                    session_id,
+                    crate::snapshots::claude_request_identity::UnhealthyRootReason::of(
+                        oversized, unreadable, 0,
+                    ),
+                );
             }
             paired
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
 
-    // Effort has already updated pending-family state. Release all non-paired
-    // rows before moving the selected roots into the usage aggregate.
+    // Release all non-paired rows before moving the selected roots into the
+    // usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
     // Only the page's own roots keep their rows (both root spellings, so a
     // page family can never lose its own rows). Every root read adds its
@@ -10181,7 +10074,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }))
         .collect::<BTreeSet<_>>();
     let mut cross = crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(
-        support_dir,
         &scan_result.snapshots,
     );
     let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
@@ -10221,9 +10113,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
-        let (generation, mut api, mut trace) = decode_window.time(|| {
-            let generation =
-                crate::claude_local_otel::claude_pair_generation(support_dir, &root_session_id);
+        let (mut api, mut trace) = decode_window.time(|| {
             let api = api_read.take_strict_report(support_dir, &root_session_id);
             let trace = match prepared.as_mut() {
                 Some(read) => read.take_trace(support_dir, &root_session_id),
@@ -10232,7 +10122,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     [root_session_id.clone()],
                 ),
             };
-            (generation, api, trace)
+            (api, trace)
         });
         if !api.health.is_complete() {
             stats.api_incomplete_root_count += 1;
@@ -10245,7 +10135,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_discarded_roots.insert(root_session_id.clone());
         }
         if !api.health.is_complete() || !trace.is_complete() {
-            full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 cross.add_vetoing_api(&root_session_id, &rows);
                 if let Some(veto_api_rows) = whole_corpus.as_mut() {
@@ -10321,9 +10210,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             api_rows.as_ref().map_or(0, Vec::len) + trace_rows.as_ref().map_or(0, Vec::len),
             keep,
         );
-        if !keep && (api_rows.is_some() || trace_rows.is_some()) {
-            cross.note_unkept(&root_session_id, generation);
-        }
         if let Some(rows) = api_rows {
             stats.api_evidence_row_count += rows.len();
             if keep {
@@ -10349,12 +10235,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
-    if stats.request_set_mismatch_root_count > 0 {
-        index.note_claude_ignored_rearm_veto(
-            &scan_result.census_window_end,
-            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
-        );
-    }
     // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
@@ -10398,16 +10278,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
     });
-    if !full_rearm_evidence_complete {
-        index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
-    }
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
         &trace_report,
         index,
         identity_evidence.as_ref(),
-        observations,
         comparison
             .as_deref()
             .map(|comparison| comparison.fold_view(lease))
@@ -10425,7 +10301,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .and_then(|comparison| comparison.fallback.as_ref())
     {
         fallback.after_native_fold(scan_result, index);
-        disposition.transcript_ownership_complete = false;
     }
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
@@ -10441,15 +10316,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
 
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
-        let ownership =
-            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
-                index,
-                &disposition,
-            );
         crate::snapshots::claude_request_identity::stage_request_owned_activity(
             &scan_result.snapshots,
             evidence,
-            &ownership,
             &request_owned_originals,
         )
     });
@@ -10505,18 +10374,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         index.hold_claude_history_for_unread_telemetry();
     }
     if let Some(evidence) = &identity_evidence {
-        // Contract 5 first: the ownership step below leaves new-collector items untouched. The
-        // rebuild above has just settled this pass's duplicate census.
-        let ownership =
-            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
-                index,
-                &disposition,
-            );
-        let request_identity = crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+        // Contract 5 first: the ownership step below leaves new-collector items untouched.
+        let request_identity = crate::snapshots::claude_request_identity::apply_scan_page(
             &mut scan_result.snapshots,
             evidence,
             std::mem::take(&mut disposition.request_groupings),
-            &ownership,
         );
         disposition.copy_invalidated = request_identity.copy_invalidated;
         if !request_identity.held.is_empty() {
@@ -10597,16 +10459,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         })
         .count();
-    stats.duplicate_census = disposition.duplicate_census;
-    stats.full_rearm_suppression = disposition.full_rearm_suppression;
-    stats.terminal_stream = disposition.terminal_stream;
+    stats.request_census = scan_result.claude_request_census_shadow;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
-    stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
-        census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
-        ..disposition.first_proof_hold
-    };
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
@@ -12168,8 +12024,6 @@ fn collector_status_request(
             Some(CensusBlockCause::UnreadableEvents)
         } else if status.counts.disappeared_file_count > 0 {
             Some(CensusBlockCause::DisappearedFiles)
-        } else if census.carry_admission_veto {
-            Some(CensusBlockCause::CarryAdmission)
         } else if census.state_loader_failed {
             Some(CensusBlockCause::StateLoader)
         } else if census.transport_reservation_refused {
@@ -12192,14 +12046,8 @@ fn collector_status_request(
             .to_string(),
         );
         consecutive_failures = u64::from(census.retry_attempt);
-        let due = if block_cause == Some(CensusBlockCause::CarryAdmission) {
-            census
-                .admission_due_unix_seconds
-                .or(census.retry_not_before_unix_seconds)
-        } else {
-            census.retry_not_before_unix_seconds
-        };
-        next_retry_at = due
+        next_retry_at = census
+            .retry_not_before_unix_seconds
             .and_then(|seconds| i64::try_from(seconds).ok())
             .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
             .and_then(|time| time.format(&Rfc3339).ok());
@@ -13659,7 +13507,6 @@ mod tests {
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
                 upload_context_receipt: None,
-                evidence_owed: false,
             },
         );
         index.file_snapshot_fingerprints.insert(
@@ -20514,7 +20361,7 @@ mod tests {
 
     /// [off=main] Absent/null/unknown admission preserves the complete legacy
     /// payload for all three sources, including failures=1 and no retry deadline.
-    /// [behaviour] The real hint boundary and shared builder emit all seven
+    /// [behaviour] The real hint boundary and shared builder emit all six
     /// causes plus advancing work, with fixed priority and truthful retries.
     #[test]
     #[serial(source_manifests)]
@@ -20531,7 +20378,6 @@ mod tests {
                 (
                     unreadable,
                     disappeared,
-                    carry,
                     state,
                     transport,
                     reconciliation,
@@ -20542,33 +20388,26 @@ mod tests {
             ) in [
                 (
                     Some("unreadable_events"),
-                    (2, 3, true, true, true, true, 1, true, true),
+                    (2, 3, true, true, true, 1, true, true),
                 ),
                 (
                     Some("disappeared_files"),
-                    (0, 3, true, true, true, true, 1, true, true),
-                ),
-                (
-                    Some("carry_admission"),
-                    (0, 0, true, true, true, true, 1, true, true),
+                    (0, 3, true, true, true, 1, true, true),
                 ),
                 (
                     Some("state_loader"),
-                    (0, 0, false, true, true, true, 1, true, true),
+                    (0, 0, true, true, true, 1, true, true),
                 ),
                 (
                     Some("transport_reservation"),
-                    (0, 0, false, false, true, true, 1, true, true),
+                    (0, 0, false, true, true, 1, true, true),
                 ),
                 (
                     Some("ownership_incomplete"),
-                    (0, 0, false, false, false, true, 1, true, true),
+                    (0, 0, false, false, true, 1, true, true),
                 ),
-                (
-                    Some("other"),
-                    (0, 0, false, false, false, true, 0, true, true),
-                ),
-                (None, (0, 0, false, false, false, false, 1, true, false)),
+                (Some("other"), (0, 0, false, false, true, 0, true, true)),
+                (None, (0, 0, false, false, false, 1, true, false)),
             ] {
                 let mut counts = SyncCounts::for_policy(183);
                 counts.skipped_file_count_due_to_limit = 7;
@@ -20580,12 +20419,10 @@ mod tests {
                     pending_work: pending,
                     retryable_problem: retryable,
                     transport_reservation_refused: transport,
-                    carry_admission_veto: carry,
                     state_loader_failed: state,
                     reconciliation_incomplete: reconciliation,
                     retry_attempt: 4,
                     retry_not_before_unix_seconds: Some(60),
-                    admission_due_unix_seconds: Some(30),
                 };
                 let receipt = captured_terminal_receipt_for_source_under_hint(
                     source,
@@ -20610,14 +20447,7 @@ mod tests {
                 );
                 assert_eq!(receipt["last_census_pending_file_count"], 7);
                 assert_eq!(receipt["consecutive_failures"], 4);
-                assert_eq!(
-                    receipt["next_retry_at"],
-                    if cause == Some("carry_admission") {
-                        "1970-01-01T00:00:30Z"
-                    } else {
-                        "1970-01-01T00:01:00Z"
-                    }
-                );
+                assert_eq!(receipt["next_retry_at"], "1970-01-01T00:01:00Z");
                 assert_eq!(receipt["last_success_at"], serde_json::Value::Null);
                 assert_eq!(receipt["last_census_complete"], false);
             }
@@ -21003,7 +20833,6 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
-            None,
         );
         assert!(!settled.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -21033,7 +20862,6 @@ mod tests {
             &held,
             &held,
             false,
-            None,
         );
         assert!(!deferred.bounded_sweep_had_unsettled_upload());
         assert!(deferred.files["/opaque/held.jsonl"]
@@ -21047,7 +20875,6 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
-            None,
         );
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -21071,7 +20898,6 @@ mod tests {
             held_fingerprints: BTreeSet::new(),
             account_deferred_fingerprints: BTreeSet::new(),
             progress_blocking: false,
-            held_family_roots: None,
         };
         let progress = test_upload_progress();
         let completed =
@@ -21085,28 +20911,16 @@ mod tests {
             !completed.fully_settled,
             "the debt keeps completion pending"
         );
-        let rejected = settle_checkpointed_upload(
-            committed.clone(),
-            &committed,
-            &progress,
-            &debt_only,
-            true,
-            None,
-        );
+        let rejected =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
         assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
         assert!(rejected
             .index
             .bounded_sweep_unsettled_cause_names()
             .is_empty());
         assert!(!rejected.fully_settled);
-        let deferred = settle_checkpointed_upload(
-            committed.clone(),
-            &committed,
-            &progress,
-            &debt_only,
-            false,
-            None,
-        );
+        let deferred =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
         assert!(
             deferred.index.bounded_sweep_had_unsettled_upload(),
             "a retryable server conflict beside the debt still marks the sweep"
@@ -21117,262 +20931,6 @@ mod tests {
             "the second cause names itself; the debt names nothing"
         );
         assert!(!deferred.fully_settled);
-    }
-
-    /// A `Completed`
-    /// page's blocking holds scope the sweep marker to their own families for
-    /// the terminal unchanged-proof skip only. The flag and its cause names
-    /// are exactly as before. Scopes accumulate across the sweep's pages and
-    /// survive a reload. An unplaced hold, any other cause, an unscoped stamp
-    /// earlier in the sweep, or more families than the bound keeps the
-    /// sweep-wide veto.
-    #[test]
-    fn completed_blocking_holds_scope_the_unchanged_proof_veto_to_held_families() {
-        let entry = |source: &str, fingerprint: &str| {
-            serde_json::json!({
-                "size_bytes": 1,
-                "modified_unix_seconds": 2,
-                "source_file_fingerprint": source,
-                "last_snapshot_fingerprint": fingerprint,
-                "scan_identity_version": "semantic_sync:v2",
-            })
-        };
-        let committed = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
-        }));
-        let scanned = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
-        }));
-        let held = BTreeSet::from(["held-new".to_string()]);
-        let progress = test_upload_progress();
-        let families = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<BTreeSet<_>>()
-        };
-        let block = |index: ScanIndex, held_family_roots: Option<&BTreeSet<String>>| {
-            commit_completed_with_local_holds(
-                index,
-                &committed,
-                &progress,
-                &held,
-                &BTreeSet::new(),
-                true,
-                held_family_roots,
-            )
-        };
-        let scope = |index: &ScanIndex| {
-            index
-                .unchanged_proof_unsettled_families()
-                .map(|held| held.len())
-        };
-
-        assert_eq!(scope(&scanned), Some(0), "a settled sweep owes no family");
-        let first = block(scanned.clone(), Some(&families(&["held-family"])));
-        assert!(first.bounded_sweep_had_unsettled_upload());
-        assert_eq!(
-            first.bounded_sweep_unsettled_cause_names(),
-            ["completed_blocking_holds"]
-        );
-        assert_eq!(scope(&first), Some(1));
-        let second = block(
-            first,
-            Some(&families(&["held-family", "other-held-family"])),
-        );
-        assert_eq!(
-            second.bounded_sweep_unsettled_cause_names(),
-            ["completed_blocking_holds"]
-        );
-        assert_eq!(scope(&second), Some(2), "a later page adds its families");
-        let root = test_dir("completed-blocking-holds-scope");
-        std::fs::create_dir_all(&root).expect("create scope fixture root");
-        let index_path = root.join("scan-index.json");
-        second.clone().save(&index_path).expect("save scan index");
-        let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
-        assert_eq!(
-            reloaded.unchanged_proof_unsettled_families(),
-            second.unchanged_proof_unsettled_families(),
-            "the scope crosses the save/load boundary"
-        );
-        let _ = std::fs::remove_dir_all(root);
-
-        // Doubt keeps the sweep-wide veto.
-        assert_eq!(scope(&block(second.clone(), None)), None, "unplaced hold");
-        assert_eq!(
-            scope(&block(scanned.clone(), Some(&BTreeSet::new()))),
-            None,
-            "a hold that names no family"
-        );
-        assert_eq!(
-            scope(&block(
-                block(scanned.clone(), None),
-                Some(&families(&["held-family"]))
-            )),
-            None,
-            "a scoped page cannot rescope an unscoped sweep"
-        );
-        let mut shed = second.clone();
-        shed.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
-        assert_eq!(scope(&shed), None, "any other cause");
-        assert_eq!(
-            scope(&block(shed, Some(&families(&["held-family"])))),
-            None,
-            "a scoped page after another cause"
-        );
-        let numbered = |count: usize| {
-            (0..count)
-                .map(|n| format!("held-family-{n}"))
-                .collect::<BTreeSet<_>>()
-        };
-        let bound = crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS;
-        assert_eq!(
-            scope(&block(scanned.clone(), Some(&numbered(bound)))),
-            Some(bound)
-        );
-        assert_eq!(
-            scope(&block(scanned, Some(&numbered(bound + 1)))),
-            None,
-            "overflow"
-        );
-    }
-
-    /// Review 797 P2: a loaded scope is trusted only in the shape its writer
-    /// produces. A saved index whose sweep still carries the sole
-    /// `completed_blocking_holds` cause, but whose scope is empty, over the
-    /// bound, holds a non-canonical digest, is missing, or has the wrong type,
-    /// takes the sweep-wide unchanged-proof veto. The flag and cause stay.
-    /// Review 797 r2: that veto is sticky. A later held page of the same sweep
-    /// stamping a valid family cannot turn the unknown scope back into a
-    /// scoped exception; a healthy saved scope still accumulates.
-    #[test]
-    fn saved_held_family_scope_outside_the_writer_shape_keeps_the_sweep_wide_veto() {
-        let entry = |source: &str, fingerprint: &str| {
-            serde_json::json!({
-                "size_bytes": 1,
-                "modified_unix_seconds": 2,
-                "source_file_fingerprint": source,
-                "last_snapshot_fingerprint": fingerprint,
-                "scan_identity_version": "semantic_sync:v2",
-            })
-        };
-        let committed = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
-        }));
-        let scanned = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
-        }));
-        let mut scoped = commit_completed_with_local_holds(
-            scanned,
-            &committed,
-            &test_upload_progress(),
-            &BTreeSet::from(["held-new".to_string()]),
-            &BTreeSet::new(),
-            true,
-            Some(&BTreeSet::from(["held-family".to_string()])),
-        );
-        let root = test_dir("saved-held-family-scope-shape");
-        std::fs::create_dir_all(&root).expect("create scope fixture root");
-        let index_path = root.join("scan-index.json");
-        scoped.save(&index_path).expect("save scan index");
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
-                .expect("decode saved index");
-        let written = saved["claude_full_rearm_progress"]["held_family_roots"].clone();
-        let valid = written[0].as_str().expect("one written digest").to_owned();
-        assert_eq!(
-            ScanIndex::load(&index_path)
-                .expect("reload scan index")
-                .unchanged_proof_unsettled_families()
-                .map(|held| held.len()),
-            Some(1),
-            "control: the writer's own scope is trusted"
-        );
-        let later_held_page = |index: ScanIndex| {
-            commit_completed_with_local_holds(
-                index,
-                &committed,
-                &test_upload_progress(),
-                &BTreeSet::from(["held-new".to_string()]),
-                &BTreeSet::new(),
-                true,
-                Some(&BTreeSet::from(["later-held-family".to_string()])),
-            )
-        };
-        assert_eq!(
-            later_held_page(ScanIndex::load(&index_path).expect("reload scan index"))
-                .unchanged_proof_unsettled_families()
-                .map(|held| held.len()),
-            Some(2),
-            "control: a healthy saved scope accumulates the later page's family"
-        );
-        let over_bound = (0..=crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS)
-            .map(|n| format!("{n:032x}"))
-            .collect::<Vec<_>>();
-        let key = valid.clone();
-        let damaged: [(&str, Option<serde_json::Value>); 8] = [
-            ("empty", Some(serde_json::json!([]))),
-            ("over the bound", Some(serde_json::json!(over_bound))),
-            (
-                "not a digest",
-                Some(serde_json::json!([valid, "not-a-digest"])),
-            ),
-            (
-                "uppercase digest",
-                Some(serde_json::json!([valid.to_uppercase()])),
-            ),
-            ("short digest", Some(serde_json::json!([&valid[1..]]))),
-            ("missing", None),
-            ("wrong type: number", Some(serde_json::json!(7))),
-            ("wrong type: object", Some(serde_json::json!({ key: true }))),
-        ];
-        for (case, value) in damaged {
-            let mut edited = saved.clone();
-            let progress = edited["claude_full_rearm_progress"]
-                .as_object_mut()
-                .expect("the scope is saved in the re-arm progress");
-            match value {
-                Some(value) => {
-                    progress.insert("held_family_roots".to_owned(), value);
-                }
-                None => {
-                    progress.remove("held_family_roots");
-                }
-            }
-            std::fs::write(
-                &index_path,
-                serde_json::to_vec(&edited).expect("encode edited index"),
-            )
-            .expect("write edited index");
-            let loaded = ScanIndex::load(&index_path).expect("reload edited index");
-            assert!(loaded.bounded_sweep_had_unsettled_upload(), "{case}");
-            assert_eq!(
-                loaded.bounded_sweep_unsettled_cause_names(),
-                ["completed_blocking_holds"],
-                "{case}"
-            );
-            assert_eq!(
-                loaded.unchanged_proof_unsettled_families(),
-                None,
-                "{case}: the sweep-wide veto"
-            );
-            let advanced = later_held_page(loaded);
-            assert_eq!(
-                advanced.bounded_sweep_unsettled_cause_names(),
-                ["completed_blocking_holds"],
-                "{case}: advanced"
-            );
-            assert_eq!(
-                advanced.unchanged_proof_unsettled_families(),
-                None,
-                "{case}: a later scoped page keeps the sweep-wide veto"
-            );
-        }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
@@ -23056,7 +22614,15 @@ mod tests {
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/continuation_prepare_tests.rs");
-    include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    mod census_p2_kept_pipeline_tests {
+        include!("snapshot_sync/census_p2_kept_pipeline_tests.rs");
+    }
+    use census_p2_kept_pipeline_tests::{
+        assert_listed_fold_absent, pipeline_transcript_line, PipelineCycle, PipelineFixture,
+        PipelinePage, PipelineUpload, PIPELINE_FILE_BIRTH, PIPELINE_HELD_SESSION,
+        PIPELINE_HOLD_CYCLE, PIPELINE_MACHINE_ID, PIPELINE_MAX_PAGES, PIPELINE_PAGE_FILES,
+        PIPELINE_SESSIONS,
+    };
     // Main's original shared pipeline assertions run at the production OFF
     // default, independently of the explicit-ON containment fixtures above.
 
@@ -23081,12 +22647,6 @@ mod tests {
     }
     mod p12_pipeline_original_tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
-        mod proof_rearm_idempotence_pipeline_tests {
-            include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
-            mod stale_family_carry_pipeline_tests {
-                include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
-            }
-        }
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
@@ -24708,8 +24268,17 @@ mod tests {
                     .unwrap()
                     .identity_disposition = Some("conflict");
             }
+            // An upgraded store's witness, stored from this case's rows: no
+            // build proves a new one.
+            let mut case_index = index.clone();
+            let stored = case_index.install_stored_claude_family_witness_from_support_for_test(
+                &raw.source_session_id,
+                &candidate.snapshots,
+                &support,
+            );
+            assert!(stored || case != "complete", "{case}");
             let (proof, _, _) =
-                apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut index.clone());
+                apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut case_index);
             let item = &mut candidate.snapshots[0];
             if case == "complete" {
                 assert_eq!(

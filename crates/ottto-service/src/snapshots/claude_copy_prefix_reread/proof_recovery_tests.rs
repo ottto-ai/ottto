@@ -373,11 +373,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
             ClaudeRequestCensusShape::IdentityIncomplete
         );
         assert!(record.identity_incomplete_hold());
-        index.files.get_mut(&key).unwrap().scan_identity_version =
-            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        assert!(sampled_audit::awaits_hold_deadline_restoration(
-            &index, &key
-        ));
     });
 }
 

@@ -77,7 +77,6 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
     index.claude_history_gate_loaded = true;
     index.claude_history_cutoff_unix_seconds = Some(1_790_000_000);
     index.save(&path).unwrap();
-    let history_before = serde_json::to_value(&index.claude_full_rearm_progress).unwrap();
     with_contract(2, || {
         let before = sampled_scan::now_seconds();
         let mut loaded = ScanIndex::load_for_snapshot_source(
@@ -106,10 +105,6 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
             Some("b".repeat(64).as_str())
         );
         assert_eq!(loaded.session_account_bindings["owner"], binding);
-        assert_eq!(
-            serde_json::to_value(&loaded.claude_full_rearm_progress).unwrap(),
-            history_before
-        );
         assert_eq!(
             loaded.claude_history_cutoff_unix_seconds,
             index.claude_history_cutoff_unix_seconds

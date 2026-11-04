@@ -1628,9 +1628,10 @@ mod codec_mapper_regressions {
     fn read_back_counts_aggregated_references_to_repeated_empty_evidence() {
         let scratch = crate::test_scratch::ScratchDir::canonical("codec-ref-readback");
         let index: ScanIndex = serde_json::from_value(serde_json::json!({
-            "schema_version":2,"files":{},"claude_usage_family_pending":{"f":{
-                "census_window_end":"A","invalid":false,
-                "member_request_id_hashes":{"a":[],"b":[]}
+            "schema_version":2,"files":{},"claude_usage_family_witnesses":{"f":{
+                "evidence_fingerprint":"A","member_request_id_fingerprints":{},
+                "assigned_request_id_fingerprints":{},
+                "legacy_excluded_request_id_hashes":{"a":[],"b":[]}
             }}
         }))
         .unwrap();

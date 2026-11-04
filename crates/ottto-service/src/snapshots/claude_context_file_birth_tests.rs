@@ -124,16 +124,14 @@ fn no_reports() -> (
     reports(&[], true)
 }
 
-/// Index every path. `fence_closed` models the steady state on real Macs: the
-/// global duplicate fence is held, so no item is owned by the strict rule.
-fn indexed(paths: &[&Path], fence_closed: bool) -> ScanIndex {
+/// Index every path.
+fn indexed(paths: &[&Path]) -> ScanIndex {
     let mut index = ScanIndex::default();
     for path in paths {
         index
             .files
             .insert(local_index_key(path), manifest_index_entry(None));
     }
-    index.claude_duplicate_request_witness_overflowed = fence_closed;
     index
 }
 
@@ -144,19 +142,8 @@ fn fold(
         crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     ),
     index: &mut ScanIndex,
-    census_complete: bool,
 ) -> ClaudeUsageAuthorityDisposition {
-    apply_claude_reported_usage_with_index_and_limits(
-        items,
-        &reports.0,
-        &reports.1,
-        index,
-        census_complete,
-        &stamp(OffsetDateTime::now_utc(), 60),
-        1_000,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-    )
+    apply_claude_reported_usage_with_index(items, &reports.0, &reports.1, index)
 }
 
 fn posture(item: &SnapshotItem) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
@@ -254,12 +241,12 @@ fn rewind_copy_counts_only_own_records() {
     assert_eq!(parsed.claude_file_birth.tagged_responses_for_test(), 4);
     let fold_with = |rule_on: bool| {
         let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], true);
+        let mut index = indexed(&[&path]);
         let disposition = if rule_on {
-            fold(&mut items, &no_reports(), &mut index, true)
+            fold(&mut items, &no_reports(), &mut index)
         } else {
             claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
-                fold(&mut items, &no_reports(), &mut index, true)
+                fold(&mut items, &no_reports(), &mut index)
             })
         };
         (disposition, items.remove(0))
@@ -384,13 +371,13 @@ fn compaction_pairs_across_the_copy_line_count_once() {
     assert_eq!(parsed.compaction_count, Some(4));
 
     let mut items = vec![parsed.clone()];
-    let mut index = indexed(&[&path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     let item = items.remove(0);
     let mut control = vec![parsed.clone()];
-    let mut control_index = indexed(&[&path], true);
+    let mut control_index = indexed(&[&path]);
     let _ = claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
-        fold(&mut control, &no_reports(), &mut control_index, true)
+        fold(&mut control, &no_reports(), &mut control_index)
     });
 
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
@@ -426,9 +413,9 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
     let first = assistant(ROOT, "req_a1", &stamp(now, -30), 100);
     let (path, parsed) = root_session(&dir, ROOT, std::slice::from_ref(&first));
     let mut items = vec![parsed.clone()];
-    // Incomplete census and a held fence: today this waited for a quiet pass.
-    let mut index = indexed(&[&path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, false);
+    // The first pass admits the file's numbers.
+    let mut index = indexed(&[&path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(
         posture(&items[0]),
@@ -449,7 +436,7 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
     .expect("append fixture");
     let grown = parse(&path, now);
     let mut items = vec![grown.clone()];
-    let disposition = fold(&mut items, &no_reports(), &mut index, false);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(
         posture(&items[0]),
@@ -477,12 +464,12 @@ fn subagent_file_is_not_exempt_from_the_tripwire() {
     let parsed = parse(&path, now);
     assert!(parsed.claude_file_birth.is_subagent_for_test());
     let session_id = parsed.source_session_id.clone();
-    let mut index = indexed(&[&path], true);
+    let mut index = indexed(&[&path]);
     // Admitted first: a veto is remembered for this file version (F2).
     for (owner, expected) in [(ROOT, "file_birth_rule"), (OTHER_ROOT, "withheld_tripwire")] {
         let mut items = vec![parsed.clone()];
         let evidence = reports(&[(owner, "req_s1", 1, 40)], true);
-        let disposition = fold(&mut items, &evidence, &mut index, true);
+        let disposition = fold(&mut items, &evidence, &mut index);
         assert_eq!(
             disposition.posture_admission(&session_id),
             Some(expected),
@@ -534,9 +521,9 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
     );
     // Only one file is on this page; the index still knows the other one.
     let mut items = vec![parsed.clone()];
-    let mut index = indexed(&[&path_a, &path_b], true);
+    let mut index = indexed(&[&path_a, &path_b]);
 
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
 
     assert_eq!(
         disposition.posture_admission(ROOT),
@@ -556,7 +543,7 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
     );
     // Both files on one page: the same, for each file.
     let mut items = vec![parsed.clone(), other];
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     for item in &items {
         assert_cleared(item);
     }
@@ -569,8 +556,8 @@ fn same_session_id_in_two_folders_withholds_the_tuple() {
     );
     // Once the second file is gone, the remaining file is admitted.
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path_a], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path_a]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(
         posture(&items[0]),
@@ -621,8 +608,8 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
     // Only the restored file: admitted, post-birth numbers only. First is
     // the first prompt after the restore; peak never includes copied records.
     let mut items = vec![restored.clone()];
-    let mut index = indexed(&[&restored_path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&restored_path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(
         posture(&items[0]),
@@ -633,8 +620,8 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
     // The original is also present: same session id in two files, the whole
     // tuple is withheld.
     let mut items = vec![restored];
-    let mut index = indexed(&[&restored_path, &original_path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&restored_path, &original_path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(
         disposition.posture_admission(ROOT),
         Some("withheld_multi_file")
@@ -665,8 +652,8 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
         ],
     );
     let mut items = vec![fresh, later];
-    let mut index = indexed(&[&fresh_path, &later_path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&fresh_path, &later_path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(
         disposition
             .context_file_birth
@@ -703,8 +690,8 @@ fn birth_at_or_before_2020_counts_as_unknown() {
         let mut item = parsed.clone();
         item.claude_file_birth.set_birth_for_test(birth);
         let mut items = vec![item];
-        let mut index = indexed(&[&path], true);
-        let disposition = fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&[&path]);
+        let disposition = fold(&mut items, &no_reports(), &mut index);
         assert_eq!(
             disposition.posture_admission(ROOT),
             Some(expected),
@@ -749,8 +736,8 @@ fn untimed_or_invalid_record_timestamp_withholds() {
         let case_dir = dir.join(case.replace(' ', "-"));
         let (path, parsed) = root_session(&case_dir, ROOT, &[own.clone(), tail]);
         let mut items = vec![parsed];
-        let mut index = indexed(&[&path], true);
-        let disposition = fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&[&path]);
+        let disposition = fold(&mut items, &no_reports(), &mut index);
         assert_eq!(
             disposition.posture_admission(ROOT),
             Some("withheld_untimed_record"),
@@ -790,19 +777,11 @@ fn evidence_bound_withholds_only_that_root() {
         &[assistant(SECOND, "req_b1", &stamp(now, -30), 100)],
     );
     let mut items = vec![large, small];
-    let mut index = indexed(&[&path_a, &path_b], true);
+    let mut index = indexed(&[&path_a, &path_b]);
 
-    let disposition = apply_claude_reported_usage_with_index_and_limits(
-        &mut items,
-        &no_reports().0,
-        &no_reports().1,
-        &mut index,
-        true,
-        &stamp(OffsetDateTime::now_utc(), 60),
-        2,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-    );
+    let disposition = claude_context_file_birth::with_claude_evidence_bound_for_test(2, || {
+        fold(&mut items, &no_reports(), &mut index)
+    });
 
     assert_eq!(
         disposition.posture_admission(ROOT),
@@ -868,29 +847,53 @@ fn own_rows<'a>(roots: &[&'a str], extra: &[(&'a str, &'a str)]) -> Vec<(String,
         .collect()
 }
 
-fn fold_with_bound(
-    items: &mut [SnapshotItem],
+fn row_reports(
     rows: &[(String, String)],
-    index: &mut ScanIndex,
-    bound: usize,
-) -> ClaudeUsageAuthorityDisposition {
+) -> (
+    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) {
     let rows = rows
         .iter()
         .enumerate()
         .map(|(sequence, (root, request))| (root.as_str(), request.as_str(), sequence as u64, 100))
         .collect::<Vec<_>>();
-    let (api, trace) = reports(&rows, true);
-    apply_claude_reported_usage_with_index_and_limits(
+    reports(&rows, true)
+}
+
+/// The fold's file-birth admission of every item, with the telemetry
+/// tripwire built over `rows` at a slice cap of `bound` loaded rows.
+fn admit_with_slice_cap(
+    items: &mut [SnapshotItem],
+    rows: &[(String, String)],
+    bound: usize,
+) -> (BTreeMap<String, &'static str>, ClaudeContextFileBirthCounts) {
+    let (api, trace) = row_reports(rows);
+    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
         items,
+        bound,
         &api,
         &trace,
-        index,
-        true,
-        &stamp(OffsetDateTime::now_utc(), 60),
-        bound,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-    )
+        &BTreeMap::new(),
+    );
+    let mut counts = ClaudeContextFileBirthCounts::default();
+    let mut admissions = BTreeMap::new();
+    for item in items.iter_mut() {
+        let root = claude_snapshot_family_root(item);
+        let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+            item,
+            &root,
+            &tripwire,
+            &mut claude_context_file_birth::remembered_tripwire(),
+            false,
+            &mut counts,
+        );
+        admissions.insert(
+            item.source_session_id.clone(),
+            ClaudePostureAdmission::FileBirth(verdict).as_str(),
+        );
+    }
+    (admissions, counts)
 }
 
 /// review-678c R3: one root whose requests span slices, with the
@@ -945,28 +948,20 @@ fn contradiction_in_a_later_slice_vetoes_the_root() {
     lines.push(assistant(ROOT, &late, &stamp(now, -20), 100));
     let mut files = vec![root_session(&dir, ROOT, &lines)];
     files.extend(five_request_roots(&dir, now, &fillers));
-    let paths = files
-        .iter()
-        .map(|(path, _)| path.as_path())
-        .collect::<Vec<_>>();
-    let mut index = indexed(&paths, true);
     let mut items = files
         .iter()
         .map(|(_, item)| item.clone())
         .collect::<Vec<_>>();
     assert_eq!(items[0].claude_usage_occurrences.len(), bound);
 
-    let disposition = fold_with_bound(&mut items, &page_rows(&late), &mut index, bound);
+    let (admissions, counts) = admit_with_slice_cap(&mut items, &page_rows(&late), bound);
 
-    assert_eq!(
-        disposition.posture_admission(ROOT),
-        Some("withheld_tripwire")
-    );
+    assert_eq!(admissions[ROOT], "withheld_tripwire");
     assert_cleared(&items[0]);
     for root in fillers {
-        assert_eq!(disposition.posture_admission(root), Some("file_birth_rule"));
+        assert_eq!(admissions[root], "file_birth_rule");
     }
-    let total = disposition.context_file_birth.total;
+    let total = counts.total;
     assert_eq!(total.withheld_evidence_bound_session_count, 0);
     assert_eq!(total.withheld_tripwire_session_count, 1);
     let _ = fs::remove_dir_all(dir);
@@ -985,9 +980,9 @@ fn all_copied_file_withholds() {
         ],
     );
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
+    let mut index = indexed(&[&path]);
 
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
 
     assert_eq!(
         disposition.posture_admission(ROOT),
@@ -1025,7 +1020,7 @@ fn telemetry_veto_stays_until_the_file_changes() {
         grown_as("file-birth-fp-grown"),
         grown_as("file-birth-fp-grown-2"),
     );
-    let mut index = indexed(&[&path], true);
+    let mut index = indexed(&[&path]);
     let contradiction = || reports(&[(OTHER_ROOT, "req_a1", 1, 100)], true);
     // Missing telemetry is not a contradiction. A row arriving later
     // withholds, and the withhold holds on pages without that row until the
@@ -1039,7 +1034,7 @@ fn telemetry_veto_stays_until_the_file_changes() {
         (6, &grown_again, no_reports(), "file_birth_rule", 0),
     ] {
         let mut items = vec![item.clone()];
-        let disposition = fold(&mut items, &evidence, &mut index, true);
+        let disposition = fold(&mut items, &evidence, &mut index);
         assert_eq!(
             disposition.posture_admission(ROOT),
             Some(expected),
@@ -1166,9 +1161,9 @@ fn same_session_id_never_merges_across_accounts() {
     first.session_account_evidence = Some(account('a'));
     second.session_account_evidence = Some(account('b'));
     let mut items = vec![first, second];
-    let mut index = indexed(&[&path_a, &path_b], true);
+    let mut index = indexed(&[&path_a, &path_b]);
 
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
 
     // Neither file borrows the other's numbers; both withhold the tuple.
     assert_cleared(&items[0]);
@@ -1284,10 +1279,10 @@ fn api_row_without_trace_row_counts_as_owned() {
         ],
     );
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
+    let mut index = indexed(&[&path]);
     let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 300)], false);
 
-    let disposition = fold(&mut items, &evidence, &mut index, true);
+    let disposition = fold(&mut items, &evidence, &mut index);
 
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     assert_eq!(
@@ -1318,16 +1313,13 @@ fn id_less_responses_share_the_one_scalar_source() {
     );
     assert!(!parsed.claude_context_curve_identity_complete);
     let evidence = reports(&[(ROOT, "req_a1", 1, 100)], true);
-    for fence_closed in [false, true] {
-        let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], fence_closed);
-        fold(&mut items, &evidence, &mut index, true);
-        assert_eq!(
-            posture(&items[0]),
-            (Some(500), Some(500), Some(100), Some(0)),
-            "fence_closed={fence_closed}"
-        );
-    }
+    let mut items = vec![parsed.clone()];
+    let mut index = indexed(&[&path]);
+    fold(&mut items, &evidence, &mut index);
+    assert_eq!(
+        posture(&items[0]),
+        (Some(500), Some(500), Some(100), Some(0))
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1422,7 +1414,7 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
     )
     .unwrap();
     let claude = SnapshotSource::ClaudeCode;
-    let run = |rule_on: bool, fence_closed: bool| {
+    let run = |rule_on: bool| {
         let mut index =
             crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
         let mut scan = scan_source_roots_with_test_limit(
@@ -1434,7 +1426,6 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
             100,
         )
         .unwrap();
-        index.claude_duplicate_request_witness_overflowed = fence_closed;
         let apply = |scan: &mut SourceScanResult, index: &mut ScanIndex| {
             crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, scan, index)
         };
@@ -1448,37 +1439,33 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
         (scan.snapshots, stats)
     };
 
-    for fence_closed in [false, true] {
-        let (bodies, stats) = run(true, fence_closed);
-        let (control, _) = run(false, fence_closed);
+    let (bodies, stats) = run(true);
+    let (control, _) = run(false);
 
-        assert_eq!(bodies.len(), control.len());
-        if !fence_closed {
-            let h296 = bodies
-                .iter()
-                .find(|item| item.source_session_id == root.source_session_id)
-                .expect("h296 root body");
-            assert_eq!(h296.provenance.collector, identity::COLLECTOR);
-        }
-        let mut changed = 0;
-        for (body, control) in bodies.iter().zip(&control) {
-            assert_eq!(body.source_session_id, control.source_session_id);
-            let differing = differing_keys(body, control);
-            assert!(
-                differing.is_subset(&allowed_difference()),
-                "fence_closed={fence_closed} {}: {differing:?}",
-                body.source_session_id
-            );
-            changed += usize::from(!differing.is_empty());
-        }
-        assert!(changed >= 2, "the fresh root and its subagent are admitted");
-        assert!(stats.context_file_birth.total.file_birth_rule_session_count >= 2);
-        let fresh = bodies
-            .iter()
-            .find(|item| item.source_session_id == SECOND)
-            .expect("fresh root body");
-        assert_eq!(posture(fresh), (Some(100), Some(300), Some(300), Some(0)));
+    assert_eq!(bodies.len(), control.len());
+    let h296 = bodies
+        .iter()
+        .find(|item| item.source_session_id == root.source_session_id)
+        .expect("h296 root body");
+    assert_eq!(h296.provenance.collector, identity::COLLECTOR);
+    let mut changed = 0;
+    for (body, control) in bodies.iter().zip(&control) {
+        assert_eq!(body.source_session_id, control.source_session_id);
+        let differing = differing_keys(body, control);
+        assert!(
+            differing.is_subset(&allowed_difference()),
+            "{}: {differing:?}",
+            body.source_session_id
+        );
+        changed += usize::from(!differing.is_empty());
     }
+    assert!(changed >= 2, "the fresh root and its subagent are admitted");
+    assert!(stats.context_file_birth.total.file_birth_rule_session_count >= 2);
+    let fresh = bodies
+        .iter()
+        .find(|item| item.source_session_id == SECOND)
+        .expect("fresh root body");
+    assert_eq!(posture(fresh), (Some(100), Some(300), Some(300), Some(0)));
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1556,8 +1543,8 @@ fn start_verdict_matches_the_folded_session_start() {
             "{label}: parsed"
         );
         let mut items = vec![parsed];
-        let mut index = indexed(&[&path], true);
-        fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&[&path]);
+        fold(&mut items, &no_reports(), &mut index);
         assert_eq!(
             session_start::uploaded_start_verdict(&items[0]),
             expected,
@@ -1674,8 +1661,8 @@ fn tail_and_full_read_select_the_same_first_request() {
         let mut folded = Vec::new();
         for item in [tailed, full] {
             let mut items = vec![item];
-            let mut index = indexed(&[&path], true);
-            let disposition = fold(&mut items, &no_reports(), &mut index, true);
+            let mut index = indexed(&[&path]);
+            let disposition = fold(&mut items, &no_reports(), &mut index);
             assert_eq!(
                 disposition.posture_admission(ROOT),
                 Some("file_birth_rule"),
@@ -1715,14 +1702,9 @@ fn claude_backfill_stop_latches_until_restart() {
     };
     let fold_pass = || {
         let mut items = vec![files[0].1.clone()];
-        let mut index = indexed(&paths, true);
+        let mut index = indexed(&paths);
         let (disposition, records) = crate::local_resource_diagnostics::capture(|| {
-            fold_with_bound(
-                &mut items,
-                &rows,
-                &mut index,
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            )
+            fold(&mut items, &row_reports(&rows), &mut index)
         });
         let alarms = records
             .into_iter()
@@ -1895,9 +1877,9 @@ fn withheld_item_clears_sizes_and_points_with_the_tuple() {
         prompt_tokens: 100,
     }];
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
+    let mut index = indexed(&[&path]);
 
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
 
     assert_eq!(
         disposition.posture_admission(ROOT),
@@ -1927,33 +1909,29 @@ fn id_less_neighbours_of_a_compaction_are_counted_locally() {
     );
     assert!(!parsed.claude_context_curve_identity_complete);
     let evidence = reports(&[(ROOT, "req_a1", 1, 100), (ROOT, "req_a2", 2, 200)], true);
-    for fence_closed in [false, true] {
-        let mut items = vec![parsed.clone()];
-        let mut index = indexed(&[&path], fence_closed);
-        let disposition = fold(&mut items, &evidence, &mut index, true);
-        assert_eq!(
-            items[0].compaction_events,
-            vec![SnapshotCompactionEvent {
-                at: stamp(now, -28),
-                before: Some(100),
-                after: Some(200),
-                trigger: Some("auto".to_string()),
-            }],
-            "fence_closed={fence_closed}"
-        );
-        // Counted on the local basis-counts line only; the wire is unchanged.
-        let counts = &disposition.context_file_birth;
-        assert_eq!(
-            (
-                counts.id_less_response_before_compaction_count,
-                counts.id_less_response_after_compaction_count
-            ),
-            (1, 1),
-            "fence_closed={fence_closed}"
-        );
-        let wire = serde_json::to_value(&items[0]).unwrap();
-        assert!(!wire.to_string().contains("id_less"));
-    }
+    let mut items = vec![parsed.clone()];
+    let mut index = indexed(&[&path]);
+    let disposition = fold(&mut items, &evidence, &mut index);
+    assert_eq!(
+        items[0].compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: stamp(now, -28),
+            before: Some(100),
+            after: Some(200),
+            trigger: Some("auto".to_string()),
+        }]
+    );
+    // Counted on the local basis-counts line only; the wire is unchanged.
+    let counts = &disposition.context_file_birth;
+    assert_eq!(
+        (
+            counts.id_less_response_before_compaction_count,
+            counts.id_less_response_after_compaction_count
+        ),
+        (1, 1)
+    );
+    let wire = serde_json::to_value(&items[0]).unwrap();
+    assert!(!wire.to_string().contains("id_less"));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1972,8 +1950,8 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
         ],
     );
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
-    fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path]);
+    fold(&mut items, &no_reports(), &mut index);
     let item = items.remove(0);
     assert_eq!(item.compaction_events.len(), 1);
     assert!(!item.local_context_points.is_empty());
@@ -2054,8 +2032,8 @@ fn measured_file_carries_its_first_own_request_time() {
     );
     assert_eq!(parsed.first_own_request_at, None, "the fold sets it");
     let mut items = vec![parsed.clone()];
-    let mut index = indexed(&[&path], true);
-    let disposition = fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path]);
+    let disposition = fold(&mut items, &no_reports(), &mut index);
     assert_eq!(disposition.posture_admission(ROOT), Some("file_birth_rule"));
     let counts = &disposition.context_file_birth.total;
     assert_eq!(counts.partially_pre_birth_session_count, 0);
@@ -2086,8 +2064,8 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
         item.first_own_request_at = stale.clone();
         let session = item.source_session_id.clone();
         let mut items = vec![item];
-        let mut index = indexed(&[path.as_path()], true);
-        let disposition = fold(&mut items, &no_reports(), &mut index, true);
+        let mut index = indexed(&[path.as_path()]);
+        let disposition = fold(&mut items, &no_reports(), &mut index);
         let admission = disposition.posture_admission(&session);
         let partially = disposition
             .context_file_birth
@@ -2191,8 +2169,8 @@ fn first_own_request_time_leaves_every_identity_unchanged() {
         ],
     );
     let mut items = vec![parsed];
-    let mut index = indexed(&[&path], true);
-    fold(&mut items, &no_reports(), &mut index, true);
+    let mut index = indexed(&[&path]);
+    fold(&mut items, &no_reports(), &mut index);
     let item = items.remove(0);
     assert_eq!(item.first_own_request_at, Some(stamp(now, -30)));
     let mut bare = item.clone();
@@ -2268,8 +2246,8 @@ fn tail_and_full_read_give_the_same_first_own_request_time() {
         let mut folded = Vec::new();
         for item in [tailed, full] {
             let mut items = vec![item];
-            let mut index = indexed(&[&path], true);
-            let disposition = fold(&mut items, &no_reports(), &mut index, true);
+            let mut index = indexed(&[&path]);
+            let disposition = fold(&mut items, &no_reports(), &mut index);
             assert_eq!(
                 disposition.posture_admission(ROOT),
                 Some("file_birth_rule"),
@@ -2400,8 +2378,8 @@ fn file_birth_only_admitted_scalars_reach_batch_wire_without_a_curve() {
     let mut item = parsed.clone();
     item.claude_context_curve_request_index_complete = true;
     let mut items = vec![item];
-    let mut index = indexed(&[&path], true);
-    fold(&mut items, &no_reports(), &mut index, false);
+    let mut index = indexed(&[&path]);
+    fold(&mut items, &no_reports(), &mut index);
     let item = &items[0];
     assert_eq!(
         item.claude_file_birth_verdict(),

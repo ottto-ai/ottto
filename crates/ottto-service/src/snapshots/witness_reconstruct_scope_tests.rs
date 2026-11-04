@@ -19,8 +19,9 @@ fn family_root(family: usize) -> String {
 }
 
 /// `count` single-member families, each with its own requests and exactly
-/// paired API/trace rows, proven by one complete census.
-fn proven_families(name: &str, count: usize) -> Families {
+/// paired API/trace rows, and the witnesses an older build stored for them
+/// (an upgraded store). One fold rebuilds every family.
+fn witnessed_families(name: &str, count: usize) -> Families {
     let dir = temp_dir(name);
     let mut index = ScanIndex {
         accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
@@ -41,7 +42,7 @@ fn proven_families(name: &str, count: usize) -> Families {
             .collect::<String>();
         fs::write(&path, lines).expect("write family fixture");
         // Real paused-adoption input: the family keeps ordinary money, so the
-        // reported-usage proof and rebuild below run on its body.
+        // reported-usage rebuild below runs on its body.
         let item = crate::snapshots::e2_pipeline_scan_fixture::parse_ordinary(
             &path,
             "2026-08-02T07:01:00Z",
@@ -99,8 +100,16 @@ fn proven_families(name: &str, count: usize) -> Families {
         evidence: trace,
         ..Default::default()
     };
+    for family in 0..count {
+        assert!(index.install_stored_claude_family_witness_for_test(
+            &family_root(family),
+            &raw,
+            &api,
+            &trace
+        ));
+    }
     let mut seed = raw.clone();
-    apply_claude_reported_usage_with_index(&mut seed, &api, &trace, &mut index, true, WINDOW);
+    apply_claude_reported_usage_with_index(&mut seed, &api, &trace, &mut index);
     assert_eq!(index.claude_usage_family_witnesses.len(), count);
     assert!(seed
         .iter()
@@ -125,8 +134,6 @@ fn rebuild_first_family(families: &Families) -> SnapshotItem {
         &families.api,
         &families.trace,
         &mut index,
-        false,
-        WINDOW,
     );
     assert!(disposition.quarantined_source_session_ids.is_empty());
     assert_eq!(
@@ -138,10 +145,10 @@ fn rebuild_first_family(families: &Families) -> SnapshotItem {
 
 #[test]
 fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
-    // Ordinary-money families (paused input) keep the reported-body proof.
+    // Ordinary-money families (paused input) keep the reported-body rebuild.
 
-    let alone = proven_families("witness-scope-alone", 1);
-    let crowded = proven_families("witness-scope-crowded", 9);
+    let alone = witnessed_families("witness-scope-alone", 1);
+    let crowded = witnessed_families("witness-scope-crowded", 9);
     let expected = rebuild_first_family(&alone);
     let actual = rebuild_first_family(&crowded);
     assert_eq!(

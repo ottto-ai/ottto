@@ -413,7 +413,6 @@ impl GroupBoot {
                 retention: discovery_retention!(index),
                 growth: None,
             },
-            false,
             cache,
         ) else {
             return Boot::Strict;

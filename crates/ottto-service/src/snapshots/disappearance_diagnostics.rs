@@ -1141,7 +1141,6 @@ pub(super) mod tests {
             serde_json::json!({
                 "quarantine": index.claude_usage_authority_quarantine,
                 "witnesses": index.claude_usage_family_witnesses,
-                "pending": index.claude_usage_family_pending,
                 "deferred_holds": index.claude_account_deferred_holds,
             })
         };

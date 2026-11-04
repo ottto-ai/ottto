@@ -81,56 +81,6 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
 }
 
 #[test]
-fn native_comparison_selected_membership_sees_all_paths_without_unrelated_owned_graph() {
-    let mut index = ScanIndex::default();
-    for ordinal in 0..2048 {
-        let mut entry = manifest_index_entry(Some("body"));
-        entry.source_file_fingerprint = "s".repeat(4096);
-        index
-            .files
-            .insert(format!("/unrelated/u-{ordinal}.jsonl"), entry);
-    }
-    for path in [
-        "/project/healthy.jsonl",
-        "/project/healthy/subagents/agent-a.jsonl",
-        // Not in the initial target list, but still a required family member.
-        "/different-project/healthy/subagents/agent-unexpected.jsonl",
-        "/project/duplicated.jsonl",
-        "/project/duplicated/subagents/agent-a.jsonl",
-        "/different-project/duplicated/subagents/agent-a.jsonl",
-        "/project/missing-root/subagents/agent-a.jsonl",
-    ] {
-        index
-            .files
-            .insert(path.into(), manifest_index_entry(Some("body")));
-    }
-    let selected = BTreeSet::from(["healthy".into(), "duplicated".into(), "missing-root".into()]);
-    let (all, baseline) =
-        crate::retry_allocation_probe::measure(|| complete_claude_usage_family_members(&index));
-    let (scoped, allocated) = crate::retry_allocation_probe::measure(|| {
-        complete_claude_usage_family_members_matching(&index, Some(&selected))
-    });
-    for root in &selected {
-        assert_eq!(scoped.get(root), all.get(root));
-    }
-    assert!(scoped["healthy"].contains("healthy_agent-unexpected"));
-    assert!(
-        !scoped.contains_key("duplicated"),
-        "another project's duplicate must invalidate the family"
-    );
-    assert!(!scoped.contains_key("missing-root"));
-    assert_eq!(scoped.len(), 1);
-    assert!(allocated.requested_peak_with_overlap < baseline.requested_peak_with_overlap);
-    let base_source_bytes = index
-        .files
-        .values()
-        .map(|entry| entry.source_file_fingerprint.capacity())
-        .sum::<usize>();
-    assert!(base_source_bytes >= crate::source_rotation::PARKED_BUDGET);
-    eprintln!("native comparison membership scratch: unrelated_files=2048 borrowed_base_source_bytes={base_source_bytes} baseline_global_peak={} selected_peak={} selected_duplicate_outside_targets_rejected=true missing_root_rejected=true extra_member_visible=true final_global_fold_unchanged=true admission_unproved=true not_RSS=true", baseline.requested_peak_with_overlap, allocated.requested_peak_with_overlap);
-}
-
-#[test]
 fn native_comparison_selected_restore_membership_matches_canonical_without_global_set() {
     let mut index = ScanIndex::default();
     for ordinal in 0..2048 {
@@ -336,9 +286,11 @@ impl SelectionFixture {
 // Carried from #587; the tests below exercise the new moving preparation seam,
 // not the synthetic permit/rearm controls above. No reuse is activated.
 struct NativePreparationFixture {
-    native_conjunction: bool,
     dir: PathBuf,
     parent: String,
+    /// The parent's own scanned item: the evidence loaders open the pairs of
+    /// the roots the page's items name.
+    native: Vec<SnapshotItem>,
     index: ScanIndex,
     api: Api,
     trace: Trace,
@@ -361,17 +313,23 @@ impl NativePreparationFixture {
         let (mut index, mut scan) = finish(native);
         assert!(scan.census_complete);
         let (api, trace) = reports(&parent, false);
-        let disposition = apply_claude_reported_usage_with_index(
-            &mut scan.snapshots,
+        // An upgraded store: the family's witness was stored by an older
+        // build, and the fold rebuilds it.
+        assert!(index.install_stored_claude_family_witness_for_test(
+            &parent,
+            &scan.snapshots,
             &api,
-            &trace,
-            &mut index,
-            true,
-            WINDOW,
-        );
-        let native_conjunction = claude_native_comparison::actual_native_conjunction(&disposition);
-        assert!(native_conjunction);
+            &trace
+        ));
+        apply_claude_reported_usage_with_index(&mut scan.snapshots, &api, &trace, &mut index);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+        let native = scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == parent)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(native.len(), 1);
         index.active_upload_context_fingerprint = Some("native-preparation-test".into());
         // Model delivered history: each file holds its receipt in this context.
         let context = index.active_upload_context_fingerprint.clone().unwrap();
@@ -385,9 +343,9 @@ impl NativePreparationFixture {
         }
         assert!(index.claude_usage_family_witnesses.contains_key(&parent));
         Self {
-            native_conjunction,
             dir,
             parent,
+            native,
             index,
             api,
             trace,
@@ -512,8 +470,6 @@ fn native_comparison_current_nonreported_member_withdraws_whole_family() {
         &fixture.api,
         &fixture.trace,
         &mut index,
-        true,
-        WINDOW,
     );
     assert!(disposition
         .quarantined_source_session_ids
@@ -555,8 +511,7 @@ fn native_preparation_pair_roundtrip(replace: bool) {
     let (api, trace, healthy, permissive_rows) =
         crate::snapshot_sync::prepared_claude_pair_for_test(
             &support,
-            &[],
-            &fixture.index,
+            &fixture.native,
             &fixture.parent,
             || {
                 assert_eq!(
@@ -612,7 +567,7 @@ fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
         crate::claude_local_otel::reset_evidence_read_counts_for_test();
         let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
             &support,
-            &fixture.index,
+            &fixture.native,
             &required,
             || {
                 if let Some(folder) = changed {
@@ -645,7 +600,7 @@ fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
     let required = BTreeSet::from([fixture.parent.clone(), "unknown-predecessor".to_owned()]);
     let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
         &support,
-        &fixture.index,
+        &fixture.native,
         &required,
         || {},
     );
@@ -814,7 +769,7 @@ fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_conte
     first.bind("synthetic-source-destination-context".into());
     assert!(!first.allowed());
     fixture.index.save(&scratch.join("index.json")).unwrap();
-    first.note_selected_save(fixture.native_conjunction);
+    first.note_selected_save(true);
     first.finish(true);
     let mut next = owner.begin();
     next.bind("synthetic-source-destination-context".into());
@@ -840,7 +795,7 @@ fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_conte
         !original.allowed(),
         "context rollback cannot revive a process grant"
     );
-    writeln!(std::io::stderr().lock(), "native_comparison_lifecycle: actual_native_conjunction=true actual_index_save=true next_cycle_allowed=true retained_index_restart_base=true context_change_and_drop_revoke=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_lifecycle: native_save=true actual_index_save=true next_cycle_allowed=true retained_index_restart_base=true context_change_and_drop_revoke=true").unwrap();
 }
 
 #[test]
@@ -870,7 +825,7 @@ fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
 
 fn native_comparison_quiet_bounded_page(
     fixture: &NativePreparationFixture,
-) -> (ScanIndex, SourceScanResult, ClaudeUsageAuthorityDisposition) {
+) -> (ScanIndex, SourceScanResult) {
     let native = OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&fixture.dir),
@@ -887,16 +842,14 @@ fn native_comparison_quiet_bounded_page(
     assert!(!scan.census_complete);
     assert_eq!(scan.scanned_file_count, 0);
     assert!(scan.snapshots.is_empty(), "no new body needs an ACK");
-    let disposition = apply_claude_reported_usage_with_index(
+    apply_claude_reported_usage_with_index(
         &mut scan.snapshots,
         &fixture.api,
         &fixture.trace,
         &mut index,
-        scan.census_complete,
-        &scan.census_window_end,
     );
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    (index, scan, disposition)
+    (index, scan)
 }
 
 #[test]
@@ -908,24 +861,20 @@ fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() 
     let mut bootstrap = owner.begin();
     bootstrap.bind("page-source-destination-context".into());
     fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
 
     let mut page = owner.begin();
     page.bind("page-source-destination-context".into());
     assert!(page.allowed());
-    let (mut index, scan, disposition) = native_comparison_quiet_bounded_page(&fixture);
+    let (mut index, scan) = native_comparison_quiet_bounded_page(&fixture);
     assert!(claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &index,
-        &disposition
+        &scan, &index
     ));
     index.save(&path).unwrap();
     page.note_selected_save(false); // A partial census cannot bootstrap.
     page.finish(claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &index,
-        &disposition,
+        &scan, &index,
     ));
     let mut next = owner.begin();
     next.bind("page-source-destination-context".into());
@@ -956,7 +905,7 @@ fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
     let mut bootstrap = owner.begin();
     bootstrap.bind("page-source-destination-context".into());
     fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
     let mut no_save = owner.begin();
     no_save.bind("page-source-destination-context".into());
@@ -969,53 +918,31 @@ fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
         "clean boolean cannot replace selected save"
     );
 
-    let (index, scan, disposition) = native_comparison_quiet_bounded_page(&fixture);
+    let (index, scan) = native_comparison_quiet_bounded_page(&fixture);
     assert!(claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &index,
-        &disposition
+        &scan, &index
     ));
     let mut loss = scan.clone();
     loss.unreadable_path_count = 1;
     assert!(!claude_native_comparison::selected_page_is_clean(
-        &loss,
-        &index,
-        &disposition
+        &loss, &index
     ));
     let mut sidecar = scan.clone();
     sidecar.sidecar_census_complete = false;
     assert!(!claude_native_comparison::selected_page_is_clean(
-        &sidecar,
-        &index,
-        &disposition
+        &sidecar, &index
     ));
     let mut unknown = index.clone();
     unknown.traversal = None;
     assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &unknown,
-        &disposition
+        &scan, &unknown
     ));
     let mut unsettled = index.clone();
     unsettled.mark_bounded_sweep_unsettled();
     assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &unsettled,
-        &disposition
+        &scan, &unsettled
     ));
-    let mut invalid = ClaudeUsageAuthorityDisposition::default();
-    invalid.duplicate_census.census_invalid = true;
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan, &index, &invalid
-    ));
-    let mut closed = index.clone();
-    closed.claude_duplicate_request_witness_overflowed = true;
-    assert!(!claude_native_comparison::selected_page_is_clean(
-        &scan,
-        &closed,
-        &disposition
-    ));
-    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: no_selected_save_revokes=true unreadable_sidecar_unknown_unsettled_invalid_closed_rejected=true certificate_carry_unwired=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: no_selected_save_revokes=true unreadable_sidecar_unknown_unsettled_rejected=true certificate_carry_unwired=true").unwrap();
 }
 
 fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
@@ -1278,306 +1205,6 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     state.resume_native_comparison_base();
     let (_, scan) = finish(state);
     assert!(!scan.census_complete);
-}
-
-fn native_observation_duplicate_fixture() -> (
-    crate::test_scratch::ScratchDir,
-    ScanIndex,
-    SourceScanResult,
-    String,
-    String,
-) {
-    let dir = crate::test_scratch::ScratchDir::new("native-observation-emission-split");
-    let b = "b2222222-2222-4222-8222-222222222222".to_owned();
-    let d = "d4444444-4444-4444-8444-444444444444".to_owned();
-    for (session, own) in [(&b, "b_unique"), (&d, "d_unique")] {
-        let rows = [own, "shared_second"].into_iter().enumerate().map(|(i, request)| {
-            format!("{{\"timestamp\":\"2026-08-02T07:00:0{i}Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")
-        }).collect::<String>();
-        fs::write(dir.join(format!("{session}.jsonl")), rows).unwrap();
-    }
-    let native = OwnedSourceScan::new_with_identity_capture(
-        SnapshotSource::ClaudeCode,
-        &[dir.to_path_buf()],
-        ScanIndex::default(),
-        WINDOW,
-        30,
-        8,
-        None,
-        &[],
-        false,
-        false,
-    );
-    let (index, scan) = finish(native);
-    assert!(scan.census_complete);
-    assert_eq!(scan.scanned_file_count, 2);
-    assert_eq!(scan.snapshots.len(), 2);
-    (dir, index, scan, b, d)
-}
-
-#[test]
-fn native_comparison_withheld_body_keeps_actual_duplicate_against_unaffected_body() {
-    let (_dir, mut index, mut scan, b, d) = native_observation_duplicate_fixture();
-    let mut base_index = index.clone();
-    let mut base_scan = scan.clone();
-    let api = Api::default();
-    let trace = Trace::default();
-    let base = apply_claude_reported_usage_to_scan_with_identity(
-        &mut base_scan,
-        &api,
-        &trace,
-        &mut base_index,
-        None,
-    );
-    let shared = format!("{:x}", Sha256::digest(b"shared_second"));
-    let expected = BTreeSet::from([
-        claude_duplicate_request_owner(&b, &b),
-        claude_duplicate_request_owner(&d, &d),
-    ]);
-    assert_eq!(
-        base_index.claude_duplicate_request_owners.get(&shared),
-        Some(&expected)
-    );
-    let mut bad_index = index.clone();
-    let mut bad_scan = scan.clone();
-    bad_scan
-        .snapshots
-        .retain(|item| item.source_session_id != b);
-    apply_claude_reported_usage_to_scan_with_identity(
-        &mut bad_scan,
-        &api,
-        &trace,
-        &mut bad_index,
-        None,
-    );
-    assert!(
-        !bad_index
-            .claude_duplicate_request_owners
-            .contains_key(&shared),
-        "control demonstrates why filtering before native accumulation is wrong"
-    );
-    let observed = record_claude_native_observations(&scan, &mut index);
-    scan.snapshots.retain(|item| item.source_session_id != b);
-    scan.pending_finalization.retain(|pending| {
-        claude_index_path_family_member(Path::new(&pending.index_key))
-            .is_some_and(|(_, member)| member != b)
-    });
-    let split = apply_claude_reported_usage_to_scan_with_observations(
-        &mut scan,
-        &api,
-        &trace,
-        &mut index,
-        None,
-        Some(observed),
-    );
-    assert_eq!(scan.snapshots.len(), 1);
-    assert_eq!(scan.snapshots[0].source_session_id, d);
-    assert_eq!(
-        index.claude_duplicate_request_owners.get(&shared),
-        Some(&expected)
-    );
-    assert_eq!(
-        index.claude_duplicate_request_owners,
-        base_index.claude_duplicate_request_owners
-    );
-    assert_eq!(split.duplicate_census, base.duplicate_census);
-    assert_eq!(
-        split.transcript_ownership_complete,
-        base.transcript_ownership_complete
-    );
-    // Effective terminality changes only AFTER the authoritative actual-native
-    // census, never before duplicate detection. Final selected restore/rearm is
-    // still a separate required integration gate.
-    scan.census_complete = false;
-    index.mark_bounded_sweep_unsettled();
-    writeln!(std::io::stderr().lock(), "native_comparison_observations: actual_native_files=2 actual_native_occurrences=4 withheld_bodies=1 emitted_bodies=1 b_d_duplicate_retained=true filter_first_control_misses_duplicate=true actual_fold_once=true selected_settlement_unproved=true").unwrap();
-}
-
-#[test]
-fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
-    let (_dir, mut index, mut scan, _, _) = native_observation_duplicate_fixture();
-    let mut base_index = index.clone();
-    let mut base_scan = scan.clone();
-    let api = Api::default();
-    let trace = Trace::default();
-    let base = apply_claude_reported_usage_to_scan_with_identity(
-        &mut base_scan,
-        &api,
-        &trace,
-        &mut base_index,
-        None,
-    );
-    let observed = record_claude_native_observations(&scan, &mut index);
-    let split = apply_claude_reported_usage_to_scan_with_observations(
-        &mut scan,
-        &api,
-        &trace,
-        &mut index,
-        None,
-        Some(observed),
-    );
-    assert_eq!(
-        serde_json::to_value(&index).unwrap(),
-        serde_json::to_value(&base_index).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&scan.snapshots).unwrap(),
-        serde_json::to_value(&base_scan.snapshots).unwrap()
-    );
-    assert_eq!(split.duplicate_census, base.duplicate_census);
-    assert_eq!(
-        split.transcript_ownership_complete,
-        base.transcript_ownership_complete
-    );
-}
-
-#[test]
-fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
-    if !native_positive_layout_for_test(
-        "native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior",
-    ) {
-        return;
-    }
-    let mut fixture = NativePreparationFixture::new();
-    let c = "c3333333-3333-4333-8333-333333333333";
-    let path = fixture.dir.join(format!("{c}.jsonl"));
-    let parent_rows =
-        fs::read_to_string(fixture.dir.join(format!("{}.jsonl", fixture.parent))).unwrap();
-    let mut child_rows = parent_rows
-        .lines()
-        .take(2)
-        .map(|line| line.replace(&fixture.parent, c) + "\n")
-        .collect::<String>();
-    child_rows.push_str(&format!("{{\"timestamp\":\"2026-08-02T07:00:06Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_extra\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"));
-    fs::write(&path, child_rows).unwrap();
-    fixture.api.evidence.insert(
-        c.to_owned(),
-        vec![complete_api_row(c, "req_extra", 6, 10, 10, 0)],
-    );
-    fixture
-        .trace
-        .evidence
-        .insert(c.to_owned(), vec![complete_trace_row(c, "req_extra", "")]);
-    // Introducing C changes the duplicate-owner witness and legitimately
-    // rearms existing members. This is a qualification fixture, not a quiet
-    // convergence oracle: establish a second complete native conjunction before
-    // asking which unchanged members the ordinary scanner can actually skip.
-    // Never restore fingerprints by hand or suppress that production rearm.
-    for establishing_pass in 0..2 {
-        for entry in fixture.index.files.values_mut() {
-            entry.source_file_fingerprint.clear();
-        }
-        let native = OwnedSourceScan::new_with_identity_capture(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&fixture.dir),
-            fixture.index.clone(),
-            WINDOW,
-            30,
-            8,
-            None,
-            &[],
-            false,
-            false,
-        );
-        let (mut index, mut scan) = finish(native);
-        assert_eq!(scan.scanned_file_count, 3);
-        assert!(scan.census_complete);
-        apply_claude_reported_usage_with_index(
-            &mut scan.snapshots,
-            &fixture.api,
-            &fixture.trace,
-            &mut index,
-            true,
-            WINDOW,
-        );
-        let excluded =
-            index.claude_usage_family_witnesses[c].legacy_excluded_request_id_hashes[c].clone();
-        assert_eq!(
-            excluded,
-            ["req_1", "req_2"]
-                .into_iter()
-                .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
-                .collect::<BTreeSet<_>>()
-        );
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        // Each establishing page is delivered: its exact ACKs earn receipts.
-        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
-            &mut index,
-            &scan.snapshots,
-            &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
-        );
-        if establishing_pass == 0 {
-            assert!(index
-                .files
-                .values()
-                .any(|entry| entry.source_file_fingerprint.is_empty()));
-        } else {
-            assert!(index
-                .files
-                .values()
-                .all(|entry| !entry.source_file_fingerprint.is_empty()));
-        }
-        fixture.index = index;
-    }
-    let stable_index = fixture.index.clone();
-    fixture
-        .index
-        .files
-        .get_mut(&local_index_key(&path))
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    let native = state
-        .snapshots
-        .iter()
-        .find(|item| item.source_session_id == c)
-        .unwrap()
-        .clone();
-    let healthy = BTreeSet::from([fixture.parent.clone(), c.to_owned()]);
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 2);
-    assert_eq!(
-        qualification.new_native_hashes(&native).unwrap(),
-        raw_hashes(&native),
-        "E nonempty cannot subtract a prior S even under the exact retained P"
-    );
-    assert_eq!(
-        qualification.possible_targets(&native).unwrap(),
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    fixture.index = stable_index;
-    let d = "d4444444-4444-4444-8444-444444444444";
-    fs::write(
-        fixture.dir.join(format!("{d}.jsonl")),
-        parent_rows
-            .lines()
-            .next()
-            .unwrap()
-            .replace(&fixture.parent, d)
-            + "\n",
-    )
-    .unwrap();
-    let mut state = fixture.paused();
-    assert_eq!(state.scanned_file_count, 1);
-    let native_d = state.snapshots[0].clone();
-    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
-        api: &fixture.api.evidence,
-        trace: &fixture.trace.evidence,
-        healthy_roots: &healthy,
-    });
-    assert_eq!(qualification.certified_member_count(), 3);
-    assert_eq!(
-        qualification.possible_targets(&native_d).unwrap(),
-        BTreeSet::from([fixture.parent.clone(), c.to_owned()]),
-        "C is a target only because its certified S also contains E, not just assigned req_extra"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_legacy: actual_prefix_exclusion=2 e_nonempty_q5_prior=false copied_native_requests_hit_predecessor=true certified_exclusion_is_target=true body_offer_unproved=true").unwrap();
 }
 
 #[test]
@@ -1956,18 +1583,16 @@ fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
     let (mut index, mut scan) = finish(state);
     assert!(!scan.census_complete);
     assert!(scan.snapshots.is_empty());
-    let disposition = apply_claude_reported_usage_with_index(
+    apply_claude_reported_usage_with_index(
         &mut scan.snapshots,
         &fixture.api,
         &fixture.trace,
         &mut index,
-        scan.census_complete,
-        &scan.census_window_end,
     );
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
     window.retain_current(&index);
     assert_eq!(window.certified_member_count(), 1);
-    let clean = claude_native_comparison::selected_page_is_clean(&scan, &index, &disposition);
+    let clean = claude_native_comparison::selected_page_is_clean(&scan, &index);
     assert!(clean);
     NativeWindowPage {
         index,
@@ -2016,7 +1641,7 @@ fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
     let mut bootstrap = owner.begin();
     bootstrap.bind("window-source-destination-context".into());
     fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
     let mut lease = owner.begin();
     lease.bind("window-source-destination-context".into());
@@ -2197,7 +1822,7 @@ fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base()
     let mut bootstrap = owner.begin();
     bootstrap.bind("original-scope".into());
     fixture.index.save(&path).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
     let page = native_window_page(&fixture);
     let mut no_save = owner.begin();
@@ -2227,7 +1852,7 @@ fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
     let mut bootstrap = owner.begin();
     bootstrap.bind("original-scope".into());
     fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
     let mut valid = owner.begin();
     valid.bind("original-scope".into());
@@ -2262,7 +1887,7 @@ fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
     let mut bootstrap = owner.begin();
     bootstrap.bind("scope".into());
     fixture.index.save(&scratch.join("index.json")).unwrap();
-    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.note_selected_save(true);
     bootstrap.finish(true);
     let mut outstanding = owner.begin();
     outstanding.bind("scope".into());
@@ -2281,7 +1906,7 @@ fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
     owner.discard_retained();
     assert!(!outstanding.allowed());
     assert!(outstanding.take_window().is_none());
-    outstanding.note_selected_save(fixture.native_conjunction);
+    outstanding.note_selected_save(true);
     outstanding.finish(true);
     let mut next = owner.begin();
     next.bind("scope".into());
@@ -2492,33 +2117,17 @@ fn native_comparison_selected_fallback_fixture() -> (
     let completion = controller.complete(&scan, terminal, false).unwrap();
     assert!(completion.window.is_none());
     let fallback = completion.fallback.unwrap();
-    let observed = record_claude_native_observations(&scan, &mut index);
     fallback.withhold(&mut scan);
     assert!(scan
         .snapshots
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
-    let disposition = apply_claude_reported_usage_to_scan_with_observations(
+    apply_claude_reported_usage_to_scan_with_identity(
         &mut scan,
         &fixture.api,
         &fixture.trace,
         &mut index,
         None,
-        Some(observed),
-    );
-    let shared = format!("{:x}", Sha256::digest(b"req_1"));
-    let owners = index.claude_duplicate_request_owners.get(&shared).unwrap();
-    assert!(owners.contains(&claude_duplicate_request_owner(
-        FALLBACK_COPY,
-        FALLBACK_COPY
-    )));
-    assert!(owners.contains(&claude_duplicate_request_owner(
-        FALLBACK_PEER,
-        FALLBACK_PEER
-    )));
-    assert!(
-        disposition.duplicate_census.census_complete,
-        "raw-native terminal decision reaches the ONE fold"
     );
     fallback.after_native_fold(&mut scan, &mut index);
     assert!(!scan.census_complete);
@@ -2562,7 +2171,7 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .snapshots
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
-    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
 }
 
 /// Diagnostics only: the comparison fallback's fold and its selected restore
@@ -2783,10 +2392,7 @@ fn native_comparison_corrected_native_receipt_fixture(
     let mut controller = claude_native_comparison::Controller::new(qualification);
     assert!(controller.advance(&mut state, true));
     let (mut index, mut scan) = finish(state);
-    assert!(
-        !scan.census_complete,
-        "an earlier bounded page, before terminal rearm"
-    );
+    assert!(!scan.census_complete, "an earlier bounded page");
     let mut completion = controller.complete(&scan, None, true).unwrap();
     let disposition = apply_claude_reported_usage_to_scan_with_identity(
         &mut scan,
@@ -3234,7 +2840,6 @@ fn ownership_diagnostics_preserve_real_claude_terminal_completed_heap_and_paid_c
     );
     let controller = claude_native_comparison::Controller::new_paid(
         claude_native_comparison::Qualification::default(),
-        scan.snapshots.len(),
         &mut credit,
     )
     .unwrap();

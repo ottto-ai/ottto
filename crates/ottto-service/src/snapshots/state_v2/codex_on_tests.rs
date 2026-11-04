@@ -25,7 +25,8 @@ const PI_EMPTY: &str =
 
 /// Pi has no Pi-only kind (its fork ledger lives in the durable tail record):
 /// every shared file-owned and accepted kind non-default, with each optional
-/// entry field present once, one owed file and one confirmed-empty file.
+/// entry field present once, one file not yet fingerprinted and one
+/// confirmed-empty file.
 fn pi_fixture() -> ScanIndex {
     let receipt = json!({
         "context_fingerprint": "1".repeat(64),
@@ -55,7 +56,6 @@ fn pi_fixture() -> ScanIndex {
                 "modified_unix_seconds": 1_793_088_000_u64,
                 "source_file_fingerprint": "",
                 "last_snapshot_fingerprint": null,
-                "evidence_owed": true,
             },
         },
         "terminal_jsonl_dispositions": {
@@ -142,7 +142,7 @@ impl Drop for Route {
 
 /// Serialized graph with cold rows read back from the session store.
 fn view(index: &ScanIndex) -> serde_json::Value {
-    let cold = index.claude_usage_family_pending.cold().is_some();
+    let cold = money_test_support::has_cold_archive(index);
     serde_json::to_value(if cold {
         money_test_support::resident(index)
     } else {
@@ -236,5 +236,92 @@ fn v2_reload_keeps_per_path_first_load_membership() {
             !index.note_first_index_load(path),
             "not the path's first load"
         );
+    }
+}
+
+/// [format] A previous release's store holds rows of every retired kind:
+/// Claude's with usage members (a request set shared with a live row, a value
+/// stored in chunks) and a raw usage hold, Codex's and Pi's manifest-only.
+/// One hydrate and save removes them all, releases their request sets and
+/// chunks, and leaves every live row as it was; a reopen finds none.
+#[test]
+fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
+    use kinds::tests::{referenced_sets, set_refs};
+    const LIVE: [&str; 4] = [
+        "accepted.entity",
+        "refusal.authority",
+        "proof.usage",
+        "file.census",
+    ];
+    let live = |db: &mut sqlite::Sqlite| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut headers = Vec::new();
+        for kind in LIVE {
+            mapper::rows(&mut tx, kind, |_, h| {
+                headers.push(h);
+                Ok(())
+            })
+            .unwrap();
+        }
+        headers
+    };
+    for (source, build) in fixtures() {
+        let claude = source == Source::Claude;
+        let scratch = crate::test_scratch::ScratchDir::canonical("retired-purge");
+        let path = scratch.join("state.v2.sqlite.import");
+        let index = if claude {
+            kinds::tests::with_co_owned_witness(build())
+        } else {
+            build()
+        };
+        let mut db = money_test_support::populate(source, &path, &index, BTreeMap::new());
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let retired = kinds::tests::seed_retired_rows(&mut db, claude);
+        let before = live(&mut db);
+        assert!(
+            !claude || before.len() > LIVE.len(),
+            "Claude holds live members"
+        );
+        // Each usage row's request sets, with their counts before the purge.
+        let mut sets = Vec::new();
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for key in retired.iter().filter(|key| {
+                matches!(key, RowKey::Record { kind, position: 1, .. } if kind.name() == "usage.pending")
+            }) {
+                let h = tx.get(key).unwrap().unwrap();
+                if key == &mapper::key("usage.pending", kinds::tests::CHUNKED, 1).unwrap() {
+                    assert!(h.parts > 0, "{source:?}: stored in chunks");
+                }
+                for set in referenced_sets(&mut tx, key) {
+                    let refs = set_refs(&mut tx, &set).unwrap();
+                    sets.push((set, refs));
+                }
+            }
+        }
+        assert_eq!(sets.len(), if claude { 2 } else { 0 }, "{source:?}");
+        kinds::tests::purge(&mut db, money_test_support::binding(source)).unwrap();
+        drop(db);
+        let mut db = sqlite::Sqlite::open(&path, &identity).unwrap();
+        let (_, cx) = kinds::hydrate(&mut db, money_test_support::binding(source)).unwrap();
+        assert!(cx.retired.is_empty(), "{source:?}");
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for key in &retired {
+                assert!(tx.get(key).unwrap().is_none(), "{source:?}: {key:?}");
+            }
+            for (set, refs) in &sets {
+                // One reference less: a set only the retired row held is released.
+                let after = set_refs(&mut tx, set);
+                assert_eq!(after, refs.checked_sub(1).filter(|n| *n > 0), "{source:?}");
+            }
+        }
+        assert!(
+            sets.iter().any(|(_, refs)| *refs == 2) == claude,
+            "{source:?}"
+        );
+        assert_eq!(live(&mut db), before, "{source:?}: live rows untouched");
+        db.audit_headers().unwrap();
+        db.validate_references().unwrap();
     }
 }
