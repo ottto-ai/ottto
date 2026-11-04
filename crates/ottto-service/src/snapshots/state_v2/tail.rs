@@ -472,10 +472,6 @@ fn write_value(
     row_key: &RowKey,
     value: &[u8],
 ) -> Result<Header> {
-    // The logical value against its row target, before fragments or compression.
-    if let RowKey::Record { kind, .. } = row_key {
-        telemetry::row_cap(kind.name(), value.len() as u64, value_target(row_key));
-    }
     let mut fragments = 0_u64;
     if value.len() > FRAG_BYTES {
         let key = frag_key(file, owner, page);
