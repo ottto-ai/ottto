@@ -1023,11 +1023,19 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
 // chain. Since mid-October 2026 the two records land up to ~1.2 s apart, so an
 // unlinked pair still needs a window wider than that spread.
 const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 2_000;
+#[derive(Debug, Clone, Default)]
+struct CompactionMetrics {
+    total_pre_tokens: u64,
+    total_post_tokens: u64,
+    total_cumulative_dropped_tokens: u64,
+    total_duration_ms: u64,
+    metrics_count: u64,
+}
 
 mod sources;
 use sources::claude::context_posture::{
     claude_compaction_summary, clear_claude_context_posture, paired_claude_legacy_compactions,
-    set_claude_compaction_scalars, ClaudeCompactionKind, CompactionMetrics,
+    set_claude_compaction_scalars, ClaudeCompactionKind,
 };
 
 #[derive(Debug, Clone)]
@@ -2844,6 +2852,7 @@ pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
 
 #[cfg(test)]
 pub(crate) use sources::claude::census::authority::ClaudeAuthorityRecordForTest;
+pub use sources::claude::census::authority::ClaudeRequestCensusShadowCounts;
 use sources::claude::census::authority::{
     claude_accepted_ledger_is_current, claude_index_file_body_accepted,
     claude_usage_authority_deadline_is_bounded, claude_usage_authority_preserves_pending,
@@ -2851,9 +2860,32 @@ use sources::claude::census::authority::{
 };
 #[cfg(test)]
 use sources::claude::census::authority::{sha256_hex_is_well_formed, ClaudePostureAdmission};
-pub use sources::claude::census::authority::{
-    ClaudeRequestCensusShadowCounts, ClaudeUsageAuthorityDisposition,
-};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeUsageAuthorityDisposition {
+    /// Local counters for how this fold's Claude scalars were decided.
+    pub(crate) context_file_birth: ClaudeContextFileBirthCounts,
+    quarantined_source_session_ids: BTreeSet<String>,
+    /// The account-deferred subset of `quarantined_source_session_ids`. Upload
+    /// retention still uses the union; this only classifies settlement.
+    account_deferred_source_session_ids: BTreeSet<String>,
+    /// Fixed-label `e2` emission veto counts for this page. Diagnostic only;
+    /// never serialized, persisted, or used to decide upload eligibility.
+    pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
+    pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
+    /// Contract-5 only: each rebuilt item's requests, classified and folded
+    /// into bounded row x authority-key groups during the rebuild.
+    pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// Copy-derived rows (#944): the accepted rows this
+    /// pass's bodies treat as never accepted. The sync loop tombstones them
+    /// through `AcceptedBuckets` and saves before any upload.
+    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
+    /// Why each folded item kept or lost its Claude posture scalars. Kept for
+    /// tests only: never built in a release fold, never serialized, and never
+    /// an index, account, identity, audit or upload input.
+    #[cfg(test)]
+    pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
+}
 
 fn claude_usage_family_witness_fingerprint(witness: &ClaudeUsageFamilyWitness) -> String {
     let mut digest = Sha256::new();

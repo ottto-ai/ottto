@@ -7,16 +7,16 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::snapshots::claude_context_file_birth::ClaudeContextFileBirthCounts;
 #[cfg(test)]
 use crate::snapshots::claude_context_file_birth::ClaudeFileBirthVerdict;
 use crate::snapshots::wire::SnapshotItem;
 use crate::snapshots::{
-    claude_authority_record_contract_is_valid, claude_request_accounts, claude_request_identity,
-    claude_snapshot_family_root, claude_usage_family_witness_fingerprint, usage_totals_from_item,
-    ClaudeUsageAuthorityQuarantineDisposition, ClaudeUsageAuthorityQuarantineRecord,
-    ClaudeUsageFamilyWitness, ScanIndex, ScanIndexEntry, CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS,
-    MAX_CLAUDE_USAGE_AUTHORITY_FAILURES, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+    claude_authority_record_contract_is_valid, claude_snapshot_family_root,
+    claude_usage_family_witness_fingerprint, usage_totals_from_item,
+    ClaudeUsageAuthorityDisposition, ClaudeUsageAuthorityQuarantineDisposition,
+    ClaudeUsageAuthorityQuarantineRecord, ClaudeUsageFamilyWitness, ScanIndex, ScanIndexEntry,
+    CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+    SNAPSHOT_ACCEPTED_LEDGER_VERSION,
 };
 
 /// Test-only, content-free copy of one family authority record and its
@@ -33,32 +33,6 @@ pub(crate) struct ClaudeAuthorityRecordForTest {
     /// The pending correction's proof digest and owed members.
     pub(crate) correction: Option<(String, BTreeSet<String>)>,
     pub(crate) bound_to_retained_witness: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ClaudeUsageAuthorityDisposition {
-    /// Local counters for how this fold's Claude scalars were decided.
-    pub(crate) context_file_birth: ClaudeContextFileBirthCounts,
-    quarantined_source_session_ids: BTreeSet<String>,
-    /// The account-deferred subset of `quarantined_source_session_ids`. Upload
-    /// retention still uses the union; this only classifies settlement.
-    account_deferred_source_session_ids: BTreeSet<String>,
-    /// Fixed-label `e2` emission veto counts for this page. Diagnostic only;
-    /// never serialized, persisted, or used to decide upload eligibility.
-    pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
-    pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
-    /// Contract-5 only: each rebuilt item's requests, classified and folded
-    /// into bounded row x authority-key groups during the rebuild.
-    pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
-    /// Copy-derived rows (#944): the accepted rows this
-    /// pass's bodies treat as never accepted. The sync loop tombstones them
-    /// through `AcceptedBuckets` and saves before any upload.
-    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
-    /// Why each folded item kept or lost its Claude posture scalars. Kept for
-    /// tests only: never built in a release fold, never serialized, and never
-    /// an index, account, identity, audit or upload input.
-    #[cfg(test)]
-    pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
 }
 
 /// The rule that admitted or withheld one Claude item's first/peak/last

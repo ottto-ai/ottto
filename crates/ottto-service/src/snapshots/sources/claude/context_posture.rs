@@ -8,17 +8,9 @@ use crate::snapshots::local_context_points::{local_context_points_recent, LocalC
 use crate::snapshots::wire::SnapshotItem;
 use crate::snapshots::{
     bounded_compaction_timestamps, compaction_events, ClaudeCompactionObservation,
-    ClaudeTranscriptUsageOccurrence, CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS,
+    ClaudeTranscriptUsageOccurrence, CompactionMetrics,
+    CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS,
 };
-
-#[derive(Debug, Clone, Default)]
-pub(in crate::snapshots) struct CompactionMetrics {
-    total_pre_tokens: u64,
-    total_post_tokens: u64,
-    total_cumulative_dropped_tokens: u64,
-    total_duration_ms: u64,
-    metrics_count: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::snapshots) enum ClaudeCompactionKind {
