@@ -453,8 +453,7 @@ impl OwnedJsonlParser {
         // Native EOF may apply an unterminated valid JSON row. Its reduction is
         // not the reduction through the sealed byte pointer. Conservatively
         // decline retention; keep the existing full-parser EOF output unchanged.
-        let unsealed = !self.reader.sealed_fragment()
-            && checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
@@ -554,8 +553,7 @@ impl OwnedJsonlParser {
         };
         let checkpoint =
             plan.commit_after_native_completion(self.reader.reader.get_ref(), scope, now)?;
-        let unsealed = !self.reader.sealed_fragment()
-            && checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
+        let unsealed = checkpoint.sealed_offset() != self.reader.reader.get_ref().metadata()?.len();
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
@@ -711,8 +709,7 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
-                unsealed: !self.reader.sealed_fragment()
-                    && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
+                unsealed: true,
             };
         }
         // The certificate consumed the acquisition plan, so charge the
@@ -738,8 +735,7 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
-                unsealed: !self.reader.sealed_fragment()
-                    && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
+                unsealed: true,
             };
         };
         let reduction = CachedJsonlReduction {
@@ -754,8 +750,7 @@ impl OwnedJsonlParser {
             checkpoint,
             reduction,
             released: None,
-            unsealed: !self.reader.sealed_fragment()
-                && self.reader.consumed_bytes() != self.reader.last_complete_line_end(),
+            unsealed: true,
         }
     }
 }

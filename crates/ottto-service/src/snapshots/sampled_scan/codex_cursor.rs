@@ -2814,12 +2814,9 @@ fn eof_record_due(job: &OwnedActiveFile) -> bool {
             == Some(&meta.stamp_open)
 }
 
-/// The EOF apply for a group job's live member: `eof_record_due`, the member
-/// still exactly its `boot` object (so strict finish identity holds against
-/// its boot identity), and a record main's trailing-line rule applies
-/// without loss (`apply_physical_line`: within the line cap, UTF-8, blank
-/// or one JSON value). A group refuses any line loss, so a
-/// malformed final record stays withheld, as before.
+/// The EOF apply for a group job's live member: unchanged EOF and exactly
+/// its boot object. The common reader's `apply_sealed_fragment` admits only
+/// valid JSON or a blank suffix; invalid bytes remain withheld and uncounted.
 pub(in crate::snapshots) fn group_eof_record_due(job: &OwnedActiveFile, boot: &OpenStamp) -> bool {
     eof_record_due(job)
         && job

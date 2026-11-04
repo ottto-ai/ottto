@@ -26,17 +26,9 @@ impl AckLedger {
 
     /// Offers `items`: an exact body already accepted posts nothing.
     pub(crate) fn deliver(&mut self, items: &[SnapshotItem]) {
-        let posts = &mut self.posts;
-        upload_resumable_batches_with_body_witness(
-            items,
-            &self.scope,
-            &mut self.progress,
-            &mut self.accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            crate::snapshots::snapshot_upload_body_witness,
-            |batch| {
-                *posts += batch.len();
-                Ok(crate::snapshot_client::SnapshotBatchResponse {
+        assert!(self
+            .attempt(items, |batch| Ok(
+                crate::snapshot_client::SnapshotBatchResponse {
                     conflict_rescans: Default::default(),
                     accepted: batch.len() as u64,
                     sessions_reconciled: batch.len() as u64,
@@ -48,9 +40,45 @@ impl AckLedger {
                     unchanged_entities: Vec::new(),
                     rejected_entities: Vec::new(),
                     conflict_entities: Vec::new(),
-                })
+                }
+            ))
+            .unwrap());
+    }
+
+    /// The same upload loop with a fixture's transport/partial response.
+    pub(crate) fn attempt(
+        &mut self,
+        items: &[SnapshotItem],
+        mut upload: impl FnMut(
+            Vec<SnapshotItem>,
+        ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    ) -> Result<bool> {
+        let posts = &mut self.posts;
+        upload_resumable_batches_with_body_witness(
+            items,
+            &self.scope,
+            &mut self.progress,
+            &mut self.accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            crate::snapshots::snapshot_upload_body_witness,
+            |batch| {
+                *posts += batch.len();
+                upload(batch)
             },
             |_| Ok(()),
+        )
+        .map(|result| result == ResumableUploadResult::Completed)
+    }
+
+    /// Actual progress persistence across a fixture's crash after ACK.
+    pub(crate) fn save(&self, path: &Path) {
+        self.progress.save(path).unwrap();
+    }
+    pub(crate) fn reopen(&mut self, source: SnapshotSource, path: &Path) {
+        self.progress = SnapshotUploadProgress::load(
+            path,
+            &format!("{:064x}", 99),
+            snapshot_quarantine_witness(source),
         )
         .unwrap();
     }

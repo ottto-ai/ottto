@@ -7919,15 +7919,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if !pending.parse_complete {
             continue;
         }
-        // A loss-only reduction advances source custody, not the accepted body.
-        // Bypass before replacing witnesses or retiring accepted incidence.
-        if pending.parsed_snapshot_count == 0
-            && index
-                .terminal_jsonl_dispositions
-                .contains_key(&pending.index_key)
-        {
-            continue;
-        }
         if index.finalize_claude_held_history(&pending.index_key, &pending.source_file_fingerprint)
         {
             continue;
@@ -25525,21 +25516,6 @@ impl OwnedSourceScan {
                 } else {
                     Vec::new()
                 };
-                // The common reader withheld this suffix without applying it.
-                // Reuse the existing prefix custody and scheduling obligation.
-                cursor_fragment = cursor_fragment.or_else(|| {
-                    completed_acquisition
-                        .as_ref()
-                        .filter(|_| parser.reader.sealed_fragment())
-                        .map(|completed| sampled_scan::codex_cursor::SealedFragment {
-                            offset: completed.checkpoint.sealed_offset(),
-                            debt: crate::transcript_acquisition::AuditDebt {
-                                due_unix_seconds: audit_now.saturating_add(
-                                    crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-                                ),
-                            },
-                        })
-                });
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
                 let archive_owner = codex_archive_path(&candidate.path).then(|| {
@@ -25951,12 +25927,7 @@ impl OwnedSourceScan {
                         .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
                     || (file_sampling.is_none()
                         && state_census_complete
-                        && sidecar_census_complete
-                        && sampled_jsonl::loss_free_source_report(
-                            &report,
-                            recognized_usage_drop_count,
-                            dropped_usage_record_count,
-                        )));
+                        && sidecar_census_complete));
                 if source == SnapshotSource::ClaudeCode {
                     index.claude_full_rearm_progress.rebuild_read_full &= parse_complete
                         && source_verified
@@ -26021,7 +25992,7 @@ impl OwnedSourceScan {
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
                                 complete: parse_complete,
-                                lossy: terminal_loss.is_some() || report.over_line_cap_count > 0,
+                                lossy: terminal_loss.is_some(),
                                 source_verified,
                                 // Unchanged already checked physical identity and
                                 // acquisition scope against the prior checkpoint.
@@ -26221,8 +26192,6 @@ impl OwnedSourceScan {
                     index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
                     let outcome = if last_snapshot_fingerprint.is_some() {
                         ScanParseOutcome::Snapshot
-                    } else if terminal_loss.is_some() {
-                        ScanParseOutcome::Unknown
                     } else {
                         ScanParseOutcome::ConfirmedEmpty
                     };
@@ -26266,14 +26235,7 @@ impl OwnedSourceScan {
                     if parse_complete && !non_progressing_residue {
                         sampled_audit::settle_growth(index, &index_key);
                     }
-                    let recorded_fingerprint = last_snapshot_fingerprint.or_else(|| {
-                        index
-                            .files
-                            .get(&index_key)
-                            .filter(|_| outcome == ScanParseOutcome::Unknown)
-                            .and_then(|entry| entry.last_snapshot_fingerprint.clone())
-                    });
-                    index.record(recorded, recorded_fingerprint, outcome);
+                    index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
                     if let Some(entry) = index.files.get_mut(&index_key) {
@@ -29572,10 +29534,12 @@ impl ParsedJsonlFile {
     /// ownership/conflict holds prevent publication and committed progress.
     fn progress_complete(&self) -> bool {
         self.ownership_incomplete_file_count == 0
+            && !(self.snapshots.is_empty()
+                && (self.zero_snapshot_usage_evidence || self.terminal_loss().is_some()))
     }
 
     fn non_progressing_residue(&self) -> bool {
-        !self.progress_complete() && self.ownership_incomplete_file_count > 0
+        !self.progress_complete()
     }
 
     fn terminal_loss(&self) -> Option<TerminalJsonlLoss> {
@@ -30043,20 +30007,15 @@ impl OwnedJsonlParser {
             }
         }
         if source == SnapshotSource::Pi {
-            ownership_incomplete_file_count = usize::from(
-                accumulator
-                    .seen_pi_usage_keys
-                    .usage_keys()
-                    .values()
-                    .any(|state| state.has_cross_shape_conflict()),
-            );
             accumulator.apply_first_prompt_fallback();
-            recognized_usage_drop_count += accumulator
+            let conflicts = accumulator
                 .seen_pi_usage_keys
                 .usage_keys()
                 .values()
                 .filter(|state| state.has_cross_shape_conflict())
                 .count();
+            ownership_incomplete_file_count = usize::from(conflicts > 0);
+            recognized_usage_drop_count += conflicts;
         }
         let accumulator_dropped_usage_record_count =
             accumulator.dropped_usage_record_count as usize;
@@ -30155,13 +30114,6 @@ impl OwnedJsonlParser {
         // timestamp or an identity shape the accumulator cannot settle. Treat the
         // whole file as retryable instead of persisting it as confirmed-empty.
         let zero_snapshot_usage_evidence = snapshots.is_empty() && positive_usage_evidence;
-        ownership_incomplete_file_count = ownership_incomplete_file_count.max(usize::from(
-            snapshots.is_empty()
-                && !source_session_id_seen
-                && (positive_usage_evidence
-                    || recognized_usage_drop_count > 0
-                    || !report.complete()),
-        ));
         if snapshots.is_empty() {
             recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(
                 positive_recognized_usage_count
@@ -30585,9 +30537,7 @@ struct JsonlReadReport {
 
 impl JsonlReadReport {
     fn complete(self) -> bool {
-        self.malformed_json_line_count == 0
-            && self.invalid_utf8_line_count == 0
-            && self.over_line_cap_count == 0
+        self.malformed_json_line_count == 0 && self.invalid_utf8_line_count == 0
     }
 }
 
@@ -30810,7 +30760,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             return Ok(JsonlReaderStep::Complete(*report));
         }
 
-        let applied = apply_physical_line(
+        apply_physical_line(
             buf,
             report,
             // An unterminated trailing line reaches money only, never LD.
@@ -30825,11 +30775,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 )
             }),
             &mut on_value,
-            line_complete,
+            true,
         );
-        if !applied {
-            self.sealed_fragment = Some(());
-        }
         self.finished = reached_eof;
         Ok(JsonlReaderStep::Line)
     }
@@ -53356,9 +53303,7 @@ mod tests {
                         assert_eq!(scan.invalid_utf8_line_count, 1);
                     }
                     "recognized-drop" => {
-                        // Non-progressing residue: the census completes with the
-                        // loss named while the file itself stays un-indexed and
-                        // retryable (`settle_non_progressing_residue`).
+                        // Discarded records do not withhold healthy siblings.
                         assert!(scan.census_complete, "{case}");
                         assert_eq!(scan.snapshots.len(), 1, "{case}");
                         assert_eq!(
@@ -55177,8 +55122,7 @@ mod tests {
             ),
             (12, 4)
         );
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
+        // The healthy sibling progresses; rejected records remain uncounted.
         assert!(scan.census_complete);
         assert_eq!(scan.dropped_usage_record_count, 3);
         assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
@@ -55192,8 +55136,7 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("settled mixed scan");
-        // The lossy file is never checkpointed, so a completed generation
-        // re-reads it and re-derives the same disclosed loss.
+        // Committed siblings stay quiet; the stored disposition discloses loss.
         assert_eq!(mixed_settled.scanned_file_count, 0);
         assert_eq!(mixed_settled.dropped_usage_record_count, 3);
 
@@ -55233,7 +55176,7 @@ mod tests {
         )
         .expect("settled malformed-usage checkpoint");
         // Re-read, not checkpointed: the residue is re-derived, not remembered.
-        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.scanned_file_count, 1);
         assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
         assert_eq!(settled.dropped_usage_record_count, 1);
 
@@ -67674,8 +67617,7 @@ mod tests {
             (u64::MAX, 1)
         );
         assert_eq!(scan.dropped_usage_record_count, 1);
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
+        // The exact admitted prefix progresses; the overflowing record is uncounted.
         assert!(scan.census_complete);
         assert!(index.files.contains_key(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);

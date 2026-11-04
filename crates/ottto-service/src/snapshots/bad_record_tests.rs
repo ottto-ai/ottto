@@ -211,7 +211,7 @@ fn regression<S: SourceFixture>() {
         !parsed.report.complete(),
         "loss-free authority remains strict"
     );
-    assert!(parsed.recognized_usage_drop_count > 0);
+    assert_eq!(parsed.recognized_usage_drop_count, S::bad().len());
     let loss = parsed.terminal_loss().unwrap();
     assert_eq!(
         (
@@ -275,6 +275,13 @@ fn regression<S: SourceFixture>() {
     let ((p, base, mode), consumed) = fixture::observe_consumed(|| stored::<S>(&route, &path));
     assert_eq!(mode, ReadMode::Unchanged);
     assert_eq!(consumed, 0);
+    let sample_bytes = p
+        .reader
+        .acquisition
+        .as_ref()
+        .unwrap()
+        .metrics()
+        .sample_bytes as u64;
     let (tail, restored) = finish::<S>(&route, &path, p, Some(base));
     money_oracle::assert_equivalent(
         &cold,
@@ -288,7 +295,7 @@ fn regression<S: SourceFixture>() {
     let mut quiet = emitted::<S>(Mode::Restart, &route, &[]);
     quiet.io.consumed = consumed;
     quiet.io.cheap_checks = Some(0);
-    quiet.io.anchor_reads = Some(0);
+    quiet.io.anchor_reads = Some(sample_bytes);
     quiet.io.other_reads = Some(0);
     money_oracle::assert_quiet_restart_zero_bytes(&quiet);
     // O9: an old serde writer discards additive diagnostics, retaining all
@@ -320,35 +327,55 @@ fn regression<S: SourceFixture>() {
     );
     suffix::<S>();
     loss_only::<S>(&cold, &items);
+    admission::<S>();
+    ack_transitions::<S>(&route, &items);
 }
 fn suffix<S: SourceFixture>() {
     for suffix in [b"{\"paused\":".as_slice(), b"\xff".as_slice()] {
         let mut route = route_for(S::INDEX);
         let path = route.dir.join(S::name());
-        let mut bytes = (S::lines().join("\n") + "\n{bad\n").into_bytes();
-        let seal = bytes.len();
-        bytes.extend_from_slice(suffix);
-        fs::write(&path, &bytes).unwrap();
-        let mut p = parser::<S>(&path);
-        p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
-        p.reader.set_extent_limit(bytes.len() as u64);
-        while !p.step().unwrap() {}
-        assert!(
-            !p.apply_sealed_fragment(),
-            "an unchanged stamp cannot complete invalid JSON"
-        );
-        assert!(p.reader.sealed_fragment());
-        assert_eq!(p.reader.report.malformed_json_line_count, 1);
-        assert_eq!(p.reader.report.invalid_utf8_line_count, 0);
-        let (tail, parsed) = finish::<S>(&route, &path, p, None);
-        assert_eq!(tail.certificate.sealed_offset, seal as u64);
-        assert!(
-            !tail.unsealed,
-            "unapplied suffix has a matching prefix reduction"
-        );
+        write(&path, &S::lines());
+        let (tail, parsed) = full::<S>(&route, &path);
         let cold = emitted::<S>(Mode::ColdFull, &route, &parsed.snapshots);
         commit::<S>(&mut route, &path, tail, parsed);
+        let predecessor = head::<S>(&route, &path).body;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{bad\n").unwrap();
+        file.write_all(suffix).unwrap();
+        drop(file);
+        let (mut p, base, mode) = stored::<S>(&route, &path);
+        assert_eq!(mode, ReadMode::Tail);
+        p.reader.set_extent_limit(
+            fs::metadata(&path).unwrap().len()
+                - p.reader.acquisition.as_ref().unwrap().start_offset(),
+        );
+        while !p.step().unwrap() {}
+        assert!(!p.apply_sealed_fragment());
+        assert!(p.reader.sealed_fragment());
+        assert_eq!(
+            (
+                p.reader.report.malformed_json_line_count,
+                p.reader.report.invalid_utf8_line_count
+            ),
+            (1, 0)
+        );
+        let (tail, parsed) = finish::<S>(&route, &path, p, Some(base));
+        // Existing unsealed refusal retains the prior head on an ordinary reader.
+        assert!(tail.unsealed);
+        assert!(!tail.publish(&Ok(parsed)));
+        route.save(false);
         route.index = ScanIndex::load(&route.path).unwrap();
+        assert_eq!(head::<S>(&route, &path).body, predecessor);
+        // Main's compatibility reader may disclose the unfinished row once;
+        // no resulting reduction can overwrite that predecessor.
+        let (tail, compatibility) = full::<S>(&route, &path);
+        assert_eq!(
+            compatibility.report.physical_line_count,
+            S::lines().len() + 2
+        );
+        assert!(!tail.publish(&Ok(compatibility)));
+        route.save(false);
+        assert_eq!(head::<S>(&route, &path).body, predecessor);
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(if suffix[0] == b'{' { b"true}\n" } else { b"\n" })
             .unwrap();
@@ -356,38 +383,58 @@ fn suffix<S: SourceFixture>() {
         let (p, base, mode) = stored::<S>(&route, &path);
         assert_eq!(mode, ReadMode::Tail);
         let (tail, parsed) = finish::<S>(&route, &path, p, Some(base));
+        assert_eq!(
+            (
+                parsed.snapshots[0].input_tokens,
+                parsed.snapshots[0].output_tokens
+            ),
+            S::TOTAL
+        );
+        // Compare the same lossy source on a cold Full, including partial evidence.
+        let (_, full) = full::<S>(&route, &path);
+        money_oracle::assert_equivalent(
+            &emitted::<S>(Mode::ColdFull, &route, &full.snapshots),
+            &emitted::<S>(Mode::Restart, &route, &parsed.snapshots),
+        );
         assert_eq!(parsed.report.malformed_json_line_count, 1);
         assert_eq!(
             parsed.report.invalid_utf8_line_count,
             usize::from(suffix[0] == 0xff)
         );
-        money_oracle::assert_equivalent(
-            &cold,
-            &emitted::<S>(Mode::Restart, &route, &parsed.snapshots),
-        );
+        assert_eq!(cold.snapshots.len(), parsed.snapshots.len());
         commit::<S>(&mut route, &path, tail, parsed);
     }
-    // O2: valid final JSON remains admitted, but an applied-past-seal PRE
-    // reduction must not replace its predecessor with the smaller certificate.
-    let mut route = route_for(S::INDEX);
-    let path = route.dir.join(S::name());
-    let bytes = S::lines().join("\n");
-    fs::write(&path, bytes).unwrap();
-    let mut p = parser::<S>(&path);
-    p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
-    p.reader
-        .set_extent_limit(fs::metadata(&path).unwrap().len());
-    while !p.step().unwrap() {}
-    assert!(p.apply_sealed_fragment());
-    let (tail, parsed) = finish::<S>(&route, &path, p, None);
-    assert!(tail.unsealed);
-    assert!(!tail.publish(&Ok(parsed)));
-    route.save(false);
-    assert!(
-        state_v2::load_head(&route.index, &local_index_key(&path), S::REDUCTION_REVISION)
-            .unwrap()
-            .is_none()
-    );
+    for end in ["", "   "] {
+        let mut route = route_for(S::INDEX);
+        let path = route.dir.join(S::name());
+        let mut rows = S::lines();
+        if !end.is_empty() {
+            rows.push(end.into());
+        }
+        fs::write(&path, rows.join("\n")).unwrap();
+        let mut p = parser::<S>(&path);
+        p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        p.reader
+            .set_extent_limit(fs::metadata(&path).unwrap().len());
+        while !p.step().unwrap() {}
+        assert!(p.apply_sealed_fragment());
+        let (tail, parsed) = finish::<S>(&route, &path, p, None);
+        assert_eq!(
+            (
+                parsed.snapshots[0].input_tokens,
+                parsed.snapshots[0].output_tokens
+            ),
+            S::TOTAL
+        );
+        assert!(tail.unsealed);
+        assert!(!tail.publish(&Ok(parsed)));
+        route.save(false);
+        assert!(
+            state_v2::load_head(&route.index, &local_index_key(&path), S::REDUCTION_REVISION)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
     let mut route = route_for(S::INDEX);
@@ -404,14 +451,61 @@ fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
     write(&path, &rows);
     let (tail, parsed) = full::<S>(&route, &path);
     assert!(parsed.snapshots.is_empty());
-    assert!(parsed.progress_complete());
+    assert!(!parsed.progress_complete());
+    assert!(parsed.non_progressing_residue());
     assert!(parsed.terminal_loss().is_some());
-    commit::<S>(&mut route, &path, tail, parsed);
-    route.index = ScanIndex::load(&route.path).unwrap();
-    let (p, base, mode) = stored::<S>(&route, &path);
-    assert_eq!(mode, ReadMode::Unchanged);
-    let (_, parsed) = finish::<S>(&route, &path, p, Some(base));
-    assert!(parsed.snapshots.is_empty());
+    // The public ownership counter keeps its native meaning for no-entity loss.
+    assert_eq!(parsed.ownership_incomplete_file_count, 0);
+    assert!(!tail.publish(&Ok(parsed)));
+    route.save(false);
+    assert!(
+        state_v2::load_head(&route.index, &local_index_key(&path), S::REDUCTION_REVISION)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!route
+        .index
+        .confirmed_empty_files
+        .contains(&local_index_key(&path)));
+    // Ordinary scanning/finalization also leaves accepted witnesses and incidence.
+    let mut index = ScanIndex::default();
+    let key = local_index_key(&path);
+    let witness = snapshot_upload_body_witness(&previous[0]);
+    index.files.insert(key.clone(), serde_json::from_value(json!({
+        "size_bytes":0,"modified_unix_seconds":0,"source_file_fingerprint":"prior",
+        "last_snapshot_fingerprint":previous[0].snapshot_fingerprint,"last_upload_body_witness":witness})).unwrap());
+    index.file_snapshot_fingerprints.insert(
+        key.clone(),
+        BTreeSet::from([previous[0].snapshot_fingerprint.clone()]),
+    );
+    index.accepted_rebuild_incidence.insert(
+        key.clone(),
+        BTreeSet::from([previous[0].snapshot_fingerprint.clone()]),
+    );
+    let before = (
+        index.files[&key].last_snapshot_fingerprint.clone(),
+        index.files[&key].last_upload_body_witness.clone(),
+        index.accepted_rebuild_incidence.clone(),
+    );
+    let mut scan = scan_source_roots(
+        S::SOURCE,
+        std::slice::from_ref(&route.dir),
+        &mut index,
+        "2026-10-20T16:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    )
+    .unwrap();
+    assert!(scan.snapshots.is_empty());
+    finalize_scan_after_policy(S::SOURCE, &mut scan, &mut index);
+    assert_eq!(
+        (
+            index.files[&key].last_snapshot_fingerprint.clone(),
+            index.files[&key].last_upload_body_witness.clone(),
+            index.accepted_rebuild_incidence.clone()
+        ),
+        before
+    );
+    assert!(!index.confirmed_empty_files.contains(&key));
     let mut ack = AckLedger::new(S::SOURCE);
     ack.deliver(previous);
     let mut prior = cold.clone();
@@ -436,11 +530,14 @@ fn loss_only<S: SourceFixture>(cold: &RouteResult, previous: &[SnapshotItem]) {
 #[test]
 fn claude_bad_record_keeps_valid_responses() {
     regression::<Claude>();
+    claude_responses();
+    placement();
 }
 /// [regress] O1-O3/O6-O9: Codex keeps native occurrence and cumulative rules.
 #[test]
 fn codex_bad_record_keeps_valid_occurrences() {
     regression::<Codex>();
+    codex_occurrences();
 }
 /// [regress] O1/O2/O5-O9: Pi clocks skip records; opposite-shape conflicts hold.
 #[test]
@@ -481,5 +578,410 @@ fn pi_bad_record_keeps_valid_occurrences() {
     assert!(!conflict.progress_complete());
     assert!(conflict.non_progressing_residue());
     assert!(!tail.publish(&Ok(conflict)));
-    // The ordinary clock drops in the separate fixture still publish.
+    // A checked overflow is one discarded record beside healthy occurrences.
+    let mut rows = Pi::lines();
+    let mut overflow: Value = serde_json::from_str(&pi_usage(
+        "message_end",
+        "overflow",
+        json!("2026-10-20T10:00:00Z"),
+    ))
+    .unwrap();
+    overflow["message"]["usage"]["input"] = json!(u64::MAX);
+    rows.push(overflow.to_string());
+    write(&path, &rows);
+    let (tail, parsed) = full::<Pi>(&route, &path);
+    assert!(parsed.progress_complete());
+    assert_eq!(
+        (
+            parsed.snapshots[0].input_tokens,
+            parsed.snapshots[0].request_count
+        ),
+        (24, 2)
+    );
+    assert_eq!(parsed.dropped_usage_record_count, 1);
+    assert!(tail.publish(&Ok(parsed)));
+}
+
+// O8 uses the real listing gate: an aged never-read file is skipped, an
+// eligible first admission adds valid siblings, and its accepted body stays quiet.
+fn admission<S: SourceFixture>() {
+    let route = route_for(S::INDEX);
+    let path = route.dir.join(S::name());
+    let mut rows = S::lines();
+    rows.extend(S::bad());
+    write(&path, &rows);
+    let at = "2026-12-20T00:00:00Z";
+    let now = rfc3339_unix_seconds(at).unwrap();
+    let set_age = |days| {
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(now - days * 86400))
+            .unwrap()
+    };
+    let mut index = ScanIndex::default();
+    set_age(61);
+    let skipped = scan_source_roots(
+        S::SOURCE,
+        std::slice::from_ref(&route.dir),
+        &mut index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+    )
+    .unwrap();
+    assert_eq!(
+        (skipped.scanned_file_count, skipped.snapshots.len()),
+        (0, 0)
+    );
+    set_age(59);
+    index.traversal = None;
+    let mut admitted = scan_source_roots(
+        S::SOURCE,
+        std::slice::from_ref(&route.dir),
+        &mut index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+    )
+    .unwrap();
+    assert_eq!(
+        (admitted.scanned_file_count, admitted.snapshots.len()),
+        (1, 1)
+    );
+    assert_eq!(
+        (
+            admitted.snapshots[0].input_tokens,
+            admitted.snapshots[0].output_tokens
+        ),
+        S::TOTAL
+    );
+    finalize_scan_after_policy(S::SOURCE, &mut admitted, &mut index);
+    let accepted = index.files[&local_index_key(&path)]
+        .last_snapshot_fingerprint
+        .clone();
+    assert!(accepted.is_some());
+    index.traversal = None;
+    let quiet = scan_source_roots(
+        S::SOURCE,
+        std::slice::from_ref(&route.dir),
+        &mut index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+    )
+    .unwrap();
+    assert_eq!(quiet.scanned_file_count, 0);
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(
+        index.files[&local_index_key(&path)].last_snapshot_fingerprint,
+        accepted
+    );
+}
+
+// O3: bad totals never reset a native baseline. Cumulative-only usage retains
+// the native next-hour placement; per-turn usage and native occurrences retain
+// their existing repeat/reset rules.
+fn codex_occurrences() {
+    let mut route = route_for(Source::Codex);
+    let path = route.dir.join(Codex::name());
+    let event = |minute, total: Value, last: Option<u64>| {
+        let mut info = json!({"total_token_usage":{"input_tokens":total,"output_tokens":0}});
+        if let Some(last) = last {
+            info["last_token_usage"] = json!({"input_tokens":last,"output_tokens":0});
+        }
+        json!({"type":"event_msg","timestamp":format!("2026-10-18T{minute:02}:00:00Z"),
+            "payload":{"type":"token_count","info":info}})
+        .to_string()
+    };
+    for per_turn in [false, true] {
+        let rows = vec![codex_lines(1)[0].clone(),
+            json!({"type":"turn_context","timestamp":"2026-10-18T10:00:00Z","payload":{"model":"gpt-5"}}).to_string(),
+            event(10, json!(100), per_turn.then_some(100)),
+            event(11, json!("invalid"), None),
+            event(12, json!(200), per_turn.then_some(100)),
+            event(12, json!(200), per_turn.then_some(100)),
+            event(13, json!(50), per_turn.then_some(50))];
+        write(&path, &rows);
+        let (tail, parsed) = full::<Codex>(&route, &path);
+        assert!(parsed.progress_complete());
+        assert_eq!(parsed.snapshots[0].input_tokens, 250);
+        assert_eq!(parsed.recognized_usage_drop_count, 1);
+        let bucket = parsed.snapshots[0]
+            .usage_buckets
+            .iter()
+            .find(|b| b.bucket_start == "2026-10-18T12:00:00Z")
+            .unwrap();
+        assert_eq!(
+            bucket
+                .model_usage
+                .iter()
+                .map(|row| row.input_tokens)
+                .sum::<u64>(),
+            100,
+            "the bad total is neither zero nor a reset"
+        );
+        let cold = emitted::<Codex>(Mode::ColdFull, &route, &parsed.snapshots);
+        commit::<Codex>(&mut route, &path, tail, parsed);
+        route.index = ScanIndex::load(&route.path).unwrap();
+        let (p, base, mode) = stored::<Codex>(&route, &path);
+        assert_eq!(mode, ReadMode::Unchanged);
+        let (_, restored) = finish::<Codex>(&route, &path, p, Some(base));
+        money_oracle::assert_equivalent(
+            &cold,
+            &emitted::<Codex>(Mode::Restart, &route, &restored.snapshots),
+        );
+    }
+}
+
+// O4: a progressive response is finalized once. A conflicting response stays
+// excluded while a distinct healthy response retains exact native money.
+fn claude_responses() {
+    let mut route = route_for(Source::Claude);
+    let path = route.dir.join(Claude::name());
+    let response = |id, input, output, at| {
+        json!({"type":"assistant",
+        "sessionId":"5f0c2a8e-1111-4222-8333-944445555777","timestamp":at,
+        "requestId":id,"message":{"id":id,"model":"claude-opus-4-1",
+            "usage":{"input_tokens":input,"output_tokens":output}}})
+        .to_string()
+    };
+    let rows = vec![
+        response("progressive", 10, 1, "2026-10-20T10:00:00Z"),
+        response("progressive", 10, 3, "2026-10-20T10:01:00Z"),
+        response("conflict", 20, 5, "2026-10-20T10:02:00Z"),
+        response("conflict", 21, 4, "2026-10-20T10:03:00Z"),
+        response("healthy", 7, 2, "2026-10-20T10:04:00Z"),
+    ];
+    write(&path, &rows);
+    let (tail, parsed) = full::<Claude>(&route, &path);
+    assert!(parsed.progress_complete());
+    assert_eq!(
+        (
+            parsed.snapshots[0].input_tokens,
+            parsed.snapshots[0].output_tokens,
+            parsed.snapshots[0].request_count
+        ),
+        (17, 5, 2)
+    );
+    assert!(parsed.recognized_usage_drop_count > 0);
+    let cold = emitted::<Claude>(Mode::ColdFull, &route, &parsed.snapshots);
+    commit::<Claude>(&mut route, &path, tail, parsed);
+    route.index = ScanIndex::load(&route.path).unwrap();
+    let (p, base, mode) = stored::<Claude>(&route, &path);
+    assert_eq!(mode, ReadMode::Unchanged);
+    let (_, parsed) = finish::<Claude>(&route, &path, p, Some(base));
+    money_oracle::assert_equivalent(
+        &cold,
+        &emitted::<Claude>(Mode::Restart, &route, &parsed.snapshots),
+    );
+}
+
+// O7: transport refusal and not-stored credit nothing; a partial ACK credits
+// its exact entity; crash/reopen retains that credit without replaying it.
+fn ack_transitions<S: SourceFixture>(route: &Route, items: &[SnapshotItem]) {
+    let mut rows = S::lines();
+    let original = &items[0].source_session_id;
+    let sibling = "019a0c2a-8e11-7222-8333-944445555778";
+    for row in &mut rows {
+        *row = row.replace(original, sibling);
+    }
+    let path = route.dir.join(format!("rollout-{sibling}.jsonl"));
+    write(&path, &rows);
+    let (_, parsed) = full::<S>(route, &path);
+    let mut offered = items.to_vec();
+    offered.extend(parsed.snapshots);
+    assert_eq!(offered.len(), 2);
+    let response = |batch: &[SnapshotItem], partial: bool, not_stored: bool| {
+        let refs: Vec<Value> = batch.iter().take(if partial {1} else {batch.len()}).map(|item| json!({
+            "source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
+            "body_witness_digest":snapshot_upload_body_witness(item),"occurrence_count":1,
+            "unchanged_basis":not_stored.then_some("usage_identical")
+        })).collect();
+        serde_json::from_value::<crate::snapshot_client::SnapshotBatchResponse>(json!({
+            "accepted":refs.len(),"sessions_reconciled":refs.len(),"session_ids":[],"disabled":false,
+            "disabled_reason":null,"entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities":if not_stored {vec![]} else {refs.clone()},
+            "unchanged_entities":if not_stored {refs} else {vec![]}
+        })).unwrap()
+    };
+    let mut ack = AckLedger::new(S::SOURCE);
+    assert!(ack
+        .attempt(&offered, |_| Err(anyhow::anyhow!(
+            "synthetic transport failure"
+        )))
+        .is_err());
+    assert!(!offered.iter().any(|item| ack.settled(item)));
+    let mut unstored = AckLedger::new(S::SOURCE);
+    let _ = unstored.attempt(&offered, |batch| Ok(response(&batch, false, true)));
+    assert!(!offered.iter().any(|item| unstored.settled(item)));
+    let _ = ack.attempt(&offered, |batch| Ok(response(&batch, true, false)));
+    assert!(ack.settled(&offered[0]));
+    assert!(!ack.settled(&offered[1]));
+    let progress = route.dir.join("acks.json");
+    ack.save(&progress);
+    let mut restarted = AckLedger::new(S::SOURCE);
+    restarted.reopen(S::SOURCE, &progress);
+    assert!(restarted.settled(&offered[0]));
+    assert!(!restarted.settled(&offered[1]));
+    restarted.deliver(&offered);
+    assert_eq!(restarted.posts(), 1);
+    assert!(offered.iter().all(|item| restarted.settled(item)));
+}
+
+// The existing native account corpus supplies two accounts and the switch;
+// add one genuine side call and an unobserved transcript request, then feed
+// the production evidence/tag stage after both cold and continued native reads.
+fn placement() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        let (dir, specimen, mut api, mut traces) = claude_request_account_mixed_fixture(4, false);
+        let session = specimen.source_session_id.clone();
+        let path = dir.join(format!("{session}.jsonl"));
+        let support = dir.with_extension("b2-evidence");
+        let mut side = api.evidence[&session][3].clone();
+        side.request_id = "side-call".into();
+        side.input_tokens = 5;
+        side.output_tokens = 2;
+        side.fingerprint.clear();
+        side.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&side).unwrap())
+        );
+        api.evidence.get_mut(&session).unwrap().push(side);
+        let mut trace = traces.evidence[&session][3].clone();
+        trace.request_id = "side-call".into();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        traces.evidence.get_mut(&session).unwrap().push(trace);
+        for (kind, rows) in [
+            (
+                "claude-code-effort",
+                serde_json::to_value(&api.evidence[&session]).unwrap(),
+            ),
+            (
+                "claude-code-trace-ownership",
+                serde_json::to_value(&traces.evidence[&session]).unwrap(),
+            ),
+        ] {
+            let file = support
+                .join("local-otel")
+                .join(kind)
+                .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())));
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(
+                file,
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","sessionId":session,
+            "timestamp":"2026-08-02T07:04:00Z","requestId":"gap","message":{"id":"gap",
+                "model":"claude-opus-4-1","usage":{"input_tokens":7,"output_tokens":2}}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","sessionId":session,
+            "timestamp":"2026-08-02T07:05:00Z","requestId":"bad","message":{"id":"bad",
+                "usage":{"input_tokens":"invalid"}}})
+        )
+        .unwrap();
+        drop(file);
+        let births = BTreeMap::from([(
+            path.clone(),
+            time::OffsetDateTime::parse(
+                "2026-08-02T07:00:00Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap()
+            .unix_timestamp_nanos(),
+        )]);
+        let run = |scanner: &E2ScanFixture, index, sampled| {
+            let index = if sampled {
+                scanner.routed(index, &dir)
+            } else {
+                index
+            };
+            let (mut index, mut scan, _) = scanner.scan(
+                std::slice::from_ref(&dir),
+                &support,
+                index,
+                100,
+                sampled,
+                &births,
+                &[],
+            );
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                &support, &mut scan, &mut index,
+            );
+            for item in &mut scan.snapshots {
+                item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            }
+            (index, scan)
+        };
+        let (cold_index, cold_scan) = run(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            false,
+        );
+        let cold = fixture::scan_money(SnapshotSource::ClaudeCode, &cold_index, &cold_scan);
+        assert_eq!(cold_scan.snapshots[0].input_tokens, 22);
+        assert_eq!(
+            cold_scan.snapshots[0].request_count, 6,
+            "four responses, gap and independent side call"
+        );
+        let mut accounts = BTreeSet::new();
+        fn accounts_in(value: &Value, into: &mut BTreeSet<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(a) = map.get("account_identifier_hash").and_then(Value::as_str) {
+                        into.insert(a.to_owned());
+                    }
+                    for v in map.values() {
+                        accounts_in(v, into);
+                    }
+                }
+                Value::Array(a) => {
+                    for v in a {
+                        accounts_in(v, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for item in &cold_scan.snapshots {
+            accounts_in(&serde_json::to_value(item).unwrap(), &mut accounts);
+        }
+        assert!(
+            accounts.len() >= 2,
+            "native tags cover both sides of the account switch"
+        );
+        assert!(!api.evidence[&session]
+            .iter()
+            .any(|row| row.request_id == "gap"));
+        let scanner = E2ScanFixture::capturing_identity();
+        let (index, scan) = run(&scanner, ScanIndex::default(), true);
+        money_oracle::assert_equivalent(
+            &cold,
+            &fixture::scan_money(SnapshotSource::ClaudeCode, &index, &scan),
+        );
+        let (restored, scan) = run(&E2ScanFixture::capturing_identity(), index, true);
+        money_oracle::assert_equivalent(
+            &cold,
+            &fixture::scan_money(SnapshotSource::ClaudeCode, &restored, &scan),
+        );
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(support).unwrap();
+    });
 }
