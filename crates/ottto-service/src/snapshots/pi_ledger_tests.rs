@@ -22,6 +22,42 @@ fn fork_usage(kind: &str, id: &str, at: &str, input: u64) -> Value {
     }
 }
 
+/// [money] Every Pi usage shape passes one gate: an absent clock counts, a
+/// present but invalid clock drops positive usage (counted) and adds nothing
+/// for zero usage.
+#[test]
+fn every_pi_usage_shape_passes_the_same_clock_gate() {
+    for kind in [
+        "message",
+        "message_end",
+        "compaction",
+        "branch_summary",
+        "usage",
+    ] {
+        for (clock, input, counted, dropped) in [
+            (None, 100, 100, 0),
+            (Some("invalid"), 100, 0, 1),
+            (Some("invalid"), 0, 0, 0),
+        ] {
+            let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
+            apply_pi_line(&fork_header(None, FORK_TIME), &mut acc);
+            let mut value = fork_usage(kind, "gate", FORK_TIME, input);
+            let object = value.as_object_mut().unwrap();
+            object.remove("timestamp");
+            if let Some(message) = object.get_mut("message").and_then(Value::as_object_mut) {
+                message.remove("timestamp");
+            }
+            if let Some(clock) = clock {
+                object.insert("timestamp".into(), clock.into());
+            }
+            apply_pi_line(&value, &mut acc);
+            let label = format!("{kind}/{clock:?}/{input}");
+            assert_eq!(acc.accepted_usage_totals.input_tokens, counted, "{label}");
+            assert_eq!(acc.dropped_usage_record_count, dropped, "{label}");
+        }
+    }
+}
+
 /// [money] Fork usage of every entry kind stamped before the header is skipped
 /// and counted; usage at or after the header counts.
 #[test]
