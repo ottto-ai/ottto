@@ -2647,6 +2647,11 @@ fn apc_family_money(
         family.len(),
         "one ACKed body per member"
     );
+    // The routes run at different synthetic page clocks. `collected_at` is
+    // that clock, not money, so the compared bodies share one.
+    for item in &mut scan.snapshots {
+        item.collected_at = "2026-08-02T08:00:00Z".to_string();
+    }
     crate::snapshots::sampled_scan::transition_fixture::scan_money(
         SnapshotSource::ClaudeCode,
         &last.index,
