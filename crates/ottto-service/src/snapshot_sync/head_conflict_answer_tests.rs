@@ -1031,7 +1031,9 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
 
 /// The mirror is runtime-only: a restart reloads the open challenge from
 /// the persisted ledger, and the first activation after it mirrors the
-/// session again; the scan index itself never stores it.
+/// session again; the scan index itself never stores it. A challenge whose
+/// session holds no saved base can never carry an answer: it is not
+/// mirrored before or after the restart, so its files may re-fold.
 #[test]
 fn a_restart_mirrors_the_persisted_challenge_again() {
     let item = item();
@@ -1040,6 +1042,17 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     let _ = cycle(&mut progress, &item, 1_000, |item| {
         conflict(item, &challenge(0xc))
     });
+    let baseless = cache_session_key("synthetic-baseless-session");
+    progress.head_conflict_challenges.insert(
+        baseless.clone(),
+        HeadConflictChallenge {
+            challenge: challenge(0xd),
+            stale_revision_v2_hash: "d".repeat(64),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+    assert!(!progress.accepted_cache_heads.contains_key(&baseless));
     let root = crate::test_scratch::ScratchDir::new("head-conflict-mirror-restart");
     let progress_path = root.join("upload-progress.json");
     let index_path = root.join("scan-index.json");
@@ -1053,6 +1066,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
         &mut progress,
     );
     assert!(index.head_conflict_owed(&key));
+    assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
     index.save(&index_path).unwrap();
 
     let mut restarted = SnapshotUploadProgress::load(
@@ -1070,4 +1084,6 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
         &mut restarted,
     );
     assert!(index.head_conflict_owed(&key));
+    assert!(restarted.head_conflict_challenges.contains_key(&baseless));
+    assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
 }

@@ -221,11 +221,15 @@ fn append_after_restart_and_eviction_preserves_placement() {
 /// to the cold Full's body and placement (two accounts, a mid-session switch,
 /// a side call and an evidence gap). The retried body is one finalized item,
 /// POSTed once per upload and cleared only by its exact ACK. A session that
-/// owes a head-CAS answer reads the same body through a native Full.
+/// owes a head-CAS answer reads the same body through a native Full. A
+/// challenge whose session holds no saved base can carry no answer: the
+/// upload-context activation leaves it unmirrored, so the due retry, a
+/// twin's family pull and growth continue from stored state to the cold
+/// Full's body, and its ordinary accept clears it.
 #[test]
 fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
     with_e2(|| {
-        let (c, _) = placement_corpus("s2-identity-deferred-retry");
+        let (mut c, path) = placement_corpus("s2-identity-deferred-retry");
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
@@ -315,6 +319,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         // The held body is leased, POSTed once, and only an exact ACK clears it.
         progress.prepare_quarantine_retries(&prior.quarantined_snapshot_fingerprints);
         assert!(progress.active_quarantine_retries.contains(&refused));
+        let leased = progress.clone();
         let posts = |sent: &[Vec<u8>]| {
             sent.iter()
                 .map(|bytes| {
@@ -348,11 +353,148 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         assert!(!progress.quarantined_fingerprints.contains_key(&refused));
 
         // A session that owes a head-CAS answer reads Full, to the same body.
-        let mut owed = prior;
+        let mut owed = prior.clone();
         owed.activate_head_conflict_sessions([cache_session_key(ROOT)].into());
         let answered = page(&c, owed, 100, true);
         assert!(answered.modes.0 > 0, "the owed answer reads a native Full");
         money_oracle::assert_equivalent(&cold, &result(&answered, Mode::ColdFull));
+
+        // A base-less challenge (no saved head or cache state, no attempt),
+        // mirrored the production way; a saved base is the mirrored control.
+        let key = cache_session_key(ROOT);
+        let mut challenged = leased.clone();
+        challenged.head_conflict_challenges.insert(
+            key.clone(),
+            HeadConflictChallenge {
+                challenge: "c".repeat(64),
+                stale_revision_v2_hash: "d".repeat(64),
+                answer_attempts: 0,
+                last_answer_unix: 0,
+            },
+        );
+        assert!(!challenged.accepted_cache_heads.contains_key(&key));
+        assert!(!challenged.accepted_cache_states.contains_key(&key));
+        let mut based = challenged.clone();
+        based
+            .accepted_cache_heads
+            .insert(key.clone(), "e".repeat(64));
+        let activated = |progress: &SnapshotUploadProgress| {
+            let mut index = prior.clone();
+            activate_source_upload_context(
+                SOURCE,
+                "e2-synthetic-destination".into(),
+                &mut index,
+                &mut progress.clone(),
+            );
+            index
+        };
+        assert!(!activated(&challenged).head_conflict_owed(&key), "no base");
+        assert!(activated(&based).head_conflict_owed(&key), "control");
+        let same_sessions = |cold: &mut Page, warm: &Page| {
+            cold.scan.snapshots.retain(|item| {
+                warm.scan
+                    .snapshots
+                    .iter()
+                    .any(|warm| warm.source_session_id == item.source_session_id)
+            });
+        };
+
+        // The due retry re-folds to the cold Full; the base-holding control
+        // still reads Full.
+        let refolded = page(&c, activated(&challenged), 100, true);
+        assert_eq!(refolded.modes.0, 0, "a base-less challenge re-folds");
+        money_oracle::assert_equivalent(&cold, &result(&refolded, Mode::Restart));
+        let mirrored = page(&c, activated(&based), 100, true);
+        assert!(mirrored.modes.0 > 0, "control: a saved base reads Full");
+
+        // No answer can attach: the POSTs carry no rescan claim, the exact
+        // ACK settles the body, and the ordinary accept clears the challenge.
+        let mut items = refolded.scan.snapshots.clone();
+        for item in &mut items {
+            item.cache_base_head_etag = challenged
+                .accepted_cache_heads
+                .get(&cache_session_key(&item.source_session_id))
+                .cloned();
+        }
+        assert_eq!(
+            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds()),
+            0
+        );
+        let mut settled = challenged.clone();
+        let (status, sent, _) = upload(&items, &mut settled, ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(posts(&sent), 1, "POSTed exactly once");
+        for bytes in &sent {
+            let wire: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            for item in json_array(&wire["snapshots"]) {
+                for claim in [
+                    "conflict_head_challenge",
+                    "forced_full_rescan",
+                    "rescan_from_revision_hash",
+                ] {
+                    assert!(item.get(claim).is_none(), "{claim}");
+                    assert!(item["semantic_envelope"].get(claim).is_none(), "{claim}");
+                }
+            }
+        }
+        assert!(
+            settled.accepted_fingerprints.contains(&refused),
+            "exact ACK"
+        );
+        assert!(!settled.quarantined_fingerprints.contains_key(&refused));
+        assert!(
+            !settled.head_conflict_challenges.contains_key(&key),
+            "the ordinary accept clears it"
+        );
+
+        // ForcedFamily: a twin copy the page reads pulls the family in. The
+        // base-less session reads exactly as an unchallenged one; mirrored,
+        // the pulled root reads Full instead.
+        let twin = c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &std::fs::read_to_string(&path).unwrap(),
+            "2026-08-02T07:05:00Z",
+        );
+        let pulled = |progress: &SnapshotUploadProgress| {
+            hinted(
+                &c,
+                activated(progress),
+                100,
+                true,
+                std::slice::from_ref(&twin),
+            )
+        };
+        let plain = pulled(&leased);
+        let family = pulled(&challenged);
+        assert_eq!(family.modes, plain.modes, "base-less reads as unchallenged");
+        assert!(
+            pulled(&based).modes.0 > plain.modes.0,
+            "control: the pulled root is selected, and mirrored reads Full"
+        );
+        let mut family_cold = page(&c, ScanIndex::default(), 100, false);
+        same_sessions(&mut family_cold, &family);
+        let family_cold = result(&family_cold, Mode::ColdFull);
+        assert!(accounts(&family_cold).len() >= 2, "positive control");
+        money_oracle::assert_equivalent(&family_cold, &result(&family, Mode::Restart));
+        std::fs::remove_file(&twin).unwrap();
+        c.births.remove(&twin);
+
+        // Growth reads a Tail append to the cold Full's body.
+        append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        let grown = hinted(
+            &c,
+            activated(&challenged),
+            100,
+            true,
+            std::slice::from_ref(&path),
+        );
+        assert_eq!(grown.modes.0, 0, "a base-less grown file never reads Full");
+        assert!(grown.modes.1 > 0, "it continues as an append");
+        let mut grown_cold = page(&c, ScanIndex::default(), 100, false);
+        same_sessions(&mut grown_cold, &grown);
+        let grown_cold = result(&grown_cold, Mode::ColdFull);
+        assert!(accounts(&grown_cold).len() >= 2, "positive control");
+        money_oracle::assert_equivalent(&grown_cold, &result(&grown, Mode::Restart));
     });
 }
 
