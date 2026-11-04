@@ -7353,7 +7353,7 @@ const FORGOTTEN_INSTALLATION: &str = "Installation identity and credentials were
 /// Ottto, and the server's answer for a cloud reset.
 fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
     const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
-    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
+    const STILL_REGISTERED: &str = "This Mac may still be registered to the previous Ottto account on the server. If that account was deleted or already disconnected this Mac, sign in and choose Replace it on the claim page. Otherwise a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
     const FORGOTTEN: &str = FORGOTTEN_INSTALLATION;
     let (code, text) = match (forget_installation, device_released) {
         (true, None) => (
