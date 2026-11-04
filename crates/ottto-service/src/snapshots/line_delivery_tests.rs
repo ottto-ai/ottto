@@ -908,7 +908,7 @@ fn discovery_page(source: &str) -> Value {
     page_counts(&rows)
 }
 
-fn unselected_page(source: &str) -> Value {
+pub(in crate::snapshots) fn unselected_page(source: &str) -> Value {
     discovery_page(source)
         .get("line_delivery_unselected")
         .cloned()
@@ -922,7 +922,7 @@ fn rescue(files: &mut SharedMap<String, ScanIndexEntry>, path: &Path) {
     files.insert(local_index_key(path), entry);
 }
 
-fn candidates(index: &ScanIndex) -> Vec<PathBuf> {
+pub(in crate::snapshots) fn candidates(index: &ScanIndex) -> Vec<PathBuf> {
     let mut paths = index
         .traversal
         .as_ref()
@@ -1031,13 +1031,7 @@ fn roster_gate_counts_age_and_admits_large_files() {
     rescue(&mut index.files, &file("rescued"));
     let refresh = || {
         let mut index = index.clone();
-        refresh_retained_codex_roster(
-            SnapshotSource::Codex,
-            index.traversal.as_mut().unwrap(),
-            30,
-            discovery_retention!(index),
-            (&index.files).into(),
-        );
+        refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 30, None);
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
             candidates(&index),
@@ -1433,12 +1427,11 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             if source == SnapshotSource::Codex {
                 assert_eq!(
                     codex_parent_outside_window(
-                        discovery_retention!(index),
+                        &index,
                         &path(name),
                         &File::open(path(name)).unwrap(),
                         rfc3339_unix_seconds(NOW),
                         7,
-                        (&index.files).into(),
                     ),
                     !retained,
                     "Codex parent {name}"
@@ -1488,13 +1481,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
                 .unwrap()
                 .set_modified(UNIX_EPOCH)
                 .unwrap();
-            refresh_retained_codex_roster(
-                source,
-                index.traversal.as_mut().unwrap(),
-                7,
-                discovery_retention!(index),
-                (&index.files).into(),
-            );
+            refresh_retained_codex_roster(source, &mut index, 7, None);
             assert!(candidates(&index).contains(&path("grown")));
             assert_eq!(
                 discovery_page(source.api_slug())["discovery_retained"],
@@ -1545,13 +1532,7 @@ fn codex_roster_retains_aged_indexed_growth() {
         .unwrap()
         .codex_rollout_paths
         .contains(&local_index_key(&path)));
-    refresh_retained_codex_roster(
-        SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
-        7,
-        discovery_retention!(index),
-        (&index.files).into(),
-    );
+    refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None);
     assert!(candidates(&index).contains(&path));
     assert!(index
         .traversal

@@ -96,8 +96,7 @@ fields!(SessionAccountEvidence; []; provider,account_identifier_hash,provider_wo
 fields!(SnapshotUsageBucket; []; bucket_start,model_usage,first_activity_at,last_activity_at);
 fields!(SnapshotModelUsage; []; copy_unproven,model,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,reasoning_effort,unattributed_total_tokens,request_count,selector_context,selector_sources,auth_mode,billing_channel,billing_provider,gateway_provider,model_provider,subscription_product,account_identifier_hash,evidence_ref,identity_parts,identity_retained,copy_invalidated,cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd);
 fields!(SnapshotIdentityPart; []; account_identifier_hash,evidence_ref,input_tokens,output_tokens,cache_read_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,reasoning_output_tokens,unattributed_total_tokens,request_count,cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd);
-fields!(SnapshotRequestEvidence; []; identity_basis,provider_workspace_hash,account_source,sole_login_witness);
-fields!(crate::snapshots::SoleLoginWitness; []; v,kind,folder,covered_from);
+fields!(SnapshotRequestEvidence; []; identity_basis,provider_workspace_hash,account_source);
 fields!(SnapshotCost; []; total_cost_usd,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,evidence_source);
 fields!(SnapshotProvenance; []; collector,source_file_count,input_token_scope,state_total_tokens,state_archived);
 fields!(SessionArtifact; []; kind,value);

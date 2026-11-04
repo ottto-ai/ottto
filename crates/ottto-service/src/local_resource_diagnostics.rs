@@ -631,6 +631,8 @@ pub(crate) struct LineDeliveryCounts {
 /// K10 (LD): why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
+    /// A never-read file past the first-read bound.
+    FirstReadAge = 16,
     /// F4 kept custody because another same-member path prevents absence proof.
     WithheldAbsenceAmbiguous = 18,
 }
@@ -1126,6 +1128,7 @@ impl Probe {
                 source,
                 &[
                     ("age", 0),
+                    ("first_read_age", 16),
                     ("size", 1),
                     ("withheld_oversized", 2),
                     ("withheld_absence_ambiguous", 18),
@@ -1820,10 +1823,6 @@ pub(crate) fn claude_state_v2(counts: &impl Serialize) {
 /// wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
-}
-/// At most once per 24 h while reconstructions after a head persist.
-pub(crate) fn tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
-    traversal_point("tail_restart_full_alarm", source, counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({

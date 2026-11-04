@@ -314,8 +314,6 @@ pub(super) struct Sqlite {
     _owner_lock: File,
     clean: bool,
     save_failure: Option<Hold>,
-    // In-memory per connection: reopening re-arms the first over-threshold save.
-    save_over_ceiling: bool,
 }
 pub(super) struct Txn<'a> {
     store: &'a mut Sqlite,
@@ -339,7 +337,6 @@ impl Drop for Txn<'_> {
             if self.write && !self.store.import {
                 let bytes = self.store.wal_bytes();
                 self.store.stats.observe_wal(bytes);
-                self.store.stats.refused_save_bytes = self.dirty_bytes;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
             }
             // SQLite journal OFF cannot promise rollback. An aborted import
@@ -525,7 +522,6 @@ impl Sqlite {
             _owner_lock: owner_lock,
             clean: false,
             save_failure: None,
-            save_over_ceiling: false,
         }
     }
     /// Journal OFF is confined to an unpublished O_EXCL .import database. A
@@ -835,7 +831,6 @@ impl Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
-            self.stats.refused_save_bytes = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -1152,10 +1147,6 @@ impl Sqlite {
         self.stats.dirty_rows_per_save > 5_000
             || self.stats.encoded_bytes_per_save > SAVE_TARGET_BYTES
     }
-    /// Charged bytes of the last refused or over-threshold save.
-    pub(super) fn refused_save_bytes(&self) -> u64 {
-        self.stats.refused_save_bytes
-    }
     fn record_save_error(&mut self, error: &anyhow::Error) {
         if self.save_failure.is_some() {
             return;
@@ -1192,25 +1183,16 @@ fn systemic(error: &anyhow::Error) -> bool {
     })
 }
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
-const SAVE_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {
     fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
             return Ok(());
         }
-        let previous_bytes = self.dirty_bytes;
         self.dirty_rows = self.dirty_rows.saturating_add(rows);
         self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
         self.estimated_pages = self.estimated_pages.saturating_add(pages);
-        if previous_bytes <= SAVE_TARGET_BYTES && self.dirty_bytes > SAVE_TARGET_BYTES {
-            telemetry::event("save_payload_alarm", &self.dirty_bytes);
-        }
-        // Targets size the NEXT collection page; the complete dirty delta
-        // commits even above the counts-only alarm threshold.
-        if self.dirty_bytes >= self.store.purge_policy.save_ceiling {
-            self.store.stats.refused_save_bytes = self.dirty_bytes;
-        }
+        // Targets size the NEXT collection page; the complete dirty delta commits.
         Ok(())
     }
     fn admit_change(
@@ -1702,12 +1684,6 @@ impl Txn<'_> {
             self.store.stats.dirty_rows_per_save = self.dirty_rows;
             self.store.stats.encoded_bytes_per_save = self.dirty_bytes;
             if !self.store.import {
-                let over_ceiling = self.dirty_bytes >= self.store.purge_policy.save_ceiling;
-                if over_ceiling && !self.store.save_over_ceiling {
-                    telemetry::event("save_ceiling_alarm", &self.dirty_bytes);
-                    telemetry::event("save_ceiling_cause", &"charged_work");
-                }
-                self.store.save_over_ceiling = over_ceiling;
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
                 telemetry::event("save_estimated_pages", &self.estimated_pages);
             }
@@ -1740,7 +1716,6 @@ impl Txn<'_> {
             }
         }
         if !self.store.import {
-            self.store.stats.refused_save_bytes = self.dirty_bytes;
             telemetry::save_work(self.dirty_rows, self.dirty_bytes);
         }
         self.finished = true;

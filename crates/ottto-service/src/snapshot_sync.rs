@@ -6007,8 +6007,6 @@ struct SourcePreparation {
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     claude_scan_roots: Option<Vec<PathBuf>>,
-    /// Claude only: the hint's sole-login witness contract, read once per prepare.
-    sole_login: bool,
     account_witness: [u8; 32],
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
@@ -6797,28 +6795,14 @@ fn prepare_sync_source_inner(
     if let Some(encoded_key) = encoded_attribution_key.as_mut() {
         encoded_key.zeroize();
     }
-    let sole_login = source == SnapshotSource::ClaudeCode
-        && activity_hint
-            .session_request_sole_login_witness_contract
-            .as_deref()
-            == Some(crate::snapshots::claude_folder_login::SOLE_LOGIN_WITNESS_CONTRACT);
     if source == SnapshotSource::ClaudeCode {
-        // No capability or no key: no address digest, so no verdict.
-        let key = attribution_context
-            .as_ref()
-            .filter(|_| sole_login)
-            .map(SessionAttributionContext::accepted_fingerprint_key);
-        // A key or capability change only scrubs what retained parses compare
-        // under the old key: every parse, cursor and count stays, so a server
-        // hint never causes a re-read.
-        let address = crate::claude_status_coverage::bind_address_key(key);
-        let context = crate::snapshots::claude_request_identity::bind_session_context_key(
+        // A key change only scrubs what retained parses compare under the old
+        // key: every parse, cursor and count stays, so a server hint never
+        // causes a re-read.
+        if crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        );
-        if context || address {
-            daemon
-                .transcript_cache
-                .scrub_retained_identity(context, address);
+        ) {
+            daemon.transcript_cache.scrub_retained_context_digests();
         }
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
@@ -7183,7 +7167,6 @@ fn prepare_sync_source_inner(
         retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
-        sole_login,
         account_witness,
         scan_started_at,
         activity_hint,
@@ -7574,7 +7557,6 @@ fn prepare_continuation_source(
         retry_authority: None,
         source,
         claude_scan_roots: None,
-        sole_login: false,
         account_witness: inputs.account_witness,
         scan_started_at,
         activity_hint: inputs.activity_hint.clone(),
@@ -7725,7 +7707,6 @@ fn finish_sync_source(
         retry_authority,
         source,
         claude_scan_roots,
-        sole_login,
         account_witness,
         scan_started_at,
         activity_hint,
@@ -7774,17 +7755,6 @@ fn finish_sync_source(
                 .as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
-    if source == SnapshotSource::ClaudeCode {
-        upload_progress
-            .accepted_identity_buckets
-            .set_sole_login_enabled(sole_login);
-        crate::snapshots::claude_folder_login::begin_page(
-            &mut index,
-            &committed_index,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            sole_login,
-        );
-    }
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -10400,25 +10370,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
-    if let Some(accepted) =
-        accepted_identity_buckets.filter(|accepted| accepted.sole_login_enabled())
-    {
-        let census_clean = scan_result.census_complete
-            && scan_result.census_residue_index_key_count == 0
-            && scan_result.census_residue_blocked_session_count == 0;
-        crate::snapshots::claude_folder_login::note_page(
-            index,
-            &scan_result.snapshots,
-            &api_report,
-            census_clean,
-        );
-        crate::snapshots::claude_folder_login::stamp_page(
-            &mut scan_result.snapshots,
-            index,
-            &api_report,
-            accepted,
-        );
-    }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -19517,10 +19468,10 @@ mod tests {
         );
         assert_eq!(
             safe_error(
-                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveCeiling)
+                &anyhow::Error::new(crate::snapshots::state_v2::Hold::SaveFull)
                     .context("scan local snapshots /synthetic/private/path")
             ),
-            "local state store held: state_v2_save_ceiling"
+            "local state store held: state_v2_sqlite_full"
         );
         assert_eq!(
             safe_error(&SourcesFailed(vec!["claude_code", "codex"]).into()),
@@ -22413,7 +22364,8 @@ mod tests {
             ),
         )
         .expect("write old replay fixture");
-        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+        // Older than the policy window, inside the first-read bound.
+        let old_mtime = OffsetDateTime::parse("2026-07-16T12:00:00Z", &Rfc3339)
             .expect("old fixture mtime")
             .unix_timestamp() as u64;
         std::fs::OpenOptions::new()
@@ -22433,7 +22385,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut policy_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, false),
+            scan_request_window_days(30, false),
         )
         .expect("policy-width scan");
         assert_eq!(policy_scan.discovered_file_count, 0);
@@ -22445,7 +22397,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut replay_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, true),
+            scan_request_window_days(30, true),
         )
         .expect("wide replay scan");
         assert_eq!(replay_scan.backfill_window_days, 730);

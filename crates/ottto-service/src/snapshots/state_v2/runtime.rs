@@ -20,8 +20,6 @@ pub(crate) enum Hold {
     NewerSchema,
     MigrationFailed,
     ReloadRequired,
-    SaveCeiling,
-    SaveOversize,
     SaveFull,
     ReferenceDrift,
     AckCustody,
@@ -34,8 +32,6 @@ impl std::fmt::Display for Hold {
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
             Self::MigrationFailed => "state_v2_migration_failed",
-            Self::SaveCeiling => "state_v2_save_ceiling",
-            Self::SaveOversize => "state_v2_save_oversize",
             Self::SaveFull => "state_v2_sqlite_full",
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
@@ -105,8 +101,6 @@ impl Hold {
         let hold = if sqlite::disk_full(&error) {
             telemetry::event("sqlite_full", &1);
             Self::SaveFull
-        } else if Self::ceiling_cause(&error).is_some() {
-            Self::SaveCeiling
         } else if error
             .chain()
             .any(|e| e.to_string() == "state_v2_foreign_binding")
@@ -131,15 +125,6 @@ impl Hold {
         // Do not retain arbitrary engine messages/paths in public health output.
         hold.into()
     }
-    /// Content-free cause of refused save pressure. Logical value admission
-    /// still holds as `SaveCeiling`; aggregate charged work only alarms.
-    fn ceiling_cause(error: &anyhow::Error) -> Option<&'static str> {
-        error.chain().find_map(|e| match e.to_string().as_str() {
-            "state_v2_save_ceiling" => Some("charged_work"),
-            "state_v2_value_admission" => Some("value_admission"),
-            _ => None,
-        })
-    }
 }
 struct RouteState {
     pace: Pace,
@@ -153,9 +138,6 @@ struct RouteState {
     page_limit: usize,
     requested_page: usize,
     save_hold: Option<Hold>,
-    // Page-one pressure names the last admitted file, never upload authority.
-    last_read: Option<(String, u64)>,
-    save_retry_completed: bool,
     pass_written_start: Option<u64>,
     // Live ACK custody exceeded the companion bound: no collection before this.
     custody_retry_at: Option<Instant>,
@@ -188,14 +170,8 @@ impl RouteState {
         if claim_only {
             return;
         }
-        // A cursor-only save after a paced skip cannot resolve the held file.
-        if self.save_hold == Some(Hold::SaveOversize) && !self.save_retry_completed {
-            return;
-        }
         self.save_hold = None;
         self.report_hold();
-        self.last_read = None;
-        self.save_retry_completed = false;
         if over_target {
             self.reduce_page();
         } else {
@@ -226,8 +202,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     page_limit: 250,
                     requested_page: 250,
                     save_hold: None,
-                    last_read: None,
-                    save_retry_completed: false,
                     pass_written_start: None,
                     custody_retry_at: None,
                     tail: Default::default(),
@@ -564,7 +538,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             let generation = import::import_generation(index)?;
             let identity = Identity {
                 format: FORMAT,
-                db_id: random.iter().map(|b| format!("{b:02x}")).collect(),
+                db_id: crate::hex::encode(&random),
                 binding,
                 fence_generation: generation,
             };
@@ -637,7 +611,7 @@ pub(in super::super) fn save_locked(
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let runtime = index.v2().persistence_v2.clone();
     let expected = claim_generation.unwrap_or(index.generation);
-    let result = with_save_session(path, runtime, expected, claim_only, |state, session, id| {
+    let result = with_save_session(path, runtime, expected, |state, session, id| {
         let previous = match state.save_digests.take() {
             Some(previous) => previous,
             None => {
@@ -690,18 +664,16 @@ pub(in super::super) fn save_locked(
 }
 /// Custody shared by both v2 writes: fence and session checks, then a stale
 /// graph is refused before any write without invalidating the healthy
-/// session. A failed write keeps its pressure hold and reopens the session.
+/// session. A failed write keeps a disk-full hold and reopens the session.
 /// `None`: no runtime and no published store.
 fn with_save_session<T>(
     path: &Path,
     runtime: Option<Arc<Runtime>>,
     expected: u64,
-    claim_only: bool,
     write: impl FnOnce(&mut RouteState, &mut Session, Identity) -> Result<T>,
 ) -> Result<Option<T>> {
     let binding = binding_for(path)?;
     let mut stale_graph = false;
-    let mut ceiling = None;
     let mut result = held(with_state(path, |state| {
         let pair = fence::reconcile(path, &binding, state.latched)?;
         let Some(runtime) = runtime else {
@@ -724,11 +696,7 @@ fn with_save_session<T>(
             stale_graph = true;
             bail!(Hold::ReloadRequired);
         }
-        let written = write(state, session, identity);
-        if let Err(error) = &written {
-            ceiling = Hold::ceiling_cause(error).map(|c| (c, session.db.refused_save_bytes()));
-        }
-        written.map(Some)
+        write(state, session, identity).map(Some)
     }));
     if let Err(error) = &result {
         if stale_graph {
@@ -736,27 +704,7 @@ fn with_save_session<T>(
         }
         with_state(path, |state| {
             state.save_digests = None;
-            state.save_retry_completed = false;
-            if let (Some(Hold::SaveCeiling), Some((cause, bytes))) =
-                (error.downcast_ref::<Hold>(), ceiling)
-            {
-                // A save-pressure hold is never silent: alarm with its fixed cause.
-                telemetry::event("save_ceiling_alarm", &bytes);
-                telemetry::event("save_ceiling_cause", &cause);
-            }
-            if (!claim_only || state.save_hold != Some(Hold::SaveOversize))
-                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveCeiling))
-            {
-                state.save_hold = Some(if state.page_limit == 1 {
-                    telemetry::event("save_oversize_alarm", &1);
-                    Hold::SaveOversize
-                } else {
-                    state.reduce_page();
-                    Hold::SaveCeiling
-                });
-            } else if state.save_hold != Some(Hold::SaveOversize)
-                && matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull))
-            {
+            if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull)) {
                 state.save_hold = Some(Hold::SaveFull);
             }
             if let Some(runtime) = &state.current {
@@ -827,7 +775,7 @@ pub(in super::super) fn claim_growth_locked(
     let runtime = index.v2().persistence_v2.clone();
     ensure!(runtime.is_some(), Hold::ReloadRequired);
     let _save_window = telemetry::Window::begin("save");
-    with_save_session(path, runtime, expected, true, |state, session, id| {
+    with_save_session(path, runtime, expected, |state, session, id| {
         recovered_write(path, None, &id, session, |session| {
             #[cfg(test)]
             if tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take) {
@@ -1045,60 +993,6 @@ pub(in super::super) fn ack_custody_held(path: &Path) -> bool {
         return false;
     };
     state.lock().is_ok_and(|state| state.custody_held())
-}
-
-pub(in super::super) fn save_oversize_active(index: &ScanIndex) -> Result<bool> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(false);
-    };
-    with_state(&path, |state| {
-        Ok(state.save_hold == Some(Hold::SaveOversize))
-    })
-}
-
-/// Native completion can make a recovery delta safe without advancing an
-/// unACKed file entry. The subsequent successful normal save clears the hold.
-pub(in super::super) fn save_read_completed(index: &ScanIndex, key: &str) -> Result<()> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(());
-    };
-    with_state(&path, |state| {
-        if state.save_hold == Some(Hold::SaveOversize)
-            && state
-                .last_read
-                .as_ref()
-                .is_some_and(|(held, _)| held == key)
-        {
-            state.save_retry_completed = true;
-        }
-        Ok(())
-    })
-}
-
-/// Gate before transcript samples/reads. Keep the source fence: upload recovery
-/// and accepted progress are source-owned, so a per-file bypass is unsafe here.
-/// Only the page-one file may retry; growth_read_admitted then requires the
-/// existing durable growth Full claim before admitting its payload.
-pub(in super::super) fn save_read_admitted(index: &ScanIndex, key: &str, now: u64) -> Result<bool> {
-    let Some(path) = runtime_path(index)? else {
-        return Ok(true);
-    };
-    with_state(&path, |state| {
-        if state.save_hold == Some(Hold::SaveOversize)
-            && !state.last_read.as_ref().is_some_and(|(held, last)| {
-                held == key
-                    && now >= last.saturating_add(super::super::sampled_audit::GROWTH_FULL_INTERVAL)
-            })
-        {
-            // Unknown key means the delta was not a single file acquisition.
-            return Ok(false);
-        }
-        if state.page_limit == 1 {
-            state.last_read = Some((key.to_owned(), now));
-            state.save_retry_completed = false;
-        }
-        Ok(true)
-    })
 }
 
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
@@ -1550,6 +1444,7 @@ mod tests;
 #[cfg(test)]
 pub(in super::super) use tests::{
     delete_usage_row_in_session, erase_published, materialized, usage_unknown_count,
+    with_session_db,
 };
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
