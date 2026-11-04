@@ -119,13 +119,38 @@ pub(crate) fn apply(
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
 ) -> Qualification {
-    let evidence =
-        super::claude_request_identity::ScanEvidence::new(api, trace, Default::default());
-    apply_with_shared_index(snapshots, api, trace, &BTreeMap::new(), &evidence)
+    apply_with_originals(snapshots, api, trace, &BTreeMap::new())
 }
 
-/// Qualify over the request/owner index contract 5 already built from these
-/// same reports this pass.
+pub(crate) fn apply_with_originals(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+) -> Qualification {
+    let mut requests = BTreeMap::new();
+    for (root, rows) in &api.evidence {
+        for row in rows {
+            requests
+                .entry((root.as_str(), row.request_id.as_str()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(row));
+        }
+    }
+    let mut owners = BTreeMap::new();
+    for (root, rows) in &trace.evidence {
+        for row in rows {
+            owners
+                .entry((root.as_str(), row.request_id.as_str()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(row));
+        }
+    }
+    qualify_all(snapshots, api, trace, &requests, &owners, originals)
+}
+
+/// `apply_with_originals` over the request/owner index contract 5 already
+/// built from these same reports this pass, instead of building it twice.
 pub(crate) fn apply_with_shared_index(
     snapshots: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,

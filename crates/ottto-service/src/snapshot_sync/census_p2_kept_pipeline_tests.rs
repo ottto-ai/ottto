@@ -635,6 +635,8 @@ fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accept
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) = mixed_rejected_fixture("h1-real-account-refusal", true);
     assert_real_rejected_hold(

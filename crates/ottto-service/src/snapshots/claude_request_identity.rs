@@ -115,6 +115,37 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
     matches!(source, SnapshotSource::ClaudeCode)
 }
 
+/// Every Claude sync cycle builds contract-5 evidence. A test may model a
+/// pre-cutover daemon's unpermitted page, or pin the legacy account path
+/// (own-request account qualification, mixed bodies, owner holds) that production now
+/// reaches only for bodies contract 5 leaves untagged.
+pub(crate) fn builds_evidence() -> bool {
+    #[cfg(test)]
+    if PRE_CUTOVER.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+#[cfg(test)]
+thread_local! { static PRE_CUTOVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Runs this thread's sync evidence stage without contract-5 evidence until
+/// dropped, as every unpermitted cycle did before the cutover. Only for
+/// fixtures that model that daemon or whose subject is the legacy path.
+#[cfg(test)]
+pub(crate) struct PreCutoverEvidenceForTest(bool);
+#[cfg(test)]
+impl PreCutoverEvidenceForTest {
+    pub(crate) fn enter() -> Self {
+        Self(PRE_CUTOVER.with(|v| v.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for PreCutoverEvidenceForTest {
+    fn drop(&mut self) {
+        PRE_CUTOVER.with(|v| v.set(self.0));
+    }
+}
+
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
