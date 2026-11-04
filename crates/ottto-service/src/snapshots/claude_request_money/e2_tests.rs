@@ -3025,7 +3025,7 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
 }
 
 #[test]
-fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
+fn e2_identity_markerless_desktop_goes_per_request_and_keeps_recent_activity() {
     {
         let path = root_file("identity-markerless-desktop");
         let index = ScanIndex::default();
@@ -3073,11 +3073,17 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
             &Default::default(),
         )
         .is_empty());
-        let before = serde_json::to_vec(&items).unwrap();
+        // A single-account markerless body takes the per-request shape.
         let outcome =
             claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
-        assert_eq!((outcome.sent, outcome.ineligible), (0, 1));
-        assert_eq!(serde_json::to_vec(&items).unwrap(), before);
+        assert_eq!(
+            (outcome.sent + outcome.fallback, outcome.ineligible),
+            (1, 0)
+        );
+        assert_eq!(
+            items[0].provenance.collector,
+            claude_request_identity::COLLECTOR
+        );
         claude_request_identity::publish_request_owned_activity(&items, activity);
         assert_eq!(
             crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),

@@ -289,7 +289,8 @@ pub(crate) mod money_mark {
 /// acting in the fold gates on the request's own provider timestamp
 /// (`observed_at >= T`, as `provider_context_bucket` does), so a cold read
 /// equals a stored one; anything else goes through the operator command.
-pub(crate) const RULE_EPOCH: u8 = 1;
+/// 2: org lines govern requests from `ACCOUNT_RULE_FROM`.
+pub(crate) const RULE_EPOCH: u8 = 2;
 
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
@@ -1191,6 +1192,7 @@ impl FileFold {
         session: Option<&str>,
         context: Option<&ReadContext<'_>>,
         first_sequence: Option<u64>,
+        trust_from: Option<u64>,
     ) {
         let started = Instant::now();
         let subagent = context
@@ -1203,6 +1205,7 @@ impl FileFold {
             first_sequence,
             subagent,
             &[],
+            trust_from,
         )));
         self.spend(started);
     }
