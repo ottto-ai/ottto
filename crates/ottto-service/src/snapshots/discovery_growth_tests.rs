@@ -4,6 +4,7 @@
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::local_resource_diagnostics::capture;
+use crate::snapshot_watcher::ListingTrigger;
 
 const SESSION: &str = "5e551011-0000-4000-8000-00000000d171";
 
@@ -103,7 +104,29 @@ impl Fixture {
         index: ScanIndex,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, &[])
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            &[],
+            &mut ListingRequest::default(),
+        )
+    }
+    /// One page over `roots` served with a listing request; returns what
+    /// stays unserved.
+    fn page_requesting(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        index: ScanIndex,
+        mut list_all: ListingRequest,
+    ) -> (ScanIndex, Reads, Vec<Value>, ListingRequest) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let (index, _, reads, rows) =
+            self.page_with(source, roots, index, &now, &[], &mut list_all);
+        (index, reads, rows, list_all)
     }
     fn page_hinted(
         &self,
@@ -112,7 +135,15 @@ impl Fixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        self.page_with(source, index, &now, hints)
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            hints,
+            &mut ListingRequest::default(),
+        )
     }
     fn page_at(
         &self,
@@ -120,14 +151,24 @@ impl Fixture {
         index: ScanIndex,
         now: &str,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
-        self.page_with(source, index, now, &[])
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            now,
+            &[],
+            &mut ListingRequest::default(),
+        )
     }
     fn page_with(
         &self,
         source: SnapshotSource,
+        roots: &[PathBuf],
         mut index: ScanIndex,
         now: &str,
         hints: &[PathBuf],
+        list_all: &mut ListingRequest,
     ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
         index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
             source,
@@ -137,9 +178,9 @@ impl Fixture {
         self.cache.bind_withheld(&mut index);
         let reads = Reads::default();
         let ((index, result), rows) = capture(|| {
-            let mut scan = OwnedSourceScan::new(
+            let mut scan = OwnedSourceScan::new_selecting(
                 source,
-                std::slice::from_ref(&self.root),
+                roots,
                 index,
                 now,
                 7,
@@ -147,6 +188,9 @@ impl Fixture {
                 None,
                 hints,
                 false,
+                list_all,
+                true,
+                &[],
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -1032,6 +1076,81 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
     }
 }
 
+/// [behaviour] A walk that starts in the requesting page serves the request
+/// without a second listing. A listing request lists every root of a kept
+/// generation at once, for every source: the downtime writes are read and no
+/// generation starts. A request while that walk runs neither restarts nor
+/// drops it: it stays unserved for the pass after the walk.
+#[test]
+fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let roots = std::slice::from_ref(&f.root);
+        let mut first = ListingRequest::default();
+        first.record(ListingTrigger::Start);
+        let (index, _, _, unserved) = f.page_requesting(source, roots, ScanIndex::default(), first);
+        assert!(!unserved.requested(), "{source:?}: the new walk serves it");
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .map_or(true, |walk| walk.counts.listing_generations == 0),
+            "{source:?}: no second listing"
+        );
+
+        let index = kept_generation(&f, source, false);
+        append_records(
+            &f.root.join(format!("{GROWN}.jsonl")),
+            &usage_records(source, GROWN, 2, false),
+        );
+        append_records(
+            &f.root.join(format!("{CREATED}.jsonl")),
+            &usage_records(source, CREATED, 1, true),
+        );
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        let mut rescan = ListingRequest::default();
+        rescan.record(ListingTrigger::Rescan);
+        let starting = |row: &&Value| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        };
+        with_test_directory_entries(ROOT_ENTRIES, || {
+            let (index, reads, rows, unserved) = f.page_requesting(source, roots, index, first);
+            assert!(!unserved.requested(), "{source:?}: served at once");
+            let walk = index.traversal.as_ref().unwrap();
+            assert_eq!(walk.counts.listing_generations, 1, "{source:?}");
+            assert!(!walk.pending_directories.is_empty(), "{source:?}");
+            let (mut index, more, more_rows, unserved) =
+                f.page_requesting(source, roots, index, rescan);
+            assert_eq!(unserved, rescan, "{source:?}: kept, the walk not restarted");
+            let mut read = [modes(&reads), modes(&more)].concat();
+            let mut starts = rows.iter().chain(&more_rows).filter(starting).count();
+            // The passes after it drain what the listing queued.
+            for _ in 0..8 {
+                if index.traversal.as_ref().map_or(true, |walk| {
+                    walk.pending_directories.is_empty() && walk.pending_candidates.is_empty()
+                }) {
+                    break;
+                }
+                let (next, _, reads, rows) = f.page(source, index);
+                index = next;
+                read.extend(modes(&reads));
+                starts += rows.iter().filter(starting).count();
+            }
+            read.sort();
+            assert_eq!(read, expected, "{source:?}");
+            assert_eq!(starts, 0, "{source:?}: no new generation");
+        });
+    }
+}
+
 /// [regress] A re-armed (owed) file whose stamp is unchanged stays
 /// schedulable through the re-listing pass and through the watcher-hint
 /// filter, and a pass queues it as the hint rule does (a census member for
@@ -1069,7 +1188,13 @@ fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
             if !hinted {
                 let mut walked = index.clone();
                 let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-                start_due_listing_pass(walked.traversal.as_mut().unwrap(), &now);
+                start_due_listing_pass(
+                    source,
+                    walked.traversal.as_mut().unwrap(),
+                    &now,
+                    false,
+                    &mut ListingRequest::default(),
+                );
                 advance_bounded_directory_traversal(source, &mut walked, 7, None);
                 let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
                 let owed = queued
@@ -1167,7 +1292,13 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
     let traversal = index.traversal.as_mut().unwrap();
     traversal.listing_started_unix_seconds =
         Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
-    start_due_listing_pass(traversal, &now.format(&Rfc3339).unwrap());
+    start_due_listing_pass(
+        source,
+        traversal,
+        &now.format(&Rfc3339).unwrap(),
+        false,
+        &mut ListingRequest::default(),
+    );
     advance_bounded_directory_traversal(source, index, 7, None);
     assert!(index
         .traversal

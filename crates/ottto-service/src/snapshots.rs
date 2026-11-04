@@ -11,6 +11,7 @@ use crate::local_resource_diagnostics::rearm_cause;
 use crate::local_resource_diagnostics::{
     line_delivery_unselected, page_selection, CapCounts, PageSelection, UnselectedReason,
 };
+use crate::snapshot_watcher::ListingRequest;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -22012,13 +22013,14 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             hinted_paths,
             watcher_overflowed,
+            &mut ListingRequest::default(),
             claude_request_identity_capture,
             &[],
         )
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    #[allow(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -22029,6 +22031,7 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
+        list_all: &mut ListingRequest,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
@@ -22042,6 +22045,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             hinted_paths,
             watcher_overflowed,
+            list_all,
             claude_request_identity_capture,
             recovery_priority,
         )
@@ -22139,7 +22143,7 @@ impl OwnedSourceScan {
         self
     }
 
-    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "14 args; no options struct yet")]
     fn new_selecting(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -22150,6 +22154,8 @@ impl OwnedSourceScan {
         claude_effort_support_dir: Option<&Path>,
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
+        // Served here when no walk runs; otherwise left for the caller to defer.
+        list_all: &mut ListingRequest,
         claude_request_identity_capture: bool,
         // Only changes native selection order, never ownership or settlement.
         recovery_priority: &[PathBuf],
@@ -22273,7 +22279,13 @@ impl OwnedSourceScan {
                 Some(&resource_probe.discovery_growth),
             );
             let traversal = index.traversal.as_mut().expect("traversal initialized");
-            start_due_listing_pass(traversal, collected_at);
+            start_due_listing_pass(
+                source,
+                traversal,
+                collected_at,
+                progress == TraversalProgress::Started,
+                list_all,
+            );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
@@ -38074,23 +38086,43 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
 }
 
 /// Once a kept generation's latest walk has finished, re-list its roots
-/// every `LISTING_INTERVAL_SECONDS`, metadata only. The pass queues only
+/// every `LISTING_INTERVAL_SECONDS`, metadata only, or at once when the
+/// watcher cannot vouch for what changed (`list_all`). The pass queues only
 /// changed or owed files (`ScanIndex::listing_unchanged`) and never starts a
 /// generation, so it re-arms nothing; it can only delay this generation's
-/// discovery, never complete it.
-fn start_due_listing_pass(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {
+/// discovery, never complete it. A walk this page started has passed no
+/// directory yet, so it serves the request itself; any other running walk is
+/// never restarted, and the request stays in `list_all` for after it.
+fn start_due_listing_pass(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    collected_at: &str,
+    walk_started: bool,
+    list_all: &mut ListingRequest,
+) {
     let Some(now) = rfc3339_unix_seconds(collected_at) else {
         return;
     };
+    let requested =
+        list_all.requested() && (walk_started || traversal.pending_directories.is_empty());
+    if requested {
+        let request = std::mem::take(list_all);
+        eprintln!(
+            "local snapshot listing for {}: {request}",
+            source.api_slug()
+        );
+    }
     if !traversal.pending_directories.is_empty() {
         return;
     }
-    let Some(started) = traversal.listing_started_unix_seconds else {
-        traversal.listing_started_unix_seconds = Some(now);
-        return;
-    };
-    if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
-        return;
+    if !requested {
+        let Some(started) = traversal.listing_started_unix_seconds else {
+            traversal.listing_started_unix_seconds = Some(now);
+            return;
+        };
+        if now < started.saturating_add(LISTING_INTERVAL_SECONDS) {
+            return;
+        }
     }
     traversal.listing_started_unix_seconds = Some(now);
     traversal.counts.listing_generations += 1;

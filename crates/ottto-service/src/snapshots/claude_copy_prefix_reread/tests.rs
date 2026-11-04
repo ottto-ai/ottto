@@ -64,6 +64,7 @@ fn walk(
         None,
         &[],
         false,
+        &mut Default::default(),
         true,
         scope,
     );
