@@ -49,6 +49,7 @@ pub(in crate::snapshots) fn carry_tail(
     )?
     .ok_or(Hold::ReloadRequired)?;
     *index = next;
+    super::super::super::sampled_audit::renew_growth_claims(index, &path);
     Ok(())
 }
 /// Staged state never declines; a later completion of the file merges into it.

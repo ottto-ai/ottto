@@ -1692,18 +1692,16 @@ pub(in crate::snapshots) mod tests {
                     snapshot_upload_body_witness(expected)
                 );
             }
-            // Codec corruption and an invalid mandatory receipt both fail
-            // ordinary acquisition. Preserve that file's reduction diagnostic
-            // and census loss beside the unchanged independent plain money.
-            let acquisition_failed = matches!(refusal, "body" | "receipt");
+            // Body, receipt and launcher proof failures all fail ordinary
+            // acquisition. Each keeps its exact per-file diagnostic and census
+            // loss beside byte-identical independent plaintext money.
             assert_eq!(
                 result.unreadable_path_count,
-                control.unreadable_path_count + usize::from(acquisition_failed),
+                control.unreadable_path_count + 1,
                 "{refusal}: ordinary unreadable-file accounting"
             );
-            assert_eq!(
-                result.census_complete,
-                control.census_complete && !acquisition_failed,
+            assert!(
+                !result.census_complete,
                 "{refusal}: ordinary census eligibility"
             );
             assert_eq!(

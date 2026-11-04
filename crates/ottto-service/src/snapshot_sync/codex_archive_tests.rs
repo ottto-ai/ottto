@@ -57,6 +57,11 @@ impl ScanIndex {
         let root = crate::test_scratch::ScratchDir::canonical("archive-upload-checkpoint");
         let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
         let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
+        // A prepare-time carry already committed both old/new keys. Match
+        // the production constructor's baseline, without admitting later work.
+        let prepared = (route.is_some() && index.generation != previous.generation)
+            .then(|| ScanIndex::load(&index_path).unwrap());
+        let previous = prepared.as_ref().unwrap_or(previous);
         let progress_path = snapshot_upload_progress_path(&index_path);
         if route.is_none() {
             std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();

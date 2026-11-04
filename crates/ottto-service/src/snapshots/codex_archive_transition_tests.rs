@@ -531,12 +531,28 @@ fn inventory_refusal_isolates_only_proven_dependants() {
         .confirmed_empty_files
         .contains(&local_index_key(&sibling)));
     // Repair to a disjoint same-id response through the shared native rows.
-    let rows = codex_file_join::tests::member(MAIN, "side-response", 100, 300);
+    let mut rows = codex_file_join::tests::member(MAIN, "side-response", 100, 300);
+    rows[0]["payload"]["source"] = json!("cli");
+    rows[0]["payload"]["creator_user_id"] = json!("synthetic-user-a");
+    rows[0]["payload"]["creator_account_id"] = json!("synthetic-workspace-a");
     let repaired = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
     // Group replay still requires physical plaintext certificates. The
     // provider's repaired plaintext takes the existing generic group path.
     fs::remove_file(&sibling).unwrap();
     fs::write(sibling.with_extension(""), repaired).unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let paths = fs::read_dir(&c.sessions)
+        .unwrap()
+        .map(|entry| local_index_key(&entry.unwrap().path()))
+        .collect();
+    let inventory = codex_file_join::header_cache_tests::page(c.scratch.as_ref(), &paths, &cache);
+    let group = inventory
+        .groups()
+        .into_values()
+        .find(|group| group.owner == MAIN)
+        .unwrap();
+    codex_file_join::tests::replay_group(group, None, &ScanIndex::default())
+        .expect("the repaired native counter chain must be admissible");
     let (_, cold, _, _, _) = page(
         &c,
         ScanIndex::default(),
@@ -641,6 +657,16 @@ pub(super) fn carried_downgrade_index(root: &Path) -> ScanIndex {
     assert!(quiet.snapshots.is_empty());
     assert_eq!(consumed, 0);
     assert_eq!(full_decodes(&logs), 0);
+    assert_eq!(
+        state_v2::runtime_path(&index).unwrap().as_deref(),
+        Some(session.path())
+    );
+    state_v2::guard_local(
+        session.path(),
+        index.v2().persistence_v2.as_ref(),
+        index.generation,
+    )
+    .expect("a prepared carry retains the next ordinary save's authenticated lineage");
     index.save(session.path()).unwrap();
     let index = ScanIndex::load(session.path()).unwrap();
     let mut value = serde_json::to_value(state_v2::money_test_support::resident(&index)).unwrap();

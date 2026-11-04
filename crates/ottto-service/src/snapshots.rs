@@ -38765,10 +38765,7 @@ impl ScanIndex {
         self.withheld_memo.rekey(from, to);
         if let Some(scan_root) = scan_root {
             if let Some(claim) = self.v2_mut().growth_retention.remove(from) {
-                sampled_audit::merge_growth_claims(
-                    &mut self.v2_mut().growth_retention,
-                    &BTreeMap::from([(to.to_owned(), claim)]),
-                );
+                self.v2_mut().growth_retention.insert(to.to_owned(), claim);
             }
             move_map(&mut self.codex_state_only_blocked_by_file, from, to);
             move_set(&mut self.legacy_unresolved_root_file_witnesses, from, to);
