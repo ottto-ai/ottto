@@ -3342,9 +3342,7 @@ mod tests {
             Some(ClaudeRequestKey::shape("shape-RAWKEY"))
         );
         take_l_spans();
-        let mut e = Enc::bytes(1 << 20);
-        state.put(&mut e).unwrap();
-        let body = e.into_bytes();
+        let body = Enc::count_write(1 << 20, |e| state.put(e)).unwrap();
         let spans = take_l_spans();
         let at = |needle: &str| {
             body.windows(needle.len())
@@ -3400,11 +3398,7 @@ mod tests {
             );
             state
         };
-        let body = |state: &SessionStartState| {
-            let mut e = Enc::bytes(1 << 20);
-            state.put(&mut e).unwrap();
-            e.into_bytes()
-        };
+        let body = |state: &SessionStartState| Enc::count_write(1 << 20, |e| state.put(e)).unwrap();
         let build: [(&str, &dyn Fn() -> SessionStartState); 2] =
             [("claude", &claude), ("codex", &codex)];
         for (name, build) in build {
@@ -3443,20 +3437,17 @@ mod tests {
                 // The prelude is its own session fact: it round-trips in full.
                 assert!(state.has_codex_prelude(), "{name}");
                 assert!(decoded.codex_prelude.is_none(), "{name}: the body drops it");
-                let mut e = Enc::bytes(1 << 20);
-                state.put_codex_prelude_fact(&mut e).unwrap();
-                let prelude = e.into_bytes();
+                let prelude =
+                    Enc::count_write(1 << 20, |e| state.put_codex_prelude_fact(e)).unwrap();
                 let mut d = Dec::new(&prelude);
                 decoded.take_codex_prelude_fact(&mut d).unwrap();
                 d.finish().unwrap();
-                let mut again = Enc::bytes(1 << 20);
-                decoded.put_codex_prelude_fact(&mut again).unwrap();
-                assert_eq!(again.into_bytes(), prelude, "{name}");
+                let again =
+                    Enc::count_write(1 << 20, |e| decoded.put_codex_prelude_fact(e)).unwrap();
+                assert_eq!(again, prelude, "{name}");
             }
             assert!(state.has_opening_fact(), "{name}");
-            let mut e = Enc::bytes(1 << 20);
-            state.put_opening_fact(&mut e).unwrap();
-            let fact = e.into_bytes();
+            let fact = Enc::count_write(1 << 20, |e| state.put_opening_fact(e)).unwrap();
             let mut d = Dec::new(&fact);
             decoded.take_opening_fact(&mut d).unwrap();
             d.finish().unwrap();
@@ -3465,9 +3456,8 @@ mod tests {
                 Some(digest.to_bytes()),
                 "{name}"
             );
-            let mut again = Enc::bytes(1 << 20);
-            decoded.put_opening_fact(&mut again).unwrap();
-            assert_eq!(again.into_bytes(), fact, "{name}");
+            let again = Enc::count_write(1 << 20, |e| decoded.put_opening_fact(e)).unwrap();
+            assert_eq!(again, fact, "{name}");
             assert_eq!(body(&decoded), encoded, "{name}");
         }
     }

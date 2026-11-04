@@ -456,18 +456,6 @@ pub(in crate::snapshots) trait TailSource {
     }
 }
 
-/// One exactly sized value: the field walk counts, then writes.
-fn encode(put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>) -> Result<Vec<u8>, Refuse> {
-    let mut count = Enc::count(usize::MAX);
-    put(&mut count)?;
-    let len = count.counted();
-    let mut out = Vec::with_capacity(len);
-    let mut writer = Enc::writer(&mut out, len);
-    put(&mut writer)?;
-    writer.finish_written()?;
-    Ok(out)
-}
-
 /// The head envelope every codec writes: the identity, the checkpoint
 /// certificate, the read report and the three reduction scalars, then the
 /// codec's `lead`, the shared head-field walk and the codec's `trailer`.
@@ -485,7 +473,7 @@ fn encode_envelope(
         view.positive_recognized_usage_count,
         view.positive_usage_evidence,
     );
-    encode(|e| {
+    Enc::count_write(usize::MAX, |e| {
         e.with_moved_field("OpeningCall.files", |e| {
             id.put(e)?;
             certificate.put(e)?;
@@ -545,7 +533,7 @@ fn page_bytes<'a, T: 'a>(
     items: impl ExactSizeIterator<Item = &'a T> + Clone,
     put: impl Fn(&T, &mut Enc<'_>) -> Result<(), Refuse>,
 ) -> Result<Vec<u8>, Refuse> {
-    encode(|e| {
+    Enc::count_write(usize::MAX, |e| {
         e.varint(items.len() as u64)?;
         items.clone().try_for_each(|item| put(item, e))
     })
@@ -806,7 +794,12 @@ fn fact_pages(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> 
     FACTS
         .into_iter()
         .filter(|fact| fact.present(acc))
-        .map(|fact| Ok((fact as u64, encode(|e| fact.put(acc, e))?)))
+        .map(|fact| {
+            Ok((
+                fact as u64,
+                Enc::count_write(usize::MAX, |e| fact.put(acc, e))?,
+            ))
+        })
         .collect()
 }
 
