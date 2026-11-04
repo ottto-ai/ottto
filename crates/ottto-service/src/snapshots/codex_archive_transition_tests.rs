@@ -95,6 +95,14 @@ fn page(
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed(c, index, cache, |_| {})
+}
+fn page_observed(
+    c: &Corpus,
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    mut observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
     let ((answer, consumed), logs) = crate::local_resource_diagnostics::capture(|| {
         oracle::observe_consumed(|| {
@@ -111,9 +119,13 @@ fn page(
             )
             .with_sampled_acquisition(cache, Scope("encoding-money-transition".into()))
             .with_line_observer("test", Box::new(delivered.clone()));
+            observe(&mut scan);
             for _ in 0..100_000 {
                 match scan.step(None) {
-                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Pending(mut next) => {
+                        observe(&mut next);
+                        scan = next;
+                    }
                     OwnedSourceScanStep::Complete {
                         mut index,
                         mut scan,
@@ -460,7 +472,21 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
             &emitted(&index, &cold_main),
             &route(&index, &materialized, posts),
         );
-        assert_quiet(&c, index, &appended_route);
+        let (mut index, _) = assert_quiet(&c, index, &appended_route);
+        // The accepted carried object keeps its ordinary grant as listing
+        // generations expire; an unrelated discovery never regrants its Full.
+        e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, quiet, delivery, consumed, logs) = page(&c, index, cache.clone());
+        assert!(quiet.snapshots.is_empty());
+        assert!(delivery.0.lock().unwrap().is_empty());
+        assert_eq!(consumed, 0);
+        assert_eq!(
+            full_decodes(&logs),
+            0,
+            "no regranted Full after aged listing"
+        );
+        assert_eq!(cache.cursor_reserved(), 0);
     }
 }
 
@@ -812,4 +838,214 @@ fn release_0217_archive_manifest_members_and_header_attempts_load_inert() {
     assert!(state_v2::legacy_archive_was_seen(&index, &key).unwrap());
     assert!(index.decode_holds.is_empty());
     assert!(index.files.is_empty());
+}
+
+/// [regress] Header decoder refusal holds its filename owner, while ordinary
+/// siblings publish exact money; funding the next attempt reaches the same EOF.
+#[test]
+fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("a"));
+    c.write(GAP, None);
+    append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched"))));
+    let compressed = c.path(MAIN).with_extension("jsonl.zst");
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(&fs::read(c.path(MAIN)).unwrap()[..], 1).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(c.path(MAIN)).unwrap();
+    let (cold_index, cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    assert_eq!(cold.snapshots.len(), 4);
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    // Ordinary part of the former incomplete-inventory hint fixture: no
+    // body escapes the failed generation, and a new generation can recover.
+    let mut injected = false;
+    let (mut hinted, incomplete, delivery, _, _) = page_observed(
+        &c,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+        |scan| {
+            if !injected {
+                scan.codex_join_inventory.as_mut().unwrap().complete = false;
+                injected = true;
+            }
+        },
+    );
+    assert!(injected);
+    assert!(incomplete.snapshots.is_empty());
+    assert!(!incomplete.census_complete);
+    assert!(
+        delivery.0.lock().unwrap().is_empty(),
+        "no body read on incomplete membership"
+    );
+    hinted.traversal = None;
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let occupied = OpenedInput::funded(File::open(&compressed).unwrap(), &cache)
+        .unwrap()
+        .unwrap();
+    let (working, refused, _, _, logs) = page(&c, hinted, cache.clone());
+    assert!(refused
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != MAIN));
+    assert_eq!(
+        refused.unreadable_path_count, 0,
+        "resource refusal is not unreadable"
+    );
+    assert!(refused.ownership_incomplete_file_count > 0);
+    assert!(
+        serde_json::to_value(&refused.causes).unwrap()["contributions"][ownership::INVENTORY]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(full_decodes(&logs), 0);
+    let pending = working
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .find(|pending| pending.path == compressed)
+        .expect("ordinary retry stays queued");
+    assert!(pending.census_member);
+    let mut cold_plain = cold.clone();
+    cold_plain
+        .snapshots
+        .retain(|item| item.source_session_id != MAIN);
+    money_oracle::assert_equivalent(
+        &emitted(&cold_index, &cold_plain),
+        &emitted(&working, &refused),
+    );
+    let (index, posts) = working.checkpoint_with_captured_posts(&refused, &prior, "accept");
+    assert_eq!(posts.len(), 1);
+    occupied.close();
+    assert_eq!(cache.cursor_reserved(), 0);
+    // Reuse an ordinary funded header, then count only the body Full below.
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    for root in c.roots() {
+        directories.observe(&root, &fs::metadata(&root).unwrap());
+    }
+    let mut headers = codex_file_join::HeaderInventory::new(
+        &c.roots(),
+        &BTreeSet::from([local_index_key(&compressed)]),
+        Some(&directories),
+    );
+    while !headers.step_encoded(&CodexTitleMetadata::default(), Some(&cache)) {}
+    assert!(headers.complete);
+    let before = index.clone();
+    let mut raced_plain_append = false;
+    let (working, funded, _, _, logs) = page_observed(&c, index, cache.clone(), |scan| {
+        if scan.codex_join_prepared && !raced_plain_append {
+            append(&c.path(OTHER), "{}\n");
+            raced_plain_append = true;
+        }
+    });
+    assert!(
+        raced_plain_append,
+        "ordinary plain append races the inventory boundary"
+    );
+    assert_eq!(
+        full_decodes(&logs),
+        1,
+        "one funded body Full, no retry grant"
+    );
+    assert_eq!(funded.snapshots.len(), 1);
+    let mut cold_main = cold;
+    cold_main
+        .snapshots
+        .retain(|item| item.source_session_id == MAIN);
+    money_oracle::assert_equivalent(
+        &emitted(&cold_index, &cold_main),
+        &emitted(&working, &funded),
+    );
+    let (index, posts) = working.checkpoint_with_captured_posts(&funded, &before, "accept");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_quiet(&c, index, &emitted(&cold_index, &cold_main));
+    drop(session);
+}
+
+/// [regress] An unchanged compressed member never groups a different-stem
+/// plaintext rollout into a Strict hold or reads its compressed bytes again.
+#[test]
+fn different_stem_compressed_member_keeps_plain_singleton_publication() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("b"));
+    c.write(GAP, None);
+    let compressed = c.path(MAIN).with_extension("jsonl.zst");
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(c.path(MAIN)).unwrap();
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let (working, first, _, _, _) = page(
+        &c,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+    assert_eq!(posts.len(), 1);
+    let compressed_key = local_index_key(&compressed);
+    let carried = serde_json::to_value(&index.files[&compressed_key]).unwrap();
+    let plain = c
+        .sessions
+        .join(format!("rollout-2026-10-08T09-00-00-{MAIN}.jsonl"));
+    fs::write(&plain, rollout(MAIN, Some("a"))).unwrap();
+    append(&plain, &turn(3));
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let before = index.clone();
+    let decoders = codex_zst_refusal_tests::activity().0;
+    let (working, scan, _, _, logs) =
+        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+    assert_eq!(full_decodes(&logs), 0);
+    assert_eq!(
+        codex_zst_refusal_tests::activity().0,
+        decoders,
+        "unchanged compressed bytes are not read"
+    );
+    assert_eq!(
+        serde_json::to_value(&working.files[&compressed_key]).unwrap(),
+        carried
+    );
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].source_session_id, MAIN);
+    let parked = c.scratch.join("compressed-cold-control");
+    fs::rename(&compressed, &parked).unwrap();
+    let (cold_index, mut cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    fs::rename(&parked, &compressed).unwrap();
+    cold.snapshots.retain(|item| item.source_session_id == MAIN);
+    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+    assert_eq!(posts.len(), 1, "only the new plaintext usage publishes");
+    money_oracle::assert_equivalent(&emitted(&cold_index, &cold), &route(&index, &scan, posts));
+    drop(session);
 }

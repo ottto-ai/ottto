@@ -16278,7 +16278,13 @@ impl OwnedSourceScan {
                         .iter()
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
-                    inventory.complete &= selected.is_subset(&inventoried);
+                    inventory.complete &= selected.difference(&inventoried).all(|key| {
+                        let owners = codex_session_id_candidates_from_path(Path::new(key));
+                        !owners.is_empty()
+                            && owners
+                                .iter()
+                                .all(|owner| inventory.held_owners.contains(owner))
+                    });
                     let current_owners = inventory
                         .headers
                         .iter()

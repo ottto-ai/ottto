@@ -636,9 +636,11 @@ impl HeaderInventory {
                         candidate,
                     )
                 }) {
-                    // The ordinary queue owns the next attempt. Finish this
-                    // inventory as incomplete so paused readers can release credit.
-                    self.complete = false;
+                    // Funding uncertainty holds filename dependants only. An
+                    // unknown filename retains the existing wildcard fence.
+                    let owners = codex_session_id_candidates_from_path(Path::new(&key));
+                    self.complete &= codex_archive_path(Path::new(&key)) && !owners.is_empty();
+                    self.held_owners.extend(owners);
                     return false;
                 }
                 if let Some(cache) = cache {
@@ -660,7 +662,11 @@ impl HeaderInventory {
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
-        for header in &self.headers {
+        for header in self
+            .headers
+            .iter()
+            .filter(|header| !codex_archive_path(&header.candidate.path))
+        {
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)

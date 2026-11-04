@@ -2224,6 +2224,31 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
         assert!(cache.cursor_slot_free(), "{}", counters(&cache));
         assert_eq!(pending_hint(&index, &path), None, "dequeued");
     });
+    // Ordinary part of the former archive-gone fixture: a paid, paused
+    // plain Full may not publish after disappearance and refunds every claim.
+    super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+    let gone = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (index, first, modes) = page_in(
+            &gone,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "cursor-fixture",
+        );
+        assert!(first.snapshots.is_empty());
+        assert_eq!(modes.0, 1, "one paid plain Full");
+        assert!(
+            !cache.cursor_slot_free(),
+            "the Full is paused after reading"
+        );
+        fs::remove_file(gone.file(SESSION)).unwrap();
+        let (_, vanished, modes) = page_in(&gone, index, Some(cache.clone()), "cursor-fixture");
+        assert!(vanished.snapshots.is_empty(), "vanished Full emits nothing");
+        assert_eq!(modes.0, 0, "vanish does not regrant Full");
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(cache.cursor_slot_free());
+    });
 }
 
 /// A quiescent file larger than B whose last record has

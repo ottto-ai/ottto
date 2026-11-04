@@ -1319,10 +1319,12 @@ pub(in crate::snapshots) mod tests {
                 VecDeque::from([f.candidate()]),
                 true,
             );
-            let (actual_index, actual, _) = {
-                let (index, scan) = finish_selector(restart, &checkpoint.0);
-                (index, scan, ())
-            };
+            let ((actual_index, actual), funded_logs) =
+                crate::local_resource_diagnostics::capture(|| {
+                    finish_selector(restart, &checkpoint.0)
+                });
+            assert_eq!(full_decodes(&funded_logs), 1, "one ordinary funded Full");
+            assert_eq!(cache.cursor_reserved(), 0);
             assert_eq!(actual.snapshots.len(), 1);
             assert_eq!(actual.snapshots[0].input_tokens, 750);
             let (cold_index, cold, _) = run_archive(
