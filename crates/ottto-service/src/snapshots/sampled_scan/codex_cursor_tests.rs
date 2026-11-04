@@ -2302,15 +2302,31 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 now += 10;
             }
             let completed = completed.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
-            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
-            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
             assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
             if case == "malformed" {
-                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
-                assert!(unpaged.malformed_json_line_count > 0, "main reports it");
-                assert!(malformed_lines > 0, "{case}: the loss is reported");
+                assert_eq!(counter(&cache, |c| c.eof_record_applied), 0);
+                assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1);
+                assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
+                assert!(
+                    unpaged.malformed_json_line_count > 0,
+                    "compatibility reader reports it"
+                );
+                assert_eq!(
+                    malformed_lines, 0,
+                    "withheld bytes are not applied or counted"
+                );
+                let totals = |scan: &SourceScanResult| {
+                    scan.snapshots
+                        .iter()
+                        .map(|s| (s.input_tokens, s.output_tokens, s.request_count))
+                        .collect::<Vec<_>>()
+                };
+                assert!(!completed.snapshots.is_empty());
+                assert_eq!(totals(&completed), totals(&unpaged));
                 return;
             }
+            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
             assert_eq!(counter(&cache, |c| c.jobs_certified), 1, "{case}");
             assert_eq!(
                 fingerprints(&completed),

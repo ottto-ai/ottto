@@ -52278,14 +52278,7 @@ mod tests {
     fn unhealthy_generation_retries_with_backoff_while_hints_still_progress() {
         let root = temp_dir("bounded-unhealthy-retry");
         let malformed = root.join("a-malformed.jsonl");
-        fs::write(
-            &malformed,
-            concat!(
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
-                "not-json\n"
-            ),
-        )
-        .expect("write malformed fixture");
+        fs::write(&malformed, "not-json\n").expect("write malformed fixture");
         let mut index = ScanIndex::default();
         let first = scan_source_roots(
             SnapshotSource::Pi,
@@ -55163,8 +55156,8 @@ mod tests {
             index
                 .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
                 .entity_count,
-            0,
-            "the incomplete file never advances the durable manifest"
+            1,
+            "the all-bad rewrite keeps the previously admitted sibling manifest"
         );
 
         let settled = scan_source_roots(
@@ -61783,8 +61776,9 @@ mod tests {
             ),
             (7, 3)
         );
-        assert_eq!(scan.recognized_usage_drop_count, 2);
-        assert_eq!(scan.dropped_usage_record_count, 2);
+        // One conflicting response is dropped, comprising two physical rows.
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
         assert!(!index
             .confirmed_empty_files
             .contains(&local_index_key(&path)));
@@ -64267,8 +64261,8 @@ mod tests {
     fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
         let partial_key = index.files.keys().next().unwrap().clone();
-        let body = String::from_utf8(fs::read(&partial_key).unwrap()).unwrap();
-        fs::write(&partial_key, format!("{body}not valid json\n")).unwrap();
+        // All-bad replacement: a valid sibling would now be publishable.
+        fs::write(&partial_key, "not valid json\n").unwrap();
         index.activate_effective_upload_body_witness_revision(1);
         let previous = index.clone();
         let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
@@ -69114,7 +69108,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_created_thread_malformed_crash_tail_is_uncommittable_with_or_without_curve() {
+    fn codex_created_thread_malformed_crash_tail_keeps_valid_sibling_usage() {
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let turn_id = "01a03e99-5000-7000-8000-000000000001";
@@ -69155,7 +69149,17 @@ mod tests {
         );
         let parsed = parse_codex_test_with_metadata(&path, &metadata);
         assert!(!parsed.report.complete());
-        assert!(!parsed.progress_complete());
+        assert!(parsed.progress_complete());
+        assert_eq!(parsed.snapshots.len(), 1);
+        assert_eq!(
+            (
+                parsed.snapshots[0].input_tokens,
+                parsed.snapshots[0].output_tokens,
+                parsed.snapshots[0].cache_read_tokens,
+                parsed.snapshots[0].request_count
+            ),
+            (12, 2, 8, 1)
+        );
         assert_eq!(parsed.report.malformed_json_line_count, 1);
         assert_eq!(
             parsed.state_only_blocked_session_ids,

@@ -620,46 +620,10 @@ fn scan_behind_accepted_never_reemits_a_smaller_body() {
     });
 }
 
-/// Failure context for the lossy row: scan counters and every index field
-/// that names the lossy file.
-fn lossy_diag(label: &str, page: &Page, key: &str) -> String {
-    let scan = &page.scan;
-    let fields = serde_json::to_value(&page.committed)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, v)| v.to_string().contains(key))
-        .map(|(k, v)| {
-            let text = v.to_string().chars().take(1500).collect::<String>();
-            format!("{k}={text}")
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "\n[{label}] modes={:?} discovered={} scanned={} limit_skipped={} \
-         malformed={} census_complete={} emitted={:?} decode_hold={} \
-         len={:?}\n committed_entry={:?}\n after_entry={:?}\n fields={fields:?}",
-        page.modes,
-        scan.discovered_file_count,
-        scan.scanned_file_count,
-        scan.skipped_file_count_due_to_limit,
-        scan.malformed_json_line_count,
-        scan.census_complete,
-        scan.snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<Vec<_>>(),
-        page.committed.decode_holds_file(key),
-        std::fs::metadata(key).map(|m| m.len()).ok(),
-        page.committed.files.get(key),
-        page.index.files.get(key),
-    )
-}
-
-/// [money] A lossy append gets no new stored authority. Repeated reads from
-/// the last good head retain the cold Full's money and loss disclosures.
+/// [money] A bad physical record preserves valid siblings through durable
+/// Tail and later appends, matching byte-zero Full including placement.
 #[test]
-fn lossy_prefix_retains_the_previous_head_and_matches_full() {
+fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
     with_e2(|| {
         let mut c = corpus("s2-lossy-prefix");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
@@ -683,40 +647,49 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         let current = page(&c, prior, 100, true);
-        let key = path.to_str().unwrap().to_owned();
-        let mut diag = format!(
-            "cold emitted={:?}",
-            cold.snapshots.keys().collect::<Vec<_>>()
-        );
-        diag += &lossy_diag("lossy", &current, &key);
-        assert_eq!(current.modes.0, 0, "{diag}");
-        assert!(current.modes.1 > 0, "{diag}");
-        let mut held = result(&current, Mode::Restart);
-        held.accepted = previous.accepted.clone();
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
-        let prior = commit(&session, current);
-        // The lossy completion set no marker and kept the pre-append entry,
-        // so unchanged bytes would rightly skip: they reproduce the same hold.
-        // New bytes after the lossy point, seen through the watcher hint,
-        // re-select the file; the Tail continues from the retained head.
-        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
-        diag += &lossy_diag("replay", &replay, &key);
+        assert_eq!(current.modes.0, 0);
+        assert!(current.modes.1 > 0);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
         assert_eq!(
-            replay.modes.0, 0,
-            "lossy completion must leave the old head{diag}"
+            current
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            30
         );
-        assert!(
-            replay.modes.1 > 0,
-            "the old seal must replay the lossy suffix{diag}"
+        let emitted = result(&current, Mode::Restart);
+        money_oracle::assert_no_smaller_reemit(ROOT, &previous, &emitted, &cold, false);
+        let prior = commit(&session, current);
+        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
+        // A hint selects both files so complete envelopes can be compared.
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let replay = hinted(&c, prior, 100, true, &[path, sibling]);
+        assert_eq!(replay.modes.0, 0);
+        assert!(replay.modes.1 > 0);
+        assert_eq!(
+            replay
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            60
         );
-        // Nothing new is emitted: the root is held again, as in a cold Full
-        // of the same bytes, and the sibling is unchanged since the lossy
-        // page, so that page's emitted sibling body is the stored path's.
-        assert!(replay.scan.snapshots.is_empty(), "{diag}");
-        assert!(!cold.snapshots.contains_key(ROOT), "{diag}");
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
+        // The unchanged sibling is suppressed after its exact ACK. Compare
+        // the changed root using the same source bytes on each route.
+        let mut cold = cold;
+        cold.snapshots.remove(COPY);
+        for envelope in cold.normalized.as_array_mut().unwrap() {
+            envelope["snapshots"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|s| s["source_session_id"] != COPY);
+        }
+        money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
     });
 }
 

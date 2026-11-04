@@ -2781,7 +2781,8 @@ fn observed_unindexed_retry_pending_member_keeps_its_family_after_a_replay_reset
     fixture.seed_retry_pending_authority(session);
     fixture.seed_retry_pending_family_pending(session);
     // A response whose fork marker lacks its message is dropped: the file
-    // stays readable, carries usage, and parses only as residue.
+    // stays readable and parses only as residue. Replace every old valid row:
+    // mixed files now publish valid siblings.
     let invalid_fork = serde_json::json!({
         "timestamp": "2026-08-02T07:00:30Z",
         "type": "assistant",
@@ -2795,7 +2796,8 @@ fn observed_unindexed_retry_pending_member_keeps_its_family_after_a_replay_reset
         },
     });
     let mut file = std::fs::OpenOptions::new()
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(fixture.root.join(format!("{session}.jsonl")))
         .expect("open the held family's member");
     file.write_all(format!("{invalid_fork}\n").as_bytes())

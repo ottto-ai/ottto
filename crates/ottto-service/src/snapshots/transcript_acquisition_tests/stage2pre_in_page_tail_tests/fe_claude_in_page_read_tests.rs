@@ -808,59 +808,46 @@ fn claude_lossy_baseline() -> Baseline {
     base
 }
 
-/// SP-7a-c (GREEN): a lossy row in a Claude `Tail`, not grown. Main: the
-/// retention refuses (`RetentionIncompleteOrLossy`), no copy, nothing
-/// unreadable.
+/// Bad physical rows no longer block a quiescent Tail's valid siblings.
 #[test]
-fn fe_claude_sp7a_lossy_tail_not_grown_keeps_main_uncertified_path() {
+fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let base = claude_lossy_baseline();
-    let ((_, _, seen), counts) = observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
+    let ((_, result, seen), counts) =
+        observe(|| plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache));
     assert_eq!(seen.modes, (0, 1, 0));
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
-    assert_eq!(counts.retention_incomplete_or_lossy, 1);
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "no copy"
+    assert_eq!(counts.retention_incomplete_or_lossy, 0);
+    assert_eq!(result.malformed_json_line_count, 1);
+    assert!(base.cache.retained_checkpoint(&base.key).is_some());
+    assert_eq!(
+        content(production_body(CLAUDE, result)),
+        content(full_body(&base.fixture, CLAUDE))
     );
 }
 
-/// SP-7b-c (GREEN): a lossy row in `[s, frozen)` and an append after the
-/// open step. Lossy reads are excluded from H3c and follow main: one
-/// unreadable (main's `OpenRead`; with H1c, `ScopeObject` at revalidation),
-/// no checkpoint, copy or publication.
+/// A grown Tail publishes the same sealed prefix with a bad physical row;
+/// the post-open append stays owed, with no retained copy or audit credit.
 #[test]
-fn fe_claude_sp7b_lossy_grown_tail_is_excluded_and_refused() {
+fn fe_claude_sp7b_bad_record_grown_tail_keeps_valid_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let base = claude_lossy_baseline();
     let path = base.path.clone();
     let appended = row_bytes(CLAUDE, 6..8);
-    let (_, tail, seen, _) = page_injecting(
+    let (index, tail, seen, read) = page_injecting(
         &base.fixture,
         CLAUDE,
-        base.index,
+        base.index.clone(),
         &base.cache,
         is_tail,
         |_| append_raw(&path, &appended),
     );
-    assert_eq!(
-        (
-            seen.unreadable,
-            seen.causes[OPEN_READ] + seen.causes[SCOPE_OBJECT]
-        ),
-        (1, 1),
-        "SP-7b-c: one refusal; causes={:?}",
-        seen.causes
-    );
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "SP-7b-c: no checkpoint or copy"
-    );
-    assert!(tail.snapshots.is_empty(), "SP-7b-c: nothing published");
+    assert_eq!(tail.malformed_json_line_count, 1);
+    assert_prefix_published("SP-7b-c", &base, &index, tail, &seen, &read, read.frozen);
 }
 
 /// An overdue checkpoint still Tails the append without Full-audit credit.
@@ -1336,11 +1323,10 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
     }
 }
 
-/// Source loss may be discovered by response resolution only at finish,
-/// after H3c's reader/report check. Refuse the grown body rather than publish
-/// without an indexed audit marker (even if the request-census record cannot be stored).
+/// Source loss discovered during response finalization excludes that response
+/// while a grown prefix preserves every healthy response without audit credit.
 #[test]
-fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
+fn fe_claude_finalizer_response_loss_keeps_valid_grown_prefix() {
     // Resolver conflict as drop residue is gate-off only; gate on it is a disclosed `e2` conflict.
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -1370,22 +1356,27 @@ fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
     bytes.push(b'\n');
     append_raw(&base.path, &bytes);
     let path = base.path.clone();
-    let (_, result, seen, _) = page_injecting(
+    let (index, result, seen, read) = page_injecting(
         &base.fixture,
         CLAUDE,
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(base.index),
+        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(base.index.clone()),
         &base.cache,
         is_full,
         |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
     );
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &result,
-        &seen,
-        SCOPE_OBJECT,
-        "FE finalizer loss",
+    assert_eq!(seen.unreadable, 0);
+    assert_eq!(result.dropped_usage_record_count, 1);
+    assert_eq!(result.snapshots.len(), 1);
+    assert_eq!(
+        (
+            result.snapshots[0].input_tokens,
+            result.snapshots[0].output_tokens,
+            result.snapshots[0].request_count
+        ),
+        (800, 80, 5)
     );
+    assert!(base.cache.retained_checkpoint(&base.key).is_none());
+    assert_eq!(index.files[&base.key].size_bytes, read.frozen);
 }
 
 /// An ineligible Full still has a ReadPlan, but H1c never froze its reader.

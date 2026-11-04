@@ -2640,7 +2640,7 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn incomplete_native_replay_cannot_publish_a_partial_joined_replacement() {
+    fn bad_native_record_preserves_the_complete_joined_replacement() {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
@@ -2658,13 +2658,15 @@ pub(super) mod tests {
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str(&(serde_json::to_string(&bad).unwrap() + "\n"));
         fs::write(&path, text).unwrap();
-        let (after, held) = scan(&root, previous.clone(), 2);
-        assert!(held.snapshots.is_empty());
-        assert!(!held.census_complete);
-        assert_eq!(held.ownership_incomplete_file_count, 2);
+        let (_, current) = scan(&root, previous.clone(), 2);
+        let (_, cold) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(current.snapshots.len(), 1);
+        assert_eq!(current.snapshots[0].input_tokens, 300);
+        assert_eq!(current.recognized_usage_drop_count, 1);
+        assert_eq!(current.ownership_incomplete_file_count, 0);
         assert_eq!(
-            serde_json::to_value(&after.files).unwrap(),
-            serde_json::to_value(&previous.files).unwrap()
+            serde_json::to_value(&current.snapshots).unwrap(),
+            serde_json::to_value(&cold.snapshots).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }
