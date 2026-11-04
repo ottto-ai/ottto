@@ -19348,7 +19348,7 @@ impl OwnedSourceScan {
                         if tail_source::has_codec(source) {
                             let replay = if let Some(group) = active.group.as_deref() {
                                 Some((
-                                    tail_source::ReconstructCause::GroupReplay,
+                                    tail_source::counters::Replay::Group,
                                     group
                                         .consumed_before
                                         .saturating_add(active.parser.reader.consumed_bytes()),
@@ -19359,7 +19359,7 @@ impl OwnedSourceScan {
                                     .as_ref()
                                     .is_some_and(|acquisition| acquisition.tier_prefix_replay)
                                     .then_some((
-                                        tail_source::ReconstructCause::TierPrefixReplay,
+                                        tail_source::counters::Replay::TierPrefix,
                                         plan.metrics().native_bytes,
                                     ))
                             };
@@ -20251,8 +20251,8 @@ impl OwnedSourceScan {
                         twins: history_upgrade.twin_groups(),
                     }),
                 };
-                // This Claude completion's Tail write: encoded at PRE into a
-                // local buffer, published only on the native finish's verdict.
+                // This completion's Tail write: encoded at PRE into a local
+                // buffer, published only on the native finish's verdict.
                 #[cfg(unix)]
                 let tail_base = parser.take_tail_base();
                 #[cfg(unix)]
@@ -20261,7 +20261,7 @@ impl OwnedSourceScan {
                     .zip(file_sampling.as_ref())
                     .filter(|_| sampling.is_some() && !comparison_target)
                     .and_then(|(completed, active)| {
-                        // `None` off a Tail route or without a codec.
+                        // `None` off a Tail route.
                         tail_source::pending(
                             source,
                             index,

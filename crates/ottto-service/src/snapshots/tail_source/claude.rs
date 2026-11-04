@@ -10,12 +10,13 @@
 //! paths by call id) is a session fact, never read back from the file. Skill
 //! labels are stored as they are.
 use super::{
-    capability_hour, changed_files, decode_envelope, encode_envelope, fact_count, fact_pages,
-    fixed_pages, hour_pages, page_bytes, read_fact_page, read_hour_page, read_page, slot_start,
-    CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource, SESSION_FACTS,
+    changed_files, decode_envelope, encode_envelope, fixed_pages, full_log_pages, hour, log,
+    page_bytes, read_page, read_shared_page, shared_elements, shared_pages, slot, slot_start,
+    CollectionSpec, DecodedHead, HeadIdentity, ReconstructCause, TailSource, CHANGED_FILES,
+    SESSION_FACTS,
 };
 use crate::durable_tail_codec::{Durable, Refuse};
-use crate::snapshots::state_v2::{Collection, Shape as PageShape};
+use crate::snapshots::state_v2::Collection;
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
 
@@ -24,41 +25,11 @@ const LOG_G: u32 = 256;
 const COMPACTIONS_G: u32 = 64;
 
 const COLLECTIONS: [CollectionSpec; 6] = [
-    CollectionSpec {
-        collection: Collection::Responses,
-        shape: PageShape::Slot,
-        g: RESPONSES_G,
-        required: true,
-        private: false,
-    },
-    CollectionSpec {
-        collection: Collection::ToolUses,
-        shape: PageShape::Log,
-        g: LOG_G,
-        required: true,
-        private: false,
-    },
-    CollectionSpec {
-        collection: Collection::ChangedFiles,
-        shape: PageShape::Log,
-        g: LOG_G,
-        required: true,
-        private: false,
-    },
-    CollectionSpec {
-        collection: Collection::CapabilityHours,
-        shape: PageShape::Hour,
-        g: 0,
-        required: true,
-        private: false,
-    },
-    CollectionSpec {
-        collection: Collection::Compactions,
-        shape: PageShape::Slot,
-        g: COMPACTIONS_G,
-        required: true,
-        private: false,
-    },
+    slot(Collection::Responses, RESPONSES_G),
+    log(Collection::ToolUses, LOG_G),
+    CHANGED_FILES,
+    hour(Collection::CapabilityHours),
+    slot(Collection::Compactions, COMPACTIONS_G),
     SESSION_FACTS,
 ];
 
@@ -77,11 +48,8 @@ impl TailSource for Claude {
         (match collection {
             Collection::Responses => acc.claude_responses.values().len(),
             Collection::ToolUses => acc.seen_claude_capability_tool_uses.len(),
-            Collection::ChangedFiles => acc.activity_changed_file_hashes.len(),
-            Collection::CapabilityHours => acc.activity_capability_buckets.len(),
             Collection::Compactions => acc.claude_compaction_observations.len(),
-            Collection::SessionFacts => fact_count(acc),
-            _ => 0,
+            _ => shared_elements(acc, collection),
         }) as u64
     }
 
@@ -124,18 +92,18 @@ impl TailSource for Claude {
         .find_map(|(field, set)| set.then_some(field))
     }
 
+    /// The capability tool uses; the changed files as every codec's.
     fn log_keys(acc: &SnapshotAccumulator, collection: Collection) -> Vec<&String> {
         match collection {
             Collection::ToolUses => acc.seen_claude_capability_tool_uses.keys().collect(),
-            Collection::ChangedFiles => changed_files::keys(acc),
-            _ => Vec::new(),
+            _ => changed_files::keys(acc),
         }
     }
 
     fn log_page(collection: Collection, keys: &[&String]) -> Result<Vec<u8>, Refuse> {
         match collection {
-            Collection::ChangedFiles => changed_files::page(keys),
-            _ => page_bytes(keys.iter(), |id, e| id.put(e)),
+            Collection::ToolUses => page_bytes(keys.iter(), |id, e| id.put(e)),
+            _ => changed_files::page(keys),
         }
     }
 
@@ -143,7 +111,7 @@ impl TailSource for Claude {
         collection: Collection,
         bytes: &[u8],
     ) -> Result<Vec<String>, ReconstructCause> {
-        if collection == Collection::ChangedFiles {
+        if collection != Collection::ToolUses {
             return changed_files::page_keys(bytes);
         }
         let mut keys = Vec::new();
@@ -176,22 +144,13 @@ impl TailSource for Claude {
                     response.put(e)
                 })
             }
-            Collection::ToolUses => Self::log_keys(acc, collection)
-                .chunks(LOG_G as usize)
-                .enumerate()
-                .map(|(page, keys)| Ok((page as u64, Self::log_page(collection, keys)?)))
-                .collect(),
-            Collection::CapabilityHours => {
-                hour_pages(&acc.activity_capability_buckets, capability_hour)
-            }
+            Collection::ToolUses => full_log_pages::<Self>(acc, collection, LOG_G),
             Collection::Compactions => fixed_pages(
                 &acc.claude_compaction_observations,
                 COMPACTIONS_G,
                 |observation, e| observation.put(e),
             ),
-            Collection::ChangedFiles => changed_files::encode(acc),
-            Collection::SessionFacts => fact_pages(acc),
-            _ => Ok(Vec::new()),
+            _ => shared_pages::<Self>(acc, collection),
         }
     }
 
@@ -233,13 +192,6 @@ impl TailSource for Claude {
                     Some(()) => Err(ReconstructCause::Corrupt),
                 }
             }),
-            Collection::ChangedFiles => changed_files::decode(bytes, into),
-            Collection::CapabilityHours => read_hour_page(
-                page,
-                bytes,
-                &mut into.activity_capability_buckets,
-                capability_hour,
-            ),
             Collection::Compactions => {
                 let observations = &mut into.claude_compaction_observations;
                 slot_start(page, COMPACTIONS_G, observations.len())?;
@@ -248,8 +200,7 @@ impl TailSource for Claude {
                     Ok(())
                 })
             }
-            Collection::SessionFacts => read_fact_page(page, bytes, into),
-            _ => Err(ReconstructCause::Corrupt),
+            _ => read_shared_page(collection, page, bytes, into),
         }
     }
 
