@@ -208,9 +208,16 @@ fn a_conflict_owed_session_reads_native_full() {
             assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
         }
     }
-    // The conflict-owed Full counts under the existing `head_conflict` row.
+    // The conflict-owed Full counts under the existing `head_conflict` row,
+    // through the selection note the scan makes after the load.
     let _ = counts::drain("claude_code");
     let _ = loaded(&route, &path, &key);
+    route.index.note_change_reason_selected(
+        SnapshotSource::ClaudeCode,
+        &super::settlement_tests::candidate(&path),
+        Some(CandidateParseReason::ForcedFamily),
+        None,
+    );
     counts::read(
         "claude_code",
         &key,
@@ -221,6 +228,7 @@ fn a_conflict_owed_session_reads_native_full() {
     let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
     assert_eq!(page["read"]["head_conflict"]["files"], 1);
     assert_eq!(page["read"]["head_conflict"]["native_bytes"], 7);
+    assert!(page["read"].get("copy_ownership").is_none());
 }
 
 /// [money] SOURCE (b): stored state incomplete for the file never re-folds.
