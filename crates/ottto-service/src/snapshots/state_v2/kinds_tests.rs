@@ -1725,8 +1725,8 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
 
 /// [format] A previous-release store holding the six retired Codex state-only
 /// rows and both residue leaves (witness populated) loads at the current
-/// layout; its next save writes neither leaf and keeps the retired rows, and
-/// the reopened store hydrates the same model.
+/// layout; its next save writes neither leaf and removes the retired rows,
+/// and the reopened store hydrates the same model.
 #[test]
 fn retired_state_only_kinds_and_leaves_load_inert() {
     let retired = [
@@ -1816,7 +1816,7 @@ fn retired_state_only_kinds_and_leaves_load_inert() {
     }
     for (kind, _) in &retired {
         let key = mapper::key(kind, "", 0).unwrap();
-        assert!(tx.get(&key).unwrap().is_some(), "{kind} kept, never read");
+        assert!(tx.get(&key).unwrap().is_none(), "{kind} retired on save");
     }
 }
 
