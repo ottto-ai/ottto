@@ -78,10 +78,6 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
         control.presence = expected;
         control.layout = actual.layout;
         control.layout_recorded = actual.layout_recorded;
-        // Baseline enumeration consumes the hydrated ordinal inventory;
-        // both projections refer to this same committed store's windows.
-        control.account_ids = actual.account_ids.clone();
-        control.account_controls = actual.account_controls;
         let actual = kinds::baseline(&restored, &mut actual).unwrap().rows;
         let mut control_index = index.clone();
         control_index.generation += 1;

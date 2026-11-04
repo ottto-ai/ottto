@@ -16,12 +16,6 @@
 //! restart loses them: those families re-derive as `presence_only` until
 //! ordinary authorized work attests them again; nothing is inferred.
 //!
-//! The account proof binds the same revision: each member's finalized
-//! `identity_revision` must equal its current source/entity/body tuple, or the
-//! family is `evidence` until ordinary finalization catches up. A subagent's
-//! rows only gain an account from a prior witness or a family proven at a
-//! terminal page, so a fresh multi-member family stays `evidence` mid-walk.
-//!
 //! Runtime state (rotation cursor, root path counts, attestations, sticky
 //! vetoes, `first_pending_at`) is process-local, bounded and charged in
 //! `runtime_heap_bytes`; it is never persisted and never used for a decision.
@@ -94,18 +88,13 @@ pub(super) enum Incomplete {
     Quarantine,
     /// A member is this generation's non-progressing residue.
     Residue,
-    /// No valid account proof binds every member at its current revision:
-    /// missing or invalid pending, member set mismatch (a new member without
-    /// its own proof), an observed member with no index entry, an empty
-    /// (changed or re-armed) fingerprint, or an `identity_revision` that is
-    /// missing, stale or not yet finalized for the current tuple.
+    /// A member has no index entry, or an empty (changed or re-armed)
+    /// fingerprint.
     Evidence,
     /// A member's current revision has no attestation from this generation:
     /// presence (observed key, stored fingerprint) is not coverage.
     #[serde(rename = "evidence/presence_only")]
     EvidencePresenceOnly,
-    /// The account proof is old-window carry, not a current-window proof.
-    NotCurrentWindow,
     /// A member name maps to more than one path, the family has members
     /// outside its own directory, or global uniqueness is unknown.
     PathNotUnique,
@@ -711,7 +700,7 @@ struct KeyBudget {
 /// A family's keys under `prefix`.
 struct Members<'a> {
     /// Each member once, in key order: confirmed-empty files hold no requests
-    /// and are not members, as in `complete_claude_family_members`.
+    /// and are not members.
     live: Vec<&'a str>,
     /// Paths of the family, confirmed-empty ones included.
     paths: usize,
@@ -867,7 +856,7 @@ impl<'a> View<'a> {
             })
     }
 
-    /// The checks between `held` and the account proof.
+    /// The checks between `held` and the revision checks.
     fn custody(&self, family: &FamilyRef, members: &[&str]) -> Option<Incomplete> {
         if self
             .index
@@ -886,7 +875,6 @@ impl<'a> View<'a> {
     /// first-match reason. Pure: no stat, open, read or write.
     fn classify(&self, family: &FamilyRef, family_members: &Members) -> Option<Incomplete> {
         let index = self.index;
-        let traversal = self.traversal;
         let members = family_members.live.as_slice();
         if let Some(reason) = self.closure(family, members, self.vetoes) {
             return Some(reason);
@@ -899,46 +887,18 @@ impl<'a> View<'a> {
             return Some(reason);
         }
         let name_set = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
-        let proven = index
-            .claude_account_family_pending
-            .get(&family.root)
-            .filter(|pending| {
-                !pending.invalid
-                    && pending
-                        .members
-                        .keys()
-                        .map(String::as_str)
-                        .eq(name_set.iter().copied())
-                    && pending
-                        .member_requests
-                        .keys()
-                        .map(String::as_str)
-                        .eq(name_set.iter().copied())
-            });
-        // The proof must have finalized this member's current revision.
-        let revisions = members
+        // Each member's current revision: its index entry's fingerprint.
+        let Some(revisions) = members
             .iter()
-            .zip(&names)
-            .map(|(key, member)| {
-                let entry = index
+            .map(|key| {
+                index
                     .files
                     .get(*key)
-                    .filter(|entry| !entry.source_file_fingerprint.is_empty())?;
-                let finalized = proven?
-                    .member_requests
-                    .get(member)?
-                    .identity_revision
-                    .as_ref()?;
-                let current = claude_account_identity_revision(
-                    &entry.source_file_fingerprint,
-                    entry.last_snapshot_fingerprint.as_deref(),
-                    entry.last_upload_body_witness.as_deref(),
-                )?;
-                (current == *finalized).then_some(entry.source_file_fingerprint.as_str())
+                    .filter(|entry| !entry.source_file_fingerprint.is_empty())
+                    .map(|entry| entry.source_file_fingerprint.as_str())
             })
             .collect::<Option<Vec<_>>>()
-            .filter(|revisions| revisions.len() == members.len());
-        let (Some(pending), Some(revisions)) = (proven, revisions) else {
+        else {
             return Some(Incomplete::Evidence);
         };
         if !self.attested_current
@@ -948,9 +908,6 @@ impl<'a> View<'a> {
                 .all(|(key, revision)| self.attested.covers(key, revision))
         {
             return Some(Incomplete::EvidencePresenceOnly);
-        }
-        if pending.census_window_end != traversal.census_window_end {
-            return Some(Incomplete::NotCurrentWindow);
         }
         if name_set.len() != members.len()
             || self.roots.paths_of(&family.root) != u32::try_from(family_members.paths).ok()

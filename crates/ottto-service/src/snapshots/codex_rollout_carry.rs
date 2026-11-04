@@ -279,8 +279,7 @@ impl ScanIndex {
                 && !self.accepted_rebuild_incidence.contains_key(&to)
                 && !self.terminal_jsonl_dispositions.contains_key(&to)
                 && !self.v2().growth_retention.contains_key(&to)
-                && !self.confirmed_empty_files.contains(&to)
-                && !self.codex_state_only_blocked_by_file.contains_key(&to),
+                && !self.confirmed_empty_files.contains(&to),
             "codex_carry_destination_custody"
         );
         if let Some((cache, _)) = sampling {

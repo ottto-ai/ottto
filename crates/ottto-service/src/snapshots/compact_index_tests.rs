@@ -6,10 +6,8 @@ use super::lenient_decode_tests::raw_slot;
 use super::*;
 use std::io::Cursor;
 
-const WINDOW_END: &str = "2026-10-25T18:18:19Z";
-
-/// The shape that dominates a live Claude index: per-family account pending
-/// hashes and one file entry.
+/// The shape of a live Claude index: per-file entries, fingerprints and
+/// activity.
 fn synthetic_index(families: usize) -> ScanIndex {
     let mut index = ScanIndex::default();
     for n in 0..families {
@@ -26,30 +24,6 @@ fn synthetic_index(families: usize) -> ScanIndex {
             .snapshot_activity_at
             .insert(fingerprint.clone(), Some("2026-10-22T00:00:00Z".into()));
         index.accepted_snapshot_fingerprints.insert(fingerprint);
-        let hashes = (0..8)
-            .map(|request| format!("{:x}", Sha256::digest(format!("{n}:{request}").as_bytes())))
-            .collect::<BTreeSet<_>>();
-        index.claude_account_family_pending.insert(
-            root.clone(),
-            ClaudeAccountFamilyPending {
-                current: ClaudeAccountFamilyPendingWindow {
-                    version: CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
-                    census_window_end: WINDOW_END.into(),
-                    account_identifier_hash: "a".repeat(64),
-                    evidence_request_count: 8,
-                    census_complete: false,
-                    members: BTreeMap::from([(root.clone(), 8)]),
-                    member_requests: BTreeMap::from([(
-                        root,
-                        ClaudeAccountRequestSet::from_full_hashes(&hashes)
-                            .expect("synthetic hashes have distinct prefixes"),
-                    )]),
-                    invalid: false,
-                },
-                previous_windows: Default::default(),
-                confirmed_absent_members: BTreeSet::new(),
-            },
-        );
     }
     index
 }
@@ -57,10 +31,6 @@ fn synthetic_index(families: usize) -> ScanIndex {
 fn assert_same_state(actual: &ScanIndex, expected: &ScanIndex, label: &str) {
     assert_eq!(actual.generation, expected.generation, "{label}");
     assert_eq!(actual.files.len(), expected.files.len(), "{label}");
-    assert_eq!(
-        actual.claude_account_family_pending, expected.claude_account_family_pending,
-        "{label}"
-    );
     assert_eq!(
         actual.accepted_snapshot_fingerprints, expected.accepted_snapshot_fingerprints,
         "{label}"

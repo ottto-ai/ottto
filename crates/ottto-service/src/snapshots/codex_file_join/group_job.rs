@@ -91,29 +91,13 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
 }
 
 /// The settleable disclosure of one member of a refused group (outcome R).
-pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosure {
+pub(in crate::snapshots) fn refusal_disclosure() -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::HeldTerminal,
         cause: ownership::GROUP,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![owner.to_owned()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
-        parsed_snapshot_count: 0,
-        held: cursor::HeldCounts::default(),
-    }
-}
-
-/// The strict debt a parked `ProbeBudgetOrder` group discloses again
-/// (round 3): never settleable, the owner held.
-fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
-    cursor::Disclosure {
-        reason: cursor::DebtReason::ProbeBudgetOrder,
-        cause: ownership::GROUP,
-        ownership_incomplete_file_count: 0,
-        zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![owner.to_owned()],
-        diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
     }
@@ -153,7 +137,6 @@ pub(in crate::snapshots) fn disclose_members(
 /// A genuine open/read failure, line loss, receipt, owner or creator
 /// conflict: strict, exactly as before P2.
 pub(in crate::snapshots) fn disclose_strict(
-    owner: &str,
     members: &[CandidateFile],
     targets: DisclosureTargets<'_>,
 ) {
@@ -165,10 +148,6 @@ pub(in crate::snapshots) fn disclose_strict(
     targets
         .residue_index_keys
         .extend(members.iter().map(|member| local_index_key(&member.path)));
-    targets.residue_blocked_session_ids.insert(owner.to_owned());
-    targets
-        .codex_state_only_blocked_session_ids
-        .insert(owner.to_owned());
 }
 
 /// How one boot step ended.
@@ -1280,7 +1259,9 @@ pub(in crate::snapshots) fn end_group(
                                 stamp.clone(),
                             ),
                             group.dependencies.clone(),
-                            probe_order_disclosure(&group.owner),
+                            // Round 3: the strict debt a parked group
+                            // discloses again, never settleable.
+                            cursor::strict_disclosure(cursor::DebtReason::ProbeBudgetOrder),
                             reason.append_curable() && position + 1 == group.members.len(),
                         );
                     }
@@ -1295,7 +1276,7 @@ pub(in crate::snapshots) fn end_group(
             if let Some(lease) = lease {
                 cursor::end_group_lease(lease, &active);
             }
-            disclose_strict(&group.owner, &group.members, targets.reborrow());
+            disclose_strict(&group.members, targets.reborrow());
             cursor::dequeue_members(index, &group.members);
         }
         GroupEnd::Refused {
@@ -1304,7 +1285,7 @@ pub(in crate::snapshots) fn end_group(
             offset,
             at_eof,
         } => {
-            let disclosure = refusal_disclosure(&group.owner);
+            let disclosure = refusal_disclosure();
             let live_failed = position + 1 == group.members.len();
             if let Some(context) = sampling {
                 // §d.4: growth of the live member may cure this refusal, so
@@ -1380,7 +1361,7 @@ pub(in crate::snapshots) fn end_group(
             if let Some(lease) = lease {
                 lease.release();
             }
-            disclose_strict(&group.owner, &group.members, targets.reborrow());
+            disclose_strict(&group.members, targets.reborrow());
             cursor::dequeue_members(index, &group.members);
         }
     }

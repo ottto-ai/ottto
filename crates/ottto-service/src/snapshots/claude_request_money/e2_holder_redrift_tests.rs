@@ -10,7 +10,9 @@ use crate::snapshots::claude_request_census::{
 };
 use crate::snapshots::tests::complete_api_row;
 use crate::snapshots::upload_context_receipt::{EntityStamp, Receipt, RECEIPT_REPLAY_EPOCH};
-use crate::snapshots::{apply_claude_code_line, SnapshotAccumulator, SnapshotSource};
+use crate::snapshots::{
+    apply_claude_code_line, collector_version, SnapshotAccumulator, SnapshotSource,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -364,12 +366,18 @@ fn accepted_receipt(index: &mut ScanIndex, dir: &Path) {
     crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(index, &holder_key(dir));
 }
 
+/// The copy-prefix proof wait family this thread recorded.
+fn wait_counts() -> Value {
+    serde_json::to_value(take_thread_counts()).unwrap()["copy_prefix_wait"].clone()
+}
+
 /// [regress] A holder with no accepted body in any context (its census alone
 /// proves nothing): the prefix waits at most `HOLD_PASSES`, then counts,
-/// flagged. A later acceptance removes it once, on the copy's next read, and
-/// names that read in one counter.
+/// flagged, as one expired wait. A later acceptance removes it once, on the
+/// copy's next read.
 #[test]
 fn copy_keeps_prefix_flagged_until_origin_has_an_accepted_body() {
+    take_thread_counts();
     let dir = scratch();
     let path = copy_at(&dir);
     let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
@@ -383,18 +391,21 @@ fn copy_keeps_prefix_flagged_until_origin_has_an_accepted_body() {
     assert_eq!(fold(&kept).prefix.unproven_requests, 2, "flagged");
     assert_eq!(fold(&kept).prefix.hold_expired, 2);
     assert_eq!(fold(&kept).entity.totals().1, 3, "nothing counted nowhere");
+    assert_eq!(
+        wait_counts(),
+        json!({"version": collector_version(), "started": 1,
+            "expired": {"episodes": 1, "decisions": 3}})
+    );
 
     let copy_key = local_index_key(&path);
     index
         .claude_money_birth_store
         .set_money_marks(&copy_key, money_mark::DISCLOSED);
     accepted_receipt(&mut index, &dir);
-    take_diag();
     let removed = decide_pass(&mut index, &path);
     assert_eq!(fold(&removed).entity.removed_requests, 2);
     assert_eq!(fold(&removed).entity.totals().1, 1);
     assert_eq!(fold(&removed).disclosed, 0);
-    assert_eq!(take_diag().get("copy_prefix_late_origin_removed"), Some(&2));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -403,6 +414,7 @@ fn copy_keeps_prefix_flagged_until_origin_has_an_accepted_body() {
 /// pass after the origin's ACK removes it and leaves no debt.
 #[test]
 fn first_read_defers_then_removes_on_the_pass_after_the_origin_ack() {
+    take_thread_counts();
     let dir = scratch();
     let path = copy_at(&dir);
     let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
@@ -421,6 +433,10 @@ fn first_read_defers_then_removes_on_the_pass_after_the_origin_ack() {
     assert_eq!(fold(&next).prefix.held_requests, 0);
     assert_eq!(fold(&next).disclosed, 0);
     assert!(!index.claude_copy_removals.pending(file));
+    assert_eq!(
+        wait_counts()["proof"],
+        json!({"episodes": 1, "decisions": 2})
+    );
     let _ = fs::remove_dir_all(dir);
 }
 

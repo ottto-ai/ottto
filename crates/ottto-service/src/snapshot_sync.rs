@@ -4131,7 +4131,6 @@ struct SyncCounts {
     /// Residue witness cardinalities, counts only.
     census_residue_index_key_count: u64,
     census_residue_archived_rollout_count: u64,
-    census_residue_blocked_session_count: u64,
     uploaded_count: u64,
 }
 
@@ -4262,8 +4261,6 @@ impl SyncCounts {
             terminal_over_line_cap_count: scan_result.terminal_over_line_cap_count as u64,
             census_residue_index_key_count: scan_result.census_residue_index_key_count as u64,
             census_residue_archived_rollout_count: scan_result.census_residue_archived_rollout_count
-                as u64,
-            census_residue_blocked_session_count: scan_result.census_residue_blocked_session_count
                 as u64,
             uploaded_count,
         }
@@ -9838,10 +9835,19 @@ thread_local! {
 }
 
 // Test seam for the streamed-evidence equality arm: its reference keeps every
-// root's rows and folds them whole, as one pass over every root would.
+// scope root's rows and folds them whole, as one pass over every root would.
 #[cfg(test)]
 thread_local! {
     static WHOLE_CORPUS_EVIDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam for the scope's reference: the next enrichment on this thread
+// reads these roots beside the page's own, as a pass over every side-file
+// root would.
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_ROOTS: std::cell::RefCell<Option<BTreeSet<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn whole_corpus_evidence() -> bool {
@@ -9878,7 +9884,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         fallback.withhold(scan_result);
     }
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
-    let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
     let originals = scan_result
@@ -9901,6 +9906,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
+    // The named fork parents, whatever route the copy decisions take.
+    let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
+        &scan_result.snapshots,
+    );
     // `e2`: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
     crate::snapshots::claude_request_money::e2::decide_page_copies(
@@ -9929,13 +9938,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 &mut scan_result.snapshots,
                 &evidence,
             );
-            let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
                 &mut scan_result.snapshots,
                 &evidence.evidence,
                 index,
-                census_complete,
-                &census_window_end,
             );
             api_read = evidence;
         }
@@ -9951,11 +9957,37 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     });
     let telemetry_read_failed = stats.effort_evidence_load_failed;
-    let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+    // Only the page's own roots keep their rows (both root spellings, so a
+    // page family can never lose its own rows).
+    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+        .chain(scan_result.snapshots.iter().filter_map(|item| {
+            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
+        }))
+        .collect::<BTreeSet<_>>();
+    // Summed CPU/wall sub-windows of evidence_read: the scope's census walk
+    // and the cross-root summary build, and strict per-root decode. One
+    // record each per pass.
+    let mut cross_window =
+        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
+    // Side files are read for this page's scope only.
+    let scope = cross_window.time(|| {
+        crate::snapshots::claude_cross_root_evidence::EvidenceScope::of_page(
+            &scan_result.snapshots,
+            index,
+            &kept_roots,
+            fork_parents,
+            &api_read.evidence,
+        )
+    });
+    #[cfg(test)]
+    let scope = match REFERENCE_ROOTS.with(std::cell::RefCell::take) {
+        Some(roots) => crate::snapshots::claude_cross_root_evidence::EvidenceScope::every(
+            kept_roots.iter().cloned().chain(roots),
+        ),
+        None => scope,
+    };
+    let usage_roots = scope.roots().cloned().collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
@@ -10021,17 +10053,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // Release all non-paired rows before moving the selected roots into the
     // usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
-    // Only the page's own roots keep their rows (both root spellings, so a
-    // page family can never lose its own rows). Every root read adds its
-    // cross-root answers first, so the fold sees the whole corpus's answers.
-    let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
-        .into_iter()
-        .chain(scan_result.snapshots.iter().filter_map(|item| {
-            crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned)
-        }))
-        .collect::<BTreeSet<_>>();
+    // Every root read adds its cross-root answers first, so the fold sees
+    // the scope's answers.
     let mut cross = crate::snapshots::claude_cross_root_evidence::CrossRootEvidence::new(
         &scan_result.snapshots,
+        scope,
     );
     let mut whole_corpus = whole_corpus_evidence().then(crate::snapshots::ClaudeVetoApiRows::new);
     // Context scalars only: API rows of roots without a sidecar pair still
@@ -10062,12 +10088,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     let mut trace_discarded_roots = BTreeSet::new();
-    // Summed CPU/wall sub-windows of evidence_read: strict per-root decode and
-    // the cross-root summary build. One record each per pass.
     let mut decode_window =
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
-    let mut cross_window =
-        crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_cross_root");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
         let (mut api, mut trace) = decode_window.time(|| {
@@ -10226,7 +10248,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_unhealthy_roots,
         );
         let evidence = match &whole_corpus {
-            Some(_) => evidence,
+            Some(_) => evidence.with_scope(&cross),
             None => evidence.with_cross_root(&cross),
         };
         evidence
@@ -12079,9 +12101,6 @@ fn collector_status_request(
         last_census_residue_archived_rollout_count: status
             .counts
             .census_residue_archived_rollout_count,
-        last_census_residue_blocked_session_count: status
-            .counts
-            .census_residue_blocked_session_count,
         last_census_pending_file_count: Some(status.counts.skipped_file_count_due_to_limit),
         last_census_block_cause: block_cause,
         consecutive_failures,
@@ -12490,7 +12509,6 @@ fn report_checkin_status(
         last_census_residue_settled: false,
         last_census_residue_index_key_count: 0,
         last_census_residue_archived_rollout_count: 0,
-        last_census_residue_blocked_session_count: 0,
         last_census_pending_file_count: None,
         last_census_block_cause: None,
         consecutive_failures: 0,
@@ -20495,7 +20513,6 @@ mod tests {
         counts.terminal_dropped_usage_record_count = 1_105;
         counts.census_residue_index_key_count = 1;
         counts.census_residue_archived_rollout_count = 1;
-        counts.census_residue_blocked_session_count = 1;
         counts
     }
 
@@ -20657,9 +20674,11 @@ mod tests {
         assert_eq!(receipt["last_census_residue_settled"], true);
         assert_eq!(receipt["last_census_residue_index_key_count"], 1);
         assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
-        assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
+        assert!(receipt
+            .get("last_census_residue_blocked_session_count")
+            .is_none());
         // Counts only. The backend refuses a path-shaped message outright,
-        // and the witness's index keys and session ids never leave the index.
+        // and the witness's index keys never leave the index.
         let message = receipt["last_error_message"].as_str().expect("message");
         for fragment in [
             "/",
@@ -20998,7 +21017,6 @@ mod tests {
             assert_eq!(receipt["last_terminal_dropped_usage_record_count"], 1_105);
             assert_eq!(receipt["last_census_residue_index_key_count"], 1);
             assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
-            assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
         }
     }
 
@@ -21652,9 +21670,10 @@ mod tests {
 
         let mut index =
             ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-1".to_string(), "a".repeat(64));
+        index.file_snapshot_fingerprints.insert(
+            "/tmp/rollout-session-1.jsonl".to_string(),
+            BTreeSet::from(["a".repeat(64)]),
+        );
         index
             .snapshot_activity_at
             .insert("a".repeat(64), Some("2099-12-31T12:00:00Z".to_string()));
@@ -22702,6 +22721,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_telemetry_retention_tests {
             include!("snapshot_sync/claude_telemetry_retention_tests.rs");
+        }
+        mod scoped_cross_root_tests {
+            include!("snapshot_sync/scoped_cross_root_tests.rs");
         }
     }
     mod p12_pipeline_original_tests {

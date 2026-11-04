@@ -92,8 +92,7 @@ pub(super) fn hydrate_context(store: &mut sqlite::Sqlite) -> Result<(ScanIndex, 
 /// semantic delta under the resident committed context. Emit the complete
 /// dirty delta with per-key SQLite header reads. Saves above 5k rows /
 /// 32 MiB reduce the next collection page; above 256 MiB, charged work alarms
-/// without refusing the save. More than 64 account windows is an alarm, never permission
-/// to drop unsettled custody. KEEP persisted shared refs: decode only each
+/// without refusing the save. KEEP persisted shared refs: decode only each
 /// changed row's old refs, diff against new refs, adjust/reclaim in this
 /// transaction. Never perform whole-history GC during a save.
 pub(super) fn save(
@@ -102,7 +101,6 @@ pub(super) fn save(
     previous: kinds::Baseline,
     next: &mut ScanIndex,
     cx: &mut KindCx,
-    claim_only: bool,
 ) -> Result<kinds::Baseline> {
     {
         let mut tx = db.begin(TxnMode::Read)?;
@@ -113,11 +111,7 @@ pub(super) fn save(
         next,
         super::super::sampled_scan::now_seconds(),
     );
-    if !claim_only {
-        next.retire_committed_claude_account_pending_windows();
-    }
     super::super::lenient_decode::check_held_output(next)?;
-    cx.compact_allowance = (!claim_only).then_some(128);
     kinds::save_graph(db, identity, previous, next, cx)
 }
 
@@ -1131,8 +1125,7 @@ mod application_cases {
                 super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
                     .unwrap()
             );
-            // Loads keep account archives cold; compare the bytes the store holds.
-            let saved = super::super::runtime::materialized(&current);
+            let saved = serde_json::to_vec(&current).unwrap();
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
                 .0
@@ -1140,10 +1133,7 @@ mod application_cases {
             assert_eq!(reloaded.generation, 2);
             assert_eq!(serde_json::to_vec(&reloaded.traversal).unwrap(), wide);
             // Every other row, money and placement included, reopens unchanged.
-            assert_eq!(
-                serde_json::to_vec(&super::super::runtime::materialized(&reloaded)).unwrap(),
-                serde_json::to_vec(&saved).unwrap()
-            );
+            assert_eq!(serde_json::to_vec(&reloaded).unwrap(), saved);
             assert_eq!(fs::read(&progress_path).unwrap(), progress);
             // An older build's 16 MiB decode bound refuses the widened row
             // rather than reading a narrower value: it holds until upgrade.
@@ -1494,7 +1484,7 @@ mod application_cases {
         index
             .decode_holds
             .v2_insert(
-                "claude_account_family_pending",
+                "claude_usage_family_witnesses",
                 "synthetic-raw".into(),
                 br#"{ "retry_after_unix_seconds": "bad", "text": "\u0061" }"#.to_vec(),
                 None,

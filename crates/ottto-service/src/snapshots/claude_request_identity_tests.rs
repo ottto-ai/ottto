@@ -3092,16 +3092,9 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
             complete_trace_row(ROOT, "req_2", ""),
         ],
     );
-    let mut index =
-        crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
+    let index = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     let mut enriched = vec![item];
-    apply_claude_effort_evidence_with_index(
-        &mut enriched,
-        &api.evidence,
-        &mut index,
-        false,
-        &stamp(now),
-    );
+    apply_claude_effort_evidence_with_index(&mut enriched, &api.evidence, &index);
     assert_eq!(
         enriched[0]
             .session_account_evidence

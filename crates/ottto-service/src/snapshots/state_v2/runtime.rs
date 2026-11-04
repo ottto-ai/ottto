@@ -347,13 +347,7 @@ fn load_with_custody(
                                 Ok((db.stamp()? == stamp).then_some(stamp))
                             },
                         )?;
-                        if let Some((mut index, mut cx, digests, _)) = image {
-                            // Same session and stamp: rollovers its commits
-                            // wrote stay committed for graphs that outlive
-                            // this load.
-                            if !session.cx.ambiguous {
-                                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
-                            }
+                        if let Some((mut index, cx, digests, _)) = image {
                             session.cx = cx;
                             adopt(state, digests, &session.cx);
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
@@ -635,9 +629,6 @@ pub(in super::super) fn save_locked(
                 let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
-                // Committed rollovers outlive the dropped baseline: a sibling
-                // graph saved after a claim-only save still skips them.
-                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                 session.cx = cx;
                 digests
             }
@@ -648,14 +639,7 @@ pub(in super::super) fn save_locked(
         }
         recovered_write(path, progress_owner, &id, session, |session| {
             session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
-            let saved = import::save(
-                &mut session.db,
-                &id,
-                previous,
-                index,
-                &mut session.cx,
-                claim_only,
-            );
+            let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
             // A commit published the stage; otherwise it waits for the next
             // save or the exit commit.
             if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
@@ -1236,7 +1220,7 @@ fn read_txn_at<R>(
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::{erase_published, materialized, with_session_db};
+pub(in super::super) use tests::{erase_published, with_session_db};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]

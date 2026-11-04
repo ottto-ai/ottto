@@ -172,7 +172,7 @@ impl Fixture {
     }
     /// The walk's observations commit with the next full save; reload them.
     pub(in crate::snapshots) fn save(&mut self) {
-        self.index = self.session.save_reload(&mut self.index).0;
+        self.index = self.session.save_reload(&mut self.index);
     }
     pub(in crate::snapshots) fn close(self) {
         let Self {
