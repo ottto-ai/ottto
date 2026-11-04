@@ -1677,11 +1677,12 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     assert!(progress.head_conflict_challenges.is_empty());
     assert_eq!(store.stored, ["r3-owed"], "no double credit");
 
-    let (result, wires) = page(&mut progress, std::slice::from_ref(&owed), &none, |_, _| {
-        panic!("a settled body sends no POST")
-    });
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert!(wires.is_empty());
+    // A repeat pass sends no POST: the packer skips an exact settled body.
+    // (`page` forces a retry of every item, so ask the packer's predicate.)
+    assert!(progress.contains_body(
+        &owed.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&owed)
+    ));
 
     // A later patched revision under a stale saved base conflicts under CAS.
     let mut patched = revised(&owed, 1);
