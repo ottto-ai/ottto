@@ -1479,8 +1479,9 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
         serde_json::to_vec(&run(true)).unwrap(),
         serde_json::to_vec(&clean).unwrap()
     );
-    // Positive control: two accounts placed, usage tokens and the typed
-    // birth store present.
+    // Positive control: two accounts placed and the typed birth store
+    // present. The fixture's usage-pending rows are a retired kind and load
+    // as nothing.
     let accounts: BTreeSet<_> = clean.claude_account_family_pending["family"]
         .previous_windows
         .resident()
@@ -1490,12 +1491,7 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
         .collect();
     assert_eq!(accounts.len(), 2);
     let value = serde_json::to_value(&clean).unwrap();
-    assert!(
-        value["claude_usage_family_pending"]["synthetic-family"]["member_occurrences"]
-            ["synthetic-file"]
-            .as_object()
-            .is_some_and(|occurrences| !occurrences.is_empty())
-    );
+    assert!(value.get("claude_usage_family_pending").is_none());
     let birth = serde_json::to_vec(&clean.claude_money_birth_store).unwrap();
     assert!((1024 * 1024..4 * 1024 * 1024).contains(&birth.len()));
     assert_eq!(
