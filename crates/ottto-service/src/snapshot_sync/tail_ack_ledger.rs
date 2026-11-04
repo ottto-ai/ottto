@@ -72,7 +72,7 @@ impl AckLedger {
     }
 
     /// Actual progress persistence across a fixture's crash after ACK.
-    pub(crate) fn save(&self, path: &Path) {
+    pub(crate) fn save(&mut self, path: &Path) {
         self.progress.save(path).unwrap();
     }
     pub(crate) fn reopen(&mut self, source: SnapshotSource, path: &Path) {

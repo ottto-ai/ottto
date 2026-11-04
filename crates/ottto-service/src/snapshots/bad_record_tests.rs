@@ -730,6 +730,53 @@ fn codex_occurrences() {
             &emitted::<Codex>(Mode::Restart, &route, &restored.snapshots),
         );
     }
+    // A login/creator switch between cumulative records keeps native placement
+    // rules: a contradictory creator clears the session witness, not money.
+    let mut initial: Value = serde_json::from_str(&codex_lines(1)[0]).unwrap();
+    initial["payload"]["creator_user_id"] = json!("synthetic-user-a");
+    initial["payload"]["creator_account_id"] = json!("synthetic-workspace-a");
+    let mut switched = initial.clone();
+    switched["timestamp"] = json!("2026-10-18T11:30:00Z");
+    switched["payload"]["creator_user_id"] = json!("synthetic-user-b");
+    switched["payload"]["creator_account_id"] = json!("synthetic-workspace-b");
+    let rows = vec![
+        initial.to_string(),
+        event(10, json!(100), None),
+        event(11, json!("invalid"), None),
+        switched.to_string(),
+        event(12, json!(200), None),
+    ];
+    write(&path, &rows);
+    let (_, switched) = full::<Codex>(&route, &path);
+    assert_eq!(switched.snapshots[0].input_tokens, 200);
+    assert!(switched.snapshots[0].session_account_evidence.is_none());
+    let usage = |input| json!({"input_tokens":input,"output_tokens":2,"total_tokens":input+2});
+    let native = |id, total, input: Value| {
+        json!({"type":"token_usage_record",
+        "timestamp":"2026-10-18T10:00:00Z","payload":{
+            "thread_id":"019a0c2a-8e11-7222-8333-944445555777","turn_id":id,
+            "response_id":id,"usage":{"input_tokens":input,"output_tokens":2},
+            "thread_token_usage":usage(total)}})
+        .to_string()
+    };
+    let rows = vec![
+        codex_lines(1)[0].clone(),
+        native("n1", 10, json!(10)),
+        native("bad", 20, json!("invalid")),
+        native("n2", 30, json!(10)),
+    ];
+    write(&path, &rows);
+    let (_, native) = full::<Codex>(&route, &path);
+    assert!(native.progress_complete());
+    assert_eq!(
+        (
+            native.snapshots[0].input_tokens,
+            native.snapshots[0].output_tokens,
+            native.snapshots[0].request_count
+        ),
+        (20, 4, 2)
+    );
+    assert!(native.recognized_usage_drop_count > 0);
 }
 
 // O4: a progressive response is finalized once. A conflicting response stays
