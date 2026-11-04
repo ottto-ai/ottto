@@ -10059,8 +10059,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         "claude_code",
         "claude_local_evidence",
     );
-    let read_window =
+    let mut read_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
+    let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -10088,6 +10089,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    evidence_mem.sample(0);
     #[cfg(test)]
     E2_AFTER_API_ATTACH.with(|hook| {
         if let Some(after_attach) = hook.borrow_mut().take() {
@@ -10317,6 +10319,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         let api_rows = api.evidence.remove(&root_session_id);
         let trace_rows = trace.evidence.remove(&root_session_id);
         let keep = whole_corpus.is_some() || kept_roots.contains(&root_session_id);
+        evidence_mem.note_root(
+            api_rows.as_ref().map_or(0, Vec::len) + trace_rows.as_ref().map_or(0, Vec::len),
+            keep,
+        );
         if !keep && (api_rows.is_some() || trace_rows.is_some()) {
             cross.note_unkept(&root_session_id, generation);
         }
@@ -10333,9 +10339,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             }
         }
     }
+    evidence_mem.kept_rows = api_report.evidence.values().map(Vec::len).sum::<usize>()
+        + trace_report.evidence.values().map(Vec::len).sum::<usize>();
+    evidence_mem.legacy_owners = cross.legacy_request_owners.owner_count();
+    evidence_mem.sample(1);
     cross_window.time(|| cross.finish());
     drop(decode_window);
     drop(cross_window);
+    evidence_mem.sample(2);
+    read_window.set_evidence_mem(evidence_mem);
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
