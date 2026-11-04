@@ -3996,6 +3996,13 @@ pub struct ScanIndex {
     /// leases additionally have claims saved in both checkpoints before scanning.
     #[serde(skip)]
     terminal_contract_retries: BTreeMap<String, String>,
+    /// Runtime-only hashed session keys (`cache_session_key`) with an open
+    /// head-CAS challenge, mirrored from the upload ledger when the cycle's
+    /// upload context activates. Never persisted. Such a session's answer
+    /// rides only a native Full, so its files never continue from Tail state;
+    /// removed once the server takes a typed basis for stored reuse.
+    #[serde(skip)]
+    head_conflict_sessions: BTreeSet<String>,
     #[serde(skip)]
     pub(crate) refusal_exposure: crate::local_resource_diagnostics::RefusalExposure,
     /// Runtime-only: this index's path was loaded in this process with no
@@ -4405,6 +4412,7 @@ impl Default for ScanIndex {
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
             terminal_contract_retries: BTreeMap::new(),
+            head_conflict_sessions: BTreeSet::new(),
             refusal_exposure: Default::default(),
             claude_history_unverified_in_process: false,
             claude_rebuild_read_load_eligible: false,
@@ -20870,25 +20878,11 @@ impl SnapshotAccumulator {
         )
     }
 
-    fn into_items_with_repository_identity(
-        mut self,
-        path: &Path,
-        collected_at: &str,
-        source_file_fingerprint: String,
-        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-        measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
-        emit_empty_pi_fork: bool,
-    ) -> Vec<SnapshotItem> {
-        // Defence in depth: the scan already refuses to collect the Workflow
-        // journal, but the parse entry points are public, so nothing downstream
-        // may mint a `<parentSessionId>_journal` session either.
-        if self.source == SnapshotSource::ClaudeCode
-            && claude_transcript_excluded_from_snapshots(path)
-        {
-            return Vec::new();
-        }
-        let Some(source_session_id) = self
-            .source_session_id
+    /// The file's first in-file session id, before the wire rule: the parsed
+    /// id, else (Codex) the identity bound for this exact file, else the
+    /// file stem.
+    fn raw_source_session_id(&self, path: &Path) -> Option<String> {
+        self.source_session_id
             .clone()
             .or_else(|| {
                 (self.source == SnapshotSource::Codex)
@@ -20909,7 +20903,32 @@ impl SnapshotAccumulator {
                     .and_then(|value| value.to_str())
                     .map(|value| value.to_string())
             })
-        else {
+    }
+
+    /// The `source_session_id` this state's items carry on the wire.
+    pub(in crate::snapshots) fn wire_source_session_id(&self, path: &Path) -> Option<String> {
+        self.raw_source_session_id(path)
+            .map(|id| snapshot_source_session_id(self.source, path, id))
+    }
+
+    fn into_items_with_repository_identity(
+        mut self,
+        path: &Path,
+        collected_at: &str,
+        source_file_fingerprint: String,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+        emit_empty_pi_fork: bool,
+    ) -> Vec<SnapshotItem> {
+        // Defence in depth: the scan already refuses to collect the Workflow
+        // journal, but the parse entry points are public, so nothing downstream
+        // may mint a `<parentSessionId>_journal` session either.
+        if self.source == SnapshotSource::ClaudeCode
+            && claude_transcript_excluded_from_snapshots(path)
+        {
+            return Vec::new();
+        }
+        let Some(source_session_id) = self.raw_source_session_id(path) else {
             return Vec::new();
         };
         let source_session_id = if self.source == SnapshotSource::Codex {
@@ -49489,6 +49508,16 @@ impl ScanIndex {
             .collect()
     }
 
+    /// Mirror the upload ledger's open head-CAS challenge sessions.
+    pub(crate) fn activate_head_conflict_sessions(&mut self, sessions: BTreeSet<String>) {
+        self.head_conflict_sessions = sessions;
+    }
+
+    /// The hashed session key owes a head-CAS answer this cycle.
+    pub(crate) fn head_conflict_owed(&self, session_key: &str) -> bool {
+        self.head_conflict_sessions.contains(session_key)
+    }
+
     /// A leased file still queued for a bounded page has not reached a hold.
     pub(crate) fn quarantine_retry_is_queued(&self, fingerprint: &str) -> bool {
         self.terminal_contract_retries
@@ -51937,6 +51966,7 @@ impl ScanIndex {
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
             terminal_contract_retries: self.terminal_contract_retries.clone(),
+            head_conflict_sessions: self.head_conflict_sessions.clone(),
             refusal_exposure: self.refusal_exposure,
             claude_history_unverified_in_process: self.claude_history_unverified_in_process,
             claude_rebuild_read_load_eligible: self.claude_rebuild_read_load_eligible,

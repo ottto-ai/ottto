@@ -1372,6 +1372,44 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     );
 }
 
+/// After a restart, the first real ordinary prepare mirrors an open head-CAS
+/// challenge from the persisted upload ledger into the scan index, so the
+/// session's files read a native Full; another session is not mirrored.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
+    if !supported("a_restarted_ordinary_prepare_mirrors_an_open_head_conflict") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("retry-gate-restart", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = cache_session_key(IDENTITY_PIPELINE_ROOT);
+    let mut progress = first.progress.clone();
+    progress.head_conflict_challenges.insert(
+        key.clone(),
+        HeadConflictChallenge {
+            challenge: "c".repeat(64),
+            stale_revision_v2_hash: "d".repeat(64),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+    progress.save(&first.progress_path).unwrap();
+    pipeline.daemon = test_daemon("otm_test");
+    let preparation = pipeline
+        .prepare_cycle(t0 + 600)
+        .unwrap()
+        .expect("real due preparation");
+    assert!(preparation.committed_index.head_conflict_owed(&key));
+    assert!(!preparation
+        .committed_index
+        .head_conflict_owed(&cache_session_key("synthetic-other-session")));
+}
+
 /// A protected root, named by the local
 /// re-emission list, whose family a census retired as absent (tombstoned,
 /// witness kept) and whose member then returns, through the real

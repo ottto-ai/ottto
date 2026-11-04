@@ -2522,11 +2522,12 @@ fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
 
 /// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS
 /// conflict with a challenge is recorded on a production-shaped Claude body.
-/// Then (a) a 0-new-byte late-evidence selection never re-folds: every arm
-/// reads a native Full, equal to the cold Full, and that Full answers; and
-/// (b) an append continues from the saved head (a counted `hit`: identity,
-/// certificate and offset match the bytes already read), byte-equal to the
-/// cold Full and the RAM arm, and its body carries the answer.
+/// While the answer is owed (the ledger's challenge mirrored into the scan
+/// index, as each prepare does), no read continues from stored state: (a) a
+/// 0-new-byte late-evidence selection and (b) an append read a native Full,
+/// with no saved-head hit, equal to the cold Full, and that Full carries the
+/// answer. The append's Full holds the route's six-hour growth claim, so a
+/// second owner on the same route defers.
 #[test]
 fn conflict_then_append() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2588,7 +2589,7 @@ fn conflict_then_append() {
             SnapshotQuarantineDisposition::RetryPending
         );
         settle_index_after_upload(&mut refused.index, &refused.committed, &progress);
-        let prior = disk.commit(
+        let mut prior = disk.commit(
             &refused.cache,
             SnapshotSource::ClaudeCode,
             &mut refused.index,
@@ -2596,6 +2597,9 @@ fn conflict_then_append() {
         assert!(prior
             .quarantined_snapshot_fingerprints
             .contains_key(&fingerprint));
+        prior.activate_head_conflict_sessions(
+            progress.head_conflict_challenges.keys().cloned().collect(),
+        );
 
         // (a) 0 new bytes, late evidence: no arm re-folds; the answer is a Full.
         let late = [
@@ -2611,7 +2615,7 @@ fn conflict_then_append() {
         compare_claude_uploads(&pages);
         answers(&pages[2], &progress, &challenge);
 
-        // (b) An append continues from the saved head and carries the answer.
+        // (b) An append of the conflicted session reads Full and answers.
         append(&path, &line(ROOT, "r3", AT, 30));
         input_clock(&path);
         c.evidence(
@@ -2624,22 +2628,24 @@ fn conflict_then_append() {
             &[],
         );
         let (mut pages, disk_hits) = arms(&c, &warm, &mut disk, &prior);
-        assert_eq!(
-            pages[0].modes,
-            (0, 1, 0),
-            "the RAM arm continues the append"
-        );
-        assert_eq!(
-            pages[2].modes,
-            (0, 1, 0),
-            "the restored arm continues the append"
-        );
-        assert!(
-            disk_hits > 0,
-            "the saved head matches the bytes already read"
-        );
+        assert_eq!(pages[0].modes, (1, 0, 0), "the RAM arm reads Full");
+        assert_eq!(disk_hits, 0, "an owed answer never continues the head");
+        // A grown file read Full takes the route's durable six-hour growth
+        // claim. The RAM arm took it on the shared route, so the new owner's
+        // growth Full of the same key defers and sends nothing.
+        assert_eq!(pages[2].modes, (0, 0, 0), "the new owner defers");
         finish_claude_pages(&c, &mut pages);
-        compare_claude_uploads(&pages);
-        answers(&pages[2], &progress, &challenge);
+        assert!(pages[2]
+            .scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != ROOT));
+        let (a, wire_a, _) = upload(&pages[0].scan.snapshots, &mut e2_progress(), ack);
+        let (b, wire_b, _) = upload(&pages[1].scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(b.unwrap(), ResumableUploadResult::Completed);
+        assert!(!wire_a.is_empty(), "fixture must reach real upload");
+        assert_eq!(wire_a, wire_b, "the RAM arm's Full equals the cold Full");
+        answers(&pages[0], &progress, &challenge);
     });
 }
