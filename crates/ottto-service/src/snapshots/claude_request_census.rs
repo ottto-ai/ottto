@@ -36,36 +36,21 @@ use std::sync::Arc;
 // Reloading a held record does not enter it again; a lost/over-budget record
 // is not a successful clearance. No persisted or uploaded bookkeeping.
 // Slots: entered, cleared, audit deadline restored (option B).
-#[cfg(not(test))]
-static IDENTITY_INCOMPLETE_HOLDS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-#[cfg(test)]
-thread_local! {
-    static IDENTITY_INCOMPLETE_HOLDS: [std::cell::Cell<u64>; 3] = const {
-        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
-    };
-}
+crate::local_resource_diagnostics::process_static!(fn with_identity_incomplete_holds:
+    [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3]);
 
 fn add_identity_incomplete_hold_total(slot: usize, count: u64) {
-    #[cfg(not(test))]
-    let _ = IDENTITY_INCOMPLETE_HOLDS[slot].fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |total| Some(total.saturating_add(count)),
-    );
-    #[cfg(test)]
-    IDENTITY_INCOMPLETE_HOLDS.with(|totals| {
-        totals[slot].set(totals[slot].get().saturating_add(count));
+    with_identity_incomplete_holds(|totals| {
+        let _ = totals[slot].fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(count)),
+        );
     });
 }
 
 fn identity_incomplete_hold_total(slot: usize) -> u64 {
-    #[cfg(not(test))]
-    {
-        IDENTITY_INCOMPLETE_HOLDS[slot].load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    IDENTITY_INCOMPLETE_HOLDS.with(|totals| totals[slot].get())
+    with_identity_incomplete_holds(|totals| totals[slot].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn note_identity_incomplete_hold(entered: bool, cleared: bool) {
@@ -994,7 +979,7 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(FAMILY_WALK) {
             return None;
         }
-        self.walk_transcript_holders(deadline, |_, member, record| {
+        Self::walk_transcript_holders(self.records(), deadline, |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
                 return;
             };
@@ -1010,14 +995,16 @@ impl ClaudeRequestCensus {
         Some(found)
     }
 
-    /// `e2` copy decisions, once per page: every MAIN transcript record (never
-    /// a subagent) holding some of the sorted unique `wanted` hashes, with
-    /// its key, session and the hashes it holds. The caller decides whether
-    /// the record proves anything (current revision, other session, earlier
-    /// birth). The same walk as `family_transcript_holders`, across
-    /// families. None when `deadline` passes: the caller cannot decide.
+    /// `e2` copy decisions, once per folder per page: every MAIN transcript
+    /// record (never a subagent) directly in `folder` (an index key) holding
+    /// some of the sorted unique `wanted` hashes, with its key, session and
+    /// the hashes it holds. The caller decides whether the record proves
+    /// anything (current revision, other session, earlier birth). The same
+    /// walk as `family_transcript_holders`, over the folder's key range only.
+    /// None when `deadline` passes: the caller cannot decide.
     pub(crate) fn main_transcript_holders<'a>(
         &'a self,
+        folder: &str,
         wanted: &[u64],
         deadline: std::time::Instant,
         mut visit: impl FnMut(&'a str, &'a str, &'a ClaudeRequestCensusRecord, &[u64]),
@@ -1029,8 +1016,19 @@ impl ClaudeRequestCensus {
         if walk_deadline_forced(MAIN_WALK) {
             return None;
         }
+        let prefix = format!("{folder}{}", std::path::MAIN_SEPARATOR);
+        let children = self
+            .records
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .filter(|(key, record)| {
+                !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR) && !record.is_birth_stub()
+            });
         let mut hits = Vec::new();
-        self.walk_transcript_holders(deadline, |key, member, record| {
+        Self::walk_transcript_holders(children, deadline, |key, member, record| {
             if member.subagent_stem.is_some() {
                 return;
             }
@@ -1042,10 +1040,10 @@ impl ClaudeRequestCensus {
         })
     }
 
-    /// One walk of the transcript records (a borrowed path parse per key).
+    /// One walk of `records` (a borrowed path parse per key).
     /// None when `deadline` passes (checked every 256 records).
     fn walk_transcript_holders<'a>(
-        &'a self,
+        records: impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)>,
         deadline: std::time::Instant,
         mut visit: impl FnMut(
             &'a str,
@@ -1053,7 +1051,7 @@ impl ClaudeRequestCensus {
             &'a ClaudeRequestCensusRecord,
         ),
     ) -> Option<()> {
-        for (position, (key, record)) in self.records().enumerate() {
+        for (position, (key, record)) in records.enumerate() {
             if position % 256 == 255 && std::time::Instant::now() >= deadline {
                 return None;
             }
@@ -2523,26 +2521,7 @@ impl<'de> Visitor<'de> for LooseVisitor {
     }
 }
 
-struct LowerHex<'a>(&'a [u8]);
-impl fmt::Display for LowerHex<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut text = [0_u8; 64];
-        for chunk in self.0.chunks(32) {
-            for (slot, byte) in text.chunks_exact_mut(2).zip(chunk) {
-                slot[0] = DIGITS[usize::from(byte >> 4)];
-                slot[1] = DIGITS[usize::from(byte & 15)];
-            }
-            f.write_str(std::str::from_utf8(&text[..chunk.len() * 2]).map_err(|_| fmt::Error)?)?;
-        }
-        Ok(())
-    }
-}
-impl Serialize for LowerHex<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
+use crate::hex::LowerHex;
 
 /// Base64 (standard, padded) of the big-endian bytes of each hash, streamed
 /// three hashes (24 bytes, 32 characters) at a time without a whole buffer.

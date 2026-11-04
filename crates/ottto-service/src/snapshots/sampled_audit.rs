@@ -2378,8 +2378,7 @@ pub(super) fn expired_growth_claims(
         })
         .collect();
     if !due.is_empty() {
-        let counts = serde_json::json!({"keys": due.len(), "oldest_expired_secs": oldest});
-        crate::local_resource_diagnostics::traversal_point("hold_wake", source.api_slug(), &counts);
+        crate::local_resource_diagnostics::hold_wake(source.api_slug(), due.len() as u64, oldest);
     }
     due
 }

@@ -150,13 +150,13 @@ process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
 Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
-`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
-capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
-record right after `native_collection_page`; `context_composition_read` carries
-them inline. 16 MiB is only a release point: a completed record above it
-frees its line buffer; byte targets yield between records. The counts-only
-`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
-on consecutive native pages, without changing reading or retries.
+`max_line_bytes` and `max_line_buffer_bytes` (line-buffer capacity, not RSS or
+an upper bound) go in their own `native_collection_jsonl_lines` record right
+after `native_collection_page`; `context_composition_read` carries them inline.
+16 MiB is only a release point: a completed record above it frees its line
+buffer; byte targets yield between records. The former `lines_over_16_mib`
+count and `jsonl_repeat_parse_failure_alarm` are retired; malformed/UTF-8 lines
+stay counted by the existing read report.
 
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
@@ -388,17 +388,14 @@ they reset at process start and never decide anything.
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
 | `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is neither in `tail_reconstruct_after_head` nor alarmed. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is not in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
 | `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
-| `tail_refold{reason}` | A file selected for late evidence on an unchanged transcript (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) re-folded from stored state with 0 transcript bytes, and its body was not the ACKed one: sent as an ordinary update on the head CAS, the body a native read sends. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead. |
+| `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
 | `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
-
-`tail_restart_full_alarm` is emitted on the first reconstruction after a head,
-then at most once per 24 h; the time is RAM only, so a restart alarms again.
 
 `tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
 directory beside a scan index. Each pass removes the record directory alone
@@ -415,7 +412,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | Old | New or retired |
 |---|---|
 | `store_write_failed_restart_full[files,bytes]` (upper bound) | `tail_reconstruct`, `tail_reconstruct_bytes`, `tail_reconstruct_after_head` (exact) |
-| `durable_tail_restart_full_alarm` | `tail_restart_full_alarm` |
+| `durable_tail_restart_full_alarm` | retired: `tail_reconstruct_after_head` counts each case |
 | `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
 | `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
@@ -598,10 +595,14 @@ observations are retired with whole-file refusal. `last_oversized_file_count`
 remains on the wire and emits zero. Saved refusal debt stays decodable and is
 cleared after load through the ordinary save path.
 
-The `local_resources` stage `file_size` reports the process high-water
-`largest_file_bytes` per source, with `file_over_1gib` on that same record.
-`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
-and existing footprint observations through native finish. Existing
+`native_collection_page` carries nonzero page scalars `largest_file_bytes`
+(the largest file listed or read since the source's previous page),
+`first_read_files` (files new to the index whose read finished) and
+`first_read_max_ms` (the slowest of those reads). The former per-file
+`first_read` window and `file_size` point, with `first_read_over_300s` and
+`file_over_1gib`, are retired. `hold_wake` (`keys`, `oldest_expired_secs`)
+counts expired growth claims selection woke since the previous page, replacing
+the per-pass `hold_wake` point. Existing
 `bounded_traversal_transition` records report `max_unread_bytes` on retirement
 or in `previous` when replacing a traversal, with no per-file log emissions.
 This traversal maximum uses disk length minus the last native checkpoint's size
@@ -613,8 +614,11 @@ or identities and never gate reads.
 
 `counts.line_delivery_unselected.age` counts a discovery decision outside the
 window without an owed-growth, verification or unresolved-account exemption.
-It is drained by that source's completed page, whether or not an observer is
-registered, and counts decisions rather than distinct files or bytes.
+`counts.line_delivery_unselected.first_read_age` counts a file not admitted for
+its first read: no read evidence, committed debt or queued read, and modified
+more than 60 days before the census. Files already read keep the window above.
+Both are drained by that source's completed page, whether or not an observer is
+registered, and count decisions rather than distinct files or bytes.
 
 `DiscoveryRetention::owes_with_len` also retains a file whose current length
 exceeds its committed indexed `size_bytes`, using metadata already available at
@@ -891,8 +895,9 @@ bounded-lifetime release remains a SOURCE follow-up.
 
 After each source's `native_collection_page` line, a `native_change_reasons`
 line carries `counts.change_reasons` when any count is nonzero (its own line
-keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
-local diagnostics only; they gate, cap and upload nothing.
+keeps the page line under its size bound): nonzero counts of why a body was
+read or uploaded, by one first cause. They are local diagnostics only; they
+gate, cap and upload nothing.
 
 - **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
@@ -907,10 +912,9 @@ local diagnostics only; they gate, cap and upload nothing.
   `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
   Placement is known only for Claude with complete accepted state; else `u`.
   An exact resend of a held, refused or catch-up body takes its delivery cause.
-- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
-  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
-  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
-  why.
+- **`read`** (per file): per cause, `files`, `native_bytes` and
+  `validation_bytes`. How a file was read stays in
+  `sampled_acquisition.page_events.full_reasons`.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
