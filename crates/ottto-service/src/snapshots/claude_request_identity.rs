@@ -3625,16 +3625,25 @@ pub(crate) struct RequestProbe {
     pub(crate) identity: String,
     /// `Some(reconciled)` when the item's fold carries accounts.
     pub(crate) accounts: Option<bool>,
+    /// After reconcile: the entity's certificate failure, as `Debug` text.
+    pub(crate) certificate_failure: Option<Option<String>>,
+    /// After reconcile: requests in grains with no account.
+    pub(crate) unknown_requests: Option<u64>,
+    /// After `finish_page`: whether the item was withheld.
+    pub(crate) withheld: Option<bool>,
+    /// The tagging outcome of `apply_scan_page`.
+    pub(crate) tag: Option<String>,
 }
+
+#[cfg(test)]
+pub(crate) type RequestProbeSlot = (Option<(String, String)>, Option<RequestProbe>);
 
 // Test seam: the (session, request) to probe on this thread, and the first
 // report taken from a streamed pass.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static REQUEST_PROBE: std::cell::RefCell<(
-        Option<(String, String)>,
-        Option<RequestProbe>,
-    )> = const { std::cell::RefCell::new((None, None)) };
+    pub(crate) static REQUEST_PROBE: std::cell::RefCell<RequestProbeSlot> =
+        const { std::cell::RefCell::new((None, None)) };
 }
 
 /// Records the probed request's links once, before reconcile consumes them.
@@ -3667,8 +3676,47 @@ pub(crate) fn probe_request(items: &[SnapshotItem], evidence: &ScanEvidence<'_>)
                 .as_ref()
                 .and_then(|fold| fold.accounts.as_ref())
                 .map(|accounts| accounts.reconciled),
+            ..RequestProbe::default()
         };
         slot.1 = Some(report);
+    });
+}
+
+/// Fills the probed report's later stages once, on the pass that opened it.
+#[cfg(test)]
+pub(crate) fn probe_stage(fill: impl FnOnce(&str, &mut RequestProbe)) {
+    REQUEST_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let (Some((session, _)), Some(report)) = &mut *slot else {
+            return;
+        };
+        fill(session.as_str(), report);
+    });
+}
+
+/// After reconcile: the probed item's certificate and its Unknown requests.
+#[cfg(test)]
+pub(crate) fn probe_after_reconcile(items: &[SnapshotItem]) {
+    probe_stage(|session, report| {
+        if report.unknown_requests.is_some() {
+            return;
+        }
+        let Some(fold) = items
+            .iter()
+            .find(|item| item.source_session_id == session)
+            .and_then(|item| item.claude_money.as_deref())
+        else {
+            return;
+        };
+        report.certificate_failure = Some(fold.entity.certificate_failure_for_test());
+        report.unknown_requests = Some(
+            fold.entity
+                .grains
+                .iter()
+                .filter(|((_, _, account), _)| account.is_none())
+                .map(|(_, grain)| grain.requests)
+                .sum(),
+        );
     });
 }
 
@@ -5151,7 +5199,23 @@ pub(crate) fn apply_scan_page(
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, &mut reported, &mut outcome.copy_invalidated) {
+        let tagged = tag_item(item, evidence, &mut reported, &mut outcome.copy_invalidated);
+        #[cfg(test)]
+        probe_stage(|session, report| {
+            if report.tag.is_none() && item.source_session_id == session {
+                report.tag = Some(
+                    match &tagged {
+                        Some(Ok(Tagged::Held)) => "Held",
+                        Some(Ok(Tagged::Sent { .. })) => "Sent",
+                        Some(Ok(Tagged::Fallback { .. })) => "Fallback",
+                        Some(Err(_)) => "Ineligible",
+                        None => "Untagged",
+                    }
+                    .to_owned(),
+                );
+            }
+        });
+        match tagged {
             Some(Ok(Tagged::Held)) => {
                 outcome.held.insert(item.source_session_id.clone());
             }

@@ -10349,6 +10349,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &mut scan_result.snapshots,
             evidence,
         );
+        #[cfg(test)]
+        crate::snapshots::claude_request_identity::probe_after_reconcile(&scan_result.snapshots);
         // #932's scalar stays, equal to its reason in the map.
         stats.trace_discard_no_fallback_requests = no_fallback.discarded;
         stats.unhealthy_root_no_fallback_requests = no_fallback;
@@ -10376,6 +10378,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
     );
+    #[cfg(test)]
+    crate::snapshots::claude_request_identity::probe_stage(|session, report| {
+        if report.withheld.is_none() {
+            report.withheld = Some(withheld.contains(session));
+        }
+    });
     if !trace_discard_unfolded.is_empty() {
         *disposition
             .request_owned_hold_reasons

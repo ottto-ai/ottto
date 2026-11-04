@@ -314,6 +314,26 @@ fn arm_case(arm: Arm) {
             "(v) EARLY's fold reaches the per-request loop (accounts, not reconciled)"
         );
         assert_eq!(
+            probe.certificate_failure,
+            Some(None),
+            "(vi) reconcile keeps EARLY's entity certified"
+        );
+        assert_eq!(
+            probe.unknown_requests,
+            Some(1),
+            "(vi) after reconcile, `held` sits in a grain with no account"
+        );
+        assert_eq!(
+            probe.withheld,
+            Some(false),
+            "(vii) finish_page emits EARLY rather than withholding it"
+        );
+        assert_eq!(
+            probe.tag.as_deref(),
+            Some("Sent"),
+            "(vii) the request-owned grouping tags EARLY"
+        );
+        assert_eq!(
             org_a_requests(&done, EARLY),
             1,
             "a request another session holds, whose pair is unreadable, is Unknown"
