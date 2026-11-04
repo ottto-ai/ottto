@@ -14019,8 +14019,8 @@ impl OwnedSourceScan {
         }
         let hinted_paths = changed_watcher_hints(index, hinted_paths);
         let next_generation_hints;
-        {
-            refresh_retained_codex_roster(
+        let mut unlisted = {
+            let unlisted = refresh_retained_codex_roster(
                 source,
                 index,
                 backfill_window_days,
@@ -14036,13 +14036,14 @@ impl OwnedSourceScan {
             );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
-        }
-        advance_bounded_directory_traversal(
+            unlisted
+        };
+        unlisted.extend(advance_bounded_directory_traversal(
             source,
             index,
             backfill_window_days,
             Some(&resource_probe.discovery_growth),
-        );
+        ));
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         let codex_census_valid = source == SnapshotSource::Codex
             && index
@@ -14380,6 +14381,20 @@ impl OwnedSourceScan {
                 )
             })
             .collect::<Vec<_>>();
+        // A key missing from this page's complete directory reads and proven
+        // securely absent is the same removal as a NotFound census member; the
+        // page-end owner retires it. A custody move this page (the rekey seam)
+        // leaves the old key unindexed, so it is dropped here. The proof is
+        // newer than this page's candidate observations, so it clears them.
+        for key in unlisted {
+            if index.files.contains_key(&key)
+                && sampled_audit::proven_absent(Path::new(&key), roots)
+            {
+                census.observed_index_keys.remove(&key);
+                census.claude_vanished_index_keys.insert(key.clone());
+                census.removed_index_keys.insert(key);
+            }
+        }
 
         for candidate in &files {
             sampled_audit::retain_candidate_growth(source, index, candidate);
@@ -18217,20 +18232,31 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
+                    // Codex records its counting evidence before either exit
+                    // below, as terminal reconciliation does; a refusal keeps
+                    // the entry whole.
                     if !index
                         .files
                         .get(index_key)
                         .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                        && (source != SnapshotSource::Codex
+                            || codex_counting_version::tombstone_before_retire(index, index_key))
                     {
-                        // A Claude member that vanished beneath its present
-                        // parent also drops its unverified audit debt;
-                        // every other removal keeps that debt. Both
+                        // A member that vanished beneath its present parent
+                        // also drops its unverified audit debt, proven again
+                        // here; every other removal keeps that debt. Both
                         // retire its request-census record.
-                        let vanished = census.claude_vanished_index_keys.contains(index_key)
-                            && sampled_audit::proven_absent(Path::new(index_key), &roots);
+                        let vanished = census.claude_vanished_index_keys.contains(index_key);
                         let census_record =
                             vanished && index.claude_request_census.get(index_key).is_some();
-                        if vanished && index.retire_vanished_claude_audit_debt_entry(index_key) {
+                        if vanished
+                            && index
+                                .files
+                                .get(index_key)
+                                .is_some_and(ScanIndexEntry::has_unverified_source)
+                            && sampled_audit::proven_absent(Path::new(index_key), &roots)
+                            && index.retire_vanished_claude_audit_debt_entry(index_key)
+                        {
                             crate::local_resource_diagnostics::audit_retired_absent(
                                 source.api_slug(),
                             );
@@ -18238,9 +18264,7 @@ impl OwnedSourceScan {
                                 source,
                                 disappearance_diagnostics::Vanished::AuditDebtDropped,
                             );
-                        } else if source != SnapshotSource::Codex
-                            || codex_counting_version::tombstone_before_retire(index, index_key)
-                        {
+                        } else {
                             index.remove_file_entry_unless_held(index_key);
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
@@ -28650,10 +28674,17 @@ fn refresh_retained_codex_roster(
     index: &mut ScanIndex,
     backfill_window_days: u64,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
     let mut traversal = index.traversal.take().expect("traversal initialized");
-    refresh_retained_codex_directories(source, &mut traversal, backfill_window_days, index, growth);
+    let unlisted = refresh_retained_codex_directories(
+        source,
+        &mut traversal,
+        backfill_window_days,
+        index,
+        growth,
+    );
     index.traversal = Some(traversal);
+    unlisted
 }
 
 fn refresh_retained_codex_directories(
@@ -28662,9 +28693,10 @@ fn refresh_retained_codex_directories(
     backfill_window_days: u64,
     index: &ScanIndex,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
+    let mut unlisted = BTreeSet::new();
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
-        return;
+        return unlisted;
     }
     let recovery = DiscoveryRecovery::from(&index.files);
     let retention = DiscoveryRetention {
@@ -28674,7 +28706,7 @@ fn refresh_retained_codex_directories(
     let moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
-        _ => return,
+        _ => return unlisted,
     };
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
     let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
@@ -28695,6 +28727,7 @@ fn refresh_retained_codex_directories(
                 traversal
                     .codex_rollout_paths
                     .retain(|key| !Path::new(key).starts_with(&directory));
+                unlisted_index_keys(&index.files, &directory, &BTreeSet::new(), &mut unlisted);
                 continue;
             }
             _ => continue,
@@ -28708,6 +28741,7 @@ fn refresh_retained_codex_directories(
         }
         remaining -= entries.len();
         let mut present = BTreeSet::new();
+        let mut names = BTreeSet::new();
         let mut appeared = Vec::new();
         let mut new_directories = Vec::new();
         let mut clean = true;
@@ -28719,6 +28753,12 @@ fn refresh_retained_codex_directories(
                 clean = false;
                 break;
             };
+            names.insert(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             if file_type.is_symlink() {
                 clean = false;
                 break;
@@ -28747,6 +28787,7 @@ fn refresh_retained_codex_directories(
         if !clean || !census.refresh(&directory, &before) {
             continue;
         }
+        unlisted_index_keys(&index.files, &directory, &names, &mut unlisted);
         traversal.codex_rollout_paths.retain(|key| {
             Path::new(key).parent() != Some(directory.as_path()) || present.contains(key)
         });
@@ -28822,6 +28863,7 @@ fn refresh_retained_codex_directories(
                 watcher_hint: true,
             }));
     }
+    unlisted
 }
 
 /// F5: queue `keys` again as census members of the generation that observed
@@ -29020,19 +29062,49 @@ impl DiscoveryRecovery<'_> {
     }
 }
 
+/// Returns the indexed keys this tick's complete directory reads did not list.
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
     advance_bounded_directory_traversal_with_budget(
         source,
         index,
         backfill_window_days,
         directory_entries_per_tick(),
         growth,
-    );
+    )
+}
+
+/// Adds to `unlisted` each indexed key beneath `directory` whose first
+/// component there is not in `names`, a complete listing of `directory`
+/// (empty for a directory now gone). A listed child's subtree is skipped by
+/// seeking past its prefix; its own read covers it. Nomination only: the
+/// secure absence proof decides.
+fn unlisted_index_keys(
+    files: &SharedMap<String, ScanIndexEntry>,
+    directory: &Path,
+    names: &BTreeSet<String>,
+    unlisted: &mut BTreeSet<String>,
+) {
+    use std::ops::Bound;
+    use std::path::MAIN_SEPARATOR;
+    let prefix = format!("{}{MAIN_SEPARATOR}", directory.to_string_lossy());
+    let mut keys = files.range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded));
+    while let Some((key, _)) = keys.next() {
+        let Some(rest) = key.strip_prefix(prefix.as_str()) else {
+            break;
+        };
+        let child = rest.split(MAIN_SEPARATOR).next().unwrap_or(rest);
+        if !names.contains(child) {
+            unlisted.insert(key.clone());
+        } else if child.len() < rest.len() {
+            let past = format!("{prefix}{child}{}", char::from(MAIN_SEPARATOR as u8 + 1));
+            keys = files.range::<str, _>((Bound::Included(past.as_str()), Bound::Unbounded));
+        }
+    }
 }
 
 fn directory_entries_per_tick() -> usize {
@@ -29069,11 +29141,12 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
     let mut traversal = index
         .traversal
         .take()
         .expect("bounded traversal initialized");
+    let mut unlisted = BTreeSet::new();
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
             counts.directory_entry_cap_exceeded_count,
@@ -29162,6 +29235,13 @@ fn advance_bounded_directory_traversal_with_budget(
                         disappearance_diagnostics::Site::WalkDirectory,
                     );
                 }
+                // Its indexed subtree is offered to the same absence proof.
+                unlisted_index_keys(
+                    &index.files,
+                    &directory.path,
+                    &BTreeSet::new(),
+                    &mut unlisted,
+                );
                 continue;
             }
             Err(_) => {
@@ -29216,10 +29296,13 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .cmp(&right.as_ref().map(|entry| entry.file_name()).ok())
         });
+        // Every name of a complete listing; an entry or type error leaves none.
+        let mut names = Some(BTreeSet::new());
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
+                    names = None;
                     traversal
                         .counts
                         .record_unreadable(UnreadableCause::Directory, 1);
@@ -29227,14 +29310,19 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
             };
             let path = entry.path();
+            if let Some(names) = names.as_mut() {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) if source == SnapshotSource::Codex && codex_archive_path(&path) => {
+                    names = None;
                     index.archive_io_error(&path, Some(&error));
                     debt.unlisted();
                     continue;
                 }
                 Err(_) => {
+                    names = None;
                     traversal
                         .counts
                         .record_unreadable(UnreadableCause::Metadata, 1);
@@ -29438,6 +29526,9 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
             }
         }
+        if let Some(names) = names {
+            unlisted_index_keys(&index.files, &directory.path, &names, &mut unlisted);
+        }
     }
     debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
@@ -29457,6 +29548,7 @@ fn advance_bounded_directory_traversal_with_budget(
         freshness.page_end(source, walk_ended, debt);
     }
     index.traversal = Some(traversal);
+    unlisted
 }
 
 /// A Claude transcript that is NotFound while its parent is still a real
@@ -29828,7 +29920,6 @@ fn reconcile_missing_index_entries_with_side(
         // An unobserved marked entry still needs positive filesystem proof;
         // unsafe ancestors, missing roots and permission failures keep debt.
         if !observed
-            && !index.decode_holds_file(key)
             && index
                 .files
                 .get(key)
@@ -35181,6 +35272,11 @@ impl ScanIndex {
         {
             return false;
         }
+        // A decode hold keeps the entry, its obligation and memo: nothing is
+        // released or disclosed as deleted while its stored record is unread.
+        if self.decode_holds_file(key) {
+            return false;
+        }
         let census_record = self.claude_request_census.get(key).is_some();
         let protected = self
             .files
@@ -35235,9 +35331,9 @@ impl ScanIndex {
     /// which drops its fingerprints and hold just as main's reconciliation
     /// does at the next healthy terminal. The hold is later dropped by a
     /// complete census. Returns false, retiring nothing, for an entry
-    /// without audit debt.
+    /// without audit debt or one a decode hold keeps.
     fn retire_vanished_claude_audit_debt_entry(&mut self, key: &str) -> bool {
-        if !self.persistence_available() {
+        if !self.persistence_available() || self.decode_holds_file(key) {
             return false;
         }
 

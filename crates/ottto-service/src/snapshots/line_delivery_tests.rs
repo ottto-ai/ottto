@@ -1479,6 +1479,65 @@ fn codex_roster_retains_aged_indexed_growth() {
     );
 }
 
+/// [behaviour] The retained Codex roster refresh nominates an indexed rollout
+/// missing from a clean re-listing, and every indexed key beneath a moved
+/// directory that is now gone. A re-listing with a symlink nominates nothing.
+#[cfg(unix)]
+#[test]
+fn codex_roster_refresh_nominates_only_from_clean_listings() {
+    for case in ["clean", "symlink", "gone"] {
+        let root = Root::new("ld-roster-unlisted");
+        let directory = root.projects().join("2026/10/01");
+        fs::create_dir_all(&directory).unwrap();
+        append(&directory.join("rollout-live.jsonl"), b"{}\n");
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[root.projects()],
+            &mut index,
+            NOW,
+            7,
+        );
+        while !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty()
+        {
+            advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        }
+        let live = local_index_key(&directory.join("rollout-live.jsonl"));
+        let stale = local_index_key(&directory.join("rollout-stale.jsonl"));
+        for key in [&live, &stale] {
+            index
+                .files
+                .insert(key.clone(), super::tests::manifest_index_entry(None));
+        }
+        // Match the existing roster fixture's directory-change granularity.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let expected = match case {
+            "clean" => {
+                append(&directory.join("rollout-new.jsonl"), b"{}\n");
+                BTreeSet::from([stale])
+            }
+            "symlink" => {
+                std::os::unix::fs::symlink(root.projects(), directory.join("link")).unwrap();
+                BTreeSet::new()
+            }
+            _ => {
+                fs::remove_dir_all(&directory).unwrap();
+                BTreeSet::from([live, stale])
+            }
+        };
+        assert_eq!(
+            refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None),
+            expected,
+            "{case}"
+        );
+    }
+}
+
 /// [behaviour] Growth followed by more than W of downtime is still read exactly once.
 /// Committing the new length releases this exemption; generic Tail audit debt
 /// is discharged explicitly before asserting ordinary aging, as in the hold fixture.

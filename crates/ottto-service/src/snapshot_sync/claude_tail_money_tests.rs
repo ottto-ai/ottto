@@ -914,6 +914,86 @@ fn codex_content_only_caller_matches_cold_full() {
     }
 }
 
+/// [money] An indexed sibling transcript deleted after a committed page is
+/// retired through its directory's complete read and secure absence proof.
+/// The live file's next page emits the same envelope through its retained
+/// Tail, a cold Full and a restarted owner. Pi retires the sibling in every
+/// arm; Codex protection may keep it, identically in every arm. The live
+/// entry stays. Same-build proof only: no receipt.
+#[test]
+fn deleted_sibling_retires_without_changing_live_money() {
+    const SIBLING: &str = "5b1b1b1b-0000-4000-8000-00000000c0de";
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let name = format!("deleted_sibling_{}", source.api_slug());
+        if !supported(&name) {
+            return;
+        }
+        let _cutover = crate::snapshots::TestCutover::set(0);
+        let c = corpus(&name);
+        let mut disk = Disk::with_route(&c, source);
+        let (live, sibling) = (c.root.join("live.jsonl"), c.root.join("sibling.jsonl"));
+        let header = |id: &str| {
+            json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"id":id,"timestamp":"2026-10-27T07:00:00Z"}})
+            .to_string()
+                + "\n"
+        };
+        let (scanner, live_body, sibling_body, growth) = if source == SnapshotSource::Codex {
+            (
+                E2ScanFixture::default(),
+                header(ROOT) + &codex_rows("turn-a", 10),
+                header(SIBLING) + &codex_rows("turn-s", 5).replace(ROOT, SIBLING),
+                codex_rows("turn-b", 30),
+            )
+        } else {
+            (
+                disk.owner(source),
+                pi_seed(),
+                pi_seed().replacen("synthetic-pi-session", "synthetic-pi-sibling", 1),
+                pi_json(pi_turn(
+                    "message",
+                    Some("sibling-growth"),
+                    20,
+                    "2026-10-27T06:01:00Z",
+                )),
+            )
+        };
+        for (path, body) in [(&live, &live_body), (&sibling, &sibling_body)] {
+            std::fs::write(path, body).unwrap();
+            input_clock(path);
+        }
+        if source == SnapshotSource::Codex {
+            disk.begin(&scanner, source);
+        }
+        let (mut index, scan, _) = other_page(&c, &scanner, source, ScanIndex::default());
+        assert!(!scan.snapshots.is_empty(), "{source:?}");
+        let key = |path: &Path| path.to_string_lossy().into_owned();
+        assert!(index.files.contains_key(&key(&sibling)), "{source:?}");
+        let prior = disk.commit(&scanner.cache, source, &mut index);
+        std::fs::remove_file(&sibling).unwrap();
+        append(&live, &growth);
+        input_clock(&live);
+        let restart = disk.owner(source);
+        let (tail_index, tail, _) = other_page(&c, &scanner, source, prior.clone());
+        let (full_index, full, _) =
+            other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+        let (restored_index, restored, _) = other_page(&c, &restart, source, prior);
+        let wire = other_wire(source, &full);
+        assert_eq!(other_wire(source, &tail), wire, "{source:?}: Tail");
+        assert_eq!(other_wire(source, &restored), wire, "{source:?}: restart");
+        // Codex protection may keep the sibling's custody; every route agrees.
+        let custody = |index: &ScanIndex| index.files.contains_key(&key(&sibling));
+        for index in [&tail_index, &full_index, &restored_index] {
+            assert!(index.files.contains_key(&key(&live)), "{source:?}");
+            assert_eq!(custody(index), custody(&full_index), "{source:?}");
+            assert!(
+                source == SnapshotSource::Codex || !custody(index),
+                "{source:?}"
+            );
+        }
+    }
+}
+
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
 /// exactly the cross-build receipts above, so these print a distinct line and
 /// write no receipt; the job still runs them and fails on any assertion.

@@ -877,11 +877,13 @@ pub(super) mod tests {
     }
 
     /// Control for N-T3: the same member with its parent directory missing is
-    /// not evidence of removal. Its NotFound stays loss, and the entry keeps
-    /// its unverified audit marker.
+    /// not evidence of removal at its own NotFound, which stays loss. Its
+    /// session directory's complete read no longer lists the missing parent,
+    /// and the secure proof beneath that read ancestor retires the entry and
+    /// its audit marker once (the never-queued gone-parent row).
     #[cfg(unix)]
     #[test]
-    fn claude_audit_debt_member_below_missing_parent_keeps_entry_and_marker_red() {
+    fn claude_audit_debt_member_below_missing_parent_stays_loss_and_retires_by_its_ancestor() {
         let fixture = ForcedFamilyFixture::new("absence-forced-parent-gone");
         let member_key = local_index_key(&fixture.member_path);
         fs::remove_dir(fixture.member_path.parent().unwrap()).unwrap();
@@ -893,7 +895,7 @@ pub(super) mod tests {
         expected_sites[1][Site::CandidateForcedIndex.index()] = [1, 0];
         assert_eq!(sites, expected_sites);
         assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-        assert_eq!(vanished, [[0; VANISHED]; 3]);
+        assert_eq!(vanished, [[0; VANISHED], [1, 0], [0; VANISHED]]);
         assert_eq!(
             pages
                 .iter()
@@ -904,10 +906,7 @@ pub(super) mod tests {
         let traversal = index.traversal.as_ref().expect("the loss keeps it red");
         assert!(traversal.counts.has_errors());
         assert_eq!(traversal.counts.disappeared_file_count, 1);
-        assert!(index
-            .files
-            .get(&member_key)
-            .is_some_and(|entry| entry.has_unverified_source()));
+        assert!(!index.files.contains_key(&member_key));
     }
 
     /// One bounded walk per `(at, now)` over a deleted session directory, as
@@ -1610,6 +1609,306 @@ pub(super) mod tests {
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];
         expected[1][Site::WalkDirectory.index()] = [1, 0];
         assert_eq!(sites, expected, "a vanished queued directory stays loss");
+    }
+
+    fn keys<const N: usize>(paths: [&str; N]) -> std::collections::BTreeSet<String> {
+        paths.into_iter().map(String::from).collect()
+    }
+
+    /// [behaviour] A complete listing nominates each indexed key whose first
+    /// component below the directory is unlisted. A listed child's subtree is
+    /// skipped by seeking past its prefix, while a sibling that only shares
+    /// the child's name prefix is still compared.
+    #[test]
+    fn unlisted_index_keys_seek_past_listed_children() {
+        let mut files = crate::snapshots::SharedMap::default();
+        for key in [
+            "/r/d/a",
+            "/r/d/a.jsonl",
+            "/r/d/a/x.jsonl",
+            "/r/d/a/y/z.jsonl",
+            "/r/d/a0.jsonl",
+            "/r/d/b/x.jsonl",
+            "/r/d/b/y/z.jsonl",
+            "/r/d/c.jsonl",
+            "/r/dd/e.jsonl",
+            "/r/e.jsonl",
+        ] {
+            files.insert(
+                key.to_string(),
+                super::super::tests::manifest_index_entry(None),
+            );
+        }
+        let listed = keys(["a", "a0.jsonl", "c.jsonl"]);
+        let mut unlisted = std::collections::BTreeSet::new();
+        super::super::unlisted_index_keys(&files, Path::new("/r/d"), &listed, &mut unlisted);
+        assert_eq!(
+            unlisted,
+            keys(["/r/d/a.jsonl", "/r/d/b/x.jsonl", "/r/d/b/y/z.jsonl"])
+        );
+        let mut gone = std::collections::BTreeSet::new();
+        super::super::unlisted_index_keys(
+            &files,
+            Path::new("/r/d/b"),
+            &std::collections::BTreeSet::new(),
+            &mut gone,
+        );
+        assert_eq!(gone, keys(["/r/d/b/x.jsonl", "/r/d/b/y/z.jsonl"]));
+    }
+
+    /// [behaviour] Only a complete directory read nominates: a missing leaf
+    /// below a listed parent (also one observed earlier), a missing subtree
+    /// whose directory was never queued, and a queued directory now gone. A
+    /// read cut short by the tick budget nominates nothing from it.
+    #[cfg(unix)]
+    #[test]
+    fn walk_nominates_unlisted_keys_only_from_complete_reads() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-walk-nominations");
+        let root = fs::canonicalize(&dir).unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        for name in ["live.jsonl", "other.jsonl"] {
+            fs::write(project.join(name), b"{}\n").unwrap();
+        }
+        let key = |path: PathBuf| local_index_key(&path);
+        let live = key(project.join("live.jsonl"));
+        let stale = key(project.join("stale.jsonl"));
+        let never_queued = key(root.join("gone-project").join("s.jsonl"));
+        let queued_gone = key(root.join("queued-gone").join("t.jsonl"));
+        let walk = |budget: usize| {
+            let mut index = ScanIndex::default();
+            for file in [&live, &stale, &never_queued, &queued_gone] {
+                index.files.insert(
+                    file.clone(),
+                    super::super::tests::manifest_index_entry(None),
+                );
+            }
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+            );
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.observed_index_keys.insert(stale.clone());
+            traversal.pending_directories.push_front(ScanTraversalPath {
+                scan_root: root.clone(),
+                path: root.join("queued-gone"),
+                census_member: true,
+                watcher_hint: false,
+            });
+            let mut unlisted = std::collections::BTreeSet::new();
+            while !index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_directories
+                .is_empty()
+            {
+                unlisted.extend(
+                    super::super::advance_bounded_directory_traversal_with_budget(
+                        SnapshotSource::ClaudeCode,
+                        &mut index,
+                        BACKFILL_WINDOW_DAYS,
+                        budget,
+                        None,
+                    ),
+                );
+            }
+            unlisted
+        };
+        assert_eq!(
+            walk(1_000),
+            std::collections::BTreeSet::from([
+                stale.clone(),
+                never_queued.clone(),
+                queued_gone.clone()
+            ])
+        );
+        // Two names exceed a one-entry budget: the project read is partial.
+        assert_eq!(
+            walk(1),
+            std::collections::BTreeSet::from([never_queued.clone(), queued_gone.clone()])
+        );
+    }
+
+    fn unverified(entry: &mut super::super::ScanIndexEntry) {
+        entry.scan_identity_version = Some(format!(
+            "{}:4000000000",
+            super::super::sampled_audit::UNVERIFIED_IDENTITY
+        ));
+        assert!(entry.has_unverified_source());
+    }
+
+    /// [behaviour] A key the page's directory read did not list and that is
+    /// proven absent is retired once by the page-end owner, by custody: no
+    /// hold and audit-only debt retire; a decode hold keeps the entry, its
+    /// audit marker and any account obligation with no deletion credit; an
+    /// account hold alone waits for its own absence sequence.
+    #[cfg(unix)]
+    #[test]
+    fn claude_directory_proof_retires_unlisted_keys_by_custody() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-directory-custody");
+        let root = fs::canonicalize(&dir).unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        let live = project.join("a1111111-1111-4111-8111-111111111111.jsonl");
+        fs::write(
+            &live,
+            claude_line("a1111111-1111-4111-8111-111111111111", "r"),
+        )
+        .unwrap();
+        // (stem, audit, decode, account, retired by the first walk, by F4).
+        let rows = [
+            ("none", false, false, false, true, true),
+            ("audit", true, false, false, true, true),
+            ("decode", false, true, false, false, false),
+            ("audit-decode", true, true, false, false, false),
+            ("account", false, false, true, false, true),
+            ("account-decode", false, true, true, false, false),
+            ("account-audit-decode", true, true, true, false, false),
+        ];
+        let key = |stem: &str| local_index_key(&project.join(format!("{stem}.jsonl")));
+        let mut index = ScanIndex::default();
+        for (stem, audit, decode, account, _, _) in rows {
+            let mut entry = super::super::tests::manifest_index_entry(Some(stem));
+            if audit {
+                unverified(&mut entry);
+            }
+            index.files.insert(key(stem), entry);
+            if decode {
+                index
+                    .decode_holds
+                    .v2_insert("files", key(stem), b"false".to_vec(), None, 128)
+                    .unwrap();
+            }
+            if account {
+                index
+                    .claude_account_deferred_holds
+                    .insert(key(stem), format!("{stem}-revision"));
+            }
+        }
+        let held = |index: &ScanIndex, stem: &str| {
+            (
+                index.files.contains_key(&key(stem)),
+                index
+                    .files
+                    .get(&key(stem))
+                    .is_some_and(|entry| entry.has_unverified_source()),
+                index.claude_account_deferred_holds.contains_key(&key(stem)),
+            )
+        };
+        super::super::sampled_scan::set_test_now(Some(1_000));
+        let ((_, vanished), first_rows) = crate::local_resource_diagnostics::capture(|| {
+            observe_vanished(|| claude_page(&mut index, &root, NOW, 10, &[]))
+        });
+        assert_eq!(
+            vanished,
+            [[0; VANISHED], [1, 0], [0; VANISHED]],
+            "only the audit-only key drops its debt"
+        );
+        for (stem, audit, _, account, retired, _) in rows {
+            let expected = if retired {
+                (false, false, false)
+            } else {
+                (true, audit, account)
+            };
+            assert_eq!(held(&index, stem), expected, "first walk: {stem}");
+        }
+        super::super::sampled_scan::set_test_now(Some(1_600));
+        super::super::line_delivery_tests::next_walk(
+            &mut index,
+            std::slice::from_ref(&root),
+            LATER,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let (_, later_rows) = crate::local_resource_diagnostics::capture(|| {
+            claude_page(&mut index, &root, RETRY, 10, &[])
+        });
+        super::super::sampled_scan::set_test_now(None);
+        for (stem, audit, _, account, _, retired) in rows {
+            let expected = if retired {
+                (false, false, false)
+            } else {
+                (true, audit, account)
+            };
+            assert_eq!(held(&index, stem), expected, "after F4: {stem}");
+        }
+        let released = first_rows
+            .iter()
+            .chain(&later_rows)
+            .filter_map(|row| row["counts"].get("withheld_hold_released"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            released,
+            [&serde_json::json!({"deleted": 1})],
+            "only the account hold without a decode hold is released"
+        );
+    }
+
+    /// [behaviour] Uncertainty grants no proof: a missing key below an
+    /// unreadable directory, below a directory symlink, at a dangling leaf
+    /// symlink (a listed name) or outside every root stays indexed, while a
+    /// missing key below a real directory is retired. A stale copy of a live
+    /// session under another project is retired with no observation left to
+    /// rejoin its twin group, and the live member stays indexed.
+    #[cfg(unix)]
+    #[test]
+    fn claude_directory_proof_keeps_uncertain_keys_and_drops_stale_twins() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            // SAFETY: geteuid() is always-successful and has no preconditions.
+            unsafe { libc::geteuid() },
+            0,
+            "this test blocks a directory with chmod 000, which root reads through"
+        );
+        let dir = crate::test_scratch::ScratchDir::new("absence-directory-uncertain");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (project, other, real) = (root.join("project"), root.join("other"), root.join("real"));
+        for directory in [&project, &other, &real, &project.join("locked")] {
+            fs::create_dir(directory).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, project.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), project.join("dangling.jsonl")).unwrap();
+        let session = "a1111111-1111-4111-8111-111111111111";
+        let stale_twin = format!("{session}.jsonl");
+        fs::write(project.join(&stale_twin), claude_line(session, "r")).unwrap();
+        let kept = [
+            project.join("locked").join("x.jsonl"),
+            project.join("link").join("x.jsonl"),
+            project.join("dangling.jsonl"),
+            PathBuf::from("/nonexistent-absence-root/project/x.jsonl"),
+        ];
+        let retired = [real.join("y.jsonl"), other.join(&stale_twin)];
+        let mut index = ScanIndex::default();
+        for path in kept.iter().chain(&retired) {
+            index.files.insert(
+                local_index_key(path),
+                super::super::tests::manifest_index_entry(None),
+            );
+        }
+        fs::set_permissions(project.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let pages = claude_generation(&mut index, &root, NOW, 10, &[]);
+        fs::set_permissions(project.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        let observed = |key: &String| {
+            index
+                .traversal
+                .as_ref()
+                .is_some_and(|traversal| traversal.observed_index_keys.contains(key))
+        };
+        for path in &kept {
+            assert!(index.files.contains_key(&local_index_key(path)), "{path:?}");
+        }
+        for path in &retired {
+            let key = local_index_key(path);
+            assert!(!index.files.contains_key(&key), "{path:?}");
+            assert!(!observed(&key), "{path:?}: no observation brings it back");
+        }
+        assert!(index
+            .files
+            .contains_key(&local_index_key(&project.join(&stale_twin))));
     }
 }
 
