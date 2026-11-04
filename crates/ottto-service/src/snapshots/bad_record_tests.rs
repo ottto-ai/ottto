@@ -813,7 +813,17 @@ fn codex_occurrences() {
     )
     .unwrap();
     p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
-    let (_, native) = finish::<Codex>(&route, &path, p, None);
+    while !p.step().unwrap() {}
+    let counts = p
+        .accumulator
+        .codex_counting
+        .as_deref()
+        .unwrap()
+        .counters()
+        .unwrap();
+    assert_eq!(counts.native_counted, 2);
+    assert_eq!(counts.native_not_authority, 1);
+    let (_, native) = finish::<Codex>(&route, &path, *p, None);
     assert!(native.progress_complete());
     assert_eq!(
         (
@@ -823,7 +833,9 @@ fn codex_occurrences() {
         ),
         (20, 4, 2)
     );
-    assert!(native.recognized_usage_drop_count > 0);
+    // Native rejection is diagnosed by the native counter above; the public
+    // recognized-drop counter keeps its existing UI-total meaning.
+    assert_eq!(native.recognized_usage_drop_count, 0);
 }
 
 // O4: a progressive response is finalized once. A conflicting response stays
@@ -862,6 +874,7 @@ fn claude_responses() {
             .claude_money
             .as_ref()
             .unwrap()
+            .entity
             .resolver_conflicts,
         1
     );
