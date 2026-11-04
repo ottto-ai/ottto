@@ -3613,6 +3613,65 @@ impl RequestAccounts {
 /// earlier own request, then the start/binding; every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
 /// requests stay Unknown, counted per reason in the returned totals.
+/// One request's links at reconcile entry, for the pipeline tests.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestProbe {
+    /// The scope's census holders of the request.
+    pub(crate) holders: Vec<String>,
+    pub(crate) unhealthy_roots: Vec<String>,
+    pub(crate) owner_unreadable: bool,
+    /// The classifier's answer, as `Debug` text.
+    pub(crate) identity: String,
+    /// `Some(reconciled)` when the item's fold carries accounts.
+    pub(crate) accounts: Option<bool>,
+}
+
+// Test seam: the (session, request) to probe on this thread, and the first
+// report taken from a streamed pass.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REQUEST_PROBE: std::cell::RefCell<(
+        Option<(String, String)>,
+        Option<RequestProbe>,
+    )> = const { std::cell::RefCell::new((None, None)) };
+}
+
+/// Records the probed request's links once, before reconcile consumes them.
+#[cfg(test)]
+pub(crate) fn probe_request(items: &[SnapshotItem], evidence: &ScanEvidence<'_>) {
+    REQUEST_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some((session, request)) = slot.0.clone().filter(|_| slot.1.is_none()) else {
+            return;
+        };
+        let Some(item) = items.iter().find(|item| item.source_session_id == session) else {
+            return;
+        };
+        let root = super::claude_snapshot_family_root_ref(item);
+        let identity = item
+            .claude_usage_occurrences
+            .get(request.as_str())
+            .and_then(|occurrence| request_occurrence_facts(item, request.as_str(), occurrence))
+            .map(|facts| classify_ref(evidence, &facts));
+        let report = RequestProbe {
+            holders: evidence
+                .cross
+                .map(|cross| cross.holders_for_test(&request))
+                .unwrap_or_default(),
+            unhealthy_roots: evidence.unhealthy_roots.iter().cloned().collect(),
+            owner_unreadable: evidence.owner_unreadable(root, &request),
+            identity: format!("{identity:?}"),
+            accounts: item
+                .claude_money
+                .as_ref()
+                .and_then(|fold| fold.accounts.as_ref())
+                .map(|accounts| accounts.reconciled),
+        };
+        slot.1 = Some(report);
+    });
+}
+
 pub(crate) fn reconcile_request_accounts(
     items: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,

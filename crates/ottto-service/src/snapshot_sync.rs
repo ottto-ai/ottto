@@ -10338,6 +10338,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         comparison.retire_native_fold_owner();
     }
     if let Some(evidence) = &identity_evidence {
+        #[cfg(test)]
+        if !whole_corpus_evidence() {
+            crate::snapshots::claude_request_identity::probe_request(
+                &scan_result.snapshots,
+                evidence,
+            );
+        }
         let no_fallback = crate::snapshots::claude_request_identity::reconcile_request_accounts(
             &mut scan_result.snapshots,
             evidence,
