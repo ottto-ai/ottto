@@ -758,147 +758,290 @@ fn legacy_owed_held_archive_older_than_first_read_window_is_counted() {
     assert!(index.files.contains_key(&key));
 }
 
+/// One ordinary pass's reads and emissions, as the test seams observe them,
+/// with the listing facts the pass started from.
+struct PassFacts {
+    entry_size: Option<u64>,
+    live_size: u64,
+    stamp_matches: bool,
+    listing_unchanged: bool,
+    head: Option<(bool, state_v2::Representation)>,
+    identity_samples: u64,
+    identity_sample_bytes: u64,
+    decoders: usize,
+    parses: usize,
+    zst_input_rows: usize,
+    zst_compressed_bytes: u64,
+    zst_decoded_bytes: u64,
+    consumed: u64,
+    counted_fulls: u64,
+    delivered: Vec<(DeliveryMode, u64)>,
+    snapshots: usize,
+    posts: usize,
+}
+impl std::fmt::Display for PassFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "listing: entry_size={:?} live_size={} stamp_matches={} listing_unchanged={} \
+             head(metadata_only, representation)={:?}; identity_samples={} ({} bytes) \
+             decoders={} parses={} zst_input_rows={} zst_compressed_bytes={} \
+             zst_decoded_bytes={} consumed={} counted_fulls={} delivered={:?} \
+             snapshots={} posts={}",
+            self.entry_size,
+            self.live_size,
+            self.stamp_matches,
+            self.listing_unchanged,
+            self.head,
+            self.identity_samples,
+            self.identity_sample_bytes,
+            self.decoders,
+            self.parses,
+            self.zst_input_rows,
+            self.zst_compressed_bytes,
+            self.zst_decoded_bytes,
+            self.consumed,
+            self.counted_fulls,
+            self.delivered,
+            self.snapshots,
+            self.posts,
+        )
+    }
+}
+impl PassFacts {
+    fn read_nothing(&self) -> bool {
+        self.identity_samples == 0
+            && self.decoders == 0
+            && self.parses == 0
+            && self.zst_input_rows == 0
+            && self.consumed == 0
+            && self.counted_fulls == 0
+            && self.delivered.is_empty()
+            && self.snapshots == 0
+            && self.posts == 0
+    }
+}
+
+fn head_shape(index: &ScanIndex, key: &str) -> Option<(bool, state_v2::Representation)> {
+    state_v2::load_head(index, key, u32::MAX)
+        .unwrap()
+        .map(|head| (head.metadata_only, head.common.representation))
+}
+
+/// One ordinary pass under `context`, then its accepting checkpoint.
+fn observed_pass(
+    c: &Corpus,
+    path: &Path,
+    mut index: ScanIndex,
+    context: &str,
+) -> (ScanIndex, RouteResult, PassFacts) {
+    index.activate_file_upload_context(SnapshotSource::Codex, context.into());
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let key = local_index_key(path);
+    let live = fs::metadata(path).unwrap();
+    let entry_size = index.files.get(&key).map(|entry| entry.size_bytes);
+    let stamp_matches = index.listing_stamp_matches(path, &live);
+    let listing_unchanged = index.listing_unchanged(path, &live);
+    let head = head_shape(&index, &key);
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let activity = codex_zst_refusal_tests::activity();
+    let previous = index.clone();
+    let (working, scan, delivery, consumed, logs) =
+        page(c, index, Arc::new(sampled_scan::SharedCache::default()));
+    let samples_after = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let activity_after = codex_zst_refusal_tests::activity();
+    let zst = logs
+        .iter()
+        .filter(|row| row["stage"] == "codex_zst_input")
+        .collect::<Vec<_>>();
+    let sum = |field: &str| {
+        zst.iter()
+            .filter_map(|row| row["counts"][field].as_u64())
+            .sum::<u64>()
+    };
+    let counted_fulls = logs
+        .iter()
+        .filter_map(|row| {
+            row["counts"]["sampled_acquisition"]["page_events"]["full_reasons"].as_object()
+        })
+        .flat_map(|reasons| reasons.values())
+        .filter_map(Value::as_u64)
+        .sum::<u64>();
+    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &previous, "accept");
+    let facts = PassFacts {
+        entry_size,
+        live_size: live.len(),
+        stamp_matches,
+        listing_unchanged,
+        head,
+        identity_samples: samples_after.0 - samples.0,
+        identity_sample_bytes: samples_after.1 - samples.1,
+        decoders: activity_after.0 - activity.0,
+        parses: activity_after.1 - activity.1,
+        zst_input_rows: zst.len(),
+        zst_compressed_bytes: sum("codex_zst_compressed_consumed_bytes"),
+        zst_decoded_bytes: sum("codex_zst_decoded_bytes"),
+        consumed,
+        counted_fulls,
+        delivered: delivery.0.lock().unwrap().clone(),
+        snapshots: scan.snapshots.len(),
+        posts: posts.len(),
+    };
+    let emitted_route = route(&index, &scan, posts);
+    (index, emitted_route, facts)
+}
+
 /// [regress] 0.1.219 left a never-read archived rollout as a metadata-only
 /// head owing the whole archive, unread. Its ordinary counted Full and exact
 /// ACK settle that debt: the file leaves the outstanding set, counts once
-/// (equivalent to a cold run), keeps no metadata-only head, and the next pass
-/// reads nothing.
+/// (equivalent to a cold run), keeps no metadata-only head, and the next two
+/// passes read nothing. The control is the same archive never seeded: no
+/// 0.1.219 head and no prior debt. Both arms' facts print before any assert.
 #[test]
 fn archive_whole_unread_debt_settles_after_one_counted_full() {
     use crate::snapshots::g7_debt::tests as g7;
     const CONTEXT: &str = "g7-archive-whole-context";
+    struct Arm {
+        seeded: bool,
+        expected: RouteResult,
+        read: RouteResult,
+        seeded_head: Option<(bool, state_v2::Representation)>,
+        owed: Value,
+        passes: [PassFacts; 3],
+        settled: Value,
+        head: Option<(bool, state_v2::Representation, state_v2::DebtSummary)>,
+        revisions: usize,
+        after: Value,
+        facts: String,
+    }
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let c = Corpus::new();
-    let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
-    let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
-    fs::write(&compressed, &encoded).unwrap();
-    File::options()
-        .write(true)
-        .open(&compressed)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600))
-        .unwrap();
-    let (cold_index, cold, _, _, _) = page(
-        &c,
-        ScanIndex::default(),
-        Arc::new(sampled_scan::SharedCache::default()),
-    );
-    let expected = emitted(&cold_index, &cold);
-    assert_eq!(expected.snapshots.len(), 1);
-
-    let (session, mut prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &c.scratch.join("state"),
-    );
-    let key = local_index_key(&compressed);
-    g7::seed_archive_whole_unread(&prior, &compressed);
-    prior.save(session.path()).unwrap();
-    let mut prior = ScanIndex::load(session.path()).unwrap();
-    let head = state_v2::load_head(&prior, &key, u32::MAX)
-        .unwrap()
-        .unwrap();
-    assert!(head.metadata_only);
-    assert_eq!(
-        head.common.representation,
-        state_v2::Representation::Archive
-    );
-    prior.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    let owed = g7::walk(SnapshotSource::Codex, &c.roots(), &mut prior)["debt"].clone();
-    assert_eq!(owed["outstanding_files"], 1);
-    assert_eq!(owed["unread_bytes"], encoded.len() as u64);
-    assert_eq!(owed["over_6h_files"], 1);
-    prior.traversal = None;
-
-    let (working, read, _, consumed, logs) = page(
-        &c,
-        prior.clone(),
-        Arc::new(sampled_scan::SharedCache::default()),
-    );
-    assert!(consumed > 0);
-    assert!(
-        full_decodes(&logs) > 0,
-        "the archive takes an ordinary counted Full"
-    );
-    let (mut index, posts) = working.checkpoint_with_captured_posts(&read, &prior, "accept");
-    let read_route = route(&index, &read, posts);
-    money_oracle::assert_equivalent(&expected, &read_route);
-    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    let read_head = state_v2::load_head(&index, &key, u32::MAX).unwrap();
-    let mut facts = format!(
-        "after the read: head metadata_only={:?} representation={:?} debt={:?}; \
-         receipt={} adoption={}",
-        read_head.as_ref().map(|head| head.metadata_only),
-        read_head.as_ref().map(|head| head.common.representation),
-        read_head.as_ref().map(|head| head.common.debt),
-        index.files[&key].upload_context_receipt.is_some(),
-        index.file_upload_context_requires_adoption(&key),
-    );
-
-    // The next pass reads nothing: no identity sample, decoder, delivery,
-    // consumed byte, snapshot or POST.
-    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-    let activity = codex_zst_refusal_tests::activity();
-    let previous = index.clone();
-    let (working, quiet, delivery, consumed, logs) =
-        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
-    let sampled = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get) != samples;
-    let decoded = codex_zst_refusal_tests::activity() != activity || full_decodes(&logs) > 0;
-    let delivered = delivery.0.lock().unwrap().clone();
-    let (mut index, posts) = working.checkpoint_with_captured_posts(&quiet, &previous, "accept");
-    facts += &format!(
-        "\nnext pass: sampled={sampled} decoded={decoded} consumed={consumed} \
-         delivered={delivered:?} snapshots={} posts={}",
-        quiet.snapshots.len(),
-        posts.len(),
-    );
-
-    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
-    index.save(session.path()).unwrap();
-    let mut index = ScanIndex::load(session.path()).unwrap();
-    let head = state_v2::load_head(&index, &key, u32::MAX).unwrap();
-    let mut revisions = 0;
-    if let Some(head) = &head {
-        state_v2::load_revisions(&index, &key, head, |_, _| {
-            revisions += 1;
-            Ok(())
-        })
-        .unwrap();
+    let mut arms = Vec::new();
+    for seeded in [false, true] {
+        // A fresh process per arm: no walk or aggregate carries over.
+        crate::snapshots::money_freshness::restart_for_test();
+        let c = Corpus::new();
+        let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
+        let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
+        fs::write(&compressed, &encoded).unwrap();
+        File::options()
+            .write(true)
+            .open(&compressed)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600))
+            .unwrap();
+        let (cold_index, cold, _, _, _) = page(
+            &c,
+            ScanIndex::default(),
+            Arc::new(sampled_scan::SharedCache::default()),
+        );
+        let expected = emitted(&cold_index, &cold);
+        let (session, mut prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let key = local_index_key(&compressed);
+        let mut owed = Value::Null;
+        if seeded {
+            g7::seed_archive_whole_unread(&prior, &compressed);
+            prior.save(session.path()).unwrap();
+            prior = ScanIndex::load(session.path()).unwrap();
+            prior.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+            owed = g7::walk(SnapshotSource::Codex, &c.roots(), &mut prior)["debt"].clone();
+            prior.traversal = None;
+        }
+        let seeded_head = head_shape(&prior, &key);
+        let (index, read, first) = observed_pass(&c, &compressed, prior, CONTEXT);
+        let (index, _, second) = observed_pass(&c, &compressed, index, CONTEXT);
+        let (mut index, _, third) = observed_pass(&c, &compressed, index, CONTEXT);
+        index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+        let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+        index.save(session.path()).unwrap();
+        let mut index = ScanIndex::load(session.path()).unwrap();
+        let loaded = state_v2::load_head(&index, &key, u32::MAX).unwrap();
+        let mut revisions = 0;
+        if let Some(head) = &loaded {
+            state_v2::load_revisions(&index, &key, head, |_, _| {
+                revisions += 1;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let head = loaded.as_ref().map(|head| {
+            (
+                head.metadata_only,
+                head.common.representation,
+                head.common.debt,
+            )
+        });
+        index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+        let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+        let facts = format!(
+            "{} arm: compressed={} decoded={}\nseeded head: {seeded_head:?} owed: {owed}\n\
+             pass 1: {first}\npass 2: {second}\npass 3: {third}\nsettled: {settled}\n\
+             head: {head:?} revisions={revisions}\nafter: {after}",
+            if seeded { "seeded" } else { "control" },
+            encoded.len(),
+            rollout(MAIN, Some("a")).len(),
+        );
+        eprintln!("{facts}");
+        arms.push(Arm {
+            seeded,
+            expected,
+            read,
+            seeded_head,
+            owed,
+            passes: [first, second, third],
+            settled,
+            head,
+            revisions,
+            after,
+            facts,
+        });
+        drop(session);
     }
-    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-    let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
-    facts += &format!(
-        "\nsettled: {settled}\nhead: metadata_only={:?} representation={:?} debt={:?} \
-         revisions={revisions}\nafter: {after}",
-        head.as_ref().map(|head| head.metadata_only),
-        head.as_ref().map(|head| head.common.representation),
-        head.as_ref().map(|head| head.common.debt),
-    );
-    assert!(
-        read_head.is_some_and(|head| !head.metadata_only),
-        "the counted read leaves a reduction-bearing head\n{facts}"
-    );
-    assert!(
-        !sampled && !decoded && consumed == 0 && delivered.is_empty(),
-        "no new read\n{facts}"
-    );
-    assert!(quiet.snapshots.is_empty() && posts.is_empty(), "{facts}");
-    assert_eq!(settled["outstanding_files"], 0, "{facts}");
-    assert_eq!(settled["unread_bytes"], 0, "{facts}");
-    assert_eq!(settled["over_6h_files"], 0, "{facts}");
-    if let Some(head) = &head {
-        assert!(!head.metadata_only, "{facts}");
-        assert_eq!(head.common.representation, state_v2::Representation::Tail);
-        assert_eq!(head.common.debt, Default::default(), "{facts}");
-        assert_eq!(revisions, 0, "{facts}");
+    let all = arms
+        .iter()
+        .map(|arm| arm.facts.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for arm in &arms {
+        let label = if arm.seeded { "seeded" } else { "control" };
+        if arm.seeded {
+            assert_eq!(
+                arm.seeded_head,
+                Some((true, state_v2::Representation::Archive)),
+                "{all}"
+            );
+            assert_eq!(arm.owed["outstanding_files"], 1, "{all}");
+            assert_eq!(arm.owed["over_6h_files"], 1, "{all}");
+        }
+        assert!(
+            arm.passes[0].zst_decoded_bytes > 0 && arm.passes[0].posts == 1,
+            "{label}: pass 1 is the one counted Full\n{all}"
+        );
+        for (n, pass) in arm.passes.iter().enumerate().skip(1) {
+            assert!(
+                pass.read_nothing(),
+                "{label}: pass {} reads nothing\n{all}",
+                n + 1
+            );
+        }
+        assert_eq!(arm.settled["outstanding_files"], 0, "{label}\n{all}");
+        assert_eq!(arm.settled["over_6h_files"], 0, "{label}\n{all}");
+        assert_eq!(arm.settled["unread_bytes"], 0, "{label}\n{all}");
+        if let Some((metadata_only, representation, debt)) = arm.head {
+            assert!(!metadata_only, "{label}: no metadata-only head\n{all}");
+            assert_eq!(representation, state_v2::Representation::Tail, "{all}");
+            assert_eq!(debt, Default::default(), "{all}");
+        }
+        assert_eq!(arm.revisions, 0, "{label}\n{all}");
+        assert_eq!(arm.after["outstanding_files"], 0, "{label}\n{all}");
+        assert_eq!(arm.after["over_6h_files"], 0, "{label}\n{all}");
+        money_oracle::assert_equivalent(&arm.expected, &arm.read);
     }
-    assert_eq!(after["outstanding_files"], 0, "{facts}");
-    assert_eq!(after["over_6h_files"], 0, "{facts}");
-    drop(session);
 }
 
 /// [regress] The ordinary first-seen predicate excludes never-seen old input
