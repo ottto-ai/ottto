@@ -76,23 +76,8 @@ impl Counts {
     }
 }
 const COUNTER_COUNT: usize = 23;
-#[cfg(not(test))]
-static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
-#[cfg(test)]
-thread_local! {
-    static COUNTERS: [AtomicU64; COUNTER_COUNT] =
-        const { [const { AtomicU64::new(0) }; COUNTER_COUNT] };
-}
-fn counters<T>(f: impl FnOnce(&[AtomicU64; COUNTER_COUNT]) -> T) -> T {
-    #[cfg(test)]
-    {
-        COUNTERS.with(f)
-    }
-    #[cfg(not(test))]
-    {
-        f(&COUNTERS)
-    }
-}
+crate::local_resource_diagnostics::process_static!(fn counters:
+    [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT]);
 pub(super) fn record(counts: &Counts) {
     counters(|counters| {
         for (counter, value) in counters.iter().zip([

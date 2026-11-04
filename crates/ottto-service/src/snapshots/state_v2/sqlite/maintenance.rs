@@ -11,8 +11,6 @@ pub(in super::super) struct PurgePolicy {
     pub(in super::super) deadline: Duration,
     pub(in super::super) work: Duration,
     pub(super) space: fn(&Path) -> Option<u64>,
-    /// Counts-only charged-work alarm threshold for one save.
-    pub(super) save_ceiling: u64,
     /// Memory for one transaction's old-row string sets; past it, erasure is
     /// required without a diff.
     pub(super) path_diff_budget: usize,
@@ -23,7 +21,6 @@ impl Default for PurgePolicy {
             deadline: ERASURE_DEADLINE,
             work: ERASURE_WORK_BUDGET,
             space: free_space,
-            save_ceiling: SAVE_CEILING_BYTES,
             path_diff_budget: PATH_DIFF_BUDGET_BYTES,
         }
     }
@@ -87,9 +84,6 @@ pub(in super::super) struct MaintenanceStats {
     cache_used_bytes: Option<u64>,
     db_bytes: Option<u64>,
     pub(super) encoded_bytes_per_save: u64,
-    // Retain the existing name for refused or over-threshold charged work.
-    #[serde(skip)]
-    pub(super) refused_save_bytes: u64,
     pub(super) dirty_rows_per_save: u64,
     pub(super) max_value_bytes: u64,
     pub(super) record_rows: u64,

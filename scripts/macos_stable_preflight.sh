@@ -298,6 +298,18 @@ def require_string(value: Any, label: str) -> str:
     return value
 
 
+def app_source_commit(manifest: dict[str, Any], label: str) -> str:
+    materials = require_object(manifest.get("supply_chain"), f"{label} supply_chain").get("materials")
+    commits = [
+        material.get("commit")
+        for material in (materials if isinstance(materials, list) else [])
+        if isinstance(material, dict) and material.get("kind") == "git_subtree"
+    ]
+    if len(commits) != 1:
+        die(f"{label} must record exactly one app source commit in supply_chain.materials")
+    return require_string(commits[0], f"{label} app source commit")
+
+
 def contains_placeholder(value: Any) -> bool:
     if isinstance(value, str):
         return value == "not_run" or value.startswith("TODO")
@@ -377,8 +389,27 @@ if candidate.get("product") != "ottto-local-platform":
     die("stable-candidate RC evidence product must be ottto-local-platform")
 if candidate.get("channel") != "stable-candidate":
     die("stable-candidate RC evidence candidate channel must be stable-candidate")
-if candidate.get("commit") != stable_commit:
-    die("stable-candidate RC evidence commit must match stable manifest commit")
+# The stable build must be the same release as the verified candidate:
+# base version (candidate without -rcN), public commit, and app source commit.
+candidate_version = require_string(candidate.get("version"), "stable-candidate RC evidence version")
+candidate_identity = (
+    re.sub(r"-rc[0-9]+$", "", candidate_version),
+    require_string(candidate.get("commit"), "stable-candidate RC evidence commit"),
+    require_string(
+        candidate.get("app_source_commit"),
+        "stable-candidate RC evidence app_source_commit",
+    ),
+)
+stable_identity = (
+    require_string(manifest.get("version"), "stable manifest version"),
+    stable_commit,
+    app_source_commit(manifest, "stable manifest"),
+)
+if stable_identity != candidate_identity:
+    die(
+        "stable manifest release identity (version, commit, app source commit) "
+        f"{stable_identity} must match the stable-candidate RC {candidate_identity}"
+    )
 if candidate.get("sha256") != candidate_manifest_sha:
     die("stable-candidate RC evidence candidate SHA must match stable manifest gate")
 

@@ -59,15 +59,7 @@ const PLACEMENT_Y: usize = 3;
 const PLACEMENT_N: usize = 4;
 const PLACEMENT_U: usize = 5;
 const UPLOAD_BYTES: usize = 6;
-/// File grain: reason x read mode. A read mode is how, never why.
-const MODES: [&str; 6] = [
-    "tail",
-    "state_missing",
-    "scope_changed",
-    "audit_due",
-    "clock_changed",
-    "other",
-];
+/// File grain, per reason.
 const READ_FIELDS: [&str; 3] = ["files", "native_bytes", "validation_bytes"];
 const SUB_COUNTS: [&str; 2] = [
     "source_reset_same_size_edit_files",
@@ -79,7 +71,7 @@ const SUB_COUNTS: [&str; 2] = [
 const UNKNOWN: [&str; 2] = ["money_only_reveal", "late_external_evidence"];
 const UPLOAD_START: usize = CHANGE_REASON_START;
 const READ_START: usize = UPLOAD_START + TOKENS.len() * FIELDS.len();
-const SUB_START: usize = READ_START + TOKENS.len() * MODES.len() * READ_FIELDS.len();
+const SUB_START: usize = READ_START + TOKENS.len() * READ_FIELDS.len();
 pub(super) const END: usize = SUB_START + SUB_COUNTS.len();
 
 /// Claude session bits from this page's identity tagging.
@@ -232,15 +224,7 @@ pub(crate) fn read(
     if token == Token::SourceReset && mode == ReadMode::Full(FullReason::SameSizeEdit) {
         add(source, SUB_START, 1);
     }
-    let mode = match mode {
-        ReadMode::Tail => 0,
-        ReadMode::Full(FullReason::StateMissing) => 1,
-        ReadMode::Full(FullReason::ScopeChanged) => 2,
-        ReadMode::Full(FullReason::AuditDue) => 3,
-        ReadMode::Full(FullReason::ClockChanged) => 4,
-        _ => 5,
-    };
-    let row = READ_START + (token as usize * MODES.len() + mode) * READ_FIELDS.len();
+    let row = READ_START + token as usize * READ_FIELDS.len();
     for (field, amount) in [1, native_bytes, validation_bytes].into_iter().enumerate() {
         add(source, row + field, amount);
     }
@@ -362,7 +346,7 @@ pub(crate) struct Page {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     upload: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    read: BTreeMap<&'static str, BTreeMap<&'static str, BTreeMap<&'static str, u64>>>,
+    read: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     #[serde(flatten)]
     sub_counts: BTreeMap<&'static str, u64>,
     unknown: [&'static str; 2],
@@ -393,17 +377,9 @@ pub(crate) fn drain(source: &str) -> Option<Page> {
         if !row.is_empty() {
             page.upload.insert(name, row);
         }
-        let modes = MODES
-            .into_iter()
-            .enumerate()
-            .map(|(mode, label)| {
-                let base = READ_START + (token * MODES.len() + mode) * READ_FIELDS.len();
-                (label, cells(base, &READ_FIELDS[..]))
-            })
-            .filter(|(_, cell)| !cell.is_empty())
-            .collect::<BTreeMap<_, _>>();
-        if !modes.is_empty() {
-            page.read.insert(name, modes);
+        let read = cells(READ_START + token * READ_FIELDS.len(), &READ_FIELDS[..]);
+        if !read.is_empty() {
+            page.read.insert(name, read);
         }
     }
     page.sub_counts = cells(SUB_START, &SUB_COUNTS[..]);

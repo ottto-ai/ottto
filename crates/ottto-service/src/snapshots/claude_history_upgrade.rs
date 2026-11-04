@@ -827,18 +827,14 @@ impl super::ScanIndex {
             super::claude_index_path_family_member(std::path::Path::new(index_key))
         {
             if let Some(keys) = path_twins(groups, &member) {
-                for (key, size) in keys {
+                for (key, _) in keys {
                     if self.claude_money_birth_store.staged(key) {
                         continue;
                     }
                     // Exactly one metadata read per indexed twin per page. No content read.
                     let opened = probe_opened_birth(key);
-                    self.claude_money_birth_store.stage_opened(
-                        &member,
-                        key,
-                        opened,
-                        size.unwrap_or(0),
-                    );
+                    self.claude_money_birth_store
+                        .stage_opened(&member, key, opened);
                 }
             }
         }
@@ -1019,43 +1015,18 @@ pub(crate) enum LocalCount {
     ActivationRefused = 2,
 }
 
-#[cfg(not(test))]
-static LOCAL_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+crate::local_resource_diagnostics::process_static!(fn with_local_counts:
+    [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3]);
 
-#[cfg(not(test))]
 fn add_local_count(count: LocalCount) {
-    LOCAL_COUNTS[count as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The process-wide count so far.
-#[cfg(not(test))]
-pub(crate) fn local_count(count: LocalCount) -> u64 {
-    LOCAL_COUNTS[count as usize].load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(test)]
-thread_local! {
-    static LOCAL_COUNTS: [std::cell::Cell<u64>; 3] = const {
-        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
-    };
-}
-
-#[cfg(test)]
-fn add_local_count(count: LocalCount) {
-    LOCAL_COUNTS.with(|counts| {
-        let cell = &counts[count as usize];
-        cell.set(cell.get().saturating_add(1));
+    with_local_counts(|counts| {
+        counts[count as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     });
 }
 
-/// The count so far on this test thread.
-#[cfg(test)]
+/// The process-wide count so far (this thread's under test).
 pub(crate) fn local_count(count: LocalCount) -> u64 {
-    LOCAL_COUNTS.with(|counts| counts[count as usize].get())
+    with_local_counts(|counts| counts[count as usize].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn note_listed_literal_denied() {

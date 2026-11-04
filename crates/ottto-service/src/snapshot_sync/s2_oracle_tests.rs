@@ -742,7 +742,9 @@ fn assert_family_converges(c: &Corpus, session: &StateV2ColdSession, mut index: 
     );
 }
 
-/// [money] Resolved path twins stop selecting with evidence fixed.
+/// [money] Resolved path twins stop selecting with evidence fixed. The later
+/// twin's own turn is after the copy proof cutoff, so the same-session page
+/// proof dedupes its copied request whenever both twins are read.
 #[test]
 fn forced_family_converges_after_resolve() {
     with_e2(|| {
@@ -754,8 +756,8 @@ fn forced_family_converges_after_resolve() {
         );
         c.write_at(
             &format!("z/{ROOT}.jsonl"),
-            &(line(ROOT, "a", AT, 10) + &line(ROOT, "b", "2026-08-02T07:03:10Z", 20)),
-            "2026-08-02T07:03:00Z",
+            &(line(ROOT, "a", AT, 10) + &line(ROOT, "b", "2026-11-04T07:03:10Z", 20)),
+            "2026-11-04T07:03:00Z",
         );
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,

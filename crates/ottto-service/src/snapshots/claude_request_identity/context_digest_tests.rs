@@ -52,17 +52,12 @@ fn digest_is_the_keyed_domain_separated_hmac_not_the_plain_sha() {
             .finalize()
     );
     assert_ne!(keyed, plain);
-    assert_ne!(
-        keyed,
-        hmac_hex(&[3; 32], json!(["claude_folder_login_address:v1", email]))
-    );
 
     bind_session_context_key(Some(&attribution(4)));
     assert_ne!(keyed, accepted::session_context_digest(email).unwrap());
 }
 
 /// Without a key nothing is stored and nothing explains an organization change.
-/// The first email still qualifies, until a later sentence that cannot be compared.
 #[test]
 fn no_key_stores_no_field_and_fails_closed() {
     bind_session_context_key(None);
@@ -75,8 +70,6 @@ fn no_key_stores_no_field_and_fails_closed() {
     assert_eq!(markers.context_digest, None);
     assert_eq!(markers.context_position, Some(0));
     assert_eq!(markers.context_flip_position, Some(2));
-    assert!(markers.email_precedes(1));
-    assert!(!markers.email_precedes(2));
     assert!(matches!(
         markers.verdict(0, false),
         MarkerVerdict::Trusted(_)
@@ -195,7 +188,6 @@ fn scrub_drops_a_pending_change_and_remembers_a_blank_sentence() {
     note_marker_line(&mut blank, &org(ORG_2), 1);
     let blank = blank.unwrap();
     assert_eq!(blank.verdict(1, false), MarkerVerdict::UntrustedFlip);
-    assert!(!blank.email_precedes(1));
 }
 
 /// SOURCE condition 1 with no sentence digest to clear: a blank no-key sentence

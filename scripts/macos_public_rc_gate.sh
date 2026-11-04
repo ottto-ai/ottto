@@ -14,7 +14,8 @@ Usage: macos_public_rc_gate.sh --candidate-manifest <release-manifest.json> --ev
 Validates stable-candidate RC evidence before stable public-v1 promotion.
 The stable-candidate manifest must pass the release gate, the evidence must be
 redacted and fully passed, and an optional stable manifest must point at the
-same stable-candidate evidence and commit.
+same stable-candidate evidence and commit. The evidence must name the
+candidate's app source commit.
 USAGE
 }
 
@@ -152,6 +153,18 @@ def resolve_reference(base_dir: Path, reference: str) -> Path:
     return (base_dir / path).resolve()
 
 
+def app_source_commit(manifest: dict[str, Any], label: str) -> str:
+    materials = require_object(manifest.get("supply_chain"), f"{label} supply_chain").get("materials")
+    commits = [
+        material.get("commit")
+        for material in (materials if isinstance(materials, list) else [])
+        if isinstance(material, dict) and material.get("kind") == "git_subtree"
+    ]
+    if len(commits) != 1:
+        die(f"{label} must record exactly one app source commit in supply_chain.materials")
+    return require_string(commits[0], f"{label} app source commit")
+
+
 def contains_placeholder(value: Any) -> bool:
     if isinstance(value, str):
         return value == "not_run" or value.startswith("TODO")
@@ -181,6 +194,7 @@ if candidate_manifest.get("min_protocol_version") != 15:
     die("stable-candidate manifest min_protocol_version must be 15")
 if not re.fullmatch(r"[0-9a-f]{7,40}", candidate_commit):
     die("stable-candidate manifest commit is not a git SHA prefix")
+candidate_app_commit = app_source_commit(candidate_manifest, "stable-candidate manifest")
 
 raw_artifacts = candidate_manifest.get("artifacts", [])
 if not isinstance(raw_artifacts, list) or not raw_artifacts:
@@ -226,6 +240,8 @@ if candidate_evidence.get("version") != candidate_version:
     die("evidence stable-candidate version does not match stable-candidate manifest")
 if candidate_evidence.get("commit") != candidate_commit:
     die("evidence stable-candidate commit does not match stable-candidate manifest")
+if candidate_evidence.get("app_source_commit") != candidate_app_commit:
+    die("evidence stable-candidate app_source_commit does not match stable-candidate manifest")
 if candidate_evidence.get("sha256") != candidate_sha:
     die("evidence stable-candidate manifest SHA does not match stable-candidate manifest")
 if local_platform.get("runtime") != "ottto-service":

@@ -343,15 +343,29 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
     assert_eq!(sent[0], sent[1], "identical bytes on the resend");
 }
 
-/// No exact capability token: nothing new reaches the wire and no ledger is
-/// written, so the persisted index and the body stay byte-identical.
+/// [format] A server that still advertises the retired recorded-login
+/// capability is ignored: its hint decodes as before, and request evidence
+/// keeps its existing wire bytes.
 #[test]
-fn recorded_login_capability_off_keeps_every_byte() {
+fn sole_login_hint_token_is_ignored() {
+    let mut raw = serde_json::json!({
+        "source": SnapshotSource::ClaudeCode.api_slug(),
+        "server_time": "2026-10-24T00:00:00Z",
+        "last_data_at": null,
+        "record_count_15m": 0,
+        "record_count_24h": 0,
+        "local_usage_reconciliation_enabled": true,
+        "backfill_window_days": 30,
+        "recommended_scan_after": "2026-10-24T00:05:00Z",
+    });
+    assert!(crate::snapshot_client::decode_activity_hint(raw.clone()).is_ok());
+    raw["session_request_sole_login_witness_contract"] =
+        "session_request_sole_login_witness:v1".into();
+    assert!(crate::snapshot_client::decode_activity_hint(raw).is_ok());
     let entry = crate::snapshots::SnapshotRequestEvidence {
         identity_basis: "transcript_org".to_string(),
         provider_workspace_hash: Some("d".repeat(64)),
         account_source: None,
-        sole_login_witness: None,
     };
     assert_eq!(
         serde_json::to_value(&entry).unwrap(),
@@ -360,30 +374,4 @@ fn recorded_login_capability_off_keeps_every_byte() {
             "provider_workspace_hash": "d".repeat(64),
         })
     );
-    let mut index = crate::snapshots::ScanIndex::default();
-    let before = serde_json::to_vec(&index).unwrap();
-    crate::snapshots::claude_folder_login::begin_page(
-        &mut index,
-        &crate::snapshots::ScanIndex::default(),
-        &[std::path::PathBuf::from("/synthetic/cfg/projects")],
-        false,
-    );
-    assert_eq!(serde_json::to_vec(&index).unwrap(), before);
-}
-
-/// [regress] D156: the login-address key and its capability are not in the
-/// acquisition scope, so a flap or a rotation never forces a whole read.
-#[test]
-fn the_login_address_key_never_changes_the_acquisition_scope() {
-    use crate::claude_status_coverage::bind_address_key;
-    let index_path = std::path::Path::new("/synthetic/index.json");
-    let scope = || cycle_sampled_scope(&[7; 32], "namespace", index_path, true).0;
-    bind_address_key(None);
-    let off = scope();
-    bind_address_key(Some(zeroize::Zeroizing::new([0x42; 32])));
-    assert_eq!(scope(), off);
-    bind_address_key(Some(zeroize::Zeroizing::new([0x43; 32])));
-    assert_eq!(scope(), off);
-    bind_address_key(None);
-    assert_eq!(scope(), off);
 }

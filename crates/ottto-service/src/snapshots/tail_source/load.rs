@@ -49,8 +49,9 @@ pub(in crate::snapshots) enum Load {
 
 /// A selection of an unchanged transcript for evidence read at finish (late
 /// telemetry or side calls, a family or account proof, a quarantine retry).
-/// Its re-fold from stored state reads 0 transcript bytes; a body that is not
-/// the ACKed one goes as an ordinary update, counted `tail_refold{reason}`.
+/// Its re-fold from stored state reads 0 transcript bytes, counted
+/// `tail_refold{reason}` at the load; a body that is not the ACKed one goes as
+/// an ordinary update.
 pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool {
     matches!(
         reason,
@@ -330,12 +331,6 @@ pub(super) fn load<S: TailSource>(
         counters::add(source, "tail_reconstruct_bytes", cause, bytes);
         if after_head {
             counters::bump(source, "tail_reconstruct_after_head", cause);
-            if counters::restart_full_alarm_due(source) {
-                crate::local_resource_diagnostics::tail_restart_full_alarm(
-                    source.api_slug(),
-                    &serde_json::json!({ "cause": cause }),
-                );
-            }
         }
     }
     counters::bump(source, "tail_db_loads", outcome);
@@ -414,7 +409,7 @@ fn stored<S: TailSource>(
     })?;
     let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
     if toggled {
-        reduction.scrub_identity(true, false);
+        reduction.scrub_context_digest();
     }
     let taken = Taken {
         modified_hint: checkpoint.modified_hint(),

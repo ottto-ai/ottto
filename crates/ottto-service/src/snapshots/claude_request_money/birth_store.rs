@@ -81,7 +81,7 @@ struct Session(
 // Sessions are a sorted Vec: inserts within a page grow amortized, and the
 // save-time prune shrinks it back to its length.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BirthStore(Vec<Session>, Vec<(LocationKey, u8)>, MoneyMarks);
+pub(crate) struct BirthStore(Vec<Session>, Vec<LocationKey>, MoneyMarks);
 /// Money-rule marks (design item 8): the rule version applied and, per
 /// indexed path with a settled request-owned body, which rules shaped its
 /// money. A later money fix re-owes only the paths its mask names.
@@ -375,36 +375,20 @@ impl BirthStore {
         self.staged_location(location_key(path))
     }
     pub(in crate::snapshots) fn staged_location(&self, path: LocationKey) -> bool {
-        self.1.binary_search_by_key(&path, |o| o.0).is_ok()
-    }
-    pub(in crate::snapshots) fn witnessed(&self, path: LocationKey) -> bool {
-        self.1
-            .binary_search_by_key(&path, |o| o.0)
-            .ok()
-            .is_some_and(|i| self.1[i].1 == 3)
+        self.1.binary_search(&path).is_ok()
     }
     pub(in crate::snapshots) fn stage_opened(
         &mut self,
         session: &str,
         path: &str,
         opened: Option<ClaudeOpenedBirth>,
-        indexed_size: u64,
     ) {
         let pk = location_key(path);
         if let Some(opened) = opened.filter(|o| o.birth != 0) {
             self.record_opened(session, path, i128::from(opened.birth), opened);
         }
-        let valid = opened.is_some_and(|current| {
-            current.size >= indexed_size
-                && self
-                    .get(session)
-                    .and_then(|s| s.4.binary_search_by_key(&pk, |o| o.0).ok().map(|i| &s.4[i]))
-                    .is_some_and(|o| o.3.covers(current))
-        });
-        let status = u8::from(opened.is_some()) | (u8::from(valid) << 1);
-        match self.1.binary_search_by_key(&pk, |o| o.0) {
-            Ok(i) => self.1[i].1 = status,
-            Err(i) => self.1.insert(i, (pk, status)),
+        if let Err(i) = self.1.binary_search(&pk) {
+            self.1.insert(i, pk);
         }
     }
     /// Remember the identity at birth, never rebind an old minimum to a replacement.
@@ -528,17 +512,6 @@ impl BirthStore {
         s.3 = 0;
         true
     }
-    /// Earlier effective birth, then digest order, prevents reciprocal deletion.
-    /// Caller validates the opened live witness, rather than pathname existence.
-    #[cfg(test)]
-    pub(crate) fn original_witness(
-        &self,
-        session: &str,
-        path: &str,
-        live: impl FnMut(LocationKey) -> bool,
-    ) -> Option<LocationKey> {
-        self.original_witness_at(session, path, self.effective_cutoff(session, path)?, live)
-    }
     pub(crate) fn observations(
         &self,
         session: &str,
@@ -547,30 +520,6 @@ impl BirthStore {
             s.4.iter()
                 .filter_map(|&(p, b, _, _)| (b != 0).then_some((p, i128::from(b))))
         })
-    }
-    pub(crate) fn original_witness_at(
-        &self,
-        session: &str,
-        path: &str,
-        opened_birth: i128,
-        mut live: impl FnMut(LocationKey) -> bool,
-    ) -> Option<LocationKey> {
-        let s = self.get(session)?;
-        let pk = location_key(path);
-        let own = self
-            .effective_cutoff(session, path)
-            .map_or(opened_birth, |b| b.min(opened_birth));
-        let current = (own, pk);
-        s.4.iter()
-            .filter_map(|&(p, b, _, _)| {
-                if b == 0 {
-                    return None;
-                }
-                let b = if p == s.1 { s.2 } else { b };
-                (p != pk && (i128::from(b), p) < current && live(p)).then_some((b, p))
-            })
-            .min()
-            .map(|(_, p)| p)
     }
     /// Observations survive partial/held save restoration independently of ACKs.
     pub(crate) fn preserve_missing_from(&mut self, previous: &Self) {
@@ -659,7 +608,7 @@ impl BirthStore {
     fn memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.0.capacity() * std::mem::size_of::<Session>()
-            + self.1.capacity() * std::mem::size_of::<(LocationKey, u8)>()
+            + self.1.capacity() * std::mem::size_of::<LocationKey>()
             + self.2.paths.capacity() * std::mem::size_of::<(LocationKey, u8)>()
             + self
                 .0
@@ -711,6 +660,13 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+    /// Whether the persisted generation witness of session "s"'s live path
+    /// "A" covers `opened`, as a discovered move validates it.
+    fn witnessed(store: &BirthStore, opened: ClaudeOpenedBirth) -> bool {
+        store.can_record_discovered_move("s", "A", "A-moved", opened)
+    }
+    /// [behaviour] The object witness at birth persists and only grows; the
+    /// page's metadata probes do not survive a restart or a page.
     #[test]
     fn generation_witness_is_append_only_persisted_and_page_probes_are_transient() {
         let mut store = BirthStore::default();
@@ -721,40 +677,41 @@ mod tests {
             size: 10,
         };
         store.record_opened("s", "A", 100, opened);
-        store.stage_opened("s", "A", Some(opened), 10);
-        assert!(store.witnessed(location_key("A")));
+        store.stage_opened("s", "A", Some(opened));
+        assert!(store.staged_location(location_key("A")));
+        assert!(witnessed(&store, opened));
         let mut restored: BirthStore =
             serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
         assert!(
-            !restored.witnessed(location_key("A")),
+            !restored.staged_location(location_key("A")),
             "no cached probes survive restart"
         );
-        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 20, ..opened }), 10);
-        assert!(
-            restored.witnessed(location_key("A")),
-            "append preserves the witness"
-        );
+        assert!(witnessed(&restored, opened), "the witness is persisted");
+        let grown = ClaudeOpenedBirth { size: 20, ..opened };
+        restored.stage_opened("s", "A", Some(grown));
+        assert!(witnessed(&restored, grown), "append preserves the witness");
         restored.preserve_missing_from(&store);
         restored.begin_page();
-        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 19, ..opened }), 10);
+        assert!(!restored.staged_location(location_key("A")));
+        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 19, ..opened }));
         assert!(
-            !restored.witnessed(location_key("A")),
+            !witnessed(&restored, ClaudeOpenedBirth { size: 19, ..opened }),
             "remember the highest observed extent"
         );
         restored.begin_page();
-        restored.stage_opened(
-            "s",
-            "A",
-            Some(ClaudeOpenedBirth {
-                birth: 200,
-                inode: 3,
-                size: 30,
-                ..opened
-            }),
-            10,
-        );
+        let replacement = ClaudeOpenedBirth {
+            birth: 200,
+            inode: 3,
+            size: 30,
+            ..opened
+        };
+        restored.stage_opened("s", "A", Some(replacement));
+        let at_old_birth = ClaudeOpenedBirth {
+            birth: 100,
+            ..replacement
+        };
         assert!(
-            !restored.witnessed(location_key("A")),
+            !witnessed(&restored, at_old_birth) && witnessed(&restored, grown),
             "old minimum never rebinds to a replacement"
         );
         assert_eq!(restored.observed_birth("s", "A"), Some(100));
@@ -841,6 +798,8 @@ mod tests {
         bytes
     }
 
+    /// [format] A CMB3 identity decodes to the compact object witness and
+    /// survives a CMB4 round trip.
     #[test]
     fn cmb3_identity_decodes_to_the_compact_object_witness() {
         let mut restored: BirthStore = serde_json::from_value(serde_json::json!(
@@ -853,18 +812,21 @@ mod tests {
             inode: 2,
             size: 10,
         };
-        restored.stage_opened("s", "A", Some(opened), 10);
-        assert!(restored.witnessed(location_key("A")));
+        restored.stage_opened("s", "A", Some(opened));
+        assert!(witnessed(&restored, opened));
         restored.begin_page();
-        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { inode: 3, ..opened }), 10);
-        assert!(!restored.witnessed(location_key("A")), "another object");
+        let other = ClaudeOpenedBirth { inode: 3, ..opened };
+        restored.stage_opened("s", "A", Some(other));
+        assert!(!witnessed(&restored, other), "another object");
         // Written back as CMB4 and read again, the witness is unchanged.
         let mut again: BirthStore =
             serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
-        again.stage_opened("s", "A", Some(opened), 10);
-        assert!(again.witnessed(location_key("A")));
+        again.stage_opened("s", "A", Some(opened));
+        assert!(witnessed(&again, opened));
+        assert!(!witnessed(&again, other));
     }
 
+    /// [format] CMB1/CMB2 minima decode without an invented object witness.
     #[test]
     fn legacy_birth_codecs_keep_minima_without_inventing_generation_witnesses() {
         for version in [b"CMB1", b"CMB2"] {
@@ -873,21 +835,17 @@ mod tests {
                 serde_json::from_value(serde_json::json!(URL_SAFE_NO_PAD.encode(legacy))).unwrap();
             assert_eq!(restored.observed_birth("s", "A"), Some(100));
             assert_eq!(restored.effective_cutoff("s", "A"), Some(100));
-            assert!(!restored.witnessed(location_key("A")));
+            let opened = ClaudeOpenedBirth {
+                birth: 100,
+                device: 1,
+                inode: 2,
+                size: 10,
+            };
+            assert!(!witnessed(&restored, opened));
             let mut restored = restored;
-            restored.stage_opened(
-                "s",
-                "A",
-                Some(ClaudeOpenedBirth {
-                    birth: 100,
-                    device: 1,
-                    inode: 2,
-                    size: 10,
-                }),
-                10,
-            );
+            restored.stage_opened("s", "A", Some(opened));
             assert!(
-                !restored.witnessed(location_key("A")),
+                !witnessed(&restored, opened),
                 "legacy minima have no recorded generation to compare"
             );
         }
@@ -921,6 +879,8 @@ mod tests {
             "an unmoved live twin keeps its own cutoff"
         );
     }
+    /// [regress] A path moved away and copied back takes a new birth; the
+    /// retired birth stays with the move's destination.
     #[test]
     fn move_then_copy_back_does_not_reuse_retired_birth_after_restore_or_restart() {
         let mut store = BirthStore::default();
@@ -942,29 +902,12 @@ mod tests {
         assert_eq!(restored.observed_birth("s", "A"), Some(300));
         assert_eq!(restored.effective_cutoff("s", "A"), Some(300));
         assert_eq!(restored.effective_cutoff("s", "B"), Some(100));
-        assert!(restored.original_witness("s", "B", |_| true).is_none());
-        assert_eq!(
-            restored.original_witness("s", "A", |_| true),
-            Some(location_key("B"))
-        );
         restored.record_observation("s", "A", 400);
         assert_eq!(
             restored.observed_birth("s", "A"),
             Some(300),
             "same-path replacement within new generation keeps minimum"
         );
-    }
-    #[test]
-    fn equal_birth_witnesses_have_only_one_winner() {
-        for (a, b) in [("A", "B"), ("B", "A")] {
-            let mut births = BirthStore::default();
-            births.record_observation("s", a, 100);
-            births.record_observation("s", b, 100);
-            let aw = births.original_witness("s", a, |_| true);
-            let bw = births.original_witness("s", b, |_| true);
-            assert_ne!(aw.is_some(), bw.is_some());
-            assert!(births.original_witness("s", a, |_| false).is_none());
-        }
     }
     #[test]
     fn retain_thirty_days_after_last_indexed_session_path() {
