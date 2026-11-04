@@ -1,11 +1,13 @@
 //! The cross-root answers of one Claude local-evidence pass, gathered root by
-//! root while the strict read streams the corpus. Only the page's own roots
-//! keep their rows; every other root's rows are dropped right after they are
-//! added here. Each answer equals the one a pass holding every root's rows
-//! gives: the same rows, the same sorted root order, the same first refusal.
+//! root while the strict read streams the pass's scope. Only the page's own
+//! roots keep their rows; every other root's rows are dropped right after they
+//! are added here. Each answer equals the one a pass holding every scope
+//! root's rows gives: the same rows, the same sorted root order, the same
+//! first refusal.
 
 use super::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
-use super::{ClaudeLegacyRequestOwners, SnapshotItem};
+use super::claude_request_census::claude_request_hash;
+use super::{ClaudeLegacyRequestOwners, ScanIndex, SnapshotItem};
 use crate::claude_local_otel::{ClaudeLocalOtelEvidence, ClaudeTraceOwnershipEvidence};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,8 +63,115 @@ impl RequestRootJoins {
     }
 }
 
+/// The roots one pass reads side files for, and which other sessions own a
+/// page request. Root ids stay in memory only: no `Debug`, never logged.
+#[derive(Default)]
+pub(crate) struct EvidenceScope {
+    roots: BTreeSet<String>,
+    /// Census hash of a page request without an own API row: the sessions
+    /// whose MAIN transcript holds it.
+    holders: BTreeMap<u64, BTreeSet<String>>,
+    /// Page root: the sessions its files' `fork-context-ref` lines name.
+    parents: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl EvidenceScope {
+    /// Each page file's named fork parent, by the file's family root.
+    pub(crate) fn fork_parents(items: &[SnapshotItem]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|item| {
+                let parent = item.claude_money.as_deref()?.fork_parent()?;
+                Some((
+                    super::claude_snapshot_family_root_ref(item).to_owned(),
+                    parent.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// `kept`: the page's own roots, read with their witnesses' legacy owners
+    /// and named fork parents. `api`: the page's API read, by root. One census
+    /// walk over every folder, with no deadline (in memory, no I/O), adds the
+    /// holders of the page requests that have no API row of their own.
+    pub(crate) fn of_page(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        kept: &BTreeSet<String>,
+        fork_parents: Vec<(String, String)>,
+        api: &BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>,
+    ) -> Self {
+        let mut scope = Self {
+            roots: kept.clone(),
+            ..Self::default()
+        };
+        scope.roots.extend(
+            kept.iter()
+                .filter_map(|root| index.claude_usage_family_witnesses.get(root))
+                .flat_map(|witness| witness.legacy_owner_roots.iter().cloned()),
+        );
+        for (root, parent) in fork_parents {
+            scope.roots.insert(parent.clone());
+            scope.parents.entry(root).or_default().insert(parent);
+        }
+        let own = api
+            .iter()
+            .flat_map(|(root, rows)| {
+                rows.iter()
+                    .map(move |row| (root.as_str(), row.request_id.as_str()))
+            })
+            .collect::<BTreeSet<_>>();
+        let own = &own;
+        let mut wanted = items
+            .iter()
+            .flat_map(|item| {
+                let root = super::claude_snapshot_family_root_ref(item);
+                super::claude_request_money::e2::item_request_ids(item)
+                    .filter(move |id| !own.contains(&(root, id.as_str())))
+                    .map(|id| claude_request_hash(id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let holders = &mut scope.holders;
+        let complete = index.claude_request_census.main_transcript_holders(
+            None,
+            &wanted,
+            None,
+            |_, holder, _, hits| {
+                for &hash in hits {
+                    holders.entry(hash).or_default().insert(holder.to_owned());
+                }
+            },
+        );
+        debug_assert!(complete.is_some(), "a walk without a deadline completes");
+        scope
+            .roots
+            .extend(scope.holders.values().flatten().cloned());
+        scope
+    }
+
+    /// The test reference: the given roots, as a pass over every side-file
+    /// root would read them.
+    #[cfg(test)]
+    pub(crate) fn every(roots: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            roots: roots.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Every root to read, in sorted order.
+    pub(crate) fn roots(&self) -> impl Iterator<Item = &String> {
+        self.roots.iter()
+    }
+}
+
 /// Root ids and request strings stay in memory only: no `Debug`, never logged.
 pub(crate) struct CrossRootEvidence {
+    /// The roots this pass reads and the owners it names.
+    scope: EvidenceScope,
     /// Every root added, by ordinal; tripwire rows name their root this way.
     roots: Vec<String>,
     /// (a) Exact cross-root answers for the page's possible request lookups.
@@ -75,8 +184,9 @@ pub(crate) struct CrossRootEvidence {
 }
 
 impl CrossRootEvidence {
-    pub(crate) fn new(items: &[SnapshotItem]) -> Self {
+    pub(crate) fn new(items: &[SnapshotItem], scope: EvidenceScope) -> Self {
         Self {
+            scope,
             roots: Vec::new(),
             // Includes copied/excluded ids and occurrence-only keys. These
             // cover transcript grouping, reconciliation and activity inputs.
@@ -90,6 +200,22 @@ impl CrossRootEvidence {
             legacy_request_owners: ClaudeLegacyRequestOwners::default(),
             tripwire_rows: Vec::new(),
         }
+    }
+
+    /// The other sessions the scope names as owners of `request_id` in a file
+    /// under `root`: the census holders and the file's named fork parents.
+    pub(crate) fn named_owners<'s>(
+        &'s self,
+        root: &'s str,
+        request_id: &str,
+    ) -> impl Iterator<Item = &'s String> + 's {
+        self.scope
+            .holders
+            .get(&claude_request_hash(request_id))
+            .into_iter()
+            .chain(self.scope.parents.get(root))
+            .flatten()
+            .filter(move |owner| owner.as_str() != root)
     }
 
     fn ordinal(&mut self, root: &str) -> u32 {
@@ -285,7 +411,8 @@ mod tests {
                 .remove(0)
             },
         );
-        let mut cross = CrossRootEvidence::new(std::slice::from_ref(&item));
+        let mut cross =
+            CrossRootEvidence::new(std::slice::from_ref(&item), EvidenceScope::default());
         // No healthy root claims this request. The vetoing row is independent
         // of ownership demand and must not become a foreign-owner answer.
         cross.add_vetoing_api(
