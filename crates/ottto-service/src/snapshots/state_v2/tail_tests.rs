@@ -265,19 +265,16 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
     assert_eq!(erasure_marks(&index), 1);
 }
 
-fn usage_family() -> crate::snapshots::ClaudeUsageFamilyPending {
-    crate::snapshots::ClaudeUsageFamilyPending {
-        census_window_end: "2026-11-02T00:00:00Z".into(),
-        member_request_id_hashes: BTreeMap::from([(
-            "family".into(),
-            std::collections::BTreeSet::from(["c".repeat(64)]),
-        )]),
-        member_occurrences: BTreeMap::new(),
-        invalid: false,
-        idless_revision: None,
-        identity_contract: None,
-        contract_unproven: false,
-    }
+/// A usage-family witness whose excluded request hashes are one shared
+/// request set.
+fn usage_witness() -> crate::snapshots::ClaudeUsageFamilyWitness {
+    serde_json::from_value(serde_json::json!({
+        "evidence_fingerprint": "e".repeat(64),
+        "member_request_id_fingerprints": {"family": "f".repeat(64)},
+        "assigned_request_id_fingerprints": {},
+        "legacy_excluded_request_id_hashes": {"family": ["c".repeat(64)]},
+    }))
+    .unwrap()
 }
 
 /// [behaviour] One bad file rolls back alone with its own graph rows: its
@@ -329,16 +326,17 @@ fn one_file_closure_rolls_back_alone_and_the_route_reloads() {
         index.files.insert(SIBLING.into(), progress_row());
         index.accepted_snapshot_fingerprints.insert("b".repeat(64));
         index
-            .claude_usage_family_pending
-            .add("family".into(), usage_family());
+            .claude_usage_family_witnesses
+            .insert("family".into(), usage_witness());
     };
     let shared_committed = |index: &ScanIndex| {
         assert!(index.files.get(SIBLING).is_some());
         assert!(index
             .accepted_snapshot_fingerprints
             .contains(&"b".repeat(64)));
-        let family = index.claude_usage_family_pending.view("family");
-        assert_eq!(family.map(|family| family.hash_member_count()), Some(1));
+        let witness = index.claude_usage_family_witnesses.get("family");
+        let excluded = witness.map(|w| w.legacy_excluded_request_id_hashes.len());
+        assert_eq!(excluded, Some(1));
     };
     for attempts in 1..=2 {
         advance(&mut index);

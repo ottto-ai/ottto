@@ -13,10 +13,16 @@ fn fixture() -> ScanIndex {
     raw["generation"] = json!(0);
     raw["claude_request_census"]["same-census"] =
         raw["claude_request_census"]["synthetic-file"].clone();
-    raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
-        ["same-member"] = raw["claude_usage_family_pending"]["synthetic-family"]
-        ["member_request_id_hashes"]["synthetic-file"]
-        .clone();
+    // Usage proof whose two members hold one shared request set: a repeated
+    // reference inside one ACCOUNTS row.
+    let excluded = json!(["b".repeat(64)]);
+    raw["claude_usage_family_witnesses"]["synthetic-family"] = json!({
+        "evidence_fingerprint": "e".repeat(64),
+        "member_request_id_fingerprints": {"synthetic-file": "f".repeat(64)},
+        "assigned_request_id_fingerprints": {},
+        "legacy_excluded_request_id_hashes":
+            {"synthetic-file": excluded, "same-member": excluded},
+    });
     raw["claude_account_family_pending"]["synthetic-family"]["v"] =
         json!("claude_account_request_set:v2");
     raw["claude_account_family_pending"]["synthetic-family"]["r"] =
@@ -89,8 +95,8 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
         let mut raw = serde_json::to_value(fixture()).unwrap();
         raw["accepted_snapshot_fingerprints"] = json!([]);
         raw["confirmed_empty_files"] = json!([]);
-        raw["claude_usage_family_pending"]["empty-family"] =
-            json!({"census_window_end":"", "member_request_id_hashes":{}, "invalid":false});
+        raw["claude_usage_family_witnesses"]["empty-family"] = json!({"evidence_fingerprint":"",
+            "member_request_id_fingerprints":{}, "assigned_request_id_fingerprints":{}});
         raw["snapshot_activity_at"] = json!({"absent-time":null,"empty-time":""});
         if let Some(value) = &value {
             raw["claude_history_cutoff_unix_seconds"] = value.clone();
@@ -132,8 +138,8 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
         "v1_field.census_shadow",
         "tombstone.claude_retired_family_tombstones",
         "account.current",
-        "usage.pending",
-        "family.requests",
+        "proof.usage",
+        "file.census",
         "file.entities",
         "setting.historical_replay_generation",
         "accepted.entity",
@@ -163,9 +169,9 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
     }
 }
 
-/// [money] money ref diffs rollback and commit across accounts census and family membership.
+/// [money] money ref diffs rollback and commit across accounts, census and usage proof.
 #[test]
-fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_membership() {
+fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_usage_proof() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-ref-diff");
     let mut db = money_test_support::populate(
         Source::Claude,
@@ -184,7 +190,7 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_family_members
         .as_object_mut()
         .unwrap()
         .remove("same-census");
-    raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
+    raw["claude_usage_family_witnesses"]["synthetic-family"]["legacy_excluded_request_id_hashes"]
         .as_object_mut()
         .unwrap()
         .remove("same-member");
@@ -342,7 +348,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
         })
         .collect::<Vec<_>>();
     raw["claude_account_family_pending"]["synthetic-family"]["members"] = members.into();
-    raw["claude_usage_family_pending"]["synthetic-family"]["member_request_id_hashes"]
+    raw["claude_usage_family_witnesses"]["synthetic-family"]["legacy_excluded_request_id_hashes"]
         ["synthetic-file"] = json!(hashes);
     raw["file_snapshot_fingerprints"]["synthetic-file"] = json!(hashes);
     raw["historical_replay_generation"] = json!(hashes.join(""));

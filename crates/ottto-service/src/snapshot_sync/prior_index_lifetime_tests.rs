@@ -90,30 +90,6 @@ impl Drop for Guard {
     }
 }
 
-fn large_prior_index(occurrences: usize) -> ScanIndex {
-    let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
-    let mut rows = serde_json::Map::new();
-    let mut hashes = Vec::new();
-    for n in 0..occurrences {
-        let hash = format!("{n:064x}");
-        hashes.push(hash.clone());
-        rows.insert(
-            hash,
-            serde_json::json!({"sequence":n,"input_tokens":1,"output_tokens":1,
-            "cache_read_tokens":0,"cache_creation_5m_tokens":0,"cache_creation_1h_tokens":0,
-            "reasoning_output_tokens":0,"model":format!("synthetic-{}", "m".repeat(192)),
-            "speed_mode":"fast","reasoning_effort":"high"}),
-        );
-    }
-    // Old native proof work, not an accepted body or a current observation.
-    // The real scan replaces this old-window member through its normal fold.
-    value["claude_usage_family_pending"] = serde_json::json!({IDENTITY_PIPELINE_ROOT:{
-        "census_window_end":"2000-01-01T00:00:00Z",
-        "member_request_id_hashes":{IDENTITY_PIPELINE_ROOT:hashes},
-        "member_occurrences":{IDENTITY_PIPELINE_ROOT:rows},"invalid":false}});
-    serde_json::from_value(value).unwrap()
-}
-
 /// What one real cycle of the money parity control left: the live outputs
 /// and the native allowance its collection saw.
 #[derive(Debug, PartialEq)]
@@ -191,7 +167,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
         &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
         &namespace,
     ));
-    large_prior_index(16).save(&index_path).unwrap();
+    ScanIndex::default().save(&index_path).unwrap();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),

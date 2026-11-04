@@ -397,20 +397,20 @@ calling these measurements installed evidence.
 
 ### Tail Counters
 
-Claude's continuation state lives in the state database. Its counters ride a
-`durable_tail_alarm` record (schema 2 additive, source label) on any page where
-one changed; each source with a Tail codec (today Claude only) has its own
-record and keys. Each is `[since the last record, process total]`, counts only;
+Each source's continuation state (Claude Code, Codex and Pi) lives in the state
+database. Its counters ride a `durable_tail_alarm` record (schema 2 additive,
+source label) on any page where one changed; each source has its own record and
+keys. Each is `[since the last record, process total]`, counts only;
 they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
 | `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `error`. Counters only: no traversal point repeats them. |
 | `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
-| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`. `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action: it is not in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
+| `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`, and the Codex replays `group_replay` (a group read from its first member) and `tier_prefix_replay` (a file with a protected receipt read from its start). `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action and a replay is no load outcome: neither is in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
 | `tail_shorter_file_full{files}` | A file shorter than its committed head, read Full (`Shrunk` on the acquisition's Full reason). No floor holds it. |
-| `tail_bootstrap_full{no_head,metadata_only,new_file}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), or a new file. |
+| `tail_bootstrap_full{no_head,metadata_only,new_file,unrouted}` | A file's first read, apart from reconstruction: no head, a head with no reduction (revisions or inventory only), a new file, or an indexed file with no database route (v1, a paused import, no support dir), whose growth reads Full. |
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
 | `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
@@ -1540,10 +1540,10 @@ The digest is RAM-only authority and is never emitted in diagnostic records.
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include
-`counts.full_causes.restore_outcome.miss.<class>` for Codex and Pi: saturating
-u64 counts, scoped to that page, of files with no retained reduction, by the
-class below. Claude keeps no reduction in RAM, so its loads are counted by
-`tail_db_loads` instead.
+`counts.full_causes.restore_outcome.miss.<class>` for every source: saturating
+u64 counts, scoped to that page, of files read with neither a retained
+reduction nor a Tail load, by the class below. A Tail load's outcome is counted
+by `tail_db_loads` instead.
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.
@@ -1754,8 +1754,7 @@ Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.
 An indexed Pi file that changes without an available RAM reduction reads Full under the shared `state_missing`
-planner reason in `sampled_acquisition.page_events.full_reasons`. Cache admission
-fallbacks use `resource_full{cache_transit}` and the existing source-tagged alarm.
+planner reason in `sampled_acquisition.page_events.full_reasons`.
 A Pi usage ledger has no key cap and is never truncated.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped

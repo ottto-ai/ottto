@@ -102,24 +102,8 @@ pub(super) fn visit_key(
         }
     }
 }
-/// One family's only row (position 1) of `kind`, decoded, with its row
-/// digest as stored. `None`: no row. Another row under the key errs.
-pub(super) fn read_row<T: DeserializeOwned + Serialize>(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    name: &str,
-) -> Result<Option<(T, [u8; 32])>> {
-    let page = tx.scan_record_key(&RecordKind::parse(kind)?, name.as_bytes(), None, 2)?;
-    let Some(h) = page.first() else {
-        return Ok(None);
-    };
-    only_row(h, || Ok(page.len() > 1))?;
-    read_digest(tx, h).map(Some)
-}
 /// One ascending header range read over a kind, paged, resumed past every
-/// row of `after`'s key and consumed in key order: every row (`next`), or a
-/// key's only row (`row`), as `read_row` reads it, passing over rows of keys
-/// it is not asked for.
+/// row of `after`'s key and consumed in key order.
 pub(super) struct KeyRows {
     kind: RecordKind,
     after: Option<RowKey>,
@@ -154,36 +138,6 @@ impl KeyRows {
         self.peek(tx)?;
         Ok(self.page.pop_front())
     }
-    /// `name`'s only row; `None`: it has none. Names must ascend.
-    pub(super) fn row(&mut self, tx: &mut dyn Transaction, name: &str) -> Result<Option<Header>> {
-        use std::cmp::Ordering;
-        while let Some(h) = self.peek(tx)? {
-            match record(h)?.0.cmp(name.as_bytes()) {
-                Ordering::Less => {}
-                Ordering::Greater => break,
-                Ordering::Equal => {
-                    let h = self.page.pop_front().context("state_v2_record_key")?;
-                    only_row(&h, || match self.peek(tx)? {
-                        Some(next) => Ok(record(next)?.0 == name.as_bytes()),
-                        None => Ok(false),
-                    })?;
-                    return Ok(Some(h));
-                }
-            }
-            self.page.pop_front();
-        }
-        Ok(None)
-    }
-}
-/// One row decoded, with its row digest as stored.
-pub(super) fn read_digest<T: DeserializeOwned + Serialize>(
-    tx: &mut dyn Transaction,
-    h: &Header,
-) -> Result<(T, [u8; 32])> {
-    let mut digests = Digests::new();
-    let value = read(tx, h, Some(&mut digests))?;
-    let digest = digests.remove(&h.key).context("state_v2_row_digest")?;
-    Ok((value, digest))
 }
 pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<Vec<u8>> {
     ensure!(
@@ -200,6 +154,7 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
 }
 /// Shared-evidence kinds: (kind, field holding request-set references, class).
 /// `file.census` keeps one set in its field; the others keep a map of sets.
+/// Retired `usage.pending` stays listed so removing its rows releases its sets.
 const SHARED: [(&str, &str, &str); 4] = [
     ("account_window", "r", "account"),
     ("usage.pending", "member_request_id_hashes", "requests"),

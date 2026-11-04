@@ -121,7 +121,6 @@ impl Holds {
                     | "claude_account_family_witnesses"
                     | "claude_account_family_pending"
                     | "claude_usage_family_witnesses"
-                    | "claude_usage_family_pending"
                     | "claude_usage_authority_quarantine"
                     | "quarantined_snapshot_fingerprints"
             ),
@@ -257,28 +256,21 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
-/// The record map a field's codec writes. A cold usage map keeps its
-/// families in the store only, so no codec may see it.
+/// The record map a field's codec writes.
 trait Records {
     type Value: Serialize;
-    fn records(&self) -> Option<&BTreeMap<String, Self::Value>>;
+    fn records(&self) -> &BTreeMap<String, Self::Value>;
 }
 impl<T: Serialize> Records for BTreeMap<String, T> {
     type Value = T;
-    fn records(&self) -> Option<&Self> {
-        Some(self)
+    fn records(&self) -> &Self {
+        self
     }
 }
 impl<T: Serialize> Records for SharedMap<String, T> {
     type Value = Shared<T>;
-    fn records(&self) -> Option<&BTreeMap<String, Shared<T>>> {
-        Some(self)
-    }
-}
-impl Records for UsagePending {
-    type Value = ClaudeUsageFamilyPending;
-    fn records(&self) -> Option<&BTreeMap<String, ClaudeUsageFamilyPending>> {
-        self.resident()
+    fn records(&self) -> &BTreeMap<String, Shared<T>> {
+        self
     }
 }
 struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
@@ -316,11 +308,12 @@ impl Serialize for ScanIndex {
             };
             (held $name:ident) => {
                 if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
-                    let records = Records::records(&self.$name)
-                        .ok_or_else(|| serde::ser::Error::custom("usage_pending_cold"))?;
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(records, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(
+                            Records::records(&self.$name),
+                            self.decode_holds.0.get(stringify!($name)),
+                        ),
                     )?;
                 }
             };
@@ -347,7 +340,6 @@ impl Serialize for ScanIndex {
         field!(held claude_account_family_witnesses);
         field!(held claude_account_family_pending);
         field!(held claude_usage_family_witnesses);
-        field!(held claude_usage_family_pending);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
         field!(
             claude_request_census_shadow,
@@ -357,21 +349,8 @@ impl Serialize for ScanIndex {
         field!(claude_retired_family_tombstones);
         field!(claude_retired_family_tombstones_initialized);
         field!(claude_retired_family_tombstones_uncertain, is_false);
-        field!(claude_duplicate_request_owners, BTreeMap::is_empty);
-        field!(claude_duplicate_request_witness_overflowed);
-        field!(claude_owned_start_census, BTreeMap::is_empty);
         field!(claude_account_deferred_holds, BTreeMap::is_empty);
-        field!(claude_duplicate_fence_rearm_attempt, is_zero_u8);
-        field!(
-            claude_duplicate_fence_next_full_rearm_unix_seconds,
-            Option::is_none
-        );
-        field!(
-            claude_full_rearm_progress,
-            ClaudeFullRearmProgress::is_empty
-        );
         field!(claude_request_identity_contract, Option::is_none);
-        field!(claude_request_identity_contract_changed, std::ops::Not::not);
         field!(claude_desktop_store_cursor, Option::is_none);
         field!(claude_desktop_store_upper_bound, Option::is_none);
         field!(claude_desktop_store_sweep_had_errors);
@@ -388,7 +367,6 @@ impl Serialize for ScanIndex {
         field!(bounded_sweep_had_unsettled_upload);
         field!(bounded_sweep_unsettled_causes, is_zero_u16);
         field!(traversal, Option::is_none);
-        field!(claude_stale_family_carry, ClaudeStaleFamilyCarry::is_empty);
         field!(scan_residue_witness, Option::is_none);
         field!(historical_replay_generation, Option::is_none);
         field!(confirmed_empty_files, BTreeSet::is_empty);
@@ -415,7 +393,6 @@ impl Serialize for ScanIndex {
             codex_counting_version::EvictedLegacyOwners::is_empty
         );
         field!(upload_ack_retirement_handoff, Option::is_none);
-        field!(held_audit_progress, Option::is_none);
         field!(
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
@@ -468,22 +445,22 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_account_family_witnesses",
     "claude_account_family_pending",
     "claude_usage_family_witnesses",
-    "claude_usage_family_pending",
+    "claude_usage_family_pending", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_request_census",
     "claude_request_census_shadow",
     "claude_usage_authority_quarantine",
     "claude_retired_family_tombstones",
     "claude_retired_family_tombstones_initialized",
     "claude_retired_family_tombstones_uncertain",
-    "claude_duplicate_request_owners",
-    "claude_duplicate_request_witness_overflowed",
-    "claude_owned_start_census",
+    "claude_duplicate_request_owners", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_duplicate_request_witness_overflowed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_owned_start_census", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_account_deferred_holds",
-    "claude_duplicate_fence_rearm_attempt",
-    "claude_duplicate_fence_next_full_rearm_unix_seconds",
-    "claude_full_rearm_progress",
+    "claude_duplicate_fence_rearm_attempt", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_duplicate_fence_next_full_rearm_unix_seconds", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_full_rearm_progress", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_request_identity_contract",
-    "claude_request_identity_contract_changed",
+    "claude_request_identity_contract_changed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_desktop_store_cursor",
     "claude_desktop_store_upper_bound",
     "claude_desktop_store_sweep_had_errors",
@@ -498,7 +475,7 @@ pub(super) const FIELDS: &[&str] = &[
     "bounded_sweep_had_unsettled_upload",
     "bounded_sweep_unsettled_causes",
     "traversal",
-    "claude_stale_family_carry",
+    "claude_stale_family_carry", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "scan_residue_witness",
     "historical_replay_generation",
     "context_curve_capability_enabled", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
@@ -523,7 +500,7 @@ pub(super) const FIELDS: &[&str] = &[
     "reread_guard", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
-    "held_audit_progress",
+    "held_audit_progress", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_money_birth_store",
     "claude_desktop_store_inventory", // Only versioned cursor fences are serialized.
     "claude_copy_removals",
@@ -593,11 +570,6 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "session_account_bindings",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
-    "claude_request_identity_contract_changed",
-    "claude_owned_start_census",
-    "claude_stale_family_carry",
-    "claude_duplicate_request_owners",
-    "claude_duplicate_request_witness_overflowed",
     "accepted_snapshot_fingerprints",
     "file_snapshot_fingerprints",
     "accepted_incidence_pending_census",
@@ -637,39 +609,6 @@ struct Span {
     start: u64,
     len: u64,
     resource: bool,
-}
-
-/// Replace one optional provenance token with null without retaining its
-/// bytes. The lexical pass already checked the original grammar and depth.
-struct AbsentMarkerReader<'a, R> {
-    reader: &'a mut R,
-    prefix: u64,
-    marker_end: u64,
-    suffix: u64,
-    replacement: &'static [u8],
-    skipped: bool,
-}
-impl<R: Read + Seek> Read for AbsentMarkerReader<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.prefix > 0 {
-            let n = self.reader.by_ref().take(self.prefix).read(buf)?;
-            self.prefix -= n as u64;
-            return Ok(n);
-        }
-        if !self.skipped {
-            self.reader.seek(SeekFrom::Start(self.marker_end))?;
-            self.skipped = true;
-        }
-        if !self.replacement.is_empty() {
-            return self.replacement.read(buf);
-        }
-        let n = self.reader.by_ref().take(self.suffix).read(buf)?;
-        self.suffix -= n as u64;
-        Ok(n)
-    }
 }
 
 // Constant-space gate over ORIGINAL bytes. No nesting tags/parent stack are
@@ -1227,26 +1166,16 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
         Ok(Some(span))
     }
     fn hydrate_family_input(&mut self, index: &ScanIndex) -> std::result::Result<(), Error> {
+        // Only held roots are serialized.
         let roots = family_hold_roots(&self.holds.0);
-        // Only held roots are serialized. A cold usage map is refused only
-        // when a held root names one of its stored families; otherwise it
-        // contributes nothing, exactly as its resident entries would not.
-        if index.claude_usage_family_pending.cold().is_some()
-            && roots
-                .iter()
-                .any(|root| index.claude_usage_family_pending.contains_key(root))
-        {
-            return Err(Error::Refused("usage pending cold"));
-        }
         let mut input = HydrateInput(Vec::new());
         self.family_spans.clear();
         macro_rules! field {
             ($field:ident) => {{
                 let name = stringify!($field);
                 let start = input.0.len() as u64;
-                let empty = BTreeMap::new();
                 let view = FamilyView {
-                    typed: Records::records(&index.$field).unwrap_or(&empty),
+                    typed: Records::records(&index.$field),
                     raw: self.original_holds.as_ref().and_then(|h| h.0.get(name)),
                     roots: &roots,
                 };
@@ -1264,7 +1193,6 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
         field!(claude_account_family_witnesses);
         field!(claude_account_family_pending);
         field!(claude_usage_family_witnesses);
-        field!(claude_usage_family_pending);
         field!(claude_usage_authority_quarantine);
         self.reader = std::io::Cursor::new(input.0);
         Ok(())
@@ -1320,11 +1248,8 @@ pub(super) fn post_decode_hydrated(
     // records takes the field before the span and the debt flag after it.
     macro_rules! records {
         ($field:ident) => {
-            records!($field, index.$field)
-        };
-        ($field:ident, $records:expr) => {
             if let Some(span) = decoder.raw_hydrate_input(stringify!($field))? {
-                let records = &mut $records;
+                let records = &mut index.$field;
                 for key in decoder.original_holds.as_ref().unwrap().0[stringify!($field)].keys() {
                     records.remove(key);
                 }
@@ -1346,14 +1271,6 @@ pub(super) fn post_decode_hydrated(
     records!(claude_account_family_witnesses);
     records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
-    // A cold usage map keeps its families in the store; no hold rewrites it.
-    records!(
-        claude_usage_family_pending,
-        *index
-            .claude_usage_family_pending
-            .resident_mut()
-            .ok_or(Error::Refused("usage pending cold"))?
-    );
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
             .original_holds
@@ -1771,78 +1688,6 @@ impl<R: BufRead + Seek> Decoder<R> {
             self.counts.families += 1;
         }
     }
-    // The revision marker has a fixed 32-byte payload. Inspect its lexical
-    // span before Serde sees it: from_reader buffers malformed strings and map
-    // keys even when a visitor discards them. Damage to this optional field
-    // removes only carry eligibility, never the surrounding negative record.
-    fn damaged_idless_marker(&mut self, record: Span) -> std::result::Result<Option<Span>, Error> {
-        self.reader.seek(SeekFrom::Start(record.start))?;
-        let close = match self.ws()? {
-            Some(b'{') => b'}',
-            Some(b'[') => b']',
-            _ => return Ok(None),
-        };
-        let mut damaged = None;
-        self.eat(if close == b'}' { b'{' } else { b'[' })?;
-        let mut position = 0usize;
-        while self.ws()? != Some(close) {
-            let marker = if close == b']' {
-                // Derive accepts the struct's positional representation too.
-                position == 4
-            } else {
-                let key = self.span()?;
-                let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
-                    self.typed::<String>(key)? == "idless_revision"
-                } else {
-                    false
-                };
-                self.eat(b':')?;
-                marker
-            };
-            position = position.saturating_add(1);
-            let value = self.span()?;
-            // Includes ample space for our pretty-printed fixed array. Wider
-            // spellings are damage, never permission to allocate a token.
-            if marker
-                && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err())
-                && damaged.replace(value).is_some()
-            {
-                return Err(Error::Refused("duplicate idless marker"));
-            }
-            self.reader.seek(SeekFrom::Start(value.start + value.len))?;
-            if self.ws()? == Some(b',') {
-                self.eat(b',')?;
-            } else {
-                break;
-            }
-        }
-        self.eat(close)?;
-        Ok(damaged)
-    }
-    fn pending_typed<T: serde::de::DeserializeOwned>(
-        &mut self,
-        record: Span,
-    ) -> std::result::Result<T, Error> {
-        let Some(marker) = self.damaged_idless_marker(record)? else {
-            return self.typed(record);
-        };
-        if self.persistence_map {
-            return Err(Error::Refused("incomplete persistence marker"));
-        }
-        self.reader.seek(SeekFrom::Start(record.start))?;
-        let masked = AbsentMarkerReader {
-            reader: &mut self.reader,
-            prefix: marker.start - record.start,
-            marker_end: marker.start + marker.len,
-            suffix: record.start + record.len - marker.start - marker.len,
-            replacement: b"null",
-            skipped: false,
-        };
-        let result = serde_json::from_reader(masked).map_err(|_| Error::Refused("record type"));
-        self.reader
-            .seek(SeekFrom::Start(record.start + record.len))?;
-        result
-    }
     fn records<T: serde::de::DeserializeOwned>(
         &mut self,
         field: &'static str,
@@ -1885,8 +1730,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                 // Four numeric fields: bound malformed strings before Serde
                 // scratch allocation. Preserve opaque pacing debt as a hold.
                 Err(Error::Refused("growth retention record size"))
-            } else if field == "claude_usage_family_pending" {
-                self.pending_typed(value)
             } else {
                 self.typed(value)
             };
@@ -2071,7 +1914,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                     "claude_account_family_witnesses"
                         | "claude_account_family_pending"
                         | "claude_usage_family_witnesses"
-                        | "claude_usage_family_pending"
                         | "claude_usage_authority_quarantine"
                 ) {
                     self.family_spans.insert(name, value);
@@ -2207,14 +2049,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 .records::<Shared<_>>("claude_usage_family_witnesses", value, true)?
                                 .into()
                         }
-                        "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending =
-                                UsagePending::from(self.records::<ClaudeUsageFamilyPending>(
-                                    "claude_usage_family_pending",
-                                    value,
-                                    true,
-                                )?)
-                        }
+                        // TOMBSTONE: decode-and-drop (retired global census state).
+                        "claude_usage_family_pending"
+                        | "claude_duplicate_request_owners"
+                        | "claude_duplicate_request_witness_overflowed"
+                        | "claude_owned_start_census"
+                        | "claude_duplicate_fence_rearm_attempt"
+                        | "claude_duplicate_fence_next_full_rearm_unix_seconds"
+                        | "claude_full_rearm_progress"
+                        | "claude_request_identity_contract_changed"
+                        | "claude_stale_family_carry"
+                        | "held_audit_progress" => {}
                         "claude_request_census" => {
                             index.claude_request_census = self
                                 .census(value, "claude_request_census")?
@@ -2278,37 +2123,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 index.claude_retired_family_tombstones_uncertain = flag;
                             }
                         }
-                        "claude_duplicate_request_owners" => {
-                            index.claude_duplicate_request_owners = self.typed(value)?
-                        }
-                        "claude_duplicate_request_witness_overflowed" => {
-                            index.claude_duplicate_request_witness_overflowed = self.typed(value)?
-                        }
-                        "claude_owned_start_census" => {
-                            index.claude_owned_start_census = self.typed(value)?
-                        }
                         "claude_account_deferred_holds" => {
                             index.claude_account_deferred_holds = self.typed(value)?
                         }
-                        "claude_duplicate_fence_rearm_attempt" => {
-                            index.claude_duplicate_fence_rearm_attempt = self.typed(value)?
-                        }
-                        "claude_duplicate_fence_next_full_rearm_unix_seconds" => {
-                            index.claude_duplicate_fence_next_full_rearm_unix_seconds =
-                                self.typed(value)?
-                        }
-                        "claude_full_rearm_progress" => {
-                            // #720 scheduling-only memory: malformed progress
-                            // costs another re-arm, never opens the fence. Match
-                            // the native deserialize_lenient_default policy.
-                            index.claude_full_rearm_progress =
-                                self.history_scalar(value, ClaudeFullRearmProgress::default())?;
-                        }
                         "claude_request_identity_contract" => {
                             index.claude_request_identity_contract = self.typed(value)?
-                        }
-                        "claude_request_identity_contract_changed" => {
-                            index.claude_request_identity_contract_changed = self.typed(value)?
                         }
                         "claude_desktop_store_cursor" => {
                             index.claude_desktop_store_cursor = self.typed(value)?
@@ -2348,19 +2167,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 .census(value, "bounded_sweep_unsettled_causes")?
                                 .bounded_sweep_unsettled_causes
                         }
-                        "held_audit_progress" => {
-                            // Scheduling damage cannot erase or verify a census
-                            // hold. Bound the single path before allocating it.
-                            index.held_audit_progress = if value.len <= 8192 {
-                                self.history_scalar(value, None)?
-                            } else {
-                                None
-                            };
-                        }
                         "traversal" => index.traversal = self.typed(value)?,
-                        "claude_stale_family_carry" => {
-                            index.claude_stale_family_carry = self.typed(value)?
-                        }
                         "scan_residue_witness" => index.scan_residue_witness = self.typed(value)?,
                         "historical_replay_generation" => {
                             index.historical_replay_generation = self.typed(value)?
@@ -2625,9 +2432,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_usage_family_witnesses" => {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
-                        "claude_usage_family_pending" => {
-                            index.claude_usage_family_pending.discard(&key);
-                        }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
                         }
@@ -2727,7 +2531,6 @@ impl ScanIndex {
                 "claude_account_family_witnesses",
                 "claude_account_family_pending",
                 "claude_usage_family_witnesses",
-                "claude_usage_family_pending",
             ]
             .iter()
             .any(|field| self.decode_holds.contains(field, root))

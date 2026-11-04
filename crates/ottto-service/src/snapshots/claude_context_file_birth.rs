@@ -350,11 +350,6 @@ impl ClaudeFileBirth {
             .or_else(|| self.birth_nanos())
     }
 
-    /// Read through the Claude transcript parser.
-    pub(super) fn observed(&self) -> bool {
-        self.scope != ClaudeBirthScope::NotObserved
-    }
-
     fn root_with_birth(&self) -> bool {
         matches!(self.scope, ClaudeBirthScope::Root(_))
     }
@@ -947,8 +942,6 @@ pub(super) fn remembered_tripwire() -> std::sync::MutexGuard<'static, ClaudeReme
 pub struct ClaudeContextBasisCounts {
     /// Responses and compaction boundaries tagged as copied by file birth.
     pub tagged_record_count: u64,
-    /// Scalars from a provider-proven start (the strict rule).
-    pub proof_basis_session_count: usize,
     /// Scalars admitted by the file birth rule.
     pub file_birth_rule_session_count: usize,
     /// File-birth admissions whose every kept request telemetry assigned to
@@ -977,34 +970,24 @@ impl ClaudeContextBasisCounts {
         if partially {
             self.partially_pre_birth_session_count += 1;
         }
-        let counter = match outcome {
-            ContextBasisOutcome::Proof => &mut self.proof_basis_session_count,
-            ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) => {
-                if confirmed {
-                    self.telemetry_confirmed_session_count += 1;
-                }
-                if remembered {
-                    self.withheld_tripwire_remembered_session_count += 1;
-                }
-                match verdict {
-                    ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
-                    ClaudeFileBirthVerdict::UnknownBirth => {
-                        &mut self.withheld_unknown_birth_session_count
-                    }
-                    ClaudeFileBirthVerdict::UntimedRecord => {
-                        &mut self.withheld_untimed_record_session_count
-                    }
-                    ClaudeFileBirthVerdict::AllCopied => {
-                        &mut self.withheld_all_copied_session_count
-                    }
-                    ClaudeFileBirthVerdict::MultiFile => {
-                        &mut self.withheld_multi_file_session_count
-                    }
-                    ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
-                    ClaudeFileBirthVerdict::EvidenceBound => {
-                        &mut self.withheld_evidence_bound_session_count
-                    }
-                }
+        let ContextBasisOutcome::FileBirth(verdict, confirmed, remembered) = outcome;
+        if confirmed {
+            self.telemetry_confirmed_session_count += 1;
+        }
+        if remembered {
+            self.withheld_tripwire_remembered_session_count += 1;
+        }
+        let counter = match verdict {
+            ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
+            ClaudeFileBirthVerdict::UnknownBirth => &mut self.withheld_unknown_birth_session_count,
+            ClaudeFileBirthVerdict::UntimedRecord => {
+                &mut self.withheld_untimed_record_session_count
+            }
+            ClaudeFileBirthVerdict::AllCopied => &mut self.withheld_all_copied_session_count,
+            ClaudeFileBirthVerdict::MultiFile => &mut self.withheld_multi_file_session_count,
+            ClaudeFileBirthVerdict::Tripwire => &mut self.withheld_tripwire_session_count,
+            ClaudeFileBirthVerdict::EvidenceBound => {
+                &mut self.withheld_evidence_bound_session_count
             }
         };
         *counter += 1;
@@ -1013,7 +996,6 @@ impl ClaudeContextBasisCounts {
 
 #[derive(Debug, Clone, Copy)]
 enum ContextBasisOutcome {
-    Proof,
     /// Verdict, telemetry confirmed, tripwire remembered from an earlier fold.
     FileBirth(ClaudeFileBirthVerdict, bool, bool),
 }
@@ -1061,8 +1043,7 @@ impl ClaudeContextFileBirthCounts {
         let tagged = birth
             .tagged_responses
             .saturating_add(birth.tagged_boundaries(&item.claude_context_curve_boundaries));
-        let partially = matches!(outcome, ContextBasisOutcome::FileBirth(..))
-            && birth.partially_pre_birth(&item.claude_context_curve_boundaries);
+        let partially = birth.partially_pre_birth(&item.claude_context_curve_boundaries);
         self.total.record(outcome, tagged, partially);
         let version = item
             .session_start
@@ -1086,10 +1067,6 @@ impl ClaudeContextFileBirthCounts {
             .entry(key.to_string())
             .or_default()
             .record(outcome, tagged, partially);
-    }
-
-    pub(super) fn record_proof(&mut self, item: &SnapshotItem) {
-        self.record(item, ContextBasisOutcome::Proof);
     }
 
     /// Count one body the fold left without the v1 contract (R9).

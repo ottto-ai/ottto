@@ -160,7 +160,7 @@ impl ScanIndex {
 
     pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
         let Some(entry) = self.files.get_mut(key).filter(|entry| {
-            entry.observed_fingerprint() == fingerprint
+            entry.source_file_fingerprint == fingerprint
                 && entry.has_unverified_source()
                 && !entry.has_prefix_provenance()
         }) else {
@@ -185,7 +185,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
+            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
         else {
             return false;
         };
@@ -207,7 +207,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
+            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
         else {
             return false;
         };
@@ -231,7 +231,7 @@ impl ScanIndex {
         let Some(entry) = self
             .files
             .get_mut(key)
-            .filter(|entry| entry.observed_fingerprint() == source_fingerprint)
+            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
         else {
             return false;
         };
@@ -260,9 +260,9 @@ pub(super) fn path_requires_verification(
     files: &SharedMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files
-        .get(&local_index_key(path))
-        .is_some_and(|entry| entry.has_unverified_source() || entry.rearmed())
+    files.get(&local_index_key(path)).is_some_and(|entry| {
+        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
+    })
 }
 
 /// Retain the existing partial growth safeguard and shorter/future floors
@@ -305,474 +305,14 @@ pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
     }
 }
 
-/// Restorations per sampled scan: under a steady scan cadence, at most one
-/// restored audit falls due per page.
-const HOLD_DEADLINE_RESTORES_PER_SCAN: usize = 1;
-
-/// A plain-v2 entry whose census record is an N1 hold owes its deadline back
-/// (option B below). Until a scan restores it, reconciliation keeps it as it
-/// keeps a marked entry: an unobserved aged file must not be pruned, with its
-/// hold, while it waits for the per-scan or audit-slot budget.
-pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> bool {
-    index.files.get(key).is_some_and(|entry| {
-        entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-    }) && index
-        .claude_request_census
-        .get(key)
-        .is_some_and(|record| record.identity_incomplete_hold())
-}
-
-/// A hold may delay a re-offer, never cancel it. A
-/// marker-erasing daemon (0.1.189's parse-free migrate) rewrote held entries
-/// to plain v2, dropping their audit deadline; an unchanged file then skips
-/// forever and an aged one leaves discovery. Re-derive the marker from the
-/// persisted census hold: one interval out, as a Tail stages it, and tagged
-/// `p` because plain v2 cannot prove the lost tag was `c`. Each restored
-/// entry owes one Full; the deadline only delays it. Restorations take free
-/// audit slots and always leave one, so sampling stays supported. A key
-/// whose unattempted progress slot (or failed-open backoff) already owes an
-/// earlier due keeps it: converting the obligation re-arms debt, never moves
-/// it later (#865).
-pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> usize {
-    let pending = index
-        .files
-        .values()
-        .filter(|entry| entry.has_unverified_source())
-        .take(CACHE_ENTRIES)
-        .count();
-    let budget = CACHE_ENTRIES
-        .saturating_sub(pending.saturating_add(1))
-        .min(HOLD_DEADLINE_RESTORES_PER_SCAN);
-    let Some(due) = now.checked_add(AUDIT_INTERVAL_SECONDS) else {
-        return 0;
-    };
-    let keys = index
-        .claude_request_census
-        .records()
-        .map(|(key, _)| key)
-        .filter(|key| awaits_hold_deadline_restoration(index, key))
-        .take(budget)
-        .cloned()
-        .collect::<Vec<_>>();
-    let owed = index
-        .held_audit_progress
-        .as_ref()
-        .filter(|slot| !slot.attempted && slot.due > 0)
-        .map(|slot| (slot.key.clone(), slot.due));
-    for key in &keys {
-        let due = owed
-            .as_ref()
-            .filter(|(owed, _)| owed == key)
-            .map_or(due, |(_, owed)| due.min(*owed));
-        let due = with_open_backoff(|backoff| backoff.owed(key)).map_or(due, |owed| due.min(owed));
-        if let Some(entry) = index.files.get_mut(key) {
-            entry.scan_identity_version = Some(provenance_marker(due, true));
-        }
-    }
-    if !keys.is_empty() {
-        super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(
-            keys.len() as u64
-        );
-    }
-    keys.len()
-}
-
-/// Saturated sampled slots must not make a plain-v2 hold wait for an
-/// unrelated unavailable/oversized file forever. One durable rotating slot
-/// schedules a native Full after a fresh interval, without allocating a
-/// sampled marker or taking the last sampled slot. It grants no authority.
-/// `attempted` is set only once the secure open succeeds. A failed open
-/// rotates too but keeps the owed due, so debt never moves later; census
-/// holds stay eligible for the next round. A key whose open keeps failing
-/// backs off and then parks (`OpenBackoff`), and holds the slot only while no
-/// other key can use it, so it never starves a readable member.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct HeldAuditProgress {
-    pub(super) key: String,
-    pub(super) due: u64,
-    pub(super) attempted: bool,
-}
-crate::heap_layout_bound::fields!(HeldAuditProgress; key, due, attempted);
-
-pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    let slot = index.held_audit_progress.as_ref()?;
-    (slot.key == key && now >= slot.due && awaits_hold_deadline_restoration(index, key)).then_some(
-        AuditDebt {
-            due_unix_seconds: slot.due,
-        },
-    )
-}
-
+/// The durable audit debt the next read of `key` carries. A debt alone never
+/// selects a Full (`ReadPlan::prepare`): a read with a stored or retained copy
+/// continues from it, and the debt travels in that read's checkpoint.
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    let obligation = index
+    index
         .files
         .get(key)
-        .and_then(|entry| entry.audit_obligation(now));
-    obligation.or_else(|| progress_debt(index, key, now))
-}
-
-/// A held key the slot may serve: bounded, still awaiting restoration, and
-/// owned by a scan root, so its Full can be queued.
-fn progress_eligible(index: &ScanIndex, key: &str) -> bool {
-    key.len() <= 4096
-        && awaits_hold_deadline_restoration(index, key)
-        && index
-            .traversal
-            .as_ref()
-            .is_some_and(|traversal| traversal.first_matching_scan_root(Path::new(key)).is_some())
-}
-
-/// BTreeMap order plus a persisted cursor gives every held path a turn,
-/// including when a prior turn failed its secure open/cap. A key that is
-/// backing off or parked is chosen only when no other key is eligible: it
-/// then holds the slot, and its due, without being queued.
-fn next_progress_key(index: &ScanIndex, after: Option<&str>, now: u64) -> Option<String> {
-    let records = || {
-        index
-            .claude_request_census
-            .records()
-            .map(|(key, _)| key)
-            .filter(|key| progress_eligible(index, key.as_str()))
-    };
-    let pick = |blocked: bool| {
-        let wanted = |key: &&String| open_blocked(key, now) == blocked;
-        records()
-            .filter(wanted)
-            .find(|key| after.map_or(true, |after| key.as_str() > after))
-            .or_else(|| records().find(wanted))
-            .cloned()
-    };
-    pick(false).or_else(|| pick(true))
-}
-
-/// A slot for `key` never owes a later due than its failed-open backoff, or
-/// than the same key's unattempted previous slot.
-fn progress_slot(key: String, due: u64, previous: Option<&HeldAuditProgress>) -> HeldAuditProgress {
-    let due = with_open_backoff(|backoff| backoff.owed(&key)).map_or(due, |owed| due.min(owed));
-    let due = previous
-        .filter(|slot| slot.key == key && !slot.attempted && slot.due > 0)
-        .map_or(due, |slot| due.min(slot.due));
-    HeldAuditProgress {
-        key,
-        due,
-        attempted: false,
-    }
-}
-
-/// A progress Full whose secure open keeps failing backs
-/// off instead of retrying every page: 1 page after the first failure,
-/// doubling, each wait capped at 6 h. The eighth consecutive failure parks
-/// the key (one alarm); a parked key is retried only after its stat changes,
-/// or after a restart. RAM only: nothing here is persisted, and its owed due,
-/// census hold and slot are never cleared or moved later.
-const OPEN_PARK_FAILURES: u8 = 8;
-const OPEN_BACKOFF_CAP_SECONDS: u64 = 6 * 60 * 60;
-/// Census keys are at most 4 KiB, so the map stays bounded (about 1 MiB at
-/// worst). On overflow the longest-quiet entry is evicted (counted) and that
-/// key may retry (fail toward reading); its owed due moves into the
-/// slot with it, so the debt is never dropped or moved later.
-const OPEN_BACKOFF_KEYS: usize = 256;
-
-type OpenStamp = Option<[i64; 7]>;
-
-fn open_stamp(key: &str) -> OpenStamp {
-    let metadata = std::fs::metadata(key).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some([
-            metadata.dev() as i64,
-            metadata.ino() as i64,
-            metadata.size() as i64,
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        ])
-    }
-    #[cfg(not(unix))]
-    {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |elapsed| elapsed.as_nanos() as i64);
-        Some([metadata.len() as i64, modified, 0, 0, 0, 0, 0])
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OpenFailure {
-    failures: u8,
-    owed_due: u64,
-    first_failed: u64,
-    last_failed: u64,
-    retry_page: u64,
-    stamp: OpenStamp,
-}
-
-#[derive(Debug)]
-struct OpenBackoff {
-    page: u64,
-    keys: BTreeMap<String, OpenFailure>,
-    /// Process total of overflow evictions.
-    evicted: u64,
-}
-
-/// One recorded failure: `parked` exactly when it parks the key, and the
-/// overflow-evicted key with its owed due.
-struct RecordedFailure {
-    parked: Option<OpenFailure>,
-    evicted: Option<(String, u64)>,
-}
-
-impl OpenBackoff {
-    const fn new() -> Self {
-        Self {
-            page: 0,
-            keys: BTreeMap::new(),
-            evicted: 0,
-        }
-    }
-    fn blocked(&self, key: &str, now: u64) -> bool {
-        self.keys.get(key).is_some_and(|failure| {
-            (failure.failures >= OPEN_PARK_FAILURES
-                || (self.page < failure.retry_page
-                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
-                && open_stamp(key) == failure.stamp
-        })
-    }
-    fn owed(&self, key: &str) -> Option<u64> {
-        self.keys.get(key).map(|failure| failure.owed_due)
-    }
-    fn record_failure(&mut self, key: &str, due: u64, now: u64) -> RecordedFailure {
-        let mut evicted = None;
-        if !self.keys.contains_key(key) && self.keys.len() >= OPEN_BACKOFF_KEYS {
-            let quiet = self
-                .keys
-                .iter()
-                .min_by_key(|(_, failure)| failure.last_failed)
-                .map(|(key, _)| key.clone());
-            if let Some(quiet) = quiet {
-                evicted = self
-                    .keys
-                    .remove(&quiet)
-                    .map(|failure| (quiet, failure.owed_due));
-                self.evicted = self.evicted.saturating_add(1);
-            }
-        }
-        let page = self.page;
-        let failure = self.keys.entry(key.to_owned()).or_insert(OpenFailure {
-            failures: 0,
-            owed_due: due,
-            first_failed: now,
-            last_failed: now,
-            retry_page: page,
-            stamp: None,
-        });
-        failure.failures = failure.failures.saturating_add(1);
-        failure.owed_due = failure.owed_due.min(due);
-        failure.last_failed = now;
-        failure.retry_page = page.saturating_add(1 << u32::from(failure.failures - 1).min(62));
-        failure.stamp = open_stamp(key);
-        RecordedFailure {
-            parked: (failure.failures == OPEN_PARK_FAILURES).then(|| failure.clone()),
-            evicted,
-        }
-    }
-}
-
-process_state! {
-    /// A leaf lock: `body` never takes another lock or re-enters.
-    fn with_open_backoff: OpenBackoff = OpenBackoff::new(); clear_poison: false
-}
-
-fn open_blocked(key: &str, now: u64) -> bool {
-    with_open_backoff(|backoff| backoff.blocked(key, now))
-}
-
-/// Census-line counts: keys whose progress open failed and are still owed
-/// (backing off or parked), and the age of the oldest first failure.
-pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
-    with_open_backoff(|backoff| {
-        (
-            backoff.keys.len(),
-            backoff
-                .keys
-                .values()
-                .map(|failure| now.saturating_sub(failure.first_failed))
-                .max()
-                .unwrap_or(0),
-        )
-    })
-}
-
-/// Census-line process total: overflow evictions from the backoff map.
-pub(super) fn held_audit_open_backoff_evicted() -> u64 {
-    with_open_backoff(|backoff| backoff.evicted)
-}
-
-#[cfg(test)]
-pub(super) fn reset_open_backoff_for_test() {
-    with_open_backoff(|backoff| *backoff = OpenBackoff::new());
-}
-
-#[cfg(test)]
-mod open_backoff_tests;
-
-/// The queued progress Full for `key` passed its secure open: the slot's
-/// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends.
-pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
-    if let Some(slot) = index
-        .held_audit_progress
-        .as_mut()
-        .filter(|slot| slot.key == key)
-    {
-        slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
-    }
-}
-
-#[derive(Serialize)]
-struct HeldAuditOpenParked {
-    held_audit_open_failures: u8,
-    held_audit_open_owed_age_seconds: u64,
-    held_audit_open_failed_keys: usize,
-}
-
-/// The queued progress Full for `key` failed its secure open. Back the key
-/// off (or park it), then rotate the turn, wrapping to `key` itself when no
-/// other member is eligible, but keep the owed due: a failed open never
-/// re-arms a later deadline.
-pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
-    let Some(due) = index
-        .held_audit_progress
-        .as_ref()
-        .filter(|slot| slot.key == key && !slot.attempted)
-        .map(|slot| slot.due)
-    else {
-        return;
-    };
-    // The bounded failure record only; no census/ACK state changes.
-    let (recorded, keys) =
-        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked.as_ref() {
-        // Counts only; no path or id. Once per park.
-        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
-            held_audit_open_failures: parked.failures,
-            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
-            held_audit_open_failed_keys: keys,
-        });
-    }
-    let previous = index.held_audit_progress.take();
-    // An overflow-evicted key may retry, so it takes the next turn,
-    // and its owed due moves into the slot: the debt is never dropped.
-    let (evicted, evicted_due) = recorded.evicted.unzip();
-    index.held_audit_progress = evicted
-        .filter(|evicted| progress_eligible(index, evicted))
-        .or_else(|| next_progress_key(index, Some(key), now))
-        .map(|next| {
-            let mut slot = progress_slot(next, due, previous.as_ref());
-            slot.due = evicted_due.map_or(slot.due, |owed| slot.due.min(owed));
-            slot
-        });
-}
-
-/// Select this page's progress slot: keep an unattempted, unblocked slot,
-/// else rotate. Returns the key to queue: the slot is due and its key is not
-/// backing off or parked. A blocked key keeps the slot and its due unqueued.
-fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<String> {
-    with_open_backoff(|backoff| {
-        backoff.page = backoff.page.saturating_add(1);
-        // Restoring a plain-v2 hold changes its representation, not its
-        // failed-open obligation. Keep the same-stat park and original D
-        // until source verification discharges them (or the entry is gone).
-        backoff
-            .keys
-            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
-    });
-    let previous = index.held_audit_progress.clone();
-    let keep = previous.as_ref().is_some_and(|slot| {
-        !slot.attempted
-            && slot.due > 0
-            && now
-                .checked_add(AUDIT_INTERVAL_SECONDS)
-                .is_some_and(|latest| slot.due <= latest)
-            && progress_eligible(index, slot.key.as_str())
-            && !open_blocked(&slot.key, now)
-    });
-    if !keep {
-        let key = next_progress_key(index, previous.as_ref().map(|slot| slot.key.as_str()), now);
-        index.held_audit_progress = key
-            .zip(now.checked_add(AUDIT_INTERVAL_SECONDS))
-            .map(|(key, due)| progress_slot(key, due, previous.as_ref()));
-    }
-    let slot = index.held_audit_progress.as_ref()?;
-    (now >= slot.due && !open_blocked(&slot.key, now)).then(|| slot.key.clone())
-}
-
-impl OwnedSourceScan {
-    /// At most one additional Full attempt per page. The queue contains only
-    /// a bounded path and deadline; entry/census identity is never rewritten.
-    pub(super) fn prepare_held_audit_progress(&mut self, now: u64) {
-        if self.file_limit == 0 {
-            return;
-        }
-        let Some(key) = schedule_held_audit_progress(&mut self.index, now) else {
-            return;
-        };
-        let path = PathBuf::from(&key);
-        // First match, not deepest: the root enters the sampled scope hash.
-        let Some(root) = self
-            .index
-            .traversal
-            .as_ref()
-            .and_then(|traversal| traversal.first_matching_scan_root(&path).cloned())
-        else {
-            return;
-        };
-        let Some(entry) = self.index.files.get(&key) else {
-            return;
-        };
-        let candidate = CandidateFile {
-            physical_identity: None,
-            scan_root: root,
-            path,
-            size_bytes: entry.size_bytes,
-            modified_unix_seconds: entry.modified_unix_seconds,
-            modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
-            source_file_fingerprint: String::new(),
-            legacy_source_file_fingerprint: String::new(),
-            legacy_config_reconciliation_required: false,
-            opened_object_identity: String::new(),
-            fingerprint_changed_nanos: 0,
-            fingerprint_birth_nanos: 0,
-            withheld_content_stamp: None,
-        };
-        // Mirror candidate conversion's census observation. An old queued
-        // age rejection must not delete a successful recovery at settlement.
-        if !self.census.claude_vanished_index_keys.contains(&key) {
-            self.census.removed_index_keys.remove(&key);
-        }
-        self.census.observed_index_keys.insert(key.clone());
-        self.identified_candidates
-            .retain(|candidate| local_index_key(&candidate.path) != key);
-        self.identified_candidates.push_front(candidate);
-        // Preserve the ordinary page limit and every displaced candidate.
-        while self.identified_candidates.len() > self.file_limit.max(1) {
-            let candidate = self.identified_candidates.pop_back().unwrap();
-            if let Some(traversal) = self.index.traversal.as_mut() {
-                traversal.pending_candidates.push_front(ScanTraversalPath {
-                    scan_root: candidate.scan_root,
-                    path: candidate.path,
-                    census_member: true,
-                    watcher_hint: false,
-                });
-            }
-        }
-        super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(1);
-    }
+        .and_then(|entry| entry.audit_obligation(now))
 }
 
 impl SourceScanResult {
@@ -831,7 +371,7 @@ impl SourceScanResult {
                     && index
                         .files
                         .get(key)
-                        .is_some_and(|entry| entry.observed_fingerprint() == fingerprint)
+                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
                     && index.stage_sampled_audit(key, fingerprint, debt)
                 {
                     reserved += 1;
@@ -913,75 +453,6 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
-    /// [behaviour] Virtual recovery keeps grown keys observed without reading before due.
-    #[test]
-    fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
-        use crate::snapshots::claude_request_census::{
-            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
-        };
-        let mut index = index();
-        let mut candidate = candidate();
-        let key = local_index_key(&candidate.path);
-        let record =
-            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
-                .with_unverified_for_test(true);
-        index
-            .claude_request_census_mut_for_test()
-            .insert_for_test(&key, record);
-        let now = 10 * 86_400;
-        let due = now + 100;
-        index.held_audit_progress = Some(HeldAuditProgress {
-            key: key.clone(),
-            due,
-            attempted: false,
-        });
-        candidate.size_bytes += 1;
-        candidate.source_file_fingerprint = "changed".into();
-        assert!(awaits_hold_deadline_restoration(&index, &key));
-        assert!(
-            discovery_retention!(index).owes_with_len(
-                SnapshotSource::ClaudeCode,
-                &candidate.path,
-                candidate.size_bytes
-            ),
-            "growth stays discoverable, never dropped"
-        );
-        let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
-            index.candidate_decision_in_window(candidate, at, Some(at), 7, &mut None)
-        };
-        let mut recent = candidate.clone();
-        recent.modified_unix_seconds = now;
-        assert_eq!(
-            decide(&index, &recent, now),
-            (
-                CandidateDecision::Parse,
-                Some(CandidateParseReason::TranscriptChanged)
-            ),
-            "recent growth preserves main's immediate selection"
-        );
-        assert_eq!(
-            decide(&index, &candidate, due - 1).0,
-            CandidateDecision::Skip,
-            "scheduling future virtual debt cannot acquire the grown file"
-        );
-        assert_eq!(
-            decide(&index, &candidate, due),
-            (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
-            "due read retains its counted audit cause"
-        );
-        index
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .source_file_fingerprint
-            .clear();
-        assert_eq!(
-            decide(&index, &candidate, due - 1).0,
-            CandidateDecision::Parse,
-            "genuine external rearm is not hidden by the virtual delay"
-        );
-    }
-
     #[test]
     fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
         let mut index = index();
@@ -1254,120 +725,6 @@ mod tests {
             150
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Option B: only a plain-v2 entry whose census record is an N1 hold gets
-    /// a deadline back; one per scan, one interval out, prefix-tagged, and
-    /// never into the last free audit slot.
-    #[test]
-    fn option_b_restores_only_erased_hold_deadlines_paced_by_audit_slots() {
-        use crate::snapshots::claude_request_census::{
-            identity_incomplete_hold_deadlines_restored_total as restored_total,
-            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
-            CLAUDE_REQUEST_CENSUS_DERIVATION,
-        };
-        let held = || {
-            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
-                .with_unverified_for_test(true)
-        };
-        let mut retired = held();
-        retired.retire();
-        let mut index = ScanIndex::default();
-        for (key, record) in [
-            ("held-a", held()),
-            ("held-b", held()),
-            ("held-legacy-entry", held()),
-            ("not-held-retired", retired),
-            (
-                "not-held-stale-derivation",
-                held().with_derivation_for_test(CLAUDE_REQUEST_CENSUS_DERIVATION + 1),
-            ),
-            ("not-held-verified", held().with_unverified_for_test(false)),
-            (
-                "not-held-exact",
-                Record::synthetic_for_test(&"a".repeat(64), 1, Shape::Exact, vec![1])
-                    .with_unverified_for_test(true),
-            ),
-        ] {
-            index.files.insert(key.into(), entry());
-            index
-                .claude_request_census_mut_for_test()
-                .insert_for_test(key, record);
-        }
-        index
-            .files
-            .get_mut("held-legacy-entry")
-            .unwrap()
-            .scan_identity_version = Some("semantic_sync:v1".into());
-        let plain = |index: &ScanIndex| {
-            index
-                .files
-                .iter()
-                .filter(|(_, entry)| !entry.has_unverified_source())
-                .map(|(key, _)| key.clone())
-                .collect::<BTreeSet<_>>()
-        };
-        let before = plain(&index);
-        let total = restored_total();
-
-        assert_eq!(restore_held_audit_deadlines(&mut index, 100), 1);
-        assert_eq!(restored_total(), total + 1);
-        let restored = &index.files["held-a"];
-        assert_eq!(
-            restored.unverified_deadline(),
-            Some(100 + AUDIT_INTERVAL_SECONDS)
-        );
-        assert!(
-            restored.has_prefix_provenance(),
-            "plain v2 cannot prove `c`"
-        );
-        assert!(!restored.audit_requires_full(100), "no read at restoration");
-        assert!(restored.audit_requires_full(100 + AUDIT_INTERVAL_SECONDS));
-        assert!(
-            !index.files["held-b"].has_unverified_source(),
-            "one per scan"
-        );
-
-        // The next scan restores the next hold; a restored entry is not
-        // restored again, and nothing else ever is.
-        assert_eq!(restore_held_audit_deadlines(&mut index, 200), 1);
-        assert_eq!(
-            index.files["held-a"].unverified_deadline(),
-            Some(100 + AUDIT_INTERVAL_SECONDS)
-        );
-        assert_eq!(
-            index.files["held-b"].unverified_deadline(),
-            Some(200 + AUDIT_INTERVAL_SECONDS)
-        );
-        assert_eq!(restore_held_audit_deadlines(&mut index, 300), 0);
-        assert_eq!(restored_total(), total + 2);
-        let mut unchanged = before;
-        unchanged.remove("held-a");
-        unchanged.remove("held-b");
-        assert_eq!(plain(&index), unchanged);
-        assert_eq!(
-            index.files["held-legacy-entry"]
-                .scan_identity_version
-                .as_deref(),
-            Some("semantic_sync:v1")
-        );
-
-        // Restoration leaves the last audit slot free, so a full pending
-        // set keeps sampling supported and restores nothing.
-        let mut full = ScanIndex::default();
-        full.files.insert("held".into(), entry());
-        full.claude_request_census_mut_for_test()
-            .insert_for_test("held", held());
-        for slot in 0..CACHE_ENTRIES - 1 {
-            let mut pending = entry();
-            pending.set_unverified_deadline(1);
-            full.files.insert(format!("pending-{slot}"), pending);
-        }
-        assert_eq!(restore_held_audit_deadlines(&mut full, 100), 0);
-        assert!(!full.files["held"].has_unverified_source());
-        full.files.remove("pending-0");
-        assert_eq!(restore_held_audit_deadlines(&mut full, 100), 1);
-        assert_eq!(restored_total(), total + 3);
     }
 }
 

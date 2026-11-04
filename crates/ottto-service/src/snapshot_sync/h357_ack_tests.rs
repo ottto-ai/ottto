@@ -819,7 +819,6 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
         upload_context_receipt: None,
-        evidence_owed: false,
     }
 }
 
@@ -1880,7 +1879,6 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         held_fingerprints: BTreeSet::from(["f".repeat(64)]),
         account_deferred_fingerprints: BTreeSet::new(),
         progress_blocking: false,
-        held_family_roots: None,
     };
     let settlement = settle_checkpointed_upload(
         ScanIndex::default(),
@@ -1888,7 +1886,6 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         &ledger,
         &holds,
         true,
-        None,
     );
     assert!(!settlement.fully_settled);
     let refusals = PermanentRefusalCounts::of(&ledger);
