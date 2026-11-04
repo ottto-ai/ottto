@@ -2114,10 +2114,6 @@ pub(super) mod test_hooks {
         BUCKETS.with(|buckets| buckets.borrow_mut().push(bucket));
     }
 
-    pub(in crate::snapshots) fn buckets() -> Vec<super::sampled_jsonl::Bucket> {
-        BUCKETS.with(|buckets| buckets.borrow().clone())
-    }
-
     /// A census unreadable cause, by its `UnreadableCause` ordinal.
     pub(in crate::snapshots) fn record_unreadable(cause: usize) {
         UNREADABLE.with(|causes| causes.borrow_mut().push(cause));

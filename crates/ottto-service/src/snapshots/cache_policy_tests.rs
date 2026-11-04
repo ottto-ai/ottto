@@ -1582,12 +1582,21 @@ fn cache_policy_full_singleton_releases_only_after_growth() {
                 grown.append(&usage(source, 182, 3, MODEL));
                 grown.set_modified(file_modified + 1);
                 let next = observed_scan(&grown, source, full.index, &cache);
-                if releases {
-                    assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is Tail");
-                } else {
-                    assert_eq!(next.modes, (1, 0, 0), "{label}: the next page is Full");
-                    assert_eq!(next.state_missing(), 1, "{label}");
-                }
+                assert_eq!(next.modes, (0, 1, 0), "{label}: the next page is Tail");
+                assert_eq!(
+                    next.state_missing(),
+                    0,
+                    "{label}: the committed head remains"
+                );
+                assert_eq!(
+                    crate::snapshots::tail_source::committed_sealed_offset(
+                        source,
+                        &next.index,
+                        &grown.key(),
+                    ),
+                    Some(fs::metadata(&grown.path).unwrap().len()),
+                    "{label}: the next append commits its complete continuation",
+                );
             }
         }
     }
