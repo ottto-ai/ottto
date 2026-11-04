@@ -592,7 +592,11 @@ impl HeaderInventory {
             if let Some(index) = index.as_deref_mut() {
                 if let Some(route) = state_v2::runtime_path(index)? {
                     index
-                        .carry_codex_rollout(&route, &candidate, None)
+                        .carry_codex_rollout_with_cache(
+                            &route,
+                            &candidate,
+                            cache.map(|cache| (cache, None)),
+                        )
                         .map_err(|_| {
                             std::io::Error::new(
                                 std::io::ErrorKind::WouldBlock,

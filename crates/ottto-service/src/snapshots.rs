@@ -21954,6 +21954,7 @@ impl OwnedSourceScan {
             &mut ListingRequest::default(),
             claude_request_identity_capture,
             &[],
+            None,
         )
     }
 
@@ -21972,6 +21973,10 @@ impl OwnedSourceScan {
         list_all: &mut ListingRequest,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
+        carry_cache: Option<(
+            &sampled_scan::SharedCache,
+            &crate::transcript_acquisition::Scope,
+        )>,
     ) -> Self {
         Self::new_selecting(
             source,
@@ -21986,6 +21991,7 @@ impl OwnedSourceScan {
             list_all,
             claude_request_identity_capture,
             recovery_priority,
+            carry_cache,
         )
     }
 
@@ -22099,6 +22105,10 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         // Only changes native selection order, never ownership or settlement.
         recovery_priority: &[PathBuf],
+        carry_cache: Option<(
+            &sampled_scan::SharedCache,
+            &crate::transcript_acquisition::Scope,
+        )>,
     ) -> Self {
         let _jsonl_scope =
             crate::local_resource_diagnostics::jsonl::Scope::begin(source.api_slug());
@@ -22228,14 +22238,16 @@ impl OwnedSourceScan {
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
-        advance_bounded_directory_traversal(
+        advance_bounded_directory_traversal_with_cache(
             source,
             index,
             backfill_window_days,
+            directory_entries_per_tick(),
             Some(&resource_probe.discovery_growth),
+            carry_cache.map(|(cache, scope)| (cache, Some(scope))),
         );
         if source == SnapshotSource::Codex {
-            index.prepare_codex_carries(None);
+            index.prepare_codex_carries(carry_cache.map(|(cache, scope)| (cache, Some(scope))));
         }
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         if source == SnapshotSource::Codex {
@@ -26562,7 +26574,11 @@ impl OwnedSourceScan {
                 // derived index state directly. Any recreation after this absence witness
                 // belongs to the next generation.
                 if source == SnapshotSource::Codex {
-                    index.prepare_codex_carries(sampling.as_ref());
+                    index.prepare_codex_carries(
+                        sampling
+                            .as_ref()
+                            .map(|s| (s.cache.as_ref(), Some(&s.namespace))),
+                    );
                     census.removed_index_keys.retain(|key| {
                         index.files.contains_key(key)
                             && !index
@@ -38459,6 +38475,7 @@ impl DiscoveryRecovery<'_> {
     }
 }
 
+#[cfg(test)]
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     index: &mut ScanIndex,
@@ -38502,12 +38519,34 @@ fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+#[cfg(test)]
 fn advance_bounded_directory_traversal_with_budget(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
+) {
+    advance_bounded_directory_traversal_with_cache(
+        source,
+        index,
+        backfill_window_days,
+        max_entries,
+        growth,
+        None,
+    );
+}
+
+fn advance_bounded_directory_traversal_with_cache(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    backfill_window_days: u64,
+    max_entries: usize,
+    growth: Option<&discovery_growth::Page>,
+    carry_cache: Option<(
+        &sampled_scan::SharedCache,
+        Option<&crate::transcript_acquisition::Scope>,
+    )>,
 ) {
     let mut traversal = index
         .traversal
@@ -38742,7 +38781,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 index.traversal = Some(traversal);
                 let carried = state_v2::runtime_path(index).and_then(|route| {
                     route.map_or(Ok(false), |route| {
-                        index.carry_codex_rollout(&route, &candidate, None)
+                        index.carry_codex_rollout_with_cache(&route, &candidate, carry_cache)
                     })
                 });
                 traversal = index
@@ -39185,7 +39224,7 @@ fn reconcile_missing_index_entries_with_side(
     source: SnapshotSource,
 ) -> bool {
     if source == SnapshotSource::Codex {
-        index.prepare_codex_carries(None);
+        index.prepare_codex_carries(cache.map(|cache| (cache, None)));
     }
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;

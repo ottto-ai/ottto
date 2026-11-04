@@ -109,7 +109,13 @@ impl ScanIndex {
 
     /// Reconcile the discovered namespace before either absence consumer.
     /// Failures retain ordinary pending/observation custody, never grant reads.
-    pub(super) fn prepare_codex_carries(&mut self, sampling: Option<&sampled_scan::Context>) {
+    pub(super) fn prepare_codex_carries(
+        &mut self,
+        sampling: Option<(
+            &sampled_scan::SharedCache,
+            Option<&crate::transcript_acquisition::Scope>,
+        )>,
+    ) {
         let Some(walk) = self.traversal.as_ref() else {
             return;
         };
@@ -134,18 +140,35 @@ impl ScanIndex {
             return;
         };
         for candidate in candidates {
-            let _ = self.carry_codex_rollout(&route, &candidate, sampling);
+            let _ = self.carry_codex_rollout_with_cache(&route, &candidate, sampling);
         }
     }
 
     /// Called on a metadata-only candidate, before any sample/header/body read
     /// and before either absence-retirement path. Returns false for ordinary
     /// acquisition, including a newly materialized plaintext object.
+    #[cfg(test)]
     pub(super) fn carry_codex_rollout(
         &mut self,
         index_path: &Path,
         candidate: &CandidateFile,
         sampling: Option<&sampled_scan::Context>,
+    ) -> Result<bool> {
+        self.carry_codex_rollout_with_cache(
+            index_path,
+            candidate,
+            sampling.map(|s| (s.cache.as_ref(), Some(&s.namespace))),
+        )
+    }
+
+    pub(super) fn carry_codex_rollout_with_cache(
+        &mut self,
+        index_path: &Path,
+        candidate: &CandidateFile,
+        sampling: Option<(
+            &sampled_scan::SharedCache,
+            Option<&crate::transcript_acquisition::Scope>,
+        )>,
     ) -> Result<bool> {
         let to = local_index_key(&candidate.path);
         if self.files.contains_key(&to) {
@@ -277,22 +300,19 @@ impl ScanIndex {
                 && !self.codex_state_only_blocked_by_file.contains_key(&to),
             "codex_carry_destination_custody"
         );
-        if let Some(sampling) = sampling {
+        if let Some((cache, namespace)) = sampling {
             // A live job must finish or fail its ordinary path revalidation
             // before this pass can rehome its committed checkpoint.
             ensure!(
-                !sampling.cache.cursor_job_owns(from) && !sampling.cache.cursor_job_owns(&to),
+                !cache.cursor_job_owns(from) && !cache.cursor_job_owns(&to),
                 "codex_carry_active_job"
             );
             for key in [from.as_str(), to.as_str()] {
-                sampling.cache.refresh_header(key.to_owned(), None);
-                sampling
-                    .cache
-                    .memo_forget(&sampled_scan::codex_cursor::memo_key(
-                        &sampling.namespace,
-                        key,
-                    ));
-                drop(sampling.cache.take(key));
+                cache.refresh_header(key.to_owned(), None);
+                if let Some(namespace) = namespace {
+                    cache.memo_forget(&sampled_scan::codex_cursor::memo_key(namespace, key));
+                }
+                drop(cache.take(key));
             }
         }
         state_v2::carry_tail(

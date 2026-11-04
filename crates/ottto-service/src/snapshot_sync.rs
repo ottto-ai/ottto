@@ -7133,6 +7133,7 @@ fn prepare_sync_source_inner(
         &mut watcher_hints.list_all,
         request_identity_capture,
         &copy_prefix_scope,
+        Some((daemon.transcript_cache.as_ref(), &sampled_scope)),
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
