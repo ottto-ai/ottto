@@ -461,6 +461,8 @@ fn load_with_custody(
     }
     result
 }
+/// A hydrated graph, its context and baseline, and the stamp they were read at.
+type Image = (ScanIndex, KindCx, kinds::Baseline, (u64, u64));
 /// One hydrate of the durable image: ACK progress recovery before decode,
 /// then the caller's freshness check, then the baseline before
 /// normalization. `fresh` returns the stamp the image belongs to; `None`
@@ -472,7 +474,7 @@ fn hydrate_image(
     path: &Path,
     source: super::super::scan_index_persistence::Source,
     fresh: impl FnOnce(&ScanIndex, &sqlite::Sqlite) -> Result<Option<(u64, u64)>>,
-) -> Result<Option<(ScanIndex, KindCx, kinds::Baseline, (u64, u64))>> {
+) -> Result<Option<Image>> {
     super::ack::ProgressRecovery::recover_route(identity, stamp.0, path)
         .context("state_v2_open_recover")?;
     telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
