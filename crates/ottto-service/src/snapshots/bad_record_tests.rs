@@ -684,7 +684,12 @@ fn codex_occurrences() {
     let mut route = route_for(Source::Codex);
     let path = route.dir.join(Codex::name());
     let event = |minute, total: Value, last: Option<u64>| {
-        let mut info = json!({"total_token_usage":{"input_tokens":total,"output_tokens":0}});
+        let root = if total.is_number() {
+            json!({"input_tokens":total,"output_tokens":0})
+        } else {
+            json!({"input_tokens":total})
+        };
+        let mut info = json!({"total_token_usage":root});
         if let Some(last) = last {
             info["last_token_usage"] = json!({"input_tokens":last,"output_tokens":0});
         }
@@ -759,10 +764,12 @@ fn codex_occurrences() {
             "thread_token_usage":usage(total)}})
         .to_string()
     };
+    let mut bad: Value = serde_json::from_str(&native("bad", 20, json!("invalid"))).unwrap();
+    bad["payload"]["usage"] = json!({"input_tokens":"invalid"});
     let rows = vec![
         codex_lines(1)[0].clone(),
         native("n1", 10, json!(10)),
-        native("bad", 20, json!("invalid")),
+        bad.to_string(),
         native("n2", 30, json!(10)),
     ];
     write(&path, &rows);
