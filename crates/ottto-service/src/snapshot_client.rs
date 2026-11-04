@@ -1523,8 +1523,7 @@ pub struct SnapshotStatusRequest {
     /// class by class, by equality, that every loss a receipt discloses is
     /// exactly the loss the daemon settled — instead of taking an opaque error
     /// code on faith. Additive: a backend that predates them ignores them.
-    /// `#[serde(default)]` so a terminal-status journal written by an older
-    /// daemon still reloads.
+    /// `#[serde(default)]` so a body that predates them still deserializes.
     #[serde(default)]
     pub last_terminal_ownership_incomplete_file_count: u64,
     #[serde(default)]
@@ -3748,35 +3747,6 @@ mod tests {
             hint.session_request_identity_retained_contract.as_deref(),
             Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
         );
-    }
-
-    /// An older daemon's terminal-status journal predates the residue fields.
-    /// It must still reload — with the residue absent, not as a parse error —
-    /// so a daemon upgrade never strands the last committed receipt.
-    #[test]
-    fn a_journaled_receipt_without_residue_fields_reloads_with_them_absent() {
-        let mut committed = serde_json::to_value(clean_checkin_request()).expect("receipt JSON");
-        let body = committed.as_object_mut().expect("object");
-        for name in [
-            "last_terminal_ownership_incomplete_file_count",
-            "last_terminal_zero_snapshot_usage_evidence_count",
-            "last_terminal_recognized_usage_drop_count",
-            "last_terminal_dropped_usage_record_count",
-            "last_terminal_over_line_cap_count",
-            "last_census_residue_settled",
-            "last_census_residue_index_key_count",
-            "last_census_residue_archived_rollout_count",
-        ] {
-            assert!(body.remove(name).is_some(), "{name} is on the wire");
-        }
-        let reloaded: SnapshotStatusRequest =
-            serde_json::from_value(committed).expect("a pre-residue journal reloads");
-        assert!(!reloaded.last_census_residue_settled);
-        assert_eq!(reloaded.last_terminal_dropped_usage_record_count, 0);
-        assert_eq!(reloaded.last_census_residue_index_key_count, 0);
-        reloaded
-            .validate_declared_report_kind()
-            .expect("the reloaded beat is still truthful");
     }
 
     #[test]

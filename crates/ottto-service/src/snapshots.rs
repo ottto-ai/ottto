@@ -3726,10 +3726,14 @@ pub struct SourceScanResult {
     pending_finalization: Vec<PendingIndexFinalization>,
     /// RAM-only observations of this bounded page; never serialized or uploaded.
     discovery_growth: discovery_growth::Page,
-    pub(crate) cap_counts: CapCounts,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
     /// Local-only V2 counting receipts of this scan, moved out of its census.
     /// `None` when no configured counting parse finished (never a zero block).
+    /// No production reader; scan tests assert the receipts.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "receipts are asserted by scan tests only")
+    )]
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
@@ -18094,11 +18098,9 @@ impl OwnedSourceScan {
             let Some(mut candidate) = identified_candidates.pop_front() else {
                 context_read_budget.flush(index, &codex_selected_flags);
                 if codex_page.continuation() {
-                    let cap_counts = index
-                        .traversal
-                        .as_mut()
-                        .map(|t| t.counts.caps.drain(source.api_slug()))
-                        .unwrap_or_default();
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.counts.caps.drain(source.api_slug());
+                    }
                     let continuation_evidence = codex_join_inventory
                         .map(|inventory| CodexContinuationEvidence {
                             inventory,
@@ -18117,7 +18119,6 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
-                            cap_counts,
                             discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
                             continuation_evidence,
@@ -18743,7 +18744,6 @@ impl OwnedSourceScan {
                     });
                 let scan = SourceScanResult {
                     census_status,
-                    cap_counts: counts.caps,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
