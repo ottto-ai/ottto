@@ -393,7 +393,7 @@ fn stored<S: TailSource>(
     })?;
     let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
     if toggled {
-        reduction.scrub_identity(true, false);
+        reduction.scrub_context_digest();
     }
     let taken = Taken {
         modified_hint: checkpoint.modified_hint(),

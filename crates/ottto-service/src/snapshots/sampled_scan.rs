@@ -232,13 +232,12 @@ impl SharedCache {
     }
 }
 impl SharedCache {
-    /// A change of the key retained digests were made under (`context`), or of
-    /// the login-address key or its capability (`address`). Keeps every parse:
-    /// a server hint can change either, and that must never cause a re-read.
-    pub(crate) fn scrub_retained_identity(&self, context: bool, address: bool) {
+    /// A change of the key retained digests were made under. Keeps every parse:
+    /// a server hint can change the key, and that must never cause a re-read.
+    pub(crate) fn scrub_retained_context_digests(&self) {
         self.retained()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .scrub_states(|state| state.scrub_identity(context, address));
+            .scrub_states(sampled_jsonl::CachedJsonlReduction::scrub_context_digest);
     }
 
     /// Bind before constructor-time discovery/selection, which consults CONTENT.

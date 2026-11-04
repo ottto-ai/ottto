@@ -275,7 +275,7 @@ fn claude_layout() -> String {
 /// whether old heads still decode (a `G` append does), or bump
 /// `Claude::REDUCTION_REVISION`, then update this pin.
 const CLAUDE_LAYOUT_SHA256: &str =
-    "7b524958b42c394491662b40f42f762bb51526f5c31689be1a130f5008cfb69e";
+    "292b38dad1f7aaaf7010d40285e1f68e5cb32418496c619707b32e1e6e0603d1";
 
 /// [money] Any drift of the stored Claude head or page layout fails here.
 #[test]
