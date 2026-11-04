@@ -11,14 +11,12 @@
 //! persisted: a crash between the two unlinks leaves one member, which the
 //! next run deletes.
 use super::claude_request_census::held_candidates;
-use super::claude_request_money::e2::{scan_evidence, Evidence, SIDE_CALL_DEADLINE};
 use super::money_freshness::index_current_since_start;
 use super::*;
 use crate::claude_local_otel::telemetry_stem;
 use crate::local_resource_diagnostics::ClaudeTelemetryRetention as Counts;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 /// Keys this pass removed from the index (the retirer's work).
 pub(crate) fn removed_index_keys(before: &ScanIndex, after: &ScanIndex) -> BTreeSet<String> {
@@ -183,14 +181,15 @@ fn protected_stems(
     Some(roots.into_iter().map(telemetry_stem).collect())
 }
 
-/// One census traversal (subagents included) for every candidate: a record
-/// holding one of a candidate's request ids is a copy and keeps it. A listed
-/// file proves which requests it holds only through its census record of the
-/// listed revision (same mtime) that the `e2` source verification calls
-/// current; any other listed file (no record, stale, queued, lossy, no
-/// mtime) is unknown and keeps every candidate whose first request is not
-/// newer than the file (a copy is written after the requests it copies). An
-/// unfinished traversal keeps them all.
+/// One census traversal (subagents included, no deadline: it runs after the
+/// save) for every candidate: a record holding one of a candidate's request
+/// ids is a copy and keeps it. A listed file whose loss-free record proves its
+/// scan is known through the ids of that read, even if the file has grown
+/// since: a copy is written when its file is created, and a transcript then
+/// appends only its own turns. Any other listed file (no record, lossy,
+/// retired, twin, over budget) is unknown and keeps every candidate whose
+/// first request is not newer than the file (a copy is written after the
+/// requests it copies; no mtime keeps all).
 fn copied_candidates(
     index: &ScanIndex,
     removed: &BTreeSet<String>,
@@ -212,9 +211,9 @@ fn copied_candidates(
     }
     let union = wanted.keys().copied().collect::<Vec<_>>();
     let mut copied = vec![false; candidates.len()];
-    let walked = claude_request_census::ClaudeRequestCensus::walk_transcript_holders(
+    claude_request_census::ClaudeRequestCensus::walk_transcript_holders(
         census.records(),
-        Instant::now() + SIDE_CALL_DEADLINE,
+        None,
         |_, _, record| {
             for hash in held_candidates(record, &union) {
                 for &at in &wanted[&hash] {
@@ -223,19 +222,14 @@ fn copied_candidates(
             }
         },
     );
-    if walked.is_none() {
-        return vec![true; candidates.len()];
-    }
     let unknown = roster
         .listed
         .iter()
         .filter(|(key, _)| !removed.contains(*key) && root_of(key).is_some())
-        .filter(|(key, listed)| {
-            !census.get(key).is_some_and(|record| {
-                !record.is_lossy()
-                    && listed.is_some_and(|listed| record.modified() == Some(listed))
-                    && scan_evidence(index, key, record) == Evidence::Current
-            })
+        .filter(|(key, _)| {
+            !census
+                .get(key)
+                .is_some_and(|record| !record.is_lossy() && record.proves_scan())
         })
         .map(|(_, mtime)| mtime.unwrap_or(u64::MAX))
         .max();

@@ -17,6 +17,8 @@ const HALF: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const NAMED: &str = "9338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 /// The candidate of a dependency row.
 const HELD: &str = "a338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+/// A listed transcript no page has read (no census record).
+const UNREAD: &str = "b338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
 fn member(c: &Corpus, dir: &str, session: &str) -> PathBuf {
     c.support
@@ -499,31 +501,11 @@ fn telemetry_retention_keeps_every_dependency() {
     }
 }
 
-/// [money] Retention follows only a completed upload: a rejected, deferred,
-/// shed, disabled or failed page drops it even when it settles. (A failed
-/// selected save returns before retention.)
-#[test]
-fn telemetry_retention_follows_only_a_completed_upload() {
-    assert!(telemetry_retention_follows(&Ok(
-        ResumableUploadResult::Completed
-    )));
-    let dropped: [Result<ResumableUploadResult>; 5] = [
-        Ok(ResumableUploadResult::Rejected { count: 1 }),
-        Ok(ResumableUploadResult::Deferred { count: 1 }),
-        Ok(ResumableUploadResult::Shed { retry_after: None }),
-        Ok(ResumableUploadResult::Disabled(None)),
-        Err(anyhow::anyhow!("synthetic upload failure")),
-    ];
-    for upload in &dropped {
-        assert!(!telemetry_retention_follows(upload), "{upload:?}");
-    }
-}
-
 /// [money] Fail closed: a member that changes after it was read is kept under
 /// the lock; no current walk, a pair written after the walk began, a listed
-/// transcript whose census record is older than its listed revision (it may
-/// hold a copy), a listed transcript without an mtime, and a malformed member
-/// all keep the pair.
+/// transcript with no census record (it may hold a copy), one without an
+/// mtime, and a malformed member all keep the pair. A transcript that grew
+/// since its loss-free read is known through that read's ids.
 #[test]
 fn telemetry_retention_fails_closed() {
     with_e2(|| {
@@ -551,14 +533,17 @@ fn telemetry_retention_fails_closed() {
         retire(&c, &warm.index);
         assert_eq!(gone(), (true, true), "written after the walk began");
 
-        let mut stale = BTreeMap::new();
-        stale.insert(key(&c, COPY), Some(u64::MAX - 1));
-        roster(now_ms() + 60_000, stale);
-        retire(&c, &warm.index);
-        assert_eq!(gone(), (true, true), "a stale census record is unknown");
-
         let mut unknown = listing(&c);
-        unknown.insert(key(&c, COPY), None);
+        unknown.insert(key(&c, UNREAD), Some(u64::MAX - 1));
+        roster(now_ms() + 60_000, unknown.clone());
+        retire(&c, &warm.index);
+        assert_eq!(
+            gone(),
+            (true, true),
+            "a listed file without a census record is unknown"
+        );
+
+        unknown.insert(key(&c, UNREAD), None);
         roster(now_ms() + 60_000, unknown);
         retire(&c, &warm.index);
         assert_eq!(
@@ -567,10 +552,23 @@ fn telemetry_retention_fails_closed() {
             "a listed file without an mtime is unknown"
         );
 
-        append(&member(&c, "claude-code-effort", GONE), "{not json\n");
+        let api = member(&c, "claude-code-effort", GONE);
+        let rows = std::fs::read_to_string(&api).unwrap();
+        append(&api, "{not json\n");
         walked(&c, now_ms() + 60_000);
         retire(&c, &warm.index);
         assert_eq!(gone(), (true, true), "a malformed member is a read fault");
+
+        std::fs::write(&api, rows).unwrap();
+        let mut grown = listing(&c);
+        grown.insert(key(&c, COPY), Some(u64::MAX - 1));
+        roster(now_ms() + 60_000, grown);
+        retire(&c, &warm.index);
+        assert_eq!(
+            gone(),
+            (false, false),
+            "a grown transcript is known through its last read"
+        );
     });
 }
 

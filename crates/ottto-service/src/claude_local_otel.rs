@@ -1585,9 +1585,7 @@ pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bo
         trace_evidence_path(support_dir, session_id),
     ]
     .iter()
-    .all(|path| {
-        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    })
+    .all(|path| matches!(telemetry_member(path), Ok(None)))
 }
 
 /// One telemetry pair (API + trace member) as read for retention. Each member
@@ -1677,8 +1675,7 @@ pub(crate) fn read_telemetry_pair(
     let mut observed = Vec::new();
     if generations[0].is_some() {
         let (rows, witness) = decode_api_sidecar(support_dir, &session_id).map_err(|_| ())?;
-        let health = witness.health;
-        if health.malformed_lines + health.unreadable_lines + health.invalid_session_rows > 0 {
+        if !witness.health.is_complete() {
             return Err(());
         }
         for row in rows {
@@ -1688,9 +1685,7 @@ pub(crate) fn read_telemetry_pair(
     }
     if generations[1].is_some() {
         let mut report = load_claude_trace_ownership_evidence(support_dir, [session_id.clone()]);
-        if report.malformed_lines + report.unreadable_lines + report.invalid_session_rows > 0
-            || !report.rows_discarded.is_empty()
-        {
+        if !report.is_complete() {
             return Err(());
         }
         for row in report.evidence.remove(&session_id).unwrap_or_default() {
@@ -1703,10 +1698,6 @@ pub(crate) fn read_telemetry_pair(
     for at in observed {
         let at = OffsetDateTime::parse(&at, &Rfc3339).map_err(|_| ())?;
         first_observed = first_observed.min(u64::try_from(at.unix_timestamp()).map_err(|_| ())?);
-    }
-    // A member that changed while it was read is held for the next run.
-    if [telemetry_member(&paths[0])?, telemetry_member(&paths[1])?] != generations {
-        return Err(());
     }
     let present = generations.iter().flatten();
     Ok(TelemetryPair {
@@ -1757,9 +1748,9 @@ pub(crate) fn unlink_telemetry_pair(
 /// Make a run's unlinks durable: one sync per telemetry directory.
 pub(crate) fn sync_telemetry_dirs(support_dir: &Path) -> std::io::Result<()> {
     for dir in [STORE_DIR, TRACE_STORE_DIR] {
-        match File::open(support_dir.join(dir)) {
+        match crate::context_composition::sync_dir(&support_dir.join(dir)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            dir => dir?.sync_all()?,
+            synced => synced?,
         }
     }
     Ok(())
