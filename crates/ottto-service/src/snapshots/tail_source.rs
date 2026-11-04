@@ -19,11 +19,11 @@ pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
-/// The one list of sources with a Tail codec: `$s` names the source's codec
-/// type inside `$arm`; every other source takes `$none`. A source joins by
-/// adding its arm here, never through its `state_v2` registry flag.
+/// Every source's Tail codec: `$s` names the source's codec type inside
+/// `$arm`. A source joins by adding its arm here, never through its
+/// `state_v2` registry flag.
 macro_rules! with_codec {
-    ($source:expr, $s:ident => $arm:expr, _ => $none:expr) => {
+    ($source:expr, $s:ident => $arm:expr) => {
         match $source {
             SnapshotSource::ClaudeCode => {
                 type $s = claude::Claude;
@@ -41,28 +41,14 @@ macro_rules! with_codec {
     };
 }
 
-/// Whether `source` has a Tail codec: its Tail counters exist, and on a Tail
-/// route its reduction is never kept in RAM.
-pub(in crate::snapshots) fn has_codec(source: SnapshotSource) -> bool {
-    with_codec!(source, S => S::SOURCE == source, _ => false)
+/// Whether `source` has a Tail codec; only `keeps_ram` asks.
+fn has_codec(source: SnapshotSource) -> bool {
+    with_codec!(source, S => S::SOURCE == source)
 }
 
-/// The reduction revision `source`'s codec writes, when it has one.
-pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> Option<u32> {
-    with_codec!(source, S => Some(S::REDUCTION_REVISION), _ => None)
-}
-
-/// The state database route `source`'s Tail lives on, when it has a codec.
-/// `Err`: the route exists but cannot be read now (a database hold); the
-/// caller holds the file, and RAM is never its fallback.
-pub(in crate::snapshots) fn tail_route(
-    source: SnapshotSource,
-    index: &ScanIndex,
-) -> anyhow::Result<Option<PathBuf>> {
-    if !has_codec(source) {
-        return Ok(None);
-    }
-    state_v2::runtime_path(index)
+/// The reduction revision `source`'s codec writes.
+pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
+    with_codec!(source, S => S::REDUCTION_REVISION)
 }
 
 /// Whether `source`'s reduction is kept in RAM between reads: exactly when it
@@ -91,8 +77,7 @@ pub(in crate::snapshots) fn load_candidate(
 ) -> load::Load {
     with_codec!(
         source,
-        S => load::entry::<S>(index, route, candidate, live, capture, held, scope),
-        _ => load::Load::Cold(None)
+        S => load::entry::<S>(index, route, candidate, live, capture, held, scope)
     )
 }
 
@@ -104,7 +89,7 @@ pub(in crate::snapshots) fn stored_usage(
     index: &ScanIndex,
     key: &str,
 ) -> Option<(u64, u64)> {
-    with_codec!(source, S => stored_usage_of::<S>(index, key), _ => None)
+    with_codec!(source, S => stored_usage_of::<S>(index, key))
 }
 
 fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, u64)> {
@@ -136,37 +121,21 @@ pub(in crate::snapshots) fn pending(
 ) -> Option<seam::PendingTail> {
     with_codec!(
         source,
-        S => seam::PendingTail::new::<S>(index, completed, active, candidate, held, capture, base, quiet),
-        _ => None
+        S => seam::PendingTail::new::<S>(index, completed, active, candidate, held, capture, base, quiet)
     )
-}
-
-/// A certified cursor job's Tail write, handed to the same staging path as an
-/// ordinary completion (`pending`, then the PRE encode and native verdict).
-/// A cursor certificate reports its completion unsealed (fail-closed,
-/// `CompletedNativeAcquisition::unsealed`); the job's own bit is whether the
-/// native EOF applied an unterminated final record past its sealed offset,
-/// so only that bit drops the publish. A withheld fragment is not applied:
-/// the reduction is the reduction through the sealed offset, and the next
-/// read tails from there.
-pub(in crate::snapshots) fn certified_job(
-    tail: seam::PendingTail,
-    eof_applied: bool,
-) -> seam::PendingTail {
-    tail.sealed_by_job(eof_applied)
 }
 
 /// `key`'s committed sealed offset on `source`'s Tail route: where its next
 /// read continues, read from the head's certificate without decoding the
-/// reduction. `None`: no codec, no route, no readable head, or a route that
-/// cannot be read now; the caller then plans the whole file.
+/// reduction. `None`: no route, no readable head, or a route that cannot be
+/// read now; the caller then plans the whole file.
 pub(in crate::snapshots) fn committed_sealed_offset(
     source: SnapshotSource,
     index: &ScanIndex,
     key: &str,
 ) -> Option<u64> {
-    let revision = reduction_revision(source)?;
-    tail_route(source, index).ok()??;
+    let revision = reduction_revision(source);
+    state_v2::tail_route_path(index).ok()??;
     let head = state_v2::load_head(index, key, revision).ok()??;
     if head.metadata_only {
         return None;
@@ -359,7 +328,7 @@ impl HeadIdentity {
         Self {
             binding: hash.finalize().into(),
             capture: request_identity_capture,
-            key_epoch: with_codec!(source, S => S::key_epoch(), _ => None),
+            key_epoch: with_codec!(source, S => S::key_epoch()),
         }
     }
     fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
@@ -641,6 +610,20 @@ fn slot_start(page: u64, g: u32, held: usize) -> Result<(), ReconstructCause> {
     } else {
         Err(ReconstructCause::Corrupt)
     }
+}
+
+/// One `Slot` page of plain elements onto `into`, in stored order.
+fn read_slot_vec<T: Durable + crate::heap_layout_bound::HeapLayoutBound>(
+    page: u64,
+    bytes: &[u8],
+    g: u32,
+    into: &mut crate::owned_heap::OwnedVec<T>,
+) -> Result<(), ReconstructCause> {
+    slot_start(page, g, into.len())?;
+    read_page(bytes, g, |d| {
+        into.push(T::take(d)?);
+        Ok(())
+    })
 }
 
 /// An hourly bucket's page: its hour since the epoch. A start that does not

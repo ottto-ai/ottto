@@ -7,6 +7,7 @@ use crate::snapshots::{
 };
 use crate::transcript_acquisition::{FullReason, ReadMode};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const NOW: u64 = 100_000;
 const INTERVAL: u64 = 6 * 60 * 60;

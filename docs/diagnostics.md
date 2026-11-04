@@ -80,7 +80,7 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows` | Logical/main-file size and backend owner counts, with existing size alarms. |
 | `save_span`, `load_span` | Latest v2 save/load duration in milliseconds and generation (null on failed load); saves also report outcome (`committed`, `not_published`, `ambiguous`, `error`) and existing put/delete attempt counts, including rolled-back work. A reconciled published COMMIT error reports `committed`; cached loads also report a span. Byte/read counts are omitted: charged save work is not bytes written, and decode counters may reset during hydration. No paths, keys, ids or values. |
-| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure or live ACK-custody hold remains visible after hydration. This is current posture, not an occurrence counter. |
+| `hold` | Latest v2 hold, explicitly `"none"` after successful open or a load/save that resolves the hold. A retained save-pressure hold remains visible after hydration. This is current posture, not an occurrence counter. |
 | `quick_check_ms`, `quick_check_slow_alarm` | Open-time integrity scan duration in milliseconds and whether it exceeded 2 seconds plus 10 ms per allocated MiB. The scan completes without an interrupt deadline; a slow scan never holds collection. |
 | `db_unavailable_cause` | Latest v2 storage-hold cause: `at` = outermost static `state_v2_*` code, `cause` = innermost static code, `io_<ErrorKind>` or `sqlite_<extended code>`. Never messages, paths, keys or values. |
 | `baseline_bytes`, `baseline_age_s`, `baseline_14day_escalation_alarm` | Exact preserved root/referenced-shard bytes at import; baseline age and escalation refreshed on import, authenticated save, load and maintenance. |
@@ -133,7 +133,7 @@ Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, follo
 by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
 
 Source health uses `index_retrying` and "local index busy, retrying" for typed
-reload, migration, save-pressure and ACK-custody holds. These do not increment
+reload, migration and save-pressure holds. These do not increment
 repair-required counters or recommend repair. Unsupported formats require an
 update. `DbUnavailable` retains `index_shard_unavailable` repair advice for every
 cause; explicit integrity repair, lost fences, foreign bindings and reference

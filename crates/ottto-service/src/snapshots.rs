@@ -14793,13 +14793,10 @@ impl SnapshotAccumulator {
         {
             return Vec::new();
         }
-        let Some(source_session_id) = self.raw_source_session_id(path) else {
+        // The same session key the head-CAS ledger answers under
+        // (`tail_source::load::conflict_owed`).
+        let Some(source_session_id) = self.wire_source_session_id(path) else {
             return Vec::new();
-        };
-        let source_session_id = if self.source == SnapshotSource::Codex {
-            snapshot_source_session_id(self.source, path, source_session_id)
-        } else {
-            source_session_id
         };
         if self.source == SnapshotSource::Codex && !self.codex_usage_accounting_complete() {
             return Vec::new();
@@ -14854,22 +14851,13 @@ impl SnapshotAccumulator {
             session_account_evidence = Some(evidence);
         }
         // A Claude Code subagent transcript (Task tool or Workflow tool) shares
-        // its parent's `sessionId`; re-key it from its PATH to a distinct id so
-        // it ingests as its own `isSidechain=true` (ai_agent) session instead of
-        // collapsing into -- and overwriting -- the human parent. Top-level
-        // transcripts are unchanged.
+        // its parent's `sessionId`; the wire rule above re-keys it from its PATH
+        // to a distinct id so it ingests as its own `isSidechain=true`
+        // (ai_agent) session instead of collapsing into -- and overwriting --
+        // the human parent. Top-level transcripts are unchanged.
         let claude_subagent = (self.source == SnapshotSource::ClaudeCode)
             .then(|| claude_subagent_identity(path))
             .flatten();
-        let source_session_id = if self.source == SnapshotSource::ClaudeCode {
-            snapshot_source_session_id_with(
-                self.source,
-                claude_subagent.as_ref(),
-                source_session_id,
-            )
-        } else {
-            source_session_id
-        };
         // Subagent tree position, read from the provider's own sidecar. Absent
         // or malformed metadata simply leaves the derived facts absent.
         let claude_agent_meta = claude_subagent
@@ -19284,7 +19272,7 @@ impl OwnedSourceScan {
                         // from its first member, and a file with protected
                         // tiers re-read from its start.
                         #[cfg(unix)]
-                        if tail_source::has_codec(source) {
+                        {
                             let replay = if let Some(group) = active.group.as_deref() {
                                 Some((
                                     tail_source::counters::Replay::Group,
@@ -20195,7 +20183,7 @@ impl OwnedSourceScan {
                     // A certified cursor job stages its Tail the same way,
                     // under its own seal bit.
                     .map(|tail| match cursor_eof_applied {
-                        Some(eof_applied) => tail_source::certified_job(tail, eof_applied),
+                        Some(eof_applied) => tail.sealed_by_job(eof_applied),
                         None => tail,
                     });
                 #[cfg(unix)]
@@ -22295,7 +22283,7 @@ impl OwnedSourceScan {
             // re-reads from its committed head.
             #[cfg(unix)]
             if decision == CandidateDecision::Skip
-                && matches!(tail_source::tail_route(source, index), Ok(Some(_)))
+                && matches!(state_v2::tail_route_path(index), Ok(Some(_)))
                 && tail_source::load::set_aside(index, &local_index_key(&candidate.path))
             {
                 decision = CandidateDecision::Parse;
@@ -22635,7 +22623,7 @@ impl OwnedSourceScan {
                 // back, by the rule its retention keys on. A route that
                 // cannot be read now holds the file for its next selection.
                 #[cfg(unix)]
-                let tail_route = match tail_source::tail_route(source, index) {
+                let tail_route = match state_v2::tail_route_path(index) {
                     Ok(route) => route,
                     Err(_) => {
                         tail_source::counters::bump(source, "tail_db_loads", "held");
@@ -22646,10 +22634,7 @@ impl OwnedSourceScan {
                 // No database route (v1, a paused import, no support dir): a
                 // codec source keeps no RAM copy either, so its growth reads Full.
                 #[cfg(unix)]
-                if tail_route.is_none()
-                    && tail_source::has_codec(source)
-                    && index.files.contains_key(&key)
-                {
+                if tail_route.is_none() && index.files.contains_key(&key) {
                     tail_source::counters::bump(source, "tail_bootstrap_full", "unrouted");
                 }
                 #[cfg(not(unix))]
@@ -41398,22 +41383,9 @@ pub(crate) fn snapshot_source_session_id(
     path: &Path,
     first_id: String,
 ) -> String {
-    let claude_identity = (source == SnapshotSource::ClaudeCode)
-        .then(|| claude_subagent_identity(path))
-        .flatten();
-    snapshot_source_session_id_with(source, claude_identity.as_ref(), first_id)
-}
-
-/// Same rule as [`snapshot_source_session_id`], for callers that already
-/// parsed the Claude subagent identity from the path, so it is parsed once.
-fn snapshot_source_session_id_with(
-    source: SnapshotSource,
-    claude_identity: Option<&ClaudeSubagentIdentity>,
-    first_id: String,
-) -> String {
     match source {
-        SnapshotSource::ClaudeCode => claude_identity
-            .map(ClaudeSubagentIdentity::source_session_id)
+        SnapshotSource::ClaudeCode => claude_subagent_identity(path)
+            .map(|identity| identity.source_session_id())
             .unwrap_or(first_id),
         SnapshotSource::Codex => resolve_codex_identity(&first_id),
         _ => first_id,

@@ -11,9 +11,7 @@ use super::tests::{append, cold, committed, committed_lines, counted, len, loade
 use super::*;
 use crate::local_resource_diagnostics::capture;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
-use crate::snapshots::tail_source::{
-    counters, has_codec, hour_pages, keeps_ram, read_hour_page, tail_route,
-};
+use crate::snapshots::tail_source::{counters, hour_pages, keeps_ram, read_hour_page};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
@@ -204,31 +202,15 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
         .all(|epoch| *epoch == claude_request_money::e2::RULE_EPOCH));
 }
 
-/// [behaviour] L01: the codec list alone gives a source its codec and Tail
-/// route, whatever the registry's `state_v2` flag says (all three sources),
-/// and each source's counters stay on its own line.
+/// [behaviour] L01: every source's Tail lives on the route, whatever the
+/// registry's `state_v2` flag says, and each source's counters stay on its
+/// own line.
 #[test]
 fn codec_list_gives_routes_and_counters_stay_per_source() {
-    const CODECS: [SnapshotSource; 3] = [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ];
     let route = route();
-    for source in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ] {
-        let codec = CODECS.contains(&source);
-        assert_eq!(has_codec(source), codec, "{}", source.api_slug());
-        assert_eq!(
-            tail_route(source, &route.index).unwrap().is_some(),
-            codec,
-            "{}",
-            source.api_slug()
-        );
-    }
+    assert!(crate::snapshots::state_v2::tail_route_path(&route.index)
+        .unwrap()
+        .is_some());
     counters::bump(SnapshotSource::ClaudeCode, "tail_db_loads", "hit");
     for other in [SnapshotSource::Codex, SnapshotSource::Pi] {
         let ((), lines) = capture(|| counters::emit(other));

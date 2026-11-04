@@ -1262,7 +1262,7 @@ pub(in crate::snapshots) fn end_group(
     // An ended group's replay counts with the bytes it read, as a completed
     // one's does at its completion.
     #[cfg(unix)]
-    if sampling.is_some() && crate::snapshots::tail_source::has_codec(SnapshotSource::Codex) {
+    if sampling.is_some() {
         crate::snapshots::tail_source::counters::replay(
             SnapshotSource::Codex,
             crate::snapshots::tail_source::counters::Replay::Group,

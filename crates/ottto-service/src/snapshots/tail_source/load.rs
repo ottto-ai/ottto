@@ -143,12 +143,10 @@ pub(in crate::snapshots) fn retire_absent(
     observed: &BTreeSet<String>,
     residue: &BTreeSet<String>,
 ) {
-    let (Ok(Some(route)), Some(revision)) = (
-        super::tail_route(source, index),
-        super::reduction_revision(source),
-    ) else {
+    let Ok(Some(route)) = state_v2::tail_route_path(index) else {
         return;
     };
+    let revision = super::reduction_revision(source);
     let Ok(mut absent) = state_v2::tail_head_keys(index) else {
         return;
     };

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,7 +22,6 @@ pub(crate) enum Hold {
     ReloadRequired,
     SaveFull,
     ReferenceDrift,
-    AckCustody,
 }
 impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,7 +35,6 @@ impl std::fmt::Display for Hold {
             Self::ReferenceDrift => "state_v2_reference_drift",
             Self::ReloadRequired => "current_index_requires_reload",
             Self::FenceLost => "state_v2_fence_lost",
-            Self::AckCustody => "state_v2_ack_custody_hold",
         })
     }
 }
@@ -139,19 +137,12 @@ struct RouteState {
     requested_page: usize,
     save_hold: Option<Hold>,
     pass_written_start: Option<u64>,
-    // Live ACK custody exceeded the companion bound: no collection before this.
-    custody_retry_at: Option<Instant>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
 }
 impl RouteState {
-    fn custody_held(&self) -> bool {
-        self.custody_retry_at.is_some_and(|at| Instant::now() < at)
-    }
     fn report_hold(&self) {
-        if self.custody_held() {
-            telemetry::event("hold", &Hold::AckCustody);
-        } else if let Some(hold) = self.save_hold {
+        if let Some(hold) = self.save_hold {
             telemetry::event("hold", &hold);
         } else {
             telemetry::event("hold", &"none");
@@ -203,7 +194,6 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     requested_page: 250,
                     save_hold: None,
                     pass_written_start: None,
-                    custody_retry_at: None,
                     tail: Default::default(),
                 }))
             })
@@ -981,35 +971,6 @@ pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf
     Ok(Some(
         guard.as_ref().ok_or(Hold::ReloadRequired)?.path.clone(),
     ))
-}
-
-/// Live custody alone exceeds the companion bound. Pace collection at the
-/// growth-full interval: one parse/admission retry per interval, no POST in
-/// between, and owed debt stays in the unchanged index/progress.
-pub(in super::super) fn hold_ack_custody(path: &Path) {
-    let retry_at =
-        Instant::now() + Duration::from_secs(super::super::sampled_audit::GROWTH_FULL_INTERVAL);
-    if with_state(path, |state| {
-        state.custody_retry_at = Some(retry_at);
-        Ok(())
-    })
-    .is_ok()
-    {
-        telemetry::event("hold", &Hold::AckCustody);
-        telemetry::count("ack_custody_hold_alarm", 1);
-    }
-}
-
-/// Existing routes only: an admission probe never adds a registry slot.
-pub(in super::super) fn ack_custody_held(path: &Path) -> bool {
-    let Some(state) = states()
-        .lock()
-        .ok()
-        .and_then(|states| states.get(path).cloned())
-    else {
-        return false;
-    };
-    state.lock().is_ok_and(|state| state.custody_held())
 }
 
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
