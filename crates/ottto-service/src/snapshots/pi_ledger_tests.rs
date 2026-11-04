@@ -42,6 +42,15 @@ fn every_pi_usage_shape_passes_the_same_clock_gate() {
             let mut acc = SnapshotAccumulator::new(SnapshotSource::Pi);
             apply_pi_line(&fork_header(None, FORK_TIME), &mut acc);
             let mut value = fork_usage(kind, "gate", FORK_TIME, input);
+            if input == 0 {
+                // True zero usage: the fixture's output tokens go too.
+                let output = if value.get("message").is_some() {
+                    "/message/usage/output"
+                } else {
+                    "/usage/output"
+                };
+                *value.pointer_mut(output).unwrap() = 0.into();
+            }
             let object = value.as_object_mut().unwrap();
             object.remove("timestamp");
             if let Some(message) = object.get_mut("message").and_then(Value::as_object_mut) {
