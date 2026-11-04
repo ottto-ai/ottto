@@ -176,10 +176,11 @@ const PARSE_FOR_AUTHORITY: (CandidateDecision, Option<CandidateParseReason>) = (
     Some(CandidateParseReason::AuthorityQuarantine),
 );
 
-/// [regress] An unindexed member of a family with an authority record (a
-/// held body the committed index does not keep) waits like an indexed member
+/// [money] An unindexed member of a family with an authority record (a held
+/// body the committed index does not keep) waits like an indexed member
 /// instead of a new-file read every pass; a changed or owed member, or one
-/// whose family has no record, is still read as a new file.
+/// whose family has no record, is still read as a new file. A family that
+/// returns this way publishes exactly once, with a cold Full's money.
 #[test]
 fn an_unchanged_unindexed_member_waits_for_its_family_authority() {
     const NEW_FILE: (CandidateDecision, Option<CandidateParseReason>) = (
@@ -205,6 +206,102 @@ fn an_unchanged_unindexed_member_waits_for_its_family_authority() {
     assert_eq!(apc_decision(&index, &candidates[1]), NEW_FILE, "owed");
     index.claude_usage_authority_quarantine.remove(APC_ROOT);
     assert_eq!(apc_decision(&index, &candidates[0]), NEW_FILE, "no record");
+    #[cfg(unix)]
+    returning_family_publishes_once_under_its_authority_record();
+}
+
+/// The money arm: a member that returns unindexed under its family's held
+/// terminal record is not read while held. When its retry falls due it is
+/// read once and published once, in RAM and from a restored index, with the
+/// money of a cold Full; a later quiet pass publishes nothing again.
+#[cfg(unix)]
+fn returning_family_publishes_once_under_its_authority_record() {
+    use crate::snapshots::apply_claude_reported_usage_with_index as fold_authority;
+    use crate::snapshots::claude_request_money::e2::{finish_page, TelemetryRead};
+    use crate::snapshots::e2_pipeline_scan_fixture::{write_exclusions, E2ScanFixture};
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    let scratch = crate::test_scratch::ScratchDir::new("unindexed-member-authority-money");
+    let root = scratch.join("project");
+    fs::create_dir_all(&root).unwrap();
+    let id = "a0000000-0000-4000-8000-00000000000b";
+    let path = root.join(format!("{id}.jsonl"));
+    let at = "2026-08-02T07:00:00Z";
+    let line = serde_json::json!({"type":"assistant", "version":"2.1.309", "sessionId":id,
+        "timestamp":at, "requestId":"request", "message":{"id":"message",
+        "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}});
+    fs::write(&path, format!("{line}\n")).unwrap();
+    write_exclusions(&scratch, &[]);
+    let births = BTreeMap::from([(path.clone(), rfc3339_unix_nanos(at).unwrap())]);
+    let source = SnapshotSource::ClaudeCode;
+    let roots = [root];
+    let scan = |index, sampled| {
+        E2ScanFixture::default().scan(&roots, &scratch, index, 10, sampled, &births, &[])
+    };
+    let api = Default::default();
+    let trace = Default::default();
+    let finish = |index: &mut ScanIndex, scan: &mut SourceScanResult| {
+        fold_authority(&mut scan.snapshots, &api, &trace, index);
+        finish_page(
+            &mut scan.snapshots,
+            index,
+            TelemetryRead::Loaded,
+            &mut Default::default(),
+            &Default::default(),
+        );
+        scan_money(source, index, scan)
+    };
+    let publishes = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|item| item.source_session_id == id)
+            .count()
+    };
+    let mut fresh = ScanIndex::default();
+    fresh.load_claude_reemission_exclusions(&scratch);
+    let (mut cold_idx, mut cold_scan, _) = scan(fresh, false);
+    let key = local_index_key(&path);
+    // The member returns unindexed: the committed index does not keep its
+    // held body, and the family's terminal record holds its revision.
+    let mut returned = cold_idx.clone();
+    let revision = returned
+        .files
+        .remove(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clone();
+    returned.file_snapshot_fingerprints.remove(&key);
+    returned.insert_unproven_terminal_claude_authority_for_test(id, &revision);
+    let (returned, held, modes) = scan(returned, true);
+    assert_eq!(modes, (0, 0, 0), "the held member waits for its record");
+    assert_eq!(publishes(&held), 0);
+    let mut due = returned;
+    due.claude_usage_authority_quarantine
+        .get_mut(id)
+        .unwrap()
+        .retry_after_unix_seconds = PRE_E2_TERMINAL_DEADLINE_CUTOFF;
+    let saved = scratch.join("scan-index.json");
+    due.save(&saved).unwrap();
+    let restored = ScanIndex::load(&saved).unwrap();
+    let cold = finish(&mut cold_idx, &mut cold_scan);
+    let mut routes = Vec::new();
+    for (route, index) in [("RAM", due), ("restore", restored)] {
+        let (mut index, mut read, modes) = scan(index, true);
+        assert_eq!(modes, (1, 0, 0), "{route}: one read when due");
+        let money = finish(&mut index, &mut read);
+        assert_eq!(publishes(&read), 1, "{route}: published once");
+        assert!(
+            !index.claude_usage_authority_quarantine.contains_key(id),
+            "{route}: the record settles"
+        );
+        index.save(&saved).unwrap();
+        let (_, quiet, modes) = scan(ScanIndex::load(&saved).unwrap(), true);
+        assert_eq!(modes, (0, 0, 0), "{route}: not read again");
+        assert_eq!(publishes(&quiet), 0, "{route}: not published again");
+        routes.push(money);
+    }
+    money_oracle::assert_equivalent(&cold, &routes[0]);
+    money_oracle::assert_equivalent(&cold, &routes[1]);
+    money_oracle::assert_no_smaller_reemit(id, &cold, &routes[0], &cold, false);
 }
 
 /// A persisted grant over a bounded terminal record is a valid v2 record:
