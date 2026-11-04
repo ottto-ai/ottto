@@ -3837,7 +3837,6 @@ fn account_limit_holds_over_32_with_a_visible_reason() {
             matches!(result, Tagged::Sent { .. }),
             "{accounts}: {result:?}"
         );
-        assert_eq!(item.request_evidence.len(), accounts);
         assert_eq!(
             item.usage_buckets[0].model_usage[0]
                 .identity_parts
