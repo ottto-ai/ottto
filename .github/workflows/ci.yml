@@ -239,6 +239,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+          # The PR merge commit plus its base parent, for the move checks.
+          fetch-depth: 2
 
       # Pinned binary with the action's per-version SHA-256; no unverified
       # cargo-install fallback.
@@ -258,6 +260,9 @@ jobs:
           cargo -V
 
       - name: Public surface gate
+        env:
+          # A `Move-only:` line makes the move checks fail instead of report.
+          MOVE_ONLY_PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/public_repo_surface_ci.sh --scope portable
 
   dependency-review:
