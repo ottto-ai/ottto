@@ -61,9 +61,13 @@ pub(crate) fn codex_evidence_of_items(
     })
 }
 
-/// The store an older release left: `index` as a standalone index file in
-/// which every transcript's family still carries the retired per-family
-/// pending usage evidence and every file entry the retired owed bit. A routed
+/// The store release 0.1.217 left mid-walk: `index` as a standalone index
+/// file in which every transcript's family still carries the retired
+/// per-family pending usage evidence and every file entry the retired owed
+/// bit, the walk carries every family (stale-family carry roots, with each
+/// file queued for replay), the full re-arm progress names them structural
+/// and held with another invalidation observed, and the duplicate fence and
+/// identity-contract latch are set, in that release's field shapes. A routed
 /// index is written as its resident copy without the route, as a standalone
 /// file holds it.
 pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
@@ -77,6 +81,8 @@ pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
     };
     let mut legacy = serde_json::to_value(&copy).expect("encode the index");
     let mut pending = serde_json::Map::new();
+    let mut roots = BTreeSet::new();
+    let mut replay = Vec::new();
     let files = legacy["files"]
         .as_object_mut()
         .expect("the index encodes its file entries");
@@ -87,6 +93,13 @@ pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
             .and_then(|stem| stem.to_str())
             .expect("a transcript key")
             .to_string();
+        roots.insert(session.clone());
+        replay.push(json!({
+            "scan_root": std::path::Path::new(key).parent().expect("a transcript directory"),
+            "path": key,
+            "census_member": true,
+            "watcher_hint": false,
+        }));
         let mut members = serde_json::Map::new();
         members.insert(session.clone(), json!(["0".repeat(64)]));
         pending.insert(
@@ -100,6 +113,30 @@ pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
         );
     }
     legacy["claude_usage_family_pending"] = Value::Object(pending);
+    let digests = roots
+        .iter()
+        .map(|root| {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(root.as_bytes()))[..16].to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    legacy["claude_stale_family_carry"] = json!({
+        "origin": {
+            "context_fingerprint": "c".repeat(64),
+            "process": 1,
+            "full_rearm_window": true,
+        },
+        "roots": roots,
+        "replay": replay,
+    });
+    legacy["claude_full_rearm_progress"] = json!({
+        "observed_window": "2026-08-02T08:00:00Z",
+        "structural_roots": digests,
+        "other_invalidation_observed": true,
+        "held_family_roots": digests,
+    });
+    legacy["claude_duplicate_request_witness_overflowed"] = json!(true);
+    legacy["claude_request_identity_contract_changed"] = json!(true);
     legacy
 }
 
@@ -113,6 +150,13 @@ pub(crate) fn upgrade_from_legacy_store(
         .as_object()
         .unwrap()
         .is_empty());
+    assert!(
+        !legacy["claude_stale_family_carry"]["roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a carrying walk"
+    );
     std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).expect("write the legacy store");
     super::super::ScanIndex::load(path).expect("an older release's store loads")
 }
