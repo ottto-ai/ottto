@@ -3825,13 +3825,14 @@ pub(crate) fn reconcile_request_accounts(
             if blocked {
                 carry.block(occurrence.usage.request_count);
             }
-            // Incomplete evidence (an unreadable owner included): no marker,
-            // carry, start or binding fills it.
+            // The classifier's refusal for an owner the scope names but could
+            // not read: no marker, carry, start or binding fills it.
             let account = if blocked
-                || matches!(
+                || (matches!(
                     identity,
                     Some(IdentityRef::Refused(Refusal::IncompleteEvidence))
-                ) {
+                ) && evidence.owner_unreadable(root, request.as_str()))
+            {
                 None
             } else if preserve_org {
                 own_marker.and_then(|run| run.account.clone())
