@@ -39,7 +39,6 @@ pub(in crate::snapshots) fn carry_tail(
                     previous,
                     &mut next,
                     &mut session.cx,
-                    false,
                 )?;
                 session.stamp = session.db.stamp()?;
                 state.save_digests = Some(digests);
