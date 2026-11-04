@@ -1127,8 +1127,9 @@ fn same_context_restart_rearms_no_file() {
 
 /// An index written by an older release still carries the retired per-family
 /// pending evidence and per-file owed bits. Decoding drops both and changes no
-/// file entry, and the next traversal after a restart wakes no root, including
-/// a root whose only debt was that pending evidence.
+/// file entry. With that index on disk, the next traversal after a restart
+/// wakes no root, including a root whose only debt was that pending evidence,
+/// and its save purges both.
 #[test]
 #[serial(source_manifests)]
 fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
@@ -1161,7 +1162,7 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
         entry["evidence_owed"] = true.into();
     }
     let decoded: ScanIndex =
-        serde_json::from_value(legacy).expect("an older release's index decodes");
+        serde_json::from_value(legacy.clone()).expect("an older release's index decodes");
     let reencoded = serde_json::to_value(&decoded).expect("re-encode the decoded index");
     assert!(
         matches!(
@@ -1176,5 +1177,209 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
         assert!(upgraded.get("evidence_owed").is_none(), "{key}");
         assert_eq!(upgraded, serde_json::to_value(entry).unwrap(), "{key}");
     }
+    // The restart loads the older release's store itself, pending rows and
+    // owed bits included.
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&legacy).unwrap())
+        .expect("persist the older release's index");
+    let upgraded = ScanIndex::load(&fixture.index_path).expect("the persisted index loads");
+    assert_eq!(upgraded.files.len(), index.files.len());
     assert_quiet_restart_traversal(&mut fixture, "upgrade");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read the saved index"))
+            .expect("decode the saved index");
+    assert!(
+        matches!(
+            saved.get("claude_usage_family_pending"),
+            None | Some(serde_json::Value::Null)
+        ),
+        "the next save purges the retired pending evidence"
+    );
+    for (key, entry) in saved["files"]
+        .as_object()
+        .expect("the saved index encodes its file entries")
+    {
+        assert!(entry.get("evidence_owed").is_none(), "{key}");
+    }
+}
+
+/// A listed family grows after the baseline accepted its body, in the same
+/// upload context. Returns the fixture, the baseline index, the baseline route
+/// with the family's accepted body and witness, and the pages of the growing
+/// traversal. With
+/// `witnessed`, the family keeps the witness an older build stored, without
+/// an authority record, as an upgraded store does.
+fn grown_listed_family(
+    name: &str,
+    witnessed: bool,
+) -> (
+    PipelineFixture,
+    ScanIndex,
+    crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    Vec<PipelinePage>,
+) {
+    use crate::snapshots::sampled_scan::transition_fixture::{scan_money, Accepted};
+    let fixture = PipelineFixture::new(name);
+    let accepted_pages = fixture.traversal(8, &PIPELINE_BASELINE_CYCLE);
+    let last = accepted_pages.last().expect("baseline page");
+    assert!(last.scan.census_complete);
+    assert!(last.fully_settled);
+    let page = accepted_pages
+        .iter()
+        .find(|page| {
+            page.scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+        })
+        .expect("the baseline uploads the family");
+    let item = page
+        .scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+        .unwrap();
+    assert!(last
+        .index
+        .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+    let mut prior = scan_money(SnapshotSource::ClaudeCode, &page.index, &page.scan);
+    prior.accepted.insert(
+        PIPELINE_HELD_SESSION.to_string(),
+        Accepted {
+            body: prior.snapshots[PIPELINE_HELD_SESSION].clone(),
+            witness: snapshot_upload_body_witness(item),
+        },
+    );
+    if witnessed {
+        fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        assert!(value["claude_usage_authority_quarantine"]
+            .as_object_mut()
+            .expect("authority records")
+            .remove(PIPELINE_HELD_SESSION)
+            .is_some());
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
+            .expect("keep the witness without its record");
+    }
+    let seeded = ScanIndex::load(&fixture.index_path).expect("load the seeded index");
+    assert_eq!(
+        seeded
+            .claude_usage_family_witness_digest_for_test(PIPELINE_HELD_SESSION)
+            .is_some(),
+        witnessed
+    );
+    assert!(seeded
+        .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+        .is_none());
+    fixture.list_held(&[PIPELINE_HELD_SESSION]);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    let pages = fixture.traversal(9, &PIPELINE_BASELINE_CYCLE);
+    assert!(
+        pages
+            .iter()
+            .any(|page| page.parsed.contains(PIPELINE_HELD_SESSION)),
+        "the grown family is read"
+    );
+    assert_listed_fold_absent(&pages, PIPELINE_HELD_SESSION);
+    let baseline = last.index.clone();
+    (fixture, baseline, prior, pages)
+}
+
+/// A witnessed listed family that grows reads contractless money, so the
+/// fold holds it. No body of it reaches the uploader, its accepted body and
+/// witness stay the prior ones, and no smaller body replaces them.
+#[test]
+#[serial(source_manifests)]
+fn witnessed_listed_family_grows_held_never_smaller() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    let _source_manifests = SourceManifestTestGuard::new();
+    let (_unwitnessed, _, _, control) =
+        grown_listed_family("census-p2-listed-grows-control", false);
+    let cold = control
+        .iter()
+        .find(|page| page.parsed.contains(PIPELINE_HELD_SESSION))
+        .map(|page| scan_money(SnapshotSource::ClaudeCode, &page.index, &page.scan))
+        .unwrap();
+    let (_witnessed, baseline, prior, pages) =
+        grown_listed_family("census-p2-listed-grows-held", true);
+    assert!(
+        cold.snapshots[PIPELINE_HELD_SESSION]["request_count"].as_u64()
+            > prior.accepted[PIPELINE_HELD_SESSION].body["request_count"].as_u64(),
+        "the held revision is larger than the accepted body"
+    );
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let mut holds = 0;
+    for page in pages
+        .iter()
+        .filter(|page| page.parsed.contains(PIPELINE_HELD_SESSION))
+    {
+        holds += page.held.len();
+        assert!(page.held.is_disjoint(&page.uploaded));
+        assert!(page
+            .index
+            .claude_usage_family_witness_digest_for_test(PIPELINE_HELD_SESSION)
+            .is_some());
+        let mut candidate = scan_money(SnapshotSource::ClaudeCode, &page.index, &page.scan);
+        // The accepted body is the one the index still records as current.
+        let accepted = &prior.accepted[PIPELINE_HELD_SESSION];
+        let fingerprint = prior.snapshots[PIPELINE_HELD_SESSION]["snapshot_fingerprint"]
+            .as_str()
+            .expect("the accepted body's fingerprint");
+        if page
+            .index
+            .accepted_snapshot_fingerprint_recorded(fingerprint)
+            && page.index.files[&held_key].last_snapshot_fingerprint
+                == baseline.files[&held_key].last_snapshot_fingerprint
+        {
+            candidate
+                .accepted
+                .insert(PIPELINE_HELD_SESSION.to_string(), accepted.clone());
+        }
+        money_oracle::assert_no_smaller_reemit(
+            PIPELINE_HELD_SESSION,
+            &prior,
+            &candidate,
+            &cold,
+            true,
+        );
+    }
+    assert!(holds > 0, "the grown body is offered and held");
+}
+
+/// D-1: a listed family with no witness gets no rebuild and no demotion, so
+/// its grown body uploads on transcript money alone: every request counted,
+/// never $0 and never lost.
+#[test]
+#[serial(source_manifests)]
+fn listed_family_without_witness_uploads_transcript_only() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let (_fixture, _, prior, pages) = grown_listed_family("census-p2-listed-unwitnessed", false);
+    assert!(pages.iter().all(|page| page.held.is_empty()));
+    let page = pages
+        .iter()
+        .find(|page| page.parsed.contains(PIPELINE_HELD_SESSION))
+        .unwrap();
+    let item = page
+        .scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == PIPELINE_HELD_SESSION)
+        .expect("the grown body reaches the uploader");
+    assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+    assert!(page
+        .index
+        .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+    assert_eq!(
+        item.usage_accounting_contract, None,
+        "transcript-only money"
+    );
+    let body = serde_json::to_value(item).unwrap();
+    assert_eq!(body["request_count"], serde_json::json!(2));
+    assert_eq!(body["input_tokens"], serde_json::json!(20));
+    assert_eq!(body["output_tokens"], serde_json::json!(20));
+    assert!(
+        body["request_count"].as_u64()
+            > prior.accepted[PIPELINE_HELD_SESSION].body["request_count"].as_u64(),
+        "the grown body carries more than the accepted one"
+    );
 }
