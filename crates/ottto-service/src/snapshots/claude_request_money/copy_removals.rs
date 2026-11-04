@@ -56,9 +56,13 @@ impl CopyRemovals {
         Ok(serde_json::from_value(value).unwrap_or_else(|_| Self::missing()))
     }
     pub(crate) fn pending(&self, file: LocationKey) -> bool {
+        self.hold_age(file) > 0
+    }
+    /// The passes `file`'s prefix has been held so far (0: no wait).
+    pub(crate) fn hold_age(&self, file: LocationKey) -> u64 {
         self.files
             .binary_search_by_key(&file, |f| f.0)
-            .is_ok_and(|i| self.files[i].1 > 0)
+            .map_or(0, |i| self.files[i].1)
     }
     /// Hold at most two passes; the third emits flagged. No unbounded or
     /// non-discoverable hold is created.
@@ -123,10 +127,7 @@ impl CopyRemovals {
                     .count() as u64
             })
             .sum::<u64>();
-        let attempts = self
-            .files
-            .binary_search_by_key(&file, |f| f.0)
-            .map_or(0, |i| self.files[i].1);
+        let attempts = self.hold_age(file);
         self.replace(file, attempts, groups);
         added
     }
