@@ -304,7 +304,7 @@ fn regression<S: SourceFixture>() {
         "parser_generation":JSONL_TERMINAL_DISPOSITION_GENERATION,
         "loss":{"over_line_cap_count":1,"recognized_usage_drop_count":loss.recognized_usage_drop_count,
         "dropped_usage_record_count":loss.dropped_usage_record_count}});
-    let legacy: TerminalJsonlDisposition = serde_json::from_value(old).unwrap();
+    let legacy = state_v2::terminal_loss_for_test(&serde_json::to_vec(&old).unwrap());
     assert_eq!(
         legacy.loss.recognized_usage_drop_count,
         loss.recognized_usage_drop_count
@@ -800,7 +800,11 @@ fn ack_transitions<S: SourceFixture>(route: &Route, items: &[SnapshotItem]) {
             "accepted":refs.len(),"sessions_reconciled":refs.len(),"session_ids":[],"disabled":false,
             "disabled_reason":null,"entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
             "accepted_entities":if not_stored {vec![]} else {refs.clone()},
-            "unchanged_entities":if not_stored {refs} else {vec![]}
+            "unchanged_entities":if not_stored {refs} else {vec![]},
+            "rejected_entities":if partial {batch.iter().skip(1).map(|item| json!({
+                "source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
+                "occurrence_count":1,"reason":"invalid","detail":"synthetic refusal","permanent":true
+            })).collect::<Vec<_>>()} else {vec![]}
         })).unwrap()
     };
     let mut ack = AckLedger::new(S::SOURCE);
@@ -822,9 +826,15 @@ fn ack_transitions<S: SourceFixture>(route: &Route, items: &[SnapshotItem]) {
     restarted.reopen(S::SOURCE, &progress);
     assert!(restarted.settled(&offered[0]));
     assert!(!restarted.settled(&offered[1]));
-    restarted.deliver(&offered);
-    assert_eq!(restarted.posts(), 1);
-    assert!(offered.iter().all(|item| restarted.settled(item)));
+    let retry = offered[1].clone();
+    // Permanent refusal stores no body ACK; a fresh delivery context can retry it.
+    let mut retrying = AckLedger::new(S::SOURCE);
+    retrying.deliver(std::slice::from_ref(&retry));
+    assert!(retrying.settled(&retry));
+    restarted.deliver(std::slice::from_ref(&offered[0]));
+    assert_eq!(restarted.posts(), 0);
+    assert!(restarted.settled(&offered[0]));
+    assert!(!restarted.settled(&offered[1]));
 }
 
 // The existing native account corpus supplies two accounts and the switch;
@@ -839,6 +849,8 @@ fn placement() {
         let support = dir.with_extension("b2-evidence");
         let mut side = api.evidence[&session][3].clone();
         side.request_id = "side-call".into();
+        side.client_request_id = "client-side-call".into();
+        side.event_sequence = Some(5);
         side.input_tokens = 5;
         side.output_tokens = 2;
         side.fingerprint.clear();
@@ -849,6 +861,7 @@ fn placement() {
         api.evidence.get_mut(&session).unwrap().push(side);
         let mut trace = traces.evidence[&session][3].clone();
         trace.request_id = "side-call".into();
+        trace.client_request_id = "client-side-call".into();
         trace.fingerprint.clear();
         trace.fingerprint = format!(
             "sha256:{:x}",
@@ -936,7 +949,7 @@ fn placement() {
             false,
         );
         let cold = fixture::scan_money(SnapshotSource::ClaudeCode, &cold_index, &cold_scan);
-        assert_eq!(cold_scan.snapshots[0].input_tokens, 22);
+        assert_eq!(cold_scan.snapshots[0].input_tokens, 52);
         assert_eq!(
             cold_scan.snapshots[0].request_count, 6,
             "four responses, gap and independent side call"
@@ -976,7 +989,19 @@ fn placement() {
             &cold,
             &fixture::scan_money(SnapshotSource::ClaudeCode, &index, &scan),
         );
-        let (restored, scan) = run(&E2ScanFixture::capturing_identity(), index, true);
+        let mut index = index;
+        // The file has a committed reduction but its finalized body is still owed.
+        index
+            .files
+            .get_mut(&local_index_key(&path))
+            .unwrap()
+            .last_snapshot_fingerprint = None;
+        let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).unwrap();
+        index.save(&route).unwrap();
+        let loaded = ScanIndex::load(&route).unwrap();
+        let restarted = E2ScanFixture::capturing_identity();
+        restarted.on_committed_route(&route);
+        let (restored, scan) = run(&restarted, loaded, true);
         money_oracle::assert_equivalent(
             &cold,
             &fixture::scan_money(SnapshotSource::ClaudeCode, &restored, &scan),

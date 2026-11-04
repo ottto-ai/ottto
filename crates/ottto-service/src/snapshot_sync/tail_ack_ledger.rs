@@ -1,5 +1,6 @@
 //! The real resumable upload loop and its exact-body progress, for Tail transition
-//! fixtures: POSTs are counted, every one is accepted, and nothing is persisted.
+//! fixtures: POSTs are counted; callers choose transport/ACK outcomes and can
+//! persist the existing progress ledger across a synthetic restart.
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

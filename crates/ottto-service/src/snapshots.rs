@@ -2736,7 +2736,9 @@ impl ScanTraversalCounts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct TerminalJsonlLoss {
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
     malformed_json_line_count: usize,
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
     invalid_utf8_line_count: usize,
     recognized_usage_drop_count: usize,
     dropped_usage_record_count: u64,

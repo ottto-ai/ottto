@@ -30,6 +30,13 @@ pub(super) use runtime::{
 };
 mod catalogue;
 mod codec;
+
+/// The real exact stored-row decoder for the upgrade regression.
+#[cfg(test)]
+pub(super) fn terminal_loss_for_test(bytes: &[u8]) -> super::TerminalJsonlDisposition {
+    codec::decode(bytes, 4096).unwrap()
+}
+
 mod ignored;
 mod interning;
 mod kinds;

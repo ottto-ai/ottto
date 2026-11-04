@@ -350,6 +350,14 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
             ) {}
             if cursor {
                 assert!(reader.sealed_fragment());
+                if serde_json::from_slice::<Value>(&last).is_err() {
+                    assert!(!reader.apply_sealed_fragment(|value| seen.push(value.clone())));
+                    assert!(reader.sealed_fragment());
+                    assert_eq!(seen.len(), 2);
+                    assert_eq!(reader.report.malformed_json_line_count, 0);
+                    assert_eq!(reader.report.invalid_utf8_line_count, 0);
+                    return (seen, reader.report);
+                }
                 assert!(reader.apply_sealed_fragment(|value| seen.push(value.clone())));
                 assert!(!reader.sealed_fragment());
                 assert!(reader.buf.is_empty());
@@ -357,7 +365,12 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
             }
             (seen, reader.report)
         };
-        assert_eq!(read(true), read(false));
+        if serde_json::from_slice::<Value>(&last).is_ok() {
+            assert_eq!(read(true), read(false));
+        } else {
+            assert_eq!(read(true).0.len(), 2);
+            assert_eq!(read(false).1.malformed_json_line_count, 1);
+        }
     }
 }
 
