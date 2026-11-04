@@ -3527,10 +3527,9 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     let new = write_dated_rollout(&fixture, "2026/11/01", NEW);
     refresh_retained_codex_roster(
         SnapshotSource::Codex,
-        index.traversal.as_mut().unwrap(),
+        &mut index,
         BACKFILL_WINDOW_DAYS,
-        discovery_retention!(index),
-        (&index.files).into(),
+        None,
     );
     assert!(!index
         .traversal

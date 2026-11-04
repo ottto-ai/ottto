@@ -699,14 +699,8 @@ fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -
     Ok(read_sample(file, offset, expected.len(), count)? == expected)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 use crate::hex::is_sha256_lower as digest_shaped;
+use crate::hex::sha256_lower as sha256_hex;
 
 /// The parts of a prior certificate `prepare`'s decision reads, borrowed from
 /// a `Checkpoint` or a `PrefixSeal`.

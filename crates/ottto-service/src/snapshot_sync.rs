@@ -22361,7 +22361,8 @@ mod tests {
             ),
         )
         .expect("write old replay fixture");
-        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+        // Older than the policy window, inside the first-read bound.
+        let old_mtime = OffsetDateTime::parse("2026-07-16T12:00:00Z", &Rfc3339)
             .expect("old fixture mtime")
             .unix_timestamp() as u64;
         std::fs::OpenOptions::new()
@@ -22381,7 +22382,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut policy_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, false),
+            scan_request_window_days(30, false),
         )
         .expect("policy-width scan");
         assert_eq!(policy_scan.discovered_file_count, 0);
@@ -22393,7 +22394,7 @@ mod tests {
             std::slice::from_ref(&root),
             &mut replay_index,
             "2026-08-30T12:00:00Z",
-            scan_request_window_days(183, true),
+            scan_request_window_days(30, true),
         )
         .expect("wide replay scan");
         assert_eq!(replay_scan.backfill_window_days, 730);

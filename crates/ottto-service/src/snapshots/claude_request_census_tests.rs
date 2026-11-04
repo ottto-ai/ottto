@@ -165,10 +165,7 @@ fn write_census_corpus(root: &Path) {
                 1,
                 10,
             ),
-            census_user_line(
-                "canary-over-line-cap",
-                &"x".repeat(16_777_216 + 1024),
-            ),
+            census_user_line("canary-over-line-cap", &"x".repeat(16_777_216 + 1024)),
         ],
     );
     // A provider-marked fork prefix is excluded from the child's ids.
@@ -800,9 +797,15 @@ fn census_retired_record_survives_an_unchanged_reparse() {
             10,
         )],
     );
-    // Windows far enough past the file's mtime (now) to retire it.
+    // Windows far enough past the file's mtime (now) to retire it (35 days),
+    // inside its first-read bound (60 days).
+    let after = |days: i64| {
+        (time::OffsetDateTime::now_utc() + time::Duration::days(days))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
     let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, "2027-03-01T09:00:00Z");
+    census_scan(&root, &mut index, &after(45));
     let key = census_key(&index, &root, "census-retired.jsonl");
     let retired = index
         .claude_request_census_for_test()
@@ -821,7 +824,7 @@ fn census_retired_record_survives_an_unchanged_reparse() {
         .expect("entry")
         .source_file_fingerprint
         .clear();
-    census_scan(&root, &mut index, "2027-03-02T09:00:00Z");
+    census_scan(&root, &mut index, &after(46));
     let reparsed = index
         .claude_request_census_for_test()
         .record_for_test(&key)
