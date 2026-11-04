@@ -2592,12 +2592,13 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
     });
 }
 
-/// Owner B: a list seen once and now missing keeps today's pause and alarm
-/// with the gate on. No owed file is re-read or stamped 3, and a genuine
-/// change uploads its ordinary body (every family is kept on ordinary money
-/// while the list pauses adoption), never the literal and never withheld.
+/// A list seen once and now missing keeps today's pause and alarm with the
+/// gate on: no owed file is re-read or stamped 3. [money] The pause holds
+/// adoption only: a genuine change of an unlisted family uploads the `e2`
+/// literal, as under the installed list, never withheld (G1), and its file
+/// is not stamped 3 while the list is missing (G3).
 #[test]
-fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
+fn e2_missing_list_pauses_history_and_uploads_changes_as_e2() {
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
     fixture.baseline_at(2);
     fixture.install_list(&[]);
@@ -2617,9 +2618,12 @@ fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
             BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
             "only the genuine change uploads"
         );
-        assert!(changed.uploaded_literal.is_empty());
+        assert_eq!(
+            changed.uploaded_literal,
+            BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+            "the change uploads the e2 literal"
+        );
         assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
-        e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
         assert!(changed
             .index
             .files

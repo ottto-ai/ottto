@@ -11950,15 +11950,6 @@ impl SnapshotAccumulator {
                 self.fallback_bucket_timestamp(None),
             )
         });
-        if let Some(money) = money.as_mut() {
-            money.set_identity(
-                self.claude_org_markers.as_deref(),
-                self.account_identifier_hash.as_deref(),
-                self.source_session_id.as_deref(),
-                money_context.as_ref(),
-                responses.first().map(|response| response.sequence),
-            );
-        }
         crate::local_resource_diagnostics::claude_record_counts(
             self.claude_response_record_count,
             responses
@@ -11968,13 +11959,42 @@ impl SnapshotAccumulator {
                 .unwrap_or(0),
             CLAUDE_RECORDS_PER_FILE_ALARM,
         );
+        let first_sequence = responses.first().map(|response| response.sequence);
+        // Resolve the sorted book first: org lines govern from the first
+        // response whose provider time is from `ACCOUNT_RULE_FROM`.
+        let responses = responses
+            .into_iter()
+            .map(|response| response.resolve_classified(&selectors))
+            .collect::<Vec<_>>();
+        if let Some(money) = money.as_mut() {
+            let trust_from = responses
+                .iter()
+                .flatten()
+                .find(|response| {
+                    claude_request_identity::from_account_rule(
+                        response
+                            .terminal_timestamp
+                            .as_deref()
+                            .and_then(rfc3339_unix_seconds),
+                    )
+                })
+                .map(|response| response.sequence);
+            money.set_identity(
+                self.claude_org_markers.as_deref(),
+                self.account_identifier_hash.as_deref(),
+                self.source_session_id.as_deref(),
+                money_context.as_ref(),
+                first_sequence,
+                trust_from,
+            );
+        }
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         // The previous resolved response's end when it ended a turn (no tool
         // use); `None` after a tool use or an unresolved response. A response
         // whose prompt follows it starts a turn: the time between is idle.
         let mut turn_end: Option<String> = None;
         for response in responses {
-            let mut response = match response.resolve_classified(&selectors) {
+            let mut response = match response {
                 Ok(response) => response,
                 // With the `e2` gate on, a resolver conflict is counted
                 // and disclosed on the body (resolver_conflict_count) and the
@@ -32948,7 +32968,7 @@ impl ScanIndex {
             kind,
             &claude_history_upgrade::PolicyInputs {
                 exclusions: &self.claude_reemission_exclusions,
-                listed: self.claude_reemission_excluded(candidate),
+                listed: self.claude_family_listed(&candidate.path),
                 birth_unix_seconds,
                 latched: claude_reemission_stop_latched(),
                 active_revision: self.active_effective_upload_body_witness_revision,
@@ -33033,7 +33053,7 @@ impl ScanIndex {
             self.claude_reemission_exclusions
                 .close_over_roots(std::iter::once((root, stem)));
         }
-        if self.claude_reemission_excluded(candidate) {
+        if self.claude_family_listed(&candidate.path) {
             return;
         }
         let root_directory;
@@ -33272,8 +33292,6 @@ impl ScanIndex {
         )
     }
 
-    /// True when the list names the family of this indexed Claude file (its
-    /// root or the member itself), as the candidate decision reads it.
     /// The re-emission list's status reason (`missing_after_install` raises
     /// the local alarm each cycle).
     #[cfg(test)]
@@ -33281,9 +33299,12 @@ impl ScanIndex {
         self.claude_reemission_exclusions.status()
     }
 
-    fn claude_family_listed(&self, index_key: &str) -> bool {
+    /// True when the list names the family of this Claude file (its root or
+    /// the member itself): the one listed predicate for candidates, indexed
+    /// keys and the `e2` fold.
+    fn claude_family_listed(&self, path: impl AsRef<Path>) -> bool {
         !self.claude_reemission_exclusions.is_empty()
-            && claude_index_path_member_ref(Path::new(index_key)).is_some_and(|member| {
+            && claude_index_path_member_ref(path.as_ref()).is_some_and(|member| {
                 self.claude_reemission_exclusions
                     .excludes(member.root, member.subagent_stem)
             })
@@ -33388,6 +33409,8 @@ impl ScanIndex {
         // literal never stamps a listed family, or any file while the list is
         // paused, whatever this cycle decided (a covering ACK, below-floor or
         // confirmed-empty settlement of a file that was not a candidate).
+        // The pause holds adoption only: a file that uploads `e2` under it
+        // keeps its stamp and is owed again once the list is back.
         if claude_history_upgrade::denies_request_owned_literal(allowed_active)
             && (self.claude_reemission_exclusions.pauses_adoption()
                 || self.claude_family_listed(index_key))
@@ -37112,16 +37135,6 @@ impl ScanIndex {
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_with_reason_gated(candidate, now, true)
-    }
-
-    /// True when the local list names this Claude file's family root or the
-    /// member itself.
-    fn claude_reemission_excluded(&self, candidate: &CandidateFile) -> bool {
-        !self.claude_reemission_exclusions.is_empty()
-            && claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
-                self.claude_reemission_exclusions
-                    .excludes(member.root, member.subagent_stem)
-            })
     }
 
     /// True when only the body-witness revision selects this candidate: the
