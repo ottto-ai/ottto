@@ -55307,8 +55307,17 @@ mod tests {
     fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
         let partial_key = index.files.keys().next().unwrap().clone();
-        // All-bad replacement: a valid sibling would now be publishable.
-        fs::write(&partial_key, "not valid json\n").unwrap();
+        // Keep the native owner while replacing all usage with one invalid record.
+        let body = fs::read_to_string(&partial_key).unwrap();
+        let header = body.lines().next().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(header).unwrap()["type"],
+            "session_meta"
+        );
+        let invalid = json!({"type":"event_msg","timestamp":"2026-07-22T08:00:00Z",
+            "payload":{"type":"token_count","info":{"total_token_usage":{
+                "input_tokens":"invalid","output_tokens":"invalid"}}}});
+        fs::write(&partial_key, format!("{header}\n{invalid}\n")).unwrap();
         index.activate_effective_upload_body_witness_revision(1);
         let previous = index.clone();
         let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);

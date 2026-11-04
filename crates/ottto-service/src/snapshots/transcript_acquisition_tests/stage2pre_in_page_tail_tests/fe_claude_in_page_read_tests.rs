@@ -791,15 +791,30 @@ fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
         return;
     }
     let base = claude_lossy_baseline();
-    let ((_, result, seen), counts) =
+    let ((index, result, seen), counts) =
         observe(|| plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache));
     assert_eq!(seen.modes, (0, 1, 0));
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
     assert_eq!(counts.retention_incomplete_or_lossy, 0);
     assert_eq!(result.malformed_json_line_count, 1);
-    assert!(base.cache.retained_checkpoint(&base.key).is_some());
+    assert!(base.cache.retained_checkpoint(&base.key).is_none());
+    let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+        CLAUDE,
+        &base.cache,
+        &index,
+        &base.key,
+    )
+    .unwrap();
+    assert_eq!(continuation.sealed_offset(), len(&base.path));
     assert_eq!(
         content(production_body(CLAUDE, result)),
+        content(full_body(&base.fixture, CLAUDE))
+    );
+    append_raw(&base.path, &row_bytes(CLAUDE, 6..7));
+    let (_, next, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(
+        content(production_body(CLAUDE, next)),
         content(full_body(&base.fixture, CLAUDE))
     );
 }

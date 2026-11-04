@@ -755,23 +755,45 @@ fn codex_occurrences() {
     let (_, switched) = full::<Codex>(&route, &path);
     assert_eq!(switched.snapshots[0].input_tokens, 200);
     assert!(switched.snapshots[0].session_account_evidence.is_none());
-    let usage = |input| json!({"input_tokens":input,"output_tokens":2,"total_tokens":input+2});
-    let native = |id, total, input: Value| {
-        json!({"type":"token_usage_record",
-        "timestamp":"2026-10-18T10:00:00Z","payload":{
-            "thread_id":"019a0c2a-8e11-7222-8333-944445555777","turn_id":id,
-            "response_id":id,"usage":{"input_tokens":input,"output_tokens":2},
-            "thread_token_usage":usage(total)}})
-        .to_string()
+    let usage = |input: Value, output: u64| {
+        json!({"input_tokens":input,
+        "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":output,
+        "reasoning_output_tokens":0,"total_tokens":input.as_u64().unwrap_or(0)+output})
     };
-    let mut bad: Value = serde_json::from_str(&native("bad", 20, json!("invalid"))).unwrap();
-    bad["payload"]["usage"] = json!({"input_tokens":"invalid"});
-    let rows = vec![
-        codex_lines(1)[0].clone(),
-        native("n1", 10, json!(10)),
-        bad.to_string(),
-        native("n2", 30, json!(10)),
-    ];
+    let mut rows = vec![codex_lines(1)[0].clone()];
+    for (id, total, output, input) in [
+        ("n1", 10, 2, json!(10)),
+        ("bad", 20, 4, json!("invalid")),
+        ("n2", 30, 6, json!(10)),
+    ] {
+        rows.push(
+            json!({"type":"event_msg","timestamp":"2026-10-18T10:00:00Z",
+            "payload":{"type":"task_started","turn_id":id}})
+            .to_string(),
+        );
+        rows.push(
+            json!({"type":"turn_context","timestamp":"2026-10-18T10:00:00Z",
+            "payload":{"turn_id":id,"model":"gpt-5"}})
+            .to_string(),
+        );
+        let used = if input.is_number() {
+            usage(input, 2)
+        } else {
+            json!({"input_tokens":"invalid"})
+        };
+        rows.push(
+            json!({"type":"token_usage_record","timestamp":"2026-10-18T10:00:00Z",
+            "payload":{"thread_id":"019a0c2a-8e11-7222-8333-944445555777",
+            "turn_id":id,"response_id":id,"usage":used,
+            "thread_token_usage":usage(json!(total),output)}})
+            .to_string(),
+        );
+        rows.push(
+            json!({"type":"event_msg","timestamp":"2026-10-18T10:00:00Z",
+            "payload":{"type":"task_complete","turn_id":id}})
+            .to_string(),
+        );
+    }
     write(&path, &rows);
     let (_, native) = full::<Codex>(&route, &path);
     assert!(native.progress_complete());
@@ -816,7 +838,8 @@ fn claude_responses() {
         ),
         (17, 5, 2)
     );
-    assert!(parsed.recognized_usage_drop_count > 0);
+    assert_eq!(parsed.recognized_usage_drop_count, 0);
+    assert_eq!(parsed.snapshots[0].resolver_conflict_count, Some(1));
     let cold = emitted::<Claude>(Mode::ColdFull, &route, &parsed.snapshots);
     commit::<Claude>(&mut route, &path, tail, parsed);
     route.index = ScanIndex::load(&route.path).unwrap();
@@ -871,24 +894,37 @@ fn ack_transitions<S: SourceFixture>(route: &Route, items: &[SnapshotItem]) {
     let mut unstored = AckLedger::new(S::SOURCE);
     let _ = unstored.attempt(&offered, |batch| Ok(response(&batch, false, true)));
     assert!(!offered.iter().any(|item| unstored.settled(item)));
-    let _ = ack.attempt(&offered, |batch| Ok(response(&batch, true, false)));
-    assert!(ack.settled(&offered[0]));
-    assert!(!ack.settled(&offered[1]));
+    let mut accepted_fingerprint = None;
+    let _ = ack.attempt(&offered, |batch| {
+        accepted_fingerprint = Some(batch[0].snapshot_fingerprint.clone());
+        Ok(response(&batch, true, false))
+    });
+    let accepted_fingerprint = accepted_fingerprint.unwrap();
+    let accepted = offered
+        .iter()
+        .find(|item| item.snapshot_fingerprint == accepted_fingerprint)
+        .unwrap();
+    let rejected = offered
+        .iter()
+        .find(|item| item.snapshot_fingerprint != accepted_fingerprint)
+        .unwrap();
+    assert!(ack.settled(accepted));
+    assert!(!ack.settled(rejected));
     let progress = route.dir.join("acks.json");
     ack.save(&progress);
     let mut restarted = AckLedger::new(S::SOURCE);
     restarted.reopen(S::SOURCE, &progress);
-    assert!(restarted.settled(&offered[0]));
-    assert!(!restarted.settled(&offered[1]));
-    let retry = offered[1].clone();
+    assert!(restarted.settled(accepted));
+    assert!(!restarted.settled(rejected));
+    let retry = rejected.clone();
     // Permanent refusal stores no body ACK; a fresh delivery context can retry it.
     let mut retrying = AckLedger::new(S::SOURCE);
     retrying.deliver(std::slice::from_ref(&retry));
     assert!(retrying.settled(&retry));
-    restarted.deliver(std::slice::from_ref(&offered[0]));
+    restarted.deliver(std::slice::from_ref(accepted));
     assert_eq!(restarted.posts(), 0);
-    assert!(restarted.settled(&offered[0]));
-    assert!(!restarted.settled(&offered[1]));
+    assert!(restarted.settled(accepted));
+    assert!(!restarted.settled(rejected));
 }
 
 // The existing native account corpus supplies two accounts and the switch;

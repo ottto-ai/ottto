@@ -2658,16 +2658,47 @@ pub(super) mod tests {
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str(&(serde_json::to_string(&bad).unwrap() + "\n"));
         fs::write(&path, text).unwrap();
-        let (_, current) = scan(&root, previous.clone(), 2);
-        let (_, cold) = scan(&root, ScanIndex::default(), 2);
-        assert_eq!(current.snapshots.len(), 1);
-        assert_eq!(current.snapshots[0].input_tokens, 300);
+        let (mut after, mut current) = scan(&root, previous.clone(), 2);
+        let (mut cold_index, mut cold) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(current.snapshots.len(), 2, "one alias per physical member");
+        assert!(current.snapshots.iter().all(|s| s.input_tokens == 300));
         assert_eq!(current.recognized_usage_drop_count, 1);
         assert_eq!(current.ownership_incomplete_file_count, 0);
+        current
+            .codex_joining_validator()
+            .unwrap()
+            .validate(&current.snapshots)
+            .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut current, &mut after);
+        current.finish_codex_capture_boundary(&mut after);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut cold, &mut cold_index);
+        cold.finish_codex_capture_boundary(&mut cold_index);
         assert_eq!(
             serde_json::to_value(&current.snapshots).unwrap(),
             serde_json::to_value(&cold.snapshots).unwrap()
         );
+        let accepted = current
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(accepted.len(), 1, "one body identity across both aliases");
+        assert_eq!(
+            serde_json::to_value(
+                &after
+                    .committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new())
+                    .files
+            )
+            .unwrap(),
+            serde_json::to_value(&previous.files).unwrap(),
+            "no ACK cannot settle either alias"
+        );
+        let mut settled = after.committable_subset(&previous, &accepted, &BTreeMap::new());
+        let state = root.join("index.json");
+        settled.save(&state).unwrap();
+        let (_, quiet) = scan(&root, ScanIndex::load(&state).unwrap(), 2);
+        assert!(quiet.snapshots.is_empty());
+        assert_eq!(quiet.semantic_noop_count, 2);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

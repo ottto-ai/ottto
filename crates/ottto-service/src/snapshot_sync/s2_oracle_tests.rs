@@ -633,7 +633,14 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let initial = page(&c, index, 100, true);
+        let scanner = E2ScanFixture::capturing_identity();
+        scanner.on_committed_route(session.path());
+        let read = |index, hints: &[PathBuf]| {
+            let mut page = c.raw(&scanner, index, 100, true, hints);
+            page.enrich(&c);
+            page
+        };
+        let initial = read(index, &[]);
         let mut previous = result(&initial, Mode::ColdFull);
         accepted(&mut previous, &initial.scan.snapshots);
         let prior = commit(&session, initial);
@@ -646,7 +653,7 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
             &line(COPY, "sibling-later", "2026-08-02T07:01:00Z", 7),
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let current = page(&c, prior, 100, true);
+        let current = read(prior, &[]);
         assert_eq!(current.modes.0, 0);
         assert!(current.modes.1 > 0);
         assert_eq!(current.scan.malformed_json_line_count, 1);
@@ -663,10 +670,21 @@ fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
         let emitted = result(&current, Mode::Restart);
         money_oracle::assert_no_smaller_reemit(ROOT, &previous, &emitted, &cold, false);
         let prior = commit(&session, current);
+        let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+            SOURCE,
+            &scanner.cache,
+            &prior,
+            &crate::snapshots::local_index_key(&path),
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.sealed_offset(),
+            std::fs::metadata(&path).unwrap().len()
+        );
         append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
         // A hint selects both files so complete envelopes can be compared.
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = hinted(&c, prior, 100, true, &[path, sibling]);
+        let replay = read(prior, &[path, sibling]);
         assert_eq!(replay.modes.0, 0);
         assert!(replay.modes.1 > 0);
         assert_eq!(
