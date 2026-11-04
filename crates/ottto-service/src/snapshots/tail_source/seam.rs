@@ -92,8 +92,14 @@ impl PendingTail {
         })
     }
 
-    /// A certified cursor job's own seal bit in place of its certificate's
-    /// fail-closed `unsealed` (`tail_source::certified_job`).
+    /// A certified cursor job's Tail write, staged as an ordinary completion's
+    /// (`pending`, then the PRE encode and native verdict). A cursor
+    /// certificate reports its completion unsealed (fail-closed,
+    /// `CompletedNativeAcquisition::unsealed`); the job's own bit is whether
+    /// the native EOF applied an unterminated final record past its sealed
+    /// offset, so only that bit drops the publish. A withheld fragment is not
+    /// applied: the reduction is the reduction through the sealed offset, and
+    /// the next read tails from there.
     pub(in crate::snapshots) fn sealed_by_job(mut self, eof_applied: bool) -> Self {
         self.unsealed = eof_applied;
         self

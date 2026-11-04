@@ -1562,7 +1562,7 @@ fn a_codec_route_error_holds_the_file_without_ram() {
         let size = index.files[&key].size_bytes;
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         crate::snapshots::state_v2::poison_route_for_test(&index);
-        assert!(super::tail_source::tail_route(source, &index).is_err());
+        assert!(crate::snapshots::state_v2::tail_route_path(&index).is_err());
         assert!(!super::tail_source::keeps_ram(source));
         let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
         assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");

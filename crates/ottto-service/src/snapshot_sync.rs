@@ -195,16 +195,6 @@ fn bootstrap_cache_heads_with_budget(
                 // Refusal must leave the in-memory ledger equal to its saved
                 // checkpoint so partial settlement can commit retirement proof.
                 progress.admit_ack_reoffers(probes)?;
-                // A prune is durable before the probe POST, so a failed POST
-                // leaves the saved checkpoint equal to the ledger.
-                if progress.admit_ack_custody(
-                    probes.iter(),
-                    probes.iter().map(|item| item.source_session_id.as_str()),
-                    &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
-                    &snapshot_upload_body_witness,
-                )? {
-                    persist(progress)?;
-                }
                 for probe in probes {
                     progress
                         .accepted_fingerprints
@@ -2575,7 +2565,7 @@ impl SnapshotUploadProgress {
         item: &T,
         head_changed_without_proof: bool,
     ) -> Result<()> {
-        self.record_stored_state(item, head_changed_without_proof, None, false)
+        self.record_stored_state(item, head_changed_without_proof, None)
     }
 
     /// `stored` is the item's stored-body entity ACK (fingerprint-exact, no
@@ -2585,13 +2575,11 @@ impl SnapshotUploadProgress {
     /// public witness version, so the entity-ACK validator also checked the
     /// exact version. Count-only and legacy ACKs pass `None`.
     /// `retained_proof_missing` only removes, so it is always applied.
-    /// `preview` sizes pre-upload custody without reporting hypothetical evictions.
     fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
         head_changed_without_proof: bool,
         stored: Option<(&crate::snapshot_client::SnapshotEntityRef, &str)>,
-        preview: bool,
     ) -> Result<()> {
         let value = serde_json::to_value(item)?;
         let Some(session) = value
@@ -2600,11 +2588,7 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
-        if preview {
-            self.accepted_identity_buckets.preview_record(&value);
-        } else {
-            self.accepted_identity_buckets.record(&value);
-        }
+        self.accepted_identity_buckets.record(&value);
         if let Some((entity, local_witness)) = stored {
             // Mirrors `snapshot_ack_body_witness_version`'s public domains.
             let versioned_body = ["session_account_evidence", "cache_observations"]
@@ -8244,7 +8228,6 @@ fn finish_sync_source(
     upload_progress
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
-    upload_progress.freeze_custody_page(&scan_result.snapshots);
     crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
     let probes = scan_result
         .snapshots
@@ -10899,12 +10882,6 @@ where
         })
         .count();
     progress.admit_ack_batch(new_acks)?;
-    let custody_pruned = progress.admit_ack_custody(
-        indices.iter().map(|index| &items[*index]),
-        items.iter().filter_map(session_id),
-        fingerprint,
-        body_witness,
-    )?;
     let batch = indices
         .iter()
         .map(|index| items[*index].clone())
@@ -10951,8 +10928,7 @@ where
     // Option (ii): the server may store a replacement proof even if this
     // reply is lost; drop the superseded one durably so no later marker can
     // preserve the replacement in its place.
-    // A custody prune is likewise durable before the POST.
-    if replaced_retained_proof || custody_pruned {
+    if replaced_retained_proof {
         persist(progress)?;
     }
     let response = upload(batch);
@@ -11134,7 +11110,6 @@ where
                     stored_refs
                         .get(item_fingerprint)
                         .map(|entity| (*entity, witness.as_str())),
-                    false,
                 )?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));
@@ -13003,6 +12978,40 @@ pub(crate) fn with_state_v2_progress_owner<T>(
             action(&owner, &path)
         }
     }
+}
+
+/// The removed upload-progress bound, (64 MiB - 16 KiB) / 6 bytes.
+#[cfg(test)]
+pub(crate) const OLD_PROGRESS_BOUND_FOR_TEST: usize = 11_182_080;
+
+/// Test evidence: real-shaped upload progress past the former 11,182,080 B
+/// ACK custody bound, grown as the index quarantine mirror grows it (terminal
+/// refusal records). No source is given cache evidence.
+#[cfg(test)]
+pub(crate) fn above_old_bound_progress_for_test(
+    source: SnapshotSource,
+    namespace: &str,
+    generation: u64,
+) -> Vec<u8> {
+    let mut progress =
+        SnapshotUploadProgress::new(namespace.into(), snapshot_quarantine_witness(source));
+    let hex = |text: String| format!("{:x}", Sha256::digest(text.as_bytes()));
+    for n in 0.. {
+        progress.quarantine_permanent_body(
+            &hex(format!("fingerprint-{n}")),
+            &hex(format!("body-{n}")),
+            reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+        );
+        if n % 1000 == 999 {
+            progress.generation = generation;
+            let bytes = serde_json::to_vec_pretty(&progress).unwrap();
+            if bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST {
+                validate_state_v2_original_progress(&bytes, namespace).unwrap();
+                return bytes;
+            }
+        }
+    }
+    unreachable!()
 }
 
 pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str) -> Result<()> {
@@ -23298,21 +23307,8 @@ mod tests {
             }
             let index_path = root.join("boundary-index.json");
             let progress_path = root.join("boundary-progress.json");
-            let mut baseline = ScanIndex::default();
-            baseline.prepare_historical_replay("boundary-pending-replay".into());
+            let (mut baseline, mut working, mut progress) = Self::fresh_state(&root);
             baseline.save(&index_path).unwrap();
-            let mut working = baseline.clone();
-            let mut progress = test_upload_progress();
-            progress.destination_namespace_hash =
-                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-            progress.prepare_historical_replay("boundary-pending-replay");
-            // As the source pass: bind the context on index and ledger first.
-            activate_source_upload_context(
-                SnapshotSource::Codex,
-                Self::context(),
-                &mut working,
-                &mut progress,
-            );
             let mut items = Self::prepare(&root, &mut working, None).snapshots;
             items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
             assert_eq!(items.len(), 3);
@@ -23492,6 +23488,35 @@ mod tests {
                 self.working.file_upload_context_ack_candidates(&self.items);
             scan
         }
+        /// A cold Full of this root: a fresh index, scanned as `new` scans it.
+        fn cold_full(&self, keep_cache: bool) -> Vec<SnapshotItem> {
+            Self::cold_full_of(&self.root, keep_cache)
+        }
+        /// A fresh baseline index, then the working index and ledger with the
+        /// upload context bound first, as the source pass binds it.
+        fn fresh_state(root: &Path) -> (ScanIndex, ScanIndex, SnapshotUploadProgress) {
+            let mut baseline = ScanIndex::default();
+            baseline.prepare_historical_replay("boundary-pending-replay".into());
+            let mut working = baseline.clone();
+            let mut progress = test_upload_progress();
+            progress.destination_namespace_hash =
+                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+            progress.prepare_historical_replay("boundary-pending-replay");
+            activate_source_upload_context(
+                SnapshotSource::Codex,
+                Self::context(),
+                &mut working,
+                &mut progress,
+            );
+            (baseline, working, progress)
+        }
+        fn cold_full_of(root: &Path, keep_cache: bool) -> Vec<SnapshotItem> {
+            let (_, mut index, progress) = Self::fresh_state(root);
+            let mut items =
+                Self::prepare(root, &mut index, keep_cache.then_some(&progress)).snapshots;
+            items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+            items
+        }
         fn stable_context(index: &ScanIndex) {
             let value = serde_json::to_value(index).unwrap();
             assert!(value["upload_context_fingerprint"].is_null());
@@ -23503,32 +23528,79 @@ mod tests {
             assert_eq!(value["bounded_sweep_had_unsettled_upload"], true);
         }
     }
+    /// The transition oracle's view of `items` sent as one Codex batch.
+    fn codex_route(
+        mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+        items: &[SnapshotItem],
+    ) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some(collector_version()),
+            snapshots: items.to_vec(),
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
+            mode,
+            SnapshotSource::Codex,
+            vec![serde_json::to_vec(&request).unwrap()],
+            items,
+        )
+    }
+    /// Money totals and account placement of `actual` equal `cold`, per entity.
+    fn assert_same_money(
+        cold: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+        actual: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    ) {
+        use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
+        money_oracle::assert_placement_equivalent(cold, actual);
+        let mut differences = Vec::new();
+        money_oracle::entity_differences(cold, actual, &mut differences);
+        assert!(differences.is_empty(), "{}", differences.join("\n"));
+    }
     impl Drop for SameSourceAckFixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
-    /// [money] ACK custody over the companion bound, on a mixed logical page:
-    /// headless T (items[0]) and already-headed S (items[1], no pending head).
-    /// Phase 1: settled history saturates the bound; pruning it (never a page
-    /// session) is durable before the POST, both batches settle into an exact
-    /// receipt/index checkpoint. C, accepted before this page and pruned as
-    /// settled history, then grows: the ordinary scan re-reads it once with its
-    /// real cache evidence; with its head pruned it is deferred under head CAS
-    /// and probed for a fresh head, then its definite body settles into the
-    /// receipt and index. A
-    /// failed POST still leaves a committable partial checkpoint. Phase 2: live (pending-head) evidence alone exceeds the
-    /// bound; the route takes an alarmed paced hold, nothing is posted and
-    /// custody bytes are unchanged.
+    /// [money] Progress past the former 11,182,080 B ACK custody bound, on a
+    /// mixed logical page: headless T (items[0]) and already-headed S
+    /// (items[1], no pending head). Settled off-page history (phase 1) and
+    /// live pending-head evidence (phase 2) are both kept: the batch or the
+    /// bootstrap probe posts once, no cache state or head is pruned, and the
+    /// receipt carries the exact saved ledger. Each arm posts the same bodies
+    /// and settles the same ACK ledger as a cold ledger (phase 0), and the
+    /// receiver's bodies carry the money totals and account placement of a
+    /// cold Full of the root (transition oracle). In phase 1, C (accepted
+    /// before this page and settled, with real cache observations) then grows:
+    /// the ordinary scan re-reads it once, its retained head rides the
+    /// head-CAS body with no bootstrap probe, and the repeated event ids leave
+    /// money and placement equal to a cold Full.
     #[test]
     #[serial]
-    fn v2_custody_prunes_settled_cache_evidence_and_holds_live_overflow_without_post() {
-        let counter = |rows: &[serde_json::Value], name: &str| {
-            rows.iter()
-                .filter(|row| row["stage"] == "claude_state_v2")
-                .filter_map(|row| row["counts"]["latest"][name].as_u64())
-                .next_back()
+    fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
+        use crate::snapshots::sampled_scan::transition_fixture::Mode;
+        let event_ids = |state: &serde_json::Value| {
+            state["observations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["event_id"].as_str().map(str::to_string))
+                .collect::<BTreeSet<_>>()
+        };
+        // C's growth: a cache break (share 0.9 -> 0), which the detector
+        // records as an observation.
+        let grow = |path: &Path| {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            for row in [
+                serde_json::json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:02Z","payload":{"response_id":"resp_reopened","usage":{"input_tokens":120000,"cached_input_tokens":0,"output_tokens":2}}}),
+                serde_json::json!({"type":"event_msg","timestamp":"2026-09-30T10:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":220000,"cached_input_tokens":90000,"output_tokens":3},"last_token_usage":{"input_tokens":120000,"cached_input_tokens":0,"output_tokens":2}}}}),
+            ] {
+                std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes()).unwrap();
+            }
         };
         let headed =
             |items: Vec<SnapshotItem>| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
@@ -23544,15 +23616,15 @@ mod tests {
             coverage: "complete".into(),
             omitted_observation_count: None,
         };
-        let mut pruned_total = 0;
-        for (phase, arm) in [
-            (1, "page"),
-            (1, "bootstrap"),
-            (1, "failed_post"),
-            (2, "page"),
-            (2, "bootstrap"),
+        let mut cold = BTreeMap::new();
+        for (phase, bootstrap) in [
+            (0, false),
+            (0, true),
+            (1, false),
+            (1, true),
+            (2, false),
+            (2, true),
         ] {
-            let bootstrap = arm == "bootstrap";
             let mut f = SameSourceAckFixture::new();
             if bootstrap {
                 let item = &f.items[0];
@@ -23563,10 +23635,36 @@ mod tests {
             }
             // C was accepted before this page: settled history, not on it.
             let c = cache_session_key(&f.items[2].source_session_id);
-            f.progress.accepted_cache_states.insert(
-                c.clone(),
-                serde_json::json!({"observations":[], "value":"c"}),
-            );
+            // C's accepted cache state with real observations: a cold scan of
+            // a copy of C's file grown with the same rows the reopen adds.
+            let c_path = std::fs::read_dir(&f.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.to_string_lossy()
+                        .ends_with(&format!("{}.jsonl", f.items[2].source_session_id))
+                })
+                .unwrap();
+            let c_state = {
+                let copy = std::env::temp_dir()
+                    .join(format!("ottto-ack-bound-c-copy-{}", unique_poison_scope()));
+                std::fs::create_dir_all(&copy).unwrap();
+                let copied = copy.join(c_path.file_name().unwrap());
+                std::fs::copy(&c_path, &copied).unwrap();
+                grow(&copied);
+                let scanned = SameSourceAckFixture::cold_full_of(&copy, true);
+                std::fs::remove_dir_all(&copy).unwrap();
+                let patch = scanned
+                    .iter()
+                    .find(|item| item.source_session_id == f.items[2].source_session_id)
+                    .and_then(|item| item.cache_observations.as_ref())
+                    .expect("C carries a cache patch");
+                crate::snapshots::cache_state_from_patch(None, patch).unwrap()
+            };
+            assert!(!event_ids(&c_state).is_empty(), "non-empty observations");
+            f.progress
+                .accepted_cache_states
+                .insert(c.clone(), c_state.clone());
             f.progress
                 .accepted_cache_heads
                 .insert(c.clone(), "c".repeat(64));
@@ -23582,11 +23680,10 @@ mod tests {
                 .accepted_cache_heads
                 .insert(s.clone(), "d".repeat(64));
             // Reachable cumulative cache evidence; each record stays below 128 KiB.
-            let sessions = (0..111)
+            let sessions = (0..if phase == 0 { 0 } else { 115 })
                 .map(|n| format!("old-{n}"))
-                .chain(["edge".to_string()])
                 .collect::<Vec<_>>();
-            for session in &sessions[..111] {
+            for session in &sessions {
                 f.progress.accepted_cache_states.insert(
                     cache_session_key(session),
                     serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
@@ -23596,341 +23693,348 @@ mod tests {
                     .insert(cache_session_key(session), "f".repeat(64));
             }
             // Pending head obligations mark sessions live: one in phase 1, all in 2.
-            // Identifiers are fingerprint-shaped, as the progress loader requires
-            // (snapshot_sync.rs:1572); otherwise a restart quarantines the ledger.
+            // Identifiers are fingerprint-shaped, as the progress loader requires.
             let live = if phase == 1 {
                 &sessions[..1]
             } else {
                 &sessions[..]
             };
-            f.progress.pending_cache_heads.insert(
-                cache_session_key("pending-file"),
-                PendingCacheHeadFile {
-                    source_file_fingerprint: cache_session_key("pending-source"),
-                    group_fingerprint: cache_session_key("pending-group"),
-                    entities: live
-                        .iter()
-                        .map(|session| {
-                            (
-                                cache_session_key(&format!("entity-{session}")),
-                                cache_session_key(session),
-                            )
-                        })
-                        .collect(),
-                    reselected_heads: BTreeMap::new(),
-                    settled_entities: BTreeSet::new(),
-                },
-            );
-            let remaining = 11_182_000 - serde_json::to_vec_pretty(&f.progress).unwrap().len() - 64;
-            f.progress.accepted_cache_states.insert(
-                cache_session_key("edge"),
-                serde_json::json!({"observations":[], "value":"x".repeat(remaining)}),
-            );
+            if !live.is_empty() {
+                f.progress.pending_cache_heads.insert(
+                    cache_session_key("pending-file"),
+                    PendingCacheHeadFile {
+                        source_file_fingerprint: cache_session_key("pending-source"),
+                        group_fingerprint: cache_session_key("pending-group"),
+                        entities: live
+                            .iter()
+                            .map(|session| {
+                                (
+                                    cache_session_key(&format!("entity-{session}")),
+                                    cache_session_key(session),
+                                )
+                            })
+                            .collect(),
+                        reselected_heads: BTreeMap::new(),
+                        settled_entities: BTreeSet::new(),
+                    },
+                );
+            }
             f.progress.save(&f.progress_path).unwrap();
             let bytes = std::fs::read(&f.progress_path).unwrap();
-            let index_bytes = std::fs::read(&f.index_path).unwrap();
+            assert!(
+                phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
+                "past the former bound"
+            );
             let recovery = crate::snapshots::ProgressRecovery::synthetic(
                 &f.index_path,
                 &f.progress.destination_namespace_hash,
                 f.baseline.generation,
             );
-            recovery.admit_progress_bytes(bytes.len() as u64).unwrap();
             recovery.adopt_synthetic(Some(&bytes));
             f.progress.ack_recovery = Some(Box::new(recovery));
-            // As the source pass does, before its bootstrap and batches.
-            f.progress.freeze_custody_page(&f.items);
-            let before = f.progress.clone();
+            let states = f
+                .progress
+                .accepted_cache_states
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut heads = f.progress.accepted_cache_heads.clone();
             let posts = std::cell::Cell::new(0);
-            let attempt = |f: &mut SameSourceAckFixture| {
-                if bootstrap {
-                    bootstrap_cache_heads_with_budget(
-                        &f.items[..1],
-                        &unique_poison_scope(),
-                        &mut f.progress,
-                        false,
-                        &mut InplaceRetryBudget::default(),
-                        |items, _| {
-                            posts.set(posts.get() + 1);
-                            headed(items)
-                        },
-                        |progress| progress.save(&f.progress_path),
+            let sent = std::cell::RefCell::new(Vec::new());
+            let sent_items = std::cell::RefCell::new(Vec::new());
+            let post = |items: &[SnapshotItem]| {
+                posts.set(posts.get() + 1);
+                sent_items.borrow_mut().extend(items.iter().cloned());
+                sent.borrow_mut().extend(items.iter().map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
                     )
-                    .map(|_| ())
-                } else {
-                    f.send(0, |items| {
-                        posts.set(posts.get() + 1);
-                        if arm == "failed_post" {
-                            return Err(anyhow!("post lost after prune"));
-                        }
-                        same_source_fixture_ack(items)
-                    })
-                    .map(|_| ())
-                }
+                }));
             };
+            if bootstrap {
+                bootstrap_cache_heads_with_budget(
+                    &f.items[..1],
+                    &unique_poison_scope(),
+                    &mut f.progress,
+                    false,
+                    &mut InplaceRetryBudget::default(),
+                    |items, _| {
+                        post(items.as_slice());
+                        headed(items)
+                    },
+                    |progress| progress.save(&f.progress_path),
+                )
+                .unwrap();
+                // Only T's head is new: the probe's.
+                heads.insert(
+                    cache_session_key(&f.items[0].source_session_id),
+                    "e".repeat(64),
+                );
+            } else {
+                f.send(0, |items| {
+                    post(items.as_slice());
+                    same_source_fixture_ack(items)
+                })
+                .unwrap();
+            }
+            assert_eq!(posts.get(), 1, "one POST, no hold");
+            assert!(states
+                .iter()
+                .all(|key| f.progress.accepted_cache_states.contains_key(key)));
+            assert_eq!(f.progress.accepted_cache_heads, heads, "nothing pruned");
             let mut receipt = f.index_path.clone().into_os_string();
             receipt.push(".v2-ack-receipt");
             let settled_receipt = |f: &SameSourceAckFixture| {
                 let receipt: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+                let saved = std::fs::read(&f.progress_path).unwrap();
+                assert!(phase == 0 || saved.len() > OLD_PROGRESS_BOUND_FOR_TEST);
                 assert_eq!(
                     receipt["progress"].as_str().unwrap().as_bytes(),
-                    std::fs::read(&f.progress_path).unwrap(),
+                    saved,
                     "receipt carries the exact saved ledger"
                 );
             };
-            if phase == 1 {
-                let (result, rows) = crate::local_resource_diagnostics::capture(|| attempt(&mut f));
-                // Settled history only: old-0 is pending-live, S and T are in the page.
-                let pruned = counter(&rows, "ack_custody_pruned").unwrap();
-                assert!(pruned >= pruned_total + 112, "cumulative prune count");
-                pruned_total = pruned;
-                for key in sessions[1..]
-                    .iter()
-                    .map(|s| cache_session_key(s))
-                    .chain([c.clone()])
-                {
-                    assert!(!f.progress.accepted_cache_states.contains_key(&key));
-                    assert!(!f.progress.accepted_cache_heads.contains_key(&key));
+            settled_receipt(&f);
+            if bootstrap {
+                // S keeps its projected head; T gets the probe's head.
+                let mut page = f.items.clone();
+                for item in &mut page[..2] {
+                    item.cache_observations = Some(observations.clone());
                 }
-                let old = cache_session_key("old-0");
-                assert!(f.progress.accepted_cache_states.contains_key(&old));
-                assert!(f.progress.accepted_cache_heads.contains_key(&old));
-                assert!(f.progress.accepted_cache_states.contains_key(&s));
-                assert_eq!(f.progress.accepted_cache_heads[&s], "d".repeat(64));
-                assert!(!f.progress.ack_recovery.as_ref().unwrap().custody_held());
-                assert_eq!(posts.get(), 1);
-                if arm == "failed_post" {
-                    assert!(result.is_err());
-                    // The prune was saved before the POST: the partial checkpoint
-                    // still finds the saved ledger equal to memory and commits.
-                    assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 0);
-                    settled_receipt(&f);
-                    continue;
-                }
-                result.unwrap();
-                if bootstrap {
-                    // S keeps its projected head; T gets the probe's head.
-                    let mut page = f.items.clone();
-                    for item in &mut page[..2] {
-                        item.cache_observations = Some(observations.clone());
-                    }
-                    page[1].cache_base_head_etag = Some("d".repeat(64));
-                    assert_eq!(
-                        apply_bootstrapped_cache_heads(&mut page, &f.progress).unwrap(),
-                        0
-                    );
-                    assert_eq!(page[0].cache_base_head_etag, Some("e".repeat(64)));
-                    assert_eq!(page[1].cache_base_head_etag, Some("d".repeat(64)));
-                }
-                // Later transport batches of the same page settle; T's body is
-                // already acknowledged by its probe in the bootstrap arm.
-                f.send(0, |items| {
-                    posts.set(posts.get() + 1);
-                    same_source_fixture_ack(items)
-                })
-                .unwrap();
-                f.send(1, |items| {
-                    posts.set(posts.get() + 1);
-                    same_source_fixture_ack(items)
-                })
-                .unwrap();
-                assert_eq!(posts.get(), 2);
-                assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 2);
-                assert_eq!(f.baseline.files.len(), 3);
-                for item in &f.items {
-                    assert!(f.progress.contains_body(
-                        &item.snapshot_fingerprint,
-                        &snapshot_upload_body_witness(item)
-                    ));
-                }
-                settled_receipt(&f);
-                // Each file is current by its own receipt under the active
-                // context; no census adoption stands in for one. Run the quiet
-                // pass from the saved checkpoint first: all accepted bodies
-                // stay suppressed.
-                let recovery = f.progress.ack_recovery.take();
-                // Every restart below reloads this exact saved ledger.
-                let saved = std::fs::read(&f.progress_path).unwrap();
-                let adopted = |index: &ScanIndex| {
-                    crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(index) == 0
-                };
-                for _ in 0..3 {
-                    f.restart_preparation();
-                    assert!(f.items.is_empty(), "accepted bodies stay suppressed");
-                    f.working.save(&f.index_path).unwrap();
-                    if adopted(&f.working) {
-                        break;
-                    }
-                }
-                assert!(adopted(&f.working));
-                // Pruned C reopens: its rollout grows and the ordinary scan (the
-                // counted read owner) re-reads only that file into one definite
-                // body with its real cache evidence. Its head was pruned, so it
-                // takes the missing-head path and settles exactly.
-                let path = std::fs::read_dir(&f.root)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .find(|path| {
-                        path.to_string_lossy()
-                            .ends_with(&format!("{}.jsonl", c_item.source_session_id))
-                    })
-                    .unwrap();
-                let mut grown = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap();
-                for row in [
-                    serde_json::json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:02Z","payload":{"response_id":"resp_reopened","usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}),
-                    serde_json::json!({"type":"event_msg","timestamp":"2026-09-30T10:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":220000,"cached_input_tokens":190000,"output_tokens":3},"last_token_usage":{"input_tokens":120000,"cached_input_tokens":100000,"output_tokens":2}}}}),
-                ] {
-                    std::io::Write::write_all(&mut grown, format!("{row}\n").as_bytes()).unwrap();
-                }
-                drop(grown);
-                let scan = f.restart(true);
-                assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
-                f.progress.ack_recovery = recovery;
-                assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
-                assert_eq!(scan.semantic_noop_count, 0);
-                assert_eq!(scan.unreadable_path_count, 0);
-                assert_eq!(scan.ownership_incomplete_file_count, 0);
+                page[1].cache_base_head_etag = Some("d".repeat(64));
                 assert_eq!(
-                    f.items.len(),
-                    1,
-                    "one definite body for the reopened source"
-                );
-                let scanned = f.items[0].clone();
-                assert_eq!(scanned.source_session_id, c_item.source_session_id);
-                assert_ne!(scanned.snapshot_fingerprint, c_item.snapshot_fingerprint);
-                assert!(!f.progress.accepted_cache_heads.contains_key(&c));
-                assert!(!f.progress.accepted_cache_states.contains_key(&c));
-                assert!(scanned.cache_observations.is_some(), "real cache evidence");
-                // Under head CAS the headless session is deferred to a pending head.
-                let deferred = capture_deferred_cache_head_identities(
-                    SnapshotSource::Codex,
-                    &f.items,
-                    &f.progress,
-                    true,
-                    true,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
-                );
-                assert_eq!(deferred.len(), 1);
-                assert_eq!(deferred[0].session_key, c);
-                assert_eq!(
-                    deferred[0].snapshot_fingerprint,
-                    scanned.snapshot_fingerprint
-                );
-                // The ordinary pass, in finish_sync_source order: no new pending
-                // head, the cache patch is kept with no base head, the page is
-                // frozen, and the headless item is probed.
-                let groups = cache_head_file_groups(&f.working);
-                assert!(!f
-                    .progress
-                    .record_pending_cache_head(&f.items[0], &groups, false)
-                    .unwrap());
-                prepare_snapshot_cache_for_upload(
-                    &mut f.items[0],
-                    &f.progress,
-                    true,
-                    false,
-                    &BTreeSet::new(),
-                );
-                f.progress.freeze_custody_page(&f.items);
-                let probes = f
-                    .items
-                    .iter()
-                    .filter(|item| {
-                        item.cache_observations.is_some() && item.cache_base_head_etag.is_none()
-                    })
-                    .map(cache_head_probe)
-                    .collect::<Vec<_>>();
-                assert_eq!(probes.len(), 1, "the reopened headless session is probed");
-                let stages = std::cell::RefCell::new(Vec::new());
-                assert_eq!(
-                    bootstrap_cache_heads_with_budget(
-                        &probes,
-                        &unique_poison_scope(),
-                        &mut f.progress,
-                        true,
-                        &mut InplaceRetryBudget::default(),
-                        |items, enforce_head_cas| {
-                            posts.set(posts.get() + 1);
-                            stages.borrow_mut().push(enforce_head_cas);
-                            head_cas_fixture_ack(items, enforce_head_cas, &"e".repeat(64))
-                        },
-                        |progress| progress.save(&f.progress_path),
-                    )
-                    .unwrap(),
+                    apply_bootstrapped_cache_heads(&mut page, &f.progress).unwrap(),
                     0
                 );
-                // Ordinary authority, then the exact CAS repeat.
-                assert_eq!(stages.into_inner(), [false, true]);
-                assert_eq!(f.progress.accepted_cache_heads[&c], "e".repeat(64));
-                assert_eq!(
-                    apply_bootstrapped_cache_heads(&mut f.items, &f.progress).unwrap(),
-                    0
-                );
-                assert_eq!(f.items[0].cache_base_head_etag, Some("e".repeat(64)));
-                assert!(f.items[0].cache_observations.is_some());
-                let reopened = f.items[0].clone();
-                // The cache-bearing body is head-CAS: its ACK returns the next head.
-                f.send(0, |items| {
-                    posts.set(posts.get() + 1);
-                    head_cas_fixture_ack(items, false, &"a".repeat(64))
-                })
-                .unwrap();
-                assert_eq!(posts.get(), 5);
-                assert_eq!(f.progress.accepted_cache_heads[&c], "a".repeat(64));
-                assert!(f.progress.accepted_cache_states.contains_key(&c));
-                assert!(f.progress.contains_body(
-                    &reopened.snapshot_fingerprint,
-                    &snapshot_upload_body_witness(&reopened)
-                ));
-                assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
-                assert_ne!(
-                    serde_json::to_value(&f.baseline.files[&f.keys[2]]).unwrap(),
-                    c_entry
-                );
-                assert!(f.baseline.file_snapshot_fingerprints[&f.keys[2]]
-                    .contains(&reopened.snapshot_fingerprint));
-                settled_receipt(&f);
-                continue;
+                assert_eq!(page[0].cache_base_head_etag, Some("e".repeat(64)));
+                assert_eq!(page[1].cache_base_head_etag, Some("d".repeat(64)));
             }
-            let (error, rows) =
-                crate::local_resource_diagnostics::capture(|| attempt(&mut f).unwrap_err());
-            assert!(error.is::<ack_retention::AckSettlementRequired>());
-            assert!(f.progress.ack_recovery.as_ref().unwrap().custody_held());
-            // The hold event's row carries the cumulative alarm before this
-            // hold; the alarm count then rises by exactly one.
-            let alarms = rows
+            // Later transport batches of the same page settle; T's body is
+            // already acknowledged by its probe in the bootstrap arm.
+            f.send(0, |items| {
+                post(items.as_slice());
+                same_source_fixture_ack(items)
+            })
+            .unwrap();
+            f.send(1, |items| {
+                post(items.as_slice());
+                same_source_fixture_ack(items)
+            })
+            .unwrap();
+            assert_eq!(posts.get(), 2);
+            // Each page body posts exactly once, as a cold Full would send it.
+            let mut posted = sent.borrow().clone();
+            let mut page = f
+                .items
                 .iter()
-                .filter(|row| row["stage"] == "claude_state_v2")
-                .map(|row| {
-                    row["counts"]["latest"]["ack_custody_hold_alarm"]
-                        .as_u64()
-                        .unwrap_or(0)
+                .map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
+                    )
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(
-                alarms.last(),
-                Some(&(alarms[0] + 1)),
-                "the live-overflow hold alarms once"
+            posted.sort();
+            page.sort();
+            assert_eq!(posted, page, "each page body posts exactly once");
+            let settled = (
+                posted.into_iter().map(|(fp, _)| fp).collect::<Vec<_>>(),
+                f.progress.accepted_fingerprints.clone(),
             );
-            assert_eq!(posts.get(), 0);
-            assert_eq!(f.progress, before);
-            assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
-            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_bytes);
-            // Paced: even once its sessions settle, no retry before the interval.
-            f.progress.pending_cache_heads.clear();
-            let before = f.progress.clone();
-            let error = attempt(&mut f).unwrap_err();
-            assert!(error.is::<ack_retention::AckSettlementRequired>());
-            assert_eq!(posts.get(), 0);
-            assert_eq!(f.progress, before);
-            assert_eq!(std::fs::read(&f.progress_path).unwrap(), bytes);
-            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_bytes);
+            if phase == 0 {
+                cold.insert(bootstrap, settled);
+            } else {
+                assert_eq!(
+                    cold[&bootstrap], settled,
+                    "same POSTs and ACK ledger as a cold ledger"
+                );
+            }
+            // Money totals and account placement equal a cold Full of this
+            // root, the receiver holding C's earlier body and this page's.
+            let mut eventual = vec![c_item.clone()];
+            eventual.extend(sent_items.borrow().iter().cloned());
+            assert_same_money(
+                &codex_route(Mode::ColdFull, &f.cold_full(false)),
+                &codex_route(Mode::Restart, &eventual),
+            );
+            assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 2);
+            assert_eq!(f.baseline.files.len(), 3);
+            for item in &f.items {
+                assert!(f.progress.contains_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item)
+                ));
+            }
+            settled_receipt(&f);
+            if phase != 1 {
+                continue;
+            }
+            // Quiet restart from the saved checkpoint: accepted bodies stay
+            // suppressed until each file is current by its own receipt.
+            let recovery = f.progress.ack_recovery.take();
+            let saved = std::fs::read(&f.progress_path).unwrap();
+            let adopted = |index: &ScanIndex| {
+                crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
+                    index,
+                ) == 0
+            };
+            for _ in 0..3 {
+                f.restart_preparation();
+                assert!(f.items.is_empty(), "accepted bodies stay suppressed");
+                f.working.save(&f.index_path).unwrap();
+                if adopted(&f.working) {
+                    break;
+                }
+            }
+            assert!(adopted(&f.working));
+            // Settled C reopens: its rollout grows and the ordinary scan
+            // re-reads only that file into one definite body.
+            grow(&c_path);
+            let scan = f.restart(true);
+            assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
+            f.progress.ack_recovery = recovery;
+            assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
+            assert_eq!(
+                f.items.len(),
+                1,
+                "one definite body for the reopened source"
+            );
+            assert_eq!(f.items[0].source_session_id, c_item.source_session_id);
+            assert_ne!(f.items[0].snapshot_fingerprint, c_item.snapshot_fingerprint);
+            assert!(
+                f.items[0].cache_observations.is_some(),
+                "real cache evidence"
+            );
+            let reopened_ids = event_ids(
+                &crate::snapshots::cache_state_from_patch(
+                    None,
+                    f.items[0].cache_observations.as_ref().unwrap(),
+                )
+                .unwrap(),
+            );
+            assert!(
+                event_ids(&c_state).is_subset(&reopened_ids),
+                "the reopened patch repeats C's accepted event ids"
+            );
+            // Its retained head means no missing-head deferral and no probe.
+            assert!(capture_deferred_cache_head_identities(
+                SnapshotSource::Codex,
+                &f.items,
+                &f.progress,
+                true,
+                true,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+            )
+            .is_empty());
+            prepare_snapshot_cache_for_upload(
+                &mut f.items[0],
+                &f.progress,
+                true,
+                true,
+                &BTreeSet::new(),
+            );
+            assert_eq!(f.items[0].cache_base_head_etag, Some("c".repeat(64)));
+            assert!(f.items[0].cache_observations.is_some());
+            let reopened = f.items[0].clone();
+            f.send(0, |items| {
+                post(items.as_slice());
+                head_cas_fixture_ack(items, false, &"a".repeat(64))
+            })
+            .unwrap();
+            assert_eq!(posts.get(), 3, "no bootstrap offers for the retained head");
+            // The repeated event ids change neither money nor placement.
+            assert_same_money(
+                &codex_route(Mode::ColdFull, &f.cold_full(false)),
+                &codex_route(Mode::Restart, &sent_items.borrow()),
+            );
+            assert_eq!(f.progress.accepted_cache_heads[&c], "a".repeat(64));
+            assert!(f.progress.contains_body(
+                &reopened.snapshot_fingerprint,
+                &snapshot_upload_body_witness(&reopened)
+            ));
+            assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
+            assert_ne!(
+                serde_json::to_value(&f.baseline.files[&f.keys[2]]).unwrap(),
+                c_entry
+            );
+            assert!(f.baseline.file_snapshot_fingerprints[&f.keys[2]]
+                .contains(&reopened.snapshot_fingerprint));
+            settled_receipt(&f);
         }
+    }
+
+    /// [money] Placement past the former 11,182,080 B bound: the placement
+    /// oracle's bodies (two accounts, a mid-session switch, a side call, an
+    /// evidence gap and a tagged row) are stored-body ACKed into a ledger past
+    /// the old bound, saved receipt-first, crashed before the progress rename
+    /// and recovered. The recovered ledger passes the transition oracle's
+    /// equivalence and placement assertions against the cold one.
+    #[test]
+    fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
+        use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+        let cold = money_oracle::placement_tests::placement_fixture();
+        let scratch = crate::test_scratch::ScratchDir::new("v2-placement-above-bound");
+        let index_path = scratch.join("index.json");
+        let path = scratch.join("progress.json");
+        let mut progress = test_upload_progress();
+        progress.accepted_identity_buckets =
+            crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+        for n in 0..115 {
+            progress.accepted_cache_states.insert(
+                cache_session_key(&format!("old-{n}")),
+                serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
+            );
+        }
+        progress.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let recovery = crate::snapshots::ProgressRecovery::synthetic(
+            &index_path,
+            &progress.destination_namespace_hash,
+            0,
+        );
+        recovery.adopt_synthetic(Some(&before));
+        progress.ack_recovery = Some(Box::new(recovery.clone()));
+        for snapshot in cold.snapshots.values() {
+            progress.record_stored_state(snapshot, false, None).unwrap();
+        }
+        progress.save(&path).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
+            "past the former bound"
+        );
+        // Crash: the exact receipt is durable, the progress rename is lost.
+        ottto_core::write_owner_only_file_atomic(&path, &before).unwrap();
+        let mut restored = SnapshotUploadProgress::load_with_recovery(
+            &path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+            Some(recovery),
+        )
+        .unwrap();
+        assert!(std::fs::read(&path).unwrap() == after, "exact replay");
+        restored
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        let ledger = cold
+            .snapshots
+            .keys()
+            .map(|entity| {
+                let state = restored
+                    .accepted_identity_buckets
+                    .get(entity)
+                    .expect("recovered entity");
+                (entity.clone(), serde_json::to_value(state).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut route = cold.clone();
+        route.mode = Mode::Restart;
+        route.accepted_identity_buckets = Some(serde_json::json!(ledger));
+        money_oracle::assert_equivalent(&cold, &route);
     }
 
     #[test]

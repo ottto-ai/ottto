@@ -279,17 +279,13 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     }
 }
 
-/// A scan fixture's page of a source with a Tail codec continues from its
-/// owner's route; with no cache it reads a fixture route unrouted. Other
-/// sources are left alone.
+/// A scan fixture's page continues from its owner's route; with no cache it
+/// reads a fixture route unrouted.
 pub(crate) fn route_for_test(
-    source: SnapshotSource,
+    _source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
-    if !tail_source::has_codec(source) {
-        return index;
-    }
     let Some(cache) = cache else {
         // A scan with no cache to own a route is the cold oracle: it reads a
         // fixture route's graph unrouted, as before Claude kept its Tail there,

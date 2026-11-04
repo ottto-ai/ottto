@@ -43,7 +43,7 @@ fn claude_cache_rows_keep_the_stored_body_ack() {
     };
     let ack = |progress: &mut SnapshotUploadProgress, body: &Value| {
         progress
-            .record_stored_state(body, false, Some((&entity, witness.as_str())), false)
+            .record_stored_state(body, false, Some((&entity, witness.as_str())))
             .unwrap();
     };
     let progress = || {
