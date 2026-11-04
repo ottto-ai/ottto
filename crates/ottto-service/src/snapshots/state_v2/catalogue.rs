@@ -10,7 +10,7 @@ use super::*;
 
 /// `field => Group (codec check [Members]) [owned kinds] heap`. Codecs:
 /// `control`/`misc`/`map`/`scalar` are generated, `hook` is hand code, and
-/// `runtime`/`retired none` are never stored; ordinary saves remove retired contents.
+/// `runtime`/`retired none` are never stored; D203 seeds remove Codex contents.
 /// `own` heap has its own RetainedHeap
 /// category; `side` is summed into side_maps. The heap walk destructures every
 /// field, so adding or deleting a ScanIndex slot fails to compile until its
@@ -247,7 +247,7 @@ pub(super) fn group(kind: &str) -> Option<Group> {
 pub(super) fn accepts(kind: &str) -> bool {
     group(kind).is_some() || RESERVED.contains(&kind)
 }
-/// Retired catalogue kinds are accepted and discarded on ordinary save.
+/// Retired catalogue kinds are accepted; seeded D203 rows drop on ordinary save.
 pub(super) fn retired_kind(kind: &str) -> bool {
     macro_rules! lookup {
         ($f:ident, Misc, (retired none), [$kind:literal], $h:ident) => {
