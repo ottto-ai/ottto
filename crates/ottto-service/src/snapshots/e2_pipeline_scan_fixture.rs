@@ -154,13 +154,13 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
         .clone();
     into.reason_reoffer_retries = from.reason_reoffer_retries.clone();
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
+    into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.claude_history_unverified_in_process = from.claude_history_unverified_in_process;
     into.claude_rebuild_read_load_eligible = from.claude_rebuild_read_load_eligible;
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
     into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
-    into.copy_prefix_recovery_scope = from.copy_prefix_recovery_scope.clone();
     into.withheld_memo = from.withheld_memo.clone();
 }
 
@@ -714,6 +714,16 @@ pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bo
     index.file_upload_context_requires_adoption(&local_index_key(path))
 }
 
+/// Files that still owe their own upload-context proof, by the per-file gate
+/// alone (no owed-count exemption).
+pub(crate) fn upload_context_unproven_files_for_test(index: &ScanIndex) -> usize {
+    index
+        .files
+        .keys()
+        .filter(|key| index.file_upload_context_requires_adoption(key))
+        .count()
+}
+
 /// Install the real exclusion input used by ordinary-money fixture families.
 /// An empty slice adopts request-owned money on the next normal source pass.
 pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
@@ -788,4 +798,46 @@ pub(crate) fn pause_adoption(support: &Path) {
     let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b"malformed synthetic exclusion input").unwrap();
+}
+
+/// Telemetry retention dependency row: an account hold on `key`.
+pub(crate) fn hold_claude_account_for_test(index: &mut ScanIndex, key: &str) {
+    index
+        .claude_account_deferred_holds
+        .insert(key.to_owned(), "held-source".to_owned());
+}
+
+/// Telemetry retention dependency row: a Tail head for `key` (no pages) on
+/// `index`'s live route, committed by an ordinary save. True when the
+/// committed heads then hold it.
+pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> bool {
+    let route = route_of(index).expect("a routed index");
+    state_v2::stage_tail(
+        &route,
+        key,
+        state_v2::StagedFile {
+            revision: 1,
+            head: b"head".to_vec(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    index.save(&route).unwrap();
+    state_v2::tail_head_keys(index).unwrap().contains(key)
+}
+
+/// Telemetry retention dependency row: `owner` is a legacy owner root of
+/// `root`'s family witness, under a terminal (unproven) authority record.
+pub(crate) fn legacy_owner_of_terminal_family_for_test(
+    index: &mut ScanIndex,
+    root: &str,
+    owner: &str,
+) {
+    index.insert_unproven_terminal_claude_authority_for_test(root, &"1".repeat(64));
+    index
+        .claude_usage_family_witnesses
+        .get_mut(root)
+        .expect("the terminal record retains its witness")
+        .legacy_owner_roots
+        .insert(owner.to_owned());
 }

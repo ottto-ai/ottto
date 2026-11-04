@@ -878,6 +878,7 @@ fn capture_local_evidence(
 ) -> std::result::Result<(), LocalCaptureFailure> {
     if source != SnapshotSource::ClaudeCode
         || !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces")
+        || !claude_collection_enabled(support_dir)
     {
         return Ok(());
     }
@@ -901,6 +902,22 @@ fn capture_local_evidence(
         }
         Err(_) => Err(LocalCaptureFailure::NotStored),
     }
+}
+
+/// Claude is granted to this device and not paused. While it is off, the
+/// relay acknowledges and stores nothing: the user stopped collection for that
+/// source, so the local writer refuses the whole request (consent, not a
+/// per-record failure). Data already stored is kept. Read per request, with no
+/// lock held, so a pause or resume applies to the next export.
+fn claude_collection_enabled(support_dir: &Path) -> bool {
+    ottto_core::FileDeviceStore::new(support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME))
+        .load()
+        .ok()
+        .flatten()
+        .is_some_and(|device| {
+            crate::snapshot_sync::enabled_snapshot_sources_in(&device, support_dir)
+                .contains(&SnapshotSource::ClaudeCode)
+        })
 }
 
 /// The request body with its OTLP content encoding removed. OTLP/HTTP allows
@@ -2179,6 +2196,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// Grant Claude to this support dir's device, as a connected install has.
+    pub(super) fn grant_claude(support_dir: &Path) {
+        ottto_core::FileDeviceStore::new(
+            support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME),
+        )
+        .save(&ottto_core::LocalDeviceBinding {
+            device_id: "device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        })
+        .expect("save device grant");
+    }
+
+    /// [behaviour] Collection stops while Claude is not granted or is paused:
+    /// the export is acknowledged and nothing is appended. Once the pause
+    /// marker is gone, appends resume.
+    #[test]
+    fn claude_capture_stores_nothing_while_the_source_is_off() {
+        let dir = crate::test_scratch::ScratchDir::new("relay-capture-off");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+        let export = || {
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &dir);
+            assert_export_success(&response, "application/json", b"{}");
+            crate::claude_local_otel::load_claude_effort_evidence(
+                &dir,
+                ["retired-forward-session".to_string()],
+            )
+            .ok()
+            .and_then(|evidence| evidence.get("retired-forward-session").map(Vec::len))
+            .unwrap_or(0)
+        };
+        assert_eq!(export(), 0, "not granted");
+        grant_claude(&dir);
+        crate::snapshot_sync::disable_snapshot_source(&dir, SnapshotSource::ClaudeCode)
+            .expect("pause Claude");
+        assert_eq!(export(), 0, "paused");
+        std::fs::remove_file(dir.join("snapshots/claude_code.source-disabled"))
+            .expect("clear the pause marker");
+        assert_eq!(export(), 1, "resumed");
+    }
+
     fn assert_export_success(response: &LocalExportResponse, content_type: &str, body: &[u8]) {
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, content_type);
@@ -2188,6 +2246,7 @@ pub(crate) mod tests {
     #[test]
     fn retired_forward_keeps_claude_log_evidence_identical_to_direct_capture() {
         let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs");
+        grant_claude(&relay_dir);
         let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs-direct");
         let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
 
@@ -2219,6 +2278,7 @@ pub(crate) mod tests {
     #[test]
     fn retired_forward_keeps_claude_trace_ownership_identical_to_direct_capture() {
         let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces");
+        grant_claude(&relay_dir);
         let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces-direct");
         let request = otlp_post(
             "/v1/traces",
@@ -2275,17 +2335,18 @@ pub(crate) mod tests {
     #[test]
     fn retired_forward_reports_local_failures_with_non_retryable_statuses() {
         let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-failures");
+        grant_claude(&support_dir);
         let malformed = otlp_post("/v1/logs", "application/json", b"{not json");
         let response =
             local_otlp_export_response(SnapshotSource::ClaudeCode, &malformed, &support_dir);
         assert_eq!(response.status, 400);
 
-        // A regular file where the support directory should be makes the
+        // A regular file where the evidence directory should be makes the
         // evidence append fail after a successful decode.
-        let blocked = support_dir.join("not-a-directory");
-        std::fs::write(&blocked, b"").expect("write blocking file");
+        std::fs::write(support_dir.join("local-otel"), b"").expect("write blocking file");
         let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
-        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &blocked);
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
         assert_eq!(response.status, 500);
         let body: serde_json::Value =
             serde_json::from_slice(&response.body).expect("JSON error body");
@@ -2296,6 +2357,7 @@ pub(crate) mod tests {
     fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
         use std::io::Write as _;
         let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
+        grant_claude(&support_dir);
         let gzip_member = |bytes: &[u8]| {
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

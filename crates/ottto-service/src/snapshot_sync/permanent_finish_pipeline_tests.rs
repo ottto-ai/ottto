@@ -769,6 +769,8 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
 enum AckScriptedPost {
     Accept,
     Disabled,
+    /// Every entity is a held conflict: a Deferred page.
+    Conflict,
 }
 
 struct AckScriptedServer {
@@ -830,6 +832,22 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
+                        AckScriptedPost::Conflict => {
+                            let conflicts = items
+                                .iter()
+                                .map(|item| {
+                                    serde_json::json!({
+                                "source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                "occurrence_count":1})
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({"accepted":0,"sessions_reconciled":0,
+                                "session_ids":[],"disabled":false,"disabled_reason":null,
+                                "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
+                                "unchanged_entities":[],"rejected_entities":[],
+                                "conflict_entities":conflicts})
+                        }
                         AckScriptedPost::Disabled => serde_json::json!({"accepted":0,
                             "sessions_reconciled":0,"session_ids":[],"disabled":true,
                             "disabled_reason":"synthetic_disabled","accepted_entities":[],
@@ -1075,4 +1093,85 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
         );
     }
     ack_retention::note_capacity_stop_census(source, false, true);
+}
+
+/// [money] Claude telemetry retention on the real prepare/finish: a selected
+/// save that fails after a completed upload, and a page whose upload is held
+/// as a conflict (Deferred), never reach retention and unlink nothing, with a
+/// complete roster in place; an accepted page with a clean save reaches it.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
+    const UNREAD: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let newer_index = || {
+        let mut newer = serde_json::to_value(ScanIndex::default()).unwrap();
+        newer["generation"] = 7.into();
+        newer
+    };
+    for arm in ["save_fails", "deferred", "completed"] {
+        let server = AckScriptedServer::new();
+        let mut home = AckFinishHome::new(&server);
+        let stem = crate::claude_local_otel::telemetry_stem(UNREAD);
+        let pair = ["claude-code-effort", "claude-code-trace-ownership"].map(|dir| {
+            let path = home
+                .support
+                .join("local-otel")
+                .join(dir)
+                .join(format!("{stem}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let row = serde_json::json!({"session_id":UNREAD, "request_id":"g0",
+                "observed_at":"2026-08-02T07:00:10Z"});
+            std::fs::write(&path, row.to_string() + "\n").unwrap();
+            path
+        });
+        let (preparation, index, scan) = home.prepare(arm);
+        let index_path = preparation.index_path.clone();
+        crate::snapshots::money_freshness::set_roster_for_test(
+            SnapshotSource::ClaudeCode,
+            Some((u64::MAX / 2, BTreeMap::new())),
+        );
+        crate::snapshots::claude_telemetry_retention::take_runs_for_test();
+        match arm {
+            "save_fails" => {
+                // Another writer advanced the saved index: the selected
+                // save's compare-and-swap refuses.
+                std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+                std::fs::write(&index_path, serde_json::to_vec(&newer_index()).unwrap()).unwrap();
+            }
+            "deferred" => server
+                .script
+                .lock()
+                .unwrap()
+                .push_back(AckScriptedPost::Conflict),
+            _ => {}
+        }
+        let offered = server.offered.lock().unwrap().len();
+        let result = home.finish(preparation, index, scan);
+        assert_eq!(
+            server.offered.lock().unwrap().len(),
+            offered + 1,
+            "{arm}: an actual upload"
+        );
+        let runs = crate::snapshots::claude_telemetry_retention::take_runs_for_test();
+        match arm {
+            "save_fails" => {
+                assert!(result.is_err(), "{arm}");
+                assert_eq!(
+                    std::fs::read(&index_path).unwrap(),
+                    serde_json::to_vec(&newer_index()).unwrap(),
+                    "{arm}: the selected save never committed"
+                );
+                assert_eq!(runs, 0, "{arm}");
+            }
+            "deferred" => assert_eq!(runs, 0, "{arm}: {result:?}"),
+            _ => {
+                result.unwrap_or_else(|error| panic!("{arm}: {error:#}"));
+                assert_eq!(runs, 1, "{arm}: the completed page reaches retention");
+            }
+        }
+        if arm != "completed" {
+            assert!(pair.iter().all(|path| path.exists()), "{arm}: zero unlinks");
+        }
+    }
 }

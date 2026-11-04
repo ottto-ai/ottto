@@ -10,6 +10,7 @@
 //! agent task label; upload policy removes them unless the existing
 //! session-title privacy consent and the backend capability are both active.
 
+use crate::hex::sha256_lower as sha256_hex;
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
@@ -24,7 +25,6 @@ use std::time::{Duration, Instant};
 use toml_edit::DocumentMut;
 use zeroize::Zeroizing;
 
-pub const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
 /// `skill_id` facts per session; invocations are emitted before references.
 pub(crate) const MAX_SKILL_FACTS: usize = 8;
@@ -880,10 +880,6 @@ fn looks_like_local_path(token: &str) -> bool {
             .any(|fragment| lowered.contains(fragment))
 }
 
-fn sha256_hex(value: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(value))
-}
-
 /// Convert direct provider metadata into allowlisted facts.
 ///
 /// Absence means omission. In particular, no fact in this function claims a
@@ -1547,6 +1543,8 @@ fn evidence_ref(source_session_id: &str, field: &str, value: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 
     fn origin() -> SnapshotOrigin {
         SnapshotOrigin::default()

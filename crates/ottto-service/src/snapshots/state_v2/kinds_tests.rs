@@ -166,9 +166,13 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
     );
     {
         let mut tx = db.begin(TxnMode::Read).unwrap();
-        for (kind, _, introduced) in catalogue::LAYOUTS {
-            // Archive custody is written only while held; this fixture holds none.
-            if *introduced > previous_layout && !kinds_misc::ARCHIVE_KINDS.contains(kind) {
+        for (kind, field, introduced) in catalogue::LAYOUTS {
+            // Archive custody is written only while held; this fixture holds
+            // none. A retired kind is never written.
+            if *introduced > previous_layout
+                && !kinds_misc::ARCHIVE_KINDS.contains(kind)
+                && !field.starts_with("retired_")
+            {
                 assert!(
                     tx.get(&mapper::key(kind, "", 0).unwrap())
                         .unwrap()
@@ -251,69 +255,41 @@ fn store_without_the_retired_upload_context_row_opens_at_the_current_layout() {
     assert_eq!(cx.layout, catalogue::LAYOUT);
 }
 
-/// [format] A layout-1 store's retired `v1_field.claude_desktop_census_witness`
-/// row is still an accepted kind: the store hydrates and keeps the row.
+/// [format] An earlier store's retired rows (layout 1's
+/// `v1_field.claude_desktop_census_witness`, layout 5's
+/// `v1_field.claude_folder_login_ledger` member) are still accepted kinds: the
+/// store hydrates, keeps each row and reads nothing from it.
 #[test]
 fn retired_desktop_census_witness_row_still_hydrates() {
-    let kind = "v1_field.claude_desktop_census_witness";
-    assert_eq!(catalogue::introduced(kind).unwrap(), 1);
-    let row = mapper::key(kind, "", 0).unwrap();
-    let (_scratch, mut db) = Scratch::store();
-    commit_populate(&mut db, &fixture());
-    let mut tx = db.begin(TxnMode::Write).unwrap();
     let witness = serde_json::json!({
         "completed_at_unix_seconds": 1, "process_id": 1, "inventory": "inventory"
     });
-    mapper::put(&mut tx, &row, &witness).unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.layout, catalogue::LAYOUT);
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(tx.get(&row).unwrap().is_some());
-}
-
-/// [format] The layout-5 folder login ledger has no `reoffer*` fields: a
-/// record without them writes and reads back equal. Safe only because no
-/// released writer ever filled the ledger: the read is exact, so a row that
-/// carries any other field (such as a dropped `reoffer*` one) refuses
-/// hydration. No writer may ship before this record shape.
-#[test]
-fn folder_login_ledger_roundtrips_at_layout_5_and_unknown_fields_refuse() {
-    use crate::snapshots::claude_folder_login::FolderRecord;
-    let kind = "v1_field.claude_folder_login_ledger";
-    assert_eq!(catalogue::introduced(kind).unwrap(), 5);
-    let record = serde_json::json!({
+    let folder = serde_json::json!({
         "fresh": true, "mixed": false, "login": "a".repeat(64), "org": "b".repeat(64),
         "owner_proven": true, "census_complete": true, "covered_from": 3600, "matched": [7, 9]
     });
-    let (_scratch, mut db) = Scratch::store();
-    let mut index = fixture();
-    index.claude_folder_login_ledger = serde_json::from_value(serde_json::json!({
-        "folder": record, "sticky": {"mixed": true}
-    }))
-    .unwrap();
-    commit_populate(&mut db, &index);
-    let (restored, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert_eq!(cx.layout, catalogue::LAYOUT);
-    assert_eq!(
-        restored.claude_folder_login_ledger,
-        index.claude_folder_login_ledger
-    );
-    assert_eq!(
-        serde_json::to_value(&restored.claude_folder_login_ledger["folder"]).unwrap(),
-        record
-    );
-    let mut extra = record.clone();
-    extra["reoffer_pending"] = true.into();
-    assert!(serde_json::from_value::<FolderRecord>(extra.clone()).is_ok());
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    mapper::put(&mut tx, &mapper::key(kind, "folder", 1).unwrap(), &extra).unwrap();
-    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
-    let error = hydrate(&mut db, Scratch::binding()).err().unwrap();
-    assert!(
-        format!("{error:#}").contains("state_v2_ignored_field"),
-        "{error:#}"
-    );
+    for (kind, introduced, name, position, value) in [
+        ("v1_field.claude_desktop_census_witness", 1, "", 0, witness),
+        (
+            "v1_field.claude_folder_login_ledger",
+            5,
+            "folder",
+            1,
+            folder,
+        ),
+    ] {
+        assert_eq!(catalogue::introduced(kind).unwrap(), introduced);
+        let row = mapper::key(kind, name, position).unwrap();
+        let (_scratch, mut db) = Scratch::store();
+        commit_populate(&mut db, &fixture());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::put(&mut tx, &row, &value).unwrap();
+        assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+        let (_, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(cx.layout, catalogue::LAYOUT, "{kind}");
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx.get(&row).unwrap().is_some(), "{kind}");
+    }
 }
 
 /// [regress] v2 hydration's closed catalogue includes its own growth raw holds.
@@ -1651,6 +1627,8 @@ fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
 
 #[path = "codex_archive_kinds_tests.rs"]
 mod codex_archive_tests;
+#[path = "field_schema_tests.rs"]
+mod field_schema_tests;
 
 /// Stores `row` (exact 0.1.215 serialized shape) as `kind`'s field row of an
 /// otherwise current store, then reads it back through the production
@@ -1772,4 +1750,89 @@ fn shipped_0_1_215_retired_leaves_are_dropped_by_the_next_save() {
             assert!(json.pointer(leaf).is_none(), "{leaf} kept after save");
         }
     }
+}
+
+/// [money] H8. Past both old caps (65,537 records; one record holding one
+/// hash more than the old 2,097,152 cap), the census survives a v2 save and
+/// hydrate whole, and the restored graph's v1 bytes decode to it too. The
+/// synthetic keys have no index entry: held-new custody restores as well.
+#[test]
+fn no_cap_money_survives_v1_v2_restore() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    // The old caps: request hashes and records the census held.
+    const OLD_HASH_CAP: u64 = 2_097_152;
+    const OLD_RECORD_CAP: u64 = 65_536;
+    let fp = "a".repeat(64);
+    let mut index = fixture();
+    let before = index.claude_request_census.hash_total();
+    index.claude_request_census.insert(
+        "/synthetic/full.jsonl".into(),
+        Record::synthetic_for_test(&fp, 7, Shape::Exact, (0..=OLD_HASH_CAP).collect()),
+    );
+    for n in 0..OLD_RECORD_CAP {
+        index.claude_request_census.insert(
+            format!("/synthetic/s{n:05}.jsonl"),
+            Record::synthetic_for_test(&fp, 7, Shape::Exact, vec![OLD_HASH_CAP + 1 + n]),
+        );
+    }
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &index);
+    index.generation = 1;
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(restored.claude_request_census, index.claude_request_census);
+    assert_eq!(
+        restored.claude_request_census.hash_total(),
+        before + (OLD_HASH_CAP + 1 + OLD_RECORD_CAP) as usize
+    );
+    let v1: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+    assert_eq!(v1.claude_request_census, index.claude_request_census);
+}
+
+/// [format] H10. Transcript records as an older release wrote them (every
+/// field and shape, retired and over-budget included) decode through the v1
+/// index map, write back byte-identical, and hydrate from v2 rows to the
+/// same records: one record codec for both stores.
+#[test]
+fn transcript_codec_compatibility() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensus, CLAUDE_REQUEST_CENSUS_DERIVATION as V,
+    };
+    use base64::Engine as _;
+    let fp = "a".repeat(64);
+    let b = base64::engine::general_purpose::STANDARD.encode(
+        [1_u64, 5, u64::MAX]
+            .iter()
+            .flat_map(|hash| hash.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let rows = serde_json::json!({
+        "/synthetic/live.jsonl": {"v": V, "fp": fp, "w": 7, "s": "exact", "tw": true,
+            "u": true, "b": b, "bi": 1_700_000_000_u64, "bd": 5, "bn": 42, "ur": 3,
+            "ut": 900, "m": 1_700_000_200_u64},
+        "/synthetic/retired.jsonl": {"v": V, "fp": fp, "w": 7, "s": "exact", "r": 2, "m": 1},
+        "/synthetic/over.jsonl": {"v": V, "fp": fp, "w": 7, "s": "over_budget"},
+        "/synthetic/lossy.jsonl": {"v": V, "fp": fp, "w": 7, "s": "lossy", "u": true, "b": b},
+        "/synthetic/empty.jsonl": {"v": V, "fp": fp, "w": 7, "s": "empty"},
+    });
+    let v1: ClaudeRequestCensus =
+        serde_json::from_slice(&serde_json::to_vec(&rows).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&v1).unwrap(), rows);
+    let (_scratch, mut db) = Scratch::store();
+    let mut index = fixture();
+    for name in rows.as_object().unwrap().keys() {
+        let record = v1.get(name).expect("decoded").clone();
+        index.claude_request_census.insert(name.clone(), record);
+    }
+    commit_populate(&mut db, &index);
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    for name in rows.as_object().unwrap().keys() {
+        assert_eq!(
+            restored.claude_request_census.get(name),
+            v1.get(name),
+            "{name}"
+        );
+    }
+    assert_eq!(restored.claude_request_census, index.claude_request_census);
 }

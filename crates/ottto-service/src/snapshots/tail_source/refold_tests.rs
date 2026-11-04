@@ -1,15 +1,16 @@
 //! L02 (D168-3): a late-evidence re-fold from stored state is the body a
 //! fresh native read sends now, byte for byte. It goes as an ordinary update,
 //! with no rescan claim, counted by its reason (the row is
-//! `oracle_tests::differing_stored_body_is_sent_as_the_cold_full_body`). Stored state that is
-//! incomplete for the file, or a body waiting on a server retry (a head-CAS
-//! conflict), reads natively instead. The scan-level sidecar rows
+//! `oracle_tests::differing_stored_body_is_sent_as_the_cold_full_body`). A
+//! body waiting on a server retry re-folds too. Stored state that is
+//! incomplete for the file, or a session that owes a head-CAS answer, reads
+//! natively instead. The scan-level sidecar rows
 //! (`claude_tail_money_tests`: `quiet_sidecar_growth`, `side_owner`, ...)
 //! compare the same re-fold's upload with a cold Full on real evidence.
 use super::super::claude::tests::lines;
 use super::super::seam::tests::{route, Route};
 use super::settlement_tests::stored_finish;
-use super::tests::{append, cold, committed, loaded, read};
+use super::tests::{append, cold, cold_accumulator, committed, counted, loaded, read};
 use super::*;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
 use crate::transcript_acquisition::ReadMode;
@@ -102,45 +103,124 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
     assert_eq!(money, cold(&route, &path));
 }
 
-/// [money] SOURCE (c): while a body of the file waits on a server retry (a
-/// head-CAS conflict), no late-evidence selection re-folds it: the read that
-/// answers is a native Full. An append still continues from its head.
+/// [money] SOURCE (c): a body that waits on a server retry with no head-CAS
+/// answer owed re-folds from stored state for every late-evidence selection:
+/// an identity deferral (503), a non-permanent rejection and a refusal
+/// re-offer lease each resend the same body, so the re-fold reads no
+/// transcript byte and is byte-equal to a fresh native read.
 #[test]
-fn a_retry_held_file_reads_natively() {
+fn a_retry_pending_body_refolds_from_tail() {
     let mut route = route();
     let (path, key) = committed(&mut route, "a.jsonl", 3);
+    let native = wire(&fresh(&route, &path));
     let fingerprint = "c".repeat(64);
+    let body = "d".repeat(64);
     route
         .index
         .file_snapshot_fingerprints
         .insert(key.clone(), [fingerprint.clone()].into());
-    for reason in LATE {
-        assert!(reuses_stored(
-            &route.index,
-            &key,
-            Some(reason),
-            false,
-            false
-        ));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // The index's view of each kind: the record carries no cause.
+    let deferred = SnapshotQuarantineRecord {
+        upload_body_witness: Some(body.clone()),
+        retry_after_unix_seconds: now,
+        ..snapshot_quarantine_record(SnapshotSource::ClaudeCode)
+    };
+    let rejected = SnapshotQuarantineRecord {
+        upload_body_witness: Some(body.clone()),
+        ..snapshot_quarantine_record(SnapshotSource::ClaudeCode)
+    };
+    type Kind = fn(&mut ScanIndex, &str, &SnapshotQuarantineRecord, &SnapshotQuarantineRecord);
+    let kinds: [(&str, Kind); 3] = [
+        ("identity_deferred", |index, fp, deferred, _| {
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fp.to_owned(), deferred.clone());
+        }),
+        ("non_permanent_rejection", |index, fp, _, rejected| {
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fp.to_owned(), rejected.clone());
+        }),
+        ("reoffer_lease", |index, fp, _, _| {
+            index
+                .reason_reoffer_retries
+                .insert(fp.to_owned(), "d".repeat(64));
+        }),
+    ];
+    for (kind, setup) in kinds {
+        route.index.quarantined_snapshot_fingerprints.clear();
+        route.index.reason_reoffer_retries.clear();
+        setup(&mut route.index, &fingerprint, &deferred, &rejected);
+        for reason in LATE {
+            assert!(
+                reuses_stored(&route.index, &key, Some(reason), false, false),
+                "{kind}: {reason:?}"
+            );
+        }
+        let (refold, native_bytes) = stored_finish(&route, &path, &key);
+        assert_eq!(native_bytes, 0, "{kind}");
+        assert_eq!(wire(&refold), native, "{kind}");
     }
-    route.index.quarantined_snapshot_fingerprints.insert(
-        fingerprint,
-        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
-    );
-    for reason in LATE {
-        assert!(
-            !reuses_stored(&route.index, &key, Some(reason), false, false),
-            "{reason:?}"
-        );
-    }
+}
+
+/// [money] D142(a): a file whose session owes a head-CAS answer never
+/// continues from stored state, whatever its selection: late evidence, a
+/// change and a grown file all read a native Full from byte 0, so the answer
+/// rides only a real Full. The read counts under `head_conflict`.
+#[test]
+fn a_conflict_owed_session_reads_native_full() {
+    use crate::local_resource_diagnostics::change_reason as counts;
+    let mut route = route();
+    let (path, key) = committed(&mut route, "a.jsonl", 3);
+    let session = cold_accumulator(&route, &path)
+        .wire_source_session_id(&path)
+        .unwrap();
+    let owed = crate::snapshot_sync::cache_session_key(&session);
+    // Another session's challenge is not this file's.
+    route
+        .index
+        .activate_head_conflict_sessions(["e".repeat(64)].into());
+    assert!(matches!(loaded(&route, &path, &key).0, Load::Reused(..)));
+    route
+        .index
+        .activate_head_conflict_sessions([owed.clone()].into());
     let changed = Some(CandidateParseReason::TranscriptChanged);
-    assert!(reuses_stored(&route.index, &key, changed, true, false));
-    // The quarantine retry selects the grown file before its change does;
-    // the append still continues from its head.
     let retry = Some(CandidateParseReason::ActivityOrQuarantineRetry);
-    assert!(reuses_stored(&route.index, &key, retry, true, false));
-    let (_, mode, start) = read(&route, &path, None);
-    assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
+    for (grew, reasons) in [
+        (false, LATE.map(Some).to_vec()),
+        (false, vec![changed, None]),
+        (true, vec![changed, retry]),
+    ] {
+        if grew {
+            append(&path, 3);
+        }
+        for reason in reasons {
+            // The selection may continue; the load refuses on the head.
+            assert!(reuses_stored(&route.index, &key, reason, grew, false));
+            let (load, counted_load) = loaded(&route, &path, &key);
+            assert!(matches!(load, Load::Cold(None)), "{reason:?} grew={grew}");
+            assert_eq!(counted(&counted_load), ("miss".into(), vec![]));
+            let (_, mode, start) = read(&route, &path, None);
+            assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
+        }
+    }
+    // The conflict-owed Full counts under the existing `head_conflict` row.
+    let _ = counts::drain("claude_code");
+    let _ = loaded(&route, &path, &key);
+    counts::read(
+        "claude_code",
+        &key,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+        7,
+        0,
+    );
+    let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
+    assert_eq!(page["read"]["head_conflict"]["files"], 1);
+    assert_eq!(page["read"]["head_conflict"]["native_bytes"], 7);
 }
 
 /// [money] SOURCE (b): stored state incomplete for the file never re-folds.

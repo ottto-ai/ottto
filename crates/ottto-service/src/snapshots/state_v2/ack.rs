@@ -151,7 +151,7 @@ pub(super) fn erase_failed_imports(index_path: &Path) -> Result<()> {
     super::super::sync_checkpoint_parent(index_path)
 }
 fn preserve_failed_import(index_path: &Path, companion: &Path, bytes: &[u8]) -> Result<()> {
-    let suffix: String = digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let suffix = crate::hex::encode(&digest(bytes));
     let target = fence::sibling(
         index_path,
         &format!(".v2-ack-receipt.failed-import-{suffix}"),

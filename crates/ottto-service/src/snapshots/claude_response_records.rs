@@ -1119,9 +1119,7 @@ mod output_tests {
             name: name.into(),
         }];
         take_l_spans();
-        let mut e = Enc::bytes(1 << 10);
-        tool_uses.put(&mut e).unwrap();
-        let body = e.into_bytes();
+        let body = Enc::count_write(1 << 10, |e| tool_uses.put(e)).unwrap();
         let spans = take_l_spans();
         assert_eq!(spans.len(), 1, "{spans:?}");
         let (start, end, path) = spans[0];

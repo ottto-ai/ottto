@@ -95,14 +95,17 @@ expected repository and subject digest from the release manifest:
 gh attestation verify <artifact> --repo <owner>/<repo> \
   --predicate-type https://slsa.dev/provenance/v1 \
   --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 gh attestation verify <artifact> --repo <owner>/<repo> \
   --predicate-type https://cyclonedx.org/bom \
   --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
-  --source-ref refs/heads/main \
+  --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
 ```
+
+Releases are built from the protected release tag `v<version>`; releases built
+before tag-based releases verify with `--source-ref refs/heads/main`.
 
 The attestation subject must match the artifact digest. The SLSA provenance must
 use the expected source repository, workflow, commit, and Build L2-or-better
@@ -163,8 +166,8 @@ macos_public_rc_gate.sh \
 ```
 
 Stable preflight requires `quality_gates.stable_candidate_rc.status: passed`,
-the candidate manifest SHA-256, and an evidence file whose candidate commit
-matches the stable manifest commit. The stable-candidate manifest must mark
+the candidate manifest SHA-256, and an evidence file whose candidate version
+(without `-rcN`), commit, and app source commit match the stable manifest. The stable-candidate manifest must mark
 every macOS artifact as signed, notarized, and Gatekeeper-assessed, and the
 evidence must include passed `artifact_signatures`, `notarization`, and
 `gatekeeper_assessment` checks. It must also bind the exercised local runtime to

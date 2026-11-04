@@ -75,8 +75,6 @@ pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
                 | Hold::ReferenceDrift => Reason::ShardUnavailable,
                 Hold::MigrationFailed
                 | Hold::ReloadRequired
-                | Hold::SaveCeiling
-                | Hold::SaveOversize
                 | Hold::SaveFull
                 | Hold::AckCustody => Reason::Retrying,
             });
