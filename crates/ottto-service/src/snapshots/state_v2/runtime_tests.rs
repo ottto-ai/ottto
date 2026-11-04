@@ -575,7 +575,6 @@ mod hydrate_parity {
     use crate::snapshots as s;
     use s::lenient_decode;
     use serde_json::value::RawValue;
-    use std::collections::BTreeSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn seed() -> ScanIndex {

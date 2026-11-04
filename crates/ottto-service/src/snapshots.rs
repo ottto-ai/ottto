@@ -49640,7 +49640,7 @@ mod tests {
             let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
             let evidence = BTreeMap::from([(root.clone(), api.clone())]);
             let mut current = vec![child.clone()];
-            let mut index =
+            let index =
                 crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
             apply_claude_effort_evidence_with_index(&mut current, &evidence, &index);
             assert!(current[0]

@@ -116,10 +116,6 @@ pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) sibling_exact_incidence_only: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) account_reproof_calls: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) account_reproof_cleared: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) history_permitted_not_stamped_not_accepted: u64,
@@ -141,8 +137,6 @@ impl Rearm {
             restored_empty_sibling,
             restored_nonempty_sibling,
             sibling_exact_incidence_only,
-            account_reproof_calls,
-            account_reproof_cleared,
             authority_normalization_cleared,
             history_permitted_not_stamped_not_accepted,
             history_permitted_not_stamped_telemetry_unread,
@@ -460,16 +454,6 @@ pub(crate) fn restored(previous_empty: bool, held: bool, exact_only: bool) {
             .saturating_add(u64::from(exact_only));
     });
 }
-/// One account-reproof clear of a family member's source revision.
-pub(crate) fn clear(nonempty: bool) {
-    update(|counts| {
-        let c = &mut counts.claude_reread;
-        c.account_reproof_calls = c.account_reproof_calls.saturating_add(1);
-        c.account_reproof_cleared = c
-            .account_reproof_cleared
-            .saturating_add(u64::from(nonempty));
-    });
-}
 /// Why an upgrade the history gate permitted this page did not stamp.
 pub(crate) enum NotStamped {
     NotAccepted,
@@ -526,26 +510,28 @@ mod tests {
     #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);
-        clear(true);
+        restored(true, false, false);
         {
             let other = Scope::begin(false);
-            clear(true);
+            restored(true, false, false);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             assert_eq!(other.finish(), Counts::default());
         }
         let nested = Scope::begin(true);
-        clear(false);
-        assert_eq!(nested.finish().claude_reread.account_reproof_calls, 1);
-        std::thread::spawn(|| clear(true)).join().unwrap();
+        restored(false, false, false);
+        assert_eq!(nested.finish().claude_reread.restored_nonempty_sibling, 1);
+        std::thread::spawn(|| restored(true, false, false))
+            .join()
+            .unwrap();
         let mut page = scope.finish();
-        assert_eq!(page.claude_reread.account_reproof_calls, 1);
-        assert_eq!(page.claude_reread.account_reproof_cleared, 1);
+        assert_eq!(page.claude_reread.restored_empty_sibling, 1);
+        assert_eq!(page.claude_reread.restored_nonempty_sibling, 0);
         assert!(page.retained_cache_page_events.is_empty());
         let resumed = Scope::begin(true);
-        clear(false);
+        restored(false, false, false);
         page.merge(resumed.finish());
-        assert_eq!(page.claude_reread.account_reproof_calls, 2);
-        assert_eq!(page.claude_reread.account_reproof_cleared, 1);
+        assert_eq!(page.claude_reread.restored_empty_sibling, 1);
+        assert_eq!(page.claude_reread.restored_nonempty_sibling, 1);
         assert!(!active());
     }
     #[test]

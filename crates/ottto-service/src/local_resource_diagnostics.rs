@@ -2911,7 +2911,7 @@ mod tests {
     fn claude_page_events_use_existing_carriers_without_source_leakage() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
+            claude_reread::restored(true, false, false);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -2926,7 +2926,7 @@ mod tests {
             );
             // Another source's page: its retained-cache events and nothing else.
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
+            claude_reread::restored(true, false, false);
             cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
@@ -2947,7 +2947,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["source"], "claude_code");
         assert_eq!(
-            rows[0]["counts"]["claude_reread"]["account_reproof_cleared"],
+            rows[0]["counts"]["claude_reread"]["restored_empty_sibling"],
             1
         );
         assert_eq!(
