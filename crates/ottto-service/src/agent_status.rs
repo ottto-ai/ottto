@@ -15223,8 +15223,7 @@ fn percent_quota_status(used_percent: u8) -> AgentQuotaWindowStatus {
 }
 
 fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("pi") && !home_path(".pi").exists() && !pi_agent_dir(&home_dir()).exists()
-    {
+    if !crate::agent_configs::detection::source_present_locally(&SourceKind::Pi) {
         return not_installed_snapshot(SourceKind::Pi, "pi", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(

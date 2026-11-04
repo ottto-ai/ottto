@@ -12876,9 +12876,6 @@ fn run_verify_source_action(
     action: &SetupRunActionApiResponse,
     source: SourceKind,
 ) -> Result<SetupVerifyActionOutcome, LocalApiError> {
-    if source == SourceKind::Pi {
-        return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
-    }
     if source == SourceKind::Codex {
         reconcile_codex_source_off()?;
         let result = verify_source(
@@ -12924,6 +12921,11 @@ fn run_verify_source_action(
             }),
             Some(result),
         ));
+    }
+    // Pi verifies its routes after the shared not-installed gate, so a Mac
+    // without Pi never creates Pi directories or runs a doomed smoke.
+    if source == SourceKind::Pi {
+        return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
@@ -14532,17 +14534,17 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
         }
         SourceKind::Pi => {
             let command_found = executable_exists("pi");
-            let sessions = crate::agent_status::pi_sessions_dir(&home_path(""));
+            let present = crate::agent_configs::detection::source_present_locally(source);
             let telemetry_installed = snapshot_device_credentials_include_source("pi");
             setup_scan_source(
                 source,
                 "pi",
-                command_found || sessions.exists(),
+                present,
                 command_found,
                 telemetry_installed,
                 if telemetry_installed {
                     "healthy"
-                } else if command_found || sessions.exists() {
+                } else if present {
                     "needs_repair"
                 } else {
                     "not_found"
@@ -15283,6 +15285,17 @@ fn verify_source_unchecked(
     };
     let api_base_url = setup_credentials.connection.api_base_url.clone();
 
+    // Before anything else: if the source CLI is genuinely not installed on this
+    // Mac, there is nothing to smoke. Running the smoke anyway returns
+    // "not installed or not executable", which the health projection renders as
+    // a BLOCKING telemetry failure and stalls onboarding on a machine that never
+    // had the app. Report a clean, non-blocking not-installed result instead.
+    if !source_binary_present(&source) {
+        let result = not_installed_verification_result(source.clone(), config);
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
+
     if source == SourceKind::Pi {
         let connection = setup_credentials.connection.clone();
         let pi_token = setup_credentials.setup_run_token.clone();
@@ -15335,18 +15348,6 @@ fn verify_source_unchecked(
     // install fail to verify Codex even though the smoke ran and `fix` reported
     // success. Detect the missing provisioning up front and return an accurate,
     // actionable status instead of running a doomed smoke.
-    //
-    // Before any of that: if the source CLI is genuinely not installed on this
-    // Mac, there is nothing to smoke. Running the smoke anyway returns
-    // "not installed or not executable", which the health projection renders as
-    // a BLOCKING telemetry failure and stalls onboarding on a machine that never
-    // had the app. Report a clean, non-blocking not-installed result instead.
-    if !source_binary_present(&source) {
-        let result = not_installed_verification_result(source.clone(), config);
-        daemon.record_verification_result(&result)?;
-        return Ok(result);
-    }
-
     if !relay_device_is_provisioned() {
         let result = verification_result_with_config(
             source.clone(),
