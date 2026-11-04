@@ -1,18 +1,8 @@
-//! Test support for the parser's native finish, plus the private local
-//! literal codec. Content (`X`) is never re-derived from the file: a Tail
-//! source stores it as session facts (D168-1).
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the native-finish support and local literal codec are reached only from tests"
-    )
-)]
+//! Test support for the parser's native finish. Content (`X`) is never
+//! re-derived from the file: a Tail source stores it as session facts.
 
 #[cfg(test)]
 use std::fs::File;
-
-pub(crate) mod pl_text;
 
 #[cfg(test)]
 use super::*;

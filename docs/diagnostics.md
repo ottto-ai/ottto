@@ -150,13 +150,13 @@ process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
 
 Whole-record JSONL parsing has no line-size refusal. A native page's nonzero
-`max_line_bytes`, `lines_over_16_mib` and `max_line_buffer_bytes` (line-buffer
-capacity, not RSS or an upper bound) go in their own `native_collection_jsonl_lines`
-record right after `native_collection_page`; `context_composition_read` carries
-them inline. 16 MiB is only a release point: a completed record above it
-frees its line buffer; byte targets yield between records. The counts-only
-`jsonl_repeat_parse_failure_alarm` fires when the malformed/UTF-8 counters rise
-on consecutive native pages, without changing reading or retries.
+`max_line_bytes` and `max_line_buffer_bytes` (line-buffer capacity, not RSS or
+an upper bound) go in their own `native_collection_jsonl_lines` record right
+after `native_collection_page`; `context_composition_read` carries them inline.
+16 MiB is only a release point: a completed record above it frees its line
+buffer; byte targets yield between records. The former `lines_over_16_mib`
+count and `jsonl_repeat_parse_failure_alarm` are retired; malformed/UTF-8 lines
+stay counted by the existing read report.
 
 Records use `schema_version: 2`. Within a version, fields and stage values may
 only be added; readers must ignore unknown keys and stages. Removing a field
@@ -437,7 +437,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `retail_*`, `stale_full`, `pace_anomaly`, `pace_evicted`, `upgrade_missing_full`, `d3`, `restore_pending_quiet` | Retired with their mechanisms |
 | `store_disabled`, `t14_*`, `mode_repaired`, `stale_record_refused`, `temp_*`, `resource_pause*`, `memo_evicted`, `receipt_*`, `uninventoried_records`, `owed_overflow_discovery_only`, `native_stage_skipped`, `restore_unavailable_*` | Retired, `.rec` mechanics. A corrupt row is `tail_reconstruct{corrupt}`; the database owner's mode is the store's own |
 | `gc_*`, `rec_orphans_erased`, `native_class_*`, `records_invalidated`, `off_v1_*` | `tail_legacy_dir`, `tail_apply.retired`, the erasure epoch and deadline, `tail_reconstruct{identity}` |
-| `private_label_*`, `skill_label_native_dropped` | Retired (D122): local labels are data and consent filters upload only. Source removal, forget, identity-failure erasure and failed-purge alarms stay |
+| `private_label_*`, `skill_label_native_dropped` | Retired: local labels are data and consent filters upload only. Uninstall, identity-failure erasure and failed-purge alarms stay; source removal and forget keep local data |
 
 Not built, and so absent from the counters: `tail_candidate_owed`,
 `tail_set_aside_probe`.
@@ -606,10 +606,14 @@ observations are retired with whole-file refusal. `last_oversized_file_count`
 remains on the wire and emits zero. Saved refusal debt stays decodable and is
 cleared after load through the ordinary save path.
 
-The `local_resources` stage `file_size` reports the process high-water
-`largest_file_bytes` per source, with `file_over_1gib` on that same record.
-`first_read` reports scalar `file_bytes`, `first_read_ms`, `first_read_over_300s`
-and existing footprint observations through native finish. Existing
+`native_collection_page` carries nonzero page scalars `largest_file_bytes`
+(the largest file listed or read since the source's previous page),
+`first_read_files` (files new to the index whose read finished) and
+`first_read_max_ms` (the slowest of those reads). The former per-file
+`first_read` window and `file_size` point, with `first_read_over_300s` and
+`file_over_1gib`, are retired. `hold_wake` (`keys`, `oldest_expired_secs`)
+counts expired growth claims selection woke since the previous page, replacing
+the per-pass `hold_wake` point. Existing
 `bounded_traversal_transition` records report `max_unread_bytes` on retirement
 or in `previous` when replacing a traversal, with no per-file log emissions.
 This traversal maximum uses disk length minus the last native checkpoint's size
@@ -899,8 +903,9 @@ bounded-lifetime release remains a SOURCE follow-up.
 
 After each source's `native_collection_page` line, a `native_change_reasons`
 line carries `counts.change_reasons` when any count is nonzero (its own line
-keeps the page line under its size bound): nonzero counts of why a body was read or uploaded, by one first cause. They are
-local diagnostics only; they gate, cap and upload nothing.
+keeps the page line under its size bound): nonzero counts of why a body was
+read or uploaded, by one first cause. They are local diagnostics only; they
+gate, cap and upload nothing.
 
 - **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
@@ -915,10 +920,9 @@ local diagnostics only; they gate, cap and upload nothing.
   `usage_identical`), `placement_y`/`placement_n`/`placement_u` and `upload_bytes`.
   Placement is known only for Claude with complete accepted state; else `u`.
   An exact resend of a held, refused or catch-up body takes its delivery cause.
-- **`read`** (per file): cause x read mode (`tail`, `state_missing`,
-  `scope_changed`, `audit_due`, `clock_changed`, `other`) with `files`,
-  `native_bytes` and `validation_bytes`. A read mode is how a file was read, not
-  why.
+- **`read`** (per file): per cause, `files`, `native_bytes` and
+  `validation_bytes`. How a file was read stays in
+  `sampled_acquisition.page_events.full_reasons`.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.

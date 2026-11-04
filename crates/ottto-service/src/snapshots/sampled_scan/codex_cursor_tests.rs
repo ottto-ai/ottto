@@ -12701,7 +12701,10 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
 /// publication; the restart-record store's no-record mode, which dropped it,
 /// is gone.
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "validated native cursor layout"
+)]
 fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
     if !crate::test_isolation::run_here() {
         return;

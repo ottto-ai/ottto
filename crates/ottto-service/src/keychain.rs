@@ -6,7 +6,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const TELEMETRY_KEY_SERVICE_PREFIX: &str = "ottto-telemetry-key-";
 pub const CODEX_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-codex";
 pub const CLAUDE_CODE_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-claude_code";
 pub const LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE: &str = "ottto.telemetry.device-secret";

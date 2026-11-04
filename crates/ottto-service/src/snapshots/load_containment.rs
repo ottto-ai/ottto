@@ -155,12 +155,8 @@ impl std::error::Error for ScanIndexRebuildLoop {}
 
 // One bit per supported source, no paths or index contents retained. Tests
 // mirror the process state per thread, like the existing containment alarms.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_PAUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-thread_local! {
-    static SCAN_INDEX_REBUILD_PAUSED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
+crate::local_resource_diagnostics::process_static!(fn with_rebuild_paused:
+    std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0));
 fn scan_index_source_bit(source: SnapshotSource) -> u8 {
     match source {
         SnapshotSource::ClaudeCode => 1,
@@ -170,26 +166,16 @@ fn scan_index_source_bit(source: SnapshotSource) -> u8 {
 }
 fn note_scan_index_rebuild_paused(source: SnapshotSource, paused: bool) {
     let bit = scan_index_source_bit(source);
-    #[cfg(not(test))]
-    if paused {
-        SCAN_INDEX_REBUILD_PAUSED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        SCAN_INDEX_REBUILD_PAUSED.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
-    }
-    #[cfg(test)]
-    SCAN_INDEX_REBUILD_PAUSED.with(|state| {
-        state.set(if paused {
-            state.get() | bit
+    with_rebuild_paused(|state| {
+        if paused {
+            state.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
         } else {
-            state.get() & !bit
-        });
+            state.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+        }
     });
 }
 pub(crate) fn scan_index_rebuild_paused(source: SnapshotSource) -> bool {
-    #[cfg(not(test))]
-    let state = SCAN_INDEX_REBUILD_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    let state = SCAN_INDEX_REBUILD_PAUSED.with(std::cell::Cell::get);
+    let state = with_rebuild_paused(|state| state.load(std::sync::atomic::Ordering::Relaxed));
     state & scan_index_source_bit(source) != 0
 }
 
@@ -357,24 +343,20 @@ impl ScanIndexRebuildOverrideState {
 #[cfg(not(test))]
 static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideState; 3]> =
     std::sync::Mutex::new([ScanIndexRebuildOverrideState::NONE; 3]);
-/// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
-/// this process.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// Finite per-code counters: identity, carried-debt admission, persistence,
-/// and cooldown. No error strings or source contents become metric labels.
-#[cfg(not(test))]
-static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: [std::sync::atomic::AtomicUsize; 4] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+crate::local_resource_diagnostics::process_static!(
+    /// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
+    /// this process.
+    fn with_manual_override:
+    std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
+crate::local_resource_diagnostics::process_static!(
+    /// Finite per-code counters: identity, carried-debt admission, persistence,
+    /// and cooldown. No error strings or source contents become metric labels.
+    fn with_override_refused:
+    [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4]);
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_REBUILD_OVERRIDE: std::cell::Cell<[ScanIndexRebuildOverrideState; 3]> =
         const { std::cell::Cell::new([ScanIndexRebuildOverrideState::NONE; 3]) };
-    static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: std::cell::Cell<[usize; 4]> =
-        const { std::cell::Cell::new([0; 4]) };
 }
 
 fn scan_index_source_slot(source: SnapshotSource) -> usize {
@@ -518,26 +500,18 @@ pub(crate) fn scan_index_rebuild_auto_retry_at(source: SnapshotSource) -> Option
         .ok()
 }
 
-#[cfg(not(test))]
 fn count_scan_index_rebuild_manual_override() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1)
-}
-
-#[cfg(test)]
-fn count_scan_index_rebuild_manual_override() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(|counter| {
-        let count = counter.get().saturating_add(1);
-        counter.set(count);
-        count
+    with_manual_override(|counter| {
+        counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
     })
 }
 
 /// This thread's `scan_index_rebuild_manual_override` counter.
 #[cfg(test)]
 pub(crate) fn scan_index_rebuild_manual_override_count() -> usize {
-    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(std::cell::Cell::get)
+    with_manual_override(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 const CARRIED_ACK_ENTRIES_MAX: usize = 4096;
@@ -557,25 +531,18 @@ fn override_refusal_slot(code: &str) -> usize {
         _ => unreachable!("fixed override refusal code"),
     }
 }
-#[cfg(not(test))]
 fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED[override_refusal_slot(code)]
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1)
-}
-#[cfg(test)]
-fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| {
-        let mut counters = cell.get();
-        let slot = override_refusal_slot(code);
-        counters[slot] = counters[slot].saturating_add(1);
-        cell.set(counters);
-        counters[slot]
+    with_override_refused(|counters| {
+        counters[override_refusal_slot(code)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
     })
 }
 #[cfg(test)]
 fn scan_index_rebuild_override_refused_count(code: &str) -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| cell.get()[override_refusal_slot(code)])
+    with_override_refused(|counters| {
+        counters[override_refusal_slot(code)].load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 #[cfg(test)]
 pub(crate) fn scan_index_rebuild_override_identity_unrecoverable_count() -> usize {

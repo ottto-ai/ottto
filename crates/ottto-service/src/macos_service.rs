@@ -115,19 +115,6 @@ pub fn write_launch_agent(
     Ok(install_plan(config, plist_path))
 }
 
-pub fn ensure_launch_agent_write_allowed(
-    config: &LaunchAgentConfig,
-    plist_path: &Path,
-    allow_owner_migration: bool,
-) -> Result<LaunchAgentOwnerState> {
-    let state = inspect_launch_agent_owner(plist_path, Some(&config.executable_path));
-    if allow_owner_migration || !state.owner_drift {
-        return Ok(state);
-    }
-
-    Err(owner_conflict_error(&state))
-}
-
 /// A refusal to replace another installation, independent of probe failures.
 #[derive(Debug)]
 pub struct LaunchAgentOwnerConflict {
@@ -445,6 +432,19 @@ fn conflicting_owner(state: &LaunchAgentOwnerState) -> InstallOwner {
 mod tests {
     use super::*;
     use ottto_core::OTTTO_SERVICE_BINARY_NAME;
+
+    fn ensure_launch_agent_write_allowed(
+        config: &LaunchAgentConfig,
+        plist_path: &Path,
+        allow_owner_migration: bool,
+    ) -> Result<LaunchAgentOwnerState> {
+        let state = inspect_launch_agent_owner(plist_path, Some(&config.executable_path));
+        if allow_owner_migration || !state.owner_drift {
+            return Ok(state);
+        }
+
+        Err(owner_conflict_error(&state))
+    }
 
     /// [behaviour] Generated service jobs disable libmalloc large-cache retention.
     #[test]

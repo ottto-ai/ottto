@@ -212,14 +212,17 @@ fn copied_candidates(
     }
     let union = wanted.keys().copied().collect::<Vec<_>>();
     let mut copied = vec![false; candidates.len()];
-    let walked =
-        census.walk_transcript_holders(Instant::now() + SIDE_CALL_DEADLINE, |_, _, record| {
+    let walked = claude_request_census::ClaudeRequestCensus::walk_transcript_holders(
+        census.records(),
+        Instant::now() + SIDE_CALL_DEADLINE,
+        |_, _, record| {
             for hash in held_candidates(record, &union) {
                 for &at in &wanted[&hash] {
                     copied[at] = true;
                 }
             }
-        });
+        },
+    );
     if walked.is_none() {
         return vec![true; candidates.len()];
     }

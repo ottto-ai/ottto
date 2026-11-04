@@ -714,6 +714,16 @@ pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bo
     index.file_upload_context_requires_adoption(&local_index_key(path))
 }
 
+/// Files that still owe their own upload-context proof, by the per-file gate
+/// alone (no owed-count exemption).
+pub(crate) fn upload_context_unproven_files_for_test(index: &ScanIndex) -> usize {
+    index
+        .files
+        .keys()
+        .filter(|key| index.file_upload_context_requires_adoption(key))
+        .count()
+}
+
 /// Install the real exclusion input used by ordinary-money fixture families.
 /// An empty slice adopts request-owned money on the next normal source pass.
 pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {

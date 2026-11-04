@@ -294,25 +294,6 @@ pub(crate) fn record_claude_history_list_intent(state_dir: &Path) -> Result<()> 
     })
 }
 
-/// Deliberate installation reset shares the save lock: a transaction already
-/// holding it finishes before deletion; later updates reload the empty state.
-pub(crate) fn remove_backfill_state(state_dir: &Path) -> Result<()> {
-    let _save = BACKFILL_SAVE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("backfill save lock poisoned"))?;
-    let path = backfill_state_path(state_dir);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path),
-        Ok(_) => std::fs::remove_file(&path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => Err(error),
-    }
-    .context("remove backfill state during installation reset")?;
-    File::open(state_dir)
-        .and_then(|directory| directory.sync_all())
-        .context("sync removed backfill state directory")
-}
-
 /// Apply the server-issued backfill policy from a claim/switch completion.
 ///
 /// - `policy == Some("from")` with a parseable RFC3339 `cutoff_at` persists the
@@ -1083,58 +1064,6 @@ mod tests {
         assert_eq!(state_directory_syncs(), saved + 1);
         assert!(!backfill_state_path(&empty).exists());
         let _ = fs::remove_dir_all(empty);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn installation_reset_waits_for_an_inflight_update_then_removes_old_state() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-        let dir = temp_dir("backfill-reset-lock");
-        let (loaded_tx, loaded_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let writer_dir = dir.clone();
-        let writer = std::thread::spawn(move || {
-            update_backfill_state(&writer_dir, |state| {
-                state.backfill_cutoff_at = Some("2026-07-06T10:00:00Z".into());
-                state.backfill_cutoff_user_id = Some("old-user".into());
-                state.claim_backfill_policy_full = true;
-                loaded_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            })
-            .unwrap();
-        });
-        loaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (removed_tx, removed_rx) = mpsc::channel();
-        let reset_dir = dir.clone();
-        let reset = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            remove_backfill_state(&reset_dir).unwrap();
-            removed_tx.send(()).unwrap();
-        });
-        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let while_writer_locked = removed_rx.recv_timeout(Duration::from_millis(100));
-        // Release before asserting so a failed exclusion assertion cannot
-        // strand either worker or poison the process-global save lock.
-        release_tx.send(()).unwrap();
-        writer.join().unwrap();
-        reset.join().unwrap();
-        assert!(
-            matches!(while_writer_locked, Err(mpsc::RecvTimeoutError::Timeout)),
-            "reset cannot finish while a save transaction is in flight"
-        );
-        assert!(
-            !backfill_state_path(&dir).exists(),
-            "old save finished before deletion"
-        );
-        record_claude_history_list_intent(&dir).unwrap();
-        let new_state = load_backfill_state(&dir);
-        assert_eq!(new_state.backfill_cutoff_at, None);
-        assert_eq!(new_state.backfill_cutoff_user_id, None);
-        assert!(!new_state.claim_backfill_policy_full);
-        remove_backfill_state(&dir).unwrap();
-        remove_backfill_state(&dir).unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 

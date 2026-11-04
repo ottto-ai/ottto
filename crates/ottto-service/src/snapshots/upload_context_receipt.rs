@@ -136,16 +136,34 @@ fn receipt_binds_bytes(entry: &ScanIndexEntry, receipt: &Receipt, empty: bool) -
 
 /// Measured backlog of entities and files that still owe proof under the
 /// active context. Bytes are local file sizes; state-only entities have none.
+/// File buckets are disjoint: every file without its own proof is in exactly
+/// one of `owed_files`, `listed_files`, `empty_files`, `ledger_accepted_files`.
 #[derive(Default, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct OwedCounts {
+    /// Non-exempt files whose indexed committed delivery remains unresolved.
+    pub owed_files: u64,
     pub no_proof_entities: u64,
     pub no_proof_bytes: u64,
     pub wrong_context_entities: u64,
     pub wrong_context_bytes: u64,
-    pub empty_pending_files: u64,
-    pub empty_pending_bytes: u64,
     /// Owed files that owe no read: they pay on their next ordinary read.
     pub context_only_files: u64,
+    /// Settled without a context receipt: operator-listed family files.
+    pub listed_files: u64,
+    /// Settled without a context receipt: confirmed empty, absent on disk.
+    pub empty_files: u64,
+    /// Settled without a context receipt: every committed member exactly in
+    /// the current accepted ledger.
+    pub ledger_accepted_files: u64,
+}
+
+/// Why a file without its own context proof still owes nothing. Counts only:
+/// none of these is delivery proof, and none gates a read or an upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exempt {
+    Listed,
+    Empty,
+    LedgerAccepted,
 }
 
 const OWED_LOG_INTERVAL_SECONDS: u64 = 3_600;
@@ -878,16 +896,45 @@ impl ScanIndex {
         );
     }
 
-    /// Gates nothing: files still owing their own proof, for census lines.
-    pub(crate) fn upload_context_owed_file_count(&self) -> usize {
-        self.files
-            .keys()
-            .filter(|key| self.file_upload_context_requires_adoption(key))
-            .count()
+    /// Count-only: whether a file without its own proof still owes nothing.
+    /// Listed while the operator list names its family; Empty only while
+    /// absent on disk (a deleted file cannot grow unread; any other stat
+    /// result stays owed); LedgerAccepted by the source's exact body-accepted
+    /// predicate on a current ledger (`ledger_current`, hoisted by the
+    /// caller), with no open evidence debt. Pi has no file-body predicate.
+    fn owed_count_exemption(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        entry: &ScanIndexEntry,
+        ledger_current: bool,
+    ) -> Option<Exempt> {
+        if self.claude_family_listed(key) {
+            return Some(Exempt::Listed);
+        }
+        if self.confirmed_empty_files.contains(key) {
+            let absent = std::fs::symlink_metadata(key)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            return absent.then_some(Exempt::Empty);
+        }
+        let accepted = ledger_current
+            && !entry.evidence_owed
+            && match source {
+                SnapshotSource::ClaudeCode => claude_index_file_body_accepted(self, key, entry),
+                SnapshotSource::Codex => codex_index_file_body_accepted(self, key, entry),
+                SnapshotSource::Pi => false,
+            };
+        accepted.then_some(Exempt::LedgerAccepted)
     }
 
-    /// Gates nothing: what per-item proof would still owe under this context.
-    pub(crate) fn upload_context_owed_counts(&self) -> OwedCounts {
+    /// Gates nothing: the one owed counter. `owed_files` counts non-exempt
+    /// files whose indexed committed delivery remains unresolved. Exempt files
+    /// (operator-listed, confirmed empty and absent, or exactly
+    /// ledger-accepted) may still lack a context receipt under forward-only
+    /// policy and count only in their settled bucket; ordinary growth is
+    /// selected elsewhere. The entity and byte buckets keep their
+    /// proof-accounting meaning for owed files.
+    pub(crate) fn upload_context_owed_counts(&self, source: SnapshotSource) -> OwedCounts {
         let mut counts = OwedCounts::default();
         let Some(active) = self.active_upload_context_fingerprint.as_ref() else {
             return counts;
@@ -898,23 +945,33 @@ impl ScanIndex {
                 .get(entity)
                 .is_some_and(|stamp| stamp.context_fingerprint == *active)
         };
+        let ledger_current = claude_accepted_ledger_is_current(self);
         for (key, entry) in &self.files {
             let Some(expected) = self.file_expected_context(key) else {
                 continue;
             };
             let receipt = entry.upload_context_receipt.as_ref();
-            if self.confirmed_empty_files.contains(key) {
-                if !self.empty_proof_matches(key, entry) {
-                    counts.empty_pending_files += 1;
-                    counts.empty_pending_bytes =
-                        counts.empty_pending_bytes.saturating_add(entry.size_bytes);
-                }
+            let empty = self.confirmed_empty_files.contains(key);
+            let proven = if empty {
+                self.empty_proof_matches(key, entry)
+            } else {
+                self.receipt_matches(key, entry)
+            };
+            if proven {
                 continue;
+            }
+            // Exemption first, before any membership early exit.
+            let exempt = self.owed_count_exemption(source, key, entry, ledger_current);
+            match exempt {
+                Some(Exempt::Listed) => counts.listed_files += 1,
+                Some(Exempt::Empty) => counts.empty_files += 1,
+                Some(Exempt::LedgerAccepted) => counts.ledger_accepted_files += 1,
+                None => counts.owed_files += 1,
             }
             let Some(members) = self.file_snapshot_fingerprints.get(key) else {
                 continue;
             };
-            if members.is_empty() || self.receipt_matches(key, entry) {
+            if exempt.is_some() || empty || members.is_empty() {
                 continue;
             }
             counts.context_only_files += u64::from(self.context_only_debt(key));
@@ -954,7 +1011,7 @@ impl ScanIndex {
         crate::local_resource_diagnostics::traversal_point(
             "upload_context_owed",
             source.api_slug(),
-            &self.upload_context_owed_counts(),
+            &self.upload_context_owed_counts(source),
         );
     }
 }

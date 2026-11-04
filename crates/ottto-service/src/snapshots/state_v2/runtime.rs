@@ -1244,6 +1244,7 @@ fn erasure_inventory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn invalidate_locked(path: &Path) -> Result<()> {
     with_state(path, |state| {
         state.latched = true;
@@ -1261,13 +1262,6 @@ fn invalidate_locked(path: &Path) -> Result<()> {
         Ok(())
     })
 }
-/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
-/// handles first; its established cleanup owner performs all file deletion.
-#[cfg(target_os = "macos")]
-pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
-    close_tree(support, false)
-}
-
 /// The retired restart-record directory beside a scan index.
 pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
     index_path.with_extension("durable-tail")
@@ -1276,143 +1270,21 @@ pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
 /// Removes that directory, never following a link, and syncs its parent.
 /// `Ok(false)`: nothing was there.
 pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
-    match fs::symlink_metadata(records) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(records)?,
-        Ok(_) => fs::remove_file(records)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let removed = fence::remove_artifact(records)?;
+    if removed {
+        super::super::sync_checkpoint_parent(records)?;
     }
-    super::super::sync_checkpoint_parent(records)?;
-    Ok(true)
-}
-
-/// Explicit erasure only. Close the shared session before unlinking all
-/// artifacts, and invalidate clones before releasing CheckpointLock.
-pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
-    invalidate_locked(path)?;
-    if let Some(runtime) = index.and_then(|i| i.v2().persistence_v2.as_ref()) {
-        runtime
-            .session
-            .lock()
-            .map_err(|_| Hold::DbUnavailable)?
-            .take();
-    }
-    for (suffix, _, _) in fence::ARTIFACTS {
-        fence::remove_artifact(&fence::sibling(path, suffix))?;
-    }
-    super::ack::erase_failed_imports(path)?;
-    super::super::sync_checkpoint_parent(path)?;
-    remove_retired_record_dir(&retired_record_dir(path))?;
-    super::super::sync_checkpoint_parent(path)?;
-    // Retain the invalidated route's custody latch: erased artifacts must not
-    // let this process resume v1 or re-create v2 without an explicit new lineage.
-    Ok(())
-}
-
-/// Close/erase only live runtimes already owned by this process. The caller's
-/// existing whole-tree removal owns legacy files and unregistered artifacts;
-/// discovering those files here would register routes for files no source reads.
-pub(in super::super) fn erase_tree(support: &Path) -> Result<()> {
-    close_tree(support, true)?;
-    telemetry::event("source_erasure_confirmed", &1);
-    Ok(())
-}
-
-/// Unlinks one source's local copy in every namespace. `indexes` are the only
-/// routed paths; `family` (their shared file stem) also covers progress, locks,
-/// legacy and policy-scoped indexes and temps. An error leaves `complete` uncalled,
-/// so the caller's marker stays pending and the next cycle repeats this sweep.
-pub(crate) fn erase_source(
-    indexes: &[PathBuf],
-    family: &str,
-    others: &[PathBuf],
-    complete: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    for path in indexes {
-        {
-            // Erasure must not depend on decoding the files it removes.
-            let _owner =
-                super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
-            crate::snapshot_sync::with_state_v2_progress_lock(path, |_| erase_locked(path, None))?;
-        }
-        // Lock files go only after their flocks are released.
-        let parent = path.parent().context("source_erasure_parent")?;
-        for entry in fs::read_dir(parent)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let rest = name.to_str().and_then(|name| name.strip_prefix(family));
-            let owned = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']));
-            if owned {
-                fence::remove_artifact(&entry.path())?;
-            }
-        }
-        super::super::sync_checkpoint_parent(path)?;
-    }
-    for path in others {
-        fence::remove_artifact(path)?;
-        super::super::sync_checkpoint_parent(path)?;
-    }
-    // All clones are closed; a dropped latch gives reconnect a fresh lineage.
-    let mut routes = states().lock().map_err(|_| Hold::DbUnavailable)?;
-    for path in indexes {
-        routes.remove(path);
-    }
-    drop(routes);
-    complete()?;
-    telemetry::event("source_erasure_confirmed", &indexes.len());
-    Ok(())
-}
-
-/// Account removal: every Tail row of the route at `path`, of any file and
-/// kind, debt included, in one Tail-only commit; then a TRUNCATE checkpoint,
-/// so no removed value stays in the WAL (`secure_delete` zeroes freed pages).
-/// Graph, index and census rows stay. Live sessions close first, as erasure's
-/// do; the next load reopens the store. `Ok(false)`: no store at `path`.
-pub(crate) fn erase_tail_rows(path: &Path) -> Result<bool> {
-    let Some(binding) = binding(path) else {
-        return Ok(false);
-    };
-    if !fence::exists(&fence::sibling(path, ".v2.sqlite"))? {
-        return Ok(false);
-    }
-    let _owner = super::super::CheckpointLock::acquire_with_custody(path, false, Some(true))?;
-    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
-        with_state(path, |state| {
-            let Some((identity, db_path)) = fence::reconcile(path, &binding, state.latched)? else {
-                return Ok(false);
-            };
-            state.latched = true;
-            state.save_digests = None;
-            state.tail = Default::default();
-            let current = state.current.take();
-            let live = state.runtimes.drain(..).filter_map(|r| r.upgrade());
-            for runtime in live.chain(current) {
-                runtime
-                    .session
-                    .lock()
-                    .map_err(|_| Hold::DbUnavailable)?
-                    .take();
-            }
-            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
-            let expected = db.stamp()?.0;
-            super::ack::ProgressRecovery::recover_route_locked(&identity, expected, path, owner)?;
-            let every = tail::TailStage::erase_every();
-            tail::commit_exit(&mut db, &identity, expected, &every)?;
-            let checkpoint = db.checkpoint(CheckpointMode::IdleReclaim);
-            ensure!(
-                checkpoint.state == CheckpointState::Complete,
-                Hold::DbUnavailable
-            );
-            Ok(true)
-        })
-    })
+    Ok(removed)
 }
 
 pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
     telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
 }
 
-fn close_tree(support: &Path, erase: bool) -> Result<()> {
+/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
+/// handles first; its established cleanup owner performs all file deletion.
+#[cfg(any(test, target_os = "macos"))]
+pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
     let root = support.join("snapshots");
     let routes: Vec<_> = states()
         .lock()
@@ -1443,11 +1315,7 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
         }
         if path.parent().is_some_and(Path::is_dir) {
             let _lock = super::super::CheckpointLock::acquire(&path)?;
-            if erase {
-                erase_locked(&path, None)?;
-            } else {
-                invalidate_locked(&path)?;
-            }
+            invalidate_locked(&path)?;
         } else {
             invalidate_locked(&path)?;
         }
