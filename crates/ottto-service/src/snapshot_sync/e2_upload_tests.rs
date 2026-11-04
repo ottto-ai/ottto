@@ -587,119 +587,133 @@ fn e2_single_class_pages_keep_the_previous_batches() {
 /// loses its ACK after the server stored it, or its checkpoint save fails.
 /// After a restart from the saved ledger only unsettled bodies are re-sent;
 /// a replay of a stored body is an exact repeat (unchanged), so nothing is
-/// stored or credited twice. Both class orders: ordinary before patched, and
-/// patched before legacy.
+/// stored or credited twice. Every class order: ordinary before patched, patched
+/// before legacy, and a mixed literal family whose patched root is sent
+/// before its ordinary members.
 #[test]
 fn e2_class_request_lost_after_a_checkpoint_resends_only_unsettled_bodies() {
     for (first, second) in [(0u8, 1u8), (1, 2)] {
-        for (lost, save_fails) in [(second, false), (first, false), (second, true)] {
-            let items = vec![
-                with_class(plain_item(1), second),
-                with_class(plain_item(2), first),
-                with_class(plain_item(3), second),
-                with_class(plain_item(4), first),
-            ];
-            let root = crate::test_scratch::ScratchDir::new("e2-class-lost");
-            let path = root.join("progress.json");
-            let mut progress = test_upload_progress();
-            progress.save(&path).unwrap();
-            // The server stores each new body once; a stored body is unchanged.
-            let stored = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
-            let serve = |batch: &[FamilyItem]| {
-                let mut stored = stored.borrow_mut();
-                let (mut accepted, mut unchanged) = (Vec::new(), Vec::new());
-                for item in batch {
-                    if stored.contains_key(&item.fingerprint) {
-                        unchanged.push(item.fingerprint.clone());
-                    } else {
-                        stored.insert(item.fingerprint.clone(), 1);
-                        accepted.push(item.fingerprint.clone());
-                    }
+        let items = vec![
+            with_class(plain_item(1), second),
+            with_class(plain_item(2), first),
+            with_class(plain_item(3), second),
+            with_class(plain_item(4), first),
+        ];
+        assert_lost_class_request_resends_only_unsettled(&items, first, second);
+    }
+    // Patched before ordinary: a literal family's patched root group, then
+    // its ordinary members' group.
+    let mut items = family("root-pm", 3, 0);
+    items[0].class = 1;
+    assert_lost_class_request_resends_only_unsettled(&items, 1, 0);
+}
+
+/// Sends `items` (two classes, `first` sent before `second`) with each loss:
+/// the second request's reply lost, the first request's reply lost, and the
+/// second request's checkpoint save failing; then restarts from the saved
+/// ledger and checks only unsettled bodies are re-sent, once.
+fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first: u8, second: u8) {
+    for (lost, save_fails) in [(second, false), (first, false), (second, true)] {
+        let root = crate::test_scratch::ScratchDir::new("e2-class-lost");
+        let path = root.join("progress.json");
+        let mut progress = test_upload_progress();
+        progress.save(&path).unwrap();
+        // The server stores each new body once; a stored body is unchanged.
+        let stored = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
+        let serve = |batch: &[FamilyItem]| {
+            let mut stored = stored.borrow_mut();
+            let (mut accepted, mut unchanged) = (Vec::new(), Vec::new());
+            for item in batch {
+                if stored.contains_key(&item.fingerprint) {
+                    unchanged.push(item.fingerprint.clone());
+                } else {
+                    stored.insert(item.fingerprint.clone(), 1);
+                    accepted.push(item.fingerprint.clone());
                 }
-                entity_ack_batch(&accepted, &unchanged, &[])
-            };
-            let mut accepted = 0;
-            let mut sent = Vec::new();
-            let result = upload_resumable_batches_with_literal_families(
-                &items,
-                &unique_poison_scope(),
-                &mut progress,
-                &mut accepted,
-                |item| item.fingerprint.as_str(),
-                |item| item.fingerprint.clone(),
-                |item| Some(item.session.as_str()),
-                |item| item.class,
-                |_| None,
-                &mut InplaceRetryBudget::default(),
-                |batch| {
-                    sent.push(batch[0].class);
-                    let response = serve(&batch);
-                    if batch[0].class == lost && !save_fails {
-                        return Err(anyhow!("synthetic lost reply"));
-                    }
-                    Ok(response)
-                },
-                |state| {
-                    let saving_lost = items
-                        .iter()
-                        .filter(|item| item.class == lost)
-                        .all(|item| state.accepted_fingerprints.contains(&item.fingerprint));
-                    if save_fails && saving_lost {
-                        return Err(anyhow!("synthetic save failure"));
-                    }
-                    state.save(&path)
-                },
-            );
-            let case = format!("{first}->{second} lost {lost} save_fails {save_fails}");
-            assert!(result.is_err(), "{case}");
-            let expected_sent = if lost == first {
-                vec![first]
-            } else {
-                vec![first, second]
-            };
-            assert_eq!(sent, expected_sent, "{case}: lower class first");
-            let mut restarted = SnapshotUploadProgress::load(
-                &path,
-                &format!("{:064x}", 99),
-                snapshot_quarantine_witness(SnapshotSource::Codex),
-            )
-            .unwrap();
-            for item in &items {
-                assert_eq!(
-                    restarted.accepted_fingerprints.contains(&item.fingerprint),
-                    lost == second && item.class == first,
-                    "{case}: {}",
-                    item.session
-                );
             }
-            let mut resent = Vec::new();
-            let (result, _) = upload_families(&items, &mut restarted, |batch| {
-                resent.extend(batch.iter().map(|item| item.session.clone()));
-                Ok(serve(batch))
-            });
-            assert_eq!(result.unwrap(), ResumableUploadResult::Completed, "{case}");
-            let mut expected = items
-                .iter()
-                .filter(|item| lost == first || item.class == second)
-                .map(|item| item.session.clone())
-                .collect::<Vec<_>>();
-            expected.sort();
-            resent.sort();
-            assert_eq!(resent, expected, "{case}: only unsettled bodies, once");
-            assert!(
-                stored.borrow().values().all(|count| *count == 1),
-                "{case}: no body stored twice"
+            entity_ack_batch(&accepted, &unchanged, &[])
+        };
+        let mut accepted = 0;
+        let mut sent = Vec::new();
+        let result = upload_resumable_batches_with_literal_families(
+            items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.fingerprint.as_str(),
+            |item| item.fingerprint.clone(),
+            |item| Some(item.session.as_str()),
+            |item| item.class,
+            |item| item.root.as_deref(),
+            &mut InplaceRetryBudget::default(),
+            |batch| {
+                sent.push(batch[0].class);
+                let response = serve(&batch);
+                if batch[0].class == lost && !save_fails {
+                    return Err(anyhow!("synthetic lost reply"));
+                }
+                Ok(response)
+            },
+            |state| {
+                let saving_lost = items
+                    .iter()
+                    .filter(|item| item.class == lost)
+                    .all(|item| state.accepted_fingerprints.contains(&item.fingerprint));
+                if save_fails && saving_lost {
+                    return Err(anyhow!("synthetic save failure"));
+                }
+                state.save(&path)
+            },
+        );
+        let case = format!("{first}->{second} lost {lost} save_fails {save_fails}");
+        assert!(result.is_err(), "{case}");
+        let expected_sent = if lost == first {
+            vec![first]
+        } else {
+            vec![first, second]
+        };
+        assert_eq!(sent, expected_sent, "{case}: first class first");
+        let mut restarted = SnapshotUploadProgress::load(
+            &path,
+            &format!("{:064x}", 99),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        for item in items {
+            assert_eq!(
+                restarted.accepted_fingerprints.contains(&item.fingerprint),
+                lost == second && item.class == first,
+                "{case}: {}",
+                item.session
             );
-            assert_eq!(stored.borrow().len(), items.len(), "{case}");
-            for item in &items {
-                assert!(restarted.accepted_fingerprints.contains(&item.fingerprint));
-            }
-            // A repeat pass sends no POST.
-            let (result, batches) = upload_families(&items, &mut restarted, |_| {
-                panic!("a settled page sends no POST")
-            });
-            assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-            assert!(batches.is_empty());
         }
+        let mut resent = Vec::new();
+        let (result, _) = upload_families(items, &mut restarted, |batch| {
+            resent.extend(batch.iter().map(|item| item.session.clone()));
+            Ok(serve(batch))
+        });
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed, "{case}");
+        let mut expected = items
+            .iter()
+            .filter(|item| lost == first || item.class == second)
+            .map(|item| item.session.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        resent.sort();
+        assert_eq!(resent, expected, "{case}: only unsettled bodies, once");
+        assert!(
+            stored.borrow().values().all(|count| *count == 1),
+            "{case}: no body stored twice"
+        );
+        assert_eq!(stored.borrow().len(), items.len(), "{case}");
+        for item in items {
+            assert!(restarted.accepted_fingerprints.contains(&item.fingerprint));
+        }
+        // A repeat pass sends no POST.
+        let (result, batches) = upload_families(items, &mut restarted, |_| {
+            panic!("a settled page sends no POST")
+        });
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(batches.is_empty());
     }
 }

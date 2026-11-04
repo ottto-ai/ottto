@@ -2716,6 +2716,259 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
     });
 }
 
+/// The mixed page's placement is not vacuous: the patched session's body
+/// holds at least two tagged placements (accounts/organizations) and an
+/// explicit untagged share (the evidence gap).
+fn assert_mixed_placement_nonvacuous(
+    route: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+) {
+    let body = &route.snapshots[ROOT];
+    let evidence = body["request_evidence"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let placement = |row: &Value| -> Option<String> {
+        if let Some(account) = row.get("account_identifier_hash").and_then(Value::as_str) {
+            return Some(account.to_owned());
+        }
+        let index = row.get("evidence_ref").and_then(Value::as_u64)? as usize;
+        Some(evidence.get(index)?.to_string())
+    };
+    let (mut tagged, mut untagged) = (BTreeSet::new(), 0usize);
+    for row in body["model_usage"].as_array().into_iter().flatten() {
+        let parts = row.get("identity_parts").and_then(Value::as_array);
+        for part in parts.map_or(std::slice::from_ref(row), Vec::as_slice) {
+            match placement(part) {
+                Some(key) => {
+                    tagged.insert(key);
+                }
+                None => untagged += 1,
+            }
+        }
+    }
+    assert!(tagged.len() >= 2, "{:?}: two tagged placements", route.mode);
+    assert!(
+        untagged > 0,
+        "{:?}: the evidence gap stays untagged",
+        route.mode
+    );
+    assert!(
+        !evidence.is_empty(),
+        "{:?}: request evidence present",
+        route.mode
+    );
+}
+
+/// The oracle detects a corrupted placement and a corrupted post-ACK ledger
+/// on this page, with identical totals.
+fn assert_mixed_placement_corruption_detected(
+    cold: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    other: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+) {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
+    let mut wrong = other.clone();
+    wrong.snapshots.get_mut(ROOT).unwrap()["request_evidence"][0]["provider_workspace_hash"] =
+        json!("f".repeat(64));
+    assert!(std::panic::catch_unwind(|| money_oracle::assert_equivalent(cold, &wrong)).is_err());
+    let mut wrong = other.clone();
+    wrong.accepted_identity_buckets.as_mut().unwrap()[ROOT] = json!("corrupt");
+    assert!(std::panic::catch_unwind(|| money_oracle::assert_equivalent(cold, &wrong)).is_err());
+}
+
+/// [money] E1p: one combined positive control on a MIXED page. The patched
+/// forked session switches account mid-session (two accounts and two
+/// organizations), has a side call with no transcript owner and a response
+/// with no evidence (an explicit untagged gap) beside tagged rows; the
+/// unpatched session switches organization. After an older owner's quiet
+/// commit, the upgraded owner, the warm Tail and the cold Full emit equal
+/// bodies, placement and actual post-ACK ledger; a restart between pages then
+/// continues to the cold Full's result again. Every request is class-pure,
+/// and corrupting placement or the ledger fails the oracle.
+#[test]
+fn mixed_class_page_placement_survives_upgrade_and_restarts() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("mixed_class_page_placement");
+        let root = forked_root(&mut c);
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
+        let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
+        input_clock(&other);
+        // (request, tokens, login, organization) on the patched session.
+        let root_evidence = |rows: &[(&str, u64, char, char)]| {
+            rows.iter()
+                .map(|(request, tokens, login, org)| {
+                    api_login(ROOT, request, *tokens, *login, Some(*org))
+                })
+                .collect::<Vec<_>>()
+        };
+        c.evidence(&root_evidence(&[("r1", 10, '1', '7')][..]), &[]);
+        c.evidence_for(UNPATCHED, &[api_for(UNPATCHED, "u1", 7, 70)], &[]);
+        let disk = Disk::new(&c);
+        let warm = E2ScanFixture::capturing_identity();
+        disk.begin(&warm, SnapshotSource::ClaudeCode);
+        let mut progress = e2_progress();
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(ROOT), "d".repeat(64));
+
+        let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        first.finish();
+        let sent = under_required_cas(&first.scan.snapshots, &progress);
+        let (result, wire, _) = upload(&sent, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(wire.len(), 2, "one request per patch class");
+        settle_index_after_upload(&mut first.index, &first.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+
+        // Upgrade: the older owner's next pass commits again without
+        // rewriting a head; the upgraded owner continues from that index.
+        let mut quiet = c.raw(&warm, prior, 100, true, &[]);
+        quiet.enrich(&c);
+        quiet.finish();
+        accept_page(&mut quiet);
+        let committed = disk.commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
+
+        // Page 1: the patched session switches account, adds a response with
+        // no evidence and a side call; the unpatched one switches organization.
+        append(
+            &root,
+            &(line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)
+                + &line(ROOT, "gap", "2026-08-02T07:00:25Z", 12)),
+        );
+        let switch = json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        append(
+            &other,
+            &(switch + &marker(org_b) + &line(UNPATCHED, "u2", "2026-08-02T07:00:30Z", 9)),
+        );
+        input_clock(&root);
+        input_clock(&other);
+        let page_one = [
+            ("r1", 10, '1', '7'),
+            ("r2", 20, '2', '8'),
+            ("mixed-side", 5, '2', '8'),
+        ];
+        c.evidence(&root_evidence(&page_one[..]), &[]);
+        c.evidence_for(
+            UNPATCHED,
+            &[
+                api_for(UNPATCHED, "u1", 7, 70),
+                api_for(UNPATCHED, "u2", 9, 90),
+            ],
+            &[],
+        );
+        let upgraded = E2ScanFixture::capturing_identity();
+        disk.begin(&upgraded, SnapshotSource::ClaudeCode);
+        let upgraded_page = c.raw(&upgraded, committed.clone(), 100, true, &[]);
+        let mut pages = [
+            c.raw(&warm, committed.clone(), 100, true, &[]),
+            c.raw(
+                &E2ScanFixture::capturing_identity(),
+                committed,
+                100,
+                true,
+                &[],
+            ),
+            upgraded_page,
+        ];
+        assert_eq!(
+            pages[1].modes.1 + pages[1].modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        finish_claude_pages(&c, &mut pages);
+        let routes = [
+            mixed_route(&pages[0], &progress, Mode::Ram),
+            mixed_route(&pages[1], &progress, Mode::ColdFull),
+            mixed_route(&pages[2], &progress, Mode::DiskRestore),
+        ];
+        for route in &routes {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        assert_mixed_placement_nonvacuous(&routes[1]);
+        money_oracle::assert_equivalent(&routes[1], &routes[0]);
+        money_oracle::assert_equivalent(&routes[1], &routes[2]);
+        assert_mixed_placement_corruption_detected(&routes[1], &routes[2]);
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
+        assert!(
+            other_body.contains(&a) && other_body.contains(&b),
+            "two organizations"
+        );
+
+        // Restart between pages: the upgraded owner's page is accepted and
+        // committed; a new owner continues page 2 from that index.
+        let [_, _, mut upgraded_page] = pages;
+        accept_page(&mut upgraded_page);
+        let next = disk.commit(
+            &upgraded_page.cache,
+            SnapshotSource::ClaudeCode,
+            &mut upgraded_page.index,
+        );
+        append(&root, &line(ROOT, "r3", "2026-08-02T07:00:40Z", 30));
+        append(&other, &line(UNPATCHED, "u3", "2026-08-02T07:00:50Z", 11));
+        input_clock(&root);
+        input_clock(&other);
+        let mut page_two = page_one.to_vec();
+        page_two.push(("r3", 30, '1', '7'));
+        c.evidence(&root_evidence(&page_two[..]), &[]);
+        c.evidence_for(
+            UNPATCHED,
+            &[
+                api_for(UNPATCHED, "u1", 7, 70),
+                api_for(UNPATCHED, "u2", 9, 90),
+                api_for(UNPATCHED, "u3", 11, 110),
+            ],
+            &[],
+        );
+        let restarted = E2ScanFixture::capturing_identity();
+        disk.begin(&restarted, SnapshotSource::ClaudeCode);
+        let mut restart_page = c.raw(&restarted, next.clone(), 100, true, &[]);
+        let mut cold_page = c.raw(&E2ScanFixture::capturing_identity(), next, 100, true, &[]);
+        assert_eq!(
+            cold_page.modes.1 + cold_page.modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        for page in [&mut restart_page, &mut cold_page] {
+            page.enrich(&c);
+            page.finish();
+        }
+        let restart_route = mixed_route(&restart_page, &progress, Mode::Restart);
+        let cold_route = mixed_route(&cold_page, &progress, Mode::ColdFull);
+        for route in [&restart_route, &cold_route] {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        assert_mixed_placement_nonvacuous(&cold_route);
+        money_oracle::assert_equivalent(&cold_route, &restart_route);
+        assert_mixed_placement_corruption_detected(&cold_route, &restart_route);
+        println!(
+            "MIXED_CLASS_PAGE_PLACEMENT VERIFIED arms=ram_tail,cold_full,upgraded_owner,restart_between_pages"
+        );
+    });
+}
+
 /// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS
 /// conflict with a challenge is recorded on a production-shaped Claude body.
 /// While the answer is owed (the ledger's challenge mirrored into the scan
