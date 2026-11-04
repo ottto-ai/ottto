@@ -265,10 +265,17 @@ class RetryTests(unittest.TestCase):
             (root / 'a' / 'route_tests.rs').write_text('use x::money_oracle::assert_equivalent;\n')
             (root / 'a' / 'mod.rs').write_text('money_oracle::assert_held();\n')
             (root / 'a' / 'plain_tests.rs').write_text('fn t() {}\n')
+            (root / 'b').mkdir()
+            (root / 'b' / 'owed').mkdir()
+            (root / 'b' / 'owed' / 'tests.rs').write_text('money_oracle::assert_held();\n')
             modules = runner.oracle_modules(root)
-        self.assertEqual(modules, {'route_tests', 'a'})
+        self.assertEqual(modules, {'route_tests', 'a', 'owed::tests'})
         self.assertTrue(runner.never_retry('s::route_tests::x', set(), modules))
         self.assertFalse(runner.never_retry('s::plain_tests::x', set(), modules))
+        self.assertTrue(runner.never_retry('b::owed::tests::x', set(), modules))
+        # Any other module's `tests` stays retriable.
+        self.assertFalse(runner.never_retry('relay::legacy::tests::x', set(), modules))
+        self.assertFalse(runner.never_retry('owed::other::tests::x', set(), modules))
         source = SCRIPT.parent.parent / 'crates'
         self.assertIn('copy_prefix_route_tests', runner.oracle_modules(source))
 

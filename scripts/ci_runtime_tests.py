@@ -198,13 +198,24 @@ def oracle_modules(root: Path) -> set[str]:
     found = set()
     for path in root.rglob("*.rs"):
         if "money_oracle" in path.read_text(encoding="utf-8", errors="replace"):
-            found.add(path.parent.name if path.stem in ("mod", "lib", "main") else path.stem)
+            if path.stem in ("mod", "lib", "main"):
+                found.add(path.parent.name)
+            elif path.stem == "tests":
+                # A bare `tests` would match nearly every test; keep its parent.
+                found.add(f"{path.parent.name}::tests")
+            else:
+                found.add(path.stem)
     return found
 
 
 def never_retry(name: str, required: set[str], modules: frozenset[str] | set[str] = NEVER_RETRY_MODULES) -> bool:
     segments = name.split("::")
-    return name in required or any(seg in modules or "money" in seg for seg in segments)
+
+    def names(module: str) -> bool:
+        part = module.split("::")
+        return any(segments[i:i + len(part)] == part for i in range(len(segments)))
+
+    return name in required or any("money" in seg for seg in segments) or any(names(m) for m in modules)
 
 
 def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str]]:
