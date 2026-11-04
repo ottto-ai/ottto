@@ -643,7 +643,7 @@ impl SharedCache {
         let key = local_index_key(path);
         let previous = self
             // Remove the old row before any refresh can fail. Failed sampling,
-            // accounting or retained-lock acquisition must leave no eligible
+            // accounting or lock acquisition must leave no eligible
             // stale identity behind; the live fallback only costs a retry.
             .with_cursor(|cursor| cursor.wake.0.remove(&key).map(|entry| entry.0))
             .flatten();
@@ -2025,8 +2025,8 @@ impl SharedCache {
     ///
     /// Lock order: the pause site holds no lock here. The lease is a
     /// slot token, not a lock; `accelerated` reads the job's own flag; the one
-    /// `with_cursor` below takes only the cursor lock, with neither the
-    /// retained lock held, and calls no locking helper inside
+    /// `with_cursor` below takes only the cursor lock and calls no locking
+    /// helper inside
     /// (`CursorHeld` asserts a relock in debug builds).
     pub(in crate::snapshots) fn continuation_ticket(
         &self,
@@ -2172,9 +2172,9 @@ impl CursorLease {
     }
 
     /// Charge the job (live source-wide inputs excluded; the resuming scan
-    /// reinstalls them) and make room for it in the state budget by
-    /// releasing least-recently-useful retained copies (K6). A job that does
-    /// not fit ends as strict `JoinStateBound` debt.
+    /// reinstalls them) and fit it in the state budget (K6), reclaiming
+    /// optional header facts if needed. A job that does not fit ends as
+    /// strict `JoinStateBound` debt.
     fn suspend(self, mut job: Box<OwnedActiveFile>, count: fn(&mut Counters)) -> PauseEnd {
         // The slot charge walks the reader buffer's capacity (S3); shrink it
         // first so one overlong record cannot pin `max_line_bytes`.
@@ -2880,8 +2880,8 @@ pub(super) fn cursor_held() -> bool {
 struct CursorHeld;
 impl CursorHeld {
     fn enter() -> Self {
-        // One order: retained, then cursor. A cursor closure must never call
-        // a locking `SharedCache` helper (no recursive locking).
+        // A cursor closure must never call a locking `SharedCache` helper
+        // (no recursive locking).
         debug_assert!(
             !cursor_held(),
             "cursor lock taken while this thread holds it"
@@ -2964,10 +2964,10 @@ impl Drop for CursorCredit {
     }
 }
 
-// Reserve under retained -> cursor BEFORE taking durable Stores; carry only
-// the owner across I/O. Drop Stores before release, including unwind/early exits.
-// Never account from encode/write. May reclaim headers and retained copies when
-// the claim fits (`admit_decoder`): no primary floor or owed-state eviction.
+// Reserve under the cursor lock BEFORE taking durable Stores; carry only the
+// owner across I/O. Drop Stores before release, including unwind/early exits.
+// Never account from encode/write. May reclaim headers when the claim fits
+// (`admit_decoder`): no primary floor or owed-state eviction.
 static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
