@@ -56,13 +56,26 @@ fn first_request_own_login_transition_oracle() {
         stamp(&mut rows);
         c.evidence(&rows, &[trace("switch", ""), trace("side", "")]);
         let mut tail = pass(&scanner, prior.clone());
-        let mut restored = pass(&E2ScanFixture::capturing_identity(), prior.clone());
+        let restored_owner = E2ScanFixture::capturing_identity();
+        let saved_route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap();
+        restored_owner.on_committed_route(&saved_route);
+        let mut restored = pass(&restored_owner, prior.clone());
         let upgraded = upgrade_from_legacy_store(&prior, &c.base.join("upgrade.json"));
         let mut upgrade = pass(&E2ScanFixture::capturing_identity(), upgraded);
         let mut cold = pass(&E2ScanFixture::capturing_identity(), ScanIndex::default());
         for page in [&mut tail, &mut restored, &mut upgrade, &mut cold] {
             page.finish();
         }
+        assert!(tail.modes.1 > 0, "the retained owner must Tail the growth");
+        assert!(
+            restored.modes.1 > 0,
+            "the restored owner must Tail committed heads"
+        );
+        assert_eq!(
+            cold.modes.1 + cold.modes.2,
+            0,
+            "cold Full cannot reuse a head"
+        );
         let expected = routed(&cold, cold.upload_policy);
         for page in [&tail, &restored, &upgrade] {
             let route = routed(page, page.upload_policy);
@@ -115,6 +128,9 @@ fn first_request_own_login_transition_oracle() {
         // must consume no transcript byte and publish no smaller replacement.
         let settled = settle(&c, &prior, tail, &mut e2_progress());
         let restarted = E2ScanFixture::capturing_identity();
+        restarted.on_committed_route(
+            &crate::snapshots::e2_pipeline_scan_fixture::route_of(&settled).unwrap(),
+        );
         let ((quiet, bytes), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
             crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
                 ready(&c, &restarted, settled, 100, true)
