@@ -3857,7 +3857,7 @@ pub(super) mod tests {
             .iter()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
-        let committed = after.committable_subset(&capture, &accepted, &BTreeMap::new());
+        let mut committed = after.committable_subset(&capture, &accepted, &BTreeMap::new());
         let saved = root.join("index.json");
         committed.save(&saved).unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
