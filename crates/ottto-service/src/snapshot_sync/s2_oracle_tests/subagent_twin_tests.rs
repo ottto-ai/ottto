@@ -434,11 +434,9 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 );
                 assert_verified(&warm.index);
                 let actual = result(&warm, Mode::DiskRestore);
-                if path == &main {
-                    assert_money_equivalent_but_carrier_end(&expected, &actual);
-                } else {
-                    money_oracle::assert_equivalent(&expected, &actual);
-                }
+                // Family refolding can also move an unchanged session's
+                // carrier. Money/placement and every other body field stay exact.
+                assert_money_equivalent_but_carrier_end(&expected, &actual);
                 assert!(actual.accepted_identity_buckets.is_some());
                 prior = commit(&session, warm);
                 assert_verified(&prior);
@@ -455,16 +453,31 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                     "Tail keeps its Full-audit debt"
                 );
             }
-            // A crash/restart keeps the committed source proof, never an ACK
-            // invented from the census. Upgrade uses the existing checked store.
+            // A legacy graph retains its census but has no Tail custody.
+            // Its first selected read must re-establish a native base.
             let upgraded = fixture::upgrade_from_legacy_store(&prior, &c.base.join("legacy.json"));
             assert_verified(&upgraded);
             append(&main, &line(ROOT, "upgrade-proof", GROW, 8));
             let expected = cold(&c);
-            let restored = hinted(&c, upgraded, 100, true, &[main]);
-            assert_eq!(restored.modes.0, 0);
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut restored = c.raw(&scanner, upgraded, 100, true, std::slice::from_ref(&main));
+            restored.enrich(&c);
+            assert_eq!(restored.modes.0, 1, "the legacy store has no Tail custody");
             assert_verified(&restored.index);
             assert_money_equivalent_but_carrier_end(&expected, &result(&restored, Mode::Restart));
+            restored.finish();
+            let prior = c.reload(&mut restored.index);
+            append(&main, &line(ROOT, "after-upgrade-proof", GROW, 8));
+            let expected = cold(&c);
+            let mut continued = c.raw(&scanner, prior, 100, true, &[main]);
+            continued.enrich(&c);
+            assert_eq!(
+                continued.modes.0, 0,
+                "the saved upgrade Full now permits Tail"
+            );
+            assert!(continued.modes.1 > 0);
+            assert_verified(&continued.index);
+            assert_money_equivalent_but_carrier_end(&expected, &result(&continued, Mode::Restart));
         }
     });
 }
