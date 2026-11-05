@@ -2561,6 +2561,15 @@ mod tests {
         respond_status(endpoint, 400)
     }
 
+    thread_local! {
+        /// A fixed collector clock for this test thread; `None` is the wall clock.
+        static PINNED_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn harness_now() -> u64 {
+        PINNED_NOW.with(|now| now.get().unwrap_or_else(super::super::current_unix_seconds))
+    }
+
     /// End to end through the collector with a stand-in provider: a binding
     /// whose plain read is recent and saved resets never read takes the
     /// variant in its next due slot.
@@ -2583,6 +2592,7 @@ mod tests {
             super::super::CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             REQUESTED.lock().unwrap().clear();
+            PINNED_NOW.with(|now| now.set(None));
             super::super::claude_explicit_refresh_request().at = 0;
             super::super::claude_explicit_refresh_attempts().clear();
             super::super::claude_transient_failures().clear();
@@ -2605,7 +2615,7 @@ mod tests {
                 self.account,
                 self.organization,
             ));
-            let now = super::super::current_unix_seconds();
+            let now = harness_now();
             schedule.last_plain_read_at.get_or_insert(now - 3_600);
             schedule.next_read_not_before = None;
             write_claude_read_schedule(&self.state_dir(), &schedule).unwrap();
@@ -2635,11 +2645,13 @@ mod tests {
             respond: super::super::ClaudeOAuthTestResponder,
         ) -> super::super::ClaudeOAuthUsageOutcome {
             *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
-            let outcome = super::super::collect_claude_oauth_usage_with_access_token(
+            let outcome = super::super::collect_claude_oauth_usage_with_credential(
                 self.account,
                 self.organization,
                 Some("fixture-token".to_string()),
+                None,
                 &super::super::ClaudeOAuthUsageCaller::RegisteredSlot("slot-variant".to_string()),
+                harness_now,
             );
             *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
             outcome
@@ -2669,11 +2681,13 @@ mod tests {
             respond: super::super::ClaudeOAuthTestResponder,
         ) -> super::super::ClaudeOAuthUsageOutcome {
             *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
-            let outcome = super::super::collect_claude_oauth_usage_with_access_token(
+            let outcome = super::super::collect_claude_oauth_usage_with_credential(
                 self.account,
                 self.organization,
                 Some("fixture-token".to_string()),
+                None,
                 &caller,
+                harness_now,
             );
             *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
             outcome
@@ -3057,13 +3071,16 @@ mod tests {
     #[serial_test::serial]
     fn restart_resends_persisted_saved_resets_with_original_read_times() {
         let harness = VariantHarness::new("restart");
+        // Fixed before the fixture's one-time credit expiry (2026-11-05T07:59Z),
+        // so the plain read keeps that pool whatever today's date is.
+        PINNED_NOW.with(|now| now.set(Some(1_793_491_200)));
         harness.due(ClaudeReadSchedule::default());
         let first = harness.collect(respond_recognized);
         let saved = saved_resets_of(&first);
         assert_eq!(saved.len(), 1);
         let read_at = saved[0].grants_observed_at.clone().expect("read time");
         assert_eq!(saved[0].observed_at.as_ref(), Some(&read_at));
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        PINNED_NOW.with(|now| now.set(Some(1_793_491_202)));
 
         // Restart: nothing in memory survives; the stored reading is served.
         super::super::CLAUDE_OAUTH_CALLER_BINDINGS
