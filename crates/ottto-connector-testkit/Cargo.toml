@@ -5,6 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Ottto Team"]
 description = "Test helpers for Ottto source and collector package manifests."
+repository = "https://github.com/ottto-ai/ottto"
+homepage = "https://ottto.net"
+publish = false
 
 [lints]
 workspace = true
