@@ -2,14 +2,18 @@
 //! every transcript of that session is gone. The side files are read only for
 //! the session's own transcripts, for transcripts that copied its requests,
 //! and for state that still names its root; each of those keeps the pair.
+//! Deletion is paused until a pair's delivery is proven (see
+//! [`delivery_proven`]): until then every candidate is held and only counted
+//! from metadata; no held pair's body is read.
 //!
 //! Runs after a successful selected save whose upload completed and fully
 //! settled (a deferred, rejected, shed or partial upload drops the run), only
 //! while the last root walk began in this process and listed every root with
 //! no walk issue. Candidates: the roots whose indexed members this pass
 //! retired, plus every stored pair once per complete walk (the backlog), so a
-//! pair held once is rechecked after the next one. Nothing is persisted: a
-//! crash between the two unlinks leaves one member, which the next run deletes.
+//! pair held once is rechecked once per complete walk. Nothing is persisted: a
+//! crash between the two unlinks leaves one member, which a later released run
+//! deletes.
 use super::claude_request_census::held_candidates;
 use super::money_freshness::index_current_since_start;
 use super::*;
@@ -58,8 +62,25 @@ pub(crate) fn retire_claude_telemetry(
             Err(_) => listing_fault = 1,
         }
     }
-    let mut run = if stems.is_empty() {
-        Counts::default()
+    let release = delivery_proven(&stems);
+    let mut held = Counts::default();
+    // Classification only: a listed family member proves a current transcript.
+    let listed = roster.listed.keys().filter(|key| !removed.contains(*key));
+    let listed = listed.filter_map(|key| root_of(key)).map(telemetry_stem);
+    let listed = listed.collect::<BTreeSet<_>>();
+    for stem in stems.difference(&release) {
+        let no_transcript = !listed.contains(stem);
+        match crate::claude_local_otel::telemetry_pair_bytes(support_dir, stem) {
+            Ok(None) => continue,
+            Ok(Some(bytes)) if no_transcript => held.held_no_transcript_bytes += bytes,
+            Ok(Some(_)) => {}
+            Err(()) => held.read_fault += 1,
+        }
+        held.held_roots += 1;
+        held.held_no_transcript_roots += u64::from(no_transcript);
+    }
+    let mut run = if release.is_empty() {
+        held
     } else {
         retire(
             support_dir,
@@ -68,7 +89,8 @@ pub(crate) fn retire_claude_telemetry(
             removed,
             named,
             &roster,
-            stems,
+            release,
+            held,
         )
     };
     run.read_fault += listing_fault;
@@ -89,7 +111,37 @@ pub(crate) fn take_runs_for_test() -> u32 {
     RUNS.with(|runs| runs.replace(0))
 }
 
-/// One run over `stems`: every stem with a member is retired, held or a fault.
+/// The `no_transcript_delivery_hold` seam: the candidates proven delivered, the
+/// only ones retention may delete; none today. The change that uploads
+/// telemetry-only sessions supplies the proof: a durable per-candidate ACK of
+/// the exact body, bound to the destination and the pair's member generations;
+/// never page completion, another session's ACK or a global switch.
+fn delivery_proven(stems: &BTreeSet<String>) -> BTreeSet<String> {
+    let proven = BTreeSet::new();
+    #[cfg(test)]
+    let proven = if PROVEN.with(std::cell::Cell::get) {
+        stems.clone()
+    } else {
+        proven
+    };
+    stems.intersection(&proven).cloned().collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROVEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: on this thread, treat every candidate as delivered (`true`) or
+/// none, as today (`false`), to exercise the pipeline a proof releases into.
+#[cfg(test)]
+pub(crate) fn prove_delivery_for_test(proven: bool) {
+    PROVEN.with(|cell| cell.set(proven));
+}
+
+/// One run over `stems`, added to `run`: every stem with a member is retired,
+/// held or a fault.
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 fn retire(
     support_dir: &Path,
     index: &ScanIndex,
@@ -98,10 +150,10 @@ fn retire(
     named: &[String],
     roster: &g7_debt::Roster,
     stems: BTreeSet<String>,
+    mut run: Counts,
 ) -> Counts {
-    let mut run = Counts::default();
     let Some(protected) = protected_stems(index, scan_roots, removed, named, roster) else {
-        run.held_roots = stems.len() as u64;
+        run.held_roots += stems.len() as u64;
         return run;
     };
     // A pair written after the roster's walk began is kept.

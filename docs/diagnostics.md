@@ -187,14 +187,20 @@ bytes since the previous Claude page. Repeated reads count again; absent keys
 mean zero. Nonzero values remain exact, with no separate diagnostic record.
 On the same line, `claude_telemetry_retired_roots` and
 `claude_telemetry_retired_bytes` count Claude telemetry pairs deleted because
-every transcript of their session is gone, `claude_telemetry_held_roots` the
-candidate pairs kept (a live reader, a copy of their requests, a listed
-transcript with no loss-free census read, a write after the walk began, or a
-change while deleting), of which `claude_telemetry_held_copied` were kept by
-the copy rule,
+every transcript of their session is gone and their delivery is proven,
+`claude_telemetry_held_roots` the candidate pairs kept (delivery not yet
+proven, a live reader, a copy of their requests, a listed transcript with no
+loss-free census read, a write after the walk began, or a change while
+deleting), of which `claude_telemetry_held_copied` were kept by the copy rule,
 and `claude_telemetry_read_fault` the pairs kept because a member could not be
-read cleanly or unlinked. A session with neither telemetry member is skipped.
-Every complete root walk makes the full recheck of stored pairs due again.
+read cleanly or unlinked. `claude_telemetry_held_no_transcript_roots` and
+`claude_telemetry_held_no_transcript_bytes` count the held pairs whose session
+has no transcript the last walk listed, and their member bytes from metadata
+(a member that cannot be statted adds no bytes). Deletion is paused until a
+pair's delivery can be proven, so every candidate is held today and none is
+read. A session with neither telemetry member is skipped. Every complete root
+walk makes the full recheck of stored pairs due again, so held counts repeat
+on each complete walk.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
