@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 
+use crate::snapshots::cache_observations::RequestSlot;
 use crate::snapshots::claude_request_money;
 use crate::snapshots::scan::json_fields::{string_at, u64_at};
 use crate::snapshots::{usage_object_has_numeric_field, UsageCosts, UsageTotals};
@@ -244,4 +245,37 @@ pub(in crate::snapshots) fn claude_code_effective_input_context(root: &Value) ->
             claude_code_usage_fields(root).effective_input_context(),
             u64::max,
         )
+}
+
+pub(in crate::snapshots) fn claude_cache_request_slot(
+    value: &Value,
+    model: Option<String>,
+    effort: Option<String>,
+    timestamp: Option<String>,
+) -> RequestSlot {
+    let usage = claude_code_usage_root(value);
+    let field = |name: &str| {
+        usage
+            .and_then(|usage| usage.get(name))
+            .and_then(Value::as_u64)
+    };
+    let uncached = field("input_tokens");
+    let read = field("cache_read_input_tokens");
+    let write = field("cache_creation_input_tokens");
+    RequestSlot {
+        request_ref: string_at(value, &["requestId"])
+            .or_else(|| string_at(value, &["request_id"]))
+            .unwrap_or_default(),
+        occurred_at: timestamp.unwrap_or_default(),
+        model,
+        effort,
+        prompt_tokens: uncached
+            .zip(read)
+            .zip(write)
+            .and_then(|((u, r), w)| u.checked_add(r)?.checked_add(w)),
+        cache_read_tokens: read,
+        cache_creation_tokens: write,
+        uncached_tokens: uncached,
+        output_tokens: field("output_tokens"),
+    }
 }
