@@ -47,8 +47,8 @@ a documentation fix, or a small test improvement.
 ## Development Setup
 
 Ottto builds on macOS 14 or later on Apple silicon; the portable crates also
-build and test on Linux. Use rustup with the Rust version CI pins, plus
-rustfmt and Clippy.
+build and test on Linux. The Rust toolchain, with rustfmt and Clippy, is
+pinned in `rust-toolchain.toml`; rustup uses it automatically in this checkout.
 
 Prerequisites, the two Cargo workspaces, the checks to run, and Linux notes are
 in [docs/development.md](docs/development.md). Run the smallest set of checks

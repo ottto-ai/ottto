@@ -1,0 +1,8 @@
+# The one place this repository pins Rust. CI (.github/actions/rust-setup),
+# release packaging and local builds all use this toolchain. Layout-sensitive
+# code accepts only compilers validated in
+# crates/ottto-service/src/heap_layout_bound.rs; update both together.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
