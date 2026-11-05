@@ -355,12 +355,30 @@ fn growth_on_either_home_and_main_only() {
     });
 }
 
+fn assert_verified_incomplete(index: &ScanIndex, key: &str) {
+    use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
+    let record = index.claude_request_census_for_test().get(key).unwrap();
+    assert_eq!(
+        record.shape_for_test(),
+        ClaudeRequestCensusShape::IdentityIncomplete
+    );
+    assert!(!record.unverified_for_test());
+    assert!(
+        !record.current_for(&index.files[key].source_file_fingerprint),
+        "source proof is not complete-negative authority"
+    );
+}
+
 /// [money] A verified identity gap survives ordinary Tail, forced growth
 /// and forced Unchanged in either discovery order, with exact placement ACKs.
 #[test]
 fn identity_incomplete_continuation_keeps_native_source_proof() {
-    use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
     with_e2(|| {
+        let mut idless: serde_json::Value =
+            serde_json::from_str(&line(ROOT, "main-gap", TURN, 4)).unwrap();
+        idless.as_object_mut().unwrap().remove("requestId");
+        idless["message"].as_object_mut().unwrap().remove("id");
+        let gap = idless.to_string() + "\n";
         for reverse in [false, true] {
             let c = twins(
                 &format!("census-continuation-{reverse}"),
@@ -371,11 +389,7 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
             );
             let home = if reverse { "a" } else { "z" };
             let main = c.root.join(format!("{home}/{ROOT}.jsonl"));
-            let mut idless: serde_json::Value =
-                serde_json::from_str(&line(ROOT, "main-gap", TURN, 4)).unwrap();
-            idless.as_object_mut().unwrap().remove("requestId");
-            idless["message"].as_object_mut().unwrap().remove("id");
-            append(&main, &(idless.to_string() + "\n"));
+            append(&main, &gap);
             let key = main.to_string_lossy().into_owned();
             let (session, index) = StateV2ColdSession::publish(
                 Source::Claude,
@@ -394,19 +408,7 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 .values()
                 .any(|v| !v.is_null()));
             let mut prior = commit(&session, first);
-            let assert_verified = |index: &ScanIndex| {
-                let record = index.claude_request_census_for_test().get(&key).unwrap();
-                assert_eq!(
-                    record.shape_for_test(),
-                    ClaudeRequestCensusShape::IdentityIncomplete
-                );
-                assert!(!record.unverified_for_test());
-                assert!(
-                    !record.current_for(&index.files[&key].source_file_fingerprint),
-                    "source proof is not complete-negative authority"
-                );
-            };
-            assert_verified(&prior);
+            assert_verified_incomplete(&prior, &key);
             for (step, path) in [
                 main.clone(),
                 c.root.join(member(home, 1)),
@@ -432,14 +434,14 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                     suffix.len() as u64,
                     "body I/O is only the appended suffix"
                 );
-                assert_verified(&warm.index);
+                assert_verified_incomplete(&warm.index, &key);
                 let actual = result(&warm, Mode::DiskRestore);
                 // Family refolding can also move an unchanged session's
                 // carrier. Money/placement and every other body field stay exact.
                 assert_money_equivalent_but_carrier_end(&expected, &actual);
                 assert!(actual.accepted_identity_buckets.is_some());
                 prior = commit(&session, warm);
-                assert_verified(&prior);
+                assert_verified_incomplete(&prior, &key);
                 assert!(
                     crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
                         SOURCE,
@@ -453,32 +455,43 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                     "Tail keeps its Full-audit debt"
                 );
             }
-            // A legacy graph retains its census but has no Tail custody.
-            // Its first selected read must re-establish a native base.
-            let upgraded = fixture::upgrade_from_legacy_store(&prior, &c.base.join("legacy.json"));
-            assert_verified(&upgraded);
-            append(&main, &line(ROOT, "upgrade-proof", GROW, 8));
-            let expected = cold(&c);
-            let scanner = E2ScanFixture::capturing_identity();
-            let mut restored = c.raw(&scanner, upgraded, 100, true, std::slice::from_ref(&main));
-            restored.enrich(&c);
-            assert_eq!(restored.modes.0, 1, "the legacy store has no Tail custody");
-            assert_verified(&restored.index);
-            assert_money_equivalent_but_carrier_end(&expected, &result(&restored, Mode::Restart));
-            restored.finish();
-            let prior = c.reload(&mut restored.index);
-            append(&main, &line(ROOT, "after-upgrade-proof", GROW, 8));
-            let expected = cold(&c);
-            let mut continued = c.raw(&scanner, prior, 100, true, &[main]);
-            continued.enrich(&c);
-            assert_eq!(
-                continued.modes.0, 0,
-                "the saved upgrade Full now permits Tail"
-            );
-            assert!(continued.modes.1 > 0);
-            assert_verified(&continued.index);
-            assert_money_equivalent_but_carrier_end(&expected, &result(&continued, Mode::Restart));
         }
+        // The family cycle above exercises both homes. A single-source legacy
+        // store isolates exactly one missing head instead of bootstrapping all
+        // seven physical family members at once.
+        let mut c = corpus("census-continuation-upgrade");
+        let main = c.root(ROOT, &(line(ROOT, "upgrade-base", TURN, 10) + &gap));
+        let key = main.to_string_lossy().into_owned();
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let prior = commit(&session, page(&c, index, 100, true));
+        assert_verified_incomplete(&prior, &key);
+        let upgraded = fixture::upgrade_from_legacy_store(&prior, &c.base.join("legacy.json"));
+        assert_verified_incomplete(&upgraded, &key);
+        append(&main, &line(ROOT, "upgrade-proof", GROW, 8));
+        let expected = cold(&c);
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut restored = c.raw(&scanner, upgraded, 100, true, std::slice::from_ref(&main));
+        restored.enrich(&c);
+        assert_eq!(restored.modes.0, 1, "the legacy store has no Tail custody");
+        assert_verified_incomplete(&restored.index, &key);
+        money_oracle::assert_equivalent(&expected, &result(&restored, Mode::Restart));
+        restored.finish();
+        let prior = c.reload(&mut restored.index);
+        append(&main, &line(ROOT, "after-upgrade-proof", GROW, 8));
+        let expected = cold(&c);
+        let mut continued = c.raw(&scanner, prior, 100, true, &[main]);
+        continued.enrich(&c);
+        assert_eq!(
+            continued.modes.0, 0,
+            "the saved upgrade Full now permits Tail"
+        );
+        assert!(continued.modes.1 > 0);
+        assert_verified_incomplete(&continued.index, &key);
+        money_oracle::assert_equivalent(&expected, &result(&continued, Mode::Restart));
     });
 }
 
