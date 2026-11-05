@@ -65,6 +65,8 @@ require_grep 'scripts/macos_notarize\.sh' 'notarization step'
 require_grep 'scripts/macos_attestation_bind\.sh' 'attestation binding step'
 require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature step'
 require_grep 'scripts/macos_stable_preflight\.sh' 'stable preflight step'
+require_grep '--record-sha256' 'install-macos.sh SHA-256 recorded in the stable manifest'
+require_grep '--require-installer-sha256' 'new stable releases require the installer helper SHA-256'
 require_grep 'dist/macos/packaged-app-launch-smoke\.json' 'packaged launch smoke evidence upload'
 require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evidence upload'
 
@@ -94,6 +96,15 @@ if unpinned:
     sys.exit(1)
 if workflow.count("actions/attest@") < 4:
     print("Expected initial and final provenance/SBOM attestation steps", file=sys.stderr)
+    sys.exit(1)
+record = workflow.find("--record-sha256")
+first_checksums = workflow.find("- name: Generate attestation subject checksums")
+first_sign = workflow.find("scripts/macos_manifest_signature.sh sign")
+if not (0 <= record < first_checksums < first_sign):
+    print(
+        "install-macos.sh SHA-256 must be recorded before attestation checksums and manifest signing",
+        file=sys.stderr,
+    )
     sys.exit(1)
 in_run = False
 for number, line in enumerate(workflow.splitlines(), 1):

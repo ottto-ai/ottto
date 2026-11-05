@@ -297,7 +297,8 @@ jobs:
             --output dist/macos/homebrew/ottto.rb
           scripts/hosted_native_installer.sh \
             --manifest dist/macos/release-manifest.json \
-            --output dist/macos/install-macos.sh
+            --output dist/macos/install-macos.sh \
+            --record-sha256
 
       - name: Generate attestation subject checksums
         env:
@@ -424,6 +425,7 @@ jobs:
           set -euo pipefail
           scripts/macos_stable_preflight.sh \
             --manifest dist/macos/release-manifest.json \
+            --require-installer-sha256 \
             --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
             --keychain-profile "$OTTTO_NOTARY_PROFILE"
 
