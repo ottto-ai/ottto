@@ -195,6 +195,8 @@ mod footprint;
 pub(crate) mod rearm_cause;
 #[cfg(unix)]
 mod shutdown;
+#[cfg(unix)]
+mod stderr_rotation;
 
 process_static!(fn with_claude_identity_over_cap: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]);
 
@@ -1675,6 +1677,12 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Rotates a large service log once at startup, while the state lock is held.
+pub fn rotate_service_log_at_startup() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_at_startup();
+}
+
 /// Content-free allocator launch configuration, called once before serving.
 pub fn log_startup_resources() {
     let value = std::env::var_os("MallocLargeCache");

@@ -1012,6 +1012,19 @@ placeholders such as `[machine_id]` in diagnostics output. Account, user,
 organization, device, and installation identifiers must follow the same
 redacted-placeholder rule.
 
+## Service Log Rotation
+
+Each time the service starts, before it serves, it checks the file its stderr
+writes to. When that file is at least 64 MiB, it is renamed in place to
+`<stem>.<YYYYMMDDTHHMMSSZ>.log` (UTC rotation time), for example
+`ottto-service.err.20261105T142358Z.log`, and a new empty file takes the
+original name. Archives matching exactly that pattern are deleted once older
+than 7 days, but the newest 2 are always kept; the live file and any other
+name are never touched. Rotation happens only at startup, so a long-running
+service keeps appending to its live file until the next start. To read the
+full history, read the archives in name order, then the live file. A terminal,
+`/dev/null` or pipe on stderr is left alone.
+
 ## What To Share
 
 Share:

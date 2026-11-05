@@ -77,7 +77,7 @@ mod upload_policy;
 pub mod upload_receipts;
 pub mod xpc_mach;
 
-pub use local_resource_diagnostics::log_startup_resources;
+pub use local_resource_diagnostics::{log_startup_resources, rotate_service_log_at_startup};
 
 #[cfg(unix)]
 pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
