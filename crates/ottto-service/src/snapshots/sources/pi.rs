@@ -12,7 +12,8 @@ use crate::snapshots::scan_index::file_set_digest::update_length_prefixed;
 use crate::snapshots::{
     bounded_rfc3339_millis, pi_prompt_content, pi_selector_from_custom,
     pi_selector_from_usage_message, pi_usage_costs_with_observations, text_from_array,
-    usage_object_has_numeric_field, SelectorCapture, SnapshotAccumulator, UsageTotals,
+    usage_object_has_numeric_field, PiFork, PiLedger, PiUsageDedupState, SelectorCapture,
+    SnapshotAccumulator, UsageTotals,
 };
 
 pub(in crate::snapshots) fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
@@ -316,13 +317,6 @@ enum PiUsageRecordShape {
     MessageEnd,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct PiUsageDedupState {
-    pub(in crate::snapshots) message: BTreeMap<String, usize>,
-    pub(in crate::snapshots) message_end: BTreeMap<String, usize>,
-    pub(in crate::snapshots) paired_digests: BTreeSet<String>,
-}
-
 /// Counts only: the occurrence digests are unkeyed hashes.
 impl std::fmt::Debug for PiUsageDedupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -370,26 +364,6 @@ impl PiUsageDedupState {
                     .chain(self.message_end.keys())
                     .any(|digest| !self.paired_digests.contains(digest)))
     }
-}
-
-/// The accumulator's Pi-only state: the usage dedup ledger and the fork
-/// state. Claude and Codex leave it empty and never store it.
-#[derive(Clone, Default)]
-pub(crate) struct PiLedger {
-    pub(in crate::snapshots) usage_keys: BTreeMap<String, PiUsageDedupState>,
-    /// Set only for a file whose header names a parent; boxed so other
-    /// accumulators pay one pointer.
-    pub(in crate::snapshots) fork: Option<Box<PiFork>>,
-}
-
-/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
-/// their ids and timestamps, after a header that names `parentSession` at the
-/// fork time. The fork owns only what happened at or after its header time.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct PiFork {
-    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
-    /// time is missing or invalid, which counts every entry.
-    pub(in crate::snapshots) header_nanos: Option<i128>,
 }
 
 /// Never prints the local header time or `parentSession`.

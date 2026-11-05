@@ -22858,8 +22858,7 @@ use sources::codex::line::{
 };
 
 use sources::pi::{
-    apply_pi_line, pi_message_text, pi_message_usage, pi_usage_event, pi_usage_value, PiFork,
-    PiLedger, PiUsageDedupState,
+    apply_pi_line, pi_message_text, pi_message_usage, pi_usage_event, pi_usage_value,
 };
 
 fn timestamp_is_before(candidate: &str, current: &str) -> bool {
@@ -22884,6 +22883,33 @@ fn timestamp_is_after(candidate: &str, current: &str) -> bool {
         (Err(_), Ok(_)) => false,
         (Err(_), Err(_)) => candidate > current,
     }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PiUsageDedupState {
+    message: BTreeMap<String, usize>,
+    message_end: BTreeMap<String, usize>,
+    paired_digests: BTreeSet<String>,
+}
+
+/// The accumulator's Pi-only state: the usage dedup ledger and the fork
+/// state. Claude and Codex leave it empty and never store it.
+#[derive(Clone, Default)]
+pub(crate) struct PiLedger {
+    usage_keys: BTreeMap<String, PiUsageDedupState>,
+    /// Set only for a file whose header names a parent; boxed so other
+    /// accumulators pay one pointer.
+    fork: Option<Box<PiFork>>,
+}
+
+/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
+/// their ids and timestamps, after a header that names `parentSession` at the
+/// fork time. The fork owns only what happened at or after its header time.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct PiFork {
+    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
+    /// time is missing or invalid, which counts every entry.
+    header_nanos: Option<i128>,
 }
 
 fn bounded_rfc3339_millis(ms: i64) -> Option<String> {
