@@ -281,14 +281,6 @@ impl LegacyRecovery {
 }
 
 impl LoadedRoot {
-    #[cfg_attr(
-        test,
-        allow(dead_code, reason = "the #[path] contract test crate does not call it")
-    )]
-    pub(crate) fn observed_missing() -> Self {
-        Self(Arc::new(Root::Missing))
-    }
-
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
             Root::Sharded { manifest, .. } => Some(manifest.generation),
