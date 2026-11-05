@@ -21588,6 +21588,10 @@ mod tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
         }
         #[cfg(unix)]
+        mod claude_first_request_login_tests {
+            include!("snapshot_sync/claude_first_request_login_tests.rs");
+        }
+        #[cfg(unix)]
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }

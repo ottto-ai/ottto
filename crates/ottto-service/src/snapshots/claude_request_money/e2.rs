@@ -1097,7 +1097,7 @@ impl FileFold {
             ));
     }
 
-    fn is_ambiguous(&self, request_id: &str) -> bool {
+    pub(crate) fn is_ambiguous(&self, request_id: &str) -> bool {
         !self.ambiguous.is_empty()
             && self
                 .ambiguous
