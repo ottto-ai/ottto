@@ -21,7 +21,6 @@ crates/ottto-service/src/snapshots.rs	include	snapshots/reread_trigger_content_t
 crates/ottto-service/src/snapshots.rs	path	pi_retry_inputs.rs
 crates/ottto-service/src/snapshots.rs	path	snapshots/claude_request_money/birth_store.rs
 crates/ottto-service/src/snapshots.rs	path	snapshots/composition_compactions.rs
-crates/ottto-service/src/snapshots.rs	path	snapshots/local_switch.rs
 crates/ottto-service/src/snapshots.rs	path	snapshots/source_session_id_tests.rs
 crates/ottto-service/src/snapshots/account_pending_retention_tests.rs	include	account_pending_decoder_0_1_201.rs
 crates/ottto-service/src/snapshots/census_p2_kept_tests.rs	include	provider_envelope_experiment_tests.rs

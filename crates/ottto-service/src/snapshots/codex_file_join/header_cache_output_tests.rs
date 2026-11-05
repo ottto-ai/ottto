@@ -21,7 +21,7 @@ fn same_size_new_owner_rereads_and_changes_group_key() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(baseline))
         .unwrap();
-    let cache = sampled_scan::SharedCache::default();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
     let first = header_cache_tests::page(&root, &paths, &cache);
     let old = &first.headers[0];
     let path = &old.candidate.path;

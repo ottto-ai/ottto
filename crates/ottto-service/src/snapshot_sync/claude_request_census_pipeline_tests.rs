@@ -19,11 +19,9 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-records-held");
-    let baseline = fixture.baseline();
+    let baseline = fixture.native_baseline();
     let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
     let baseline_record = baseline
         .claude_request_census_for_test()
@@ -31,6 +29,7 @@ fn census_records_keep_the_held_revision_and_cover_it_in_window() {
         .expect("baseline record")
         .clone();
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    fixture.native_account_hold_input();
 
     let pages = fixture.traversal(9, &PIPELINE_HOLD_CYCLE);
     let (first, last) = (&pages[0], pages.last().expect("terminal page"));

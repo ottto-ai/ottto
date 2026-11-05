@@ -241,14 +241,7 @@ impl OwnedJsonlParser {
         scope: &Scope,
         now: u64,
     ) -> Result<Option<CompletedNativeAcquisition>> {
-        if !self.reader.finished
-            || self.reader.failure.is_some()
-            || !loss_free_source_report(
-                &self.reader.report,
-                self.recognized_usage_drop_count,
-                self.accumulator.dropped_usage_record_count,
-            )
-        {
+        if !self.reader.finished || self.reader.failure.is_some() {
             self.reader.acquisition = None;
             return Ok(None);
         }

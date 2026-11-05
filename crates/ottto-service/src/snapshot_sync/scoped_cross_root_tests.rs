@@ -193,7 +193,6 @@ fn page_over(
         modes,
         disposition: Default::default(),
         released: Default::default(),
-        unhealthy: Default::default(),
         stats: Default::default(),
         delivered: None,
         upload_policy: SnapshotUploadPolicy::default(),

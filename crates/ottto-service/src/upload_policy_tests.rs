@@ -133,7 +133,7 @@ fn post_claude(mut footprint: ContextFootprintIngestRequest, rules: FootprintRul
     let (base, body) = capture_one_post();
     assert!(crate::context_footprint::upload_if_changed(
         &SnapshotApiClient::new(base),
-        "relay-token",
+        &|| Ok("relay-token".to_string()),
         &support,
         "destination",
         &mut footprint,

@@ -132,6 +132,77 @@ pub(in crate::snapshots) fn committed_sealed_offset(
     Some(DurableCertificate::take(&mut d).ok()?.sealed_offset)
 }
 
+pub(in crate::snapshots) fn certified_certificate(
+    body: &[u8],
+) -> Result<DurableCertificate, Corrupt> {
+    let mut d = Dec::new(body);
+    HeadIdentity::take(&mut d)?;
+    DurableCertificate::take(&mut d)
+}
+
+/// Legacy physical proof keeps the certificate's birth check as well as its
+/// object/extent/mtime witness. It never samples the transcript to seed facts.
+pub(in crate::snapshots) fn certified_physical_matches(
+    body: &[u8],
+    metadata: &fs::Metadata,
+) -> bool {
+    let Ok(certificate) = certified_certificate(body) else {
+        return false;
+    };
+    let Ok(stamp) = crate::transcript_acquisition::FileStamp::capture(metadata.clone()) else {
+        return false;
+    };
+    stamp.same_listing(
+        certificate.device,
+        certificate.inode,
+        certificate.length,
+        certificate.modified,
+    ) && (certificate.birth_nanos == 0
+        || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
+}
+
+/// Rebind only a Codex head's route prefix after the caller proves a path
+/// carry. Capture, key epoch, certificate, reduction and every page stay exact.
+pub(in crate::snapshots) fn carry_codex_head(
+    route: &Path,
+    old_root: &Path,
+    old_path: &Path,
+    new_root: &Path,
+    new_path: &Path,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut d = Dec::new(body);
+    let mut stored =
+        HeadIdentity::take(&mut d).map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    anyhow::ensure!(
+        stored.binding
+            == HeadIdentity::new(
+                route,
+                SnapshotSource::Codex,
+                old_root,
+                old_path,
+                stored.capture
+            )
+            .binding,
+        "tail_carry_identity"
+    );
+    stored.binding = HeadIdentity::new(
+        route,
+        SnapshotSource::Codex,
+        new_root,
+        new_path,
+        stored.capture,
+    )
+    .binding;
+    let suffix = d
+        .raw(d.remaining())
+        .map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    let mut out = Enc::count_write(usize::MAX, |e| stored.put(e))
+        .map_err(|_| anyhow::anyhow!("tail_carry_identity"))?;
+    out.extend_from_slice(suffix);
+    Ok(out)
+}
+
 /// Why a source's live inputs could not be installed into a loaded head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum LiveLoadError {
@@ -164,8 +235,10 @@ pub(in crate::snapshots) enum ReconstructCause {
     /// Bytes that do not decode, or decoded facts that contradict each other.
     Corrupt,
     /// A capture mode, page geometry or revision this build does not read
-    /// this way.
-    Incompatible,
+    /// this way, or live evidence the stored state cannot continue under.
+    /// Carries its counter label: `incompatible` for the shared checks
+    /// (`INCOMPATIBLE`), or the name of the source's own failed check.
+    Incompatible(&'static str),
     /// A required collection, or some of its elements, is missing.
     Incomplete,
     /// The head was written for another route, scan root or path.
@@ -176,10 +249,13 @@ pub(in crate::snapshots) enum ReconstructCause {
     KeyEpoch,
 }
 impl ReconstructCause {
+    /// The shared checks' incompatibility, counted as `incompatible`.
+    pub(in crate::snapshots) const INCOMPATIBLE: Self = Self::Incompatible("incompatible");
+
     pub(in crate::snapshots) fn label(self) -> &'static str {
         match self {
             Self::Corrupt => "corrupt",
-            Self::Incompatible => "incompatible",
+            Self::Incompatible(label) => label,
             Self::Incomplete => "incomplete",
             Self::Identity => "identity",
             Self::KeyEpoch => "key_epoch",
@@ -266,7 +342,7 @@ impl HeadIdentity {
             return Err(ReconstructCause::Identity);
         }
         if stored.capture != self.capture {
-            return Err(ReconstructCause::Incompatible);
+            return Err(ReconstructCause::INCOMPATIBLE);
         }
         match (stored.key_epoch, self.key_epoch) {
             (Some(stored), Some(current)) if stored != current => Err(ReconstructCause::KeyEpoch),
@@ -397,7 +473,7 @@ pub(in crate::snapshots) trait TailSource {
                 continue;
             };
             if meta.shape != spec.shape || meta.elements_per_page != spec.g {
-                return Err(ReconstructCause::Incompatible);
+                return Err(ReconstructCause::INCOMPATIBLE);
             }
             if meta.elements != Self::elements(acc, spec.collection) {
                 return Err(ReconstructCause::Incomplete);
@@ -446,7 +522,7 @@ fn decode_envelope<S: TailSource, L, T>(
     trailer: impl FnOnce(&mut Dec<'_>) -> Result<T, Corrupt>,
 ) -> Result<(SnapshotAccumulator, L, T, DecodedHead), ReconstructCause> {
     if revision != S::REDUCTION_REVISION {
-        return Err(ReconstructCause::Incompatible);
+        return Err(ReconstructCause::INCOMPATIBLE);
     }
     let mut d = Dec::new(head);
     HeadIdentity::take(&mut d)?;
@@ -792,13 +868,13 @@ impl Fact {
         let fact = usize::try_from(page)
             .ok()
             .and_then(|at| FACTS.get(at).copied())
-            .ok_or(ReconstructCause::Incompatible)?;
+            .ok_or(ReconstructCause::INCOMPATIBLE)?;
         let mut d = Dec::new(bytes);
         if d.varint()? != page {
             return Err(ReconstructCause::Corrupt);
         }
         if d.varint()? != FACT_VERSION {
-            return Err(ReconstructCause::Incompatible);
+            return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
             Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,

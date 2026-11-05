@@ -761,7 +761,8 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let mut lines = String::new();
     let mut api = Vec::new();
     let mut trace = Vec::new();
-    for n in 1..=17 {
+    // One more own login than an item may carry.
+    for n in 1..=33 {
         let request = format!("req_{n}");
         lines.push_str(&format!("{}\n", json!({
             "timestamp": format!("2026-08-02T07:00:{n:02}Z"), "type": "assistant",
@@ -791,15 +792,15 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert!(e2_is_literal(item));
-    assert_eq!(item.request_count, 17);
+    assert_eq!(item.request_count, 33);
     assert_eq!(
         e2_login_counts(item),
-        BTreeMap::from([(None, 17)]),
-        "SOURCE: lost seventeenth-key proof cannot borrow the starting or sixteenth login"
+        BTreeMap::from([(None, 33)]),
+        "SOURCE: lost 33rd-key proof cannot borrow the starting or 32nd login"
     );
     assert_eq!(
         item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0017")
+        Some("0.0033")
     );
     let display = item.claude_account_display.as_deref().unwrap();
     assert_eq!(display.current.status, "unknown");
@@ -810,10 +811,10 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     );
     assert_eq!(item.request_identity_refusals, 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
-    // The existing seventeen-request fixture also reaches the cap through
+    // The existing 33-request fixture also reaches the cap through
     // a forward twin, a backward twin, and a twin occupying a later own key's
     // slot. No raised byte limit is required for provenance to remain owed.
-    for gaps in [vec![1], vec![17], (2..=16).step_by(2).collect()] {
+    for gaps in [vec![1], vec![33], (2..=32).step_by(2).collect()] {
         let own = api
             .iter()
             .filter(|row| !gaps.iter().any(|n| row.request_id == format!("req_{n}")))
@@ -852,7 +853,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
                 on[0].cost, off[0].cost,
                 "{gaps:?}: money conserved while Held"
             );
-            assert_eq!(on[0].request_count, 17);
+            assert_eq!(on[0].request_count, 33);
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
             assert!(
                 e2_source_counts(&on[0])
@@ -1300,17 +1301,12 @@ fn e2_bound_trace_case(
             "this arm bypasses contract-5 identity grouping"
         );
     }
-    assert_eq!(stats.trace_discard_no_fallback_requests, 0);
     assert_eq!(stats.trace_discard_deferred_items, 0);
-    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     let line = serde_json::to_value(&stats).unwrap();
-    for key in [
-        "trace_discard_no_fallback_requests",
-        "trace_discard_deferred_items",
-        "unhealthy_root_no_fallback_requests",
-    ] {
-        assert!(line.get(key).is_none(), "{key} is absent while zero");
-    }
+    assert!(
+        line.get("trace_discard_deferred_items").is_none(),
+        "absent while zero"
+    );
     let totals = e2_bound_trace_totals(&clean);
     let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     match mode {
@@ -1386,24 +1382,6 @@ fn e2_bound_trace_case(
         usize::from(discarded || matches!(mode, "malformed" | "oversized")),
         "only unreadable and incomplete pairs skip the strict read"
     );
-    // Root 4 + child 1 requests, under this cause only; a listed family has
-    // no `e2` fold to count.
-    let reason = if discarded { "discarded" } else { mode };
-    let requests = if listed { 0 } else { 5 };
-    let expected = if listed {
-        json!({})
-    } else {
-        json!({ reason: requests })
-    };
-    assert_eq!(
-        serde_json::to_value(stats.unhealthy_root_no_fallback_requests).unwrap(),
-        expected
-    );
-    assert_eq!(
-        stats.trace_discard_no_fallback_requests,
-        if discarded { requests } else { 0 },
-        "#932's scalar equals the discarded reason"
-    );
     // The production account owner after this page: a body with no login on
     // the session bound to A is held unless this scan admitted it.
     let mut bound = items.clone();
@@ -1430,11 +1408,6 @@ fn e2_bound_trace_case(
         assert_eq!(stats.trace_discard_deferred_items, 2);
         let line = serde_json::to_value(&stats).unwrap();
         assert_eq!(line["trace_discard_deferred_items"], 2);
-        assert_eq!(
-            line.get("unhealthy_root_no_fallback_requests"),
-            (!listed).then_some(&expected),
-            "absent while empty"
-        );
         assert_eq!(stats.trace_rows_discarded.cap, u64::from(mode == "cap"));
         assert_eq!(
             stats.trace_rows_discarded.generation,
@@ -1462,8 +1435,6 @@ fn e2_bound_trace_case(
             stats.trace_rows_discarded.is_empty(),
             "{mode} is not a discard"
         );
-        let line = serde_json::to_value(&stats).unwrap();
-        assert_eq!(line["unhealthy_root_no_fallback_requests"], expected);
         if mode == "malformed" {
             // The same paired read: money is unchanged, only the account moves.
             assert_eq!(
@@ -1521,7 +1492,6 @@ fn e2_bound_trace_case(
         totals,
         "no usage is dropped"
     );
-    assert!(stats.unhealthy_root_no_fallback_requests.is_empty());
     assert_eq!(stats.trace_discard_deferred_items, 0);
     assert!(stats.trace_rows_discarded.is_empty());
     fs::remove_dir_all(dir).unwrap();
@@ -1556,8 +1526,8 @@ fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", true, "subscription", false, false);
 }
 
-/// [money] Reason counts: split B/C on every other unhealthy read is
-/// Unknown, never retained A, and counted under its own reason.
+/// [money] Split B/C on every other unhealthy read is Unknown, never
+/// retained A.
 /// guard: unseen live (0 of 3,614 evidence pages)
 #[test]
 fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() {

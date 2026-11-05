@@ -191,6 +191,7 @@ impl Fixture {
                 list_all,
                 true,
                 &[],
+                None,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -1512,7 +1513,9 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
 /// on the retiring page with the resident copy's requests and tokens. Claude's
 /// copy folds its responses only at finish, so its totals are unknown. The
 /// same file deleted after its ACK counts nothing.
-/// Count only: the entry retires exactly as before.
+/// Count only: the entry retires exactly as before, whether a remove hint or
+/// the re-listing's complete directory read proves it absent; the retirement
+/// adds no accepted fingerprint.
 #[test]
 fn deleted_before_ack_counts_unacked_usage_lost() {
     for source in [
@@ -1520,16 +1523,25 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
         SnapshotSource::Codex,
         SnapshotSource::Pi,
     ] {
-        for unacked in [true, false] {
+        for (unacked, hinted) in [(true, true), (false, true), (true, false), (false, false)] {
             let mut f = Fixture::new();
             f.unacked = unacked;
-            let index = kept_generation(&f, source, false);
+            let index = kept_generation(&f, source, !hinted);
             let grown = f.root.join(format!("{GROWN}.jsonl"));
             let key = local_index_key(&grown);
             assert!(index.files[&key].last_upload_body_witness.is_some());
+            let accepted = index.accepted_snapshot_fingerprints.clone();
             fs::remove_file(&grown).unwrap();
-            let (index, _, _, rows) = f.page_hinted(source, index, &[grown]);
+            let (index, _, _, rows) = if hinted {
+                f.page_hinted(source, index, &[grown])
+            } else {
+                f.page(source, index)
+            };
             assert!(!index.files.contains_key(&key), "{source:?}: retired");
+            assert!(
+                index.accepted_snapshot_fingerprints.is_subset(&accepted),
+                "{source:?} hinted {hinted}: retirement grants no ACK"
+            );
             let page = rows
                 .iter()
                 .find(|row| row["stage"] == "native_collection_page")
@@ -1544,10 +1556,30 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             };
             assert_eq!(
                 page["counts"]["unacked_usage_lost_to_deletion"], expected,
-                "{source:?} unacked {unacked}"
+                "{source:?} unacked {unacked} hinted {hinted}"
             );
         }
     }
 }
 
 mod codex_archive_tests;
+
+/// [regress] A positive remove hint in a retained Codex generation retires
+/// this listing's absent key even if an earlier page observed it.
+#[test]
+fn codex_current_listing_removal_retires_an_earlier_generation_observation() {
+    let f = Fixture::new();
+    let index = f.retained_codex();
+    let key = local_index_key(&f.path);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&key));
+    assert!(index.files.contains_key(&key));
+    fs::remove_file(&f.path).unwrap();
+    let (index, _, _, _) =
+        f.page_hinted(SnapshotSource::Codex, index, std::slice::from_ref(&f.path));
+    assert!(!index.files.contains_key(&key));
+}

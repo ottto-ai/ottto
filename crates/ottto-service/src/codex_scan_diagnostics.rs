@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const MAX_LOCAL_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 pub(crate) const LINEAGE_SAMPLES: usize = 4;
 pub(crate) const MAX_FENCED_CENSUS_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_FENCED_CENSUS_ENTRIES: usize = 32_768;
@@ -253,7 +252,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for UnreadableSamples {
 /// (with the cause it names one call site) and, when the site names a file,
 /// that file's root class, kind and the first 8 bytes of `digest(index key)`
 /// (lineage's `file_key_digest`) as a big-endian `u64`. Never path text. One
-/// flat record, so 32 samples stay inside `MAX_LOCAL_DIAGNOSTIC_BYTES`.
+/// flat record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct UnreadableSample {
     line: u32,
@@ -915,8 +914,7 @@ pub(crate) const CREATOR_PREVIOUSLY_UPLOADED: usize = 8;
 
 /// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
 /// finished parses (a singleton, or a joined group's single replay parse,
-/// each folded once), summed with saturation. Owned by the scan result and
-/// borrowed into the local terminal journal as `local_codex_counting_v2`;
+/// each folded once), summed with saturation. Owned by the scan result;
 /// also present for active-cutover scans or tombstone bookkeeping. Usage vectors are
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -1133,7 +1131,7 @@ mod tests {
         assert!(!serde_json::to_string(&evidence).unwrap().contains("secret"));
     }
     #[test]
-    fn fully_populated_schema_stays_bounded_and_content_free() {
+    fn fully_populated_schema_stays_content_free() {
         let mut diagnostics = CodexScanDiagnostics {
             version: 1,
             generation: u64::MAX,
@@ -1255,10 +1253,8 @@ mod tests {
             open_turn_ui_pending_usage_this_scan: max,
             open_turn_ui_pending_unsummable_this_scan: u64::MAX,
         };
-        // The journal carries both blocks; together they keep the old cap.
         let mut bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
         bytes.extend(serde_json::to_vec_pretty(&receipts).unwrap());
-        assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);
         let text = String::from_utf8(bytes).unwrap();
         for forbidden in ["/Users", "credential", "raw session id"] {
             assert!(!text.contains(forbidden));

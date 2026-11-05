@@ -2471,7 +2471,7 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
 }
 
 #[test]
-fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding() {
+fn e2_identity_every_marker_keeps_starting_org_with_or_without_different_binding() {
     {
         for count in [64, 65] {
             for bound in [None, Some("b".repeat(64))] {
@@ -2503,7 +2503,7 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
                     item.request_evidence[0].provider_workspace_hash.as_deref(),
                     Some(org_hash(ORG_A).as_str())
                 );
-                assert_eq!(fold(&item).accounts.as_ref().unwrap().conflict, count == 65);
+                assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
                 assert_evidence_referenced(&item);
                 cleanup(&[&path]);
             }
@@ -2563,12 +2563,16 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
         let index = ScanIndex::default();
-        let lines = |offset| {
+        // Each twin stays within the account cap alone; their extra accounts
+        // together are one more than it.
+        let cap = crate::snapshots::claude_request_identity::MAX_AUTHORITY_KEYS as i64;
+        let (first, second) = (cap / 2, cap / 2 + 1);
+        let lines = |offset, extra| {
             let mut lines = vec![
                 org_marker(ORG_A),
                 line(&format!("first-{offset}"), &at(1), 1),
             ];
-            for i in 1..10 {
+            for i in 1..=extra {
                 let ordinal = offset + i;
                 lines.push(json!({"type":"attachment","sessionId":ROOT,"attachment":{"type":"session_context","context":{"userEmail":format!("synthetic-{ordinal}@example.invalid")}}}));
                 lines.push(org_marker(&format!(
@@ -2579,14 +2583,18 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             lines
         };
         let items = vec![
-            parse(&a, Some(t0()), &index, &lines(0)),
-            parse(&b, Some(t0()), &index, &lines(9)),
+            parse(&a, Some(t0()), &index, &lines(0, first)),
+            parse(&b, Some(t0()), &index, &lines(first, second)),
         ];
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
         let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
-        assert_eq!((item.request_count, item.input_tokens), (20, 20));
+        let requests = (first + second + 2) as u64;
+        assert_eq!(
+            (item.request_count, item.input_tokens),
+            (requests, requests)
+        );
         // Overflowing proof cannot be replaced by the starting org.
         // The old uniform-retry expectation would manufacture that identity.
         assert!(item.request_evidence.is_empty());
@@ -3025,7 +3033,7 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
 }
 
 #[test]
-fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
+fn e2_identity_markerless_desktop_goes_per_request_and_keeps_recent_activity() {
     {
         let path = root_file("identity-markerless-desktop");
         let index = ScanIndex::default();
@@ -3073,11 +3081,17 @@ fn e2_identity_markerless_desktop_keeps_d1_shape_and_recent_activity() {
             &Default::default(),
         )
         .is_empty());
-        let before = serde_json::to_vec(&items).unwrap();
+        // A single-account markerless body takes the per-request shape.
         let outcome =
             claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
-        assert_eq!((outcome.sent, outcome.ineligible), (0, 1));
-        assert_eq!(serde_json::to_vec(&items).unwrap(), before);
+        assert_eq!(
+            (outcome.sent + outcome.fallback, outcome.ineligible),
+            (1, 0)
+        );
+        assert_eq!(
+            items[0].provenance.collector,
+            claude_request_identity::COLLECTOR
+        );
         claude_request_identity::publish_request_owned_activity(&items, activity);
         assert_eq!(
             crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
@@ -3357,10 +3371,10 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
     };
 }
 
-/// [behaviour] Past the marker cap, a removed prefix's marker is no starting
-/// witness: the copy's own request takes no org.
+/// [behaviour] A removed prefix's marker is no starting witness: the copy's
+/// own request takes no org.
 #[test]
-fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
+fn e2_identity_excluded_marker_is_no_starting_witness() {
     {
         for bound in [None, Some("c".repeat(64))] {
             let path = root_file("identity-copy-marker-overflow");
@@ -3372,14 +3386,11 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
                 .claude_file_birth
                 .set_birth_for_test(t0() + 100_000_000_000);
             accumulator.account_identifier_hash = bound.clone();
-            let mut lines = vec![
+            let lines = vec![
                 org_marker(ORG_A),
                 line("copied", &at(1), 10),
                 line("own", &at(101), 20),
             ];
-            for _ in 0..64 {
-                lines.push(org_marker(ORG_A));
-            }
             for value in &lines {
                 apply_claude_code_line(value, &mut accumulator);
             }
@@ -3400,7 +3411,7 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
                 ),
                 (1, 20, Some(1))
             );
-            assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+            assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
             assert!(org_amounts(&item).is_empty());
             assert!(rows_of(&item).all(|row| row.account_identifier_hash == bound));
             assert_evidence_referenced(&item);

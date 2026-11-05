@@ -69,7 +69,14 @@ fn hinted(c: &Corpus, index: ScanIndex, limit: usize, sampled: bool, hints: &[Pa
 
 /// Commit the native page's exact ACKs and context receipts to the same
 /// live database; the next caller gets the production cold load.
-fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
+fn commit(session: &StateV2ColdSession, page: Page) -> ScanIndex {
+    commit_with_progress(session, page).0
+}
+
+fn commit_with_progress(
+    session: &StateV2ColdSession,
+    mut page: Page,
+) -> (ScanIndex, SnapshotUploadProgress) {
     page.finish();
     let mut progress = e2_progress();
     assert_eq!(
@@ -83,7 +90,7 @@ fn commit(session: &StateV2ColdSession, mut page: Page) -> ScanIndex {
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    session.save_reload(&mut page.index)
+    (session.save_reload(&mut page.index), progress)
 }
 
 fn accepted(result: &mut RouteResult, items: &[SnapshotItem]) {
@@ -214,11 +221,15 @@ fn append_after_restart_and_eviction_preserves_placement() {
 /// to the cold Full's body and placement (two accounts, a mid-session switch,
 /// a side call and an evidence gap). The retried body is one finalized item,
 /// POSTed once per upload and cleared only by its exact ACK. A session that
-/// owes a head-CAS answer reads the same body through a native Full.
+/// owes a head-CAS answer reads the same body through a native Full. A
+/// challenge whose session holds no saved base can carry no answer: the
+/// upload-context activation leaves it unmirrored, so the due retry, a
+/// twin's family pull and growth continue from stored state to the cold
+/// Full's body, and its ordinary accept clears it.
 #[test]
 fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
     with_e2(|| {
-        let (c, _) = placement_corpus("s2-identity-deferred-retry");
+        let (mut c, path) = placement_corpus("s2-identity-deferred-retry");
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
@@ -308,6 +319,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         // The held body is leased, POSTed once, and only an exact ACK clears it.
         progress.prepare_quarantine_retries(&prior.quarantined_snapshot_fingerprints);
         assert!(progress.active_quarantine_retries.contains(&refused));
+        let leased = progress.clone();
         let posts = |sent: &[Vec<u8>]| {
             sent.iter()
                 .map(|bytes| {
@@ -341,11 +353,176 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
         assert!(!progress.quarantined_fingerprints.contains_key(&refused));
 
         // A session that owes a head-CAS answer reads Full, to the same body.
-        let mut owed = prior;
+        let mut owed = prior.clone();
         owed.activate_head_conflict_sessions([cache_session_key(ROOT)].into());
         let answered = page(&c, owed, 100, true);
         assert!(answered.modes.0 > 0, "the owed answer reads a native Full");
         money_oracle::assert_equivalent(&cold, &result(&answered, Mode::ColdFull));
+
+        // A base-less challenge (no saved head or cache state, no attempt),
+        // mirrored the production way; a saved base is the mirrored control.
+        let key = cache_session_key(ROOT);
+        let mut challenged = leased.clone();
+        challenged.head_conflict_challenges.insert(
+            key.clone(),
+            HeadConflictChallenge {
+                challenge: "c".repeat(64),
+                stale_revision_v2_hash: "d".repeat(64),
+                answer_attempts: 0,
+                last_answer_unix: 0,
+            },
+        );
+        assert!(!challenged.accepted_cache_heads.contains_key(&key));
+        assert!(!challenged.accepted_cache_states.contains_key(&key));
+        let mut based = challenged.clone();
+        based
+            .accepted_cache_heads
+            .insert(key.clone(), "e".repeat(64));
+        let activated = |progress: &SnapshotUploadProgress| {
+            let mut index = prior.clone();
+            activate_source_upload_context(
+                SOURCE,
+                "e2-synthetic-destination".into(),
+                &mut index,
+                &mut progress.clone(),
+            );
+            index
+        };
+        assert!(!activated(&challenged).head_conflict_owed(&key), "no base");
+        assert!(activated(&based).head_conflict_owed(&key), "control");
+        let same_sessions = |cold: &mut Page, warm: &Page| {
+            cold.scan.snapshots.retain(|item| {
+                warm.scan
+                    .snapshots
+                    .iter()
+                    .any(|warm| warm.source_session_id == item.source_session_id)
+            });
+        };
+
+        // The due retry re-folds to the cold Full; the base-holding control
+        // still reads Full.
+        let refolded = page(&c, activated(&challenged), 100, true);
+        assert_eq!(refolded.modes.0, 0, "a base-less challenge re-folds");
+        let refolded_route = result(&refolded, Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &refolded_route);
+        // Its requests are class-pure: the body travels in the class its own
+        // cache patch selects, never under another body's CAS contract.
+        money_oracle::assert_class_pure_requests(&refolded_route);
+        let mirrored = page(&c, activated(&based), 100, true);
+        assert!(mirrored.modes.0 > 0, "control: a saved base reads Full");
+
+        // No answer can attach: the POSTs carry no rescan claim, the exact
+        // ACK settles the body, and the ordinary accept clears the challenge.
+        let mut items = refolded.scan.snapshots.clone();
+        for item in &mut items {
+            item.cache_base_head_etag = challenged
+                .accepted_cache_heads
+                .get(&cache_session_key(&item.source_session_id))
+                .cloned();
+        }
+        assert_eq!(
+            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds()),
+            0
+        );
+        let mut settled = challenged.clone();
+        let (status, sent, _) = upload(&items, &mut settled, ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(posts(&sent), 1, "POSTed exactly once");
+        for bytes in &sent {
+            let wire: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            for item in json_array(&wire["snapshots"]) {
+                for claim in [
+                    "conflict_head_challenge",
+                    "forced_full_rescan",
+                    "rescan_from_revision_hash",
+                ] {
+                    assert!(item.get(claim).is_none(), "{claim}");
+                    assert!(item["semantic_envelope"].get(claim).is_none(), "{claim}");
+                }
+            }
+        }
+        assert!(
+            settled.accepted_fingerprints.contains(&refused),
+            "exact ACK"
+        );
+        assert!(!settled.quarantined_fingerprints.contains_key(&refused));
+        assert!(
+            !settled.head_conflict_challenges.contains_key(&key),
+            "the ordinary accept clears it"
+        );
+
+        // ForcedFamily: a twin copy the page reads pulls the family in. The
+        // base-less session reads exactly as an unchallenged one; mirrored,
+        // the pulled root reads Full instead.
+        let twin = c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &std::fs::read_to_string(&path).unwrap(),
+            "2026-08-02T07:05:00Z",
+        );
+        let pulled = |progress: &SnapshotUploadProgress| {
+            hinted(
+                &c,
+                activated(progress),
+                100,
+                true,
+                std::slice::from_ref(&twin),
+            )
+        };
+        let plain = pulled(&leased);
+        let family = pulled(&challenged);
+        assert_eq!(family.modes, plain.modes, "base-less reads as unchallenged");
+        assert!(
+            pulled(&based).modes.0 > plain.modes.0,
+            "control: the pulled root is selected, and mirrored reads Full"
+        );
+        let mut family_cold = page(&c, ScanIndex::default(), 100, false);
+        same_sessions(&mut family_cold, &family);
+        let family_cold = result(&family_cold, Mode::ColdFull);
+        assert!(accounts(&family_cold).len() >= 2, "positive control");
+        money_oracle::assert_equivalent(&family_cold, &result(&family, Mode::Restart));
+        std::fs::remove_file(&twin).unwrap();
+        c.births.remove(&twin);
+
+        // Growth reads a Tail append to the cold Full's body.
+        append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        let grown = hinted(
+            &c,
+            activated(&challenged),
+            100,
+            true,
+            std::slice::from_ref(&path),
+        );
+        assert_eq!(grown.modes.0, 0, "a base-less grown file never reads Full");
+        assert!(grown.modes.1 > 0, "it continues as an append");
+        let mut grown_cold = page(&c, ScanIndex::default(), 100, false);
+        same_sessions(&mut grown_cold, &grown);
+        let grown_cold = result(&grown_cold, Mode::ColdFull);
+        assert!(accounts(&grown_cold).len() >= 2, "positive control");
+        money_oracle::assert_equivalent(&grown_cold, &result(&grown, Mode::Restart));
+
+        // The answer is accepted and the challenge clears, so the next
+        // prepare mirrors none. The next pass continues the session's files
+        // from the Tail: the root's growth and its subagent member's growth
+        // (the member the family pull brings in) read no Full and miss no
+        // stored head.
+        let mut cleared = commit(&session, answered);
+        cleared.activate_head_conflict_sessions(BTreeSet::new());
+        append(&path, &line(ROOT, "after-clear", "2026-08-02T07:05:00Z", 6));
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "after-clear-agent", "2026-08-02T07:05:00Z", 3),
+        );
+        let misses = || {
+            crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test(
+                "tail_db_loads",
+                "miss",
+            )
+        };
+        let before = misses();
+        let next = page(&c, cleared, 100, true);
+        assert_eq!(misses() - before, 0, "no stored-head miss after the clear");
+        assert_eq!(next.modes.0, 0, "no Full after the clear, members included");
+        assert!(next.modes.1 > 0, "the growth reads Tail");
     });
 }
 
@@ -508,6 +685,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             &c.base.join("state"),
         );
         let prior = commit(&session, page(&c, index, 100, true));
+        append(&path, "{broken\n");
         append(
             &path,
             &line(ROOT, "partial-later", "2026-08-02T07:04:00Z", 6),
@@ -519,11 +697,36 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         let current = page(&c, prior, 100, true);
         assert_eq!(current.modes.0, 0, "partial ACK uses a stored Tail");
         assert!(current.modes.1 > 0);
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&current.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold_page.index).unwrap()["terminal_jsonl_dispositions"]
+        );
+        let loss_body = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        let loss_fingerprint = loss_body.snapshot_fingerprint.clone();
+        let loss_witness = snapshot_upload_body_witness(loss_body);
         let mut progress = e2_progress();
+        // Patched and unpatched bodies may travel in separate requests; only
+        // the request holding the other entity carries the refusal.
         let (status, batches, _) = upload(&current.scan.snapshots, &mut progress, |items| {
             let mut response = ack(items)?;
-            let mut refused = response.accepted_entities.pop().unwrap();
+            // Preserve the existing partial outcome while exactly ACKing
+            // the loss-bearing root and leaving its other entity owed.
+            let Some(other) = response
+                .accepted_entities
+                .iter()
+                .position(|entity| entity.source_session_id != ROOT)
+            else {
+                return Ok(response);
+            };
+            let mut refused = response.accepted_entities.remove(other);
             response.accepted -= 1;
             // Cache rows put the request under head-CAS: the refusal then
             // carries the server's challenge instead of a head.
@@ -537,6 +740,11 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);
         assert_eq!(progress.quarantined_fingerprints.len(), 1);
+        assert!(progress.accepted_fingerprints.contains(&loss_fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
+        );
         let mut observed =
             RouteResult::emitted(Mode::Restart, SOURCE, batches, &current.scan.snapshots);
         let mut cold = cold;
@@ -559,6 +767,10 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         assert_eq!(
             restored.quarantined_fingerprints,
             progress.quarantined_fingerprints
+        );
+        assert_eq!(
+            restored.accepted_body_witnesses.get(&loss_fingerprint),
+            Some(&loss_witness)
         );
         assert!(current.scan.snapshots.iter().any(|item| !progress
             .accepted_fingerprints
@@ -620,46 +832,10 @@ fn scan_behind_accepted_never_reemits_a_smaller_body() {
     });
 }
 
-/// Failure context for the lossy row: scan counters and every index field
-/// that names the lossy file.
-fn lossy_diag(label: &str, page: &Page, key: &str) -> String {
-    let scan = &page.scan;
-    let fields = serde_json::to_value(&page.committed)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, v)| v.to_string().contains(key))
-        .map(|(k, v)| {
-            let text = v.to_string().chars().take(1500).collect::<String>();
-            format!("{k}={text}")
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "\n[{label}] modes={:?} discovered={} scanned={} limit_skipped={} \
-         malformed={} census_complete={} emitted={:?} decode_hold={} \
-         len={:?}\n committed_entry={:?}\n after_entry={:?}\n fields={fields:?}",
-        page.modes,
-        scan.discovered_file_count,
-        scan.scanned_file_count,
-        scan.skipped_file_count_due_to_limit,
-        scan.malformed_json_line_count,
-        scan.census_complete,
-        scan.snapshots
-            .iter()
-            .map(|item| item.source_session_id.as_str())
-            .collect::<Vec<_>>(),
-        page.committed.decode_holds_file(key),
-        std::fs::metadata(key).map(|m| m.len()).ok(),
-        page.committed.files.get(key),
-        page.index.files.get(key),
-    )
-}
-
-/// [money] A lossy append gets no new stored authority. Repeated reads from
-/// the last good head retain the cold Full's money and loss disclosures.
+/// [money] A bad physical record preserves valid siblings through durable
+/// Tail and later appends, matching byte-zero Full including placement.
 #[test]
-fn lossy_prefix_retains_the_previous_head_and_matches_full() {
+fn bad_record_tail_matches_full_and_keeps_valid_siblings() {
     with_e2(|| {
         let mut c = corpus("s2-lossy-prefix");
         let path = c.root(ROOT, &line(ROOT, "a", AT, 10));
@@ -669,7 +845,14 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let initial = page(&c, index, 100, true);
+        let scanner = E2ScanFixture::capturing_identity();
+        scanner.on_committed_route(session.path());
+        let read = |index, hints: &[PathBuf]| {
+            let mut page = c.raw(&scanner, index, 100, true, hints);
+            page.enrich(&c);
+            page
+        };
+        let initial = read(index, &[]);
         let mut previous = result(&initial, Mode::ColdFull);
         accepted(&mut previous, &initial.scan.snapshots);
         let prior = commit(&session, initial);
@@ -682,41 +865,99 @@ fn lossy_prefix_retains_the_previous_head_and_matches_full() {
             &line(COPY, "sibling-later", "2026-08-02T07:01:00Z", 7),
         );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let current = page(&c, prior, 100, true);
-        let key = path.to_str().unwrap().to_owned();
-        let mut diag = format!(
-            "cold emitted={:?}",
-            cold.snapshots.keys().collect::<Vec<_>>()
-        );
-        diag += &lossy_diag("lossy", &current, &key);
-        assert_eq!(current.modes.0, 0, "{diag}");
-        assert!(current.modes.1 > 0, "{diag}");
-        let mut held = result(&current, Mode::Restart);
-        held.accepted = previous.accepted.clone();
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
-        let prior = commit(&session, current);
-        // The lossy completion set no marker and kept the pre-append entry,
-        // so unchanged bytes would rightly skip: they reproduce the same hold.
-        // New bytes after the lossy point, seen through the watcher hint,
-        // re-select the file; the Tail continues from the retained head.
-        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
-        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let replay = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
-        diag += &lossy_diag("replay", &replay, &key);
+        let current = read(prior, &[]);
+        assert_eq!(current.modes.0, 0);
+        assert!(current.modes.1 > 0);
+        assert_eq!(current.scan.malformed_json_line_count, 1);
         assert_eq!(
-            replay.modes.0, 0,
-            "lossy completion must leave the old head{diag}"
+            current
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            30
         );
+        let emitted = result(&current, Mode::Restart);
+        money_oracle::assert_no_smaller_reemit(ROOT, &previous, &emitted, &cold, false);
+        // The changed sibling is offered before its exact ACK; suppression
+        // must never substitute for receiving that body's witness.
+        let sibling_item = current
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == COPY)
+            .unwrap();
+        assert_eq!(sibling_item.input_tokens, 12);
+        let sibling_fingerprint = sibling_item.snapshot_fingerprint.clone();
+        let sibling_witness = snapshot_upload_body_witness(sibling_item);
+        assert!(!current
+            .committed
+            .accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        let (prior, progress) = commit_with_progress(&session, current);
+        assert!(prior.accepted_snapshot_fingerprint_recorded(&sibling_fingerprint));
+        // A file stores a set digest, not an individual entity witness.
+        // Compare the exact-body ACK at its native per-entity boundary.
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&sibling_fingerprint),
+            Some(&sibling_witness)
+        );
+        let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+            SOURCE,
+            &scanner.cache,
+            &prior,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.sealed_offset(),
+            std::fs::metadata(&path).unwrap().len()
+        );
+        append(&path, &line(ROOT, "c", "2026-08-02T07:02:00Z", 30));
+        // Apply the same root selection before serialization on both routes.
+        let select_root = |page: &mut Page| {
+            page.scan.snapshots.retain(|s| s.source_session_id == ROOT);
+        };
+        let mut cold_page = page(&c, ScanIndex::default(), 100, false);
+        select_root(&mut cold_page);
+        let cold = result(&cold_page, Mode::ColdFull);
+        let mut replay = read(prior, &[path, sibling]);
         assert!(
-            replay.modes.1 > 0,
-            "the old seal must replay the lossy suffix{diag}"
+            !replay
+                .scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == COPY),
+            "only the exact ACK above suppresses the unchanged sibling"
         );
-        // Nothing new is emitted: the root is held again, as in a cold Full
-        // of the same bytes, and the sibling is unchanged since the lossy
-        // page, so that page's emitted sibling body is the stored path's.
-        assert!(replay.scan.snapshots.is_empty(), "{diag}");
-        assert!(!cold.snapshots.contains_key(ROOT), "{diag}");
-        money_oracle::assert_held(ROOT, &previous, &held, &cold);
+        // Same-generation growth continues the saved head despite its loss.
+        assert_eq!(replay.modes, (0, 1, 0));
+        let dispositions = |page: &Page| {
+            serde_json::to_value(&page.index).unwrap()["terminal_jsonl_dispositions"].clone()
+        };
+        let cold_loss = dispositions(&cold_page);
+        let losses = cold_loss.as_object().unwrap();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(
+            losses.values().next().unwrap()["loss"]["malformed_json_line_count"],
+            1
+        );
+        assert_eq!(dispositions(&replay), cold_loss);
+        assert_eq!(
+            replay
+                .scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            60
+        );
+        // Select before serialization so the real uploader derives the
+        // envelope contracts from exactly the bodies being compared.
+        select_root(&mut replay);
+        money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
     });
 }
 
@@ -848,3 +1089,5 @@ fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hol
         );
     });
 }
+
+mod pause_guard_oracle_tests;

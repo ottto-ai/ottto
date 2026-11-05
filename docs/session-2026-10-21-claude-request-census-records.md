@@ -1,5 +1,7 @@
 # Claude request-census records (shadow only)
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 Each Claude transcript index key now has one durable request-census record in
 `ScanIndex::claude_request_census`. The record has these fields:
 

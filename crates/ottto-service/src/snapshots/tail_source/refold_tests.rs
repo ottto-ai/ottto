@@ -208,9 +208,16 @@ fn a_conflict_owed_session_reads_native_full() {
             assert!(matches!(mode, ReadMode::Full(_)) && start == 0);
         }
     }
-    // The conflict-owed Full counts under the existing `head_conflict` row.
+    // The conflict-owed Full counts under the existing `head_conflict` row,
+    // through the selection note the scan makes after the load.
     let _ = counts::drain("claude_code");
     let _ = loaded(&route, &path, &key);
+    route.index.note_change_reason_selected(
+        SnapshotSource::ClaudeCode,
+        &super::settlement_tests::candidate(&path),
+        Some(CandidateParseReason::ForcedFamily),
+        None,
+    );
     counts::read(
         "claude_code",
         &key,
@@ -221,6 +228,66 @@ fn a_conflict_owed_session_reads_native_full() {
     let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
     assert_eq!(page["read"]["head_conflict"]["files"], 1);
     assert_eq!(page["read"]["head_conflict"]["native_bytes"], 7);
+    assert!(page["read"].get("copy_ownership").is_none());
+}
+
+/// [money] Once the session's challenge clears (an ordinary accept or an
+/// unchanged ACK removes it from the ledger, and the next prepare mirrors no
+/// open challenge), its file continues from the Tail again: no
+/// `ConflictOwed` miss and no Full. An unchanged file re-folds reading no
+/// transcript byte for every late-evidence selection, including a member the
+/// family pull brings in (`ForcedFamily`); a grown file reads only past the
+/// sealed offset. Only the post-clear pass is asserted here.
+#[test]
+fn a_cleared_challenge_continues_from_the_tail() {
+    let mut route = route();
+    let (path, key) = committed(&mut route, "a.jsonl", 3);
+    let session = cold_accumulator(&route, &path)
+        .wire_source_session_id(&path)
+        .unwrap();
+    let owed = crate::snapshot_sync::cache_session_key(&session);
+    route.index.activate_head_conflict_sessions([owed].into());
+    assert!(
+        matches!(loaded(&route, &path, &key).0, Load::Cold(None)),
+        "positive control: an owed answer reads Full"
+    );
+    route
+        .index
+        .activate_head_conflict_sessions(Default::default());
+    let native = wire(&fresh(&route, &path));
+    assert!(LATE.contains(&CandidateParseReason::ForcedFamily));
+    for reason in LATE {
+        assert!(reuses_stored(
+            &route.index,
+            &key,
+            Some(reason),
+            false,
+            false
+        ));
+        let (load, counted_load) = loaded(&route, &path, &key);
+        assert!(matches!(load, Load::Reused(..)), "{reason:?}");
+        assert_eq!(counted(&counted_load), ("hit".into(), vec![]));
+    }
+    let (refold, native_bytes) = stored_finish(&route, &path, &key);
+    assert_eq!(native_bytes, 0, "no transcript byte is read");
+    assert_eq!(wire(&refold), native);
+
+    append(&path, 3);
+    for reason in [
+        CandidateParseReason::TranscriptChanged,
+        CandidateParseReason::ActivityOrQuarantineRetry,
+    ] {
+        assert!(reuses_stored(&route.index, &key, Some(reason), true, false));
+    }
+    let (Load::Reused(taken, Some(base)), counted_load) = loaded(&route, &path, &key) else {
+        panic!("the committed head is reused after the clear");
+    };
+    assert_eq!(counted(&counted_load), ("hit".into(), vec![]));
+    let (parser, mode, start) = read(&route, &path, Some(taken));
+    assert!(matches!(mode, ReadMode::Tail), "a grown file reads Tail");
+    assert!(start > 0, "past the sealed offset");
+    let (_, grown) = route.finish(&path, parser, Some(base), |_| {});
+    assert_eq!(wire(&grown.unwrap().snapshots), wire(&fresh(&route, &path)));
 }
 
 /// [money] SOURCE (b): stored state incomplete for the file never re-folds.

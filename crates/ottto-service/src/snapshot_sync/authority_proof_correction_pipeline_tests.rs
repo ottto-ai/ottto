@@ -698,7 +698,6 @@ impl ApcFixture {
                 None,
                 None,
                 None,
-                None,
                 body_drains,
             )
             .expect("checkpoint shed page");
@@ -751,15 +750,13 @@ impl ApcFixture {
                 cutoff_candidates: &cutoff_candidates,
                 transport_fully_settled: settlement.fully_settled,
                 body_drains,
-                comparison: None,
                 audit_release: self.audit_release.get().then_some(AccountAuditRelease {
                     previous: &committed_index,
                     roots: std::slice::from_ref(&self.root),
                     backfill_window_days: 183,
                 }),
             },
-        )
-        .expect("no paid restore");
+        );
         // As the service finish, after the selected settlement: this page's
         // exact ACKs earn their file receipts. The synthetic responder answers
         // count ACKs, which the service never takes as receipt evidence; under

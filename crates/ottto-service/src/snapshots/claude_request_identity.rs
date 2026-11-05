@@ -146,12 +146,16 @@ impl Drop for PreCutoverEvidenceForTest {
     }
 }
 
-pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
-pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
+pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 32;
+pub(crate) const MAX_AUTHORITY_KEYS: usize = 32;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`).
-/// The byte cap is the real limit; this stops construction early.
-pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
+/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`):
+/// the receiver's dense parts bound, serialized item bytes / 320, at this
+/// pass's item cap (2,048 at the default cap). The byte cap is the real
+/// limit; this stops construction early.
+pub(crate) const fn max_parts_per_item(max_item_bytes: usize) -> usize {
+    max_item_bytes / 320
+}
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
@@ -247,40 +251,9 @@ pub(crate) enum Refusal {
     InvalidEvidence,
     ContradictoryOrg,
     BadClock,
-    MarkerOverflow,
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
-}
-
-/// Why a root's strict sidecar evidence was unhealthy this pass. Local counter
-/// label only; declaration order is precedence when several causes apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum UnhealthyRootReason {
-    /// The strict trace read was discarded (it grew or was replaced mid-read).
-    /// The family is also withheld (`e2::hold_trace_discarded`).
-    Discarded,
-    Oversized,
-    Unreadable,
-    Malformed,
-    /// A missing pair member, failed permissive read, invalid or missing
-    /// request ids, or conflicting ids.
-    Incomplete,
-}
-
-impl UnhealthyRootReason {
-    /// The strongest cause among one read's health counters.
-    pub(crate) fn of(oversized: u64, unreadable: u64, malformed: u64) -> Self {
-        if oversized > 0 {
-            Self::Oversized
-        } else if unreadable > 0 {
-            Self::Unreadable
-        } else if malformed > 0 {
-            Self::Malformed
-        } else {
-            Self::Incomplete
-        }
-    }
 }
 
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
@@ -1130,7 +1103,7 @@ fn apply_grouped_with_accepted(
         }
         top_identities.push(identity);
     }
-    if total_parts > MAX_PARTS_PER_ITEM {
+    if total_parts > max_parts_per_item(max_item_bytes) {
         over_cap.insert(OverCap::PartsPerItem);
     }
     if item.model_usage.len() > MAX_ROWS
@@ -1244,6 +1217,14 @@ fn apply_grouped_with_accepted(
             attempted_bytes,
             components.as_ref(),
         );
+        // Local explanation only: an account-limit hold never uploads, so the
+        // app can say why. Other holds (rows, bytes) keep their reason.
+        if over_cap.contains(&OverCap::AuthorityKeys)
+            || over_cap.contains(&OverCap::EvidenceEntries)
+        {
+            item.claude_account_withheld_reason =
+                Some(super::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS);
+        }
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         return Ok(Tagged::Held);
     }
@@ -2843,8 +2824,17 @@ fn identity_leaf(row: &SnapshotModelUsage, evidence: &[SnapshotRequestEvidence])
 
 // --- Transcript organization markers (cached accumulator state) -------------
 
-/// Most markers one file may carry before transcript bases switch off for it.
-pub(crate) const MAX_ORG_MARKERS_PER_FILE: usize = 64;
+/// 2026-11-05T00:00:00Z (UTC ms). A request whose own provider time is at or
+/// after it follows the latest valid org line; an earlier request keeps the
+/// terminal trust it had, so a cold read equals a stored one.
+pub(crate) const ACCOUNT_RULE_FROM: i64 = 1_793_836_800_000;
+
+/// A provider time (UTC s) at or after `ACCOUNT_RULE_FROM`.
+pub(crate) fn from_account_rule(unix_seconds: Option<u64>) -> bool {
+    unix_seconds
+        .and_then(|at| i64::try_from(at).ok())
+        .is_some_and(|at| at.saturating_mul(1_000) >= ACCOUNT_RULE_FROM)
+}
 
 /// One `credential_org` marker, positioned by the response sequence at its line:
 /// a response with sequence `s` follows it iff `s >= position`.
@@ -2864,16 +2854,100 @@ pub(crate) struct OrgMarker {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
-    starting_marker: Option<OrgMarker>,
-    overflowed: bool,
+    starting_marker: RetiredStartingMarker,
+    overflowed: RetiredOverflow,
     context_digest: Option<String>,
     context_changed: bool,
-    /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one. Without a
-    /// key, the second is the first later sentence or the first after a marker:
-    /// it could not be compared, so it counts as different.
+    /// Response position of the first non-blank `session_context` email.
     context_position: Option<u64>,
-    context_flip_position: Option<u64>,
+    context_flip_position: RetiredContextFlipPosition,
+}
+
+/// Retired: the starting marker earlier builds stored beside the entries (it
+/// copied the first one). Decoded and dropped, written as `None`, so a stored
+/// head keeps its layout and still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredStartingMarker;
+
+/// Retired: the marker-count flag earlier builds stored. A head that set it had
+/// dropped its markers, so it does not decode and the file reads cold. Written
+/// as `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredOverflow;
+
+/// Retired: the position of the first later `session_context` naming a
+/// different email, which earlier builds stored. Nothing reads it, so it is
+/// decoded and dropped, written as `None`, and a stored head still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredContextFlipPosition;
+
+impl crate::durable_tail_codec::Durable for RetiredStartingMarker {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<OrgMarker>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<OrgMarker> as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
+impl crate::durable_tail_codec::Durable for RetiredOverflow {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&false, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        if <bool as crate::durable_tail_codec::Durable>::take(d)? {
+            return Err(crate::durable_tail_codec::Corrupt);
+        }
+        Ok(Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        Self::take(d).map(|_| ())
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <bool as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
+impl crate::durable_tail_codec::Durable for RetiredContextFlipPosition {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<u64>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<u64> as crate::durable_tail_codec::Durable>::shape(s);
+    }
 }
 
 /// The hashed organization of a `credential_org` attachment; `None` when blank
@@ -2909,23 +2983,13 @@ pub(crate) fn note_marker_line(
             let state = markers.get_or_insert_with(Box::default);
             match accepted::session_context_digest(&text) {
                 // No key, no field: a sentence that cannot be compared explains
-                // no organization change and ends any earlier email.
-                None => {
-                    state.context_digest = None;
-                    if state.context_position.is_some() || !state.entries.is_empty() {
-                        state.context_flip_position.get_or_insert(response_position);
-                    }
-                }
+                // no organization change.
+                None => state.context_digest = None,
                 // An earlier email with no digest (no key then, or scrubbed on a
                 // key change) cannot be compared: this sentence is a fresh
-                // baseline. It explains no organization change and ends that email.
+                // baseline. It explains no organization change.
                 Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
                     let compared = state.context_digest.is_some();
-                    if (compared || state.context_position.is_some())
-                        && state.context_flip_position.is_none()
-                    {
-                        state.context_flip_position = Some(response_position);
-                    }
                     state.context_changed =
                         compared || (state.context_position.is_none() && !state.entries.is_empty());
                     state.context_digest = Some(digest);
@@ -2939,14 +3003,6 @@ pub(crate) fn note_marker_line(
         Some("credential_org") => {
             let org = marker_org_hash(attachment);
             let state = markers.get_or_insert_with(Box::default);
-            if state.overflowed {
-                return;
-            }
-            if state.entries.len() == MAX_ORG_MARKERS_PER_FILE {
-                state.overflowed = true;
-                state.entries = Vec::new();
-                return;
-            }
             let terminal_trusted = match state.entries.last() {
                 None => true,
                 Some(previous) => {
@@ -2954,15 +3010,11 @@ pub(crate) fn note_marker_line(
                 }
             };
             state.context_changed = false;
-            let marker = OrgMarker {
+            state.entries.push(OrgMarker {
                 position: response_position,
                 org,
                 terminal_trusted,
-            };
-            if state.starting_marker.is_none() {
-                state.starting_marker = Some(marker.clone());
-            }
-            state.entries.push(marker);
+            });
         }
         _ => {}
     }
@@ -2981,7 +3033,6 @@ pub(crate) fn take_context_digest_scrubs_for_test() -> u64 {
 pub(crate) enum MarkerVerdict<'m> {
     None,
     Trusted(&'m str),
-    Overflow,
     UntrustedFlip,
     BadOrg,
 }
@@ -2992,10 +3043,8 @@ impl OrgMarkers {
     pub(crate) fn positions(&self) -> impl Iterator<Item = u64> + '_ {
         self.entries
             .iter()
-            .chain(&self.starting_marker)
             .map(|marker| marker.position)
             .chain(self.context_position)
-            .chain(self.context_flip_position)
     }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
@@ -3006,31 +3055,16 @@ impl OrgMarkers {
         self.context_changed = false;
         if self.context_position.is_none() {
             self.context_position = Some(0);
-            self.context_flip_position = Some(0);
         }
         with_context_digest_scrubs(|counter| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
-    /// Without a key: a sentence that could not be compared came at or before
-    /// the marker governing `sequence`, so its flip might have been explained.
-    fn flip_unexplained_for_no_key(&self, sequence: u64) -> bool {
-        !accepted::session_context_key_bound()
-            && self.context_flip_position.is_some_and(|sentence| {
-                self.entries
-                    .iter()
-                    .rev()
-                    .find(|marker| marker.position <= sequence)
-                    .is_some_and(|marker| sentence <= marker.position)
-            })
-    }
-
     /// The marker governing the response with `sequence`, by line order only.
-    pub(crate) fn verdict(&self, sequence: u64, desktop: bool) -> MarkerVerdict<'_> {
-        if self.overflowed {
-            return MarkerVerdict::Overflow;
-        }
+    /// `latest` (Desktop, or a request from `ACCOUNT_RULE_FROM`) trusts any
+    /// valid org line; otherwise an unexplained flip is refused.
+    pub(crate) fn verdict(&self, sequence: u64, latest: bool) -> MarkerVerdict<'_> {
         let Some(marker) = self
             .entries
             .iter()
@@ -3041,14 +3075,14 @@ impl OrgMarkers {
         };
         match &marker.org {
             None => MarkerVerdict::BadOrg,
-            Some(_) if !desktop && !marker.terminal_trusted => MarkerVerdict::UntrustedFlip,
+            Some(_) if !latest && !marker.terminal_trusted => MarkerVerdict::UntrustedFlip,
             Some(org) => MarkerVerdict::Trusted(org),
         }
     }
 }
 
 // `e2` consumes this compact, native-sequence-ordered placement before any
-// requests aggregate. Marker state is bounded independently of request count.
+// requests aggregate.
 pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 /// A counted request's grain slot (live key, origin), the account a copied
 /// marker lent it, and whether this pass positively read its own evidence.
@@ -3069,8 +3103,11 @@ struct AccountRun {
     /// First nonzero usage following this marker: its response position and
     /// `e2` copy status. Zero-usage responses may separate it from the marker.
     copied: Option<(u64, bool)>,
+    /// Starts at `trust_from` with the org of a refused earlier line: never an
+    /// own marker position.
+    split: bool,
 }
-crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
+crate::heap_layout_bound::fields!(AccountRun; position, account, copied, split);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestAccounts {
@@ -3083,6 +3120,9 @@ pub(crate) struct RequestAccounts {
     pub(crate) conflict: bool,
     pub(crate) subagent: bool,
     first_retained: Option<u64>,
+    /// First response sequence whose provider time is from `ACCOUNT_RULE_FROM`;
+    /// org lines govern from it as on Desktop. Kept for native-copy rebuilds.
+    trust_from: Option<u64>,
     reconciled: bool,
     /// Root start known, but the native Unknown grains are not filled yet.
     root_fallback_pending: bool,
@@ -3101,7 +3141,7 @@ pub(crate) struct RequestAccounts {
     carried: CarryCounts,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis, account_source);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, first_retained, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, first_retained, trust_from, reconciled, root_fallback_pending, unhealthy_no_fallback, unhealthy_cleared_account, copied_marker_lent, carried);
 
 /// The carry rule's verdicts for one transcript.
 #[derive(Clone, Copy, Debug, Default)]
@@ -3284,12 +3324,15 @@ impl Carry<'_> {
 /// One account policy for `e2`. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
 /// Subagents are assigned their root's starting account at page finalization.
+/// From `trust_from` every valid org line governs (rule 8: the request's own
+/// time); earlier requests keep the terminal trust rule.
 pub(crate) fn request_accounts(
     markers: Option<&OrgMarkers>,
     bound: Option<&str>,
     first_sequence: Option<u64>,
     subagent: bool,
     excluded: &[u64],
+    trust_from: Option<u64>,
 ) -> RequestAccounts {
     let bound = bound.filter(|hash| wire_login_is_valid(hash)).map(|login| {
         Arc::new(AuthorityKey {
@@ -3304,6 +3347,7 @@ pub(crate) fn request_accounts(
         fallback: bound.clone(),
         bound,
         subagent,
+        trust_from,
         ..Default::default()
     };
     if subagent {
@@ -3318,35 +3362,20 @@ pub(crate) fn request_accounts(
     };
     // Only `e2` can exclude a request. Marker timestamps never decide identity.
     let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
-    if markers.overflowed {
-        if let Some(marker) = markers
-            .starting_marker
-            .as_ref()
-            .filter(own_marker)
-            .filter(|marker| marker.position <= first)
-        {
-            if let Some(org) = marker.org.as_deref().filter(|_| marker.terminal_trusted) {
-                accounts.starting = Some(Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                    account_source: None,
-                }));
-                accounts.runs.push(AccountRun {
-                    position: marker.position,
-                    account: accounts.starting.clone(),
-                    copied: None,
-                });
-            }
-        }
-    }
-    accounts.fallback = accounts.starting.clone();
-    accounts.conflict = markers.overflowed;
     // Positions where one request carries two different orgs (R3-N2).
     let mut contradicted = Vec::new();
+    // A refused org line still governing at `trust_from` starts a run there
+    // with its org; a real line at `trust_from` needs none (no R3-N2).
+    let mut refused: Option<&str> = None;
     for marker in markers.entries.iter().filter(own_marker) {
+        if let Some(from) = trust_from.filter(|from| marker.position >= *from) {
+            if let Some(org) = refused.take().filter(|_| marker.position > from) {
+                push_org_run(&mut accounts, from, org, true);
+            }
+        }
         let Some(org) = marker.org.as_deref().filter(|_| {
             marker.terminal_trusted
+                || trust_from.is_some_and(|from| marker.position >= from)
                 || accounts
                     .runs
                     .iter()
@@ -3355,6 +3384,7 @@ pub(crate) fn request_accounts(
                     .map_or(true, |key| key.org.as_deref() == marker.org.as_deref())
         }) else {
             accounts.conflict = true;
+            refused = marker.org.as_deref();
             if accounts
                 .runs
                 .last()
@@ -3364,10 +3394,12 @@ pub(crate) fn request_accounts(
                     position: marker.position,
                     account: None,
                     copied: None,
+                    split: false,
                 });
             }
             continue;
         };
+        refused = None;
         if let Some(previous) = accounts.runs.last() {
             if previous.position == marker.position {
                 if previous.account.as_ref().and_then(|key| key.org.as_deref()) != Some(org) {
@@ -3377,47 +3409,23 @@ pub(crate) fn request_accounts(
                 continue;
             }
         }
-        let key = accounts
-            .starting
-            .as_ref()
-            .filter(|key| key.org.as_deref() == Some(org))
-            .cloned()
-            .or_else(|| {
-                accounts.runs.iter().find_map(|run| {
-                    run.account
-                        .as_ref()
-                        .filter(|key| key.org.as_deref() == Some(org))
-                        .cloned()
-                })
-            })
-            .unwrap_or_else(|| {
-                Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                    account_source: None,
-                })
-            });
-        accounts.runs.push(AccountRun {
-            position: marker.position,
-            account: Some(key),
-            copied: None,
-        });
+        push_org_run(&mut accounts, marker.position, org, false);
+    }
+    if let Some((from, org)) = trust_from.zip(refused) {
+        push_org_run(&mut accounts, from, org, true);
     }
     // Derive the first own request's start from the accepted own stream,
     // preserving the first observation of a conflicting same-position pair.
-    if !markers.overflowed {
-        if let Some(key) = accounts
-            .runs
-            .iter()
-            .rev()
-            .filter(|run| run.position <= first)
-            .find_map(|run| run.account.as_ref())
-        {
-            accounts.starting = Some(key.clone());
-        }
-        accounts.fallback = accounts.starting.clone();
+    if let Some(key) = accounts
+        .runs
+        .iter()
+        .rev()
+        .filter(|run| run.position <= first)
+        .find_map(|run| run.account.as_ref())
+    {
+        accounts.starting = Some(key.clone());
     }
+    accounts.fallback = accounts.starting.clone();
     // R3-N2 (QUOTA): a later request carrying two different orgs is never
     // guessed: it goes to the starting (or bound) account, counted as a
     // conflict above. A pair at the session start is the start itself.
@@ -3443,6 +3451,37 @@ pub(crate) fn request_accounts(
     // Keep bounded runs through native copy adjudication so the first
     // retained request can establish the real start even under a conflict.
     accounts
+}
+
+/// A run for `org` at `position`, sharing the start's or an earlier run's key.
+fn push_org_run(accounts: &mut RequestAccounts, position: u64, org: &str, split: bool) {
+    let key = accounts
+        .starting
+        .as_ref()
+        .filter(|key| key.org.as_deref() == Some(org))
+        .cloned()
+        .or_else(|| {
+            accounts.runs.iter().find_map(|run| {
+                run.account
+                    .as_ref()
+                    .filter(|key| key.org.as_deref() == Some(org))
+                    .cloned()
+            })
+        })
+        .unwrap_or_else(|| {
+            Arc::new(AuthorityKey {
+                login: None,
+                org: Some(org.to_owned()),
+                basis: TRANSCRIPT_ORG,
+                account_source: None,
+            })
+        });
+    accounts.runs.push(AccountRun {
+        position,
+        account: Some(key),
+        copied: None,
+        split,
+    });
 }
 
 impl RequestAccounts {
@@ -3511,6 +3550,7 @@ impl RequestAccounts {
                 self.first_retained,
                 false,
                 &excluded,
+                self.trust_from,
             );
             own.first_retained = self.first_retained;
             *self = own;
@@ -3550,6 +3590,7 @@ impl RequestAccounts {
             first_retained.or(self.first_retained),
             false,
             &excluded,
+            self.trust_from,
         );
         own.first_retained = first_retained.or(self.first_retained);
         Some(own)
@@ -3560,13 +3601,9 @@ impl RequestAccounts {
 /// standing as an own credential_org. Only missing evidence inherits an
 /// earlier own request, then the start/binding; every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
-/// requests stay Unknown, counted per reason in the returned totals.
-pub(crate) fn reconcile_request_accounts(
-    items: &mut [SnapshotItem],
-    evidence: &ScanEvidence<'_>,
-) -> super::ClaudeUnhealthyRootNoFallbackCounts {
+/// requests stay Unknown.
+pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
     use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
-    let mut no_fallback = super::ClaudeUnhealthyRootNoFallbackCounts::default();
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -3587,19 +3624,10 @@ pub(crate) fn reconcile_request_accounts(
             // evidence for requests whose own proof could not be read: collapse
             // the partitions in place so tokens, costs, side calls and id-less
             // shares survive with no account. Durable bindings are untouched.
-            let reason = evidence.unhealthy_reason(root);
-            no_fallback.add(
-                reason,
-                fold.entity
-                    .grains
-                    .values()
-                    .map(|grain| grain.requests)
-                    .fold(0_u64, u64::saturating_add),
-            );
             fold.entity.repartition(None);
             accounts.unhealthy_no_fallback = true;
             // A discard keeps #932's hold: nothing to admit.
-            accounts.unhealthy_cleared_account = (reason != UnhealthyRootReason::Discarded)
+            accounts.unhealthy_cleared_account = (!evidence.trace_discarded_roots.contains(root))
                 .then(|| super::exact_session_account_hash(item))
                 .flatten();
             accounts.starting = None;
@@ -3735,7 +3763,7 @@ pub(crate) fn reconcile_request_accounts(
                 .iter()
                 .rev()
                 .find(|run| run.account.is_some());
-            let own_marker = marker.filter(|run| run.position == sequence);
+            let own_marker = marker.filter(|run| run.position == sequence && !run.split);
             // Absence of a paired trace is not a contradiction of an own org.
             // Keep the existing strong-org guards; only genuinely conflicting
             // telemetry is disclosed, never used to relocate an own org run.
@@ -3855,7 +3883,6 @@ pub(crate) fn reconcile_request_accounts(
         fold.accounts = Some(accounts);
         item.claude_money = Some(fold);
     }
-    no_fallback
 }
 
 /// The account this page cleared from `item` for
@@ -4053,17 +4080,10 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
     }
 }
 
-crate::local_resource_diagnostics::process_static!(fn with_no_key_flip_refusals:
-    std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
-
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "budget::Counts::is_empty")]
     identity_cap: budget::Counts,
-    /// Requests refused as an organization flip with no attribution key to
-    /// compare the sentence before it. At most what a key would have explained.
-    #[serde(skip_serializing_if = "is_zero")]
-    claude_no_key_flip_refusals: u64,
     /// Retained Claude parses scrubbed on an attribution key change.
     #[serde(skip_serializing_if = "is_zero")]
     claude_context_digest_scrubs: u64,
@@ -4075,9 +4095,6 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
     IdentityCounts {
         identity_cap: budget::take_counts(),
         claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
-            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
-        }),
-        claude_no_key_flip_refusals: with_no_key_flip_refusals(|counter| {
             counter.swap(0, std::sync::atomic::Ordering::Relaxed)
         }),
     }
@@ -4165,9 +4182,9 @@ pub(crate) struct ScanEvidence<'a> {
     request_roots: std::cell::OnceCell<RequestRootIndex>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
-    /// Why each unhealthy root failed, for its no-fallback counter only.
-    /// A root missing here counts as `Incomplete`.
-    unhealthy_reasons: BTreeMap<String, UnhealthyRootReason>,
+    /// Unhealthy roots whose strict trace read this pass discarded (it grew
+    /// or was replaced mid-read); #932's hold withholds their family.
+    trace_discarded_roots: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the
     /// verdict, and a passing row's login is its `account_identifier_hash`.
@@ -4303,19 +4320,9 @@ impl<'a> ScanEvidence<'a> {
         })
     }
 
-    pub(crate) fn with_unhealthy_reasons(
-        mut self,
-        reasons: BTreeMap<String, UnhealthyRootReason>,
-    ) -> Self {
-        self.unhealthy_reasons = reasons;
+    pub(crate) fn with_trace_discarded_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.trace_discarded_roots = roots;
         self
-    }
-
-    fn unhealthy_reason(&self, root: &str) -> UnhealthyRootReason {
-        self.unhealthy_reasons
-            .get(root)
-            .copied()
-            .unwrap_or(UnhealthyRootReason::Incomplete)
     }
 
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
@@ -4463,7 +4470,7 @@ pub(crate) struct RequestFacts<'a> {
 }
 
 /// A borrowed authority key: classification builds no strings; a `Grouping`
-/// copies one only when it admits a new key (at most 16 per item).
+/// copies one only when it admits a new key (at most `MAX_AUTHORITY_KEYS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyRef<'k> {
     login: Option<&'k str>,
@@ -4650,7 +4657,6 @@ pub(super) fn owner_is_foreign(
 fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> {
     let org = match facts.marker {
         MarkerVerdict::None => return None,
-        MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
         MarkerVerdict::UntrustedFlip => return Some(IdentityRef::Refused(Refusal::UntrustedFlip)),
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
@@ -4772,6 +4778,9 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             return;
         }
         let (sequence, event_clock_complete) = request.occurrence.unzip();
+        let terminal_unix_seconds = request
+            .occurrence
+            .and_then(|_| rfc3339_unix_seconds(request.timestamp));
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -4781,27 +4790,17 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             // record which; as in the legacy account path they cannot qualify. The trace span start
             // is event-origin but no existing rule qualifies it, and transcript
             // clocks are not theirs to borrow.
-            terminal_unix_seconds: request
-                .occurrence
-                .and_then(|_| rfc3339_unix_seconds(request.timestamp)),
+            terminal_unix_seconds,
             event_clock_complete: event_clock_complete.unwrap_or(false),
             marker: match (item.claude_org_markers.as_deref(), sequence) {
-                (Some(markers), Some(sequence)) => markers.verdict(sequence, self.desktop),
+                (Some(markers), Some(sequence)) => markers.verdict(
+                    sequence,
+                    self.desktop || from_account_rule(terminal_unix_seconds),
+                ),
                 _ => MarkerVerdict::None,
             },
         };
         let identity = classify_ref(self.evidence, &facts);
-        if matches!(identity, IdentityRef::Refused(Refusal::UntrustedFlip))
-            && item
-                .claude_org_markers
-                .as_deref()
-                .zip(sequence)
-                .is_some_and(|(markers, at)| markers.flip_unexplained_for_no_key(at))
-        {
-            with_no_key_flip_refusals(|counter| {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            });
-        }
         // Activity never overrides stronger request identity. A later Desktop
         // line can, however, qualify a marker flip the session-first CLI origin
         // would refuse solely as UntrustedFlip.
@@ -5175,17 +5174,21 @@ fn request_occurrence_facts<'a>(
         .as_ref()
         .and_then(|origin| origin.entrypoint.as_deref())
         == Some("claude-desktop");
+    let terminal_unix_seconds = rfc3339_unix_seconds(timestamp);
     Some(RequestFacts {
         root,
         source_session_id: &item.source_session_id,
         request_id,
-        terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
+        terminal_unix_seconds,
         event_clock_complete: occurrence.event_clock_complete,
         marker: item
             .claude_org_markers
             .as_deref()
             .map_or(MarkerVerdict::None, |markers| {
-                markers.verdict(occurrence.sequence, desktop)
+                markers.verdict(
+                    occurrence.sequence,
+                    desktop || from_account_rule(terminal_unix_seconds),
+                )
             }),
     })
 }
@@ -5272,11 +5275,6 @@ fn tag_item(
             )
             .any(|row| !local_subscription(row))
         {
-            return None;
-        }
-        // Single-account markerless bodies keep their established account-path wire
-        // shape. The account owner already tagged their final usage uniformly.
-        if keeps_markerless_account(item) {
             return None;
         }
         let mut grouping = request_owned_grouping(item)?;
@@ -5405,14 +5403,15 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
     D entries: Vec<OrgMarker>,
-    D starting_marker: Option<OrgMarker>,
-    N overflowed: bool,
+    D starting_marker: RetiredStartingMarker,
+    N overflowed: RetiredOverflow,
     H context_digest: Option<String>,
     N context_changed: bool,
     N context_position: Option<u64>,
-    N context_flip_position: Option<u64>,
+    N context_flip_position: RetiredContextFlipPosition,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
+crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow, RetiredContextFlipPosition);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
     N position: u64,
     U org: Option<String>,
@@ -5424,6 +5423,9 @@ crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_ha
 
 #[cfg(test)]
 mod context_digest_tests;
+
+#[cfg(test)]
+mod org_line_tests;
 
 #[cfg(test)]
 mod request_owned_contract_tests {

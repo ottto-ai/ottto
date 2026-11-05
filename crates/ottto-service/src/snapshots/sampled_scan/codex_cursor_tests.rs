@@ -4,7 +4,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -320,9 +320,8 @@ fn overlong_envelope_row() -> Vec<u8> {
     .into_bytes()
 }
 
-/// A withheld final record applied at a genuine EOF matches a
-/// read without an extent applying its trailing line, for a valid, a
-/// malformed and larger record.
+/// Valid final JSON keeps EOF admission; invalid unterminated bytes stay
+/// pending without loss on both cursor and compatibility routes.
 #[test]
 fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     for last in [
@@ -343,6 +342,15 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
                 reader.step(|value| seen.push(value.clone())).unwrap(),
                 JsonlReaderStep::Complete(_)
             ) {}
+            if serde_json::from_slice::<Value>(&last).is_err() {
+                assert!(reader.sealed_fragment());
+                assert!(!reader.apply_sealed_fragment(|value| seen.push(value.clone())));
+                assert!(reader.sealed_fragment());
+                assert_eq!(seen.len(), 2);
+                assert_eq!(reader.report.malformed_json_line_count, 0);
+                assert_eq!(reader.report.invalid_utf8_line_count, 0);
+                return (seen, reader.report);
+            }
             if cursor {
                 assert!(reader.sealed_fragment());
                 assert!(reader.apply_sealed_fragment(|value| seen.push(value.clone())));
@@ -1867,6 +1875,30 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
         assert!(cache.cursor_slot_free(), "{}", counters(&cache));
         assert_eq!(pending_hint(&index, &path), None, "dequeued");
     });
+    // Ordinary part of the former archive-gone fixture: a paid, paused
+    // plain Full may not publish after disappearance and refunds every claim.
+    super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+    let gone = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (index, first, modes) = page_in(
+            &gone,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "cursor-fixture",
+        );
+        assert!(first.snapshots.is_empty());
+        assert_eq!(modes.0, 1, "one paid plain Full");
+        assert!(
+            !cache.cursor_slot_free(),
+            "the Full is paused after reading"
+        );
+        fs::remove_file(gone.file(SESSION)).unwrap();
+        let (_, vanished, modes) = page_in(&gone, index, Some(cache.clone()), "cursor-fixture");
+        assert!(vanished.snapshots.is_empty(), "vanished Full emits nothing");
+        assert_eq!(modes.0, 0, "vanish does not regrant Full");
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
 }
 
 /// A quiescent file larger than B whose last record has
@@ -1877,7 +1909,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
 /// read, so later pages skip it, also past the audit interval. No copy is
 /// kept: the applied record lies past the certified prefix `[0, s)`, so
 /// every such job is non-retainable and converges through the index alone.
-/// A malformed record is reported as a line loss.
+/// An invalid unterminated record stays pending with no line loss on either route.
 #[test]
 fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1909,8 +1941,8 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
                 malformed_lines += scan.malformed_json_line_count;
-                // A lossy (malformed) job ends uncertified, like main's
-                // lossy full read.
+                // Complete the certified prefix without applying a pending
+                // invalid suffix, or count the valid EOF record once.
                 if counter(&cache, |c| c.jobs_certified + c.jobs_uncertified) == 1 {
                     completed = Some(scan);
                     break;
@@ -1922,14 +1954,30 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 now += 10;
             }
             let completed = completed.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
-            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
-            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
             if case == "malformed" {
-                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
-                assert!(unpaged.malformed_json_line_count > 0, "main reports it");
-                assert!(malformed_lines > 0, "{case}: the loss is reported");
+                assert_eq!(counter(&cache, |c| c.eof_record_applied), 0);
+                assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1);
+                assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
+                assert_eq!(
+                    unpaged.malformed_json_line_count, 0,
+                    "compatibility reader also keeps the suffix pending"
+                );
+                assert_eq!(
+                    malformed_lines, 0,
+                    "withheld bytes are not applied or counted"
+                );
+                let totals = |scan: &SourceScanResult| {
+                    scan.snapshots
+                        .iter()
+                        .map(|s| (s.input_tokens, s.output_tokens, s.request_count))
+                        .collect::<Vec<_>>()
+                };
+                assert!(!completed.snapshots.is_empty());
+                assert_eq!(totals(&completed), totals(&unpaged));
                 return;
             }
+            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
             assert_eq!(counter(&cache, |c| c.jobs_certified), 1, "{case}");
             assert_eq!(
                 fingerprints(&completed),
@@ -2897,7 +2945,6 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     ignore = "needs validated heap layout"
 )]
 fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
-    use codex_compressed_input::HeaderRead;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2914,9 +2961,16 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     sessions.push((SESSION, 4));
     sessions.push((REREAD, 4));
     let fixture = ScanRoot::with_sessions(&sessions);
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), MEMBERS + 2);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 3);
     for id in &ids {
         index
             .files
@@ -2925,13 +2979,6 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             .source_file_fingerprint
             .clear();
     }
-    let archive = fixture
-        .root
-        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
-    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
-        "type": "session_meta", "payload": {"id": ARCHIVE}}));
-    body.extend(token_line(1));
-    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     ensure_bounded_traversal(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
@@ -2945,15 +2992,7 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.power = true;
-    let header = archive_header_pass(&mut index, &archive, &cache);
-    assert!(matches!(header, HeaderRead::Validated(_)));
-    // Selection is under test, not the Full. Refuse archive work on every
-    // platform: on a macOS runner with mains power the selected archive's
-    // Full is reserved, and only the collector's reservation save, which
-    // this page loop does not run, releases the next page's inventory.
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(NoArchivePower));
-    index.archive_pass.power = false;
+    assert!(archive_header_pass(&mut index, &archive, &cache).is_ok());
     // Only census members stay queued; SESSION returns through its hint, and
     // the re-read and the archive are queued after the control turns.
     let reread = fixture.file(REREAD);
@@ -3016,6 +3055,14 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         index
             .files
             .get_mut(&reread_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        // This is known ordinary work, like the plaintext reread. A newly
+        // discovered compressed file now legitimately participates as fresh.
+        index
+            .files
+            .get_mut(&archive_key)
             .unwrap()
             .source_file_fingerprint
             .clear();
@@ -3102,18 +3149,6 @@ fn published_scan(
     finish_published(selected_page(fixture, cache, index, collected_at, hints))
 }
 
-/// Platform gates that refuse archive work, as off mains power.
-struct NoArchivePower;
-impl crate::snapshot_sync::continuation::PlatformGates for NoArchivePower {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Refused
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
-}
-
 /// Step `scan` to completion and apply the collector's upload policy.
 fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     let (index, scan, _) = finish_saving_reservations(scan);
@@ -3146,18 +3181,10 @@ fn finish_saving_reservations_within(
     max_steps: usize,
     phase: impl FnOnce() -> String,
 ) -> (ScanIndex, SourceScanResult, usize) {
-    let mut committed = scan.index.clone();
-    let checkpoint = Temp::new("reservation", b"");
-    fs::remove_file(&checkpoint.0).unwrap();
-    let mut saved = 0;
+    let saved = 0;
     for _ in 0..max_steps {
         match scan.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                saved += usize::from(next.index.archive_pass.dirty);
-                next.persist_archive_reservation(&mut committed, &checkpoint.0)
-                    .unwrap();
-                scan = next;
-            }
+            OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
@@ -3183,18 +3210,6 @@ fn finish_saving_reservations_within(
         "a Codex page did not complete within {max_steps} steps: {}",
         phase()
     );
-}
-
-/// Archive power as on a Mac on AC power; Linux reports it unknown.
-struct PoweredArchiveGates;
-impl crate::snapshot_sync::continuation::PlatformGates for PoweredArchiveGates {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
 }
 
 /// [regress] 0.1.215 queue: with archive power allowed (macOS), a page whose
@@ -3238,7 +3253,6 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(PoweredArchiveGates));
     fixture.append(SESSION, &token_line(5));
     let page = selected_page(
         &fixture,
@@ -3247,9 +3261,13 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         &collected_at(1),
         &[fixture.file(SESSION)],
     );
-    let (index, _, saved) = finish_saving_reservations(page);
-    assert!(saved > 0, "the archive queued no reservation");
-    assert!(index.archives.contains_key(&local_index_key(&archive)));
+    let (index, scan, saved) = finish_saving_reservations(page);
+    assert_eq!(saved, 0, "ordinary decoding needs no reservation save");
+    assert!(index.files.contains_key(&local_index_key(&archive)));
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|s| s.source_session_id == ARCHIVE));
 }
 
 /// Write a one-turn rollout in a day directory below the fixture root.
@@ -3299,7 +3317,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
                 (
                     candidate.census_member,
                     candidate.watcher_hint,
-                    codex_fresh_data_pending(candidate, &index.files),
+                    codex_fresh_data_pending(candidate, index),
                 )
             })
     };
@@ -4910,10 +4928,12 @@ fn one_writer_replays_held_totals() {
     };
     let mut held = disclosure();
     held.held = HeldCounts {
-        over_line_cap: 2,
-        recognized_usage_drop: 3,
-        dropped_usage_record: 4,
-        terminal_line_loss: 2,
+        loss: Some(TerminalJsonlLoss {
+            malformed_json_line_count: 2,
+            recognized_usage_drop_count: 3,
+            dropped_usage_record_count: 4,
+            ..Default::default()
+        }),
     };
     disclose(&held, &mut index);
     disclose(&strict(DebtReason::JoinStateBound), &mut index);
@@ -4921,14 +4941,14 @@ fn one_writer_replays_held_totals() {
     // Only the first (settleable, replayed) disclosure added totals.
     assert_eq!(
         (
-            census.over_line_cap_count,
+            census.malformed_json_line_count,
             census.recognized_usage_drop_count,
             census.dropped_usage_record_count,
             census.terminal_over_line_cap_count,
             census.terminal_recognized_usage_drop_count,
             census.terminal_dropped_usage_record_count,
         ),
-        (2, 3, 4, 2, 2, 2)
+        (2, 3, 4, 0, 3, 4)
     );
 }
 
@@ -7602,28 +7622,17 @@ fn decoder_eviction_reclaims_header_facts() {
     });
 }
 
-/// One pass's header attempt on an owed archive, through the production read.
+/// The ordinary funded encoding opener, with the existing header recognition bound.
 fn archive_header_pass(
-    index: &mut ScanIndex,
+    _index: &mut ScanIndex,
     path: &Path,
     cache: &Arc<SharedCache>,
-) -> codex_compressed_input::HeaderRead {
-    let archive = index
-        .archives
-        .entry(local_index_key(path))
-        .or_insert_with(|| {
-            codex_compressed_input::ArchiveEvidence::from_metadata(
-                fs::symlink_metadata(path).unwrap(),
-            )
-            .unwrap()
-        });
-    archive.work.get_or_insert_with(Box::default).reservation =
-        codex_compressed_input::ArchiveReservation::HeaderReady;
-    let mut candidate = codex_zst_refusal_tests::candidate(path);
-    candidate.size_bytes = fs::metadata(path).unwrap().len();
-    index
-        .inventory_archive_header(&candidate, Some(cache))
-        .unwrap()
+) -> std::io::Result<String> {
+    let mut input = OpenedInput::encoded(File::open(path)?, path, Some(cache))?.header_only();
+    let mut header = String::new();
+    let result = input.read_line(&mut header).map(|_| header);
+    input.close();
+    result
 }
 
 fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
@@ -7651,7 +7660,6 @@ fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
     ignore = "needs validated heap layout"
 )]
 fn a_refused_archive_decoder_recovers_on_the_next_pass() {
-    use codex_compressed_input::HeaderRead;
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7660,34 +7668,17 @@ fn a_refused_archive_decoder_recovers_on_the_next_pass() {
     with_test_limits(2048, 8192, 64, || {
         let cache = warm_decoder_cache();
         let (root, paths) = owed_archives("decoder-next-pass", 1);
-        let archive_key = local_index_key(&paths[0]);
         let mut index = ScanIndex::default();
-        index.archive_pass.power = true;
         let budget = decoder_least_budget(&cache);
         let refused = with_test_state_budget(budget - 1, || {
             archive_header_pass(&mut index, &paths[0], &cache)
         });
-        assert!(matches!(refused, HeaderRead::Deferred));
-        assert_eq!(
-            index.archives[&archive_key].owed_cause(),
-            Some(CodexZstCause::AdmissionRefused)
-        );
-        assert!(index.archives[&archive_key].header().is_none());
-        let spent = |index: &ScanIndex| {
-            index.archives[&archive_key]
-                .work
-                .as_ref()
-                .unwrap()
-                .header_attempts
-        };
-        assert_eq!(spent(&index), 0);
-        index.disclose_archive_debt();
+        assert_eq!(refused.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         let recovered = with_test_state_budget(budget, || {
             archive_header_pass(&mut index, &paths[0], &cache)
-        });
-        assert!(matches!(recovered, HeaderRead::Validated(_)));
-        assert!(index.archives[&archive_key].header().is_some());
-        assert_eq!(spent(&index), 1);
+        })
+        .unwrap();
+        assert!(recovered.contains("compressed-fixture"));
         assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     });

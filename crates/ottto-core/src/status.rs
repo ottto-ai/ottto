@@ -42,7 +42,6 @@ pub fn empty_status(machine: MachineIdentity, now: impl Into<String>) -> DaemonS
         runtime_heartbeat: None,
         local_health_events: Vec::new(),
         command_ledger: Vec::new(),
-        native_comparison: None,
         generated_at: now.into(),
     }
 }
@@ -129,34 +128,9 @@ mod tests {
         assert_eq!(status.daemon_version, compiled_release_version());
         assert_eq!(status.sources.len(), 0);
         assert_eq!(status.update.current_version, compiled_release_version());
-        // Older/inactive payloads remain byte-shape compatible: optional local
-        // diagnostics are absent, and missing diagnostics decode as UNKNOWN.
-        let old = serde_json::to_value(&status).unwrap();
-        assert!(old.get("native_comparison").is_none());
-        let old_decoded: DaemonStatus = serde_json::from_value(old).unwrap();
-        assert!(old_decoded.native_comparison.is_none());
-        let mut with_diagnostics = status;
-        with_diagnostics.native_comparison = Some(ottto_protocol::NativeComparisonStatus {
-            observation_available: true,
-            in_flight: true,
-            deferred_family_count: Some(1),
-            withheld_candidate_count: Some(2),
-            withheld_new_local_candidate_count: Some(1),
-            prior_process_debt_unknown: true,
-            counts_are_upper_bounds: true,
-            ..Default::default()
-        });
-        let encoded = serde_json::to_value(&with_diagnostics).unwrap();
-        assert!(encoded["native_comparison"]["unknown_age_family_count"].is_null());
-        assert_eq!(
-            encoded["native_comparison"]["withheld_new_local_candidate_count"],
-            1
-        );
+        let encoded = serde_json::to_value(&status).unwrap();
         let decoded: DaemonStatus = serde_json::from_value(encoded).unwrap();
-        assert_eq!(
-            decoded.native_comparison,
-            with_diagnostics.native_comparison
-        );
+        assert_eq!(decoded, status);
     }
 
     #[test]

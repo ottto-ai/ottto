@@ -17,10 +17,19 @@ across files. Before comparing, only these glue classes are reversed:
   (e) the indentation an item loses when an inline module becomes a file.
 
 Then every base item must equal exactly one head item byte for byte (comments,
-attributes, cfgs), and items that land in one file keep their base order. An
-item must sit under the same module attributes (`#[cfg(..)]` and the like), may
-only lose nesting, and every path literal must resolve, from its new file, to
-a target with the same bytes.
+attributes, cfgs), and items that land in one file keep their base order. One
+exception covers a fn signature rustfmt re-wraps (say once a visibility token
+makes it too long): a `fn` item whose text before `fn` and whose body, from its
+opening `{`, are byte for byte equal, whose only visibility token is the
+item-level one before `fn` (not inside an attribute) and whose signature holds
+no `!` (so no macro call) still matches, listed as `reflowed`, when its
+signature tokens are equal with whitespace dropped. Literals and comments stay
+exact, whitespace between two punctuation tokens that could join (`& &` vs
+`&&`) still counts, and only a trailing `,` closing the fn's own generic list or
+outer parameter list may be added or dropped. Every other item must match byte
+for byte. An item must sit under the same module attributes (`#[cfg(..)]` and
+the like), may only lose nesting, and every path literal must resolve, from its
+new file, to a target with the same bytes.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -40,7 +49,7 @@ import itertools
 import posixpath
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import rust_source_tree as rst
@@ -68,6 +77,7 @@ class Unit:
     text: str
     vis: list[tuple[int, str]] = field(default_factory=list)  # (offset in text, token)
     paths: list[tuple[str, str, bytes | None]] = field(default_factory=list)  # (macro, literal, target bytes)
+    kind: str = ""  # item kind (`fn`, `struct`, ..); "" for leading comments
 
     @property
     def key(self) -> tuple[str, str]:
@@ -80,6 +90,90 @@ class Unit:
 def squash(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.replace("( ", "(").replace(" )", ")")
+
+
+# Punctuation that never joins a neighbour into one Rust token, so whitespace beside it is layout.
+JOINLESS = set("()[]{},;")
+
+
+def reflow_key(unit: Unit) -> tuple | None:
+    """What a rustfmt re-wrap of a fn signature keeps (see the module docs), or None when `unit` gets no
+    reflow pass: not a fn, no body, an unexpected signature shape, a visibility token other than one at
+    item level before `fn` (outside attributes), or any `!` in the signature (a macro call can see token
+    boundaries this lexer does not keep)."""
+    if unit.kind != "fn" or len(unit.vis) > 1:
+        return None
+    tokens = rst.tokenize(unit.text)
+    # (kind, text, whitespace before it, offset) of every non-whitespace token.
+    code = [(token.kind, unit.text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws",
+             token.start) for index, token in enumerate(tokens) if token.kind != "ws"]
+    fn_at = body_at = vis_depth = None
+    vis_at = unit.vis[0][0] if unit.vis else None
+    depth = 0
+    for index, (kind, piece, _, start) in enumerate(code):
+        if vis_at is not None and vis_depth is None and start >= vis_at:
+            vis_depth = depth  # bracket depth where the removed visibility token stood
+        if kind == "ident" and piece == "fn" and depth == 0 and fn_at is None:
+            fn_at = index
+        elif kind == "punct" and piece == "{" and depth == 0 and fn_at is not None:
+            body_at = index
+            break
+        if kind == "punct":
+            depth += (piece in "([{") - (piece in ")]}")
+    if fn_at is None or body_at is None or (vis_at is not None and (vis_at > code[fn_at][3] or vis_depth != 0)):
+        return None
+    if any(code[index][:2] == ("punct", "!") for index in range(fn_at, body_at)):
+        return None
+    drop = set()
+    at = fn_at + 2  # after `fn name`
+    if at < body_at and code[at][:2] == ("punct", "<"):
+        at = closing(code, at, body_at, angle=True)
+        if at is None:
+            return None
+        if code[at - 1][:2] == ("punct", ","):
+            drop.add(at - 1)
+        at += 1
+    if not (at < body_at and code[at][:2] == ("punct", "(")):
+        return None
+    at = closing(code, at, body_at, angle=False)
+    if at is None:
+        return None
+    if code[at - 1][:2] == ("punct", ","):
+        drop.add(at - 1)
+    signature: list[str] = []
+    prev = None
+    for index in range(fn_at, body_at):
+        if index in drop:
+            continue
+        kind, piece, spaced, _ = code[index]
+        if (spaced and index - 1 not in drop and prev is not None and prev[0] == kind == "punct"
+                and prev[1] not in JOINLESS and piece not in JOINLESS):
+            signature.append(" ")
+        signature.append(piece)
+        prev = (kind, piece)
+    return unit.container, unit.text[:code[fn_at][3]], tuple(signature), unit.text[code[body_at][3]:]
+
+
+def closing(code: list[tuple[str, str, bool, int]], open_at: int, stop: int, angle: bool) -> int | None:
+    """The index of the `>` (angle) or `)` that closes the list opened at `open_at`, before `stop`."""
+    nest = level = 0
+    for index in range(open_at, stop):
+        kind, piece, spaced, _ = code[index]
+        if kind != "punct":
+            continue
+        if piece in "([{":
+            nest += 1
+        elif piece in ")]}":
+            nest -= 1
+            if not angle and nest == 0:
+                return index
+        elif angle and nest == 0 and piece == "<":
+            level += 1
+        elif angle and nest == 0 and piece == ">" and not (code[index - 1][1] == "-" and not spaced):
+            level -= 1
+            if level == 0:
+                return index
+    return None
 
 
 def dedent(text: str, columns: int) -> str:
@@ -170,11 +264,11 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
     units: list[Unit] = []
 
     def add(item_first: int, item_last: int, start: int, label: str, name: str, module, chain, depth,
-            container: str, strip_vis: bool = True) -> None:
+            container: str, strip_vis: bool = True, kind: str = "") -> None:
         text, vis, paths = normalise(lexed, item_first, item_last, depth, path, source, strip_vis)
         end_line = lexed.line(lexed.tokens[item_last].end - 1)
         units.append(Unit(path, lexed.line(start), end_line, len(units), label, name, module, chain,
-                          depth, container, text, vis, paths))
+                          depth, container, text, vis, paths, kind))
 
     def lead_comments(item: rst.Item, module, chain, container: str) -> None:
         if item.start >= item.lead:
@@ -208,7 +302,7 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
                 if container:
                     label = f"{squash(container.rstrip('{'))} :: {label}"
                 add(item.first_token, item.last_token, item.start, label, item.name, module, chain, item.depth,
-                    container, strip_vis=item.kind != "macro_rules")
+                    container, strip_vis=item.kind != "macro_rules", kind=item.kind)
 
     visit(lexed.items, context.module if context else None, context.chain if context else frozenset(), "")
     return units
@@ -248,20 +342,22 @@ def show(module: tuple[str, ...] | None) -> str:
 @dataclass
 class Ledger:
     pairs: list[tuple[Unit, Unit]] = field(default_factory=list)
+    reflowed: list[tuple[Unit, Unit]] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     widened: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
-def match_units(base: list[Unit], head: list[Unit]) -> tuple[list[tuple[Unit, Unit]], list[Unit], list[Unit]]:
-    """Pair equal units: same file first, then in base order."""
-    head_by_key: dict[tuple[str, str], list[Unit]] = {}
+def match_units(base: list[Unit], head: list[Unit], key=lambda unit: unit.key
+                ) -> tuple[list[tuple[Unit, Unit]], list[Unit], list[Unit]]:
+    """Pair units with equal keys: same file first, then in base order."""
+    head_by_key: dict[tuple, list[Unit]] = {}
     for unit in head:
-        head_by_key.setdefault(unit.key, []).append(unit)
+        head_by_key.setdefault(key(unit), []).append(unit)
     pairs, lost = [], []
     pending: list[Unit] = []
     for unit in base:
-        candidates = head_by_key.get(unit.key)
+        candidates = head_by_key.get(key(unit))
         same = next((c for c in candidates or [] if c.file == unit.file), None)
         if same is not None:
             candidates.remove(same)
@@ -269,7 +365,7 @@ def match_units(base: list[Unit], head: list[Unit]) -> tuple[list[tuple[Unit, Un
         else:
             pending.append(unit)
     for unit in pending:
-        candidates = head_by_key.get(unit.key)
+        candidates = head_by_key.get(key(unit))
         if candidates:
             pairs.append((unit, candidates.pop(0)))
         else:
@@ -302,8 +398,13 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
           allow_widened: set[str]) -> Ledger:
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
-    ledger.pairs = sorted(pairs, key=lambda pair: (pair[0].file, pair[0].seq))
-    moves = module_moves(pairs, head_modules)
+    # A unit with no reflow pass gets a key of its own, so it never pairs.
+    reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_key(unit) or (id(unit),))
+    # The only visibility of a reflowed unit is its leading one: compare it at one offset.
+    ledger.reflowed = [(replace(old, vis=[(0, token) for _, token in old.vis]),
+                        replace(new, vis=[(0, token) for _, token in new.vis])) for old, new in reflowed]
+    ledger.pairs = sorted(pairs + ledger.reflowed, key=lambda pair: (pair[0].file, pair[0].seq))
+    moves = module_moves(ledger.pairs, head_modules)
     explain_differences(ledger, lost, gained)
     by_destination: dict[tuple[str, str], list[tuple[Unit, Unit]]] = {}
     for old, new in ledger.pairs:
@@ -490,11 +591,14 @@ def main(argv: list[str] | None = None) -> int:
     moved = sum(1 for old, new in ledger.pairs if old.file != new.file or old.module != new.module)
     print(f"move-ledger: {len(base_units)} base items in {len(base_files)} files, "
           f"{len(head_units)} head items in {len(head_files)} files: "
-          f"{len(ledger.pairs) - moved} untouched, {moved} moved, {len(ledger.widened)} widened, "
+          f"{len(ledger.pairs) - moved} untouched, {moved} moved, {len(ledger.reflowed)} reflowed, "
+          f"{len(ledger.widened)} widened, "
           f"{len(ledger.failures)} problems")
     limit = REPORT_LIMIT if args.report else None
     for row in rows[:limit]:
         print(f"  moved {row}")
+    for old, new in ledger.reflowed[:limit]:
+        print(f"  reflowed {old.label} ({old.where()} -> {new.where()})")
     for row in ledger.widened[:limit]:
         print(f"  {row}")
     for note in ledger.notes[:limit]:

@@ -192,7 +192,12 @@ pub(crate) fn selected(source: &str, key: String, token: Token, sidecar_or_finge
         add(source, SUB_START + 1, 1);
     }
     with_tags(|tags| {
-        tags.files.insert(key, (slot, token));
+        // A Tail load refused on an owed head-CAS answer tags its read first;
+        // the selection tag that follows keeps it.
+        let tag = tags.files.entry(key).or_insert((slot, token));
+        if tag.1 != Token::HeadConflict {
+            *tag = (slot, token);
+        }
     });
 }
 /// A completed read. Growth read as a replacing Full is a source reset.
@@ -411,5 +416,23 @@ mod tests {
         assert_eq!(row["money_changed_or_unknown"], 0);
         assert_eq!(page["unknown"][0], "money_only_reveal");
         assert!(drain("pi").is_none(), "the line drains its slots");
+    }
+
+    /// [behaviour] A `head_conflict` tag survives a later selection of the
+    /// same file; any other tag is replaced by the later selection.
+    #[test]
+    fn a_head_conflict_tag_survives_a_later_selection() {
+        selected("pi", "owed".into(), Token::HeadConflict, false);
+        selected("pi", "owed".into(), Token::CopyOwnership, false);
+        selected("pi", "other".into(), Token::Append, false);
+        selected("pi", "other".into(), Token::CopyOwnership, false);
+        read("pi", "owed", ReadMode::Tail, 3, 0);
+        read("pi", "other", ReadMode::Tail, 5, 0);
+        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+        assert_eq!(page["read"]["head_conflict"]["files"], 1);
+        assert_eq!(page["read"]["head_conflict"]["native_bytes"], 3);
+        assert_eq!(page["read"]["copy_ownership"]["files"], 1);
+        assert_eq!(page["read"]["copy_ownership"]["native_bytes"], 5);
+        assert!(page["read"].get("append").is_none());
     }
 }

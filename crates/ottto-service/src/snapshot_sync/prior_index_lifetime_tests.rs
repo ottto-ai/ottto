@@ -1,6 +1,5 @@
-// Test-thread-only observer at the leased retirement boundary. The native
-// input is earned once, cloned unchanged for both real finish calls, and never
-// used to manufacture an eligible native-comparison lease.
+// Test-thread-only observer at the ordinary prior-index retirement boundary.
+// The completed input is cloned unchanged for both real finish calls.
 use super::*;
 use std::cell::RefCell;
 
@@ -32,37 +31,18 @@ pub(crate) fn after_retirement(_retained: bool) {
         }
     });
 }
-/// The test collector's rotation budget and what the native allowance saw
-/// at each initialization: (remaining, needed, granted).
-type NativeAllowance = (Option<usize>, Option<usize>, bool);
+// The ordinary test collector's rotation budget.
 thread_local! {
-    static ROTATION: RefCell<(Option<usize>, Vec<NativeAllowance>)> =
-        const { RefCell::new((None, Vec::new())) };
+    static ROTATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 pub(crate) fn rotation_budget() -> usize {
-    ROTATION.with(|state| {
-        state
-            .borrow()
-            .0
-            .unwrap_or(crate::source_rotation::PARKED_BUDGET)
-    })
+    ROTATION.with(|state| state.get().unwrap_or(crate::source_rotation::PARKED_BUDGET))
 }
-pub(crate) fn note_native_allowance(
-    remaining: Option<usize>,
-    needed: Option<usize>,
-    granted: bool,
-) {
-    ROTATION.with(|state| state.borrow_mut().1.push((remaining, needed, granted)));
-}
-/// Run `collect` under `budget`; what the native allowance saw.
-fn with_rotation_budget<T>(
-    budget: usize,
-    collect: impl FnOnce() -> T,
-) -> (T, Vec<NativeAllowance>) {
-    ROTATION.with(|state| *state.borrow_mut() = (Some(budget), Vec::new()));
+fn with_rotation_budget<T>(budget: usize, collect: impl FnOnce() -> T) -> T {
+    ROTATION.with(|state| state.set(Some(budget)));
     let collected = collect();
-    let seen = ROTATION.with(|state| std::mem::take(&mut *state.borrow_mut()).1);
-    (collected, seen)
+    ROTATION.with(|state| state.set(None));
+    collected
 }
 
 pub(in crate::snapshot_sync) struct Guard;
@@ -91,7 +71,7 @@ impl Drop for Guard {
 }
 
 /// What one real cycle of the money parity control left: the live outputs
-/// and the native allowance its collection saw.
+/// through the ordinary selected save.
 #[derive(Debug, PartialEq)]
 struct MoneyCycle {
     ok: bool,
@@ -99,7 +79,6 @@ struct MoneyCycle {
     progress: Option<Vec<u8>>,
     offered: Vec<serde_json::Value>,
     terminal: Vec<serde_json::Value>,
-    allowance: Vec<NativeAllowance>,
 }
 
 /// Wall-clock stamps the arms cannot share (they run one after another and
@@ -140,7 +119,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
         return;
     }
     let fixture = IdentityPipelineHome::new();
-    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("money-parity-support");
     let secrets = fixture.base.join("money-parity-secrets");
@@ -175,9 +153,9 @@ fn e2_real_caller_parity_at_tight_allowances() {
         codex_home_bindings: Vec::new(),
     };
     let retry_clock = current_unix_seconds();
-    // The budget's first completed native input, shared by its arms.
+    // The budget's first completed input, shared by its arms.
     let mut common = BTreeMap::<(usize, bool), (ScanIndex, SourceScanResult, String)>::new();
-    let mut cycle = |budget: usize, conflict: bool, shared: bool| -> MoneyCycle {
+    let mut cycle = |budget: usize, conflict: bool, keep_prior: bool| -> MoneyCycle {
         server.offered.lock().unwrap().clear();
         server.terminal.lock().unwrap().clear();
         cadence.next_due_cycle();
@@ -202,21 +180,19 @@ fn e2_real_caller_parity_at_tight_allowances() {
         })
         .unwrap()
         .expect("actual due preparation");
-        let ((mut preparation, index, scan), allowance) =
-            with_rotation_budget(budget, || collect_native_preparation_with_rotation(frame));
-        let (index, scan) = if shared {
+        let (mut preparation, index, scan) =
+            with_rotation_budget(budget, || collect_preparation_with_rotation(frame));
+        let (index, scan) = {
             let (index, scan, started) = common
                 .entry((budget, conflict))
                 .or_insert_with(|| (index, scan, preparation.scan_started_at.clone()))
                 .clone();
             preparation.scan_started_at = started;
             (index, scan)
-        } else {
-            (index, scan)
         };
         let progress_path = preparation.upload_progress_path.clone();
         let guard = Guard::new(
-            false,
+            keep_prior,
             conflict.then(|| index_path.clone()),
             Some(retry_clock),
         );
@@ -259,7 +235,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 .cloned()
                 .map(money_unclocked)
                 .collect(),
-            allowance,
         }
     };
 
@@ -298,36 +273,25 @@ fn e2_real_caller_parity_at_tight_allowances() {
     // is put back before every arm; the transcripts are only read.
     let mut saved = Vec::new();
     files(&support, &mut saved);
-    let mut run = |budget: usize, conflict: bool| {
+    let mut run = |budget: usize, conflict: bool, keep_prior: bool| {
         std::fs::remove_dir_all(&support).unwrap();
         for (path, bytes, permissions) in &saved {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
             std::fs::set_permissions(path, permissions.clone()).unwrap();
         }
-        cycle(budget, conflict, true)
+        cycle(budget, conflict, keep_prior)
     };
 
-    // The native comparison's exact need at the full budget, then a budget
-    // that leaves exactly that, and one byte less.
-    let full = run(crate::source_rotation::PARKED_BUDGET, false);
-    let [(Some(remaining), Some(needed), true)] = full.allowance[..] else {
-        panic!("one granted native allowance: {:?}", full.allowance);
-    };
-    let tight = crate::source_rotation::PARKED_BUDGET - (remaining - needed);
-    for (budget, granted) in [(tight, true), (tight - 1, false)] {
+    for budget in [crate::source_rotation::PARKED_BUDGET, 64 * 1024] {
         for conflict in [false, true] {
-            let baseline = run(budget, conflict);
-            let remaining = needed - usize::from(!granted);
-            assert_eq!(
-                baseline.allowance,
-                vec![(Some(remaining), Some(needed), granted)],
-                "budget {budget}: the tight allowance"
-            );
+            let baseline = run(budget, conflict, false);
             assert_eq!(baseline.ok, !conflict, "{baseline:?}");
-            assert_eq!(run(budget, conflict), baseline,
-                "gate-on replay preserves bytes, ACKs and allowances at budget {budget}, conflict {conflict}");
+            assert_eq!(
+                run(budget, conflict, true), baseline,
+                "retire versus keep preserves bytes and ACKs at budget {budget}, conflict {conflict}"
+            );
         }
     }
-    writeln!(std::io::stderr().lock(), "e2_money_parity: real_caller=true native_needed={needed} tight_budget={tight} below_refused=true failed_selected_save=true replay_equal=true").unwrap();
+    writeln!(std::io::stderr().lock(), "e2_money_parity: real_caller=true tight_budget=true failed_selected_save=true replay_equal=true").unwrap();
 }

@@ -1582,6 +1582,9 @@ fn handle_command(
             action_type,
             api_base_url,
         } => setup_action(daemon, &authorization, source, action_type, api_base_url),
+        LocalControlCommand::SourceCollection { source, enabled } => {
+            source_collection(daemon, &authorization, source, enabled)
+        }
         LocalControlCommand::TelemetryControl {
             action,
             source,
@@ -9505,10 +9508,74 @@ fn setup_answer(
         }
     };
     let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
-    if source == SourceKind::ClaudeCode {
+    // `disable_source` already revoked with its pause marker.
+    if source == SourceKind::ClaudeCode && answer_type == "skip_source" {
         crate::otlp_relay::legacy::revoke_now();
     }
     setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
+}
+
+/// The Companion's Pause/Resume of one source on this Mac, saved to the
+/// account through the relay. Nothing is deleted and nothing is re-sent.
+fn source_collection(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: SourceKind,
+    enabled: bool,
+) -> Result<serde_json::Value, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
+    let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(&source);
+    let reply = save_source_collection(&source, enabled, |body| {
+        let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials()?;
+        let client = crate::snapshot_client::SnapshotApiClient::new(
+            crate::snapshot_sync::snapshot_api_base_url()?,
+        );
+        let token = client.issue_relay_token(&device, &secret, snapshot_source)?;
+        client.upload_source_control(&token, body)
+    })?;
+    if enabled {
+        request_snapshot_sync_after_device_registration(daemon);
+    }
+    Ok(reply)
+}
+
+/// Pause stops collection before any network and stays paused if the save
+/// fails. Resume writes nothing until the account accepts it, then applies
+/// the reply exactly as a heartbeat's.
+fn save_source_collection(
+    source: &SourceKind,
+    enabled: bool,
+    post: impl FnOnce(&serde_json::Value) -> anyhow::Result<serde_json::Value>,
+) -> Result<serde_json::Value, LocalApiError> {
+    if !enabled {
+        // Also revokes Claude's legacy relay.
+        set_source_marker(crate::snapshot_sync::disable_snapshot_source, source)?;
+    }
+    let support_dir = default_support_dir();
+    let server_saved = match post(&json!({"source": source, "enabled": enabled})) {
+        Ok(reply) => {
+            crate::snapshot_sync::apply_source_control(&support_dir, &reply);
+            true
+        }
+        Err(error) if enabled => {
+            return Err(LocalApiError::LocalOperationFailed(format!(
+                "resume was not saved: {}",
+                crate::snapshot_sync::safe_error(&error)
+            )))
+        }
+        Err(error) => {
+            eprintln!(
+                "source pause not saved: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+            false
+        }
+    };
+    let paused = crate::snapshot_sync::source_paused(
+        &support_dir,
+        crate::snapshot_sync::snapshot_source_of_kind(source),
+    );
+    Ok(json!({"source": source, "source_paused": paused, "server_saved": server_saved}))
 }
 
 fn setup_action(
@@ -30695,6 +30762,241 @@ X-API-Key = "otel_redacted"
             terminal_refresh_rejection(&LocalApiError::NetworkUnavailable),
             None
         );
+    }
+
+    const SC_DEVICE: &str = "6f1c0e52-0000-4000-8000-00000000a001";
+
+    /// A support dir bound to `SC_DEVICE` with every source granted.
+    fn source_collection_support(name: &str) -> (PathBuf, [EnvVarGuard; 2]) {
+        let root = control_test_root(name);
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support root");
+        let env = [
+            EnvVarGuard::set_path("HOME", &root),
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+        ];
+        ottto_core::FileDeviceStore::default()
+            .save(&ottto_core::LocalDeviceBinding {
+                device_id: SC_DEVICE.into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec!["codex".into(), "claude_code".into(), "pi".into()],
+            })
+            .expect("bind device");
+        (support, env)
+    }
+
+    /// The server's reply for Codex: the heartbeat's `source_control` block.
+    fn sc_reply(revision: u64, state: &str) -> serde_json::Value {
+        json!({"source_control": {"contract": "source_control:v1", "device_id": SC_DEVICE,
+            "sources": [{"source": "codex", "revision": revision, "desired_state": state,
+                "changed_at": "2026-11-05T00:00:00Z",
+                "action_id": "00000000-0000-4000-8000-000000000001"}]}})
+    }
+
+    fn sc_files(support: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fs::read_dir(support.join("snapshots"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .map(|path| (path.clone(), fs::read(&path).unwrap_or_default()))
+            .collect()
+    }
+
+    /// [behaviour] Pause writes its marker before the POST; a failed POST
+    /// keeps the source paused and reports it unsaved.
+    #[test]
+    #[serial]
+    fn companion_pause_marks_before_post_and_stays_paused_on_post_failure() {
+        use crate::snapshot_sync::source_marker;
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let (support, _env) = source_collection_support("source-pause");
+        let reply = save_source_collection(&SourceKind::Codex, false, |body| {
+            assert_eq!(body, &json!({"source": "codex", "enabled": false}));
+            assert_eq!(
+                source_marker(&support, SnapshotSource::Codex).as_deref(),
+                Some("pending"),
+                "marked before the POST"
+            );
+            Err(anyhow::anyhow!("offline"))
+        })
+        .expect("an unsaved pause still pauses");
+        assert_eq!(
+            reply,
+            json!({"source": "codex", "source_paused": true, "server_saved": false})
+        );
+        assert_eq!(
+            source_marker(&support, SnapshotSource::Codex).as_deref(),
+            Some("pending")
+        );
+    }
+
+    /// [behaviour] Resume writes nothing before the POST, then applies the
+    /// server's serialized reply as a heartbeat would: the marker turns
+    /// `reconnect` and the record moves to N+1 before the handler returns.
+    #[test]
+    #[serial]
+    fn companion_resume_through_handler_applies_serialized_server_reply() {
+        use crate::snapshot_sync::{apply_source_control, source_marker};
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let (support, _env) = source_collection_support("source-resume");
+        apply_source_control(&support, &sc_reply(4, "disabled"));
+        let body: &'static str = Box::leak(sc_reply(5, "enabled").to_string().into_boxed_str());
+        let (url, server) = scripted_json_backend(vec![(200, body)]);
+        let reply = save_source_collection(&SourceKind::Codex, true, |body| {
+            assert_eq!(
+                source_marker(&support, SnapshotSource::Codex).as_deref(),
+                Some("pending"),
+                "nothing written before the POST"
+            );
+            crate::snapshot_client::SnapshotApiClient::new(url.clone())
+                .upload_source_control("relay-token", body)
+        })
+        .expect("resume saved");
+        let requests = server.join().expect("backend");
+        assert!(requests[0].starts_with("POST /api/v1/apps/health/source-control "));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(http_request_body(&requests[0])).unwrap(),
+            json!({"source": "codex", "enabled": true})
+        );
+        assert_eq!(
+            reply,
+            json!({"source": "codex", "source_paused": false, "server_saved": true})
+        );
+        assert_eq!(
+            source_marker(&support, SnapshotSource::Codex).as_deref(),
+            Some("reconnect")
+        );
+        let record = fs::read(support.join("snapshots/codex.source-control")).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(record["revision"], json!(5));
+    }
+
+    /// [behaviour] A Resume the server did not save fails and writes nothing.
+    #[test]
+    #[serial]
+    fn resume_post_failure_writes_nothing() {
+        use crate::snapshot_sync::disable_snapshot_source;
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let (support, _env) = source_collection_support("source-resume-fail");
+        disable_snapshot_source(&support, SnapshotSource::Codex).unwrap();
+        let before = sc_files(&support);
+        let error = save_source_collection(&SourceKind::Codex, true, |_| {
+            Err(anyhow::anyhow!("offline"))
+        })
+        .expect_err("an unsaved resume fails");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        assert_eq!(sc_files(&support), before);
+    }
+
+    /// [format] Status always carries `source_paused`, read at status time:
+    /// true for a paused source, false for a running or resuming one.
+    #[test]
+    #[serial]
+    fn status_reports_source_paused() {
+        use crate::snapshot_sync::{disable_snapshot_source, reconnect_snapshot_source};
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let (support, _env) = source_collection_support("source-paused-status");
+        let device = ottto_core::FileDeviceStore::default().load().unwrap();
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_registered_device_sources_presence(device, |_| true);
+        disable_snapshot_source(&support, SnapshotSource::Codex).unwrap();
+        disable_snapshot_source(&support, SnapshotSource::Pi).unwrap();
+        reconnect_snapshot_source(&support, SnapshotSource::Pi).unwrap();
+        let status = serde_json::to_value(daemon.status_for_trusted_client().unwrap()).unwrap();
+        let rows = status["sources"].as_array().unwrap().iter();
+        let paused: BTreeMap<_, _> = rows
+            .map(|row| {
+                (
+                    row["source"].as_str().unwrap(),
+                    row["source_paused"].as_bool(),
+                )
+            })
+            .collect();
+        let expected = [("claude_code", false), ("codex", true), ("pi", false)];
+        assert_eq!(paused, BTreeMap::from(expected.map(|(s, p)| (s, Some(p)))));
+    }
+
+    /// [behaviour] Claude's legacy relay is revoked once per local answer.
+    /// A disable revokes with its pause marker before the POST, so a refused
+    /// POST stays paused; a skip revokes after its POST and pauses nothing.
+    #[test]
+    #[serial]
+    fn setup_answer_revokes_claude_once_and_disable_stays_paused_on_failed_post() {
+        use crate::otlp_relay::legacy::count_revokes;
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("setup-answer-revoke");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("setup-answer-revoke-secret");
+        fs::create_dir_all(&support_root).expect("support root");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_answer")
+            .expect("persist setup token");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup answer backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("address"));
+        thread::spawn(move || {
+            for (status, reason, body) in [
+                (400, "Bad Request", r#"{"detail":"refused"}"#),
+                (
+                    200,
+                    "OK",
+                    r#"{"run":{"id":"setup_answer","status":"waiting_for_user","machine_id":"machine_test"},"sources":[],"next_action":null,"next_question":null}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept setup answer");
+                let request = read_complete_http_request(&mut stream);
+                assert!(request.contains("/api/v1/setup-runs/setup_answer/local-client/answers"));
+                write_json_response(&mut stream, status, reason, body);
+            }
+        });
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_answer".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        let answer = |answer_type: &str| {
+            setup_answer(
+                &daemon,
+                &RequestAuthorization::Token("token".to_string()),
+                SourceKind::ClaudeCode,
+                answer_type.to_string(),
+                Some(api_base_url.clone()),
+            )
+        };
+        let marker =
+            || crate::snapshot_sync::source_marker(&support_root, SnapshotSource::ClaudeCode);
+
+        let revokes = count_revokes(|| {
+            answer("disable_source").expect_err("the backend refuses the disable");
+        });
+        assert_eq!(revokes, 1);
+        assert_eq!(marker().as_deref(), Some("pending"), "fail-closed");
+
+        fs::remove_file(support_root.join("snapshots/claude_code.source-disabled"))
+            .expect("clear the pause marker");
+        let revokes = count_revokes(|| {
+            answer("skip_source").expect("skip is saved");
+        });
+        assert_eq!(revokes, 1);
+        assert_eq!(marker(), None, "a skip pauses nothing");
     }
 
     #[test]

@@ -121,6 +121,40 @@ impl PipelineFixture {
             .expect("append synthetic Claude response");
     }
 
+    /// Native ordinary-money input with an unresolved occurrence model. The
+    /// saved owner represents a binding from an earlier accepted revision;
+    /// no row account is installed during this scan's evidence stages.
+    pub(super) fn native_account_hold_input(&self) {
+        self.list_held(&[PIPELINE_HELD_SESSION]);
+        let path = self.root.join(format!("{PIPELINE_HELD_SESSION}.jsonl"));
+        let lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["requestId"] == "req_0_2" {
+                    row["message"].as_object_mut().unwrap().remove("model");
+                }
+                row.to_string() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(path, lines).unwrap();
+
+        let index = ScanIndex::load(&self.index_path).unwrap();
+        let mut saved = serde_json::to_value(index).unwrap();
+        let owner_key = crate::context_footprint::sha256_hex(&[
+            "session_owner:v1",
+            PIPELINE_MACHINE_ID,
+            PIPELINE_HELD_SESSION,
+        ]);
+        saved["session_account_bindings"][owner_key] = serde_json::json!({
+            "account_identifier_hash": "a".repeat(64),
+            "workspace_identifier_hash": null
+        });
+        let mut index: ScanIndex = serde_json::from_value(saved).unwrap();
+        index.save(&self.index_path).unwrap();
+    }
+
     pub(super) fn key(index: &ScanIndex, session: &str) -> String {
         let suffix = format!("{session}.jsonl");
         index
@@ -502,7 +536,19 @@ impl PipelineFixture {
 
     /// The baseline: every session committed and accepted, one owner proven.
     pub(super) fn baseline(&self) -> ScanIndex {
-        let pages = self.traversal(8, &PIPELINE_BASELINE_CYCLE);
+        self.baseline_for_cycle(&PIPELINE_BASELINE_CYCLE)
+    }
+
+    /// Save native baseline bodies without synthetic row-account stamping.
+    pub(super) fn native_baseline(&self) -> ScanIndex {
+        self.baseline_for_cycle(&PipelineCycle {
+            proven_owner_session: None,
+            ..PIPELINE_BASELINE_CYCLE
+        })
+    }
+
+    fn baseline_for_cycle(&self, cycle: &PipelineCycle<'_>) -> ScanIndex {
+        let pages = self.traversal(8, cycle);
         let last = pages.last().expect("baseline page");
         assert!(last.scan.census_complete);
         assert!(last.fully_settled);
@@ -598,7 +644,11 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
         pipeline_transcript_line(PIPELINE_LATER_SESSION, "req_3_1", 0),
     )
     .unwrap();
-    let baseline = fixture.baseline();
+    let baseline = if account_hold {
+        fixture.native_baseline()
+    } else {
+        fixture.baseline()
+    };
     if !account_hold {
         fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
@@ -635,10 +685,9 @@ fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accept
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) = mixed_rejected_fixture("h1-real-account-refusal", true);
+    fixture.native_account_hold_input();
     assert_real_rejected_hold(
         &fixture,
         &baseline,

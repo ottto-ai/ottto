@@ -339,9 +339,9 @@ impl Scope {
             report_at_finish: false,
         }
     }
-    pub(crate) fn finish_decision(claude: bool, has_lease: bool) -> Self {
+    pub(crate) fn finish_decision(claude: bool) -> Self {
         let mut scope = Self::begin(claude);
-        scope.report_at_finish = claude && !has_lease;
+        scope.report_at_finish = claude;
         scope
     }
     pub(crate) fn finish(mut self) -> Counts {
@@ -364,28 +364,7 @@ impl Drop for Scope {
 }
 pub(crate) fn emit_without_lease(counts: Counts) {
     if counts != Counts::default() {
-        // The disabled-before-lease point has already reported the gate.
-        // Reuse its stage at the end of work only when there are actual events.
-        // Pass a plain decision to avoid merging the active TLS scope twice.
-        #[derive(Serialize)]
-        struct Row {
-            #[serde(flatten)]
-            decision: super::NativeComparisonDecision,
-            #[serde(flatten)]
-            counts: Counts,
-        }
-        super::traversal_point(
-            "native_comparison_decision",
-            "claude_code",
-            &Row {
-                decision: super::NativeComparisonDecision {
-                    layout_supported: crate::heap_layout_bound::layout_supported(),
-                    outcome: super::NativeDecisionOutcome::DisabledBeforeLease,
-                    ..Default::default()
-                },
-                counts,
-            },
-        );
+        super::traversal_point("native_collection_page", "claude_code", &counts);
     }
 }
 pub(crate) fn active() -> bool {

@@ -1168,7 +1168,6 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
                 &committed,
                 &mut raw,
                 std::slice::from_ref(&fixture.root),
-                None,
             );
             assert!(!released
                 .claude_account_deferred_holds
@@ -1280,7 +1279,6 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                     &committed,
                     &mut candidates,
                     std::slice::from_ref(&fixture.root),
-                    None,
                 )
             });
         assert!(!accepted.claude_account_deferred_holds.contains_key(&key));
