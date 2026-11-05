@@ -4,6 +4,8 @@
 
 pub(super) mod entry;
 pub(super) mod file_set_digest;
+mod load;
+pub(super) mod save;
 pub(super) mod serde_lenient;
 pub(super) mod source_fingerprint;
 
