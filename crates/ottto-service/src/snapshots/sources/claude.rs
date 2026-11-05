@@ -1,7 +1,9 @@
 //! Claude Code: context posture, settings defaults, the usage census,
-//! subagent identity and agent metadata.
+//! subagent identity, agent metadata and the usage-field readers of one
+//! transcript record.
 
 pub(in crate::snapshots) mod census;
 pub(in crate::snapshots) mod context_posture;
+pub(in crate::snapshots) mod line;
 pub(in crate::snapshots) mod settings_defaults;
 pub(in crate::snapshots) mod subagent_identity;
