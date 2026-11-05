@@ -194,6 +194,12 @@ commit or runtime move, run
 `scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto`
 to scan current export candidates, candidate path history, and the generated
 bundle for private paths and secret-like content.
+The default `scripts/public_repo_secret_scan.sh` scans every committed `HEAD`
+blob using the committed deny policy, without reading history or working files.
+It refuses symlinks, gitlinks, unsafe paths, private/build paths, environment
+files, bytecode, and tracked derived manifests before scanning content. Findings
+contain only categories and escaped file locations. The public surface CI job
+runs this scan and the root contract check directly.
 Run `scripts/public_repo_surface_ci.sh --staged-output dist/public-export/ottto`
 to copy the generated root-shaped bundle into a temporary git checkout and run
 the same public-surface gate that the exported GitHub Actions workflow uses:

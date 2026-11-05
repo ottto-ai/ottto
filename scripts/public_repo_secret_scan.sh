@@ -21,12 +21,12 @@ usage() {
   cat <<'USAGE'
 Usage: public_repo_secret_scan.sh [--staged-output <dir>]
 
-Scans the public export candidate set for private paths and secret-like content
-before public repo bootstrap. The scan covers:
+Scans every committed HEAD blob for forbidden paths and secret-like content.
+The default reads no history, working files, or untracked files. Symlinks,
+gitlinks, unsafe paths, and tracked derived manifests are refused before reads.
 
-- current tracked export candidates
-- historical blobs for paths that lived under export roots on the current branch
-- optional root-shaped staged bundle output
+--staged-output retains the export candidate/history and staged bundle checks
+while export callers migrate.
 
 Override PUBLIC_EXPORT_REPO_ROOT or PUBLIC_EXPORT_*_FILE environment variables
 for tests. Set PUBLIC_SECRET_SCAN_ALL_REFS=1 for a whole-local-repository audit
@@ -58,6 +58,7 @@ done
 python3 - "$REPO_ROOT" "$ROOTS_FILE" "$DENY_PATTERNS_FILE" "$STAGED_OUTPUT_DIR" <<'PY'
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -69,6 +70,8 @@ roots_file = Path(sys.argv[2]).resolve()
 deny_patterns_file = Path(sys.argv[3]).resolve()
 staged_output_arg = sys.argv[4]
 staged_output_dir = Path(staged_output_arg).resolve() if staged_output_arg else None
+legacy_export = staged_output_dir is not None or os.environ.get("PUBLIC_SECRET_SCAN_ALL_REFS") == "1"
+policy_override = any(name in os.environ for name in ("PUBLIC_EXPORT_CONFIG_DIR", "PUBLIC_EXPORT_DENY_PATTERNS_FILE"))
 scan_all_refs = os.environ.get("PUBLIC_SECRET_SCAN_ALL_REFS") == "1"
 history_ref_args = ["--all"] if scan_all_refs else []
 
@@ -87,13 +90,13 @@ def git_lines(*args: str, check: bool = True) -> list[str]:
         stderr=subprocess.PIPE,
     )
     if check and proc.returncode != 0:
-        die(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+        die("git command failed")
     return [line for line in proc.stdout.splitlines() if line]
 
 
 def config_lines(path: Path) -> list[str]:
     if not path.is_file():
-        die(f"required file is missing: {path}")
+        die("required configuration file is missing")
     rows: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         stripped = raw.strip()
@@ -109,14 +112,18 @@ def compile_posix_ere(pattern: str) -> re.Pattern[str]:
 
 def load_denies() -> list[tuple[str, re.Pattern[str], str, str]]:
     denies: list[tuple[str, re.Pattern[str], str, str]] = []
-    for line in config_lines(deny_patterns_file):
+    for row_number, line in enumerate(policy_rows, start=1):
         fields = line.split("\t")
         if len(fields) < 3:
-            die(f"{deny_patterns_file} contains a malformed row: {line}")
+            die(f"malformed deny-pattern row {row_number}")
         scope, pattern, description = fields[0], fields[1], fields[2]
         if scope not in {"path", "content"}:
-            die(f"unknown deny-pattern scope '{scope}' for {pattern}")
-        denies.append((scope, compile_posix_ere(pattern), description, pattern))
+            die(f"unknown deny-pattern scope at row {row_number}")
+        try:
+            regex = compile_posix_ere(pattern)
+        except re.error:
+            die(f"invalid deny-pattern regex at row {row_number}")
+        denies.append((scope, regex, description, pattern))
     return denies
 
 
@@ -178,7 +185,7 @@ def scan_path_denies(paths: list[str], denies: list[tuple[str, re.Pattern[str], 
     for path in paths:
         for scope, regex, description, _pattern in denies:
             if scope == "path" and regex.search(path):
-                failures.append(f"{label} path denied: {description}: {path}")
+                failures.append(f"{label} path denied: {description}: {json.dumps(path, ensure_ascii=True)}:1")
 
 
 def scan_text(
@@ -193,7 +200,7 @@ def scan_text(
     for line_number, line in enumerate(text.splitlines(), start=1):
         for scope, regex, description, _pattern in denies:
             if scope == "content" and regex.search(line):
-                failures.append(f"{origin}: {description}: {path}:{line_number}")
+                failures.append(f"{origin}: {description}: {json.dumps(path, ensure_ascii=True)}:{line_number}")
 
 
 def scan_current_files(candidates: list[str], denies: list[tuple[str, re.Pattern[str], str, str]], failures: list[str]) -> None:
@@ -246,6 +253,82 @@ def scan_history(paths: list[str], denies: list[tuple[str, re.Pattern[str], str,
     return blob_count
 
 
+def git_bytes(*args: str) -> bytes:
+    proc = subprocess.run(["git", "-C", str(repo_root), *args], capture_output=True)
+    if proc.returncode:
+        die("git command failed")
+    return proc.stdout
+
+
+FORBIDDEN_PATH = re.compile(
+    r"(^|/)(\.claude|\.agents|backend|frontend|infra|dist|target|__pycache__)(/|$)"
+    r"|(^|/)tools/ottto-local-platform(/|$)|(^|/)docs/(dev|ai)(/|$)"
+    r"|(^|/)[^/]*\.py[co]$|(^|/)\.env(?:\.[^/]*)?(?:/|$)"
+    # Current tree only: history still holds these notes, so the tsv must not.
+    r"|(^|/)docs/notes(/|$)|(^|/)docs/development(/|$)|(^|/)docs/session-20[0-9][0-9]-"
+)
+
+def committed_entries() -> list[tuple[str, str]]:
+    entries = []
+    for raw in git_bytes("ls-tree", "-r", "-z", "--full-tree", "HEAD").split(b"\0"):
+        if not raw:
+            continue
+        meta, raw_path = raw.split(b"\t", 1)
+        mode, kind, oid = meta.decode("ascii").split()
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            die("unsafe non-UTF-8 path", code=1)
+        parts = path.split("/")
+        location = json.dumps(path, ensure_ascii=True) + ":1"
+        if path.startswith("/") or any(part in {"", ".", "..", ".git"} for part in parts):
+            die(f"unsafe path: {location}", code=1)
+        if mode == "120000":
+            die(f"symlink denied: {location}", code=1)
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            die(f"non-blob or mode denied: {location}", code=1)
+        if path == "PUBLIC_EXPORT_MANIFEST.json":
+            die(f"derived manifest tracked: {location}", code=1)
+        if FORBIDDEN_PATH.search(path):
+            die(f"HEAD path denied: {location}", code=1)
+        entries.append((path, oid))
+    # Preserve the manifest --guard index protection as well as HEAD protection.
+    if git_bytes("ls-files", "-z", "--", "PUBLIC_EXPORT_MANIFEST.json"):
+        die('derived manifest tracked in index: "PUBLIC_EXPORT_MANIFEST.json":1', code=1)
+    return entries
+
+
+def committed_blobs(entries: list[tuple[str, str]]):
+    # Object ids avoid quoting/pathspec ambiguities, including embedded newlines.
+    with subprocess.Popen(["git", "-C", str(repo_root), "cat-file", "--batch"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as proc:
+        assert proc.stdin is not None and proc.stdout is not None
+        for path, oid in entries:
+            proc.stdin.write(oid.encode("ascii") + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) != 3 or header[1] != b"blob":
+                die("committed blob read failed")
+            size = int(header[2])
+            data = proc.stdout.read(size)
+            if len(data) != size or proc.stdout.read(1) != b"\n":
+                die("committed blob read failed")
+            yield path, data.decode("utf-8", errors="ignore")
+        proc.stdin.close()
+        if proc.wait():
+            die("committed blob read failed")
+
+
+def scan_committed_tree(entries, denies, failures):
+    scan_path_denies([path for path, _oid in entries], denies, "HEAD", failures)
+    # Complete all path/mode refusals before opening any content blobs.
+    if failures:
+        return
+    for path, text in committed_blobs(entries):
+        scan_text(text, path, "HEAD content denied", denies, failures)
+
+
 def scan_staged_output(staged_root: Path, denies: list[tuple[str, re.Pattern[str], str, str]], failures: list[str]) -> int:
     if not staged_root.is_dir():
         die(f"staged output directory is not a directory: {staged_root}")
@@ -267,16 +350,30 @@ if not repo_root.is_dir():
     die(f"repo root is not a directory: {repo_root}")
 subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"], check=True, stdout=subprocess.DEVNULL)
 
+# Validate the complete tree before reading even the committed deny policy.
+entries = [] if legacy_export else committed_entries()
+if legacy_export or policy_override:
+    policy_rows = config_lines(deny_patterns_file)
+else:
+    policy_entry = [entry for entry in entries if entry[0] == "public-export/deny-patterns.tsv"]
+    if not policy_entry:
+        die("required committed deny policy is missing")
+    policy_text = list(committed_blobs(policy_entry))[0][1]
+    policy_rows = [line for line in policy_text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 denies = load_denies()
-current = tracked_candidates()
-history_paths = historical_paths(current)
 failures: list[str] = []
-
-scan_path_denies(current, denies, "current export", failures)
-scan_path_denies(history_paths, denies, "historical export", failures)
-scan_current_files(current, denies, failures)
-history_blob_count = scan_history(history_paths, denies, failures)
-staged_count = scan_staged_output(staged_output_dir, denies, failures) if staged_output_dir else 0
+current, history_paths = [], []
+history_blob_count = staged_count = 0
+if legacy_export:
+    current = tracked_candidates()
+    history_paths = historical_paths(current)
+    scan_path_denies(current, denies, "current export", failures)
+    scan_path_denies(history_paths, denies, "historical export", failures)
+    scan_current_files(current, denies, failures)
+    history_blob_count = scan_history(history_paths, denies, failures)
+    staged_count = scan_staged_output(staged_output_dir, denies, failures) if staged_output_dir else 0
+else:
+    scan_committed_tree(entries, denies, failures)
 
 if failures:
     for failure in failures:
@@ -291,7 +388,7 @@ if failures:
 
 print(
     "public-secret-scan: checked "
-    f"{len(current)} current candidate file(s), {len(history_paths)} historical path(s), "
+    f"{len(entries)} HEAD blob(s), {len(current)} current candidate file(s), {len(history_paths)} historical path(s), "
     f"{history_blob_count} historical blob(s), {staged_count} staged output file(s)"
 )
 PY

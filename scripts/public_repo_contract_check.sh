@@ -84,6 +84,7 @@ python3 - "$PUBLIC_ROOT" "$PRIVATE_REPO_ROOT" "$PRIVATE_RUNTIME_PIN" "$REQUIRE_P
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -907,6 +908,144 @@ def check_diagnostics_values_are_redacted(value: Any, context: str) -> None:
         for pattern, label in DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS:
             if pattern.search(raw):
                 fail(f"{path} exposes unredacted {label}: {raw!r}")
+
+
+def check_public_skeleton_contracts() -> None:
+    # Stable root requirements also apply without an exported bundle.
+    required_dirs = (
+        ".github",
+        ".github/workflows",
+        "agent-adapters",
+        "agent-adapters/codex-skill",
+        "agent-adapters/codex-skill/agents",
+        "agent-adapters/claude-code-skill",
+        "connectors",
+        "connectors/sources",
+        "crates",
+        "crates/ottto-cli",
+        "crates/ottto-connector-sdk",
+        "crates/ottto-connector-testkit",
+        "crates/ottto-core",
+        "crates/ottto-protocol",
+        "crates/ottto-service",
+        "docs",
+        "fixtures",
+        "homebrew",
+        "public-export",
+        "release",
+        "schemas",
+        "scripts",
+    )
+    for relative in required_dirs:
+        expect((PUBLIC_ROOT / relative).is_dir(), f"required directory is missing: {relative}")
+    required_files = (
+        ".github/dependabot.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/macos-stable-release.yml",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+        "SECURITY.md",
+        "SUPPORT.md",
+        "TRADEMARKS.md",
+        "agent-adapters/codex-skill/SKILL.md",
+        "agent-adapters/codex-skill/agents/openai.yaml",
+        "agent-adapters/claude-code-skill/SKILL.md",
+        "connectors/README.md",
+        "connectors/registry.generated.json",
+        "connectors/sources/codex/source.toml",
+        "crates/Cargo.lock",
+        "crates/Cargo.toml",
+        "crates/ottto-cli/Cargo.toml",
+        "crates/ottto-connector-sdk/Cargo.toml",
+        "crates/ottto-connector-testkit/Cargo.toml",
+        "crates/ottto-core/Cargo.toml",
+        "crates/ottto-protocol/Cargo.toml",
+        "crates/ottto-service/Cargo.toml",
+        "docs/README.md",
+        "docs/agent-adapters.md",
+        "docs/support.md",
+        "fixtures/cli/help-contract.txt",
+        "homebrew/README.md",
+        "release/README.md",
+        "release/manifest.schema.json",
+        "schemas/collector-fixture.schema.json",
+        "schemas/collector-manifest.schema.json",
+        "schemas/connector-registry.schema.json",
+        "schemas/source-manifest.schema.json",
+    )
+    for relative in required_files:
+        require_file(relative)
+    required_executables = (
+        "scripts/homebrew_formula.sh",
+        "scripts/hosted_native_installer.sh",
+        "scripts/macos_attestation_bind.sh",
+        "scripts/macos_manifest_signature.sh",
+        "scripts/macos_release_gate.sh",
+        "scripts/macos_release_source_check.sh",
+        "scripts/macos_public_rc_evidence_template.sh",
+        "scripts/macos_public_rc_gate.sh",
+        "scripts/macos_stable_preflight.sh",
+        "scripts/macos_stable_qa_evidence_template.sh",
+        "scripts/public_repo_contract_check.sh",
+        "scripts/public_repo_secret_scan.sh",
+        "scripts/public_repo_surface_ci.sh",
+        "scripts/test_public_repo_contract_check.sh",
+        "scripts/test_public_repo_secret_scan.sh",
+        "scripts/test_public_repo_surface_ci.sh",
+        "scripts/test_macos_public_rc_gate.sh",
+        "scripts/test_macos_attestation_bind.sh",
+        "scripts/test_macos_release_source_check.sh",
+        "scripts/test_macos_manifest_signature.sh",
+        "scripts/test_macos_stable_release_workflow.sh",
+        "scripts/test_macos_stable_qa_evidence_template.sh",
+        "scripts/public_repo_manifest.sh",
+    )
+    for relative in required_executables:
+        path = require_file(relative)
+        if path is not None:
+            expect(os.access(path, os.X_OK), f"required executable is not executable: {relative}")
+    patterns = (
+        ('^\\[workspace\\]$', 'Cargo.toml', 'root Rust workspace'),
+        ('"crates/ottto-cli"', 'Cargo.toml', 'runtime crate workspace membership'),
+        ('"crates/ottto-service"', 'Cargo.toml', 'service crate workspace membership'),
+        ('^\\[workspace\\]$', 'crates/Cargo.toml', 'connector Rust workspace'),
+        ('"ottto-connector-sdk"', 'crates/Cargo.toml', 'connector SDK workspace membership'),
+        ('"ottto-connector-testkit"', 'crates/Cargo.toml', 'connector testkit workspace membership'),
+        ('^# Ottto Local Platform$', 'README.md', 'root README title'),
+        ('^## Public V1 Promise$', 'README.md', 'public v1 promise'),
+        ('^# Ottto Local Platform Public Docs$', 'docs/README.md', 'public docs index'),
+        ('^# Agent Adapters$', 'docs/agent-adapters.md', 'agent adapter docs'),
+        ('MCP adapter is intentionally deferred', 'docs/agent-adapters.md', 'MCP adapter deferral'),
+        ('^# Ottto Local Platform Support Runbook$', 'docs/support.md', 'support runbook title'),
+        ('^## Triage$', 'docs/support.md', 'support runbook triage'),
+        ('^## Diagnostics$', 'docs/support.md', 'support runbook diagnostics'),
+        ('^## Escalation$', 'docs/support.md', 'support runbook escalation'),
+        ('^## Do Not Collect$', 'docs/support.md', 'support runbook data boundaries'),
+        ('docs/support\\.md', 'SUPPORT.md', 'root support runbook link'),
+        ('github-actions', '.github/dependabot.yml', 'GitHub Actions dependency hygiene'),
+        ('package-ecosystem: cargo', '.github/dependabot.yml', 'Cargo dependency hygiene'),
+        ('cargo clippy', '.github/workflows/ci.yml', 'Rust clippy CI'),
+        ('public_repo_surface_ci\\.sh', '.github/workflows/ci.yml', 'public surface CI gate'),
+        ('public_repo_surface_ci\\.sh --scope portable', '.github/workflows/ci.yml', 'portable (Linux) public surface CI gate'),
+        ('public_repo_surface_ci\\.sh --scope macos', '.github/workflows/ci.yml', 'macOS-native public surface CI gate'),
+        ('workflow_dispatch', '.github/workflows/macos-stable-release.yml', 'stable release manual dispatch'),
+        ('macos-stable-release', '.github/workflows/macos-stable-release.yml', 'stable release protected environment'),
+        ('macos_attestation_bind\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release attestation binding'),
+        ('macos_release_source_check\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release source verification'),
+        ('macos_manifest_signature\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release manifest signature'),
+        ('public_repo_contract_check\\.sh', 'scripts/public_repo_surface_ci.sh', 'public contract CI gate'),
+        ('public_repo_secret_scan\\.sh', 'scripts/public_repo_surface_ci.sh', 'secret scan CI gate'),
+    )
+    for pattern, relative, description in patterns:
+        path = require_file(relative)
+        if path is not None:
+            expect(re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE) is not None,
+                   f"{description}: pattern not found in {relative}")
 
 
 def check_schema_contracts() -> None:
@@ -2551,6 +2690,7 @@ def check_private_consumers() -> int:
 if not PUBLIC_ROOT.is_dir():
     die(f"public repository root is not a directory: {PUBLIC_ROOT}")
 
+check_public_skeleton_contracts()
 check_schema_contracts()
 check_registry_contract()
 check_cli_contracts()
