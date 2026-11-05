@@ -54760,6 +54760,13 @@ crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_token
 crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
 
 impl ScanIndex {
+    /// A routed page's save left out a new entry, and with it that file's
+    /// staged Tail head: a later save of this page would commit the entry
+    /// with no head.
+    pub(crate) fn left_out_new_tail_entry(&self, saved: &Self) -> bool {
+        self.v2().persistence_v2.is_some()
+            && self.files.keys().any(|key| !saved.files.contains_key(key))
+    }
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
         if let Some(state) = &committed.v2 {
             let own = self.v2_mut();
