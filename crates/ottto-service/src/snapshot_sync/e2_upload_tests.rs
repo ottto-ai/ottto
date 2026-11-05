@@ -244,7 +244,10 @@ fn e2_literal_batch_validation_error_holds_entity_and_settles_siblings() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(progress.quarantined_fingerprints.contains_key(&poison));
     for item in &items {
@@ -272,7 +275,10 @@ fn e2_partial_entity_ack_settles_only_acknowledged_members() {
     assert_eq!(batches.len(), 1, "the family travels together");
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(progress.accepted_fingerprints.contains(&root));
     assert!(!progress.accepted_fingerprints.contains(&agent));

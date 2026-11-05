@@ -275,7 +275,13 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(
+        outcome,
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
+    );
     assert_eq!(sends, 2);
     assert_eq!(accepted, 2);
     let refused = refused.unwrap().snapshot_fingerprint;
@@ -1367,16 +1373,45 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
     assert_eq!(accepted, 1);
     assert_eq!(
         with_bootstrap_deferred(outcome, deferred),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     // Deferred dominates refusal as in the partitioned uploader.
     assert_eq!(
         with_bootstrap_deferred(ResumableUploadResult::Rejected { count: 2 }, 1),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(
-        with_bootstrap_deferred(ResumableUploadResult::Deferred { count: 2 }, 1),
-        ResumableUploadResult::Deferred { count: 3 }
+        with_bootstrap_deferred(
+            ResumableUploadResult::Deferred {
+                count: 2,
+                isolated: 0
+            },
+            1
+        ),
+        ResumableUploadResult::Deferred {
+            count: 3,
+            isolated: 0
+        }
+    );
+    // A true deferral beside an isolated refusal still defers the pass.
+    assert_eq!(
+        with_bootstrap_deferred(
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 1
+            },
+            1
+        ),
+        ResumableUploadResult::Deferred {
+            count: 2,
+            isolated: 1
+        }
     );
     assert_eq!(
         with_bootstrap_deferred(ResumableUploadResult::Rejected { count: 2 }, 0),
@@ -1401,6 +1436,50 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         with_bootstrap_deferred(ResumableUploadResult::Disabled(None), 1),
         ResumableUploadResult::Disabled(None)
     );
+    // A probe refused as ordinary mixed usage is held alone and does not
+    // defer the pass; the main upload carries its exact quarantined body.
+    let mut mixed = progress();
+    let deferred = bootstrap_cache_heads(
+        &probes,
+        "h360-mixed",
+        &mut mixed,
+        true,
+        |batch, cas| {
+            let mut ack = response(&batch, 0);
+            if cas {
+                for reference in ack
+                    .accepted_entities
+                    .iter_mut()
+                    .chain(&mut ack.unchanged_entities)
+                {
+                    reference.head_etag = Some("e".repeat(64));
+                }
+                ack.accepted_entities
+                    .retain(|reference| reference.snapshot_fingerprint != conflict_fp);
+                ack.unchanged_entities
+                    .retain(|reference| reference.snapshot_fingerprint != conflict_fp);
+                ack.accepted -= 1;
+                ack.rejected_entities.push(SnapshotEntityRejection {
+                    source_session_id: probes[0].source_session_id.clone(),
+                    snapshot_fingerprint: conflict_fp.clone(),
+                    reason: "accepted_log_stale_older_mixed".into(),
+                    detail: "not logged".into(),
+                    permanent: false,
+                    occurrence_count: 1,
+                });
+            }
+            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(deferred, 0);
+    assert_eq!(
+        mixed.quarantined_fingerprints[&conflict_fp].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(cache_head_probe_held(&mixed, &probes[0]));
     // A shed or disabled probe stage still aborts before any main upload.
     crate::client_report::reset_for_test();
     for case in ["shed", "disabled"] {
