@@ -10,7 +10,7 @@ several coding agents on your Mac, such as Claude Code, Codex and Pi.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/overview-dark.png">
-    <img alt="The Ottto dashboard Overview page for a demo account: cost cards for the period, subscription plans, a table of recent sessions and the status of each connected agent." src="docs/assets/readme/overview-light.png" width="860">
+    <img alt="The Ottto dashboard Overview page for a demo account, last 7 days: cards for API usage, subscriptions, cloud providers and daily run-rate; pay-as-you-go cost drivers by agent for Claude Code, Codex and Pi; and token, session and hourly activity summaries." src="docs/assets/readme/overview-light.png" width="860">
   </picture><br>
   <sub>The Overview page of the Ottto dashboard, showing a demo account's data.</sub>
 </p>
