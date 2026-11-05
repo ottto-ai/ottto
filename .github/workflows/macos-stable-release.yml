@@ -423,6 +423,7 @@ jobs:
           set -euo pipefail
           scripts/macos_stable_preflight.sh \
             --manifest dist/macos/release-manifest.json \
+            --require-installer-sha256 \
             --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
             --keychain-profile "$OTTTO_NOTARY_PROFILE"
 

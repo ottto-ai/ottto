@@ -310,7 +310,7 @@ See `../homebrew/README.md` for the tap layout and clean-Mac install, service,
 update, and uninstall QA checklist.
 
 Generate the stable hosted native installer wrapper from the same stable
-manifest only after the stable release gate and stable preflight pass:
+manifest before stable preflight, attestation binding, and manifest signing:
 
 ```bash
 ./scripts/hosted_native_installer.sh \
@@ -322,8 +322,10 @@ manifest only after the stable release gate and stable preflight pass:
 `--record-sha256` writes the generated wrapper's SHA-256 into the manifest at
 `install_methods.verified_native_installer.sha256`. Run it before attestation
 binding and manifest signing so the signed manifest publishes the exact digest
-of the served `install-macos.sh`; stable preflight fails when the field is
-missing or does not match the file.
+of the served `install-macos.sh`. The release workflow passes
+`--require-installer-sha256` to stable preflight to reject a missing field.
+Without that flag, preflight accepts older manifests without the field for
+rollback verification; a present field must always be valid and match the file.
 
 The wrapper is a terminal convenience around the native signed artifact. It
 downloads the immutable `release-manifest.json`, verifies that the manifest is

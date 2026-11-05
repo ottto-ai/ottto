@@ -52,22 +52,25 @@ Homebrew opt path.
 When a stable release advertises a verified native installer helper, the
 stable release manifest publishes the helper's immutable URL and SHA-256 under
 `install_methods.verified_native_installer`. Download the helper from that URL
-and check it against the manifest before running it (`jq` ships with macOS 15
-and later):
+and check it against the manifest before running it. These commands use built-in
+`plutil`, available on every supported macOS version (14 or later):
 
 ```bash
+(
+set -e
 curl -fsSL https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json \
   -o release-manifest.json
-helper_url="$(jq -r '.install_methods.verified_native_installer.url' release-manifest.json)"
-helper_sha="$(jq -r '.install_methods.verified_native_installer.sha256' release-manifest.json)"
+helper_url="$(plutil -extract install_methods.verified_native_installer.url raw -expect string -o - release-manifest.json)"
+helper_sha="$(plutil -extract install_methods.verified_native_installer.sha256 raw -expect string -o - release-manifest.json)"
 curl -fsSL "$helper_url" -o install-macos.sh
-echo "$helper_sha  install-macos.sh" | shasum -a 256 -c -
+printf '%s  install-macos.sh\n' "$helper_sha" | shasum -a 256 -c -
 bash install-macos.sh
 ottto status --json
+)
 ```
 
-Stop if `shasum` reports a mismatch or the manifest has no `sha256` for the
-helper. The SHA-256 is part of the signed manifest bytes, so
+Stop if any command fails, including extraction of a missing `sha256` or a
+`shasum` mismatch. The SHA-256 is part of the signed manifest bytes, so
 `release-manifest.json.sig` covers it; see
 [Release Verification](release-verification.md).
 

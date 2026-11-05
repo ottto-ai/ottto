@@ -258,6 +258,7 @@ write_manifest \
   "$stable_manifest"
 "$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" --record-sha256 >/dev/null
 "$PREFLIGHT" --manifest "$stable_manifest" --dry-run >/dev/null
+"$PREFLIGHT" --manifest "$stable_manifest" --require-installer-sha256 --dry-run >/dev/null
 
 tampered_helper_manifest="$TMP_DIR/tampered-helper-manifest.json"
 cp "$stable_manifest" "$tampered_helper_manifest"
@@ -273,12 +274,26 @@ fi
 missing_helper_sha_manifest="$TMP_DIR/missing-helper-sha-manifest.json"
 jq 'del(.install_methods.verified_native_installer.sha256)' \
   "$stable_manifest" > "$missing_helper_sha_manifest"
-if "$PREFLIGHT" --manifest "$missing_helper_sha_manifest" --dry-run >"$TMP_DIR/missing-helper-sha.out" 2>&1; then
-  echo "Expected a stable manifest without the installer helper SHA-256 to fail stable preflight" >&2
+# Historical releases remain usable for rollback verification without the flag.
+"$PREFLIGHT" --manifest "$missing_helper_sha_manifest" --dry-run >/dev/null
+if "$PREFLIGHT" --manifest "$missing_helper_sha_manifest" --require-installer-sha256 --dry-run >"$TMP_DIR/missing-helper-sha.out" 2>&1; then
+  echo "Expected a new stable manifest without the installer helper SHA-256 to fail stable preflight" >&2
   exit 1
 fi
 grep -Fq "install_methods.verified_native_installer.sha256 must be a lowercase SHA-256" \
   "$TMP_DIR/missing-helper-sha.out"
+
+malformed_helper_sha_manifest="$TMP_DIR/malformed-helper-sha-manifest.json"
+for malformed_sha in 'null' 'false' '""' '"invalid"'; do
+  jq --argjson sha "$malformed_sha" '.install_methods.verified_native_installer.sha256 = $sha' \
+    "$stable_manifest" > "$malformed_helper_sha_manifest"
+  if "$PREFLIGHT" --manifest "$malformed_helper_sha_manifest" --dry-run >"$TMP_DIR/malformed-helper-sha.out" 2>&1; then
+    echo "Expected a present malformed installer helper SHA-256 to fail even without the requirement flag: $malformed_sha" >&2
+    exit 1
+  fi
+  grep -Fq "install_methods.verified_native_installer.sha256 must be a lowercase SHA-256" \
+    "$TMP_DIR/malformed-helper-sha.out"
+done
 
 wrong_helper_sha_manifest="$TMP_DIR/wrong-helper-sha-manifest.json"
 jq '.install_methods.verified_native_installer.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
