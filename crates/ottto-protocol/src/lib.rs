@@ -889,8 +889,10 @@ pub struct ActiveSession {
     /// Content-free reason the daemon withheld this session's account, so an
     /// app can say why instead of a bare "unknown". Closed values:
     /// `multiple_accounts` (the session's own request evidence names more than
-    /// one account) and `incomplete_request_evidence` (one account, but not
-    /// every billed request has a request witness). Only ever set while
+    /// one account), `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness) and `too_many_accounts`
+    /// (more accounts than one upload may carry, so the session is held and
+    /// not uploaded). Only ever set while
     /// `account_identifier_hash` is absent, and never names an account. Apps
     /// must treat an unknown value as no reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]

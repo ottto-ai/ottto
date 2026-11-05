@@ -146,12 +146,16 @@ impl Drop for PreCutoverEvidenceForTest {
     }
 }
 
-pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
-pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
+pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 32;
+pub(crate) const MAX_AUTHORITY_KEYS: usize = 32;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`).
-/// The byte cap is the real limit; this stops construction early.
-pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
+/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`):
+/// the receiver's dense parts bound, serialized item bytes / 320, at this
+/// pass's item cap (2,048 at the default cap). The byte cap is the real
+/// limit; this stops construction early.
+pub(crate) const fn max_parts_per_item(max_item_bytes: usize) -> usize {
+    max_item_bytes / 320
+}
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
@@ -1099,7 +1103,7 @@ fn apply_grouped_with_accepted(
         }
         top_identities.push(identity);
     }
-    if total_parts > MAX_PARTS_PER_ITEM {
+    if total_parts > max_parts_per_item(max_item_bytes) {
         over_cap.insert(OverCap::PartsPerItem);
     }
     if item.model_usage.len() > MAX_ROWS
@@ -1213,6 +1217,14 @@ fn apply_grouped_with_accepted(
             attempted_bytes,
             components.as_ref(),
         );
+        // Local explanation only: an account-limit hold never uploads, so the
+        // app can say why. Other holds (rows, bytes) keep their reason.
+        if over_cap.contains(&OverCap::AuthorityKeys)
+            || over_cap.contains(&OverCap::EvidenceEntries)
+        {
+            item.claude_account_withheld_reason =
+                Some(super::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS);
+        }
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         return Ok(Tagged::Held);
     }
@@ -4510,7 +4522,7 @@ pub(crate) struct RequestFacts<'a> {
 }
 
 /// A borrowed authority key: classification builds no strings; a `Grouping`
-/// copies one only when it admits a new key (at most 16 per item).
+/// copies one only when it admits a new key (at most `MAX_AUTHORITY_KEYS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyRef<'k> {
     login: Option<&'k str>,
