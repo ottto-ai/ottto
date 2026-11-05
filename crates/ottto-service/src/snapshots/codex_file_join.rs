@@ -1104,7 +1104,7 @@ impl TierReplay {
     pub(super) fn finish(self) -> Result<Option<AppliedTierReceipt>> {
         anyhow::ensure!(
             !self.invalid,
-            "Codex applied-tier receipt is unavailable or exceeds its bound"
+            "Codex applied-tier receipt is unavailable or invalid"
         );
         if let Some(previous) = &self.previous {
             anyhow::ensure!(

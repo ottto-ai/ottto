@@ -1583,3 +1583,48 @@ fn codex_current_listing_removal_retires_an_earlier_generation_observation() {
         f.page_hinted(SnapshotSource::Codex, index, std::slice::from_ref(&f.path));
     assert!(!index.files.contains_key(&key));
 }
+
+/// [money] A directory wider than a tiny per-tick budget is listed in full on
+/// a fresh tick for every source: the census completes and the scan emits the
+/// same snapshots and file count as under the default budget.
+#[test]
+fn wide_directory_over_budget_completes_census_with_default_budget_money() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let root = crate::test_scratch::unique_path("wide-directory-money");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        for session in [UNCHANGED, GROWN, CREATED, REARMED] {
+            append_records(
+                &root.join(format!("{session}.jsonl")),
+                &usage_records(source, session, 1, true),
+            );
+        }
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let scan = || {
+            let mut index = ScanIndex::default();
+            scan_source_roots(source, std::slice::from_ref(&root), &mut index, &now, 7).unwrap()
+        };
+        let default = scan();
+        let tiny = with_test_directory_entries(3, scan);
+
+        assert!(tiny.census_complete, "{source:?}");
+        assert_eq!(tiny.directory_entry_cap_exceeded_count, 0, "{source:?}");
+        assert_eq!(tiny.scanned_file_count, 4, "{source:?}");
+        assert_eq!(tiny.snapshots.len(), 4, "{source:?}");
+        assert_eq!(
+            tiny.scanned_file_count, default.scanned_file_count,
+            "{source:?}"
+        );
+        assert_eq!(census(&tiny), census(&default), "{source:?}");
+        assert_eq!(
+            serde_json::to_value(&tiny.snapshots).unwrap(),
+            serde_json::to_value(&default.snapshots).unwrap(),
+            "{source:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
