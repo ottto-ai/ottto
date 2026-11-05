@@ -55,8 +55,8 @@ cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test f
 # Schemas and the generated connector registry
 jq empty connectors/registry.generated.json schemas/*.schema.json
 
-# Public export check (private paths, secret-like content, export roots)
-bash scripts/public_repo_export_check.sh
+# Public tree check (private paths, secret-like content, symlinks)
+bash scripts/public_repo_secret_scan.sh
 
 # Shell scripts you changed
 shellcheck scripts/<script>.sh
