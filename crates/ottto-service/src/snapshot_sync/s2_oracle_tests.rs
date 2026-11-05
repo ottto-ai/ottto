@@ -662,12 +662,14 @@ fn shed_save_keeps_held_custody_and_drops_unkept_heads() {
         assert!(body(&shed, FRESH).is_some(), "the fresh file is not held");
         // The upload sheds before any ACK: only the partial checkpoint saves.
         let route = route_of(&shed.committed).unwrap();
+        // The route owns its progress file: the checkpoint compares against it.
         let progress_path = snapshot_upload_progress_path(&route);
-        progress.save(&progress_path).unwrap();
+        let durable: SnapshotUploadProgress =
+            serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
         let mut saved = checkpoint_partial_snapshot_index(
             &shed.index,
             &shed.committed,
-            &progress,
+            &durable,
             &shed.scan.snapshots,
             Some(&shed.scan),
             &holds.held_fingerprints,
