@@ -475,11 +475,14 @@ impl LocalDaemon {
         now: impl Into<String>,
     ) -> Self {
         let now = now.into();
+        let footprint_cwds = Arc::<context_footprint::CwdProjection>::default();
+        let codex_preludes =
+            codex_prelude_footprint::CodexPreludeFeed::new(footprint_cwds.inputs());
         Self {
             session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
-            footprint_cwds: Arc::default(),
-            codex_preludes: Arc::default(),
+            footprint_cwds,
+            codex_preludes: Arc::new(codex_preludes),
             codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
                 snapshot_sync::home_dir().ok().as_deref(),
             )),

@@ -1069,7 +1069,10 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
 /// the persisted ledger, and the first activation after it mirrors the
 /// session again; the scan index itself never stores it. A challenge whose
 /// session holds no saved base can never carry an answer: it is not
-/// mirrored before or after the restart, so its files may re-fold.
+/// mirrored before or after the restart, so its files may re-fold. A
+/// same-account re-login (A→B→C) before the restart changes nothing: the
+/// conflict is still owed, its answer rides the one counted native Full and
+/// settles it.
 #[test]
 fn a_restart_mirrors_the_persisted_challenge_again() {
     let item = item();
@@ -1105,9 +1108,10 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
     index.save(&index_path).unwrap();
 
+    let namespace = crate::snapshot_sync::relogin_namespace(&"a".repeat(64), 2);
     let mut restarted = SnapshotUploadProgress::load(
         &progress_path,
-        &"a".repeat(64),
+        &namespace,
         snapshot_quarantine_witness(SnapshotSource::Codex),
     )
     .unwrap();
@@ -1122,4 +1126,18 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     assert!(index.head_conflict_owed(&key));
     assert!(restarted.head_conflict_challenges.contains_key(&baseless));
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
+    let mut answers = 0;
+    for (at, head) in [(1_001, "2"), (1_002, "3"), (1_003, "4")] {
+        let owed = mirrored(&restarted, &key);
+        let server = |item: &SnapshotItem| accepted(item, &head.repeat(64));
+        let (result, wire) = cycle(&mut restarted, &item, at, server);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let answered = envelope(&wire)["conflict_head_challenge"] == challenge(0xc);
+        assert_rescan_claim(&wire, answered);
+        assert!(!answered || owed, "an answer rides only a mirrored Full");
+        answers += usize::from(answered);
+    }
+    assert_eq!(answers, 1);
+    assert!(!mirrored(&restarted, &key), "settled");
+    assert_eq!(restarted.accepted_cache_heads[&key], "4".repeat(64));
 }

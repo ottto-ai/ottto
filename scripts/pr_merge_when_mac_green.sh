@@ -18,7 +18,10 @@ MIN_INTERVAL=60
 # Two hours: a queued PR waits for its PR checks and then a full queue round
 # (Mac slot wait plus the Mac job) inside one shared budget.
 DEFAULT_TIMEOUT=7200
-PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
+PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner,title"
+# Optional local list of extended regexes, one per line, that a PR title must
+# not match (the title becomes the squash subject on the base branch).
+TITLE_DENY_FILE="${OTTTO_PR_TITLE_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ottto/pr-title-deny.ere}"
 
 EXIT_USAGE=2
 EXIT_REFUSED=3
@@ -26,6 +29,9 @@ EXIT_RED=4
 EXIT_HEAD_MOVED=5
 EXIT_TIMEOUT=6
 EXIT_GH=7
+# Re-enqueues after a queue run GitHub never started (hosted-runner shortage).
+MAX_NOT_ACQUIRED_REQUEUES=2
+NOT_ACQUIRED="was not acquired by Runner"
 
 usage() {
   cat <<'USAGE'
@@ -47,6 +53,10 @@ ignored. Once all six passed and the PR is
 MERGEABLE it enqueues exactly <head-sha> with GitHub's enqueuePullRequest
 mutation (expectedHeadOid; independent of the repository's auto-merge setting)
 and waits until merged, removed from the queue, the head changes, or timeout.
+When GitHub never started a queue job ("The job was not acquired by Runner",
+a hosted-runner shortage, with no step run), the removal is not a test result:
+the guard enqueues the same head again, at most twice per guard run, and only
+for a queue run created after this guard run first enqueued the PR.
 The queue's configured merge method applies; no administrator bypass is used.
 Rerunning the guard for a PR that is already queued resumes the wait.
 
@@ -61,12 +71,19 @@ Options:
   --interval  seconds between polls (default 60, minimum 60)
   --timeout   total seconds to wait before giving up (default 7200)
 
+Environment:
+  OTTTO_PR_TITLE_DENY_FILE  extended regexes, one per line, that the PR title
+                            must not match; default
+                            ${XDG_CONFIG_HOME:-~/.config}/ottto/pr-title-deny.ere.
+                            No file means no title check.
+
 Exit codes:
   0  merged
   2  usage error or missing tool
-  3  refused: PR is not open, has merge conflicts (CONFLICTING), or the base
-     branch has no merge queue
+  3  refused: PR is not open, has merge conflicts (CONFLICTING), its title
+     matches the title deny list, or the base branch has no merge queue
   4  a required check finished without success, or PR removed from merge queue
+     (after at most two re-enqueues when GitHub never started a queue job)
   5  the PR head changed while waiting; rerun for the new head
   6  timed out waiting for required checks or the merge queue
   7  a gh command failed (view, rules, ready, or enqueue)
@@ -160,6 +177,29 @@ refuse_unmergeable() {
   fi
 }
 
+# The title is the squash subject: refuse one that matches the local deny list.
+# Messages name no pattern, so the list itself is never printed. A list that
+# cannot be read or evaluated refuses rather than letting the title through.
+refuse_denied_title() {
+  [ -s "$TITLE_DENY_FILE" ] || return 0
+  local patterns pattern title status=0
+  # Blank and comment lines are dropped: an empty pattern would match any title.
+  patterns="$(grep -Ev '^[[:space:]]*(#|$)' "$TITLE_DENY_FILE")" || status=$?
+  [ "$status" -le 1 ] \
+    || die "$EXIT_REFUSED" "the title deny list ($TITLE_DENY_FILE) could not be read; fix it and rerun"
+  title="$(pr_field title)"
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    status=0
+    grep -Eq -e "$pattern" <<<"$title" 2>/dev/null || status=$?
+    case "$status" in
+      0) die "$EXIT_REFUSED" "PR #$pr title matches the title deny list ($TITLE_DENY_FILE); edit the title and rerun" ;;
+      1) ;;
+      *) die "$EXIT_REFUSED" "the title deny list ($TITLE_DENY_FILE) could not be evaluated; fix it and rerun" ;;
+    esac
+  done <<<"$patterns"
+}
+
 # Prints "<verdict>|<detail>" for the required checks on $1, judging for each
 # name the newest check run that belongs to a pull_request workflow run for
 # this PR and base in that check's workflow. <verdict> is success (all passed), red (at least one
@@ -226,8 +266,21 @@ checks_status() {
 
 # Best-effort diagnostics: queue heads differ from the PR head, so identify the
 # latest Public CI queue run by GitHub's queue branch prefix, not the PR SHA.
+# Id of the newest merge_group run of ci.yml for this PR, or 0.
+newest_queue_run_id() {
+  local runs
+  runs="$(gh api "repos/{owner}/{repo}/actions/runs?event=merge_group&per_page=100")" || { echo 0; return; }
+  printf '%s' "$runs" | jq -r --arg prefix "gh-readonly-queue/$base/pr-$pr-" --arg workflow "$CI_WORKFLOW" '
+    [.workflow_runs[]?
+     | select(.event == "merge_group" and .path == $workflow)
+     | select((.head_branch // "") | startswith($prefix)) | .id]
+    | max // 0' 2>/dev/null || echo 0
+}
+
+queue_run_id=""
 report_queue_failure() {
   local runs detail
+  queue_run_id=""
   if runs="$(gh api "repos/{owner}/{repo}/actions/runs?event=merge_group&per_page=100")"; then
     detail="$(printf '%s' "$runs" | jq -r \
       --arg prefix "gh-readonly-queue/$base/pr-$pr-" --arg workflow "$CI_WORKFLOW" '
@@ -241,7 +294,10 @@ report_queue_failure() {
         | select(.conclusion != "success"
                  and .conclusion != "skipped" and .conclusion != "neutral")
         | "merge_group run \(.id): \(.conclusion // .status) \(.html_url) (head \(.head_sha))"')" || detail=""
-    if [ -n "$detail" ]; then log "$detail"; fi
+    if [ -n "$detail" ]; then
+      log "$detail"
+      queue_run_id="$(printf '%s' "$detail" | sed -n 's/^merge_group run \([0-9]*\):.*/\1/p')"
+    fi
   else
     log "could not read merge_group runs for queue failure diagnostics"
   fi
@@ -285,6 +341,33 @@ queue_query() {
     }'
 }
 
+# Returns 0 when queue run $1 has finished, every one of its jobs is listed,
+# and every unsuccessful job never ran a step and GitHub annotated it as not
+# acquired by a runner; 2 while the run or a job is unfinished; 1 otherwise, including
+# any read error.
+not_acquired_only() {
+  local run jobs bad id
+  run="$(gh api "repos/{owner}/{repo}/actions/runs/$1")" || return 1
+  printf '%s' "$run" | jq -e '.status == "completed"' >/dev/null || return 2
+  jobs="$(gh api "repos/{owner}/{repo}/actions/runs/$1/jobs?per_page=100")" || return 1
+  printf '%s' "$jobs" | jq -e '(.jobs | type) == "array" and .total_count == (.jobs | length)' >/dev/null \
+    || return 1
+  if printf '%s' "$jobs" | jq -e 'any(.jobs[]; .status != "completed")' >/dev/null; then
+    return 2
+  fi
+  bad="$(printf '%s' "$jobs" | jq -r '
+    [.jobs[]
+     | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")]
+    | if length == 0 or any(.[]; any(.steps[]?; .conclusion != null)) then "no"
+      else .[].id end')" || return 1
+  [ -n "$bad" ] && [ "$bad" != no ] || return 1
+  for id in $bad; do
+    gh api "repos/{owner}/{repo}/check-runs/$id/annotations" \
+      | jq -e --arg text "$NOT_ACQUIRED" 'any(.[]?; (.message // "") | contains($text))' >/dev/null \
+      || return 1
+  done
+}
+
 # True when the PR's current head is queued or already merged. Any read error
 # or head mismatch is false, so the caller reports the enqueue failure.
 already_queued() {
@@ -302,6 +385,7 @@ already_queued() {
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
   local response queued_pr state current_sha entry seen_queue=false absent=0
+  local requeues=0 unfinished=0 verdict
   while :; do
     if response="$(queue_query)" && queued_pr="$(printf '%s' "$response" | jq -ce '
         select((.errors // [] | length) == 0)
@@ -334,7 +418,30 @@ wait_for_queue() {
           log "PR #$pr not visible in the merge queue; rechecking before reporting removal"
         else
           report_queue_failure
-          die "$EXIT_RED" "PR #$pr removed from merge queue; not merged"
+          verdict=1
+          # Only a run newer than the one behind the last re-enqueue counts:
+          # the old run says nothing about why the new entry left the queue.
+          if [ -n "$queue_run_id" ] && [ "$queue_run_id" -gt "$used_run" ] \
+            && [ "$requeues" -lt "$MAX_NOT_ACQUIRED_REQUEUES" ]; then
+            verdict=0
+            not_acquired_only "$queue_run_id" || verdict=$?
+          fi
+          if [ "$verdict" = 2 ] && [ "$unfinished" -lt 10 ]; then
+            unfinished=$((unfinished + 1))
+            absent=1
+            log "merge_group run $queue_run_id still has unfinished jobs; waiting before judging the removal"
+          elif [ "$verdict" = 0 ]; then
+            requeues=$((requeues + 1))
+            used_run="$queue_run_id"
+            unfinished=0
+            log "merge_group run $queue_run_id never got a runner (GitHub capacity); enqueuing PR #$pr again ($requeues of $MAX_NOT_ACQUIRED_REQUEUES)"
+            enqueue || already_queued \
+              || die "$EXIT_GH" "re-enqueueing PR #$pr at $head_sha failed"
+            seen_queue=false
+            absent=0
+          else
+            die "$EXIT_RED" "PR #$pr removed from merge queue; not merged"
+          fi
         fi
       fi
     else
@@ -350,6 +457,7 @@ wait_for_queue() {
 
 read_pr
 refuse_unmergeable
+refuse_denied_title
 base="$(pr_field baseRefName)"
 base_path="$(printf '%s' "$base" | jq -sRr @uri)"
 rules="$(gh api "repos/{owner}/{repo}/rules/branches/$base_path")" \
@@ -369,9 +477,12 @@ fi
 log "PR #$pr head $head_sha: waiting for the required checks $REQUIRED_CHECKS (interval ${interval}s, timeout ${timeout}s)"
 waited=0
 started_at=$SECONDS
+# Queue runs at or below this id predate this guard run's enqueue.
+used_run=0
 while :; do
   read_pr
   refuse_unmergeable
+  refuse_denied_title
   current_sha="$(pr_field headRefOid)"
   if [ "$current_sha" != "$head_sha" ]; then
     die "$EXIT_HEAD_MOVED" "PR #$pr head moved from $head_sha to $current_sha; rerun to wait for the new head"
@@ -384,6 +495,7 @@ while :; do
         mergeable="$(pr_field mergeable)"
         if [ "$mergeable" = MERGEABLE ]; then
           log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
+          used_run="$(newest_queue_run_id)"
           if ! enqueue; then
             # A rerun after a timeout finds the PR already queued (or just
             # merged); resume waiting instead of reporting a gh failure.

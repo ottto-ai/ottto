@@ -4,11 +4,10 @@ This directory documents the Homebrew tap publishing path for the Ottto local
 platform. The tap formula is generated from a stable
 `release-manifest.json`; do not hand-write URLs or checksums.
 
-The intended public tap is `ottto-ai/homebrew-ottto`, which Homebrew users
-install through the short tap name `ottto-ai/ottto`:
+The public tap is `ottto-ai/tap` (GitHub repository `ottto-ai/homebrew-tap`):
 
 ```bash
-brew install ottto-ai/ottto/ottto
+brew install ottto-ai/tap/ottto
 brew services start ottto
 ottto --no-autostart status --json
 ```
@@ -25,9 +24,9 @@ After `macos_package.sh`, notarization, `macos_release_gate.sh`, and
 tap formula:
 
 ```bash
-tools/ottto-local-platform/scripts/homebrew_formula.sh \
-  --manifest tools/ottto-local-platform/dist/macos/release-manifest.json \
-  --output /path/to/homebrew-ottto/Formula/ottto.rb
+./scripts/homebrew_formula.sh \
+  --manifest dist/macos/release-manifest.json \
+  --output /path/to/homebrew-tap/Formula/ottto.rb
 ```
 
 The generator refuses a manifest unless it:
@@ -105,7 +104,7 @@ Run these checks from a clean Apple Silicon Mac before publishing a stable tap
 change:
 
 ```bash
-cd /path/to/homebrew-ottto
+cd /path/to/homebrew-tap
 ruby -c Formula/ottto.rb
 brew update
 brew install --build-from-source ./Formula/ottto.rb

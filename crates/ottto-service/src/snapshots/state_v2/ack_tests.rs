@@ -9,9 +9,9 @@ fn write(path: &Path, bytes: &[u8]) {
     ottto_core::write_owner_only_file_atomic(path, bytes).unwrap();
 }
 /// Crash after the durable receipt, before progress replacement: restart
-/// replays the exact successor once and a second recovery is quiet. Returns
-/// the encoded receipt size.
-fn receipt_first_case(source: Source, old: &[u8], new: &[u8]) -> u64 {
+/// (after `links` same-account re-logins) replays the exact successor once
+/// and a second recovery is quiet. Returns the encoded receipt size.
+fn receipt_first_case(source: Source, old: &[u8], new: &[u8], links: usize) -> u64 {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-receipt-first");
     let index = scratch.join("index");
     let path = scratch.join("progress");
@@ -22,6 +22,8 @@ fn receipt_first_case(source: Source, old: &[u8], new: &[u8]) -> u64 {
     binding.before_progress_save(Some(old), new).unwrap();
     let receipt = std::fs::metadata(&binding.path).unwrap().len();
     // Crash: exact receipt durable, neither progress replacement nor DB save.
+    let namespace = &mut binding.scope.identity.binding.namespace_hash;
+    *namespace = crate::snapshot_sync::relogin_namespace(namespace, links);
     let _ = telemetry::take_thread_event_for_test("ack_receipt_reconciled");
     binding.recover(&path).unwrap();
     assert!(std::fs::read(&path).unwrap() == new, "{source:?}");
@@ -38,10 +40,15 @@ fn receipt_first_case(source: Source, old: &[u8], new: &[u8]) -> u64 {
     );
     receipt
 }
-/// [money] receipt first replaces only exact predecessor and replays idempotently.
+/// [money] receipt first replaces only exact predecessor and replays
+/// idempotently, for every source and across re-logins A→B and A→B→C.
 #[test]
 fn receipt_first_replaces_only_exact_predecessor_and_replays_idempotently() {
-    receipt_first_case(Source::Claude, &progress(4, "old"), &progress(5, "new"));
+    for source in [Source::Claude, Source::Codex, Source::Pi] {
+        for links in [0, 1, 2] {
+            receipt_first_case(source, &progress(4, "old"), &progress(5, "new"), links);
+        }
+    }
 }
 /// [money] the same receipt-first replay holds past the former 11,182,080 B
 /// bound for every source with real-shaped progress, and once with progress
@@ -57,7 +64,7 @@ fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
         bytes.extend_from_slice(b"\"body\":\"padded\"}");
         bytes
     };
-    assert!(receipt_first_case(Source::Claude, &padded(4), &padded(5)) > 67_108_864);
+    assert!(receipt_first_case(Source::Claude, &padded(4), &padded(5), 0) > 67_108_864);
     let namespace = "a".repeat(64);
     for (source, snapshot) in [
         (Source::Claude, SnapshotSource::ClaudeCode),
@@ -74,7 +81,7 @@ fn receipt_first_replays_exactly_above_the_old_bound_for_every_source() {
             old.len() > crate::snapshot_sync::OLD_PROGRESS_BOUND_FOR_TEST,
             "{source:?}"
         );
-        receipt_first_case(source, &old, &real(5));
+        receipt_first_case(source, &old, &real(5), 0);
     }
 }
 /// [money] mismatched identity generation and same generation forks hold without changes.

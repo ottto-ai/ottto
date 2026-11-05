@@ -523,8 +523,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `net.ottto.Companion` bundle identifier, so dev and preview builds keep
   working unconfigured. `OTTTO_COMPANION_TEAM_ID` and
   `OTTTO_COMPANION_CODE_REQUIREMENT` override both, for running a release daemon
-  against a locally built app (see
-  [`docs/session-2026-09-16-companion-code-requirement.md`](docs/session-2026-09-16-companion-code-requirement.md))
+  against a locally built app.
 - a macOS packaging rehearsal script that builds the SwiftUI app bundle, embeds
   Rust CLI/daemon helpers, ad-hoc seals dev/preview bundles, writes a release
   manifest, and separates those internal builds from stable

@@ -607,6 +607,11 @@ pub(crate) mod reason_reoffer_pipeline_tests {
     include!("reason_reoffer_pipeline_tests.rs");
 }
 
+// Same real prepare/finish pipeline across a same-account re-login.
+pub(crate) mod relogin_pipeline_tests {
+    include!("relogin_pipeline_tests.rs");
+}
+
 thread_local! {
     static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
