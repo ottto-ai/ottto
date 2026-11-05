@@ -1436,22 +1436,25 @@ fn telemetry_member(path: &Path) -> std::result::Result<Option<ApiFileGeneration
     }
 }
 
-/// Read one pair with the existing decoders. `Err`: a read fault (symlink,
+/// Read one pair with the existing decoders. `Ok(None)`: both members are
+/// NotFound (the session has no telemetry). `Err`: a read fault (symlink,
 /// unreadable, malformed row, session mismatch, or a member that changed while
 /// read); only this pair is held.
 pub(crate) fn read_telemetry_pair(
     support_dir: &Path,
     stem: &str,
-) -> std::result::Result<TelemetryPair, ()> {
+) -> std::result::Result<Option<TelemetryPair>, ()> {
     let paths = telemetry_member_paths(support_dir, stem);
     let generations = [telemetry_member(&paths[0])?, telemetry_member(&paths[1])?];
     // The session id from the first row of a present member; it must hash to
     // the stem.
-    let present = paths
+    let Some(present) = paths
         .iter()
         .zip(&generations)
         .find_map(|(path, generation)| generation.as_ref().map(|_| path))
-        .ok_or(())?;
+    else {
+        return Ok(None);
+    };
     let mut first = String::new();
     BufReader::new(open_strict(present).map_err(|_| ())?)
         .read_line(&mut first)
@@ -1490,7 +1493,7 @@ pub(crate) fn read_telemetry_pair(
         first_observed = first_observed.min(u64::try_from(at.unix_timestamp()).map_err(|_| ())?);
     }
     let present = generations.iter().flatten();
-    Ok(TelemetryPair {
+    Ok(Some(TelemetryPair {
         request_ids,
         first_observed,
         last_write: present
@@ -1500,7 +1503,7 @@ pub(crate) fn read_telemetry_pair(
             .unwrap_or(i64::MAX),
         bytes: present.map(|generation| generation.bytes).sum(),
         generations,
-    })
+    }))
 }
 
 /// Unlink a pair's present members under the relay's append lock, only while

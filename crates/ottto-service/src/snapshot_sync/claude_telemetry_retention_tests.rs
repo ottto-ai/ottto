@@ -70,9 +70,10 @@ fn listing(c: &Corpus) -> BTreeMap<String, Option<u64>> {
     listed
 }
 
-/// A new process whose complete walk, begun at `started_at_ms`, listed `listed`.
+/// A complete walk, begun at `started_at_ms`, listed `listed` and ended (no
+/// restart).
 fn roster(started_at_ms: u64, listed: BTreeMap<String, Option<u64>>) {
-    crate::snapshots::money_freshness::set_roster_for_test(
+    crate::snapshots::money_freshness::walk_ended_for_test(
         SnapshotSource::ClaudeCode,
         Some((started_at_ms, listed)),
     );
@@ -511,7 +512,9 @@ fn telemetry_retention_fails_closed() {
     with_e2(|| {
         let (c, warm) = corpus("telemetry-retention-closed");
         let stem = format!("{:x}", Sha256::digest(HALF.as_bytes()));
-        let read = crate::claude_local_otel::read_telemetry_pair(&c.support, &stem).unwrap();
+        let read = crate::claude_local_otel::read_telemetry_pair(&c.support, &stem)
+            .unwrap()
+            .unwrap();
         append(
             &member(&c, "claude-code-effort", HALF),
             &(serde_json::to_string(&api_for(HALF, "g5", 17, 1700)).unwrap() + "\n"),
@@ -526,7 +529,7 @@ fn telemetry_retention_fails_closed() {
         );
 
         let gone = || members(&c, GONE);
-        crate::snapshots::money_freshness::set_roster_for_test(SnapshotSource::ClaudeCode, None);
+        crate::snapshots::money_freshness::walk_ended_for_test(SnapshotSource::ClaudeCode, None);
         retire(&c, &warm.index);
         assert_eq!(gone(), (true, true), "no complete walk in this process");
         walked(&c, 0);
@@ -574,7 +577,8 @@ fn telemetry_retention_fails_closed() {
 
 /// [money] The hint path: a key this pass removed keeps its root's pair while
 /// the same relative path still exists (the walk did not list it), and the
-/// next run, with no backlog, retires the pair only after a real NotFound.
+/// next run of the same walk, with no backlog, retires the pair only after a
+/// real NotFound.
 #[test]
 fn telemetry_retention_hint_path_retires_only_after_not_found() {
     with_e2(|| {
@@ -595,7 +599,7 @@ fn telemetry_retention_hint_path_retires_only_after_not_found() {
 }
 
 /// [format] A crash between a pair's two unlinks leaves one member; the next
-/// process's first complete walk deletes it. A restart's cold read of every
+/// complete walk, in the same process, deletes it. A restart's cold read of every
 /// survivor equals the read before retention, both after the crash and after
 /// the finishing run (money and placement oracle).
 #[test]
@@ -618,5 +622,25 @@ fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
         assert_eq!(members(&c, ROOT), (true, true));
         let finished = cold(&c);
         assert_equivalent(&before, &routed(&finished, finished.upload_policy));
+    });
+}
+
+/// [regress] Each complete walk rechecks every stored pair: a pair held at one
+/// walk's end is retired after the next walk ends, with no restart.
+#[test]
+fn telemetry_retention_rechecks_held_pairs_after_each_complete_walk() {
+    with_e2(|| {
+        let (c, warm) = corpus("telemetry-retention-per-walk");
+        walked(&c, 0);
+        retire(&c, &warm.index);
+        assert_eq!(
+            members(&c, GONE),
+            (true, true),
+            "written after walk 1 began"
+        );
+        walked(&c, now_ms() + 60_000);
+        retire(&c, &warm.index);
+        assert_eq!(members(&c, GONE), (false, false), "walk 2 rechecks it");
+        assert_eq!(members(&c, ROOT), (true, true));
     });
 }
