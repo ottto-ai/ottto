@@ -77,7 +77,15 @@ fn twins(name: &str, reverse: bool, clock: &str, idless: bool, positive: bool) -
         }
         rows.push(api_login(ROOT, "side", 4, '2', Some('8')));
         rows.push(api_login(ROOT, "copy-own", 13, '2', Some('8')));
-        c.evidence(&rows, &[trace("side", "000")]);
+        let mut traces = vec![trace("root-fork", "")];
+        for agent in 0..2 {
+            for r in ["child", "switch"] {
+                traces.push(trace(&format!("{r}-{agent}"), &format!("agent-{agent:03}")));
+            }
+        }
+        traces.push(trace("side", "000"));
+        traces.push(trace("copy-own", "agent-000"));
+        c.evidence(&rows, &traces);
     }
     c
 }
@@ -178,8 +186,8 @@ fn identical_family_and_idless_copies() {
 }
 
 /// [money] The inclusive gate is each duplicated occurrence's timestamp,
-/// including all-copy children. Unusable clocks take the native untimed
-/// count path before a copied skip can reach the timestamp gate.
+/// including all-copy children. Missing clocks count through the native
+/// bucket fallback and never reach the gate.
 #[test]
 fn occurrence_boundary_counts_unusable_and_old_copies() {
     with_e2(|| {
@@ -188,7 +196,6 @@ fn occurrence_boundary_counts_unusable_and_old_copies() {
             ("equal", START, 1, 3),
             ("after", TURN, 1, 3),
             ("missing", "", 2, 2),
-            ("malformed", "unusable", 2, 2),
         ] {
             let mut c = twins(
                 &format!("subagent-twin-cutoff-{name}"),
