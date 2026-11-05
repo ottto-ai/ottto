@@ -107,7 +107,7 @@ fn stored<S: SourceFixture>(route: &Route, path: &Path) -> (OwnedJsonlParser, Ta
     };
     let mut p = parser::<S>(path);
     let mode = p
-        .prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
+        .prepare_acquisition(Some(taken), &scope(), None, NOW)
         .unwrap();
     (p, base, mode)
 }

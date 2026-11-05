@@ -312,7 +312,6 @@ impl ScanIndex {
                 if let Some(namespace) = namespace {
                     cache.memo_forget(&sampled_scan::codex_cursor::memo_key(namespace, key));
                 }
-                drop(cache.take(key));
             }
         }
         Ok(true)
