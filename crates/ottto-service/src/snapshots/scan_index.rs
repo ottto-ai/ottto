@@ -3,7 +3,9 @@
 //! digests it records.
 
 mod accounts;
+mod candidate_decision;
 pub(super) mod entry;
+mod entry_retirement;
 pub(super) mod file_set_digest;
 mod historical_replay;
 mod load;
