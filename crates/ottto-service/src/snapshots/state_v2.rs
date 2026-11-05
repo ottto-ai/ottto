@@ -19,7 +19,7 @@ mod import;
 mod runtime;
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;

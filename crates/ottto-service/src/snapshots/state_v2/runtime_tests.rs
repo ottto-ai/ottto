@@ -331,19 +331,54 @@ fn publication_pending_pause_does_not_touch_v1() {
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
 
-/// [behaviour] a load naming its support dir imports v1 and publishes custody.
+/// [behaviour] a support-dir load publishes before collection, even without v1.
 #[test]
 fn support_dir_load_imports_and_publishes() {
-    let f = Fixture::new();
-    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    let index = ScanIndex::load_for_snapshot_source(
-        &f.path,
-        crate::snapshots::SnapshotSource::ClaudeCode,
-        &f.support,
-    )
-    .unwrap();
-    assert!(index.v2().persistence_v2.is_some());
-    assert!(published(&f.path).unwrap());
+    use crate::snapshots::{ScanIndexLoadOrigin, SnapshotSource};
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for presence in ["missing-parent", "missing-root", "present-v1"] {
+            let mut f = Fixture::new();
+            f.path
+                .set_file_name(format!("{}-test-scan-index.json", source.api_slug()));
+            match presence {
+                "missing-parent" => fs::remove_dir(f.path.parent().unwrap()).unwrap(),
+                "present-v1" => {
+                    let mut index = ScanIndex::default();
+                    index.accepted_snapshot_fingerprints.insert("a".repeat(64));
+                    fs::write(&f.path, serde_json::to_vec(&index).unwrap()).unwrap();
+                }
+                _ => {}
+            }
+            let (index, origin) =
+                ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support)
+                    .unwrap();
+            assert_eq!(
+                origin,
+                if presence == "present-v1" {
+                    ScanIndexLoadOrigin::Loaded
+                } else {
+                    ScanIndexLoadOrigin::Missing
+                }
+            );
+            assert!(index.v2().persistence_v2.is_some(), "{source:?}/{presence}");
+            assert!(published(&f.path).unwrap());
+            assert_eq!(
+                index.accepted_snapshot_fingerprints.len(),
+                usize::from(presence == "present-v1")
+            );
+            let reopened =
+                ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
+            assert_eq!(reopened.generation, index.generation);
+            assert_eq!(
+                reopened.accepted_snapshot_fingerprints,
+                index.accepted_snapshot_fingerprints
+            );
+        }
+    }
 }
 
 /// [format] absent parent containment guard never promotes a database.

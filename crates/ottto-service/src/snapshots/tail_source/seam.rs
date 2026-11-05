@@ -357,3 +357,7 @@ mod transition_tests;
 #[cfg(test)]
 #[path = "../bad_record_tests.rs"]
 mod bad_record_tests;
+
+#[cfg(test)]
+#[path = "fresh_destination_tests.rs"]
+mod fresh_destination_tests;

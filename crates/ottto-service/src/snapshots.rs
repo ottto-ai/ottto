@@ -33101,21 +33101,6 @@ impl ScanIndex {
         now: SystemTime,
         custody: Option<bool>,
     ) -> Result<(Self, LoadOrigin)> {
-        if !path.exists() {
-            let persistence_root = scan_index_integration::check_missing(
-                path,
-                scan_index_source_label(source),
-                support_dir,
-                custody,
-            )?;
-            return Ok((
-                Self {
-                    persistence_root,
-                    ..Self::default()
-                },
-                LoadOrigin::Missing,
-            ));
-        }
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
         let (v2_index, try_import) =
             state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
@@ -33127,19 +33112,34 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded));
         }
-        let decoded =
-            read_scan_index_representation(path, "load", scan_index_source_label(source), None)
-                .map_err(|error| match error.downcast::<lenient_decode::Error>() {
-                    Ok(error) => error,
-                    Err(error)
-                        if error.chain().any(|cause| {
-                            cause.to_string() == "scan_index_representation_refused"
-                        }) =>
-                    {
-                        lenient_decode::Error::Refused("schema_version")
-                    }
-                    Err(_) => lenient_decode::Error::Refused("storage generation requires repair"),
-                });
+        let (decoded, origin) = if !path.exists() {
+            let persistence_root =
+                scan_index_integration::check_missing(path, scan_index_source_label(source))?;
+            (
+                Ok(Self {
+                    persistence_root,
+                    ..Self::default()
+                }),
+                LoadOrigin::Missing,
+            )
+        } else {
+            let decoded =
+                read_scan_index_representation(path, "load", scan_index_source_label(source), None)
+                    .map_err(|error| match error.downcast::<lenient_decode::Error>() {
+                        Ok(error) => error,
+                        Err(error)
+                            if error.chain().any(|cause| {
+                                cause.to_string() == "scan_index_representation_refused"
+                            }) =>
+                        {
+                            lenient_decode::Error::Refused("schema_version")
+                        }
+                        Err(_) => {
+                            lenient_decode::Error::Refused("storage generation requires repair")
+                        }
+                    });
+            (decoded, LoadOrigin::Loaded)
+        };
         match decoded {
             Ok(index) if index.schema_version != SCAN_INDEX_SCHEMA_VERSION => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
@@ -33185,7 +33185,7 @@ impl ScanIndex {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
                 index.clear_retired_file_size_debt();
-                Ok((index, LoadOrigin::Loaded))
+                Ok((index, origin))
             }
             Err(error) if error.quarantines() => {
                 let cause = if matches!(error, lenient_decode::Error::HoldBudget) {

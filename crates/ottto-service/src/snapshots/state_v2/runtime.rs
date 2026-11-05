@@ -279,8 +279,7 @@ fn held<T>(result: Result<T>) -> Result<T> {
     result
 }
 
-/// Present root: caller already owns CheckpointLock, BEFORE v1 decode.
-/// Missing root calls the same function from check_missing's existing lock.
+/// Caller owns CheckpointLock, before missing-root validation or v1 decode.
 /// Without a support dir (unit tests, tools) `importable` is false and only an
 /// existing route loads. The returned flag says the caller's v1 load may import.
 pub(in super::super) fn load_locked(
