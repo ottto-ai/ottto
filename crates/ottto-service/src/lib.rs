@@ -12,6 +12,7 @@ mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
+mod claude_shell_telemetry;
 pub(crate) mod claude_spawn_gate;
 pub mod claude_upkeep;
 pub mod client_report;
@@ -1150,6 +1151,25 @@ impl LocalDaemon {
         Ok(true)
     }
 
+    fn shell_profile_finding(
+        &self,
+        source: &SourceKind,
+    ) -> Result<Option<HealthProblem>, LocalApiError> {
+        let relay = self.state()?.relay.clone();
+        Ok(claude_shell_telemetry::problem(source, &relay))
+    }
+
+    /// Doctor's existing pass, independent of account/SDK refresh.
+    pub(crate) fn refresh_shell_profile_health(&self) -> Result<(), LocalApiError> {
+        let finding = self.shell_profile_finding(&SourceKind::ClaudeCode)?;
+        let mut state = self.state()?;
+        for health in &mut state.sources {
+            claude_shell_telemetry::apply(health, finding.clone());
+        }
+        state.persist_source_state(&SourceKind::ClaudeCode);
+        Ok(())
+    }
+
     pub fn record_verification_result(
         &self,
         result: &SourceVerificationResult,
@@ -1157,6 +1177,7 @@ impl LocalDaemon {
         if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
+        let shell_finding = self.shell_profile_finding(&result.source)?;
         let mut state = self.state()?;
         let observed_at = current_rfc3339_timestamp();
         state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
@@ -1202,6 +1223,7 @@ impl LocalDaemon {
                 }
             }
         }
+        claude_shell_telemetry::apply(&mut health, shell_finding);
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -1294,6 +1316,7 @@ impl LocalDaemon {
         source: &SourceKind,
         config: SourceConfigState,
     ) -> Result<(), LocalApiError> {
+        let shell_finding = self.shell_profile_finding(source)?;
         let mut state = self.state()?;
         let Some(existing) = state
             .sources
@@ -1314,11 +1337,17 @@ impl LocalDaemon {
             existing
                 .recommended_actions
                 .retain(|action| action.action != RepairActionKind::WriteConfig);
-            if existing.state == SourceState::NeedsRepair && existing.problems.is_empty() {
+            if existing.state == SourceState::NeedsRepair
+                && existing
+                    .problems
+                    .iter()
+                    .all(claude_shell_telemetry::is_problem)
+            {
                 existing.state = SourceState::Healthy;
                 existing.grade = HealthGrade::Ok;
             }
         }
+        claude_shell_telemetry::apply(existing, shell_finding);
         state.persist_source_state(source);
         Ok(())
     }
@@ -1376,9 +1405,21 @@ impl LocalDaemon {
                 snapshots
             })
             .collect::<Vec<_>>();
+        let shell_finding = if sources.contains(&SourceKind::ClaudeCode) {
+            self.shell_profile_finding(&SourceKind::ClaudeCode)?
+        } else {
+            None
+        };
         let mut state = self.state()?;
         for collection in collections {
             upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot.clone());
+            if let Some(health) = state
+                .sources
+                .iter_mut()
+                .find(|h| h.source == collection.source_health_snapshot.source)
+            {
+                claude_shell_telemetry::apply(health, shell_finding.clone());
+            }
         }
         Ok(snapshots)
     }
@@ -1387,6 +1428,8 @@ impl LocalDaemon {
         &self,
         snapshot: AgentStatusSnapshot,
     ) -> Result<(), LocalApiError> {
+        let source = snapshot.source.clone();
+        let shell_finding = self.shell_profile_finding(&source)?;
         let mut state = self.state()?;
         if !state.running {
             return Ok(());
@@ -1396,6 +1439,9 @@ impl LocalDaemon {
         });
         if !seeded || snapshot.status == AgentStatusState::Available {
             upsert_agent_status_snapshot(&mut state, snapshot);
+            if let Some(health) = state.sources.iter_mut().find(|h| h.source == source) {
+                claude_shell_telemetry::apply(health, shell_finding);
+            }
         }
         Ok(())
     }
@@ -1446,8 +1492,21 @@ impl LocalDaemon {
             .into_iter()
             .map(|collection| collection.source_health_snapshot.clone())
             .collect();
+        let shell_finding = if verifying.contains(&SourceKind::ClaudeCode) {
+            self.shell_profile_finding(&SourceKind::ClaudeCode)?
+        } else {
+            None
+        };
         let mut state = self.state()?;
-        Ok(apply_verifying_reconfirm(&mut state, snapshots))
+        let remaining = apply_verifying_reconfirm(&mut state, snapshots);
+        for health in state
+            .sources
+            .iter_mut()
+            .filter(|h| verifying.contains(&h.source))
+        {
+            claude_shell_telemetry::apply(health, shell_finding.clone());
+        }
+        Ok(remaining)
     }
 
     pub fn set_relay_state(&self, token: &str, relay: RelayState) -> Result<(), LocalApiError> {
@@ -1730,8 +1789,13 @@ impl LocalDaemon {
         if should_load_connection {
             let _ = self.connection_for_authorized_client()?;
         }
+        let shell_finding = self.shell_profile_finding(&source)?;
         let state = self.state()?;
-        let authority = repair_authority_for_state(&state);
+        let mut authority = repair_authority_for_state(&state);
+        if let Some(problem) = shell_finding {
+            authority.message.text.push(' ');
+            authority.message.text.push_str(&problem.detail);
+        }
         Ok(RepairPlan {
             plan_id: format!("repair_{}", source_slug(&source)),
             machine_id: state.machine.machine_id.clone(),
@@ -3046,6 +3110,9 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
 }
 
 fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
+    if claude_shell_telemetry::is_problem(problem) {
+        return claude_shell_telemetry::CODE;
+    }
     if problem.code == StableProblemCode::TelemetryNotVerified
         && problem_detail_is_usage_limited(&problem.detail)
     {
@@ -3223,6 +3290,22 @@ fn local_health_blockers_for_status(
             &status.generated_at,
             "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions",
         ));
+    }
+    for source in &status.sources {
+        if let Some(problem) = source
+            .problems
+            .iter()
+            .find(|p| claude_shell_telemetry::is_problem(p))
+        {
+            blockers.push(blocker(
+                claude_shell_telemetry::CODE,
+                LocalHealthSeverity::Warning,
+                "source",
+                LocalHealthAuthority::Runtime,
+                &status.generated_at,
+                &problem.detail,
+            ));
+        }
     }
     if account.state == LocalHealthAccountState::Connected {
         if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
@@ -4318,6 +4401,13 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
         preserve_blocking_verification_state(&mut refreshed, &existing);
+        if let Some(problem) = existing
+            .problems
+            .iter()
+            .find(|p| claude_shell_telemetry::is_problem(p))
+        {
+            claude_shell_telemetry::apply(&mut refreshed, Some(problem.clone()));
+        }
         state.sources[index] = refreshed;
         return;
     }

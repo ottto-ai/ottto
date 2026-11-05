@@ -1025,6 +1025,7 @@ fn handle_command(
             if retry_relay_authorization {
                 require_authorized_local_client(daemon, &authorization)?;
                 crate::snapshot_sync::reset_relay_authorization_backoff();
+                daemon.refresh_shell_profile_health()?;
             }
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
