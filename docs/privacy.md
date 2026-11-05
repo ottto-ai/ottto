@@ -45,19 +45,18 @@ Connecting a Mac (setup, claim completion and device registration) uploads:
   UUID cannot be read), a random installation id, and a one-way id for the
   macOS user account that runs Ottto.
 
-Routine health reports carry `machine_id` but not the Mac name or hardware
-UUID. They do include the full path of the running `ottto-service` binary and
-its process id; for an install under your home folder, that path contains the
-home folder name. The other health fields are Ottto account and organization
-ids, versions, states, codes, timestamps and short status messages; command
-output in those messages has local paths removed.
+Routine health reports carry `machine_id` and the install type
+(`app_bundle_helper`, `homebrew`, `hosted_installer`, `dev` or `unknown`), not
+the Mac name, the hardware UUID or any file path. The other health fields are
+Ottto account and organization ids, versions, states, codes, timestamps and
+short status messages; command output in those messages has local paths
+removed.
 
 ## What Stays Local
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths. Health reports are an exception: they carry the full
-path of the running `ottto-service` binary, as described under Device Details.
+absolute local paths.
 
 Raw provider account and organization ids are identifiers, not credentials.
 Agent status uploads carry them on the account block and on plan observations,
