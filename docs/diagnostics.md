@@ -966,7 +966,7 @@ file records only the last non-success outer/inner outcome and actual invalidati
 Census v3 adds a fixed eight-category unreadable-event histogram, an explicit
 unattributed remainder for old traversals, and existing terminal-loss shares.
 Categories identify the original failing branch, not an OS diagnosis or distinct
-files; see [branch attribution](session-2026-10-12-codex-unreadable-causes.md).
+files.
 The census remains limited to 8 KiB; the sidecar to 1 KiB. Healthy attempts add
 no sidecar write or unlink. Both are owner-only disposable atomic caches without
 fsync, excluded from public status, upload DTOs and diagnostics bundles.
@@ -975,9 +975,8 @@ These files are structural diagnostic evidence, not health, current account,
 delivery, checkpoint or ACK proof. A separately scoped reader needs matching exact
 PID/start tuples before and after, image continuity, freshness and attempt ordering.
 Unavailable identity, equal-attempt contradiction or foreign-current writer evidence
-gives UNKNOWN; files show last persisted, never latest executed. See the
-[carrier contract](session-2026-10-11-codex-census-outcome-carrier.md) before interpreting
-either file. This adds no reader, runtime repair or installed acceptance.
+gives UNKNOWN; files show last persisted, never latest executed. This adds no
+reader, runtime repair or installed acceptance.
 
 ## Approved Upload
 
@@ -1249,7 +1248,7 @@ The checkpointed-upload log includes a process-lifetime count of settlement
 decisions for Rejected pages with non-progressing, restorable local holds.
 Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
-reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
+reset it.
 
 ## Prior Held Family Observation
 

@@ -58,8 +58,22 @@ Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
 unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
 use retained bodies; transcripts are read again only for changed input. Unknown
-non-permanent reasons hold their entity without invalidating sibling ACKs. See
-[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
+non-permanent reasons hold their entity without invalidating sibling ACKs.
+
+**Refusal custody.** A fresh permanent `accepted_log_stale_older_upload` refusal
+follows the existing dominated, terminal residue path and never becomes an
+accepted-body ACK. An optional per-record `exposure` observation, written only
+when a fresh permanent refusal is recorded, separates those records from legacy
+ones; a missing or malformed observation keeps a stale record owed, and legacy
+dispositions never change. The refusal owner keeps exact body witnesses for owed
+revisions and suppresses identical owed bytes; changed input gets its own offer
+and exact acknowledgement. Unknown non-permanent reasons, including
+`accepted_log_stale_older_mixed`, use ordinary RetryPending custody for that
+entity only. A body witness is not a stored body: missing body custody never
+triggers transcript reconstruction, and legacy owed entities never ride
+quarantine, re-offer, audit or revision-triggered reconstruction. Diagnostics add
+scalar owed/held counts to the existing refusal records; only a rising owed count
+raises the refusal alarm. Claude, Codex and Pi share this machinery.
 
 ## Stores
 

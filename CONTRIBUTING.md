@@ -11,6 +11,8 @@ adapters.
 - Do not include secrets, tokens, cookies, raw credentials, raw prompts, raw
   model output, customer data, private planning docs, or local filesystem paths.
 - Keep public docs standalone; they must not require private repository context.
+- Put lasting design in `docs/` or a crate's `ARCHITECTURE.md`. Dated session,
+  review or rollout notes do not belong in this repository.
 - Update tests and docs when behavior, CLI contracts, schemas, connector
   manifests, release metadata, or support workflows change.
 - A pull request that changes Rust code carries a line starting with `Reuse:`
