@@ -4355,12 +4355,12 @@ fn collect_claude_status(
                     ),
                 ));
             }
-            if let Some(max_plan) = refined_max_plan {
+            if let Some(max_plan) = refined_max_plan.and_then(|plan| claude_plan_name(Some(plan))) {
                 snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                     "claude_max_rate_limit_tier_detected",
                     AgentDiagnosticSeverity::Info,
                     format!(
-                        "Claude Max tier resolved to {max_plan} from local Claude Code account metadata."
+                        "Claude plan tier resolved to {max_plan} from local Claude Code account metadata."
                     ),
                 ));
             }
@@ -7855,14 +7855,21 @@ fn claude_oauth_plan_type_for_label(oauth: &ClaudeCliOauthAccount) -> Option<Str
     Some(refined.unwrap_or(base)).filter(|plan| !plan.is_empty())
 }
 
-/// "Claude Max 20x", "Claude Team Premium", ... for a local message.
+/// "Claude Ultra", "Claude Team Premium", ... for a local message.
 fn claude_plan_label(plan_type: Option<&str>) -> Option<String> {
+    claude_plan_name(plan_type).map(|name| format!("Claude {name}"))
+}
+
+/// "Ultra", "Team Premium", ... Plan ids keep their old names: `max_5x` is
+/// Max, `max_20x` is Ultra, and a bare `max` (tier unknown) is either.
+fn claude_plan_name(plan_type: Option<&str>) -> Option<String> {
     let plan = normalize_plan_type(plan_type?.to_string());
     let plan = plan.strip_prefix("claude_").unwrap_or(&plan);
     let label = match plan {
         "" => return None,
-        "max_20x" => "Max 20x".to_string(),
-        "max_5x" => "Max 5x".to_string(),
+        "max_20x" => "Ultra".to_string(),
+        "max_5x" => "Max".to_string(),
+        "max" => "Max or Ultra".to_string(),
         other => other
             .split('_')
             .filter(|word| !word.is_empty())
@@ -7875,7 +7882,7 @@ fn claude_plan_label(plan_type: Option<&str>) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     };
-    Some(format!("Claude {label}"))
+    Some(label)
 }
 
 /// Local-only explanation naming the plans of both logins. It never names an
@@ -34909,7 +34916,7 @@ exit 0
             slot.collection.diagnostics[0].code,
             ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch
         );
-        assert!(message.contains("Claude Max 20x"), "{message}");
+        assert!(message.contains("Claude Ultra"), "{message}");
         assert!(message.contains("Claude Team Premium"), "{message}");
         assert!(!message.contains('@'), "{message}");
         assert!(
@@ -34959,7 +34966,7 @@ exit 0
             assert!(!diagnostics.contains('@'), "no email in diagnostic uploads");
         }
         assert!(
-            !wire.contains("Claude Max 20x"),
+            !wire.contains("Claude Ultra"),
             "the local message is not uploaded"
         );
         assert!(!wire.contains("fixture-secret"), "no token in uploads");
@@ -35628,7 +35635,15 @@ exit 0
     fn binding_mismatch_message_names_plans_only() {
         assert_eq!(
             claude_plan_label(Some("max_20x")).as_deref(),
-            Some("Claude Max 20x")
+            Some("Claude Ultra")
+        );
+        assert_eq!(
+            claude_plan_label(Some("claude_max_5x")).as_deref(),
+            Some("Claude Max")
+        );
+        assert_eq!(
+            claude_plan_label(Some("max")).as_deref(),
+            Some("Claude Max or Ultra")
         );
         assert_eq!(
             claude_plan_label(Some("claude_team_premium")).as_deref(),
@@ -35640,7 +35655,7 @@ exit 0
         );
         assert_eq!(claude_plan_label(None), None);
         let message = claude_slot_binding_mismatch_message(Some("team_premium"), Some("max_20x"));
-        assert!(message.contains("a different Claude Max 20x account"));
+        assert!(message.contains("a different Claude Ultra account"));
         assert!(message.contains("the Claude Team Premium account"));
         let unknown = claude_slot_binding_mismatch_message(None, None);
         assert!(unknown.contains("a different Claude account"));
