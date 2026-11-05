@@ -817,6 +817,7 @@ const FACTS: [Fact; 6] = [
     Fact::CodexPrelude,
 ];
 const FACT_VERSION: u64 = 1;
+const WORKSPACE_BINDING_VERSION: u64 = 2;
 
 impl Fact {
     fn present(self, acc: &SnapshotAccumulator) -> bool {
@@ -834,7 +835,12 @@ impl Fact {
 
     fn put(self, acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
         e.varint(self as u64)?;
-        e.varint(FACT_VERSION)?;
+        let bound_workspace = self == Self::Workspace && acc.repository_binding.is_some();
+        e.varint(if bound_workspace {
+            WORKSPACE_BINDING_VERSION
+        } else {
+            FACT_VERSION
+        })?;
         match self {
             Self::Title => acc.title.put(e),
             Self::FirstPrompt => {
@@ -843,16 +849,25 @@ impl Fact {
             }
             // A path never enters a record body (`PathBuf` refuses outside
             // hashing); the workspace path is a parsed JSON string, stored so.
-            Self::Workspace => acc
-                .workspace_path
-                .as_ref()
-                .map(|path| {
-                    path.to_str()
-                        .map(str::to_owned)
-                        .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
-                })
-                .transpose()?
-                .put(e),
+            Self::Workspace => {
+                acc.workspace_path
+                    .as_ref()
+                    .map(|path| {
+                        path.to_str()
+                            .map(str::to_owned)
+                            .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
+                    })
+                    .transpose()?
+                    .put(e)?;
+                if let Some(binding) = &acc.repository_binding {
+                    binding.repository_hash.put(e)?;
+                    binding.repository_identity_source.put(e)?;
+                    binding.workspace_kind.put(e)?;
+                    binding.repository_label.put(e)?;
+                    binding.repository_label_source.put(e)?;
+                }
+                Ok(())
+            }
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
             Self::AgentLabel => acc.codex_agent_label.put(e),
             Self::CodexPrelude => acc.session_start.put_codex_prelude_fact(e),
@@ -873,7 +888,10 @@ impl Fact {
         if d.varint()? != page {
             return Err(ReconstructCause::Corrupt);
         }
-        if d.varint()? != FACT_VERSION {
+        let version = d.varint()?;
+        if version != FACT_VERSION
+            && !(fact == Self::Workspace && version == WORKSPACE_BINDING_VERSION)
+        {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
@@ -883,7 +901,18 @@ impl Fact {
                 into.first_prompt_title = <Option<String> as Durable>::take(&mut d)?;
             }
             Self::Workspace => {
-                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
+                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from);
+                into.repository_binding = if version == WORKSPACE_BINDING_VERSION {
+                    Some(crate::context_footprint::RepositoryIdentity {
+                        repository_hash: <Option<String> as Durable>::take(&mut d)?,
+                        repository_identity_source: <Option<String> as Durable>::take(&mut d)?,
+                        workspace_kind: <Option<String> as Durable>::take(&mut d)?,
+                        repository_label: <Option<String> as Durable>::take(&mut d)?,
+                        repository_label_source: <Option<String> as Durable>::take(&mut d)?,
+                    })
+                } else {
+                    None
+                };
             }
             Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
             Self::AgentLabel => into.codex_agent_label = <Option<String> as Durable>::take(&mut d)?,
@@ -1001,6 +1030,8 @@ head_fields! {
         N last_activity_at: Option<String>,
         U workspace_hash: Option<String>,
         X workspace_path: Option<PathBuf>,
+        // No head bytes: the optional binding belongs only to Workspace v2.
+        I repository_binding: Option<crate::context_footprint::RepositoryIdentity>,
         U latest_model: Option<String>,
         U latest_reasoning_effort: Option<String>,
         L latest_turn_id: Option<String>,
@@ -1196,3 +1227,7 @@ mod retired_slot_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tail_source/repository_binding_tests.rs"]
+mod repository_binding_tests;
