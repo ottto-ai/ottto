@@ -560,7 +560,9 @@ fn measured_first_own_request_at(item: &SnapshotItem) -> Option<String> {
 }
 
 /// Why an item without a provider-proven start kept or lost its scalars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialized (snake_case) only as `context_posture_withheld`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ClaudeFileBirthVerdict {
     Admitted,
     UnknownBirth,
@@ -571,9 +573,28 @@ pub(crate) enum ClaudeFileBirthVerdict {
     MultiFile,
     Tripwire,
     EvidenceBound,
+    /// The family root's ownership is uncertified; set by the fold, never here.
+    Uncertified,
 }
 
 crate::heap_layout_bound::no_heap!(true; ClaudeFileBirthVerdict);
+
+impl ClaudeFileBirthVerdict {
+    /// Ownership unknown: the cleared posture is withheld, not a proven empty
+    /// value. Admitted owns it; AllCopied and Tripwire disprove it.
+    pub(crate) fn posture_not_withheld(verdict: &Option<Self>) -> bool {
+        !matches!(
+            verdict,
+            Some(
+                Self::UnknownBirth
+                    | Self::UntimedRecord
+                    | Self::MultiFile
+                    | Self::EvidenceBound
+                    | Self::Uncertified
+            )
+        )
+    }
+}
 
 impl SnapshotItem {
     /// Local design E decision for this fold, independent of strict ownership.
@@ -979,7 +1000,10 @@ impl ClaudeContextBasisCounts {
         }
         let counter = match verdict {
             ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
-            ClaudeFileBirthVerdict::UnknownBirth => &mut self.withheld_unknown_birth_session_count,
+            // Uncertified is set outside admission and never recorded here.
+            ClaudeFileBirthVerdict::UnknownBirth | ClaudeFileBirthVerdict::Uncertified => {
+                &mut self.withheld_unknown_birth_session_count
+            }
             ClaudeFileBirthVerdict::UntimedRecord => {
                 &mut self.withheld_untimed_record_session_count
             }
