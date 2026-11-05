@@ -12207,7 +12207,7 @@ impl ScanIndexLoadOrigin {
     /// The one fresh/rebuilt-load definition, before replay can advance the
     /// generation.
     pub(crate) fn is_fresh(self, index: &ScanIndex) -> bool {
-        self != Self::Loaded || index.files.is_empty()
+        self != Self::Loaded || (index.generation == 0 && index.files.is_empty())
     }
 }
 

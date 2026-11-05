@@ -1834,8 +1834,8 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
         ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
         assert!(!claude_reemission_stop_latched());
     }
-    // A populated generation-0 index is not fresh; an empty saved index is
-    // fresh even after import advanced its generation.
+    // Both conditions matter: a populated generation-0 index and an empty
+    // saved index with a nonzero generation must not be treated as fresh.
     let path = home.join("existing-index.json");
     baseline.generation = 0;
     fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
@@ -1845,8 +1845,7 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     baseline.generation = 1;
     fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
     ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
-    assert!(claude_reemission_stop_latched());
-    assert_eq!(claude_reemission_stop_reason(), "index_rebuild");
+    assert!(!claude_reemission_stop_latched());
     let _ = fs::remove_dir_all(home);
 }
 

@@ -542,7 +542,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            let generation = import::import_generation(index)?;
+            let generation = import::import_generation(index, original)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: crate::hex::encode(&random),
@@ -582,10 +582,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
         db.audit_headers()?;
         let stamp = db.stamp()?;
-        ensure!(
-            stamp.0 == import::import_generation(index)?,
-            Hold::DbUnavailable
-        );
+        ensure!(stamp.0 == identity.fence_generation, Hold::DbUnavailable);
         index.generation = stamp.0;
         let digests = kinds::baseline(index, &mut cx)?;
         index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));

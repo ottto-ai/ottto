@@ -341,6 +341,10 @@ fn support_dir_load_imports_and_publishes() {
     let index = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(published(&f.path).unwrap());
+    assert_eq!(
+        index.generation, 1,
+        "present originals still advance on import"
+    );
 
     let f = Fixture::new();
     let (index, origin) =
@@ -348,7 +352,7 @@ fn support_dir_load_imports_and_publishes() {
     assert_eq!(origin, ScanIndexLoadOrigin::Missing);
     assert!(index.v2().persistence_v2.is_some());
     assert!(published(&f.path).unwrap());
-    let (reopened, origin) =
+    let (mut reopened, origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
     assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     assert!(origin.is_fresh(&reopened));
@@ -357,6 +361,11 @@ fn support_dir_load_imports_and_publishes() {
         reopened.accepted_snapshot_fingerprints,
         index.accepted_snapshot_fingerprints
     );
+    assert!(save_with(&f.path, &mut reopened).unwrap());
+    let (saved, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert!(saved.files.is_empty() && saved.generation >= 1);
+    assert!(!origin.is_fresh(&saved));
 }
 
 /// [format] absent parent containment guard never promotes a database.
