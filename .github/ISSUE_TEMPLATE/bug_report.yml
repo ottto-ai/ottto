@@ -26,9 +26,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: Ottto version and channel
-      description: The `current_version` and `channel` values from `ottto update check --json`.
-      placeholder: "0.1.220 (stable)"
+      label: Ottto version
+      description: The output of `ottto --version` (0.1.223 or later). On older builds, the `current_version` and `channel` values from `ottto update check --json`.
+      placeholder: "ottto 0.1.223"
     validations:
       required: true
   - type: dropdown
