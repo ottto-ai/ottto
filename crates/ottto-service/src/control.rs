@@ -18919,7 +18919,7 @@ for line in sys.stdin:
         prior_secret: &str,
     ) -> PendingDeviceCredentialRequestAuthority {
         let machine = MachineIdentity {
-            hardware_uuid: Some("hardware-test".to_string()),
+            hardware_uuid: Some(ottto_core::hashed_hardware_id("hardware-test")),
             ..test_machine()
         };
         let prior = PriorDeviceCredential {
@@ -22463,6 +22463,109 @@ for line in sys.stdin:
                 Some("install_test")
             );
         }
+    }
+
+    /// Whether `text` contains an `8-4-4-4-12` hex UUID, the raw
+    /// `IOPlatformUUID` shape.
+    fn contains_uuid_shape(text: &str) -> bool {
+        const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+        let bytes = text.as_bytes();
+        (0..bytes.len().saturating_sub(35)).any(|start| {
+            let mut at = start;
+            GROUPS.iter().enumerate().all(|(index, len)| {
+                let group_ok = bytes[at..at + len].iter().all(u8::is_ascii_hexdigit);
+                at += len;
+                if index + 1 == GROUPS.len() {
+                    return group_ok;
+                }
+                let dash_ok = bytes[at] == b'-';
+                at += 1;
+                group_ok && dash_ok
+            })
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn identity_payloads_carry_only_the_hashed_hardware_id() {
+        let raw = "00000000-0000-4000-8000-000000000000";
+        let hashed = "oth_275116a0382631a3808f5f844a12ecfa";
+        assert!(contains_uuid_shape(raw));
+        assert!(!contains_uuid_shape(hashed));
+        let machine = MachineIdentity {
+            hardware_uuid: Some(ottto_core::hashed_hardware_id(raw)),
+            ..test_machine()
+        };
+        let claim = PendingAuthClaim {
+            claim_code: "claim_hardware".to_string(),
+            claim_token: "token_hardware".to_string(),
+            nonce: "nonce_hardware_identity".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_hardware".to_string(),
+            expires_at: "2026-05-05T09:30:00Z".to_string(),
+        };
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install_session_hardware".to_string(),
+            install_session_token: "install_token_hardware".to_string(),
+        };
+
+        for payload in [
+            setup_claim_create_body(&machine, &claim.nonce),
+            setup_claim_complete_body(&claim, &machine),
+            setup_run_attach_body(&machine),
+            telemetry_device_register_body(&install_session, &machine),
+        ] {
+            assert_eq!(
+                payload
+                    .get("hardware_uuid")
+                    .and_then(serde_json::Value::as_str),
+                Some(hashed)
+            );
+            let encoded = payload.to_string();
+            assert!(!encoded.contains(raw), "{encoded}");
+            assert!(!contains_uuid_shape(&encoded), "{encoded}");
+        }
+    }
+
+    /// A preparation journaled by an older daemon holds the raw hardware id.
+    /// After the upgrade the daemon reports the hash; the same retry must still
+    /// match the journal instead of being refused as a rebind.
+    #[test]
+    fn raw_journaled_hardware_id_is_not_a_rebind_after_hashing() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-raw-hardware-journal");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let candidate = format!("candidate-{}", "hardware".repeat(3));
+        let raw = "00000000-0000-4000-8000-000000000000";
+        let mut current = test_pending_device_credential("preparation-raw-hardware", true);
+        current.secret_commitment_sha256 = secret_sha256(&candidate);
+        current.request_authority = Some(test_setup_claim_request_authority("prior-hardware"));
+        let mut older = current.clone();
+        older
+            .request_authority
+            .as_mut()
+            .expect("request authority")
+            .hardware_uuid = Some(raw.to_string());
+        current
+            .request_authority
+            .as_mut()
+            .expect("request authority")
+            .hardware_uuid = Some(ottto_core::hashed_hardware_id(raw));
+        // What an older daemon left on disk before the upgrade.
+        pending_store.save(&older).expect("journal raw authority");
+
+        assert_eq!(
+            stage_pending_device_credential_with_stores(
+                &current,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending_secret.load().expect("candidate staged"), candidate);
+        assert_eq!(pending_store.load().expect("journal"), Some(current));
     }
 
     #[test]

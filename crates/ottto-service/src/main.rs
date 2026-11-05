@@ -837,19 +837,39 @@ fn service_bootstrap_commands(
 }
 
 fn local_machine() -> MachineIdentity {
+    local_machine_in(&FileMachineStore::default())
+}
+
+fn local_machine_in(store: &FileMachineStore) -> MachineIdentity {
     let hostname = local_hostname();
-    let mut binding = persistent_machine_binding().unwrap_or_else(|_| LocalMachineBinding {
+    let mut binding = persistent_machine_binding(store).unwrap_or_else(|_| LocalMachineBinding {
         machine_id: fallback_machine_id(&hostname),
         installation_id: fallback_installation_id(),
         hardware_uuid: platform_hardware_uuid(),
     });
-    if binding.hardware_uuid.is_none() {
-        if let Some(uuid) = platform_hardware_uuid() {
-            binding.hardware_uuid = Some(uuid);
-            let _ = FileMachineStore::default().save(&binding);
-        }
+    if refresh_binding_hardware_id(&mut binding, platform_hardware_uuid) {
+        let _ = store.save(&binding);
     }
     machine_identity(binding, hostname)
+}
+
+/// Backfills a missing hardware id and replaces a raw one written by an older
+/// daemon with its one-way hash. Returns whether the binding changed and so
+/// needs saving.
+fn refresh_binding_hardware_id(
+    binding: &mut LocalMachineBinding,
+    current: impl FnOnce() -> Option<String>,
+) -> bool {
+    let refreshed = match binding.hardware_uuid.as_deref() {
+        Some(stored) if ottto_core::is_hashed_hardware_id(stored) => return false,
+        Some(raw) => Some(ottto_core::hashed_hardware_id(raw)),
+        None => current(),
+    };
+    if refreshed.is_none() {
+        return false;
+    }
+    binding.hardware_uuid = refreshed;
+    true
 }
 
 /// `EX_CONFIG`: `status` found no control token or machine binding.
@@ -911,7 +931,12 @@ fn machine_identity(binding: LocalMachineBinding, hostname: String) -> MachineId
     MachineIdentity {
         machine_id: binding.machine_id,
         installation_id: binding.installation_id,
-        hardware_uuid: binding.hardware_uuid,
+        // Never the raw platform id, even before `local_machine` rewrites a
+        // binding saved by an older daemon (`status` reads without saving).
+        hardware_uuid: binding
+            .hardware_uuid
+            .as_deref()
+            .map(ottto_core::normalize_hardware_id),
         account_scope,
         display_name: hostname.clone(),
         hostname,
@@ -921,9 +946,9 @@ fn machine_identity(binding: LocalMachineBinding, hostname: String) -> MachineId
     }
 }
 
-fn persistent_machine_binding() -> Result<LocalMachineBinding> {
+fn persistent_machine_binding(store: &FileMachineStore) -> Result<LocalMachineBinding> {
     let hostname = local_hostname();
-    FileMachineStore::default().load_or_create(|| {
+    store.load_or_create(|| {
         Ok(LocalMachineBinding {
             machine_id: platform_machine_id().unwrap_or_else(|| fallback_machine_id(&hostname)),
             installation_id: fallback_installation_id(),
@@ -932,10 +957,13 @@ fn persistent_machine_binding() -> Result<LocalMachineBinding> {
     })
 }
 
+/// The one-way hardware id this daemon reports and persists. The raw
+/// `IOPlatformUUID` never leaves `ioplatform_uuid` except as `machine_id`
+/// digest input.
 fn platform_hardware_uuid() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        ioplatform_uuid()
+        ioplatform_uuid().map(|raw| ottto_core::hashed_hardware_id(&raw))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -999,8 +1027,9 @@ fn current_account_uid() -> Option<u32> {
 }
 
 /// `<prefix>_` + the first 32 hex characters of the seed's SHA-256 digest. The
-/// shared shape behind `machine_id` (`otm_`) and `account_scope` (`otu_`); each
-/// caller owns its own prefix so the two can never be confused for each other
+/// shared shape behind `machine_id` (`otm_`), `account_scope` (`otu_`) and
+/// the hardware id (`oth_`, `ottto_core::hashed_hardware_id`); each
+/// caller owns its own prefix so none can be confused for another
 /// or for the randomly minted `installation_id` (`oti_`).
 fn prefixed_sha256_id(prefix: &str, seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
@@ -1011,6 +1040,8 @@ fn prefixed_sha256_id(prefix: &str, seed: &str) -> String {
     format!("{prefix}_{}", &hex[..32])
 }
 
+/// Derived from the raw `IOPlatformUUID`, never the hashed hardware id, so
+/// `machine_id` stays the value every earlier daemon on this Mac reported.
 fn platform_machine_id() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -1222,6 +1253,150 @@ mod tests {
         ] {
             assert!(!readers.contains(creating), "{creating}: {readers}");
         }
+    }
+
+    /// Fake, UUID-shaped raw id; the expected hash is the vector shared with
+    /// the backend (see `ottto_core::hashed_hardware_id`).
+    const FAKE_RAW_HARDWARE_UUID: &str = "00000000-0000-4000-8000-000000000000";
+    const FAKE_HASHED_HARDWARE_ID: &str = "oth_275116a0382631a3808f5f844a12ecfa";
+
+    fn hardware_test_machine_store(label: &str) -> (PathBuf, FileMachineStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-service-hardware-id-{}-{label}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create machine dir");
+        let path = dir.join("machine.json");
+        (path.clone(), FileMachineStore::new(path))
+    }
+
+    #[test]
+    fn hardware_id_uses_the_shared_prefixed_digest_shape() {
+        assert_eq!(
+            ottto_core::hashed_hardware_id(FAKE_RAW_HARDWARE_UUID),
+            prefixed_sha256_id(
+                "oth",
+                &format!("ottto-hardware:v1:{FAKE_RAW_HARDWARE_UUID}")
+            )
+        );
+        assert_eq!(
+            ottto_core::hashed_hardware_id(FAKE_RAW_HARDWARE_UUID),
+            FAKE_HASHED_HARDWARE_ID
+        );
+    }
+
+    #[test]
+    fn local_machine_rewrites_a_raw_stored_hardware_id_as_its_hash() {
+        let (path, store) = hardware_test_machine_store("raw-migration");
+        let machine_id = "otm_0123456789abcdef0123456789abcdef";
+        let installation_id = "oti_fedcba9876543210fedcba9876543210";
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "machine_id": machine_id,
+                "installation_id": installation_id,
+                "hardware_uuid": FAKE_RAW_HARDWARE_UUID,
+            }))
+            .expect("encode raw binding"),
+        )
+        .expect("write raw binding");
+
+        let machine = local_machine_in(&store);
+
+        assert_eq!(
+            machine.hardware_uuid.as_deref(),
+            Some(FAKE_HASHED_HARDWARE_ID)
+        );
+        assert_eq!(machine.machine_id, machine_id, "machine_id is unchanged");
+        assert_eq!(machine.installation_id, installation_id);
+        let persisted = fs::read_to_string(&path).expect("read migrated binding");
+        assert!(persisted.contains(FAKE_HASHED_HARDWARE_ID), "{persisted}");
+        assert!(!persisted.contains(FAKE_RAW_HARDWARE_UUID), "{persisted}");
+        assert_eq!(
+            store.load().expect("load migrated binding"),
+            Some(LocalMachineBinding {
+                machine_id: machine_id.to_string(),
+                installation_id: installation_id.to_string(),
+                hardware_uuid: Some(FAKE_HASHED_HARDWARE_ID.to_string()),
+            })
+        );
+
+        // A hashed binding is final: a second boot neither rehashes nor rewrites it.
+        let again = local_machine_in(&store);
+        assert_eq!(again, machine);
+        assert_eq!(
+            fs::read_to_string(&path).expect("reread binding"),
+            persisted
+        );
+    }
+
+    #[test]
+    fn refresh_binding_hardware_id_backfills_hashes_and_keeps_hashes() {
+        let binding = |hardware_uuid: Option<&str>| LocalMachineBinding {
+            machine_id: "otm_0123456789abcdef0123456789abcdef".to_string(),
+            installation_id: "oti_fedcba9876543210fedcba9876543210".to_string(),
+            hardware_uuid: hardware_uuid.map(str::to_string),
+        };
+        let hashed = || Some(FAKE_HASHED_HARDWARE_ID.to_string());
+
+        let mut missing = binding(None);
+        assert!(refresh_binding_hardware_id(&mut missing, hashed));
+        assert_eq!(missing, binding(Some(FAKE_HASHED_HARDWARE_ID)));
+
+        let mut unknown = binding(None);
+        assert!(!refresh_binding_hardware_id(&mut unknown, || None));
+        assert_eq!(unknown, binding(None));
+
+        let mut raw = binding(Some(FAKE_RAW_HARDWARE_UUID));
+        assert!(refresh_binding_hardware_id(&mut raw, || {
+            panic!("a stored raw id is hashed, not re-read")
+        }));
+        assert_eq!(raw, binding(Some(FAKE_HASHED_HARDWARE_ID)));
+
+        let mut final_hash = binding(Some(FAKE_HASHED_HARDWARE_ID));
+        assert!(!refresh_binding_hardware_id(&mut final_hash, || {
+            panic!("a hashed id is final")
+        }));
+        assert_eq!(final_hash, binding(Some(FAKE_HASHED_HARDWARE_ID)));
+    }
+
+    #[test]
+    fn machine_identity_never_carries_the_raw_hardware_id() {
+        let machine = machine_identity(
+            LocalMachineBinding {
+                machine_id: "otm_0123456789abcdef0123456789abcdef".to_string(),
+                installation_id: "oti_fedcba9876543210fedcba9876543210".to_string(),
+                hardware_uuid: Some(FAKE_RAW_HARDWARE_UUID.to_string()),
+            },
+            "test-mac.local".to_string(),
+        );
+        assert_eq!(
+            machine.hardware_uuid.as_deref(),
+            Some(FAKE_HASHED_HARDWARE_ID)
+        );
+        let encoded = serde_json::to_string(&machine).expect("encode machine");
+        assert!(!encoded.contains(FAKE_RAW_HARDWARE_UUID), "{encoded}");
+    }
+
+    /// `machine_id` keeps hashing the raw `IOPlatformUUID`; switching it to the
+    /// hashed hardware id would change every Mac's identity.
+    #[test]
+    fn machine_id_is_still_derived_from_the_raw_platform_uuid() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let from = source
+            .find("fn platform_machine_id() -> Option<String> {")
+            .expect("platform_machine_id");
+        let body = &source[from..from + source[from..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains(
+                "ioplatform_uuid().map(|uuid| stable_machine_id_from_seed(&format!(\"macos:{uuid}\")))"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("platform_hardware_uuid"), "{body}");
+        assert!(!body.contains("hashed_hardware_id"), "{body}");
     }
 
     #[test]
