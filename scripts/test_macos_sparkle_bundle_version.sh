@@ -196,68 +196,61 @@ git -C "$private_repo" add .
 git -C "$private_repo" commit -qm "app fixture"
 private_commit="$(git -C "$private_repo" rev-parse HEAD)"
 private_tree="$(git -C "$private_repo" rev-parse HEAD:tools/ottto-macos-app)"
-# Stand-in for the private GitHub master: the packager fetches it by URL.
-private_remote="$TMP_DIR/private-remote.git"
-git init -q --bare "$private_remote"
-git -C "$private_repo" push -q "$private_remote" HEAD:refs/heads/master
-export GIT_CONFIG_COUNT=1
-export GIT_CONFIG_KEY_0="url.$private_remote.insteadOf"
-export GIT_CONFIG_VALUE_0="https://github.com/ottto-ai/coding-agents-observability.git"
-cat > "$mock_bin/gh" <<'GH'
+# The packager must never call gh: any call is logged and fails.
+gh_calls="$TMP_DIR/gh.calls"
+cat > "$mock_bin/gh" <<GH
 #!/usr/bin/env bash
-set -euo pipefail
-case "$*" in
-  *repos/singular-labs/coding-agents-observability*) exit 1 ;;
-  *) echo "unexpected gh fixture invocation: $*" >&2; exit 2 ;;
-esac
+printf '%s\\n' "\$*" >> "$gh_calls"
+exit 2
 GH
 chmod +x "$mock_bin/gh"
 
-# package_expect_failure <label> <expected message> <env assignments...>
+# package_expect_failure <label> <expected message> <packager args...>
 package_expect_failure() {
   local label="$1"
   local expected="$2"
   shift 2
-  if env PATH="$mock_bin:$PATH" OTTTO_MACOS_APP_ROOT="$app_root" "$@" \
-    bash "$repo/scripts/macos_package.sh" \
-      --version "0.1.92-rc3" \
-      --channel stable-candidate \
-      --release-notes "Pin fixture" \
-      --output-dir "$TMP_DIR/$label-output" \
-      --skip-build >"$TMP_DIR/$label.out" 2>&1; then
+  if PATH="$mock_bin:$PATH" bash "$repo/scripts/macos_package.sh" \
+    --version "0.1.92-rc3" \
+    --channel stable-candidate \
+    --release-notes "Pin fixture" \
+    --output-dir "$TMP_DIR/$label-output" \
+    --skip-build "$@" >"$TMP_DIR/$label.out" 2>&1; then
     echo "Expected packaging to fail: $label" >&2
     exit 1
   fi
-  if ! grep -Fq "$expected" "$TMP_DIR/$label.out"; then
+  if ! grep -Fq -- "$expected" "$TMP_DIR/$label.out"; then
     echo "Packaging failure for $label did not report: $expected" >&2
     cat "$TMP_DIR/$label.out" >&2
     exit 1
   fi
 }
 
-# [behaviour] CI builds require the app source pin, and the checkout must be at it.
-package_expect_failure missing-pin "OTTTO_MACOS_APP_SOURCE_COMMIT must be a 40-hex" \
-  GITHUB_ACTIONS=true OTTTO_MACOS_APP_SOURCE_COMMIT=
-package_expect_failure invalid-pin "OTTTO_MACOS_APP_SOURCE_COMMIT must be a 40-hex" \
-  GITHUB_ACTIONS=true OTTTO_MACOS_APP_SOURCE_COMMIT="${private_commit:0:12}"
-package_expect_failure pin-mismatch "not the pinned commit" \
-  GITHUB_ACTIONS=true OTTTO_MACOS_APP_SOURCE_COMMIT="$(printf '0%.0s' {1..40})"
-# [behaviour] The pin must be on the first-parent line of the fetched master.
-git -C "$private_repo" commit -q --allow-empty -m "unpublished app commit"
-package_expect_failure pin-off-master "is not on the first-parent line of GitHub master" \
-  GITHUB_ACTIONS=true OTTTO_MACOS_APP_SOURCE_COMMIT="$(git -C "$private_repo" rev-parse HEAD)"
-git -C "$private_repo" reset -q --hard "$private_commit"
+# [behaviour] The app root is a required flag.
+package_expect_failure missing-app-root "--app-root is required" \
+  --app-source-commit "$private_commit"
+# [behaviour] Stable channels require the app source commit, and the checkout must be at it.
+package_expect_failure missing-pin "--app-source-commit is required for stable-candidate and stable" \
+  --app-root "$app_root"
+package_expect_failure invalid-pin "--app-source-commit must be a 40-hex" \
+  --app-root "$app_root" --app-source-commit "${private_commit:0:12}"
+package_expect_failure pin-mismatch "not --app-source-commit" \
+  --app-root "$app_root" --app-source-commit "$(printf '0%.0s' {1..40})"
 
 PATH="$mock_bin:$PATH" \
-GITHUB_ACTIONS=true \
-OTTTO_MACOS_APP_SOURCE_COMMIT="$private_commit" \
-OTTTO_MACOS_APP_ROOT="$app_root" \
 bash "$repo/scripts/macos_package.sh" \
+  --app-root "$app_root" \
+  --app-source-commit "$private_commit" \
   --version "0.1.92-rc2" \
   --channel stable-candidate \
   --release-notes "Sparkle version fixture" \
   --output-dir "$output_dir" \
   --skip-build >/dev/null
+if [[ -e "$gh_calls" ]]; then
+  echo "Packaging must not call gh:" >&2
+  cat "$gh_calls" >&2
+  exit 1
+fi
 
 # [behaviour] Only the daemon LaunchAgent carries the allocator setting.
 service_plist="$output_dir/Ottto.app/Contents/Library/LaunchAgents/net.ottto.service.plist"
@@ -334,8 +327,9 @@ if ! jq -e \
 fi
 printf '// dirty fixture\n' >> "$app_root/Package.swift"
 if PATH="$mock_bin:$PATH" \
-  OTTTO_MACOS_APP_ROOT="$app_root" \
   bash "$repo/scripts/macos_package.sh" \
+    --app-root "$app_root" \
+    --app-source-commit "$private_commit" \
     --version "0.1.92-rc3" \
     --channel stable-candidate \
     --release-notes "Dirty provenance fixture" \

@@ -57,6 +57,10 @@ require_grep 'actions/checkout@[0-9a-f]{40}' 'pinned checkout action'
 require_grep 'actions/attest@[0-9a-f]{40}' 'pinned attest action'
 require_grep 'actions/upload-artifact@[0-9a-f]{40}' 'pinned upload-artifact action'
 require_grep 'scripts/macos_package\.sh' 'packaging step'
+# shellcheck disable=SC2016 # These assertions intentionally match literal variables.
+require_grep '--app-root "\$\{OTTTO_MACOS_APP_ROOT:\?\}"' 'app root passed into macos_package from the runner'
+# shellcheck disable=SC2016
+require_grep '--app-source-commit "\$OTTTO_MACOS_APP_SOURCE_COMMIT"' 'release-tag app source commit passed into macos_package'
 require_grep 'scripts/macos_notarize\.sh' 'notarization step'
 require_grep 'scripts/macos_attestation_bind\.sh' 'attestation binding step'
 require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature step'
