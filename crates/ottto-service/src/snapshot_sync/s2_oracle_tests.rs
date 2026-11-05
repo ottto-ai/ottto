@@ -1263,3 +1263,5 @@ fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hol
 }
 
 mod pause_guard_oracle_tests;
+
+mod subagent_twin_tests;

@@ -4062,18 +4062,26 @@ const CLAUDE_RELOGIN_APPROACHING_CODE: &str = "claude_relogin_approaching";
 /// the one its `.claude.json` names (Claude Desktop and the terminal signed
 /// in as different accounts there).
 const CLAUDE_DEFAULT_HOME_SPLIT_LOGIN_CODE: &str = "claude_default_home_split_login";
-/// The default home's owner check: the binding `.claude.json` names, and the
-/// token's owner once proven and known.
-struct ClaudeDefaultHomeOwner {
+/// A Claude home's owner check (the default home or a registered slot): the
+/// binding `.claude.json` names, and the stored token's owner once proven.
+struct ClaudeTokenOwner {
     cached: Option<(String, String)>,
     proven: Option<claude_token_owner::ProvenOwner>,
 }
 
-impl ClaudeDefaultHomeOwner {
+impl ClaudeTokenOwner {
     fn proven_binding(&self) -> Option<(String, String)> {
         self.proven
             .as_ref()
             .map(|owner| (owner.account_hash.clone(), owner.organization_hash.clone()))
+    }
+
+    /// Proven to be exactly `expected`, account and organization.
+    fn proves(&self, expected: &ClaudeSlotAccountBinding) -> bool {
+        self.proven.as_ref().is_some_and(|owner| {
+            owner.account_hash == expected.account_identifier_hash
+                && owner.organization_hash == expected.organization_identifier_hash
+        })
     }
 
     /// Proven and known, but not the account `.claude.json` names.
@@ -4101,6 +4109,26 @@ impl ClaudeDefaultHomeOwner {
     }
 }
 
+/// The proven owner of a home's stored token (`home` is `"default"` or the
+/// slot id). A valid token may be sent when `calls_allowed` (the background
+/// gates of `claude_owner_call_allowed`, or false for remembered verdicts
+/// only). A lapsed token waiting for Claude Code's refresh is never sent: it
+/// keeps the verdict remembered for that same token. Any other login state
+/// has nothing to prove.
+fn prove_claude_token_owner(
+    home: &str,
+    login_state: &ClaudeLocalLoginState,
+    access_token: Option<&str>,
+    calls_allowed: bool,
+) -> Option<claude_token_owner::ProvenOwner> {
+    let may_call = match login_state {
+        ClaudeLocalLoginState::AccessValid => calls_allowed,
+        ClaudeLocalLoginState::RefreshPending => false,
+        _ => return None,
+    };
+    claude_token_owner::proven_owner(home, access_token?, may_call)
+}
+
 /// Prove the default home's token owner, only where the local files disagree:
 /// a locally valid token whose plan contradicts `.claude.json`. A lapsed token
 /// waiting for Claude Code's refresh is never sent; it keeps the verdict
@@ -4114,7 +4142,7 @@ fn resolve_claude_default_home_owner(
     login_state: &ClaudeLocalLoginState,
     stable: &mut StableClaudeSlotCredential,
     known_identities: &[ClaudeCliOauthAccount],
-) -> Option<ClaudeDefaultHomeOwner> {
+) -> Option<ClaudeTokenOwner> {
     let refresh_pending = *login_state == ClaudeLocalLoginState::RefreshPending;
     if !matches!(
         login_state,
@@ -4126,18 +4154,16 @@ fn resolve_claude_default_home_owner(
         return None;
     }
     let cached = claude_strong_oauth_identity_hashes(&stable.oauth_account);
-    // The same gates as a background usage read, "Background limit refresh"
-    // included, and never for a lapsed token: no call means unproven.
-    let may_call = !refresh_pending && claude_owner_call_allowed();
-    let owner = stable
-        .credential
-        .access_token
-        .as_deref()
-        .and_then(|token| claude_token_owner::proven_owner(token, may_call));
+    let owner = prove_claude_token_owner(
+        "default",
+        login_state,
+        stable.credential.access_token.as_deref(),
+        claude_owner_call_allowed(),
+    );
     if refresh_pending && owner.is_none() {
         return None;
     }
-    let mut resolved = ClaudeDefaultHomeOwner {
+    let mut resolved = ClaudeTokenOwner {
         cached,
         proven: owner,
     };
@@ -4156,10 +4182,10 @@ fn resolve_claude_default_home_owner(
     Some(resolved)
 }
 
-/// The owner check's hashes on the default slot's local status.
-fn apply_claude_default_home_owner(
+/// The owner check's hashes on a home's local status.
+fn apply_claude_token_owner(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
-    owner: Option<&ClaudeDefaultHomeOwner>,
+    owner: Option<&ClaudeTokenOwner>,
 ) {
     let Some(owner) = owner else {
         return;
@@ -4184,7 +4210,7 @@ fn collect_claude_status(
 ) -> (
     AgentStatusSnapshot,
     ClaudeDesktopPairs,
-    Option<ClaudeDefaultHomeOwner>,
+    Option<ClaudeTokenOwner>,
 ) {
     // Presence is decided by the canonical detector, which requires the `claude`
     // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
@@ -4863,7 +4889,7 @@ fn collect_claude_status_snapshots(
     );
     match default_owner
         .as_ref()
-        .and_then(ClaudeDefaultHomeOwner::binding_override)
+        .and_then(ClaudeTokenOwner::binding_override)
     {
         Some(binding) => retain_verified_claude_binding("default", binding, &mut default_state),
         None => retain_verified_claude_slot_binding(
@@ -4872,7 +4898,7 @@ fn collect_claude_status_snapshots(
             &mut default_state,
         ),
     }
-    apply_claude_default_home_owner(&mut default_state, default_owner.as_ref());
+    apply_claude_token_owner(&mut default_state, default_owner.as_ref());
     apply_claude_quota_access_state(&mut default_snapshot, &default_state);
     slot_states.insert("default".to_string(), default_state.clone());
     if claude_slot_status_carries_meters(&default_state) {
@@ -5979,8 +6005,6 @@ fn collect_registered_claude_slot_step(
     expires_at: &str,
 ) -> ClaudeSlotCollectionStep {
     let slot_id = descriptor.slot_id.as_str();
-    // Another account signed in to this slot: no upkeep, CLI, usage call,
-    // candidate or refresh for it until the approved account is back.
     let expected_binding = match claude_slot_pre_collection_gate(descriptor, previous, captured_at)
     {
         Ok(expected) => expected,
@@ -5992,12 +6016,50 @@ fn collect_registered_claude_slot_step(
     #[cfg(test)]
     claude_slot_after_pre_gate_hook();
     // One live local read per slot per pass (identity, stored credential,
-    // identity), shared by the upkeep decision and the resolution below.
-    // Never a `claude` spawn.
+    // identity), shared by the owner rule, the upkeep decision and the
+    // resolution below. Never a `claude` spawn.
     let network_enabled = !claude_oauth_usage_network_disabled();
-    let local = network_enabled
-        .then(|| read_registered_claude_slot_locally(descriptor))
-        .flatten();
+    let local = read_registered_claude_slot_locally(descriptor);
+    // Another account signed in to this slot, or one that cannot be shown to
+    // be the approved account: no upkeep, CLI, usage call, candidate or
+    // refresh for it until the approved account is back.
+    let mut owner = None;
+    if let Some(expected) = &expected_binding {
+        let calls_allowed = claude_owner_call_allowed();
+        let refusal = match claude_slot_owner_rule(slot_id, expected, local.as_ref(), calls_allowed)
+        {
+            ClaudeSlotOwnerRule::Named => None,
+            ClaudeSlotOwnerRule::Proven(proven) => {
+                owner = Some(proven);
+                None
+            }
+            ClaudeSlotOwnerRule::Other(plan) => Some(claude_slot_binding_mismatch_status(
+                expected,
+                plan.as_deref(),
+                previous,
+                captured_at,
+            )),
+            ClaudeSlotOwnerRule::Unproven => Some(claude_slot_approval_blocked_status(
+                expected,
+                ClaudeSlotProbeFailure::OwnerUnproven,
+                claude_slot_owner_unproven_message,
+                previous,
+                captured_at,
+            )),
+            ClaudeSlotOwnerRule::Unknown => Some(claude_slot_approval_blocked_status(
+                expected,
+                ClaudeSlotProbeFailure::IdentityUnknown,
+                claude_slot_unknown_login_message,
+                previous,
+                captured_at,
+            )),
+        };
+        if let Some(status) = refusal {
+            claude_oauth_end_slot_run(slot_id);
+            return ClaudeSlotCollectionStep::PreGateRefused(status);
+        }
+    }
+    let local = local.filter(|_| network_enabled);
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
@@ -6020,28 +6082,28 @@ fn collect_registered_claude_slot_step(
         } else {
             blocked_claude_upkeep_status(slot_id, captured_at, upkeep.status)
         };
-        if let Some(slot) = claude_config_slot_for_descriptor(descriptor) {
-            retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
-        } else {
-            clear_claude_slot_binding(&mut status);
-        }
+        retain_registered_claude_slot_binding(descriptor, owner.as_ref(), &mut status);
         append_claude_upkeep_result_receipt(&mut status, descriptor, result_observed_at);
+        apply_claude_token_owner(&mut status, owner.as_ref());
         return ClaudeSlotCollectionStep::UpkeepBlocked { status, paused };
     }
     let resolved = match local {
-        Some(local) => resolve_registered_claude_slot_from_local(local),
+        Some(local) => resolve_registered_claude_slot_from_local(local, owner.as_ref()),
         None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
     };
     let mut resolved = match resolved {
         Ok(resolved) => resolved,
         Err(failure) => {
             claude_oauth_end_slot_run(slot_id);
-            return ClaudeSlotCollectionStep::Stopped(registered_claude_failure_status(
+            let mut status = registered_claude_failure_status(
                 descriptor,
+                owner.as_ref(),
                 failure,
                 captured_at,
                 upkeep.status,
-            ));
+            );
+            apply_claude_token_owner(&mut status, owner.as_ref());
+            return ClaudeSlotCollectionStep::Stopped(status);
         }
     };
     if let Err(status) = claude_slot_post_resolution_gate(
@@ -6075,6 +6137,7 @@ fn collect_registered_claude_slot_step(
     ) {
         Ok((snapshot, mut status)) => {
             apply_claude_upkeep_observation(&mut status, upkeep.status);
+            apply_claude_token_owner(&mut status, owner.as_ref());
             ClaudeSlotCollectionStep::Collected {
                 snapshot,
                 status,
@@ -6085,6 +6148,7 @@ fn collect_registered_claude_slot_step(
         Err(mut status) => {
             retain_exact_claude_slot_binding(&mut status, &account_hash, &organization_hash);
             apply_claude_upkeep_observation(&mut status, upkeep.status);
+            apply_claude_token_owner(&mut status, owner.as_ref());
             ClaudeSlotCollectionStep::UsageFailed(status)
         }
     }
@@ -6621,6 +6685,24 @@ impl ClaudeSlotLocalRead {
             metadata: self.credential.metadata(),
         }
     }
+
+    /// The owner check of this read's own stored token, the bytes the usage
+    /// call sends, against `cached`, the pair `.claude.json` names.
+    fn token_owner(
+        &self,
+        slot_id: &str,
+        cached: Option<(String, String)>,
+        calls_allowed: bool,
+    ) -> ClaudeTokenOwner {
+        let token = match &self.credential {
+            ClaudeCredentialRead::Present(credential) => credential.access_token.as_deref(),
+            ClaudeCredentialRead::Absent | ClaudeCredentialRead::Unreadable => None,
+        };
+        ClaudeTokenOwner {
+            cached,
+            proven: prove_claude_token_owner(slot_id, &self.state, token, calls_allowed),
+        }
+    }
 }
 
 fn read_claude_slot_locally(slot: &ClaudeConfigDirSlot) -> ClaudeSlotLocalRead {
@@ -6672,7 +6754,72 @@ fn resolve_registered_claude_slot(
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     let local = read_registered_claude_slot_locally(&descriptor)
         .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
-    resolve_registered_claude_slot_from_local(local)
+    // Reconnect's identity check follows collection's owner rule.
+    let owner = match FileClaudeConfigSlotSettingsStore::default()
+        .expected_slot_binding(&descriptor.slot_id)
+    {
+        Ok(Some(expected)) => match claude_slot_owner_rule(
+            &descriptor.slot_id,
+            &expected,
+            Some(&local),
+            claude_owner_call_allowed(),
+        ) {
+            ClaudeSlotOwnerRule::Proven(owner) => Some(owner),
+            _ => None,
+        },
+        _ => None,
+    };
+    resolve_registered_claude_slot_from_local(local, owner.as_ref())
+}
+
+/// A registered slot's owner rule, from one local read of it (`.claude.json`
+/// and the stored token, the bytes its usage call sends). Where the file names
+/// another account than the approved one, the stored token decides; with
+/// `calls_allowed` false only remembered verdicts count.
+enum ClaudeSlotOwnerRule {
+    /// `.claude.json` names the approved account.
+    Named,
+    /// It names another account, and the stored token is proven to be the
+    /// approved account and organization.
+    Proven(ClaudeTokenOwner),
+    /// The stored token is proven to be another account (with the plan the
+    /// file names, for wording).
+    Other(Option<String>),
+    /// It names another account, and the token's owner is not proven: no
+    /// read, no token, a lapsed token without a verdict, or a failed check.
+    Unproven,
+    /// The file is missing, unreadable or without strong ids.
+    Unknown,
+}
+
+fn claude_slot_owner_rule(
+    slot_id: &str,
+    expected: &ClaudeSlotAccountBinding,
+    local: Option<&ClaudeSlotLocalRead>,
+    calls_allowed: bool,
+) -> ClaudeSlotOwnerRule {
+    let Some((local, oauth)) =
+        local.and_then(|local| Some((local, local.initial_oauth_account.as_ref()?)))
+    else {
+        return ClaudeSlotOwnerRule::Unknown;
+    };
+    let Some((cached, binding)) = claude_strong_oauth_identity_hashes(oauth).and_then(|cached| {
+        let binding = ClaudeSlotAccountBinding::new(&cached.0, &cached.1)?;
+        Some((cached, binding))
+    }) else {
+        return ClaudeSlotOwnerRule::Unknown;
+    };
+    if binding == *expected {
+        return ClaudeSlotOwnerRule::Named;
+    }
+    let owner = local.token_owner(slot_id, Some(cached), calls_allowed);
+    if owner.proves(expected) {
+        ClaudeSlotOwnerRule::Proven(owner)
+    } else if owner.proven.is_some() {
+        ClaudeSlotOwnerRule::Other(claude_oauth_plan_type_for_label(oauth))
+    } else {
+        ClaudeSlotOwnerRule::Unproven
+    }
 }
 
 /// Resolve a registered slot from local metadata alone. `claude auth status`
@@ -6680,8 +6827,14 @@ fn resolve_registered_claude_slot(
 /// scopes, the plan stored with the token, and the `.claude.json` account. The
 /// same fields are read here directly, so no Claude command runs and nothing
 /// can refresh (or sign out) the login.
+///
+/// `owner` proves the stored token is the approved account that a stale
+/// `.claude.json` does not name: nothing comes from that file, and the
+/// credential's plan is dropped as for the default home's proven owner.
+/// Labels then come only from that account's own last profile.
 fn resolve_registered_claude_slot_from_local(
     local: ClaudeSlotLocalRead,
+    owner: Option<&ClaudeTokenOwner>,
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
     match local.state {
         ClaudeLocalLoginState::SignedOutByCli => {
@@ -6695,21 +6848,34 @@ fn resolve_registered_claude_slot_from_local(
         ClaudeLocalLoginState::Unreadable => return Err(ClaudeSlotProbeFailure::ProbeFailed),
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {}
     }
-    let stable = stable_claude_slot_credential(
+    let mut stable = stable_claude_slot_credential(
         local.initial_oauth_account,
         local.credential.into_credential(),
         local.final_oauth_account,
     )?;
-    let mut account =
-        claude_account_from_local_metadata(&stable.oauth_account, &stable.credential)?;
-    require_claude_auth_identity_agreement(&account, &stable.oauth_account)?;
-    refine_claude_local_plan_metadata(&mut account, &stable.oauth_account);
-    let (account_identifier_hash, organization_identifier_hash) =
-        claude_strong_oauth_identity_hashes(&stable.oauth_account)
-            .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
-    if !stamp_claude_cli_account_identity(&mut account, &stable.oauth_account) {
-        return Err(ClaudeSlotProbeFailure::IdentityMismatch);
-    }
+    let (mut account, (account_identifier_hash, organization_identifier_hash)) =
+        match owner.and_then(ClaudeTokenOwner::proven_binding) {
+            Some(binding) => {
+                stable.credential.subscription_type = None;
+                let account = claude_account_from_local_metadata(
+                    &ClaudeCliOauthAccount::default(),
+                    &stable.credential,
+                )?;
+                (account, binding)
+            }
+            None => {
+                let mut account =
+                    claude_account_from_local_metadata(&stable.oauth_account, &stable.credential)?;
+                require_claude_auth_identity_agreement(&account, &stable.oauth_account)?;
+                refine_claude_local_plan_metadata(&mut account, &stable.oauth_account);
+                let binding = claude_strong_oauth_identity_hashes(&stable.oauth_account)
+                    .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
+                if !stamp_claude_cli_account_identity(&mut account, &stable.oauth_account) {
+                    return Err(ClaudeSlotProbeFailure::IdentityMismatch);
+                }
+                (account, binding)
+            }
+        };
     account.account_identifier_hash = Some(account_identifier_hash.clone());
     account.organization_identifier_hash = Some(organization_identifier_hash.clone());
     account.billing_identity_evidence = billing_identity_evidence_for(
@@ -7603,6 +7769,24 @@ fn retain_verified_claude_slot_binding(
     retain_verified_claude_binding(slot_id, current_binding, status);
 }
 
+/// [`retain_verified_claude_slot_binding`] for a registered slot, against the
+/// stored token's proven owner where it outranks a stale `.claude.json`.
+fn retain_registered_claude_slot_binding(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    owner: Option<&ClaudeTokenOwner>,
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+) {
+    match (owner, claude_config_slot_for_descriptor(descriptor)) {
+        (Some(owner), _) => {
+            retain_verified_claude_binding(&descriptor.slot_id, owner.proven_binding(), status);
+        }
+        (None, Some(slot)) => {
+            retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, status)
+        }
+        (None, None) => clear_claude_slot_binding(status),
+    }
+}
+
 /// Whether [`retain_verified_claude_binding`] kept the slot's last verified
 /// account, or why it did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7789,29 +7973,25 @@ fn claude_slot_approval_unavailable_status(
     status
 }
 
-/// The strong identity Claude Code's local account file names for this slot,
-/// plus its plan for local wording. A cheap file read: no CLI, no keychain.
-fn claude_slot_local_login(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-) -> Option<(ClaudeSlotAccountBinding, Option<String>)> {
-    let slot = claude_config_slot_for_descriptor(descriptor)?;
-    let oauth = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()))?;
-    let (account, organization) = claude_strong_oauth_identity_hashes(&oauth)?;
-    let binding = ClaudeSlotAccountBinding::new(&account, &organization)?;
-    Some((binding, claude_oauth_plan_type_for_label(&oauth)))
-}
-
 /// Whether this registered slot's current Claude login is not provably the
-/// account it is approved for: another account, or an account file that is
-/// missing, unreadable or without strong ids. Read-only; used by the upkeep
-/// worker's final spawn and publication fences so a refresh never runs for
-/// another or an unknown login. An unreadable approval also refuses.
+/// account it is approved for, under collection's owner rule with remembered
+/// verdicts only (never a provider call): another account, an unproven owner,
+/// or an account file that is missing, unreadable or without strong ids.
+/// Read-only; used by the upkeep worker's final spawn and publication fences
+/// so a refresh never runs for another or an unknown login. An unreadable
+/// approval also refuses.
 pub(crate) fn claude_slot_login_unapproved(descriptor: &ClaudeConfigSlotDescriptorV1) -> bool {
     match FileClaudeConfigSlotSettingsStore::default().expected_slot_binding(&descriptor.slot_id) {
         Ok(None) => false,
-        Ok(Some(expected)) => {
-            claude_slot_local_login(descriptor).map_or(true, |(current, _)| current != expected)
-        }
+        Ok(Some(expected)) => !matches!(
+            claude_slot_owner_rule(
+                &descriptor.slot_id,
+                &expected,
+                read_registered_claude_slot_locally(descriptor).as_ref(),
+                false,
+            ),
+            ClaudeSlotOwnerRule::Named | ClaudeSlotOwnerRule::Proven(_)
+        ),
         Err(_) => true,
     }
 }
@@ -7965,10 +8145,9 @@ fn claude_slot_approval_blocked_status(
     status
 }
 
-/// Gate before upkeep, any CLI spawn or usage call: when the slot's local
-/// Claude account file names another account than the approved one, return
-/// the identity-mismatch status instead. `Ok` carries the expected binding
-/// (when the slot has one) for the post-resolution check.
+/// Gate before upkeep, any CLI spawn or usage call: refuse when the slot's
+/// approval is undeterminable. `Ok` carries the expected binding (when the
+/// slot has one) for the owner rule and the post-resolution check.
 #[expect(clippy::result_large_err, reason = "Err is the full slot status")]
 fn claude_slot_pre_collection_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -7976,29 +8155,19 @@ fn claude_slot_pre_collection_gate(
     captured_at: &str,
 ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotCollectionStatusV1> {
     let observed = previous.and_then(claude_slot_status_binding);
-    let Some(expected) = claude_slot_expected_binding(&descriptor.slot_id, observed.as_ref())
-        .map_err(|()| claude_slot_approval_unavailable_status(previous, captured_at))?
-    else {
-        return Ok(None);
-    };
-    match claude_slot_local_login(descriptor) {
-        Some((current, _)) if current == expected => Ok(Some(expected)),
-        Some((_, signed_in_plan)) => Err(claude_slot_binding_mismatch_status(
-            &expected,
-            signed_in_plan.as_deref(),
-            previous,
-            captured_at,
-        )),
-        // Fail closed: never refresh or probe a login that cannot be shown to
-        // be the approved account.
-        None => Err(claude_slot_approval_blocked_status(
-            &expected,
-            ClaudeSlotProbeFailure::IdentityUnknown,
-            claude_slot_unknown_login_message,
-            previous,
-            captured_at,
-        )),
-    }
+    claude_slot_expected_binding(&descriptor.slot_id, observed.as_ref())
+        .map_err(|()| claude_slot_approval_unavailable_status(previous, captured_at))
+}
+
+/// Local message when another account's `.claude.json` sits in a slot whose
+/// stored sign-in cannot be checked yet.
+fn claude_slot_owner_unproven_message(approved_plan: Option<&str>) -> String {
+    let approved = claude_plan_label(approved_plan)
+        .map(|label| format!("the {label} account"))
+        .unwrap_or_else(|| "the account it was set up with".to_string());
+    format!(
+        "Claude Code's account file for this connection names a different account, and Ottto could not yet confirm that its saved sign-in is still {approved}. Ottto paused limit reading, uploads and token refresh here until it can; reconnect if this does not clear."
+    )
 }
 
 /// Local wording for a slot whose approval was observed, not verified.
@@ -8665,6 +8834,7 @@ pub(crate) fn registered_claude_race_status_for_test(
         .descriptor(slot_id.to_string(), ClaudeConfigSlotOwnership::Managed);
     registered_claude_failure_status(
         &descriptor,
+        None,
         ClaudeSlotProbeFailure::ConcurrentMutation,
         observed_at,
         ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
@@ -8680,16 +8850,13 @@ pub(crate) fn registered_claude_race_status_for_test(
 
 fn registered_claude_failure_status(
     descriptor: &ClaudeConfigSlotDescriptorV1,
+    owner: Option<&ClaudeTokenOwner>,
     failure: ClaudeSlotProbeFailure,
     observed_at: &str,
     upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
     let mut status = failure.status(observed_at);
-    if let Some(slot) = claude_config_slot_for_descriptor(descriptor) {
-        retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
-    } else {
-        clear_claude_slot_binding(&mut status);
-    }
+    retain_registered_claude_slot_binding(descriptor, owner, &mut status);
     // A cleared credential's old deadlines are not last-known-good; leaving
     // them out sends the next pass to the live (spawn-free) metadata check.
     if failure != ClaudeSlotProbeFailure::SignedOutByCli {
@@ -27476,21 +27643,21 @@ for line in sys.stdin:
         use claude_token_owner::PROFILE_TEST_RESPONSE;
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn terminal_profile() -> Result<Value, u16> {
+        fn terminal_profile(_token: &str) -> Result<Value, u16> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(serde_json::json!({
                 "account": {"uuid": "terminal-account", "email": "terminal@example.invalid"},
                 "organization": {"uuid": "terminal-org", "organization_type": "claude_max"}
             }))
         }
-        fn desktop_profile() -> Result<Value, u16> {
+        fn desktop_profile(_token: &str) -> Result<Value, u16> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(serde_json::json!({
                 "account": {"uuid": "desktop-account"},
                 "organization": {"uuid": "desktop-org"}
             }))
         }
-        fn unavailable() -> Result<Value, u16> {
+        fn unavailable(_token: &str) -> Result<Value, u16> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Err(503)
         }
@@ -27526,7 +27693,7 @@ for line in sys.stdin:
         claude_account_from_local_metadata(&proven.oauth_account, &proven.credential)
             .expect("the known owner's identity, without a plan contradiction");
         let mut status = ClaudeConfigSlotCollectionStatusV1::default();
-        apply_claude_default_home_owner(&mut status, Some(&owner));
+        apply_claude_token_owner(&mut status, Some(&owner));
         let (terminal_account, terminal_org) =
             claude_strong_oauth_identity_hashes(&terminal).expect("terminal hashes");
         let (desktop_account, desktop_org) =
@@ -27754,6 +27921,7 @@ for line in sys.stdin:
         assert_eq!(failure, ClaudeSlotProbeFailure::SignedOutByCli);
         let status = registered_claude_failure_status(
             &descriptor,
+            None,
             failure,
             "2026-10-03T17:50:00Z",
             ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
@@ -27823,6 +27991,7 @@ for line in sys.stdin:
         ] {
             let status = registered_claude_failure_status(
                 &descriptor,
+                None,
                 failure,
                 "2026-10-03T13:30:00Z",
                 upkeep.clone(),
@@ -27840,6 +28009,7 @@ for line in sys.stdin:
         persisted.collection.relogin_required_at = Some(relogin.clone());
         let status = registered_claude_failure_status(
             &persisted,
+            None,
             ClaudeSlotProbeFailure::ProbeFailed,
             "2026-10-03T13:30:00Z",
             ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
@@ -27856,6 +28026,7 @@ for line in sys.stdin:
             .expect("format");
         let status = registered_claude_failure_status(
             &descriptor,
+            None,
             ClaudeSlotProbeFailure::CredentialUnavailable,
             "2026-10-03T13:30:00Z",
             ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
@@ -33877,6 +34048,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
 
         let direct_failure = registered_claude_failure_status(
             &slot.descriptor(slot_id, ClaudeConfigSlotOwnership::Managed),
+            None,
             ClaudeSlotProbeFailure::CredentialUnavailable,
             "2026-08-12T10:00:30Z",
             ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
@@ -36216,9 +36388,14 @@ exit 44
         }
 
         fn item(&self, slot: &ClaudeConfigDirSlot, expires_in: TimeDuration) {
+            self.item_token(slot, expires_in, "fixture-access");
+        }
+
+        /// The slot's stored login, with its own access token.
+        fn item_token(&self, slot: &ClaudeConfigDirSlot, expires_in: TimeDuration, token: &str) {
             let credential = serde_json::json!({
                 "claudeAiOauth": {
-                    "accessToken": "fixture-access",
+                    "accessToken": token,
                     "refreshToken": "fixture-refresh",
                     "expiresAt": (OffsetDateTime::now_utc() + expires_in).unix_timestamp() * 1_000,
                     "refreshTokenExpiresAt":
@@ -36873,34 +37050,257 @@ exit 44
         assert!(fixture.spawns().iter().all(|line| line == "|--version"));
     }
 
-    /// T6: an approved slot whose login became valid for another account
-    /// stays `identity_mismatch`; nothing is requested for either account.
+    /// Every profile request's token, in order.
+    static PROFILE_TOKENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    const OTHER_ACCOUNT: (&str, &str) = ("account-other", "organization-other");
+
+    /// The profile endpoint, answering for the token sent: slot 0's own
+    /// token is slot 0's approved account, `token-other` another account.
+    fn profile_by_token(token: &str) -> Result<Value, u16> {
+        PROFILE_TOKENS.lock().unwrap().push(token.to_string());
+        let (account, organization) = match token {
+            "token-slot-a" => SLOT_ACCOUNTS[0],
+            "token-other" => OTHER_ACCOUNT,
+            _ => return Err(404),
+        };
+        Ok(serde_json::json!({
+            "account": {"uuid": account},
+            "organization": {"uuid": organization},
+        }))
+    }
+
+    fn profile_calls() -> usize {
+        PROFILE_TOKENS.lock().unwrap().len()
+    }
+
+    /// Installs a profile stand-in with an empty log; removes it on drop.
+    struct ProfileStandIn;
+
+    impl ProfileStandIn {
+        fn answer(respond: claude_token_owner::ProfileResponder) -> Self {
+            PROFILE_TOKENS.lock().unwrap().clear();
+            claude_token_owner::PROFILE_TEST_RESPONSE.with(|cell| cell.set(Some(respond)));
+            Self
+        }
+    }
+
+    impl Drop for ProfileStandIn {
+        fn drop(&mut self) {
+            claude_token_owner::PROFILE_TEST_RESPONSE.with(|cell| cell.set(None));
+        }
+    }
+
+    impl Phase0Fixture {
+        fn descriptor(&self, index: usize) -> ClaudeConfigSlotDescriptorV1 {
+            let status = self.status();
+            status
+                .managed_slots
+                .into_iter()
+                .chain(status.external_slots)
+                .find(|slot| slot.slot_id == self.slot_ids[index])
+                .expect("slot")
+        }
+
+        fn slot_dir_spawns(&self, index: usize) -> usize {
+            let marker = format!("{}|", self.slot_dirs[index].display());
+            self.spawns()
+                .iter()
+                .filter(|line| line.starts_with(&marker))
+                .count()
+        }
+
+        fn grant_upkeep(&self) {
+            FileClaudeConfigSlotSettingsStore::default()
+                .set_upkeep_consent(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    true,
+                )
+                .expect("keep signed in");
+        }
+    }
+
+    /// [regress] T6, the observed case: another app rewrites an approved
+    /// slot's `.claude.json` to another account; the slot's stored token stays
+    /// the approved login and decides. Lapsed with no verdict (as after a
+    /// restart): owner unproven, last reading kept, no request. Valid: one
+    /// profile call with that token, then collection on the approved pair
+    /// with no other login's label; the usage call gets that token.
+    /// Reconnect's identity check and the upkeep fence agree. Lapsed again:
+    /// its background refresh runs, binding kept.
     #[test]
     #[serial]
-    fn mismatched_slot_stays_mismatched_when_the_other_login_becomes_valid() {
-        let fixture = Phase0Fixture::new("mismatch-resume", false);
+    fn slot_with_another_accounts_cached_login_collects_on_its_proven_token() {
+        let fixture = Phase0Fixture::new("cached-other-login", false);
+        let _profile = ProfileStandIn::answer(profile_by_token);
+        let (slot, dir) = (fixture.slot(0), fixture.slot_dirs[0].clone());
+        let approved = Phase0Fixture::hashes(SLOT_ACCOUNTS[0]);
+        let approved_account = Some(approved.0.as_str());
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.item_token(&slot, TimeDuration::hours(3), "token-slot-a");
+        fixture.collect();
+        let first = fixture.slot_collection(0);
+        assert_eq!(first.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        assert_eq!(profile_calls(), 0, "a matching account file needs no proof");
+
+        fixture.write_identity(&dir, OTHER_ACCOUNT);
+        fixture.item_token(&slot, -TimeDuration::hours(1), "token-slot-a");
+        fixture.collect();
+        let unproven = fixture.slot_collection(0);
+        assert_eq!(
+            unproven.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(unproven.diagnostics[0]
+            .message
+            .contains("could not yet confirm"));
+        assert_eq!(
+            unproven.account_identifier_hash.as_deref(),
+            approved_account
+        );
+        assert!(unproven.quota_snapshot.is_some(), "last reading kept");
+        assert_eq!(profile_calls(), 0, "a lapsed token is never sent");
+
+        fixture.item_token(&slot, TimeDuration::hours(8), "token-slot-a");
+        let usage_calls = provider_calls();
+        let collection = fixture.collect();
+        let collected = fixture.slot_collection(0);
+        assert_eq!(collected.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        let other = Phase0Fixture::hashes(OTHER_ACCOUNT);
+        let hashes = |status: &ClaudeConfigSlotCollectionStatusV1| {
+            [
+                status.account_identifier_hash.clone(),
+                status.organization_identifier_hash.clone(),
+                status.cached_account_hash.clone(),
+                status.token_owner_account_hash.clone(),
+                status.token_owner_organization_hash.clone(),
+            ]
+        };
+        assert_eq!(
+            hashes(&collected),
+            [&approved.0, &approved.1, &other.0, &approved.0, &approved.1].map(|h| Some(h.clone()))
+        );
+        assert!(collected.owner_proven_at.is_some());
+        let profile = collected.account_profile.expect("approved profile");
+        assert_eq!(
+            profile.email.as_deref(),
+            Some("account-slot-a@example.invalid")
+        );
+        assert_eq!(
+            *PROFILE_TOKENS.lock().unwrap(),
+            ["token-slot-a"],
+            "the slot's own token"
+        );
+        assert_eq!(provider_calls(), usage_calls, "the reading came from cache");
+        let wire = serde_json::to_string(&collection.snapshots).expect("serialize");
+        let persisted = fs::read_to_string(
+            fixture
+                .root
+                .join("support/claude-config-slot-collection-state.json"),
+        )
+        .expect("persisted state");
+        for text in [wire, persisted] {
+            assert!(!text.contains("account-other"), "no other login's label");
+        }
+        // The resolution the usage call reads sends the proven token and
+        // takes nothing from the stale file.
+        let local = read_registered_claude_slot_locally(&fixture.descriptor(0)).expect("read");
+        let owner = local.token_owner(&fixture.slot_ids[0], None, false);
+        let resolved = resolve_registered_claude_slot_from_local(local, Some(&owner))
+            .expect("proven owner resolves");
+        assert_eq!(
+            resolved.credential.access_token.as_deref(),
+            Some("token-slot-a")
+        );
+        let account = resolved.account;
+        assert_eq!(
+            [
+                account.email,
+                account.organization_label,
+                account.plan_type,
+                account.account_id
+            ],
+            [None, None, None, None]
+        );
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("time");
+        let proof =
+            verify_claude_local_identity(&fixture.slot_ids[0], &dir.to_string_lossy(), &now)
+                .expect("Reconnect's identity check");
+        assert_eq!(
+            (
+                proof.account_identifier_hash,
+                proof.organization_identifier_hash
+            ),
+            approved.clone()
+        );
+        assert!(!claude_slot_login_unapproved(&fixture.descriptor(0)));
+
+        fixture.grant_upkeep();
+        fixture.clear_logs();
+        fixture.item_token(&slot, -TimeDuration::minutes(2), "token-slot-a");
+        fixture.collect();
+        let refreshing = fixture.slot_collection(0);
+        assert_eq!(
+            refreshing.state,
+            ClaudeConfigSlotCollectionStateV1::RefreshDue
+        );
+        assert_eq!(
+            refreshing.account_identifier_hash.as_deref(),
+            approved_account
+        );
+        crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+        assert_eq!(
+            fixture.slot_dir_spawns(0),
+            1,
+            "one refresher, for the proven login"
+        );
+    }
+
+    /// [behaviour] T6 twin: a real sign-in to another account in the slot (its
+    /// token changes owner) stays `identity_mismatch`: one profile call for
+    /// that token, no usage call, no refresher once it lapses; the upkeep
+    /// fence refuses and Reconnect's identity check reads the other account.
+    #[test]
+    #[serial]
+    fn slot_whose_token_changes_owner_stays_mismatched_without_requests() {
+        let fixture = Phase0Fixture::new("token-other-owner", false);
+        let _profile = ProfileStandIn::answer(profile_by_token);
+        let slot = fixture.slot(0);
         fixture.set_all_expiries(TimeDuration::hours(3));
         fixture.collect();
-        assert_eq!(
-            fixture.slot_collection(0).state,
-            ClaudeConfigSlotCollectionStateV1::Fresh,
-            "first pass approves the observed account"
-        );
-        fixture.write_identity(
-            &fixture.slot_dirs[0],
-            ("account-other", "organization-other"),
-        );
-        fixture.item(&fixture.slot(0), -TimeDuration::hours(1));
+        fixture.grant_upkeep();
+        fixture.write_identity(&fixture.slot_dirs[0], OTHER_ACCOUNT);
+        fixture.item_token(&slot, TimeDuration::hours(8), "token-other");
+        let usage_calls = provider_calls();
         fixture.collect();
-        fixture.item(&fixture.slot(0), TimeDuration::hours(8));
-        let before = provider_calls();
+        fixture.clear_logs();
+        fixture.item_token(&slot, -TimeDuration::minutes(2), "token-other");
         fixture.collect();
+        crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+        let mismatched = fixture.slot_collection(0);
         assert_eq!(
-            fixture.slot_collection(0).state,
+            mismatched.state,
             ClaudeConfigSlotCollectionStateV1::IdentityMismatch
         );
-        assert_eq!(provider_calls(), before);
-        assert_only_version_probes(&fixture.spawns(), "mismatch");
+        assert_eq!(
+            mismatched.account_identifier_hash,
+            Some(Phase0Fixture::hashes(SLOT_ACCOUNTS[0]).0)
+        );
+        assert_eq!(*PROFILE_TOKENS.lock().unwrap(), ["token-other"], "one call");
+        assert_eq!(provider_calls(), usage_calls, "no usage call");
+        assert_eq!(
+            fixture.slot_dir_spawns(0),
+            0,
+            "no refresh for another login"
+        );
+        assert!(claude_slot_login_unapproved(&fixture.descriptor(0)));
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("time");
+        let dir = fixture.slot_dirs[0].to_string_lossy();
+        let proof = verify_claude_local_identity(&fixture.slot_ids[0], &dir, &now).expect("read");
+        assert_eq!(
+            proof.account_identifier_hash,
+            Phase0Fixture::hashes(OTHER_ACCOUNT).0
+        );
     }
 
     /// T7: a locally expired default login sends nothing and serves its
@@ -37321,6 +37721,46 @@ exit 44
                 refresh,
                 "{label}"
             );
+        }
+    }
+
+    /// [behaviour] No proof for a slot whose `.claude.json` names another
+    /// account: with the network off (no request) or a failed check the slot
+    /// is owner unproven, never a mismatch, and keeps its approved account
+    /// and last reading.
+    #[test]
+    #[serial]
+    fn unprovable_slot_owner_keeps_the_approved_reading_without_a_mismatch() {
+        fn unavailable(token: &str) -> Result<Value, u16> {
+            PROFILE_TOKENS.lock().unwrap().push(token.to_string());
+            Err(503)
+        }
+        let fixture = Phase0Fixture::new("owner-unprovable", false);
+        let _profile = ProfileStandIn::answer(unavailable);
+        let approved = Phase0Fixture::hashes(SLOT_ACCOUNTS[0]).0;
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.collect();
+        fixture.write_identity(&fixture.slot_dirs[0], OTHER_ACCOUNT);
+        let network_off = fixture
+            .root
+            .join("support")
+            .join(CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE);
+        for (context, calls) in [("network off", 0), ("failed", 1)] {
+            if context == "network off" {
+                fs::write(&network_off, b"disabled\n").expect("network off");
+            } else {
+                let _ = fs::remove_file(&network_off);
+            }
+            fixture.collect();
+            let status = fixture.slot_collection(0);
+            assert_eq!(
+                status.state,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                "{context}"
+            );
+            assert_eq!(status.account_identifier_hash.as_ref(), Some(&approved));
+            assert!(status.quota_snapshot.is_some(), "{context}: reading kept");
+            assert_eq!(profile_calls(), calls, "{context}");
         }
     }
 }

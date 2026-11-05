@@ -54,9 +54,10 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// [regress] An indexed validation hold, or an identity deferral naming the
-/// same item (it ended the whole pass), preserves money and lets exact-ACK
-/// siblings settle; its custody survives a restart and reaches a due retry.
+/// [regress] An indexed validation hold, or an identity deferral or an ACK
+/// ref echoing another body witness naming the same item (each ended the
+/// whole pass), preserves money and lets exact-ACK siblings settle; its
+/// custody survives a restart and reaches a due retry.
 #[test]
 #[serial(client_report)]
 fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
@@ -189,14 +190,20 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             "tagged placement control"
         );
 
-        for (source, identity) in [
+        for (source, named) in [
             SnapshotSource::ClaudeCode,
             SnapshotSource::Codex,
             SnapshotSource::Pi,
         ]
         .into_iter()
-        .flat_map(|source| [(source, false), (source, true)])
-        {
+        .flat_map(|source| {
+            [
+                (source, "validation"),
+                (source, "identity"),
+                (source, "witness"),
+            ]
+        }) {
+            let identity = named == "identity";
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -307,6 +314,19 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                 }
                                 if !retrying && batch.len() > 1 {
                                     assert!(index > 0, "post-packing nonzero request index");
+                                }
+                                if named == "witness" {
+                                    // A valid HTTP reply whose ACK ref for this
+                                    // item alone echoes another body witness.
+                                    let mut response = ack(&batch)?;
+                                    for entity in &mut response.accepted_entities {
+                                        if entity.snapshot_fingerprint == fp {
+                                            entity.body_witness_digest = Some("0".repeat(64));
+                                        }
+                                    }
+                                    return response
+                                        .validate_entity_ack(&wire(&batch))
+                                        .map(|()| response);
                                 }
                                 if identity {
                                     return Err(anyhow::Error::new(UploadShed {
@@ -446,7 +466,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                             &settled, &c.base,
                         )
                     } else {
-                        c.reload_in(&mut settled, &format!("restart-identity-{identity}.json"))
+                        c.reload_in(&mut settled, &format!("restart-{named}.json"))
                     };
                 let record = reopened
                     .quarantined_snapshot_fingerprints
@@ -471,7 +491,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                         .snapshots
                         .iter()
                         .any(|item| item.source_session_id == entity),
-                    "identity={identity}: the due retry re-reads the held file"
+                    "{named}: the due retry re-reads the held file"
                 );
                 assert_eq!(next.index.snapshot_unproven_terminal_count(), 0);
             }

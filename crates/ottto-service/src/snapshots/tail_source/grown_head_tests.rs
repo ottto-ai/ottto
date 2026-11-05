@@ -292,7 +292,7 @@ fn codex_layout() -> String {
 }
 
 const CODEX_LAYOUT_SHA256: &str =
-    "241516630645f3bbc0b72232025c2b826b25663c4802bc3cc549d735db7eac8b";
+    "07cecaf1a3d9559ba0e0c5c972c209d52549df484e8870b0d6b19cbad5e164f0";
 
 /// [format] Codex's persisted head, pages and prelude fact have one layout pin.
 #[test]
@@ -312,9 +312,10 @@ fn the_codex_head_page_and_prelude_layout_is_pinned() {
 /// SHA-256 of `claude_layout()`. A change here is a layout change: decide
 /// whether old heads still decode (a `G` append does), or bump
 /// `Claude::REDUCTION_REVISION`, then update this pin.
-// Main's exact pin; the Claude descriptor omits only ignored Codex markers.
+// The binding is an ignored head field stored in Workspace v2; existing head
+// bytes and Workspace v1 still decode without a reduction-revision change.
 const CLAUDE_LAYOUT_SHA256: &str =
-    "292b38dad1f7aaaf7010d40285e1f68e5cb32418496c619707b32e1e6e0603d1";
+    "5d82dc2635e8104fc735492a148252575cdb503322e05552b5440c50ec06d7e9";
 
 /// [money] Any drift of the stored Claude head or page layout fails here.
 #[test]

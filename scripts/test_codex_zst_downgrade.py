@@ -117,9 +117,13 @@ def main():
             run(["tar", "-xf", str(archive), "-C", str(tree)])
             source = tree / "crates/ottto-service/src/snapshots.rs"
             text = source.read_text()
+            # The entry struct lives in scan_index/entry.rs once that file exists;
+            # older trees keep it in snapshots.rs.
+            entry_source = tree / "crates/ottto-service/src/snapshots/scan_index/entry.rs"
+            entry_text = entry_source.read_text() if entry_source.exists() else text
             # Fail if the chosen base already knows these fields: that requires a
             # new label/membership contract, not silently weaker comparisons.
-            entry = text.split("pub struct ScanIndexEntry {", 1)[1].split("\n}", 1)[0]
+            entry = entry_text.split("pub struct ScanIndexEntry {", 1)[1].split("\n}", 1)[0]
             if "codex_compressed_hold" in entry or "archive:" in entry:
                 raise RuntimeError("old decoder now knows custody/archive; requalify labels")
             source.write_text(text + PROBE)

@@ -473,6 +473,25 @@ impl Walk {
     }
 }
 
+/// The source's root walk ends through the real walk end: `Some((started_at_ms,
+/// listed))` a complete walk begun then that listed `listed`, `None` a walk
+/// that was not complete (no roster).
+#[cfg(test)]
+pub(crate) fn walk_ended_for_test(
+    source: SnapshotSource,
+    roster: Option<(u64, BTreeMap<String, Option<u64>>)>,
+) {
+    let mut fold = WalkFold::EMPTY;
+    if let Some((started_at_ms, listed)) = roster {
+        fold.debt = Walk {
+            started_at: Some(started_at_ms),
+            listed,
+            ..Walk::EMPTY
+        };
+    }
+    fold.page_end(source, true, None);
+}
+
 /// Every file a complete root walk listed, and when that walk began.
 pub(crate) struct Roster {
     pub(crate) started_at_ms: u64,

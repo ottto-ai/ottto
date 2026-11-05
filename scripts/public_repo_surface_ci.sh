@@ -295,6 +295,10 @@ run_step P "test public manifest check" bash scripts/test_public_repo_manifest_c
 run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
 run_step P "check root manifest is derived from the commit tree" check_root_manifest
 run_step P "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
+if [[ -z "$STAGED_OUTPUT_DIR" ]]; then
+  run_step P "scan committed public tree" bash scripts/public_repo_secret_scan.sh
+fi
+run_step P "verify root public contracts" bash scripts/public_repo_contract_check.sh
 run_step P "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
 run_step B "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
 run_step P "test public contract check" bash scripts/test_public_repo_contract_check.sh

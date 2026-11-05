@@ -116,7 +116,7 @@ impl SnapshotAckRejected {
             "snapshot head-CAS conflict lacks an exclusive head challenge",
             "snapshot evidence has no supported body witness version",
             "snapshot request contains conflicting snapshot evidence body witnesses",
-            "snapshot ACK lacks exact durable context curve body witness proof",
+            BODY_WITNESS_REFUSED,
             "snapshot ACK accepted count overflow",
             "snapshot ACK contains invalid rejection",
             "snapshot ACK does not cover the request exactly",
@@ -230,6 +230,23 @@ impl std::fmt::Debug for ShedSnapshotIndexes {
         std::fmt::Display::fmt(self, f)
     }
 }
+
+const BODY_WITNESS_REFUSED: &str =
+    "snapshot ACK lacks exact durable context curve body witness proof";
+
+/// The request-local items whose ACK refs echoed another body witness: the
+/// validator's error, then context on its `SnapshotAckRejected`. Every other
+/// invalid ACK names none and keeps the whole-pass path.
+#[derive(Debug)]
+pub struct RefusedSnapshotIndexes(pub Vec<usize>);
+
+impl std::fmt::Display for RefusedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(BODY_WITNESS_REFUSED)
+    }
+}
+
+impl std::error::Error for RefusedSnapshotIndexes {}
 
 /// The backend error code of the 503 that defers a batch while an original
 /// session identity cannot be evaluated.
@@ -1012,7 +1029,13 @@ impl SnapshotBatchResponse {
         enforce_head_cas: bool,
     ) -> Result<()> {
         self.validate_entity_ack_with_head_cas_inner(request, enforce_head_cas)
-            .map_err(|error| anyhow::Error::new(SnapshotAckRejected::from_validation(&error)))
+            .map_err(|error| {
+                let rejected = anyhow::Error::new(SnapshotAckRejected::from_validation(&error));
+                match error.downcast::<RefusedSnapshotIndexes>() {
+                    Ok(named) => rejected.context(named),
+                    Err(_) => rejected,
+                }
+            })
     }
 
     fn validate_entity_ack_with_head_cas_inner(
@@ -1159,6 +1182,7 @@ impl SnapshotBatchResponse {
         }
         let mut first = None;
         let mut bad_refs = 0_usize;
+        let mut named = std::collections::BTreeSet::new();
         let accepted = self.accepted_entities.iter().map(|r| ("accepted", r));
         let unchanged = self.unchanged_entities.iter().map(|r| ("unchanged", r));
         for (class, reference) in accepted.chain(unchanged) {
@@ -1174,9 +1198,13 @@ impl SnapshotBatchResponse {
             else {
                 continue;
             };
-            // Diagnostic only: keep counting after the first refusal; the
-            // decision below is the same as refusing at the first one.
+            // Keep walking after the first refusal: every bad ref is named,
+            // and the one diagnostic line counts them all.
             bad_refs += 1;
+            named.insert((
+                reference.source_session_id.as_str(),
+                reference.snapshot_fingerprint.as_str(),
+            ));
             if first.is_none() {
                 first = Some((
                     reason,
@@ -1198,9 +1226,20 @@ impl SnapshotBatchResponse {
             answered,
             bad_refs,
         );
-        Err(anyhow!(
-            "snapshot ACK lacks exact durable context curve body witness proof"
-        ))
+        Err(anyhow::Error::new(RefusedSnapshotIndexes(
+            request
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    named.contains(&(
+                        item.source_session_id.as_str(),
+                        item.snapshot_fingerprint.as_str(),
+                    ))
+                })
+                .map(|(index, _)| index)
+                .collect(),
+        )))
     }
 
     pub(crate) fn validate_entity_ack_identities<'a>(
@@ -4781,6 +4820,20 @@ mod tests {
         for secret in [&digest, &first.source_session_id, &zeros] {
             assert!(!line.contains(secret), "{line}");
         }
+        // Both bad refs are named by request index on the typed refusal.
+        let (request, mut ack) = witnessed_ack();
+        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+        ack.unchanged_entities[0].body_witness_version = None;
+        // A well-formed missing proof: version and digest both absent.
+        ack.unchanged_entities[0].body_witness_digest = None;
+        let error = ack.validate_entity_ack(&request).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
+        assert_eq!(
+            error
+                .downcast_ref::<RefusedSnapshotIndexes>()
+                .map(|named| &named.0),
+            Some(&vec![0, 1])
+        );
     }
 
     #[test]

@@ -7,9 +7,9 @@
 //! settled (a deferred, rejected, shed or partial upload drops the run), only
 //! while the last root walk began in this process and listed every root with
 //! no walk issue. Candidates: the roots whose indexed members this pass
-//! retired, plus every stored pair once per process (the backlog). Nothing is
-//! persisted: a crash between the two unlinks leaves one member, which the
-//! next run deletes.
+//! retired, plus every stored pair once per complete walk (the backlog), so a
+//! pair held once is rechecked after the next one. Nothing is persisted: a
+//! crash between the two unlinks leaves one member, which the next run deletes.
 use super::claude_request_census::held_candidates;
 use super::money_freshness::index_current_since_start;
 use super::*;
@@ -89,7 +89,7 @@ pub(crate) fn take_runs_for_test() -> u32 {
     RUNS.with(|runs| runs.replace(0))
 }
 
-/// One run over `stems`: every stem is retired, held or a read fault.
+/// One run over `stems`: every stem with a member is retired, held or a fault.
 fn retire(
     support_dir: &Path,
     index: &ScanIndex,
@@ -114,8 +114,9 @@ fn retire(
         }
         match crate::claude_local_otel::read_telemetry_pair(support_dir, &stem) {
             Err(()) => run.read_fault += 1,
-            Ok(pair) if pair.last_write >= fence => run.held_roots += 1,
-            Ok(pair) => candidates.push((stem, pair)),
+            Ok(None) => {}
+            Ok(Some(pair)) if pair.last_write >= fence => run.held_roots += 1,
+            Ok(Some(pair)) => candidates.push((stem, pair)),
         }
     }
     let copied = copied_candidates(index, removed, roster, &candidates);
@@ -123,6 +124,7 @@ fn retire(
     for ((stem, pair), copied) in candidates.iter().zip(copied) {
         if copied {
             run.held_roots += 1;
+            run.held_copied += 1;
             continue;
         }
         match crate::claude_local_otel::unlink_telemetry_pair(support_dir, stem, pair) {
