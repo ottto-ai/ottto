@@ -351,8 +351,8 @@ pub(crate) const CODEX_ZST_INPUT_KEYS: [&str; 6] = [
 ];
 /// The native peak is a maximum across header decoders; the rest are sums.
 const CODEX_ZST_PEAK: usize = 4;
-/// Header-only decoder closes since the last flush: the decoder count (retries
-/// included), then the `CODEX_ZST_INPUT_KEYS` totals.
+// Header-only decoder closes since the last flush: the decoder count (retries
+// included), then the `CODEX_ZST_INPUT_KEYS` totals.
 process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
 
 /// Counts only: inventory header reads decode every `.zst` once per walk, so
