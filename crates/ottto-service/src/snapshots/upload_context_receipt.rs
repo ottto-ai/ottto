@@ -105,6 +105,15 @@ impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
         self.inputs.is_none() && self.entity_stamps.is_empty()
     }
+    /// Every field but the stamps, which state v2 stores one row per entity.
+    pub(crate) fn header(&self) -> Self {
+        Self {
+            inputs: self.inputs.clone(),
+            destination_namespace_hash: self.destination_namespace_hash.clone(),
+            replay_generation: self.replay_generation.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 /// The copy-prefix money mode forms of one base: base, resumed-prefix, then

@@ -650,6 +650,11 @@ fn restart_between_pages_matches_single_full() {
             }
         }
         assert_eq!(items.len(), 2);
+        // Positive control: upload-context stamps crossed each cold reload.
+        let proof = serde_json::to_value(&index.upload_context_proof).unwrap();
+        assert!(proof["entity_stamps"]
+            .as_object()
+            .is_some_and(|stamps| !stamps.is_empty()));
         // Re-batch through the same uploader so page envelope ordering cannot
         // hide a missing entity or duplicated cumulative money.
         let items: Vec<_> = items.into_values().collect();
