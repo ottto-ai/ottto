@@ -11954,10 +11954,95 @@ fn snapshot_destination_scoped_index_path(
         .join(file_name)
 }
 
+/// Namespaces carried by the credentials `load_snapshot_device_credentials`
+/// read, keyed by device id and sha256(secret): an entry only ever applies to
+/// its exact credential, so resolving needs no second `device.json` read.
+static CARRIED_NAMESPACES: Mutex<BTreeMap<(String, String), String>> = Mutex::new(BTreeMap::new());
+
+/// Called by the credential loader on every load. It overwrites this exact
+/// credential's entry with what it resolves now: the alias only when its
+/// commitment is sha256(secret), else the raw hash. A reload after a legacy
+/// writer stripped the alias therefore resolves raw, as a fresh process does.
+pub(crate) fn carry_snapshot_namespace(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    alias: Option<&ottto_core::SnapshotNamespaceAlias>,
+) {
+    let key = (
+        device.device_id.clone(),
+        crate::control::secret_sha256(device_secret),
+    );
+    let namespace = snapshot_destination_namespace(device, device_secret, alias);
+    let mut carried = CARRIED_NAMESPACES.lock().unwrap_or_else(|p| p.into_inner());
+    carried.insert(key, namespace);
+}
+
+/// Test-only: forget what earlier loads carried for these devices.
+#[cfg(test)]
+pub(crate) fn forget_carried_namespaces_for_test(device_ids: &[&str]) {
+    let mut carried = CARRIED_NAMESPACES.lock().unwrap_or_else(|p| p.into_inner());
+    carried.retain(|(device_id, _), _| !device_ids.contains(&device_id.as_str()));
+}
+
+/// Destination namespace of a loaded relay credential.
 pub(crate) fn snapshot_upload_destination_namespace(
     device: &LocalDeviceBinding,
     device_secret: &str,
 ) -> String {
+    let key = (
+        device.device_id.clone(),
+        crate::control::secret_sha256(device_secret),
+    );
+    let carried = CARRIED_NAMESPACES.lock().unwrap_or_else(|p| p.into_inner());
+    match carried.get(&key) {
+        Some(namespace) => namespace.clone(),
+        None => snapshot_destination_namespace(device, device_secret, None),
+    }
+}
+
+/// Test-only: `links` same-account re-logins from a credential resolving to
+/// `canonical`. Each successor carries the namespace as promotion writes it
+/// and the loader reads it; returns what the last successor resolves to.
+#[cfg(test)]
+pub(crate) fn relogin_namespace(canonical: &str, links: usize) -> String {
+    let mut namespace = canonical.to_string();
+    for link in 1..=links {
+        let device = LocalDeviceBinding {
+            device_id: format!("relogin-{canonical}-{link}"),
+            machine_id: Some("otm_test".into()),
+            sources: Vec::new(),
+        };
+        let secret = format!("relogin-secret-{link}");
+        let alias = ottto_core::SnapshotNamespaceAlias {
+            namespace,
+            secret_commitment_sha256: crate::control::secret_sha256(&secret),
+        };
+        carry_snapshot_namespace(&device, &secret, Some(&alias));
+        namespace = snapshot_upload_destination_namespace(&device, &secret);
+        assert_ne!(
+            namespace,
+            snapshot_destination_namespace(&device, &secret, None)
+        );
+    }
+    namespace
+}
+
+/// The one namespace derivation: a confirmed same-account successor's alias
+/// while the secret matches its commitment, else hash(device id, secret).
+pub(crate) fn snapshot_destination_namespace(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    alias: Option<&ottto_core::SnapshotNamespaceAlias>,
+) -> String {
+    if let Some(alias) = alias.filter(|alias| {
+        crate::hex::is_sha256_lower(&alias.namespace)
+            && crate::control::secret_commitment_matches(
+                &alias.secret_commitment_sha256,
+                device_secret,
+            )
+    }) {
+        return alias.namespace.clone();
+    }
     let mut hasher = Sha256::new();
     hasher.update(b"ottto:snapshot-delivery-destination:relay-device:v1\0");
     hasher.update(device.device_id.as_bytes());
@@ -22788,7 +22873,8 @@ mod tests {
     /// oracle's bodies (two accounts, a mid-session switch, a side call, an
     /// evidence gap and a tagged row) are stored-body ACKed into a ledger past
     /// the old bound, saved receipt-first, crashed before the progress rename
-    /// and recovered. The recovered ledger passes the transition oracle's
+    /// and recovered by a restart after same-account re-logins A→B→C. The
+    /// recovered ledger passes the transition oracle's
     /// equivalence and placement assertions against the cold one.
     #[test]
     fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
@@ -22825,10 +22911,11 @@ mod tests {
             "past the former bound"
         );
         // Crash: the exact receipt is durable, the progress rename is lost.
+        // The restart follows same-account re-logins A→B→C.
         ottto_core::write_owner_only_file_atomic(&path, &before).unwrap();
         let mut restored = SnapshotUploadProgress::load_with_recovery(
             &path,
-            &progress.destination_namespace_hash,
+            &relogin_namespace(&progress.destination_namespace_hash, 2),
             test_quarantine_witness(),
             Some(recovery),
         )

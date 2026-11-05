@@ -590,6 +590,18 @@ impl Uploader {
         )?;
         Ok(retired)
     }
+    /// A restart after `links` same-account re-logins: the ledger reloads
+    /// under the successor's namespace with every accepted body.
+    pub(crate) fn relogin(&mut self, links: usize) {
+        let accepted = self.progress.accepted_body_witnesses.clone();
+        self.progress = SnapshotUploadProgress::load(
+            &self.scratch.join("progress.json"),
+            &crate::snapshot_sync::relogin_namespace(&"a".repeat(64), links),
+            self.progress.active_quarantine_witness.clone().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(self.progress.accepted_body_witnesses, accepted);
+    }
     pub(crate) fn restart(&mut self, source: SnapshotSource, context: &str) {
         self.progress = SnapshotUploadProgress::load(
             &self.scratch.join("progress.json"),
