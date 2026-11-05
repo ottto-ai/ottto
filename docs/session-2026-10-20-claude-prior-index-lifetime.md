@@ -1,5 +1,7 @@
 # Claude prior-index lifetime at final save
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 A non-current Claude native comparison already revokes its local lease before
 finalization. After all selected-state restoration and correction settlement,
 that path no longer needs the old committed scan index. It now drops that owner

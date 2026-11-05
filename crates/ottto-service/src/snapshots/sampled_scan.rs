@@ -760,11 +760,10 @@ pub(super) fn releases_at_completion(active: &OwnedActiveFile, index: &ScanIndex
         }) && sampled_singleton(active))
 }
 
-/// One file on its own plan: no comparison, cursor job, group, alias, receipt
+/// One file on its own plan: no cursor job, group, alias, receipt
 /// or tier join. Each conjunct is checked even where another implies it today.
 fn sampled_singleton(active: &OwnedActiveFile) -> bool {
-    !active.comparison_target
-        && active.cursor.is_none()
+    active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
         && active.applied_receipts.is_empty()

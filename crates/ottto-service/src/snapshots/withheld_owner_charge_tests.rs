@@ -1,6 +1,6 @@
 use super::*;
 use crate::snapshot_sync::retained_with_withheld;
-use crate::source_rotation::{Owner, PaidReservation, Step, PARKED_BUDGET};
+use crate::source_rotation::{Owner, Step, PARKED_BUDGET};
 use std::time::Duration;
 
 fn seed_held_memo(memo: &withheld_account::Memo) {
@@ -84,7 +84,6 @@ fn unsupported_sibling_preserves_only_a_memo_that_fits_the_allowance() {
 
 struct Cycle {
     memo: withheld_account::Memo,
-    native: Arc<claude_native_comparison::lifecycle::Lifecycle>,
     versions: Arc<codex_version::CodexVersionFeed>,
     memo_charge: usize,
     discards: usize,
@@ -92,9 +91,7 @@ struct Cycle {
 }
 impl Cycle {
     fn other_bound(&self, limit: usize) -> Option<usize> {
-        let versions = crate::heap_layout_bound::bound(&self.versions, limit)?;
-        let native = self.native.retained_bound(limit.checked_sub(versions)?)?;
-        versions.checked_add(native)
+        crate::heap_layout_bound::bound(&self.versions, limit)
     }
 }
 // One serial source: the rotation budget alone creates the contention.
@@ -139,9 +136,6 @@ impl Owner for Cycle {
     }
     fn discard_retained(&mut self) {
         self.discards += 1;
-        // Match SnapshotCycleOwner's native and memo cleanup. This real native
-        // policy graph would latch process_base_exit if composition refused it.
-        self.native.discard_retained();
         self.memo.discard_if_refused();
     }
     fn retained_budget_unavailable(&mut self) {
@@ -149,35 +143,20 @@ impl Owner for Cycle {
         self.discard_retained();
     }
 }
-/// [behaviour] Cap sized memo refusal does not base exit real native comparison.
+/// [behaviour] Memo refusal preserves the admitted Codex version sibling.
 
 #[test]
-fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
+fn cap_sized_memo_refusal_preserves_real_codex_version_sibling() {
     if !crate::heap_layout_bound::layout_supported() {
-        eprintln!("UNEXECUTED positive native owner charge: unsupported layout; no gate override");
+        eprintln!("UNEXECUTED positive owner charge: unsupported layout; no gate override");
         return;
     }
     assert_eq!(PARKED_BUDGET, 8 * 1024 * 1024);
-    let native = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
-    let mut lease = native.begin();
-    lease.bind("owner-charge-context".into());
-    lease.observe_policy_page("owner-charge-window", 1);
-    let mut credit = PaidReservation::from_remainder(Some(PARKED_BUDGET), 0, 0);
-    assert!(lease
-        .defer_family("native-family", false, (1, 1), &mut credit)
-        .unwrap());
-    lease.note_selected_save(true);
-    lease.finish(true);
-    assert!(native.retained_valid_for_test());
-    let native_charge = native.retained_bound(PARKED_BUDGET).unwrap();
-    assert!(native_charge > 0, "retain the real family-policy graph");
-
     let state = withheld_account::Memo::default();
     seed_held_memo(&state);
     let memo_charge = state.retained_bound(PARKED_BUDGET).unwrap();
     let mut owner = Cycle {
         memo: state.clone(),
-        native,
         versions: Arc::new(codex_version::CodexVersionFeed::new(None)),
         memo_charge,
         discards: 0,
@@ -193,7 +172,7 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
         "both fit in the full allowance"
     );
     // Let source completion populate the hold memo under a rotation budget
-    // where memo alone fits but memo + native/versions do not. A zero-sized
+    // where memo alone fits but memo + versions do not. A zero-sized
     // source charges no queue bytes.
     state.discard_retained();
     crate::source_rotation::run(&mut owner, &[()], memo_charge + other / 2);
@@ -203,25 +182,7 @@ fn cap_sized_memo_refusal_does_not_base_exit_real_native_comparison() {
         "memo refusal must not reach owner-wide discard"
     );
     assert_unavailable_population(&state);
-    assert_eq!(
-        owner.native.retained_bound(PARKED_BUDGET),
-        Some(native_charge)
-    );
-    let status = owner.native.status();
-    assert!(!status.process_base_exit);
-    assert_eq!(status.deferred_family_count, Some(1));
-    assert!(owner.native.retained_valid_for_test());
-    let mut next = owner.native.begin();
-    next.bind("owner-charge-context".into());
-    assert!(
-        next.allowed(),
-        "memo pressure cannot permanently BASE-exit native comparison"
-    );
-    assert!(
-        !next.family_can_optimize("native-family"),
-        "the existing family latch survives"
-    );
-    next.note_selected_save(true);
-    next.finish(true);
-    assert!(!owner.native.status().process_base_exit);
+    assert_eq!(owner.other_bound(PARKED_BUDGET), Some(other));
+    assert_eq!(owner.versions.snapshot().1, 0);
+    assert_eq!(owner.versions.snapshot().2, 0);
 }
