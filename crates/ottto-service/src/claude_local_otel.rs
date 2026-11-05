@@ -810,14 +810,13 @@ impl ClaudeApiEvidenceRead {
         root: &str,
     ) -> Option<crate::telemetry_attach::SessionReport<'_, ClaudeLocalOtelEvidence>> {
         let mut report = self.session_report(root)?;
-        let h = &self.reads.get(root)?.health;
-        report.complete = h.malformed_lines
-            + h.unreadable_lines
-            + h.oversized_files
-            + h.invalid_session_rows
-            + h.missing_request_ids
-            == 0
-            && h.conflicting_request_ids.is_empty();
+        let witness = self.reads.get(root)?;
+        let h = &witness.health;
+        report.complete =
+            h.malformed_lines + h.unreadable_lines + h.invalid_session_rows + h.missing_request_ids
+                == 0
+                && h.conflicting_request_ids.is_empty()
+                && (witness.generation.is_some() || h.missing_files > 0);
         Some(report)
     }
 

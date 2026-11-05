@@ -1148,6 +1148,19 @@ impl LocalDaemon {
         Ok(true)
     }
 
+    /// Doctor's existing pass, independent of account/SDK refresh.
+    pub(crate) fn refresh_shell_profile_health(&self) -> Result<(), LocalApiError> {
+        let relay = self.state()?.relay.clone();
+        let finding = claude_shell_telemetry::problem(&relay);
+        let mut state = self.state()?;
+        for health in &mut state.sources {
+            if health.source == SourceKind::ClaudeCode {
+                claude_shell_telemetry::apply(health, finding.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn record_verification_result(
         &self,
         result: &SourceVerificationResult,
@@ -9011,7 +9024,7 @@ mod tests {
             .iter()
             .any(|b| b.code == claude_shell_telemetry::CODE));
         fs::remove_file(profile).unwrap();
-        daemon.record_verification_result(&verified).unwrap();
+        daemon.refresh_shell_profile_health().unwrap();
         assert!(!daemon.state().unwrap().sources[0]
             .problems
             .iter()

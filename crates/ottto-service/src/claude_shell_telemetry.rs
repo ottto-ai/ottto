@@ -1,7 +1,7 @@
 //! Read-only shell-profile diagnostics. Values never enter the health model.
 use crate::agent_configs::fence::{FENCE_END, FENCE_START};
 use ottto_protocol::{HealthGrade, HealthProblem, SourceHealth, SourceKind, StableProblemCode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
@@ -56,7 +56,7 @@ struct Profile {
     label: String,
     lines: usize,
     names: BTreeSet<String>,
-    destinations: BTreeSet<&'static str>,
+    destinations: BTreeMap<String, BTreeSet<&'static str>>,
     header_present: bool,
     telemetry: BTreeSet<&'static str>,
     unknown: bool,
@@ -85,7 +85,10 @@ impl Profile {
         if name == "OTEL_EXPORTER_OTLP_ENDPOINT"
             || (name.starts_with("OTEL_EXPORTER_OTLP_") && name.ends_with("_ENDPOINT"))
         {
-            self.destinations.insert(destination(value, relay_port));
+            self.destinations
+                .entry(name.to_owned())
+                .or_default()
+                .insert(destination(value, relay_port));
         }
         true
     }
@@ -299,7 +302,11 @@ fn finding(home: Option<&Path>, relay_port: Option<u16>, capture: &str) -> Optio
                 p.names.iter().cloned().collect::<Vec<_>>().join(", "),
                 p.destinations
                     .iter()
-                    .copied()
+                    .map(|(name, classes)| format!(
+                        "{}:{}",
+                        name,
+                        classes.iter().copied().collect::<Vec<_>>().join(",")
+                    ))
                     .collect::<Vec<_>>()
                     .join(", "),
                 p.header_present,
@@ -322,12 +329,16 @@ pub(crate) fn project(health: &mut SourceHealth, relay: &ottto_protocol::RelaySt
     if health.source != SourceKind::ClaudeCode {
         return;
     }
+    apply(health, problem(relay));
+}
+
+pub(crate) fn apply(health: &mut SourceHealth, finding: Option<HealthProblem>) {
     let had_finding = health.problems.iter().any(is_problem);
     health.problems.retain(|problem| !is_problem(problem));
     if had_finding && health.problems.is_empty() && health.grade == HealthGrade::Warning {
         health.grade = HealthGrade::Ok;
     }
-    if let Some(problem) = problem(relay) {
+    if let Some(problem) = finding {
         health.problems.push(problem);
         if health.grade == HealthGrade::Ok {
             health.grade = HealthGrade::Warning;
@@ -411,7 +422,9 @@ mod tests {
         )
         .unwrap();
         let problem = finding(Some(&home), Some(43119), "untested").unwrap();
-        assert!(problem.detail.contains("destinations=remote"));
+        assert!(problem
+            .detail
+            .contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:remote"));
         assert!(!problem.detail.contains("private-"));
         // A directory deterministically exercises an unreadable profile, even as root.
         fs::create_dir(home.join(".bashrc")).unwrap();

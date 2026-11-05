@@ -4216,6 +4216,17 @@ pub(crate) fn note_desktop_capture(
             .values()
             .any(|o| o.desktop_request)
         {
+            // A Desktop response omitted from the request index cannot prove
+            // clean capture (for example an id-less or limited fold).
+            if item.request_count > 0
+                && item
+                    .origin
+                    .as_ref()
+                    .is_some_and(|o| o.entrypoint.as_deref() == Some("claude-desktop"))
+            {
+                requests += 1;
+                unknown = true;
+            }
             continue;
         }
         let report = api.capture_report(claude_snapshot_family_root_ref(item));
