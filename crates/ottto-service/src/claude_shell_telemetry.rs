@@ -53,15 +53,43 @@ fn destination(value: &str, relay_port: Option<u16>) -> &'static str {
     if value.contains(['$', '`', '\\']) {
         return "unparseable";
     }
-    // Parsing only: no call/send, DNS lookup, socket or listener probe.
-    let Ok(parsed) = ureq::get(value).request_url() else {
+    // Parsing only: no HTTP client, DNS lookup, socket or listener probe.
+    let Some((scheme, rest)) = value.trim().split_once("://") else {
         return "unparseable";
     };
-    let url = parsed.as_url();
-    if !matches!(url.scheme(), "http" | "https") {
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return "unparseable";
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((host, port)) if host.parse::<std::net::Ipv6Addr>().is_ok() => (host, port),
+            _ => return "unparseable",
+        },
+        None => match authority.find(':') {
+            Some(at) => authority.split_at(at),
+            None => (authority, ""),
+        },
+    };
+    let port = match port.strip_prefix(':') {
+        None if port.is_empty() => default_port,
+        Some("") => default_port,
+        Some(digits) if digits.bytes().all(|b| b.is_ascii_digit()) => match digits.parse() {
+            Ok(port) => port,
+            Err(_) => return "unparseable",
+        },
+        _ => return "unparseable",
+    };
+    if host.is_empty() {
         return "unparseable";
     }
-    let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
     let loopback = host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
@@ -69,7 +97,7 @@ fn destination(value: &str, relay_port: Option<u16>) -> &'static str {
     if !loopback {
         return "remote";
     }
-    if relay_port.is_some() && url.port_or_known_default() == relay_port {
+    if relay_port == Some(port) {
         "ottto_relay"
     } else {
         "other_loopback"
