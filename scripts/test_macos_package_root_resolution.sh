@@ -45,24 +45,50 @@ git -C "$repo" add .
 git -C "$repo" commit -qm "fixture"
 resolved_repo="$(cd "$repo" && pwd -P)"
 
-if bash "$repo/scripts/macos_package.sh" \
-  --version 0.1.0-stable-candidate.root-test \
-  --channel stable-candidate >"$TMP_DIR/package.out" 2>&1; then
-  echo "Expected package script to fail when the macOS app root is absent" >&2
+# The packager must not carry the private-source guard or credential fetch;
+# the release procedure owns those checks.
+if grep -Eq 'gh api|auth git-credential|require_command gh' "$ROOT/scripts/macos_package.sh"; then
+  echo "Package script must not reach a private repository or a gh credential helper" >&2
   exit 1
 fi
 
-expected="macOS app root does not exist: $resolved_repo/tools/ottto-macos-app"
-if ! grep -Fq "$expected" "$TMP_DIR/package.out"; then
-  echo "Expected missing app-root message not found" >&2
-  cat "$TMP_DIR/package.out" >&2
-  exit 1
-fi
+# package_expect_failure <label> <expected message> <packager args...>
+package_expect_failure() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  if bash "$repo/scripts/macos_package.sh" "$@" >"$TMP_DIR/$label.out" 2>&1; then
+    echo "Expected package script to fail: $label" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$expected" "$TMP_DIR/$label.out"; then
+    echo "Package failure for $label did not report: $expected" >&2
+    cat "$TMP_DIR/$label.out" >&2
+    exit 1
+  fi
+  if grep -Fq "not a git repository" "$TMP_DIR/$label.out"; then
+    echo "Package script resolved the wrong Git root" >&2
+    cat "$TMP_DIR/$label.out" >&2
+    exit 1
+  fi
+}
 
-if grep -Fq "not a git repository" "$TMP_DIR/package.out"; then
-  echo "Package script resolved the wrong Git root" >&2
-  cat "$TMP_DIR/package.out" >&2
-  exit 1
-fi
+# [behaviour] --app-root is required; there is no default app location.
+package_expect_failure missing-app-root "--app-root is required" \
+  --version 0.1.0-dev --channel dev
+
+# [behaviour] A missing app root is named as passed.
+package_expect_failure absent-app-root \
+  "macOS app root does not exist: $resolved_repo/tools/ottto-macos-app" \
+  --app-root "$resolved_repo/tools/ottto-macos-app" \
+  --version 0.1.0-dev --channel dev
+
+# [behaviour] A package root outside any Git checkout is refused after the
+# public source (resolved from the script's own checkout) passes its checks.
+loose_app="$TMP_DIR/loose-app"
+mkdir -p "$loose_app"
+printf '// fixture\n' > "$loose_app/Package.swift"
+package_expect_failure loose-app-root "macOS app root must belong to the private Git checkout" \
+  --app-root "$loose_app" --version 0.1.0-dev --channel dev
 
 echo "macOS package root resolution test passed"

@@ -211,6 +211,8 @@ jobs:
         run: |
           set -euo pipefail
           scripts/macos_package.sh \
+            --app-root "${OTTTO_MACOS_APP_ROOT:?}" \
+            --app-source-commit "$OTTTO_MACOS_APP_SOURCE_COMMIT" \
             --version "$VERSION" \
             --channel "$CHANNEL" \
             --artifact-base-url "$ARTIFACT_BASE_URL" \

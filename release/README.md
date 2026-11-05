@@ -42,10 +42,15 @@ requires Developer ID signing.
 From this directory's parent:
 
 ```bash
-./scripts/macos_package.sh --version 0.1.0 --channel dev
+./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+  --version 0.1.0 --channel dev
 ./scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
 ./scripts/macos_dev_install.sh --manifest dist/macos/release-manifest.json
 ```
+
+`--app-root` names the `tools/ottto-macos-app` Swift package inside its clean
+Git checkout. Stable-candidate and stable builds also take
+`--app-source-commit`, the 40-hex commit that checkout must be at.
 
 The package manifest uses URL-safe artifact names such as
 `Ottto-macos-arm64.dmg`, `ottto-macos-arm64.zip`, and
@@ -234,7 +239,8 @@ To produce a distribution-signed package, pass a Developer ID identity:
 
 ```bash
 OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Ottto Inc (...)" \
-  ./scripts/macos_package.sh --version 0.1.0 --channel stable
+  ./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+    --app-source-commit <40-hex app commit> --version 0.1.0 --channel stable
 ```
 
 Then submit the exact generated archives to Apple and update the manifest only
