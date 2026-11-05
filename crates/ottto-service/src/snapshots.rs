@@ -42613,6 +42613,194 @@ mod tests {
         .unwrap()
     }
 
+    /// [money] Queue membership grants no ACK or hold release. Exact ACKs,
+    /// local/decode holds and unobserved keys remain outside the new queue.
+    #[test]
+    fn unkept_queue_preserves_ack_holds_and_observation_guard() {
+        let (home, root, previous) = projection_adoption_fixture("unkept-guards", 3);
+        for guard in [
+            "none",
+            "accepted",
+            "local",
+            "decode_file",
+            "decode_entity",
+            "unobserved",
+        ] {
+            let mut working = previous.clone();
+            working.activate_effective_upload_body_witness_revision(1);
+            let scan = projection_adoption_scan(&root, &mut working, 2);
+            assert_eq!(scan.scanned_file_count, 2);
+            let read = scan
+                .completed_parses()
+                .map(|(key, _)| key.to_string())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(read.len(), 2);
+            // A source-changed unkept revision, independent of ACK eligibility.
+            for key in &read {
+                working.files.get_mut(key).unwrap().source_file_fingerprint = "changed".into();
+            }
+            let entities = read
+                .iter()
+                .flat_map(|key| {
+                    working
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .unwrap()
+                        .iter()
+                        .cloned()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(entities.len(), 2);
+            let accepted = if guard == "accepted" {
+                entities.clone()
+            } else {
+                BTreeSet::new()
+            };
+            let local = if guard == "local" {
+                entities.clone()
+            } else {
+                BTreeSet::new()
+            };
+            if guard == "decode_file" {
+                for key in &read {
+                    working
+                        .decode_holds
+                        .v2_insert("files", key.clone(), b"{}".to_vec(), None, 2)
+                        .unwrap();
+                }
+            }
+            if guard == "decode_entity" {
+                for entity in &entities {
+                    working
+                        .decode_holds
+                        .v2_insert(
+                            "quarantined_snapshot_fingerprints",
+                            entity.clone(),
+                            b"{}".to_vec(),
+                            None,
+                            2,
+                        )
+                        .unwrap();
+                }
+            }
+            if guard == "unobserved" {
+                working
+                    .traversal
+                    .as_mut()
+                    .unwrap()
+                    .observed_index_keys
+                    .clear();
+            }
+            let mut selected = working.committable_subset_with_local_holds(
+                &ScanIndex::default(),
+                &accepted,
+                &BTreeMap::new(),
+                &local,
+            );
+            let before = selected
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .len();
+            selected.keep_unacknowledged_codex_files_owed(&working, &local);
+            let after = selected
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .len();
+            assert_eq!(
+                after - before,
+                if guard == "none" { 2 } else { 0 },
+                "{guard}"
+            );
+            selected.keep_unacknowledged_codex_files_owed(&working, &local);
+            assert_eq!(
+                selected
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .pending_candidates
+                    .len(),
+                after,
+                "deduplicated"
+            );
+            assert_eq!(selected.accepted_snapshot_fingerprints, accepted);
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// [money] Same-source-stamp projection adoption stays outside this queue;
+    /// an unaccepted revision remains owed through the existing generation walk.
+    #[test]
+    fn unkept_same_stamp_adoption_retains_the_existing_walk_residual() {
+        let (home, root, previous) = projection_adoption_fixture("unkept-same-stamp", 3);
+        let mut working = previous.clone();
+        working.activate_effective_upload_body_witness_revision(1);
+        let mut scan = projection_adoption_scan(&root, &mut working, 2);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut scan,
+            &mut working,
+            snapshot_upload_body_witness,
+        );
+        assert_eq!(scan.snapshots.len(), 2);
+        let mut selected =
+            working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let before = selected
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .len();
+        selected.keep_unacknowledged_codex_files_owed(&working, &BTreeSet::new());
+        assert_eq!(
+            selected
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .len(),
+            before
+        );
+        assert!(selected
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0));
+        for (key, entry) in &working.files {
+            assert_eq!(
+                entry.source_file_fingerprint,
+                previous.files[key].source_file_fingerprint
+            );
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// [behaviour] A terminal partial page has no retained traversal to queue
+    /// into. A fresh ordinary traversal still discovers the undelivered files.
+    #[test]
+    fn unkept_terminal_page_waits_for_a_fresh_traversal() {
+        let (home, root, _) = projection_adoption_fixture("unkept-terminal", 3);
+        let previous = ScanIndex::default();
+        let mut working = previous.clone();
+        let mut scan = projection_adoption_scan(&root, &mut working, MAX_BACKFILL_FILES_PER_SOURCE);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut working);
+        assert_eq!(scan.snapshots.len(), 3);
+        assert!(working.traversal.is_none());
+        let mut selected =
+            working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        selected.keep_unacknowledged_codex_files_owed(&working, &BTreeSet::new());
+        assert!(selected.traversal.is_none());
+        assert!(selected.files.is_empty());
+        selected.save(&home.join("terminal-index.json")).unwrap();
+        let mut restart = ScanIndex::load(&home.join("terminal-index.json")).unwrap();
+        let next = projection_adoption_scan(&root, &mut restart, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(next.scanned_file_count, 3);
+        assert_eq!(next.snapshots.len(), 3);
+        let _ = fs::remove_dir_all(home);
+    }
+
     #[test]
     fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-3", 3);
