@@ -51,17 +51,23 @@ impl ScanIndex {
         let key = local_index_key(&candidate.path);
         let file = open_candidate_beneath_root(candidate)?;
         let stat = file.metadata()?;
-        let Some((true, head)) = self.codex_physical_matches(&key, &stat)? else {
-            return Ok(None);
-        };
-        let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
-            .filter(|value| !value.is_empty());
-        if tail_source::codex::header_facts(head.revision, &head.body)
-            .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
-            .0
-            != binding
-        {
-            return Ok(None);
+        match self.codex_physical_matches(&key, &stat)? {
+            Some((true, head)) => {
+                let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
+                    .filter(|value| !value.is_empty());
+                if tail_source::codex::header_facts(head.revision, &head.body)
+                    .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
+                    .0
+                    != binding
+                {
+                    return Ok(None);
+                }
+            }
+            // A read archive keeps no reduction-bearing head: its unchanged,
+            // unowed index entry is the physical proof. Anything else reads.
+            None if codex_archive_path(&candidate.path)
+                && self.listing_unchanged(&candidate.path, &stat) => {}
+            _ => return Ok(None),
         }
         let entry = self.files.get(&key).context("codex_carry_progress")?;
         let mut logical = candidate.clone();

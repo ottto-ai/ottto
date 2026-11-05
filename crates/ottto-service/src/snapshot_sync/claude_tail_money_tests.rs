@@ -1120,6 +1120,175 @@ fn deleted_sibling_lost_ack_settles_once() {
     });
 }
 
+/// B2 (#1351) receipts. `claude_bad_record_sibling`: a malformed record
+/// between valid responses never counts and its siblings count on every arm.
+/// `claude_paused_suffix`: an unterminated final response is pending on its
+/// first read and counts once after it completes.
+fn claude_bad_record_case(name: &str) {
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = claude_corpus(name);
+        let mut disk = Disk::new(&c);
+        let (scanner, mut prior) = warm_claude(&c, &disk);
+        let malformed = match name {
+            "claude_bad_record_sibling" => {
+                // A response cut short: its request and usage never count.
+                let bad = line(ROOT, "bad", AT, 99);
+                let bad = bad[..bad.len() - 3].to_owned() + "\n";
+                append(&path, &(bad + &line(ROOT, "r2", AT, 20)));
+                1
+            }
+            "claude_paused_suffix" => {
+                let r2 = line(ROOT, "r2", AT, 20);
+                let (start, rest) = r2.split_at(r2.len() / 2);
+                append(&path, start);
+                input_clock(&path);
+                let mut paused = c.raw(&scanner, prior, 100, true, &[]);
+                assert_eq!(paused.modes, (0, 1, 0), "the first read Tails the suffix");
+                paused.enrich(&c);
+                paused.finish();
+                assert_eq!(
+                    paused.scan.malformed_json_line_count, 0,
+                    "pending, not loss"
+                );
+                assert!(
+                    paused
+                        .scan
+                        .snapshots
+                        .iter()
+                        .all(|item| item.request_count == 1),
+                    "the unfinished response never counts"
+                );
+                accept_page(&mut paused);
+                prior = disk.commit(&paused.cache, SnapshotSource::ClaudeCode, &mut paused.index);
+                append(&path, rest);
+                0
+            }
+            _ => unreachable!(),
+        };
+        input_clock(&path);
+        let restart = disk.owner(SnapshotSource::ClaudeCode);
+        let mut pages = claude_pages(
+            &c,
+            &scanner,
+            &restart,
+            [prior.clone(), prior.clone(), prior],
+            (0, 1, 0),
+        );
+        finish_claude_pages(&c, &mut pages);
+        for page in &pages {
+            literal(page);
+            assert_eq!(page.scan.malformed_json_line_count, malformed);
+            assert_eq!(total(page), 2, "r1 and r2 count once; the bad record never");
+        }
+        receipt(name, &[compare_claude_uploads(&pages)]);
+    });
+}
+#[test]
+fn claude_bad_record_sibling() {
+    claude_bad_record_case("claude_bad_record_sibling");
+}
+#[test]
+fn claude_paused_suffix() {
+    claude_bad_record_case("claude_paused_suffix");
+}
+
+/// B2 (#1351) receipt: an invalid native usage record between valid Codex
+/// turns never counts; its siblings count exactly as in a rollout without it.
+#[test]
+fn codex_bad_record_sibling() {
+    let name = "codex_bad_record_sibling";
+    if !supported(name) {
+        return;
+    }
+    let _cutover = crate::snapshots::TestCutover::set(0);
+    let source = SnapshotSource::Codex;
+    let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
+    let thread = json!({"input_tokens":25,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":27});
+    let bad = [
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:01Z","payload":{"type":"task_started","turn_id":"turn-bad"}}),
+        json!({"type":"token_usage_record","timestamp":"2026-10-27T07:00:02Z","payload":{"thread_id":ROOT,"turn_id":"turn-bad","response_id":"turn-bad","usage":{"input_tokens":"invalid"},"thread_token_usage":thread}}),
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:04Z","payload":{"type":"task_complete","turn_id":"turn-bad"}}),
+    ].iter().map(|v| v.to_string()+"\n").collect::<String>();
+    let siblings = codex_rows("turn-b", 20) + &codex_rows("turn-c", 30);
+    let c = corpus(name);
+    let mut disk = Disk::with_route(&c, source);
+    let path = c.root.join("rollout.jsonl");
+    std::fs::write(&path, header.clone() + &codex_rows("turn-a", 10)).unwrap();
+    input_clock(&path);
+    let scanner = E2ScanFixture::default();
+    disk.begin(&scanner, source);
+    let prior = {
+        let (mut index, scan, _) = other_page(&c, &scanner, source, ScanIndex::default());
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&accepted);
+        disk.commit(&scanner.cache, source, &mut index)
+    };
+    append(
+        &path,
+        &(codex_rows("turn-b", 20) + &bad + &codex_rows("turn-c", 30)),
+    );
+    input_clock(&path);
+    let restart = disk.owner(source);
+    save_inputs(&c);
+    let (_, tail, modes) = other_page(&c, &scanner, source, prior.clone());
+    assert_eq!(modes, (0, 1, 0), "must continue from the Codex route head");
+    let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+    assert_eq!(modes, (1, 0, 0));
+    let (_, restored, modes) = other_page(&c, &restart, source, prior);
+    assert_eq!(
+        modes,
+        (0, 1, 0),
+        "a restarted owner continues from the same head"
+    );
+    // The same rollout without the bad turn, read cold, is the money oracle.
+    let control = corpus(&format!("{name}-control"));
+    let control_path = control.root.join("rollout.jsonl");
+    std::fs::write(
+        &control_path,
+        header + &codex_rows("turn-a", 10) + &siblings,
+    )
+    .unwrap();
+    input_clock(&control_path);
+    let (_, oracle, _) = other_page(
+        &control,
+        &E2ScanFixture::default(),
+        source,
+        ScanIndex::default(),
+    );
+    let totals = |scan: &SourceScanResult| {
+        scan.snapshots.iter().fold((0, 0, 0), |(r, i, o), s| {
+            (r + s.request_count, i + s.input_tokens, o + s.output_tokens)
+        })
+    };
+    assert!(totals(&oracle).0 > 0);
+    for scan in [&tail, &full, &restored] {
+        assert_eq!(
+            totals(scan),
+            totals(&oracle),
+            "valid siblings count; the bad record never"
+        );
+    }
+    let (a, b) = (other_wire(source, &tail), other_wire(source, &full));
+    let d = other_wire(source, &restored);
+    assert_eq!(a, b);
+    assert_eq!(d, b, "restarted envelope differs from cold Full");
+    receipt(
+        name,
+        &[ReceiptBody {
+            raw: a,
+            source,
+            items: tail.snapshots.clone(),
+        }],
+    );
+}
+
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
 /// exactly the cross-build receipts above, so these print a distinct line and
 /// write no receipt; the job still runs them and fails on any assertion.
