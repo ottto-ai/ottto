@@ -17,6 +17,15 @@ sparse_lifetime_counters! {
     usage_iteration_model_differs: UsageIterationModelDiffers,
     // Claude usage numeric keys the parser does not read.
     usage_unknown_numeric_key: UsageUnknownNumericKey,
+    // Claude `claude_code.llm_request` spans skipped before an ownership row.
+    llm_request_span_success_false: LlmRequestSpanSuccessFalse,
+    llm_request_span_missing_session_id: LlmRequestSpanMissingSessionId,
+    llm_request_span_missing_start_time: LlmRequestSpanMissingStartTime,
+    // Local OTLP relay requests refused or acknowledged without storing.
+    otlp_relay_busy_503: OtlpRelayBusy503,
+    otlp_relay_bad_framing_400: OtlpRelayBadFraming400,
+    otlp_relay_collection_disabled: OtlpRelayCollectionDisabled,
+    otlp_relay_unknown_content_encoding: OtlpRelayUnknownContentEncoding,
 }
 
 pub(crate) fn snapshot() -> Counts {

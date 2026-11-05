@@ -12,6 +12,31 @@ pub(super) use group_job::{
 
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+const DIRECTORY_CENSUS_UNPROVED: &str = "Codex joining directory census is unproved";
+const DIRECTORY_MEMBERSHIP_CHANGED: &str = "Codex joining directory membership changed";
+const DIRECTORY_CENSUS_MISSING: &str = "Codex joining lacks an owning directory census";
+const HEADER_INVENTORY_INCOMPLETE: &str = "Codex joining header inventory is incomplete";
+const ROOT_UNPROVED: &str = "Codex joining root is unproved";
+const HEADER_STAT_FAILED: &str = "Codex joining header stat failed";
+const HEADER_REREAD_FAILED: &str = "Codex joining header re-read failed";
+const HEADER_OWNERSHIP_CHANGED: &str = "Codex joining header ownership changed";
+const JOINED_MEMBER_OPEN_FAILED: &str = "Codex joined member open failed";
+const JOINED_MEMBER_CHANGED: &str = "Codex joined member changed after replay";
+/// Every fixed phrase a join validation failure carries, so `safe_error`
+/// names the failed check instead of the bare "sync failed".
+pub(crate) const CODEX_JOIN_VALIDATION_FAILURES: [&str; 10] = [
+    DIRECTORY_CENSUS_UNPROVED,
+    DIRECTORY_MEMBERSHIP_CHANGED,
+    DIRECTORY_CENSUS_MISSING,
+    HEADER_INVENTORY_INCOMPLETE,
+    ROOT_UNPROVED,
+    HEADER_STAT_FAILED,
+    HEADER_REREAD_FAILED,
+    HEADER_OWNERSHIP_CHANGED,
+    JOINED_MEMBER_OPEN_FAILED,
+    JOINED_MEMBER_CHANGED,
+];
+
 fn metadata_witness(metadata: &fs::Metadata) -> String {
     let mut digest = Sha256::new();
     digest.update(metadata.len().to_be_bytes());
@@ -109,22 +134,22 @@ impl DirectoryCensus {
             .retain(|directory, _| !Path::new(directory).starts_with(path));
     }
     pub(super) fn validate(&self, home: &Path) -> Result<()> {
-        anyhow::ensure!(self.stable, "Codex joining directory census is unproved");
+        anyhow::ensure!(self.stable, DIRECTORY_CENSUS_UNPROVED);
         let mut count = 0;
         for (path, witness) in &self.directories {
             if !Path::new(path).starts_with(home) {
                 continue;
             }
             count += 1;
-            let current = fs::symlink_metadata(path)?;
+            let current = fs::symlink_metadata(path).context(DIRECTORY_MEMBERSHIP_CHANGED)?;
             anyhow::ensure!(
                 current.is_dir()
                     && !current.file_type().is_symlink()
                     && metadata_witness(&current) == *witness,
-                "Codex joining directory membership changed"
+                DIRECTORY_MEMBERSHIP_CHANGED
             );
         }
-        anyhow::ensure!(count > 0, "Codex joining lacks an owning directory census");
+        anyhow::ensure!(count > 0, DIRECTORY_CENSUS_MISSING);
         Ok(())
     }
 }
@@ -722,43 +747,55 @@ impl HeaderInventory {
         if owners.is_empty() {
             return Ok(0);
         }
+        // Cross-home uniqueness of these owners is proved over the complete
+        // inventory: `affected_owners` holds any owner seen in two homes.
         let affected = self
             .affected_owners()
-            .context("Codex joining header inventory is incomplete")?;
+            .context(HEADER_INVENTORY_INCOMPLETE)?;
         anyhow::ensure!(
             owners
                 .iter()
                 .all(|owner| self.membership_complete(owner, Some(&affected))),
-            "Codex joining header inventory is incomplete"
+            HEADER_INVENTORY_INCOMPLETE
         );
-        // Uniqueness spans all registered homes, even a home with no selected
-        // owner. An unread or changed directory there may hide a new collision.
         for root in &self.roots {
-            anyhow::ensure!(
-                self.directories.contains(root),
-                "Codex joining root is unproved"
-            );
+            anyhow::ensure!(self.directories.contains(root), ROOT_UNPROVED);
         }
-        for home in self
-            .roots
+        // Re-check the directory census and headers of the homes holding
+        // these owners. A change in an unrelated home is the next page's
+        // inventory fact; it cannot fail this page. An owner without an
+        // inventoried header keeps every registered home.
+        let mut homes = BTreeSet::new();
+        let mut found = BTreeSet::new();
+        for header in self
+            .headers
             .iter()
-            .map(|root| member_home(root))
-            .collect::<BTreeSet<_>>()
+            .filter(|header| owners.contains(&header.owner))
         {
-            self.directories.validate(&home)?;
+            homes.insert(header.home.clone());
+            found.insert(header.owner.as_str());
+        }
+        if found.len() < owners.len() {
+            homes.extend(self.roots.iter().map(|root| member_home(root)));
+        }
+        for home in &homes {
+            self.directories.validate(home)?;
         }
         let mut checked_headers = 0;
-        for header in &self.headers {
+        for header in self
+            .headers
+            .iter()
+            .filter(|header| homes.contains(&header.home))
+        {
             checked_headers += 1;
-            let stat = fs::symlink_metadata(&header.candidate.path)?;
+            let stat = fs::symlink_metadata(&header.candidate.path).context(HEADER_STAT_FAILED)?;
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let (current, _) = read_header_settled(&header.candidate, None).0?;
-            anyhow::ensure!(
-                current.owner == header.owner,
-                "Codex joining header ownership changed"
-            );
+            let (current, _) = read_header_settled(&header.candidate, None)
+                .0
+                .context(HEADER_REREAD_FAILED)?;
+            anyhow::ensure!(current.owner == header.owner, HEADER_OWNERSHIP_CHANGED);
         }
         Ok(checked_headers)
     }
@@ -821,13 +858,14 @@ impl Validation {
         {
             for member in &group.members {
                 let mut opened = member.clone();
-                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
+                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)
+                    .context(JOINED_MEMBER_OPEN_FAILED)?;
                 let granted = group.live.as_ref().is_some_and(|(key, prefix)| {
                     *key == local_index_key(&member.path) && prefix.holds(&file)
                 });
                 anyhow::ensure!(
                     granted || opened.opened_object_identity == member.opened_object_identity,
-                    "Codex joined member changed after replay"
+                    JOINED_MEMBER_CHANGED
                 );
             }
         }
@@ -2197,13 +2235,16 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// [regress] A singleton depends on owning headers in every registered
-    /// home: a changed other-home id can create a cross-home collision.
+    /// [regress] A page re-checks only the homes holding its own owners: a
+    /// change in an unrelated home cannot fail it, and the next inventory
+    /// still holds an owner that a changed other-home id now collides with.
+    /// A change in a selected owner's home fails with its own phrase.
     #[test]
-    fn surviving_singleton_revalidates_other_home_ownership_and_namespace() {
+    fn surviving_singleton_revalidates_only_its_owners_homes() {
         let (root, original) = fixture();
         let sessions = root.join("sessions");
-        let other = root.join("other-home/sessions");
+        let other_root = crate::test_scratch::unique_path("ottto-codex-join-other");
+        let other = other_root.join("sessions");
         fs::create_dir_all(&other).unwrap();
         let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
         let remote = "dddddddd-1111-4111-8111-dddddddddddd";
@@ -2229,35 +2270,56 @@ pub(super) mod tests {
                 local_index_key(&healthy_path),
                 local_index_key(&remote_path),
             ])
-            .collect();
+            .collect::<BTreeSet<_>>();
         let mut directories = DirectoryCensus::new();
         for directory in [&sessions, &other] {
             directories.observe(directory, &fs::metadata(directory).unwrap());
         }
-        let mut inventory =
-            HeaderInventory::new(&[sessions, other.clone()], &paths, Some(&directories));
+        let roots = [sessions.clone(), other.clone()];
+        let mut inventory = HeaderInventory::new(&roots, &paths, Some(&directories));
         while !inventory.step(&CodexTitleMetadata::default()) {}
         let owner = original.headers[0].owner.clone();
         let selected = BTreeSet::from([owner.clone(), healthy.into()]);
         let validation = Validation::new(inventory.clone(), Vec::new(), &selected);
-        assert_eq!(validation.validate_all().unwrap(), 4);
+        // a, b and healthy; the unrelated home's header is not this page's.
+        assert_eq!(validation.validate_all().unwrap(), 3);
         write(&remote_path, healthy);
-        assert!(validation
-            .validate(&BTreeSet::from([owner.clone()]))
-            .is_err());
-        assert!(validation
-            .validate(&BTreeSet::from([healthy.into()]))
-            .is_err());
+        assert_eq!(validation.validate_all().unwrap(), 3);
+        let mut next = HeaderInventory::new(&roots, &paths, Some(&directories));
+        while !next.step(&CodexTitleMetadata::default()) {}
+        let affected = next.affected_owners();
+        assert!(!next.membership_complete(healthy, affected.as_ref()));
+        assert!(next.membership_complete(&owner, affected.as_ref()));
         fs::write(&remote_path, b"{unknown}\n").unwrap();
-        assert!(validation.validate_all().is_err());
-        assert!(validation.validate_all().is_err());
-        write(&remote_path, remote);
-        assert!(validation.validate_all().is_ok());
-        // A new unproved entry in an unselected home is still a wildcard.
         fs::write(other.join("late.jsonl"), b"{unknown}\n").unwrap();
-        assert!(validation.validate_all().is_err());
-        assert!(validation.validate_all().is_err());
+        assert!(validation.validate_all().is_ok());
+        // The selected home's header now names another owner.
+        fs::write(
+            &healthy_path,
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":remote,"rewritten":true}})
+            ),
+        )
+        .unwrap();
+        for owners in [BTreeSet::from([healthy.into()]), BTreeSet::from([owner])] {
+            let error = validation.validate(&owners).unwrap_err();
+            assert_eq!(
+                crate::snapshot_sync::safe_error(&error),
+                HEADER_OWNERSHIP_CHANGED
+            );
+        }
+        write(&healthy_path, healthy);
+        assert!(validation.validate_all().is_ok());
+        // A late member in the selected home.
+        fs::write(sessions.join("late.jsonl"), b"{unknown}\n").unwrap();
+        let error = validation.validate_all().unwrap_err();
+        assert_eq!(
+            crate::snapshot_sync::safe_error(&error),
+            DIRECTORY_MEMBERSHIP_CHANGED
+        );
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other_root).unwrap();
     }
 
     #[test]
@@ -3068,10 +3130,13 @@ pub(super) mod tests {
                         .unwrap()
                         .validate(&scan.snapshots)
                         .unwrap();
-                    assert!(
-                        scan.validate_codex_checkpoint().is_err(),
-                        "no-op suppression cannot make a stale checkpoint eligible"
-                    );
+                    let error = scan
+                        .validate_codex_checkpoint()
+                        .expect_err("no-op suppression cannot make a stale checkpoint eligible");
+                    // The failure names its own check, never the bare phrase.
+                    let shown = crate::snapshot_sync::safe_error(&error);
+                    assert_ne!(shown, "sync failed");
+                    assert!(CODEX_JOIN_VALIDATION_FAILURES.contains(&shown.as_str()));
                     break;
                 }
             }

@@ -1392,7 +1392,8 @@ page counters that share `process_retained_cache_lifecycle_totals`' event keys:
 `prefix_excluded_bodies`, `prefix_tag_clears`, `pi_cost_refused_overflow`,
 `pi_cost_precision_rounded`, `pi_fork_copies_skipped_entries`,
 `pi_fork_copies_skipped_tokens`, `codex_non_default_thread_tier`,
-`usage_iteration_model_differs` and `usage_unknown_numeric_key`. Unlike the
+`usage_iteration_model_differs`, `usage_unknown_numeric_key` and the OTLP skip
+counters below. Unlike the
 process totals (cumulative, cross-source, labelled `unknown`), these are exact
 deltas from that source's page.
 
@@ -1660,6 +1661,21 @@ counted. A non-zero value means a new numeric usage field is not reaching money.
 Counts are per parsed usage line, not per unique request; rereads count again. It
 is a cumulative saturating process total with no key name, path or session id,
 and it never affects money.
+
+## Claude OTLP spans and relay requests not stored
+
+These `process_retained_cache_lifecycle_totals` counters tell a request Claude
+Code never reported apart from one the daemon received and did not keep. A
+`claude_code.llm_request` span stores no ownership row when it carries
+`success=false` (`llm_request_span_success_false`), no session id
+(`llm_request_span_missing_session_id`) or no start time
+(`llm_request_span_missing_start_time`); other span names are not counted. The
+local relay counts connections refused at its concurrency limit
+(`otlp_relay_busy_503`), malformed HTTP requests (`otlp_relay_bad_framing_400`,
+also one `bad_framing` log line), Claude exports acknowledged while Claude
+collection is off (`otlp_relay_collection_disabled`) and bodies with an
+unsupported content encoding (`otlp_relay_unknown_content_encoding`). Counts
+only: no ids, paths or payload content, and they never affect money.
 
 ## Compressed Codex reader refusals
 

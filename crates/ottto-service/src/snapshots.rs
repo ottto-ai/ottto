@@ -179,6 +179,7 @@ mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_dictionary_slots;
 mod codex_file_join;
+pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 #[cfg(test)]
 mod file_set_digest_tests;
 #[cfg(test)]

@@ -40,8 +40,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups across registered homes. A header owner that changes
-  during a pass holds that pass’s Codex publication until revalidation on the next pass.
+  singleton sessions and joined groups: it re-checks the directories and headers of the homes
+  holding them, and the inventory holds an owner seen in two homes. A change in an unrelated
+  home is the next pass's fact. A header owner that changes in a checked home during a pass
+  holds that pass’s Codex publication until revalidation on the next pass.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.
@@ -148,8 +150,9 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 - `tests/`: tests that span stages; test data under `tests/fixtures/`.
 
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
-except that a fn with an unchanged body may have a signature rustfmt re-wrapped; only visibility,
-`use`/`mod` lines, path literals and wrappers change) and
+except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and
+wrappers change; edits to listed validator files that anchor on moved code are reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.
