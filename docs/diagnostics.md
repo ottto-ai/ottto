@@ -64,6 +64,14 @@ The state-v2 store, Claude's scan-index store, uses stage `claude_state_v2` in
 this same local sink. Only Claude's daemon loads and already active Claude custody
 enable the resource probes; Codex and Pi keep their existing measurements.
 
+While a Claude pass runs on the scanning thread, each event below (`save_span`,
+`hold`, `growth_claim_refused`, ...) prints its own row with only the changed
+field, `{"latest": {"<name>": <value>}}`, so every save and hold stays countable.
+Stage windows, memory checkpoints, retained heap and save-work samples print
+nothing mid-pass; the pass-end row (after `post_pass_plateau`) carries the full
+snapshot with every field below. A same-name window repeated in one pass shows
+its last instance. Outside a pass, each change prints the full snapshot at once.
+
 | Field | Measurement |
 | --- | --- |
 | `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
@@ -1751,9 +1759,15 @@ scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo o
 header attempt per archive; no money effect. Whether an older binary decodes carried
 state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
-On close, `codex_zst_input` on the #799 carrier reports consumed
-`codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
-`codex_zst_cpu_micros`, including failures. There is no content or path in these
+On close, each body decoder prints `codex_zst_input` on the #799 carrier with
+consumed `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder
+thread `codex_zst_cpu_micros`, including failures. Inventory header reads decode
+every `.zst` once per walk, so their closes print no row of their own: the Codex
+pass flush that prints `codex_zst_refused` also prints one `codex_zst_input_headers`
+row, when any header decoder closed since the last flush, with
+`codex_zst_header_decoders` (retries included) and the same `codex_zst_*` fields
+summed (`codex_zst_decoder_native_peak_bytes` is the maximum). Unlike the refusal
+counters, these totals reset at each flush. There is no content or path in these
 counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
