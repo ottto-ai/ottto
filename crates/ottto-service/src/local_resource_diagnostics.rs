@@ -340,9 +340,54 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     });
 }
 
+/// One decoder close's counts, in `codex_zst_input` key order.
+pub(crate) const CODEX_ZST_INPUT_KEYS: [&str; 6] = [
+    "codex_zst_compressed_bytes",
+    "codex_zst_compressed_consumed_bytes",
+    "codex_zst_decoded_bytes",
+    "codex_zst_cpu_micros",
+    "codex_zst_decoder_native_peak_bytes",
+    "codex_zst_decoder_allocation_refusals",
+];
+/// The native peak is a maximum across header decoders; the rest are sums.
+const CODEX_ZST_PEAK: usize = 4;
+/// Header-only decoder closes since the last flush: the decoder count (retries
+/// included), then the `CODEX_ZST_INPUT_KEYS` totals.
+process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
+
+/// Counts only: inventory header reads decode every `.zst` once per walk, so
+/// `codex_zst_refused_flush` reports them as one per-walk row.
+pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
+    with_codex_zst_headers(|headers| {
+        let _ = headers[0].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        for (index, (total, count)) in headers[1..].iter().zip(counts).enumerate() {
+            if index == CODEX_ZST_PEAK {
+                total.fetch_max(count, Relaxed);
+            } else {
+                let _ = total.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_header_decoders() -> u64 {
+    with_codex_zst_headers(|headers| headers[0].load(Relaxed))
+}
+
 /// One sparse line of the non-zero cumulative counters, only when their sum
-/// moved since the last flush.
+/// moved since the last flush. Header decoder totals since the last flush go
+/// on their own `codex_zst_input_headers` row, then reset.
 pub(crate) fn codex_zst_refused_flush() {
+    let headers: [u64; 7] =
+        with_codex_zst_headers(|headers| std::array::from_fn(|i| headers[i].swap(0, Relaxed)));
+    if headers[0] != 0 {
+        let counts: BTreeMap<&str, u64> = std::iter::once("codex_zst_header_decoders")
+            .chain(CODEX_ZST_INPUT_KEYS)
+            .zip(headers)
+            .collect();
+        traversal_point("codex_zst_input_headers", "codex", &counts);
+    }
     let counts = with_codex_zst_refused(|refused| {
         let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
             .into_iter()
