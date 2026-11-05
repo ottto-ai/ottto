@@ -653,11 +653,8 @@ fn shed_save_keeps_held_custody_and_drops_unkept_heads() {
             &line(COPY, "root", AT, 10),
             "2026-08-02T07:03:00Z",
         );
-        let fresh = c.write_at(
-            &format!("{FRESH}.jsonl"),
-            &line(FRESH, "fresh", AT, 30),
-            "2026-08-02T07:03:00Z",
-        );
+        // Born before its line, so no census decides it: it is not held.
+        let fresh = c.root(FRESH, &line(FRESH, "fresh", AT, 30));
         let mut shed = c.raw(&scanner, prior.clone(), 100, true, &[]);
         deadline(|| shed.enrich(&c));
         assert_withheld(&shed, COPY, "external census unavailable");
