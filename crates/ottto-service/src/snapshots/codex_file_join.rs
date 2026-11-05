@@ -777,13 +777,16 @@ impl HeaderInventory {
             anyhow::ensure!(self.directories.contains(root), ROOT_UNPROVED);
         }
         anyhow::ensure!(self.directories.stable, DIRECTORY_CENSUS_UNPROVED);
-        for directory in self.directories.moved_directories() {
+        let mut directories = VecDeque::from(self.directories.moved_directories());
+        while let Some(directory) = directories.pop_front() {
             let (_, (_, appeared, new_directories)) = self
                 .directories
                 .relist(&directory, paths)
                 .context(DIRECTORY_MEMBERSHIP_CHANGED)?
                 .context(DIRECTORY_MEMBERSHIP_CHANGED)?;
-            anyhow::ensure!(new_directories.is_empty(), DIRECTORY_MEMBERSHIP_CHANGED);
+            // Inspect new date trees without advancing the frozen census.
+            // The next roster refresh queues them for the bounded walk.
+            directories.extend(new_directories);
             for (path, stat) in appeared {
                 anyhow::ensure!(
                     self.new_member_owners(&path, &stat, paths)?
@@ -2419,6 +2422,126 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// [money] A midnight directory defers without losing its read obligation.
+    #[test]
+    fn owner_scoped_midnight_directory_deferred_then_read_money_oracle() {
+        use sampled_scan::transition_fixture::{money_oracle, scan_money};
+
+        let (root, _) = fixture();
+        let old_day = root.join("sessions/2026/10/06");
+        fs::create_dir_all(&old_day).unwrap();
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::rename(root.join("sessions").join(name), old_day.join(name)).unwrap();
+        }
+        let write_member = |path: &Path, owner: &str| {
+            fs::write(
+                path,
+                member(owner, "response", 50, 50)
+                    .iter()
+                    .map(|row| format!("{row}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        // Keep an ordinary census page owed, so catch-up uses retained refresh.
+        write_member(
+            &old_day.join("z.jsonl"),
+            "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb",
+        );
+        let previous = ScanIndex::default();
+        let (mut index, mut first) = scan(&root, previous.clone(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+        assert!(!first.census_complete);
+        assert_eq!(first.snapshots.len(), 1);
+
+        let day = root.join("sessions/2026/10/07");
+        let path = day.join("new.jsonl");
+        let owner = "cccccccc-1111-4111-8111-cccccccccccc";
+        fs::create_dir(&day).unwrap();
+        write_member(&path, owner);
+        first
+            .codex_joining_validator()
+            .unwrap()
+            .validate(&first.snapshots)
+            .unwrap();
+        first.validate_codex_checkpoint().unwrap();
+        first.finish_codex_capture_boundary(&mut index);
+        let accepted = first
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        index = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+        let state = root.join("index.json");
+        index.save(&state).unwrap();
+        index = ScanIndex::load(&state).unwrap();
+        assert!(!index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .codex_join_directory_census
+            .as_ref()
+            .unwrap()
+            .contains(&day));
+        refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None);
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .iter()
+            .any(|queued| queued.path == day));
+        assert!(!index.files.contains_key(&local_index_key(&path)));
+
+        let previous = index.clone();
+        let (mut index, mut later) = scan(&root, index, 8);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut later, &mut index);
+        assert!(later.census_complete);
+        later.validate_codex_checkpoint().unwrap();
+        assert_eq!(
+            later
+                .completed_parses()
+                .filter(|(key, _)| *key == local_index_key(&path))
+                .count(),
+            1
+        );
+        assert_eq!(
+            later
+                .snapshots
+                .iter()
+                .filter(|s| s.source_session_id == owner)
+                .count(),
+            1
+        );
+        let accepted = later
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        later.finish_codex_capture_boundary(&mut index);
+        index = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+        index.save(&state).unwrap();
+        let (_, quiet) = scan(&root, ScanIndex::load(&state).unwrap(), 8);
+        assert_eq!(
+            quiet.scanned_file_count, 0,
+            "no repeated body read after catch-up"
+        );
+        assert!(quiet.snapshots.is_empty());
+
+        let (mut cold_index, mut cold) = scan(&root, ScanIndex::default(), 8);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut cold, &mut cold_index);
+        later.snapshots.extend(first.snapshots.clone());
+        for items in [&mut cold.snapshots, &mut later.snapshots] {
+            items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+        }
+        let expected = scan_money(SnapshotSource::Codex, &cold_index, &cold);
+        let deferred = scan_money(SnapshotSource::Codex, &index, &later);
+        let prior = scan_money(SnapshotSource::Codex, &index, &first);
+        money_oracle::assert_equivalent(&expected, &deferred);
+        money_oracle::assert_no_smaller_reemit(owner, &prior, &deferred, &expected, false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn owner_scoped_new_file_naming_page_owner_fails_before_upload() {
         let (root, inventory) = fixture();
@@ -2494,11 +2617,60 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn owner_scoped_new_subdirectory_mid_page_fails() {
+    fn owner_scoped_empty_new_subdirectory_mid_page_saves() {
         let (root, inventory) = fixture();
         let validation = validator(inventory);
         fs::create_dir(root.join("sessions/new-day")).unwrap();
-        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
+        validation.validate_all().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_scoped_nested_new_directories_defer_unrelated_rollouts() {
+        let (root, inventory) = fixture();
+        let validation = validator(inventory);
+        let day = root.join("sessions/2027/01/01");
+        fs::create_dir_all(&day).unwrap();
+        write_owner(&day.join("unrelated.jsonl"), "unrelated");
+        validation.validate_all().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_scoped_new_directory_same_owner_subagent_fails_before_upload() {
+        let (root, inventory) = fixture();
+        let owner = inventory.headers[0].owner.clone();
+        let validation = validator(inventory);
+        let day = root.join("sessions/new-day");
+        fs::create_dir(&day).unwrap();
+        fs::write(
+            day.join("subagent.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "type":"session_meta", "payload":{"id":owner,
+                        "source":{"subagent":{"fork":{"parent_thread_id":owner}}}}
+                })
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::snapshot_sync::safe_error(
+                &validation.validate(&BTreeSet::from([owner])).unwrap_err()
+            ),
+            DIRECTORY_MEMBERSHIP_CHANGED
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_scoped_new_directory_unsettled_header_fails_closed() {
+        let (root, inventory) = fixture();
+        let validation = validator(inventory);
+        let day = root.join("sessions/new-day");
+        fs::create_dir(&day).unwrap();
+        fs::write(day.join("unsettled.jsonl"), b"{\"type\":\"session_meta\"").unwrap();
+        assert_eq!(validation_error(&validation), HEADER_REREAD_FAILED);
         fs::remove_dir_all(root).unwrap();
     }
 
