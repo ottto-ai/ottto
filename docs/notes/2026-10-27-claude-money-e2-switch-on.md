@@ -1,5 +1,7 @@
 # Claude money E2 switch-on validation
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 PR C enables the E2 fold and advances the Claude upload body-witness revision
 from 2 to 3, with maximum gated revision 3. The existing history-upgrade path
 paces the one owed reread; completed revision-3 files owe no repeat pass.

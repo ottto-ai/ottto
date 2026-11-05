@@ -23,9 +23,9 @@ use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::{
     snapshot_fingerprint, SnapshotActivityCount, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, MAX_SESSION_ARTIFACT_VALUE_CHARS,
+    MAX_SESSION_ARTIFACT_VALUE_CHARS,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,34 @@ const PROVIDER_AGENT_ROLES: [&str; 3] = ["default", "explorer", "worker"];
 /// `names_withheld_contract` from a server that accepts the withheld totals. Its
 /// request schemas refuse unknown fields, so nothing else may send them.
 const NAMES_WITHHELD_CONTRACT: &str = "v1";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotUploadPolicy {
+    pub session_titles_enabled: bool,
+    pub workspace_labels_enabled: bool,
+    pub session_artifacts_enabled: bool,
+    pub session_attribution_enabled: bool,
+    /// Backend capability derived from the existing session-title privacy
+    /// choice. It is not a separate user setting and defaults off for older
+    /// backends that do not advertise the additive private-label contract.
+    pub session_attribution_labels_enabled: bool,
+}
+
+impl Default for SnapshotUploadPolicy {
+    fn default() -> Self {
+        Self {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            // Opt-in: artifacts are stripped before upload unless the backend
+            // activity hint explicitly enables them for the org.
+            session_artifacts_enabled: false,
+            // Opt-in: compact facts stay local unless the backend explicitly
+            // enables the additive attribution contract.
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        }
+    }
+}
 
 impl SnapshotUploadPolicy {
     /// Nothing optional leaves the Mac: no fetched or remembered policy exists.

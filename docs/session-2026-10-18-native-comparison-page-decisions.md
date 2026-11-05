@@ -1,5 +1,7 @@
 # Native comparison page decisions
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 `native_comparison_decision` is one fixed, content-free point in the existing
 local resource log per comparison preparation lease. It is emitted when that
 lease finishes, is abandoned, or returns untouched for a cadence wait. When the

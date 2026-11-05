@@ -491,27 +491,6 @@ fn skip_delivers_no_lines_and_ends_once() {
     assert!(counts.get("lines").is_none() && counts.get("bytes").is_none());
 }
 
-/// A native comparison target is excluded at the one begin site; its
-/// role is final before the first dispatch.
-#[test]
-fn comparison_target_read_calls_no_observer() {
-    let root = Root::new("ld-comparison");
-    append(
-        &root.file(SESSION),
-        &[raw(&row("/w/one", "u1")), b"\n".to_vec()].concat(),
-    );
-    let recorder = Recorder::default();
-    let mut scan = step_until(
-        new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer("test", Box::new(recorder.clone())),
-        |scan| scan.active_file.is_some(),
-    );
-    scan.active_file.as_deref_mut().unwrap().comparison_target = true;
-    let (_, result, _) = finish(scan);
-    assert_eq!(result.scanned_file_count, 1, "the file was read");
-    assert_eq!(recorder.events(), Vec::new());
-}
-
 /// Codex group member reads replay through the group job and call
 /// no observer.
 #[test]
@@ -1476,6 +1455,63 @@ fn codex_roster_retains_aged_indexed_growth() {
         discovery_page("codex")["discovery_retained"],
         json!({"grown": 1})
     );
+}
+
+/// [regress] A moved Codex directory with more than the former 10,000 entries
+/// per tick is refreshed in full, and a later moved directory is refreshed in
+/// the same tick (it was blocked behind the large one).
+#[test]
+fn codex_roster_refreshes_large_directory_and_later_ones_in_one_tick() {
+    let root = Root::new("ld-roster-large");
+    let days = ["2026/10/01", "2026/10/02"].map(|day| root.projects().join(day));
+    for day in &days {
+        fs::create_dir_all(day).unwrap();
+        append(&day.join("rollout-first.jsonl"), b"{}\n");
+    }
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &[root.projects()],
+        &mut index,
+        NOW,
+        7,
+    );
+    while !index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty()
+    {
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+    }
+    let mut expected = candidates(&index);
+    // Match the existing roster fixture's directory-change granularity.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Cheap padding: empty non-rollout entries still counted toward the cap.
+    for n in 0..10_000 {
+        fs::File::create(days[0].join(format!("pad-{n}"))).unwrap();
+    }
+    for day in &days {
+        let path = day.join("rollout-new.jsonl");
+        fs::File::create(&path).unwrap();
+        expected.push(path);
+    }
+    expected.sort();
+    let moved = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .codex_join_directory_census
+            .as_ref()
+            .unwrap()
+            .moved_directories()
+    };
+    assert_eq!(moved(&index), days.to_vec());
+    refresh_retained_codex_roster(SnapshotSource::Codex, &mut index, 7, None);
+    assert_eq!(candidates(&index), expected);
+    assert!(moved(&index).is_empty(), "both directories refreshed");
 }
 
 /// [behaviour] Growth followed by more than W of downtime is still read exactly once.

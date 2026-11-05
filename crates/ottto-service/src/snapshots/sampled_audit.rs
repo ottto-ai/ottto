@@ -7,6 +7,7 @@ use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
 use crate::transcript_cache::CACHE_ENTRIES;
 
 // v1 did not distinguish an ordinary Tail from a published FE prefix.
+#[cfg(test)]
 pub(super) const UNVERIFIED_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v1";
 const UNVERIFIED_STEM: &str = "semantic_sync:v2+sampled_unverified:";
 const PROVENANCE_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v2";
@@ -937,32 +938,6 @@ impl AbsenceParent {
             let _ = (self, other);
             false
         }
-    }
-}
-/// The pinned parent of the first configured root it is proven under,
-/// only when the root has no symlink in any component (its real path is
-/// itself) and that parent is on the root's device. A redirected prefix or a
-/// mounted-over or replaced volume is unmount-like and stays loss.
-pub(super) fn absence_parent_on_root_device(
-    path: &Path,
-    roots: &[PathBuf],
-) -> Option<AbsenceParent> {
-    #[cfg(unix)]
-    {
-        roots.iter().find_map(|root| {
-            let configured: PathBuf = root.components().collect();
-            if fs::canonicalize(root).ok()? != configured {
-                return None;
-            }
-            let parent = absence_parent(path, std::slice::from_ref(root))?;
-            let device = fs::symlink_metadata(root).ok()?.dev();
-            (parent.directory.metadata().ok()?.dev() == device).then_some(parent)
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, roots);
-        None
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for AbsenceParent {

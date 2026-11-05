@@ -559,6 +559,7 @@ mod ops_tests {
                     "hydrate_route_entry",
                     "hydrate_after_ack",
                     "hydrate_after_catalogue",
+                    "hydrate_after_files",
                     "hydrate_after_accounts",
                     "hydrate_after_decode",
                     "hydrate_after_baseline",

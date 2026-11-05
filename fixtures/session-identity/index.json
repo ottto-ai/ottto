@@ -1,5 +1,5 @@
 {
-  "fixture_revision": "session_identity_w0:r6",
+  "fixture_revision": "session_identity_w0:r7",
   "canonicalization": "session_identity_leaf:v3",
   "new_collector": "claude_code_jsonl:own_request_identity_rows:v1",
   "bases": [
@@ -15,9 +15,9 @@
     "basis"
   ],
   "bounds": {
-    "evidence_entries": 16,
-    "authority_keys": 16,
-    "parts_per_row": 17,
+    "evidence_entries": 32,
+    "authority_keys": 32,
+    "parts_per_row": 33,
     "total_parts": 26214,
     "total_parts_byte_cap_ceiling": 43464,
     "money_max_usd": "1000000000",
@@ -104,13 +104,28 @@
     "C": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
     "G0": "1d9539e8fa321c15c42eca2fa17e2090d0879ca4299cbe39b926bc9a14e8862a",
     "G1": "a1b07218e8ade47e1ae6a922dd15a1c365f603ac85611e6644fa0154ee5df8a6",
+    "G10": "1f05649b86ad17a98cddae79fa7637df804823428fe1081f0f227edaa0383044",
+    "G11": "e337d58e3c24b87d9da0f830efa0644ec107562b08f88f2429eca647b7781bfb",
+    "G12": "c860b8e9adcd4cf87f0b4f8ad6276273fc5f1c1f69b06470e56c56b27a4eb765",
+    "G13": "5309a9639d86fe449a4296d740191f73dff59a38e02b69afd90e5c7c83e95e4b",
+    "G14": "9a0251625ec6e2d8d322a1d21d2d89c2bee6859d192b8f3a5bf729de0d5f3b3e",
+    "G15": "b1fa53951b0c9f972e8fc496181ada79076a4c68b906c368b8720f55127304d3",
+    "G16": "a83588e9c607733cadf84cef760a1b29771dcb7a0f9511f65453ab25669115d0",
+    "G17": "3f245e8fea3e93ef575c29ed93b2f2ac801af123ad7b62e8a29a37e9db3c472f",
+    "G18": "ea76ad59fe848015707e0e100f16e8bf835811885593fe0f2596cf5251b4e8bb",
+    "G19": "9b8081753d85524c0eb74f7450a16112e0bb3a473f854d240eb55018ac8ec4c8",
     "G2": "a1ac7e97250bfe2a622826f5e6c06a51243dab89c33d70a20261886304d438d6",
+    "G20": "55cbc8a20bdfb3595e33707a04e163190d9cdba729d21a9f747d7e419f011c57",
+    "G21": "90f6c1a15e516d4ce796372b7617df0f6f2c56ad17906995c5fff708e1e88cf8",
+    "G22": "64aaf8f5696ff1252c84b50c0e05f8c9f6c04f58c33d5e6c47c7e7fba5aed08e",
+    "G23": "080b27ce394e5d38ecd424e4a1fccbb8e48d056848adb8742e5743d88f93db8c",
     "G3": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235",
     "G4": "7a421713a99881f3a3568b9a4ceae5aa0eb949c26eb66650cb53db682806adcf",
     "G5": "6fff9b450fd4031eb3ef0766dd261027bf159e6cd1573860e51aa86327ddeeb4",
     "G6": "125fe6b540aa68e4a262554dbcd29ac2271b2fcac1e9f45014a5054817a0ed59",
     "G7": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee",
     "G8": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36",
+    "G9": "ff69af88f62b2d07afb2c6025f543380939c8089c6144d5a3b4abc935143c1cf",
     "L00": "8e1aa8445c55c713d4ed3a16f717157991794ec19245c46060653c8bce819bfe",
     "L01": "27ed1fec943ee48bdfc5de8671bb06eb9623510f03465d587b0f361ab9c368eb",
     "L02": "68f756edf44759c20da990567fbf4a0bd53549a65b7a8586443543da7d95db92",
@@ -128,11 +143,27 @@
     "L14": "adccb888e1503fe5a62aed16f491040f23d2fe7cf20250a76ef6206b81dea19e",
     "L15": "3f676ffaa1d5e6b35e2d9b00c12ad8a2cac039cd9cccd0ee662d91a075fc11b0",
     "L16": "ba99ee70cabda556de16f4c959b2935638e1c4f15291703abcc571888e8759cc",
+    "L17": "f8a9ad23b61d190f9534530637027a7e810774cd1716b86979d26bce85ce1673",
+    "L18": "ee6f8acf9003a36a2db204be32d4e07c1fd32014a5c9bf73ddeed4e39ba2f7d3",
+    "L19": "ea2f93b6f73df1d6b9113be0b10362c07965be8c5a1f202485564d87cfb7d2c2",
+    "L20": "abca44a28eacd6324d4e91b04cac1945b688ab331b5159ee7b2ac1f8900164c4",
+    "L21": "123a3335d04253c7c342a39d00f168aeb7fb7774fcc143b1231b71d2ee0aa046",
+    "L22": "60879faef2f1b4236c884738f868cf6483174b5263db8a64455272945401f779",
+    "L23": "94ff1fa10eacec9fbe71b81828d284dc570e7d55a0cca0a6a98f2ec4fa4cd06a",
+    "L24": "c82ec8c44f23813a0566b1032f26975b3bb8afc9cdd95fd33fb3c797f11f6c89",
+    "L25": "503c89fc39ca87aeab7cbdd0236a898ee6d01365e09267d4742f3a7aa8481a53",
+    "L26": "9b782a912cd7b7ed0a0bcc1ef13e24ef7b052aaf39c638f10471aac64dcba77a",
+    "L27": "32077fe734fde8d3848f836940e74bb5c4f4aea7e5021cb3a31701fd66a3ff92",
+    "L28": "083af134515b489f1bd7fbaaab0aa6dd5f2277114e38cf4c36ed115ae1bb2189",
+    "L29": "f1a91446c22a4f7a010e6ece275034d5b20677be62a469d328b9887435a0590a",
+    "L30": "b95cd9ea46afba3ef18b82613da5dd35a5ee1f35b53fecea156704195830f904",
+    "L31": "cc21a942882aeec90c280085d9bd79ef810950c7943dda25288f631f0d5e879c",
+    "L32": "839f8d1b9a98c8f41afdc0bcadb000176404ce5e3d80a7c2369151b4a8a7ceba",
     "O": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
     "P": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
   },
   "default_server_state": "Every (login, org) named in a body maps to exactly one logical subscription S_<login><org> on this macOS home (S_AO, S_BP, S_BO, S_L00O, S_AG0, ...); a login-only identity maps to that login's one subscription (B -> S_BP); first_seen_at is before the usage (cutoff 'after'); the Desktop pair, when complete, is B/P -> S_BP; SOURCE is ready. Cases override this explicitly.",
-  "fixture_digest": "2a9b46f12fcd0b23f063b3b845f4d1d64d235f5711877cd315575b92c7efd8e6",
+  "fixture_digest": "aaa41ee135ba12978097c56b72861e9d7feabd735c8a5d37bf952ffa3ba3444f",
   "bodies": {
     "old-d1-single-login": {
       "file": "old-d1-single-login.json",
@@ -9587,9 +9618,9 @@
         }
       ]
     },
-    "new-cap-identities-16": {
-      "file": "new-cap-identities-16.json",
-      "file_sha256": "5d8bee59ee0109ea0080aeec8f9aa7987501d09a83287597254cead3d74279c4",
+    "new-cap-identities-32": {
+      "file": "new-cap-identities-32.json",
+      "file_sha256": "eb841bd094142466620140951f6c7e9191b019567d5dd6f39e971d799d9e1b57",
       "kind": "new",
       "summary": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
@@ -9609,10 +9640,20 @@
             "model": "claude-haiku-4-5",
             "login": null,
             "evidence_ref": null,
-            "cost_usd": "16.00",
+            "cost_usd": "32.00",
             "identity_parts": [
               {
+                "login": "L28",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
                 "login": "L09",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L21",
                 "evidence_ref": 0,
                 "cost_usd": "1.00"
               },
@@ -9623,6 +9664,11 @@
               },
               {
                 "login": "L05",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L27",
                 "evidence_ref": 0,
                 "cost_usd": "1.00"
               },
@@ -9652,6 +9698,16 @@
                 "cost_usd": "1.00"
               },
               {
+                "login": "L25",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L22",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
                 "login": "L02",
                 "evidence_ref": 0,
                 "cost_usd": "1.00"
@@ -9677,6 +9733,21 @@
                 "cost_usd": "1.00"
               },
               {
+                "login": "L23",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L26",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L20",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
                 "login": "L14",
                 "evidence_ref": 0,
                 "cost_usd": "1.00"
@@ -9687,7 +9758,47 @@
                 "cost_usd": "1.00"
               },
               {
+                "login": "L30",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L16",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
                 "login": "L13",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L24",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L31",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L19",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L18",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L29",
+                "evidence_ref": 0,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "L17",
                 "evidence_ref": 0,
                 "cost_usd": "1.00"
               }
@@ -9703,10 +9814,10 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "7c256960e95aa64afce7fdf0ab1ac9017a9445b597f7b35e4a744b287e170e7f",
-        "usage_accounting": "1d911a1c9cd98883ff58a8c151dd3cb6c6ef3530f5fac74412d08e6b5b137742"
+        "usage_accounting": "5980ddbfe0d0bcbbb9ddff079013c8c8573d0099d1e1f4c545929cf72d379f44"
       },
-      "content_hash": "daffff3a326c0f24070c2240757cb0c2814e9213a2b64895c82f86b9a944a4a9",
-      "snapshot_fingerprint": "d72ee2c8fe19128629605918dea7f457562596697292bfe94fc76be253dfe8d2",
+      "content_hash": "e814ca40f1af8eb72eb04cd2a6d672d1d04f3d8fb514cc90bce2d5c481cdaf3c",
+      "snapshot_fingerprint": "e3c68da1020234daf44bb8878a00b1676d041981fffb6e37a98c1de35f521636",
       "identity_leaf": {
         "model_usage": [
           {
@@ -9714,7 +9825,39 @@
               {
                 "identity": {
                   "basis": "telemetry",
+                  "login": "083af134515b489f1bd7fbaaab0aa6dd5f2277114e38cf4c36ed115ae1bb2189",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
                   "login": "0bff801ec86208bb94d5eb11af5ff7d0dd725c46fbcd787109f7fbca5c3e9c11",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "123a3335d04253c7c342a39d00f168aeb7fb7774fcc143b1231b71d2ee0aa046",
                   "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                 },
                 "input_tokens": 100,
@@ -9747,6 +9890,22 @@
                 "identity": {
                   "basis": "telemetry",
                   "login": "2f6181f0432723a911e928cb278ef1ad820bd4889363a121cd996bc03f8887a6",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "32077fe734fde8d3848f836940e74bb5c4f4aea7e5021cb3a31701fd66a3ff92",
                   "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                 },
                 "input_tokens": 100,
@@ -9842,6 +10001,38 @@
               {
                 "identity": {
                   "basis": "telemetry",
+                  "login": "503c89fc39ca87aeab7cbdd0236a898ee6d01365e09267d4742f3a7aa8481a53",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "60879faef2f1b4236c884738f868cf6483174b5263db8a64455272945401f779",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
                   "login": "68f756edf44759c20da990567fbf4a0bd53549a65b7a8586443543da7d95db92",
                   "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                 },
@@ -9922,6 +10113,54 @@
               {
                 "identity": {
                   "basis": "telemetry",
+                  "login": "94ff1fa10eacec9fbe71b81828d284dc570e7d55a0cca0a6a98f2ec4fa4cd06a",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "9b782a912cd7b7ed0a0bcc1ef13e24ef7b052aaf39c638f10471aac64dcba77a",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "abca44a28eacd6324d4e91b04cac1945b688ab331b5159ee7b2ac1f8900164c4",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
                   "login": "adccb888e1503fe5a62aed16f491040f23d2fe7cf20250a76ef6206b81dea19e",
                   "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                 },
@@ -9954,7 +10193,135 @@
               {
                 "identity": {
                   "basis": "telemetry",
+                  "login": "b95cd9ea46afba3ef18b82613da5dd35a5ee1f35b53fecea156704195830f904",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "ba99ee70cabda556de16f4c959b2935638e1c4f15291703abcc571888e8759cc",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
                   "login": "c3185123550500f641b31c5f7a1cb21d168ea5ae6ac92c0e8929651f35c3dc33",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "c82ec8c44f23813a0566b1032f26975b3bb8afc9cdd95fd33fb3c797f11f6c89",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "cc21a942882aeec90c280085d9bd79ef810950c7943dda25288f631f0d5e879c",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "ea2f93b6f73df1d6b9113be0b10362c07965be8c5a1f202485564d87cfb7d2c2",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "ee6f8acf9003a36a2db204be32d4e07c1fd32014a5c9bf73ddeed4e39ba2f7d3",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "f1a91446c22a4f7a010e6ece275034d5b20677be62a469d328b9887435a0590a",
+                  "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry",
+                  "login": "f8a9ad23b61d190f9534530637027a7e810774cd1716b86979d26bce85ce1673",
                   "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                 },
                 "input_tokens": 100,
@@ -9978,7 +10345,39 @@
                 {
                   "identity": {
                     "basis": "telemetry",
+                    "login": "083af134515b489f1bd7fbaaab0aa6dd5f2277114e38cf4c36ed115ae1bb2189",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
                     "login": "0bff801ec86208bb94d5eb11af5ff7d0dd725c46fbcd787109f7fbca5c3e9c11",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "123a3335d04253c7c342a39d00f168aeb7fb7774fcc143b1231b71d2ee0aa046",
                     "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                   },
                   "input_tokens": 100,
@@ -10011,6 +10410,22 @@
                   "identity": {
                     "basis": "telemetry",
                     "login": "2f6181f0432723a911e928cb278ef1ad820bd4889363a121cd996bc03f8887a6",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "32077fe734fde8d3848f836940e74bb5c4f4aea7e5021cb3a31701fd66a3ff92",
                     "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                   },
                   "input_tokens": 100,
@@ -10106,6 +10521,38 @@
                 {
                   "identity": {
                     "basis": "telemetry",
+                    "login": "503c89fc39ca87aeab7cbdd0236a898ee6d01365e09267d4742f3a7aa8481a53",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "60879faef2f1b4236c884738f868cf6483174b5263db8a64455272945401f779",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
                     "login": "68f756edf44759c20da990567fbf4a0bd53549a65b7a8586443543da7d95db92",
                     "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                   },
@@ -10186,6 +10633,54 @@
                 {
                   "identity": {
                     "basis": "telemetry",
+                    "login": "94ff1fa10eacec9fbe71b81828d284dc570e7d55a0cca0a6a98f2ec4fa4cd06a",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "9b782a912cd7b7ed0a0bcc1ef13e24ef7b052aaf39c638f10471aac64dcba77a",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "abca44a28eacd6324d4e91b04cac1945b688ab331b5159ee7b2ac1f8900164c4",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
                     "login": "adccb888e1503fe5a62aed16f491040f23d2fe7cf20250a76ef6206b81dea19e",
                     "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                   },
@@ -10218,7 +10713,135 @@
                 {
                   "identity": {
                     "basis": "telemetry",
+                    "login": "b95cd9ea46afba3ef18b82613da5dd35a5ee1f35b53fecea156704195830f904",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "ba99ee70cabda556de16f4c959b2935638e1c4f15291703abcc571888e8759cc",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
                     "login": "c3185123550500f641b31c5f7a1cb21d168ea5ae6ac92c0e8929651f35c3dc33",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "c82ec8c44f23813a0566b1032f26975b3bb8afc9cdd95fd33fb3c797f11f6c89",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "cc21a942882aeec90c280085d9bd79ef810950c7943dda25288f631f0d5e879c",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "ea2f93b6f73df1d6b9113be0b10362c07965be8c5a1f202485564d87cfb7d2c2",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "ee6f8acf9003a36a2db204be32d4e07c1fd32014a5c9bf73ddeed4e39ba2f7d3",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "f1a91446c22a4f7a010e6ece275034d5b20677be62a469d328b9887435a0590a",
+                    "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry",
+                    "login": "f8a9ad23b61d190f9534530637027a7e810774cd1716b86979d26bce85ce1673",
                     "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
                   },
                   "input_tokens": 100,
@@ -10236,17 +10859,35 @@
           ]
         ]
       },
-      "identity_leaf_sha256": "7a539f4740dcae3280de5c84f9a7463873cffd915a3a5dc30dd44c4ad556b610",
-      "item_bytes": 14624,
+      "identity_leaf_sha256": "ed055541a09afea8923ce3bbe84d926082c586eeb8df2603fd9e1a1783ee2d39",
+      "item_bytes": 24992,
       "expected": {
         "binding": "list",
         "rows": [
+          {
+            "login": "L28",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L28O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
           {
             "login": "L09",
             "org": "O",
             "basis": "telemetry",
             "outcome": "bound",
             "subscription": "S_L09O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L21",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L21O",
             "provenance": "request_identity:telemetry",
             "money": "1.00"
           },
@@ -10265,6 +10906,15 @@
             "basis": "telemetry",
             "outcome": "bound",
             "subscription": "S_L05O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L27",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L27O",
             "provenance": "request_identity:telemetry",
             "money": "1.00"
           },
@@ -10314,6 +10964,24 @@
             "money": "1.00"
           },
           {
+            "login": "L25",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L25O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L22",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L22O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
             "login": "L02",
             "org": "O",
             "basis": "telemetry",
@@ -10359,6 +11027,33 @@
             "money": "1.00"
           },
           {
+            "login": "L23",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L23O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L26",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L26O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L20",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L20O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
             "login": "L14",
             "org": "O",
             "basis": "telemetry",
@@ -10377,11 +11072,83 @@
             "money": "1.00"
           },
           {
+            "login": "L30",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L30O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L16",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L16O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
             "login": "L13",
             "org": "O",
             "basis": "telemetry",
             "outcome": "bound",
             "subscription": "S_L13O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L24",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L24O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L31",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L31O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L19",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L19O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L18",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L18O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L29",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L29O",
+            "provenance": "request_identity:telemetry",
+            "money": "1.00"
+          },
+          {
+            "login": "L17",
+            "org": "O",
+            "basis": "telemetry",
+            "outcome": "bound",
+            "subscription": "S_L17O",
             "provenance": "request_identity:telemetry",
             "money": "1.00"
           }
@@ -10403,7 +11170,7 @@
               "cache_creation_cost_usd": "0.000000"
             },
             "catalog_total": null,
-            "selected_total": "16.000000",
+            "selected_total": "32.000000",
             "selected_source": "app_reported",
             "has_known_money": true
           },
@@ -10411,7 +11178,47 @@
             {
               "identity": {
                 "basis": "telemetry",
+                "login": "083af134515b489f1bd7fbaaab0aa6dd5f2277114e38cf4c36ed115ae1bb2189",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
                 "login": "0bff801ec86208bb94d5eb11af5ff7d0dd725c46fbcd787109f7fbca5c3e9c11",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "123a3335d04253c7c342a39d00f168aeb7fb7774fcc143b1231b71d2ee0aa046",
                 "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
               },
               "context_bucket": "short",
@@ -10452,6 +11259,26 @@
               "identity": {
                 "basis": "telemetry",
                 "login": "2f6181f0432723a911e928cb278ef1ad820bd4889363a121cd996bc03f8887a6",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "32077fe734fde8d3848f836940e74bb5c4f4aea7e5021cb3a31701fd66a3ff92",
                 "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
               },
               "context_bucket": "short",
@@ -10571,6 +11398,46 @@
             {
               "identity": {
                 "basis": "telemetry",
+                "login": "503c89fc39ca87aeab7cbdd0236a898ee6d01365e09267d4742f3a7aa8481a53",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "60879faef2f1b4236c884738f868cf6483174b5263db8a64455272945401f779",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
                 "login": "68f756edf44759c20da990567fbf4a0bd53549a65b7a8586443543da7d95db92",
                 "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
               },
@@ -10671,6 +11538,66 @@
             {
               "identity": {
                 "basis": "telemetry",
+                "login": "94ff1fa10eacec9fbe71b81828d284dc570e7d55a0cca0a6a98f2ec4fa4cd06a",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "9b782a912cd7b7ed0a0bcc1ef13e24ef7b052aaf39c638f10471aac64dcba77a",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "abca44a28eacd6324d4e91b04cac1945b688ab331b5159ee7b2ac1f8900164c4",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
                 "login": "adccb888e1503fe5a62aed16f491040f23d2fe7cf20250a76ef6206b81dea19e",
                 "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
               },
@@ -10711,7 +11638,167 @@
             {
               "identity": {
                 "basis": "telemetry",
+                "login": "b95cd9ea46afba3ef18b82613da5dd35a5ee1f35b53fecea156704195830f904",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "ba99ee70cabda556de16f4c959b2935638e1c4f15291703abcc571888e8759cc",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
                 "login": "c3185123550500f641b31c5f7a1cb21d168ea5ae6ac92c0e8929651f35c3dc33",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "c82ec8c44f23813a0566b1032f26975b3bb8afc9cdd95fd33fb3c797f11f6c89",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "cc21a942882aeec90c280085d9bd79ef810950c7943dda25288f631f0d5e879c",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "ea2f93b6f73df1d6b9113be0b10362c07965be8c5a1f202485564d87cfb7d2c2",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "ee6f8acf9003a36a2db204be32d4e07c1fd32014a5c9bf73ddeed4e39ba2f7d3",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "f1a91446c22a4f7a010e6ece275034d5b20677be62a469d328b9887435a0590a",
+                "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry",
+                "login": "f8a9ad23b61d190f9534530637027a7e810774cd1716b86979d26bce85ce1673",
                 "org": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
               },
               "context_bucket": "short",
@@ -10729,13 +11816,13 @@
               "has_known_money": true
             }
           ],
-          "allocated_selected_total": "16.000000"
+          "allocated_selected_total": "32.000000"
         }
       ]
     },
-    "new-cap-identities-17-fallback": {
-      "file": "new-cap-identities-17-fallback.json",
-      "file_sha256": "716a9ed089c6331733b8947cf59240cd13638f784c7799bacd6d195cbea4ca3d",
+    "new-cap-identities-33-fallback": {
+      "file": "new-cap-identities-33-fallback.json",
+      "file_sha256": "11ab24b0bdb1af1abcb1ddb5d13fa68c5f0dea215f1a005c073db6df3734e49e",
       "kind": "new",
       "summary": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
@@ -10750,7 +11837,7 @@
             "model": "claude-haiku-4-5",
             "login": null,
             "evidence_ref": null,
-            "cost_usd": "17.00"
+            "cost_usd": "33.00"
           }
         ]
       },
@@ -10762,10 +11849,10 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "7c256960e95aa64afce7fdf0ab1ac9017a9445b597f7b35e4a744b287e170e7f",
-        "usage_accounting": "2bcd34d0c03a638808aafedf19b75cfeda32dbedc18a6d7662323ea8ea6d9663"
+        "usage_accounting": "b16e3a92e869cb0f9d60f6d9a16bb484eaf1f66361cf6ba258ec68464fbe0057"
       },
-      "content_hash": "cde35329c8fdcb4f4c5ee70932aeffed6f16ea97b4496f6c13de7f958444427e",
-      "snapshot_fingerprint": "8bdd4f1fd771a0b21a0f0746fa05a07314395e5d3771c1ac5197f0ad7444be5f",
+      "content_hash": "e7469cafe43079ea9f01936a7236c39ca719e4ae4f091f9f99ce2f3a75a82539",
+      "snapshot_fingerprint": "41e8483e37b2a1f8fd24c8641bb5f0a54af732b4df5838bb8c3403615f6ec73f",
       "identity_leaf": {
         "model_usage": [
           null
@@ -10788,7 +11875,7 @@
             "basis": null,
             "outcome": "unknown",
             "reason": "request_identity_refused",
-            "money": "17.00"
+            "money": "33.00"
           }
         ]
       },
@@ -10798,19 +11885,19 @@
         ],
         "shape": {
           "evidence_entries": 1,
-          "authority_keys": 17,
-          "max_parts_per_row": 17,
-          "total_parts": 34,
+          "authority_keys": 33,
+          "max_parts_per_row": 33,
+          "total_parts": 66,
           "max_bucket_rows": 1,
           "top_level_rows": 1,
-          "item_bytes": 14021
+          "item_bytes": 24389
         },
-        "canonical_sha256": "1e2d280a4332d4d532a4295a94eb0bb31ed3dfaf4a8f0074f6e553daf7142035"
+        "canonical_sha256": "4bcdbcef42d0c0179c27f668b5cc7a8c0ce464b52369335340d29d4ef6420f90"
       }
     },
-    "new-cap-parts-18-fallback": {
-      "file": "new-cap-parts-18-fallback.json",
-      "file_sha256": "e93c856139a02994e80e5c95f447ce0540c5d956be4b4bb7dff62db6fc1ebe6b",
+    "new-cap-parts-34-fallback": {
+      "file": "new-cap-parts-34-fallback.json",
+      "file_sha256": "a77d13009d6e2154685aa91b3a6fcf02c6600471066e1eacb58dc9faec0ede00",
       "kind": "new",
       "summary": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
@@ -10825,7 +11912,7 @@
             "model": "claude-haiku-4-5",
             "login": null,
             "evidence_ref": null,
-            "cost_usd": "18.00"
+            "cost_usd": "34.00"
           }
         ]
       },
@@ -10837,10 +11924,10 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "7c256960e95aa64afce7fdf0ab1ac9017a9445b597f7b35e4a744b287e170e7f",
-        "usage_accounting": "ad62cdbfc194691d256d8b139ded9728b2e58baea7766db99108e86270ee53b4"
+        "usage_accounting": "14bacdc64a9d107c8a9330733527502d71198e75742caefb2b1642d7c94de8e2"
       },
-      "content_hash": "043680bc5292154a780eb9b0b2db71d6010e8f22ec71a42cc52c2746021c29cb",
-      "snapshot_fingerprint": "26be59a28c188310e875aecdc29186a86a9f0a576ac88f7b152e11a29c8e9e78",
+      "content_hash": "e608eab7f8ae190f3c214de29bbc6e1dda361582b9495b94888457bbfece0a4a",
+      "snapshot_fingerprint": "eca489a354df262f75247760df304768874650bc210841312a8bb040415711d1",
       "identity_leaf": {
         "model_usage": [
           null
@@ -10863,7 +11950,7 @@
             "basis": null,
             "outcome": "unknown",
             "reason": "request_identity_refused",
-            "money": "18.00"
+            "money": "34.00"
           }
         ]
       },
@@ -10874,19 +11961,19 @@
         ],
         "shape": {
           "evidence_entries": 1,
-          "authority_keys": 17,
-          "max_parts_per_row": 18,
-          "total_parts": 36,
+          "authority_keys": 33,
+          "max_parts_per_row": 34,
+          "total_parts": 68,
           "max_bucket_rows": 1,
           "top_level_rows": 1,
-          "item_bytes": 14444
+          "item_bytes": 24812
         },
-        "canonical_sha256": "25f5fa4c32c97fce29316e2c6221cab58bf3d3e5b9bb7df2108f06db48169a75"
+        "canonical_sha256": "dce242c60ee3bf9831f09a3136211602068344371f392d2f95227386ddfb3ad7"
       }
     },
-    "new-cap-evidence-16": {
-      "file": "new-cap-evidence-16.json",
-      "file_sha256": "bba76575e6f1f690abe7fcc10e75bee31cca1922238956878e4e5d73b76742bb",
+    "new-cap-evidence-32": {
+      "file": "new-cap-evidence-32.json",
+      "file_sha256": "5e68493965d9a8eac78dabd4f69c2e8134f26229650c329aabd1e84ed40f7952",
       "kind": "new",
       "summary": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
@@ -10911,11 +11998,31 @@
             "identity_basis": "telemetry_login"
           },
           {
+            "provider_workspace_hash": "G10",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G17",
+            "identity_basis": "telemetry_login"
+          },
+          {
             "provider_workspace_hash": "G3",
             "identity_basis": "telemetry"
           },
           {
             "provider_workspace_hash": "G3",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G13",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G20",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G22",
             "identity_basis": "telemetry_login"
           },
           {
@@ -10935,6 +12042,18 @@
             "identity_basis": "telemetry_login"
           },
           {
+            "provider_workspace_hash": "G21",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G14",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G19",
+            "identity_basis": "telemetry_login"
+          },
+          {
             "provider_workspace_hash": "G2",
             "identity_basis": "telemetry"
           },
@@ -10948,6 +12067,14 @@
           },
           {
             "provider_workspace_hash": "G1",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G16",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G15",
             "identity_basis": "telemetry_login"
           },
           {
@@ -10955,8 +12082,32 @@
             "identity_basis": "telemetry"
           },
           {
+            "provider_workspace_hash": "G8",
+            "identity_basis": "telemetry_login"
+          },
+          {
             "provider_workspace_hash": "G7",
             "identity_basis": "telemetry"
+          },
+          {
+            "provider_workspace_hash": "G7",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G12",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G11",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G18",
+            "identity_basis": "telemetry_login"
+          },
+          {
+            "provider_workspace_hash": "G9",
+            "identity_basis": "telemetry_login"
           }
         ],
         "request_identity_refusals": 0,
@@ -10980,17 +12131,81 @@
               },
               {
                 "login": "A",
-                "evidence_ref": 4,
-                "cost_usd": "1.00"
-              },
-              {
-                "login": "A",
                 "evidence_ref": 6,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
+                "evidence_ref": 11,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 13,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 18,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 20,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 24,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 26,
+                "cost_usd": "1.00"
+              }
+            ]
+          },
+          {
+            "hour": 1,
+            "model": "claude-haiku-4-5",
+            "login": null,
+            "evidence_ref": null,
+            "cost_usd": "23.00",
+            "identity_parts": [
+              {
+                "login": "A",
+                "evidence_ref": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 3,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 4,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 5,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 7,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
                 "evidence_ref": 8,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 9,
                 "cost_usd": "1.00"
               },
               {
@@ -11012,49 +12227,65 @@
                 "login": "A",
                 "evidence_ref": 15,
                 "cost_usd": "1.00"
-              }
-            ]
-          },
-          {
-            "hour": 1,
-            "model": "claude-haiku-4-5",
-            "login": null,
-            "evidence_ref": null,
-            "cost_usd": "7.00",
-            "identity_parts": [
+              },
               {
                 "login": "A",
-                "evidence_ref": 1,
+                "evidence_ref": 16,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 3,
+                "evidence_ref": 17,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 5,
+                "evidence_ref": 19,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 7,
+                "evidence_ref": 21,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 9,
+                "evidence_ref": 22,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 11,
+                "evidence_ref": 23,
                 "cost_usd": "1.00"
               },
               {
                 "login": "A",
-                "evidence_ref": 13,
+                "evidence_ref": 25,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 27,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 28,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 29,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 30,
+                "cost_usd": "1.00"
+              },
+              {
+                "login": "A",
+                "evidence_ref": 31,
                 "cost_usd": "1.00"
               }
             ]
@@ -11069,10 +12300,10 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "71edcf57ad4baaa88d06fd0a7cc972c518c54c950ad452be26a18ac77c160f3d",
-        "usage_accounting": "b60ec1e4b7d2d23bad1050cbb857328da82a8ec1f8e0ac757e1c4babbefcd37f"
+        "usage_accounting": "310ef37178de25c8ea9e371e5523f5477eb30b913e23dc596f669918ea306de5"
       },
-      "content_hash": "80d1a6ddb74f603b9341ff04c8e8853f2287055fe48ac9d535a614c6a37444c8",
-      "snapshot_fingerprint": "ac81bf76429b0b80deb95879a90ebb0fcd285926ffb04f74fc93a4eb1831a1ce",
+      "content_hash": "b328266b7e38764367105005d64e76946e9f53386066cf62c8b023efa54cac9f",
+      "snapshot_fingerprint": "47b944c84cdc88cb9cdcdd634e204b8e3d7b06cfb877f91312ad411480a036d5",
       "identity_leaf": {
         "model_usage": [
           {
@@ -11143,6 +12374,38 @@
               },
               {
                 "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "1f05649b86ad17a98cddae79fa7637df804823428fe1081f0f227edaa0383044"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "3f245e8fea3e93ef575c29ed93b2f2ac801af123ad7b62e8a29a37e9db3c472f"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
                   "basis": "telemetry",
                   "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "org": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
@@ -11162,6 +12425,54 @@
                   "basis": "telemetry_login",
                   "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "org": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "5309a9639d86fe449a4296d740191f73dff59a38e02b69afd90e5c7c83e95e4b"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "55cbc8a20bdfb3595e33707a04e163190d9cdba729d21a9f747d7e419f011c57"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "64aaf8f5696ff1252c84b50c0e05f8c9f6c04f58c33d5e6c47c7e7fba5aed08e"
                 },
                 "input_tokens": 100,
                 "output_tokens": 10,
@@ -11239,6 +12550,54 @@
               },
               {
                 "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "90f6c1a15e516d4ce796372b7617df0f6f2c56ad17906995c5fff708e1e88cf8"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "9a0251625ec6e2d8d322a1d21d2d89c2bee6859d192b8f3a5bf729de0d5f3b3e"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "9b8081753d85524c0eb74f7450a16112e0bb3a473f854d240eb55018ac8ec4c8"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
                   "basis": "telemetry",
                   "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "org": "a1ac7e97250bfe2a622826f5e6c06a51243dab89c33d70a20261886304d438d6"
@@ -11290,6 +12649,38 @@
                   "basis": "telemetry_login",
                   "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "org": "a1b07218e8ade47e1ae6a922dd15a1c365f603ac85611e6644fa0154ee5df8a6"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "a83588e9c607733cadf84cef760a1b29771dcb7a0f9511f65453ab25669115d0"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "b1fa53951b0c9f972e8fc496181ada79076a4c68b906c368b8720f55127304d3"
                 },
                 "input_tokens": 100,
                 "output_tokens": 10,
@@ -11319,9 +12710,105 @@
               },
               {
                 "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
                   "basis": "telemetry",
                   "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "org": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "c860b8e9adcd4cf87f0b4f8ad6276273fc5f1c1f69b06470e56c56b27a4eb765"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "e337d58e3c24b87d9da0f830efa0644ec107562b08f88f2429eca647b7781bfb"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "ea76ad59fe848015707e0e100f16e8bf835811885593fe0f2596cf5251b4e8bb"
+                },
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0,
+                "cache_creation_1h_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "unattributed_total_tokens": 0,
+                "request_count": 1,
+                "cost_usd": "1.00"
+              },
+              {
+                "identity": {
+                  "basis": "telemetry_login",
+                  "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "org": "ff69af88f62b2d07afb2c6025f543380939c8089c6144d5a3b4abc935143c1cf"
                 },
                 "input_tokens": 100,
                 "output_tokens": 10,
@@ -11527,7 +13014,87 @@
                   "identity": {
                     "basis": "telemetry_login",
                     "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "1f05649b86ad17a98cddae79fa7637df804823428fe1081f0f227edaa0383044"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "3f245e8fea3e93ef575c29ed93b2f2ac801af123ad7b62e8a29a37e9db3c472f"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                     "org": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "5309a9639d86fe449a4296d740191f73dff59a38e02b69afd90e5c7c83e95e4b"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "55cbc8a20bdfb3595e33707a04e163190d9cdba729d21a9f747d7e419f011c57"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "64aaf8f5696ff1252c84b50c0e05f8c9f6c04f58c33d5e6c47c7e7fba5aed08e"
                   },
                   "input_tokens": 100,
                   "output_tokens": 10,
@@ -11575,6 +13142,54 @@
                   "identity": {
                     "basis": "telemetry_login",
                     "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "90f6c1a15e516d4ce796372b7617df0f6f2c56ad17906995c5fff708e1e88cf8"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "9a0251625ec6e2d8d322a1d21d2d89c2bee6859d192b8f3a5bf729de0d5f3b3e"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "9b8081753d85524c0eb74f7450a16112e0bb3a473f854d240eb55018ac8ec4c8"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                     "org": "a1ac7e97250bfe2a622826f5e6c06a51243dab89c33d70a20261886304d438d6"
                   },
                   "input_tokens": 100,
@@ -11602,14 +13217,142 @@
                   "unattributed_total_tokens": 0,
                   "request_count": 1,
                   "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "a83588e9c607733cadf84cef760a1b29771dcb7a0f9511f65453ab25669115d0"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "b1fa53951b0c9f972e8fc496181ada79076a4c68b906c368b8720f55127304d3"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "c860b8e9adcd4cf87f0b4f8ad6276273fc5f1c1f69b06470e56c56b27a4eb765"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "e337d58e3c24b87d9da0f830efa0644ec107562b08f88f2429eca647b7781bfb"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "ea76ad59fe848015707e0e100f16e8bf835811885593fe0f2596cf5251b4e8bb"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "identity": {
+                    "basis": "telemetry_login",
+                    "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                    "org": "ff69af88f62b2d07afb2c6025f543380939c8089c6144d5a3b4abc935143c1cf"
+                  },
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
                 }
               ]
             }
           ]
         ]
       },
-      "identity_leaf_sha256": "411ced24010703a8732040cdb2cee4f0dbb05f27d596df078d8a313b8ad5c209",
-      "item_bytes": 17085,
+      "identity_leaf_sha256": "ef065c30628c153405a621cab1c37c8c9113c9fc96db0f7ba09cba2f32097b14",
+      "item_bytes": 29569,
       "expected": {
         "binding": "list",
         "rows": [
@@ -11714,10 +13457,55 @@
           },
           {
             "login": "A",
+            "org": "G10",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG10",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G17",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG17",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
             "org": "G3",
             "basis": "telemetry_login",
             "outcome": "bound",
             "subscription": "S_AG3",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G13",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG13",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G20",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG20",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G22",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG22",
             "provenance": "request_identity:telemetry_login+org",
             "money": "1.00"
           },
@@ -11741,6 +13529,33 @@
           },
           {
             "login": "A",
+            "org": "G21",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG21",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G14",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG14",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G19",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG19",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
             "org": "G2",
             "basis": "telemetry_login",
             "outcome": "bound",
@@ -11754,6 +13569,78 @@
             "basis": "telemetry_login",
             "outcome": "bound",
             "subscription": "S_AG1",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G16",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG16",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G15",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG15",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G8",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG8",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G7",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG7",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G12",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG12",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G11",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG11",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G18",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG18",
+            "provenance": "request_identity:telemetry_login+org",
+            "money": "1.00"
+          },
+          {
+            "login": "A",
+            "org": "G9",
+            "basis": "telemetry_login",
+            "outcome": "bound",
+            "subscription": "S_AG9",
             "provenance": "request_identity:telemetry_login+org",
             "money": "1.00"
           }
@@ -11978,7 +13865,7 @@
               "cache_creation_cost_usd": "0.000000"
             },
             "catalog_total": null,
-            "selected_total": "7.000000",
+            "selected_total": "23.000000",
             "selected_source": "app_reported",
             "has_known_money": true
           },
@@ -12027,7 +13914,107 @@
               "identity": {
                 "basis": "telemetry_login",
                 "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "1f05649b86ad17a98cddae79fa7637df804823428fe1081f0f227edaa0383044"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "3f245e8fea3e93ef575c29ed93b2f2ac801af123ad7b62e8a29a37e9db3c472f"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                 "org": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "5309a9639d86fe449a4296d740191f73dff59a38e02b69afd90e5c7c83e95e4b"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "55cbc8a20bdfb3595e33707a04e163190d9cdba729d21a9f747d7e419f011c57"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "64aaf8f5696ff1252c84b50c0e05f8c9f6c04f58c33d5e6c47c7e7fba5aed08e"
               },
               "context_bucket": "short",
               "components": {
@@ -12087,6 +14074,66 @@
               "identity": {
                 "basis": "telemetry_login",
                 "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "90f6c1a15e516d4ce796372b7617df0f6f2c56ad17906995c5fff708e1e88cf8"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "9a0251625ec6e2d8d322a1d21d2d89c2bee6859d192b8f3a5bf729de0d5f3b3e"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "9b8081753d85524c0eb74f7450a16112e0bb3a473f854d240eb55018ac8ec4c8"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                 "org": "a1ac7e97250bfe2a622826f5e6c06a51243dab89c33d70a20261886304d438d6"
               },
               "context_bucket": "short",
@@ -12122,15 +14169,175 @@
               "selected_total": "1.000000",
               "selected_source": "app_reported",
               "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "a83588e9c607733cadf84cef760a1b29771dcb7a0f9511f65453ab25669115d0"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "b1fa53951b0c9f972e8fc496181ada79076a4c68b906c368b8720f55127304d3"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "c860b8e9adcd4cf87f0b4f8ad6276273fc5f1c1f69b06470e56c56b27a4eb765"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "e337d58e3c24b87d9da0f830efa0644ec107562b08f88f2429eca647b7781bfb"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "ea76ad59fe848015707e0e100f16e8bf835811885593fe0f2596cf5251b4e8bb"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
+            },
+            {
+              "identity": {
+                "basis": "telemetry_login",
+                "login": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                "org": "ff69af88f62b2d07afb2c6025f543380939c8089c6144d5a3b4abc935143c1cf"
+              },
+              "context_bucket": "short",
+              "components": {
+                "input_cost_usd": null,
+                "output_cost_usd": null,
+                "cache_read_cost_usd": "0.000000",
+                "cache_creation_5m_cost_usd": "0.000000",
+                "cache_creation_1h_cost_usd": "0.000000",
+                "cache_creation_cost_usd": "0.000000"
+              },
+              "catalog_total": null,
+              "selected_total": "1.000000",
+              "selected_source": "app_reported",
+              "has_known_money": true
             }
           ],
-          "allocated_selected_total": "7.000000"
+          "allocated_selected_total": "23.000000"
         }
       ]
     },
-    "new-cap-evidence-17-fallback": {
-      "file": "new-cap-evidence-17-fallback.json",
-      "file_sha256": "dd1565cc60541be244061c0edabbab76203be30099f614006ffbd3b65d3c6678",
+    "new-cap-evidence-33-fallback": {
+      "file": "new-cap-evidence-33-fallback.json",
+      "file_sha256": "178fe2b5989903393e84bed4da6660c35c5bb8ee927deb5a427c6bae984a6042",
       "kind": "new",
       "summary": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
@@ -12152,7 +14359,7 @@
             "model": "claude-haiku-4-5",
             "login": null,
             "evidence_ref": null,
-            "cost_usd": "8.00"
+            "cost_usd": "24.00"
           }
         ]
       },
@@ -12164,10 +14371,10 @@
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "71edcf57ad4baaa88d06fd0a7cc972c518c54c950ad452be26a18ac77c160f3d",
-        "usage_accounting": "01305142f80bc7fe63257d62f3b732cec4f13378a52d2ac3172f03a8d69d357e"
+        "usage_accounting": "285468db9d62ea9d7dbf60656fe2a5f2e39aed7e6ffa3e1b79ebaadd948f3475"
       },
-      "content_hash": "8c80a07a8e100f971504cca4aef0ef22521224bf27666f63bb675899833c301e",
-      "snapshot_fingerprint": "855578700586c5673a31c61e47c2c5e420fdf539722b034502db021211c58d9d",
+      "content_hash": "df5185dd2bcab56d7cf9d3286811f830d5b321fa17c4fcd7a91711423d67ed0b",
+      "snapshot_fingerprint": "d159aa484261b997cc87bac931b75afb11e82bd8efabb96862235489765fe7c9",
       "identity_leaf": {
         "model_usage": [
           null
@@ -12183,7 +14390,7 @@
         ]
       },
       "identity_leaf_sha256": "0ab3049f482b1fedf34e294041b2a311dd9e801fd1d0b9560cde4a25cb1d5cca",
-      "item_bytes": 4631,
+      "item_bytes": 4635,
       "expected": {
         "binding": "unknown",
         "rows": [
@@ -12201,7 +14408,7 @@
             "basis": null,
             "outcome": "unknown",
             "reason": "request_identity_refused",
-            "money": "8.00"
+            "money": "24.00"
           }
         ]
       },
@@ -12211,15 +14418,15 @@
           "authority_keys"
         ],
         "shape": {
-          "evidence_entries": 17,
-          "authority_keys": 17,
-          "max_parts_per_row": 17,
-          "total_parts": 34,
+          "evidence_entries": 33,
+          "authority_keys": 33,
+          "max_parts_per_row": 33,
+          "total_parts": 66,
           "max_bucket_rows": 1,
           "top_level_rows": 1,
-          "item_bytes": 16614
+          "item_bytes": 29098
         },
-        "canonical_sha256": "f75c7e9f1d09cc5ae7486f769f245d844484dfd7ef1f13e184d9770dfcb5ff4e"
+        "canonical_sha256": "83ff62034eccc5f368ce2e2434bdc8003a3c77997160bba2de5f609a92d558c7"
       }
     }
   },
@@ -14222,9 +16429,9 @@
       "section": "class",
       "title": "Refused: any bound exceeded",
       "bodies": [
-        "new-cap-identities-17-fallback",
-        "new-cap-parts-18-fallback",
-        "new-cap-evidence-17-fallback"
+        "new-cap-identities-33-fallback",
+        "new-cap-parts-34-fallback",
+        "new-cap-evidence-33-fallback"
       ],
       "expected": "whole body in today's untagged shape + refusals; explicit Unknown, never pair-filled"
     },
@@ -14436,9 +16643,9 @@
       "section": "conservation",
       "title": "bound fallback conserves usage",
       "bodies": [
-        "new-cap-identities-17-fallback",
-        "new-cap-parts-18-fallback",
-        "new-cap-evidence-17-fallback"
+        "new-cap-identities-33-fallback",
+        "new-cap-parts-34-fallback",
+        "new-cap-evidence-33-fallback"
       ],
       "expected": "fallback rows equal the never-sent tagged body's rows"
     },
@@ -14625,43 +16832,43 @@
       ],
       "expected": "parent money and availability identical; only the allocation's destinations change"
     },
-    "CAP-identities-16": {
+    "CAP-identities-32": {
       "section": "cap",
-      "title": "16 authority keys",
+      "title": "32 authority keys",
       "bodies": [
-        "new-cap-identities-16"
+        "new-cap-identities-32"
       ],
-      "expected": "sent tagged (one row, 16 parts)"
+      "expected": "sent tagged (one row, 32 parts)"
     },
-    "CAP-identities-17": {
+    "CAP-identities-33": {
       "section": "cap",
-      "title": "17 authority keys, 1 evidence entry",
+      "title": "33 authority keys, 1 evidence entry",
       "bodies": [
-        "new-cap-identities-17-fallback"
+        "new-cap-identities-33-fallback"
       ],
       "expected": "fallback, over_cap = [authority_keys]"
     },
-    "CAP-parts-18": {
+    "CAP-parts-34": {
       "section": "cap",
-      "title": "17 authority keys + an untagged share in one row (18 parts)",
+      "title": "33 authority keys + an untagged share in one row (34 parts)",
       "bodies": [
-        "new-cap-parts-18-fallback"
+        "new-cap-parts-34-fallback"
       ],
       "expected": "fallback, over_cap = [authority_keys, parts_per_row]"
     },
-    "CAP-evidence-16": {
+    "CAP-evidence-32": {
       "section": "cap",
-      "title": "16 evidence entries, 16 authority keys",
+      "title": "32 evidence entries, 32 authority keys",
       "bodies": [
-        "new-cap-evidence-16"
+        "new-cap-evidence-32"
       ],
       "expected": "sent tagged"
     },
-    "CAP-evidence-17": {
+    "CAP-evidence-33": {
       "section": "cap",
-      "title": "17 evidence entries (each its own authority key)",
+      "title": "33 evidence entries (each its own authority key)",
       "bodies": [
-        "new-cap-evidence-17-fallback"
+        "new-cap-evidence-33-fallback"
       ],
       "expected": "fallback, over_cap = [evidence_entries, authority_keys]"
     },
@@ -14726,19 +16933,19 @@
     },
     "T-cap-accepted-head": {
       "section": "transition",
-      "title": "accepted tagged head, then a 17th authority key",
+      "title": "accepted tagged head, then authority key number 33",
       "bodies": [
-        "new-cap-identities-16",
-        "new-cap-identities-17-fallback"
+        "new-cap-identities-32",
+        "new-cap-identities-33-fallback"
       ],
-      "expected": "list of 16 -> explicit Unknown for the whole body (counted; never another subscription)"
+      "expected": "list of 32 -> explicit Unknown for the whole body (counted; never another subscription)"
     },
     "T-all-unknown": {
       "section": "transition",
       "title": "every row of the body is Unknown",
       "bodies": [
         "new-tl-no-org-pair-contradicting",
-        "new-cap-identities-17-fallback"
+        "new-cap-identities-33-fallback"
       ],
       "expected": "no destinations list; scalar NULL (today's Unknown shape)"
     },

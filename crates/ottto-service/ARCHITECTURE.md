@@ -147,8 +147,9 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 - Existing subtrees that stay as they are: `state_v2/` and `tail_source/`.
 - `tests/`: tests that span stages; test data under `tests/fixtures/`.
 
-Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte;
-only visibility, `use`/`mod` lines, path literals and wrappers change) and
+Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
+except that a fn with an unchanged body may have a signature rustfmt re-wrapped; only visibility,
+`use`/`mod` lines, path literals and wrappers change) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.
@@ -168,10 +169,9 @@ only visibility, `use`/`mod` lines, path literals and wrappers change) and
 
 ## One version
 
-- A runtime switch is a support-directory marker (normally `local_switch!`), never an environment
-  variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
-  explicitly documented changes. When retired, the feature is either on by default with the OFF
-  path deleted, or deleted.
+- A runtime switch is a support-directory marker, never an environment variable alone, and it is
+  temporary. Its OFF state preserves existing behaviour except for explicitly documented changes.
+  When retired, the feature is either on by default with the OFF path deleted, or deleted.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.
@@ -188,8 +188,8 @@ sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, uninstall) reaches every store and is counted when it fails.
 Source removal, grant loss, logout, account switch and forget installation only stop
-collection and keep local state; re-enabling a source resumes from it and drops only
-that source's upload witnesses. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+collection and keep local state; re-enabling a source resumes from it and drops
+nothing, so nothing already sent is re-sent. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
 
 Local collection never depends on an upload setting. No read-side identity (file scope, Codex
 group scope, traversal, memos, tier receipts) includes a setting, the attribution key, a

@@ -186,7 +186,7 @@ fn bare_builders_and_missing_object_identity_do_not_publish() {
 }
 
 #[test]
-fn shared_role_gate_excludes_comparison_and_other_sources() {
+fn shared_role_gate_excludes_other_sources() {
     let f = fixture();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut scan = step_until(
@@ -202,10 +202,6 @@ fn shared_role_gate_excludes_comparison_and_other_sources() {
     let active = scan.active_file.as_deref_mut().unwrap();
     assert!(active.is_primary_for(SnapshotSource::Codex));
     assert!(!active.is_primary_for(SnapshotSource::ClaudeCode));
-    active.comparison_target = true;
-    assert!(!active.is_primary_for(SnapshotSource::Codex));
-    active.comparison_target = false;
-    assert!(active.is_primary_for(SnapshotSource::Codex));
     // The publication itself can borrow a held accumulator while I/O is denied.
     while !active.parser.step().unwrap() {}
     let projection = feed(&f);

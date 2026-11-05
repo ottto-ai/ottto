@@ -842,6 +842,28 @@ pub(crate) mod money_oracle {
         }
     }
 
+    /// Every emitted request is class-pure: it declares head CAS exactly when
+    /// its bodies carry a cache patch, and then every body does. An unpatched
+    /// body never travels under another body's CAS contract. (A legacy
+    /// reconciliation page is CAS without a patch; its drivers check it.)
+    pub(crate) fn assert_class_pure_requests(result: &RouteResult) {
+        assert!(!result.batches.is_empty(), "no request is no class proof");
+        for bytes in &result.batches {
+            let wire: Value = serde_json::from_slice(bytes).unwrap();
+            let cas = wire.get("head_cas_contract").is_some();
+            for snapshot in wire["snapshots"].as_array().expect("batch snapshots") {
+                let patched = snapshot
+                    .get("cache_observations")
+                    .is_some_and(|value| !value.is_null());
+                assert_eq!(
+                    patched, cas,
+                    "{:?}: request mixes cache-patch classes",
+                    result.mode
+                );
+            }
+        }
+    }
+
     #[allow(dead_code, reason = "commit 6's oracle rows hold this comparator")]
     /// Caller supplies independently known extent/revision regression; money
     /// shrink is not inferred from tokens (legitimate corrections exist).

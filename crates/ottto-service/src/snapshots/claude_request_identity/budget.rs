@@ -389,7 +389,7 @@ fn intrinsically_fits(
             .then_some(total)
     };
     minimum().is_some_and(|minimum| {
-        minimum.parts <= MAX_PARTS_PER_ITEM
+        minimum.parts <= max_parts_per_item(max_item_bytes)
             && base
                 .checked_add(minimum.bytes)
                 .is_some_and(|bytes| bytes <= max_item_bytes)
@@ -513,7 +513,7 @@ fn fits_caps(
     prior_refusals: u64,
     max_item_bytes: usize,
 ) -> Option<usize> {
-    if selection.metrics.parts > MAX_PARTS_PER_ITEM {
+    if selection.metrics.parts > max_parts_per_item(max_item_bytes) {
         return None;
     }
     let evidence = selection

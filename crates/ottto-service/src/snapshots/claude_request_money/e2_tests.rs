@@ -2563,12 +2563,16 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
         let index = ScanIndex::default();
-        let lines = |offset| {
+        // Each twin stays within the account cap alone; their extra accounts
+        // together are one more than it.
+        let cap = crate::snapshots::claude_request_identity::MAX_AUTHORITY_KEYS as i64;
+        let (first, second) = (cap / 2, cap / 2 + 1);
+        let lines = |offset, extra| {
             let mut lines = vec![
                 org_marker(ORG_A),
                 line(&format!("first-{offset}"), &at(1), 1),
             ];
-            for i in 1..10 {
+            for i in 1..=extra {
                 let ordinal = offset + i;
                 lines.push(json!({"type":"attachment","sessionId":ROOT,"attachment":{"type":"session_context","context":{"userEmail":format!("synthetic-{ordinal}@example.invalid")}}}));
                 lines.push(org_marker(&format!(
@@ -2579,14 +2583,18 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             lines
         };
         let items = vec![
-            parse(&a, Some(t0()), &index, &lines(0)),
-            parse(&b, Some(t0()), &index, &lines(9)),
+            parse(&a, Some(t0()), &index, &lines(0, first)),
+            parse(&b, Some(t0()), &index, &lines(first, second)),
         ];
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
         let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
-        assert_eq!((item.request_count, item.input_tokens), (20, 20));
+        let requests = (first + second + 2) as u64;
+        assert_eq!(
+            (item.request_count, item.input_tokens),
+            (requests, requests)
+        );
         // Overflowing proof cannot be replaced by the starting org.
         // The old uniform-retry expectation would manufacture that identity.
         assert!(item.request_evidence.is_empty());

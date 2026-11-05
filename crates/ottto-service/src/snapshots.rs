@@ -1,8 +1,8 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs, UnreadableCause, UnreadableCauses,
-    CREATOR_DIFFERENT_OWNER, CREATOR_MULTI_MATCH, CREATOR_NAMED, CREATOR_NO_MATCH, CREATOR_NO_PAIR,
-    CREATOR_PREVIOUSLY_UPLOADED, LINEAGE_SAMPLES,
+    CREATOR_DIFFERENT_OWNER, CREATOR_NAMED, CREATOR_NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED,
+    LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
@@ -204,14 +204,13 @@ pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
-use disappearance_diagnostics::enabled as vanished_directory_removal;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
 mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
-use local_context_points::{local_context_points_recent, LocalContextPoints};
+use local_context_points::LocalContextPoints;
 mod codex_fragment;
 pub(crate) mod codex_version;
 pub(crate) mod discovery_growth;
@@ -1030,15 +1029,11 @@ struct CompactionMetrics {
     metrics_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeCompactionKind {
-    LegacySummary,
-    CurrentBoundary,
-}
-crate::durable_tail_codec::durable_enum!(ClaudeCompactionKind {
-    0 => LegacySummary,
-    1 => CurrentBoundary,
-});
+mod sources;
+use sources::claude::context_posture::{
+    claude_compaction_summary, clear_claude_context_posture, paired_claude_legacy_compactions,
+    set_claude_compaction_scalars, ClaudeCompactionKind,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeCompactionObservation {
@@ -1070,254 +1065,6 @@ pub(crate) struct ClaudeCompactionObservation {
     id_less_after: bool,
 }
 
-// The time fallback consumes unlinked legacy summaries greedily in
-// current-boundary input order. Equal distances prefer the original legacy
-// index; keep millisecond truncation and the inclusive tolerance identical for
-// both callers.
-fn matching_claude_legacy_compaction(
-    observations: &[ClaudeCompactionObservation],
-    current_millis: i128,
-    matched_legacy: &BTreeSet<usize>,
-) -> Option<usize> {
-    observations
-        .iter()
-        .enumerate()
-        .filter(|(index, observation)| {
-            observation.kind == ClaudeCompactionKind::LegacySummary
-                && !observation.has_parent_link
-                && !matched_legacy.contains(index)
-        })
-        .filter_map(|(index, observation)| {
-            let legacy_timestamp = observation
-                .timestamp
-                .as_deref()
-                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
-            let delta =
-                (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
-            (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
-        })
-        .min()
-        .map(|(_, index)| index)
-}
-
-/// Legacy summaries folded into a current boundary, shared by the count and
-/// the curve so both see one event list. A summary pairs with the boundary it
-/// structurally descends from first; only boundaries left unlinked then fall
-/// back to the nearest summary inside the time tolerance that names no parent.
-fn paired_claude_legacy_compactions(
-    observations: &[ClaudeCompactionObservation],
-) -> BTreeSet<usize> {
-    let mut boundary_by_key = BTreeMap::new();
-    for (index, observation) in observations.iter().enumerate() {
-        if observation.kind == ClaudeCompactionKind::CurrentBoundary {
-            if let Some(key) = observation.pair_key {
-                boundary_by_key.entry(key).or_insert(index);
-            }
-        }
-    }
-    let mut matched_legacy = BTreeSet::new();
-    let mut linked_boundaries = BTreeSet::new();
-    for (index, observation) in observations.iter().enumerate() {
-        if observation.kind != ClaudeCompactionKind::LegacySummary {
-            continue;
-        }
-        let Some(&boundary) = observation
-            .pair_key
-            .and_then(|key| boundary_by_key.get(&key))
-        else {
-            continue;
-        };
-        if linked_boundaries.insert(boundary) {
-            matched_legacy.insert(index);
-        }
-    }
-    for (index, current) in observations.iter().enumerate() {
-        if current.kind != ClaudeCompactionKind::CurrentBoundary
-            || linked_boundaries.contains(&index)
-        {
-            continue;
-        }
-        let Some(current_timestamp) = current
-            .timestamp
-            .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        else {
-            continue;
-        };
-        let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
-        if let Some(legacy_index) =
-            matching_claude_legacy_compaction(observations, current_millis, &matched_legacy)
-        {
-            matched_legacy.insert(legacy_index);
-        }
-    }
-    matched_legacy
-}
-
-fn claude_compaction_summary(
-    observations: &[ClaudeCompactionObservation],
-) -> (u64, Vec<String>, CompactionMetrics) {
-    claude_compaction_summary_paired(
-        observations,
-        &paired_claude_legacy_compactions(observations),
-    )
-}
-
-/// `claude_compaction_summary` with the pairing already computed, so the fold
-/// can share one pairing between the summary and the compaction sizes.
-fn claude_compaction_summary_paired(
-    observations: &[ClaudeCompactionObservation],
-    matched_legacy: &BTreeSet<usize>,
-) -> (u64, Vec<String>, CompactionMetrics) {
-    let mut metrics = CompactionMetrics::default();
-
-    for current in observations
-        .iter()
-        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
-    {
-        if current
-            .timestamp
-            .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .is_none()
-        {
-            continue;
-        }
-        if let Some(pre_tokens) = current.pre_tokens {
-            metrics.total_pre_tokens = metrics.total_pre_tokens.saturating_add(pre_tokens);
-        }
-        if let Some(post_tokens) = current.post_tokens {
-            metrics.total_post_tokens = metrics.total_post_tokens.saturating_add(post_tokens);
-        }
-        if let Some(cumulative_dropped_tokens) = current.cumulative_dropped_tokens {
-            metrics.total_cumulative_dropped_tokens = metrics
-                .total_cumulative_dropped_tokens
-                .saturating_add(cumulative_dropped_tokens);
-        }
-        if let Some(duration_ms) = current.duration_ms {
-            metrics.total_duration_ms = metrics.total_duration_ms.saturating_add(duration_ms);
-        }
-        if current.pre_tokens.is_some()
-            || current.post_tokens.is_some()
-            || current.cumulative_dropped_tokens.is_some()
-            || current.duration_ms.is_some()
-        {
-            metrics.metrics_count = metrics.metrics_count.saturating_add(1);
-        }
-    }
-
-    let timestamps = observations
-        .iter()
-        .enumerate()
-        .filter(|(index, observation)| {
-            observation.kind == ClaudeCompactionKind::CurrentBoundary
-                || !matched_legacy.contains(index)
-        })
-        .filter_map(|(_, observation)| observation.timestamp.clone())
-        .collect();
-    (
-        observations.len() as u64 - matched_legacy.len() as u64,
-        bounded_compaction_timestamps(timestamps),
-        metrics,
-    )
-}
-
-fn clear_claude_context_posture(item: &mut SnapshotItem) {
-    item.claude_file_birth_verdict = None;
-    item.session_start = item
-        .session_start
-        .take()
-        .and_then(|start| (*start).inherited())
-        .map(Box::new);
-    item.peak_context_fill_tokens = None;
-    item.first_turn_context_tokens = None;
-    item.last_turn_context_tokens = None;
-    item.compaction_count = None;
-    item.compaction_timestamps.clear();
-    item.compaction_events.clear();
-    item.first_own_request_at = None;
-    item.local_context_points.clear();
-    item.compaction_total_pre_tokens = None;
-    item.compaction_total_post_tokens = None;
-    item.compaction_total_cumulative_dropped_tokens = None;
-    item.compaction_total_duration_ms = None;
-}
-
-/// The compaction tuple (count, timestamps, four totals), the compaction
-/// sizes and the Mac-local context points of a Claude Code item, all from one
-/// owned set: `owned_observations` and the requests of `occurrences` that
-/// `is_own` accepts (the requests behind first/peak/last, any order). Both
-/// posture writers call this, so the two paths cannot drift;
-/// `clear_claude_context_posture` clears the same fields and `finish()` never
-/// builds Claude sizes or points.
-///
-/// Legacy pairing runs once for the summary and the sizes. Points are built
-/// only when the item's last activity is within the 75-minute output gate,
-/// in request order without collecting the requests. Returns how many
-/// shipped events sit next to an id-less response, and whether LOCAL points
-/// exceeded their work budget, for local counters only. `sequence_ordered`
-/// is true only for the strict fold's already sorted slice.
-fn set_claude_compaction_scalars<'a, I>(
-    item: &mut SnapshotItem,
-    owned_observations: &[ClaudeCompactionObservation],
-    occurrences: I,
-    sequence_ordered: bool,
-    is_own: impl Fn(&ClaudeTranscriptUsageOccurrence) -> bool,
-) -> (compaction_events::ClaudeIdLessNeighbours, bool)
-where
-    I: ExactSizeIterator<Item = &'a ClaudeTranscriptUsageOccurrence> + Clone,
-{
-    let paired = paired_claude_legacy_compactions(owned_observations);
-    let (count, timestamps, metrics) =
-        claude_compaction_summary_paired(owned_observations, &paired);
-    item.compaction_count = Some(count);
-    item.compaction_timestamps = timestamps;
-    let (events, id_less) = compaction_events::claude_compaction_events(
-        owned_observations,
-        &paired,
-        occurrences.clone().filter(|occurrence| is_own(occurrence)),
-    );
-    item.compaction_events = events;
-    item.compaction_total_pre_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
-    item.compaction_total_post_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
-    item.compaction_total_cumulative_dropped_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
-    item.compaction_total_duration_ms =
-        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
-    let mut points_refused = false;
-    item.local_context_points =
-        if local_context_points_recent(item.source_last_activity_at.as_deref(), &item.collected_at)
-        {
-            let point = |occurrence: &'a ClaudeTranscriptUsageOccurrence| {
-                is_own(occurrence).then_some((
-                    occurrence.timestamp.as_deref(),
-                    occurrence.effective_input_context,
-                ))
-            };
-            if sequence_ordered {
-                LocalContextPoints::from_ordered_requests(occurrences, point)
-            } else {
-                LocalContextPoints::from_requests_by_sequence(
-                    occurrences,
-                    |occurrence| occurrence.sequence,
-                    point,
-                )
-                .unwrap_or_else(|| {
-                    points_refused = true;
-                    Vec::new()
-                })
-            }
-        } else {
-            Vec::new()
-        };
-    (id_less, points_refused)
-}
-
-/// Past this a Codex file's cache observations are incomplete; usage is unaffected.
-const MAX_CODEX_CACHE_REQUESTS_PER_FILE: usize = 65_536;
-
 mod wire;
 pub use wire::batch_validation::validate_snapshot_batch_request;
 pub(crate) use wire::batch_validation::validate_snapshot_batch_request_with_item_limit;
@@ -1341,7 +1088,7 @@ pub(crate) use wire::content_hash::{
 pub(crate) use wire::{
     declares_usage_decrease_hold_ack, ACCOUNT_SOURCE_CONTRACT,
     CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
-    MAX_SESSION_ARTIFACT_VALUE_CHARS,
+    CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS, MAX_SESSION_ARTIFACT_VALUE_CHARS,
 };
 pub use wire::{
     AccountSource, ClaudeRemovedUsage, CopyUnprovenCounts, SessionAccountEvidence, SessionArtifact,
@@ -3076,8 +2823,6 @@ fn claude_terminal_predates_e2(record: &ClaudeUsageAuthorityQuarantineRecord) ->
 
 include!("snapshots/authority_proof_correction.rs");
 include!("snapshots/load_containment.rs");
-#[path = "snapshots/local_switch.rs"]
-mod local_switch;
 
 #[cfg(test)]
 mod compact_index_tests;
@@ -3094,21 +2839,16 @@ mod terminal_contract_retry_tests;
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
     MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
 
-/// Test-only, content-free copy of one family authority record and its
-/// binding to the retained witness.
 #[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClaudeAuthorityRecordForTest {
-    pub(crate) contract: String,
-    pub(crate) proven_witness_fingerprint: String,
-    pub(crate) member_source_file_fingerprints: BTreeMap<String, String>,
-    pub(crate) failed_reconstruction_count: u8,
-    pub(crate) terminal: bool,
-    pub(crate) retry_after_unix_seconds: u64,
-    /// The pending correction's proof digest and owed members.
-    pub(crate) correction: Option<(String, BTreeSet<String>)>,
-    pub(crate) bound_to_retained_witness: bool,
-}
+pub(crate) use sources::claude::census::authority::ClaudeAuthorityRecordForTest;
+pub use sources::claude::census::authority::ClaudeRequestCensusShadowCounts;
+use sources::claude::census::authority::{
+    claude_accepted_ledger_is_current, claude_index_file_body_accepted,
+    claude_usage_authority_deadline_is_bounded, claude_usage_authority_preserves_pending,
+    claude_usage_authority_retry_deadline, MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
+};
+#[cfg(test)]
+use sources::claude::census::authority::{sha256_hex_is_well_formed, ClaudePostureAdmission};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
@@ -3134,157 +2874,6 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// an index, account, identity, audit or upload input.
     #[cfg(test)]
     pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
-}
-
-/// The rule that admitted or withheld one Claude item's first/peak/last
-/// context and compaction scalars in the ownership fold. Recorded by tests.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClaudePostureAdmission {
-    /// The file birth rule decided.
-    FileBirth(ClaudeFileBirthVerdict),
-}
-
-#[cfg(test)]
-impl ClaudePostureAdmission {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::FileBirth(ClaudeFileBirthVerdict::Admitted) => "file_birth_rule",
-            Self::FileBirth(ClaudeFileBirthVerdict::UnknownBirth) => "withheld_unknown_birth",
-            Self::FileBirth(ClaudeFileBirthVerdict::UntimedRecord) => "withheld_untimed_record",
-            Self::FileBirth(ClaudeFileBirthVerdict::AllCopied) => "withheld_all_copied",
-            Self::FileBirth(ClaudeFileBirthVerdict::MultiFile) => "withheld_multi_file",
-            Self::FileBirth(ClaudeFileBirthVerdict::Tripwire) => "withheld_tripwire",
-            Self::FileBirth(ClaudeFileBirthVerdict::EvidenceBound) => "withheld_evidence_bound",
-        }
-    }
-}
-
-#[cfg(test)]
-impl ClaudeUsageAuthorityDisposition {
-    pub(crate) fn posture_admission(&self, source_session_id: &str) -> Option<&'static str> {
-        self.posture_admissions
-            .get(source_session_id)
-            .map(|admission| admission.as_str())
-    }
-}
-
-impl ClaudeUsageAuthorityDisposition {
-    /// `e2` (gate on): request-owned entities `e2::finish_page` withheld (held
-    /// twin, uncertified body, unread telemetry). Their items stay on the
-    /// page but never upload; the hold is not bound to an authority record,
-    /// so it blocks progress and the files are read again: delayed, never
-    /// settled without their body. Not an account deferral.
-    pub(crate) fn hold_request_owned(&mut self, session_ids: BTreeSet<String>) {
-        self.quarantined_source_session_ids.extend(session_ids);
-    }
-
-    pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
-        self.account_deferred_source_session_ids
-            .extend(session_ids.iter().cloned());
-        self.quarantined_source_session_ids.extend(session_ids);
-    }
-
-    /// Withheld tokens of each account-deferred snapshot, by fingerprint.
-    pub(crate) fn account_deferred_tokens(
-        &self,
-        snapshots: &[SnapshotItem],
-    ) -> BTreeMap<String, u64> {
-        let deferred = self.account_deferred_fingerprints(snapshots);
-        (snapshots.iter())
-            .filter(|snapshot| deferred.contains(&snapshot.snapshot_fingerprint))
-            .map(|item| {
-                (
-                    item.snapshot_fingerprint.clone(),
-                    usage_totals_from_item(item).total_tokens(),
-                )
-            })
-            .collect()
-    }
-
-    pub(crate) fn account_deferred_fingerprints(
-        &self,
-        snapshots: &[SnapshotItem],
-    ) -> BTreeSet<String> {
-        snapshots
-            .iter()
-            .filter(|snapshot| {
-                self.account_deferred_source_session_ids
-                    .contains(&snapshot.source_session_id)
-            })
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect()
-    }
-
-    /// Held revisions that owe the traversal a clean follow-up. Two hold
-    /// classes do not:
-    ///
-    /// - an authority demotion whose root carries a bounded record bound to
-    ///   the retained witness and to this exact revision: `UnprovenTerminal`,
-    ///   or `RetryPending` without a correction grant (the path-(a) bridge).
-    ///   The record keeps the family's retry clock and quarantine, and the
-    ///   candidate gate selects the family again only when it changes or its
-    ///   retry is due; the held key keeps its committed revision;
-    /// - an account deferral, whose verdict depends on the body and the local
-    ///   request evidence rather than on traversal completeness. Its key keeps
-    ///   the committed revision and is reparsed once per process and when its
-    ///   content or account evidence changes (`withheld_account`).
-    ///
-    /// Everything else stays progress-blocking. Without a durable disclosure
-    /// for every account deferral (`account_holds_recorded == false`), account
-    /// deferrals stay progress-blocking too.
-    pub(crate) fn progress_blocking_held_fingerprints(
-        &self,
-        snapshots: &[SnapshotItem],
-        index: &ScanIndex,
-        account_holds_recorded: bool,
-    ) -> BTreeSet<String> {
-        snapshots
-            .iter()
-            .filter(|snapshot| {
-                self.quarantined_source_session_ids
-                    .contains(&snapshot.source_session_id)
-            })
-            .filter(|snapshot| {
-                if self
-                    .account_deferred_source_session_ids
-                    .contains(&snapshot.source_session_id)
-                {
-                    if !account_holds_recorded {
-                        crate::local_resource_diagnostics::claude_reread::held_reason(
-                            crate::local_resource_diagnostics::claude_reread::HeldReason::AccountHoldUnrecorded,
-                        );
-                    }
-                    return !account_holds_recorded;
-                }
-                !claude_authority_hold_is_bound(snapshot, index)
-            })
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect()
-    }
-
-    pub(crate) fn quarantined_fingerprints(&self, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
-        snapshots
-            .iter()
-            .filter(|snapshot| {
-                self.quarantined_source_session_ids
-                    .contains(&snapshot.source_session_id)
-            })
-            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-            .collect()
-    }
-
-    pub(crate) fn retain_uploadable(&self, snapshots: &mut Vec<SnapshotItem>) {
-        snapshots.retain(|snapshot| {
-            !self
-                .quarantined_source_session_ids
-                .contains(&snapshot.source_session_id)
-        });
-    }
-
-    pub(crate) fn quarantined_entity_count(&self) -> usize {
-        self.quarantined_source_session_ids.len()
-    }
 }
 
 fn claude_usage_family_witness_fingerprint(witness: &ClaudeUsageFamilyWitness) -> String {
@@ -3329,196 +2918,10 @@ fn claude_usage_family_witness_fingerprint(witness: &ClaudeUsageFamilyWitness) -
     format!("{:x}", digest.finalize())
 }
 
-fn claude_usage_authority_retry_deadline(
-    root_session_id: &str,
-    proven_witness_fingerprint: &str,
-) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    let digest = Sha256::digest(
-        [
-            root_session_id.as_bytes(),
-            proven_witness_fingerprint.as_bytes(),
-        ]
-        .concat(),
-    );
-    let jitter = u64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("sha256 prefix is exactly eight bytes"),
-    ) % CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS;
-    now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS)
-        .saturating_add(jitter)
-}
-
-fn claude_usage_authority_preserves_pending(
-    quarantine: &ClaudeUsageAuthorityQuarantineRecord,
-    witness: &ClaudeUsageFamilyWitness,
-) -> bool {
-    claude_usage_authority_deadline_is_bounded(quarantine)
-        && quarantine.proven_witness_fingerprint == claude_usage_family_witness_fingerprint(witness)
-}
-
-/// Whether an indexed file's committed body is server-accepted: it has a
-/// committed snapshot, and every current entity fingerprint is in the
-/// persisted accepted ledger and not snapshot-quarantined. A settled
-/// permanent refusal is not acceptance.
-fn claude_index_file_body_accepted(
-    index: &ScanIndex,
-    index_key: &str,
-    entry: &ScanIndexEntry,
-) -> bool {
-    !index.decode_holds_file(index_key)
-        && entry.last_snapshot_fingerprint.is_some()
-        && index
-            .file_snapshot_fingerprints
-            .get(index_key)
-            .is_some_and(|fingerprints| {
-                !fingerprints.is_empty()
-                    && fingerprints.iter().all(|fingerprint| {
-                        !index.decode_holds_indexed_entity(index_key, fingerprint)
-                            && index.accepted_snapshot_fingerprints.contains(fingerprint)
-                            && !index
-                                .quarantined_snapshot_fingerprints
-                                .contains_key(fingerprint)
-                    })
-            })
-}
-
 // Coverage requires a non-quarantined body ACK, not a refusal checkpoint.
 fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
     codex_counting_version::proven_owner(entry).is_some()
         && claude_index_file_body_accepted(index, key, entry)
-}
-
-/// Whether the accepted ledger is current and not being rebuilt by the
-/// legacy settlement reconciliation.
-fn claude_accepted_ledger_is_current(index: &ScanIndex) -> bool {
-    index.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION
-        && index
-            .legacy_settlement_reconcile_after_fingerprint
-            .is_none()
-}
-
-/// A demoted revision owes no clean follow-up only while its family quarantine
-/// is bounded, bound to the retained witness, and records exactly this
-/// revision: the candidate gate then skips it until the family changes (or,
-/// for RetryPending, its retry is due). A terminal record always qualifies. A
-/// RetryPending record qualifies only without a correction grant (path-(a)
-/// bridge): its hold, quarantine and retry clock are unchanged, and its
-/// pending count keeps the census withheld. Every other shape still blocks.
-fn claude_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) -> bool {
-    use crate::local_resource_diagnostics::claude_reread::{held_reason, HeldReason};
-    let Some(revision) = snapshot.source_file_fingerprint.as_ref() else {
-        held_reason(HeldReason::AuthorityUnboundRevision);
-        return false;
-    };
-    let mut reason = HeldReason::AuthorityUnboundRevision;
-    let root_session_id = claude_snapshot_family_root(snapshot);
-    let bound = index
-        .claude_usage_authority_quarantine
-        .get(&root_session_id)
-        .zip(index.claude_usage_family_witnesses.get(&root_session_id))
-        .is_some_and(|(record, witness)| {
-            let bounded_disposition = match record.disposition {
-                ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => true,
-                ClaudeUsageAuthorityQuarantineDisposition::RetryPending => {
-                    if record.proof_correction.is_some() {
-                        reason = HeldReason::AuthorityCorrectionPending;
-                    }
-                    record.proof_correction.is_none()
-                }
-            };
-            bounded_disposition
-                && claude_usage_authority_preserves_pending(record, witness)
-                && record
-                    .member_source_file_fingerprints
-                    .get(&snapshot.source_session_id)
-                    == Some(revision)
-        });
-    if !bound {
-        held_reason(reason);
-    }
-    bound
-}
-
-fn claude_usage_authority_deadline_is_bounded(
-    record: &ClaudeUsageAuthorityQuarantineRecord,
-) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    claude_authority_record_contract_is_valid(record)
-        && sha256_hex_is_well_formed(&record.proven_witness_fingerprint)
-        && !record.member_source_file_fingerprints.is_empty()
-        && (1..=MAX_CLAUDE_USAGE_AUTHORITY_FAILURES).contains(&record.failed_reconstruction_count)
-        && match record.disposition {
-            ClaudeUsageAuthorityQuarantineDisposition::RetryPending => {
-                record.failed_reconstruction_count < MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
-            }
-            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => {
-                record.failed_reconstruction_count == MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
-            }
-        }
-        && record
-            .member_source_file_fingerprints
-            .values()
-            .all(|fingerprint| sha256_hex_is_well_formed(fingerprint))
-        && record.retry_after_unix_seconds
-            <= now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS.saturating_mul(2))
-}
-
-fn sha256_hex_is_well_formed(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-// Account-deferred holds are disclosed from a durable map. A cycle that cannot
-// record one keeps every account deferral progress-blocking: overflow costs a
-// clean follow-up generation and never settles a traversal undisclosed.
-const MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS: usize = 4_096;
-
-/// The request-census shadow, measured by the scan on a complete
-/// Claude terminal and reported on the local evidence line. Content-free counts; nothing reads them into a decision.
-/// `would_open` is whether every indexed Claude family-member key (not
-/// confirmed empty) has a record covering it, by fingerprint or by this
-/// census window, within the hash budget and the duplicate-owner bound.
-/// `missing_*` name, first match wins, why the other keys are not covered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct ClaudeRequestCensusShadowCounts {
-    pub would_open: bool,
-    pub would_open_flips: u64,
-    pub family_keys: usize,
-    pub covered_by_fingerprint: usize,
-    pub covered_by_window: usize,
-    pub missing_residue: usize,
-    pub missing_account_hold: usize,
-    pub missing_placeholder: usize,
-    pub missing_empty_fingerprint: usize,
-    pub missing_fingerprint_mismatch: usize,
-    pub missing_migrate: usize,
-    pub missing_over_budget: usize,
-    pub quarantine_without_record: usize,
-    pub shape_exact: usize,
-    pub shape_empty: usize,
-    pub shape_identity_incomplete: usize,
-    pub shape_lossy: usize,
-    pub unverified: usize,
-    pub twin: usize,
-    pub family_unknown_roots: usize,
-    pub records: usize,
-    pub hashes: usize,
-    pub hash_budget_usage_percent: usize,
-    pub transient_limited: bool,
-    pub transient_peak_bytes: usize,
-    pub duplicate_hashes: usize,
-    pub duplicate_owner_entries: usize,
-    pub shared_keys: usize,
-    pub derivation_drift: u64,
-    pub json_bytes: usize,
-    pub heap_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3940,18 +3343,6 @@ struct PendingIndexFinalization {
     effective_upload_body_witness_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SnapshotUploadPolicy {
-    pub session_titles_enabled: bool,
-    pub workspace_labels_enabled: bool,
-    pub session_artifacts_enabled: bool,
-    pub session_attribution_enabled: bool,
-    /// Backend capability derived from the existing session-title privacy
-    /// choice. It is not a separate user setting and defaults off for older
-    /// backends that do not advertise the additive private-label contract.
-    pub session_attribution_labels_enabled: bool,
-}
-
 pub(crate) fn snapshot_source_from_api_slug(value: &str) -> Option<SnapshotSource> {
     match value {
         "codex" => Some(SnapshotSource::Codex),
@@ -3961,23 +3352,8 @@ pub(crate) fn snapshot_source_from_api_slug(value: &str) -> Option<SnapshotSourc
     }
 }
 
-impl Default for SnapshotUploadPolicy {
-    fn default() -> Self {
-        Self {
-            session_titles_enabled: true,
-            workspace_labels_enabled: true,
-            // Opt-in: artifacts are stripped before upload unless the backend
-            // activity hint explicitly enables them for the org.
-            session_artifacts_enabled: false,
-            // Opt-in: compact facts stay local unless the backend explicitly
-            // enables the additive attribution contract.
-            session_attribution_enabled: false,
-            session_attribution_labels_enabled: false,
-        }
-    }
-}
-
 pub use crate::upload_policy::apply_upload_policy;
+pub use crate::upload_policy::SnapshotUploadPolicy;
 
 #[cfg(test)]
 pub(crate) fn snapshot_item_wire_size(
@@ -4556,7 +3932,6 @@ pub(crate) fn apply_claude_reported_usage_with_identity(
         trace_report,
         index,
         identity,
-        None,
         ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     )
 }
@@ -4569,13 +3944,12 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
-    apply_claude_reported_usage_to_scan_with_comparison(
+    apply_claude_reported_usage_to_scan_with_rows(
         scan,
         api_report,
         trace_report,
         index,
         identity,
-        None,
         ClaudeEvidenceRows::Whole(&BTreeMap::new()),
     )
 }
@@ -4591,13 +3965,12 @@ pub(crate) enum ClaudeEvidenceRows<'a> {
     Streamed(&'a claude_cross_root_evidence::CrossRootEvidence),
 }
 
-pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
+pub(crate) fn apply_claude_reported_usage_to_scan_with_rows(
     scan: &mut SourceScanResult,
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
-    comparison: Option<claude_native_comparison::FoldView<'_>>,
     evidence_rows: ClaudeEvidenceRows<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     apply_claude_reported_usage_with_index_and_rows(
@@ -4606,7 +3979,6 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         trace_report,
         index,
         identity,
-        comparison,
         evidence_rows,
     )
 }
@@ -4629,15 +4001,10 @@ fn apply_claude_reported_usage_with_index_and_rows(
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
-    comparison: Option<claude_native_comparison::FoldView<'_>>,
     evidence_rows: ClaudeEvidenceRows<'_>,
 ) -> ClaudeUsageAuthorityDisposition {
     if !index.persistence_available() {
         return claude_page_refused(snapshots);
-    }
-    if let Some(diagnostic) = comparison.and_then(|view| view.lease.map(|lease| &lease.diagnostic))
-    {
-        diagnostic.update(|d| d.fold_index_generation = Some(index.generation));
     }
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     // The canonical ownership reducer validates semantic evidence too (row
@@ -5230,21 +4597,6 @@ impl ClaudeLegacyRequestOwners {
     }
 }
 
-fn claude_legacy_request_owners_from_rows<'a>(
-    api_rows: impl IntoIterator<
-        Item = (
-            &'a String,
-            &'a Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
-        ),
-    >,
-    trace_rows_by_root: &BTreeMap<
-        String,
-        Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
-    >,
-) -> Option<ClaudeLegacyRequestOwners> {
-    classify_claude_legacy_request_owners(api_rows, trace_rows_by_root).ok()
-}
-
 fn classify_claude_legacy_request_owners<'a>(
     api_rows: impl IntoIterator<
         Item = (
@@ -5365,9 +4717,6 @@ fn reconstruct_claude_usage_family_from_rows(
     })
 }
 
-// Share the exact validation without retaining a second copy of the API rows
-// in the moving comparison plan. The base caller discards assigned hashes as
-// before; preparation moves them into its small, negative-only envelope.
 fn reconstruct_claude_usage_ledger_from_rows(
     root_session_id: &str,
     witness: &ClaudeUsageFamilyWitness,
@@ -5382,23 +4731,6 @@ fn reconstruct_claude_usage_ledger_from_rows(
         trace_rows,
         legacy_request_owners,
         Clone::clone,
-    )
-}
-
-fn reconstruct_claude_usage_ledger_borrowed<'a>(
-    root_session_id: &str,
-    witness: &ClaudeUsageFamilyWitness,
-    api_rows: &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
-    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    legacy_request_owners: Option<&ClaudeLegacyRequestOwners>,
-) -> Option<ReducedClaudeUsageLedger<&'a crate::claude_local_otel::ClaudeLocalOtelEvidence>> {
-    reconstruct_claude_usage_ledger_with_rows(
-        root_session_id,
-        witness,
-        api_rows,
-        trace_rows,
-        legacy_request_owners,
-        |row| row,
     )
 }
 
@@ -5436,10 +4768,6 @@ fn reconstruct_claude_usage_ledger_with_rows<'a, R>(
     Some(reduced)
 }
 
-// One canonical validation/fold. Ordinary callers retain the same owned row
-// clones; optional preflight borrows those already-opened rows and never keeps
-// a second graph of model/account/identity strings. Order and fingerprints are
-// identical in both views.
 /// The per-row checks of a strict Claude API sidecar row, in this order:
 /// revision, root session, request id, model, one request, evidence
 /// fingerprint, RFC 3339 clock. Duplicate request ids are the caller's check.
@@ -6259,274 +5587,22 @@ fn claude_reported_usage_inputs_from_rows<'a, R>(
     Some((rows, excluded_request_hashes))
 }
 
-struct PreparedClaudeReportedUsage<'p> {
+struct PreparedClaudeReportedUsage {
     totals: UsageTotals,
     model_usage: Vec<SnapshotModelUsage>,
     usage_buckets: Vec<SnapshotUsageBucket>,
     reported_activity: UsageBucketState,
     cost: Option<SnapshotCost>,
-    // Last field: every optional temporary/result allocation drops before its
-    // peak credit is released. Ordinary preparation carries None.
-    _construction_credit: Option<ReportedUsageConstructionCredit<'p>>,
 }
 
-struct ReportedUsageConstructionCredit<'p> {
-    paid: &'p mut crate::source_rotation::PaidReservation,
-    previous_ceiling: usize,
-}
-impl Drop for ReportedUsageConstructionCredit<'_> {
-    fn drop(&mut self) {
-        self.paid.release_temporary_peak(self.previous_ceiling);
-    }
-}
-
-/// Allocation sites in the canonical prepare/bucket path below. This prices
-/// storage only; it does not build rows, normalize selectors or project a body.
-/// One borrowed input pass, with one bounded current-selector walk per row;
-/// no whole-frame or growing-bucket walk occurs inside the row loop.
-fn reported_usage_construction_peak<
-    R: std::borrow::Borrow<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
->(
-    item: &SnapshotItem,
-    rows: &[R],
-) -> Option<usize> {
-    use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
-    if !heap_layout_bound::layout_supported() {
-        return None;
-    }
-    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
-    let n = rows.len();
-    // Input validation's owned-request and account views borrow their leaves.
-    heap_layout_bound::tree_nodes::<&String, ()>(item.claude_usage_request_ids.len(), &mut cost)?;
-    heap_layout_bound::tree_nodes::<&str, ()>(n, &mut cost)?;
-    // At worst each request starts a bucket and a distinct model row. The
-    // inner bucket maps have sum(len+1) <=2N; session rows have <=N entries.
-    heap_layout_bound::tree_nodes::<String, UsageBucketState>(n, &mut cost)?;
-    heap_layout_bound::tree_nodes::<RowKey, BucketRowAccumulator>(n.checked_mul(2)?, &mut cost)?;
-    heap_layout_bound::tree_nodes::<RowKey, BucketRowAccumulator>(n, &mut cost)?;
-    heap_layout_bound::tree_nodes::<&'static str, Option<String>>(
-        ROW_BILLING_FIELDS.len(),
-        &mut cost,
-    )?;
-    heap_layout_bound::tree_nodes::<RowKey, BucketRowAccumulator>(0, &mut cost)?; // activity default
-                                                                                  // Model Vec per bucket: <=4N retained slots plus a <=2*next_pow2(N)
-                                                                                  // replacement. The final session Vec is collected from an exact iterator.
-    let capacity = n.max(4).checked_next_power_of_two()?;
-    cost.add(
-        n.checked_mul(4)?
-            .checked_add(capacity.checked_mul(2)?)?
-            .checked_mul(std::mem::size_of::<SnapshotModelUsage>())?,
-    )?;
-    cost.add(
-        n.max(4)
-            .checked_mul(std::mem::size_of::<SnapshotModelUsage>())?,
-    )?;
-    cost.add(
-        capacity
-            .checked_add(capacity / 2)?
-            .checked_mul(std::mem::size_of::<SnapshotUsageBucket>())?,
-    )?;
-    let account = rows
-        .iter()
-        .map(std::borrow::Borrow::borrow)
-        .filter_map(|row| row.account_identifier_hash.as_ref())
-        .map(String::len)
-        .max()
-        .unwrap_or(0);
-    cost.add(account)?; // unique account temporary before row construction
-    cost.add(40 + "claude_code_api_request".len())?; // total decimal + cost source
-    let mut largest_temporary = 192usize; // current 64-hex formatting old/new buffers
-    let mut longest_time = 64usize;
-    for row in rows.iter().map(std::borrow::Borrow::borrow) {
-        let occurrence = item.claude_usage_occurrences.get(&row.request_id);
-        let model = occurrence
-            .and_then(|o| o.model.as_ref())
-            .map_or(row.model.len(), String::len);
-        let effort = occurrence
-            .and_then(|o| o.reasoning_effort.as_ref())
-            .map_or(row.effort.len(), |effort| {
-                effort.len().max(row.effort.len())
-            });
-        let timestamp = occurrence
-            .and_then(|o| o.timestamp.as_ref())
-            .map_or(row.observed_at.len(), String::len)
-            .max(64);
-        longest_time = longest_time.max(timestamp);
-        let mut selector = Counter::new(crate::source_rotation::PARKED_BUDGET);
-        let mut json_strings = 0usize;
-        let mut json_fields = 0usize;
-        if let Some(occurrence) = occurrence {
-            let SelectorCapture { context, sources } = occurrence.selector.as_ref();
-            context.completed_heap_bound(&mut selector)?;
-            sources.completed_heap_bound(&mut selector)?;
-            for (key, value) in context {
-                json_strings = json_strings
-                    .checked_add(key.len())?
-                    .checked_add(value.len())?;
-                json_fields = json_fields.checked_add(1)?;
-            }
-        }
-        if !row.speed.trim().is_empty() {
-            // Each canonical selector clone may gain the speed field. Price
-            // fresh nodes as well as the fixed key/source and normalized value.
-            let context_len = occurrence.map_or(0, |o| o.selector.context.len());
-            let sources_len = occurrence.map_or(0, |o| o.selector.sources.len());
-            heap_layout_bound::tree_nodes::<String, String>(
-                context_len.checked_add(1)?,
-                &mut selector,
-            )?;
-            heap_layout_bound::tree_nodes::<String, String>(
-                sources_len.checked_add(1)?,
-                &mut selector,
-            )?;
-            selector.add(
-                "speed_mode"
-                    .len()
-                    .checked_mul(2)?
-                    .checked_add("claude_code.api_request.speed".len())?
-                    .checked_add(row.speed.len().max(16))?,
-            )?;
-            json_strings = json_strings
-                .checked_add("speed_mode".len())?
-                .checked_add(row.speed.len().max(16))?;
-            json_fields = json_fields.checked_add(1)?;
-        }
-        // Simultaneous retained selectors: bucket accumulator, billing-key
-        // strings, bucket wire row, session wire row. Whole selector graphs
-        // conservatively cover the smaller hoisted billing-string subsets.
-        for _ in 0..4 {
-            cost.add(selector.bytes)?;
-        }
-        cost.add(model.checked_mul(3)?)?; // model key + two wire model strings
-        cost.add(effort.checked_mul(4)?)?; // key/accumulator + two wire efforts
-        cost.add(account.checked_mul(2)?)?; // bucket + session wire account
-        cost.add(timestamp.checked_mul(3)?)?; // bucket key + first/last activity
-        cost.add(16)?; // retained selector hash
-                       // Each of two wire model rows has five optional decimal costs.
-                       // A u128 decimal plus dot occupies at most40 bytes.
-        cost.add(2 * 5 * 40)?;
-        // serde_json escapes each input byte to at most six bytes, plus quotes,
-        // colon and comma per field. String's old/replacement buffer bound is
-        // three times the next power-of-two length (initial capacity128).
-        let json = json_strings
-            .checked_mul(6)?
-            .checked_add(json_fields.checked_mul(6)?)?
-            .checked_add(2)?;
-        let json_growth = json.max(128).checked_next_power_of_two()?.checked_mul(3)?;
-        let clock_growth = timestamp
-            .max(128)
-            .checked_next_power_of_two()?
-            .checked_mul(3)?;
-        // Current selector + temporary hoisted values are gone after a row.
-        // Model/time/speed normalization and current SHA formatting also do
-        // not accumulate with preceding rows.
-        let temporary = selector
-            .bytes
-            .checked_mul(2)?
-            .checked_add(model)?
-            .checked_add(effort.checked_mul(2)?)?
-            .checked_add(clock_growth)?
-            .checked_add(row.speed.len().max(16).checked_mul(3)?)?
-            .checked_add(json_growth)?
-            .checked_add(192)?;
-        largest_temporary = largest_temporary.max(temporary);
-    }
-    cost.add(longest_time.checked_mul(2)?)?; // reported activity first/last
-    cost.add(largest_temporary)?;
-    Some(cost.bytes)
-}
-
-/// The optional caller cannot fall through to an uncredited canonical call.
-/// Results are used only as a validation predicate and dropped before refund;
-/// no retained body, recovery credit or upload debt can escape this boundary.
-fn validate_claude_reported_usage_paid<
-    R: std::borrow::Borrow<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
->(
-    item: &SnapshotItem,
-    rows: &[R],
-    excluded: &BTreeSet<String>,
-    occupied: usize,
-    paid: &mut crate::source_rotation::PaidReservation,
-) -> Option<bool> {
-    let previous_ceiling = paid.allocation_ceiling();
-    let construction = reported_usage_construction_peak(item, rows)?;
-    let peak = occupied.checked_add(construction)?;
-    if !paid.grow_for(peak) {
-        return None;
-    }
-    let credit = ReportedUsageConstructionCredit {
-        paid,
-        previous_ceiling,
-    };
-    #[cfg(test)]
-    let result = {
-        let (result, allocation) = crate::retry_allocation_probe::measure(|| {
-            prepare_claude_reported_usage_with_credit(item, rows, excluded, None, Some(credit))
-        });
-        assert!(
-            allocation.requested_peak_with_overlap <= construction,
-            "canonical optional prepare exceeded its source-bound prepayment"
-        );
-        eprintln!("native canonical prepare credit: requested_peak={} prepaid_construction={construction} rows={} same_canonical_path=true not_RSS=true", allocation.requested_peak_with_overlap, rows.len());
-        result
-    };
-    #[cfg(not(test))]
-    let result =
-        prepare_claude_reported_usage_with_credit(item, rows, excluded, None, Some(credit));
-    let valid = result.is_some();
-    drop(result);
-    Some(valid)
-}
-
-#[cfg(test)]
-fn borrowed_claude_ledger_workspace(
-    ledger: &ReducedClaudeUsageLedger<&crate::claude_local_otel::ClaudeLocalOtelEvidence>,
-) -> Option<usize> {
-    use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
-    let ReducedClaudeUsageLedger {
-        evidence_fingerprint,
-        assigned_request_id_hashes,
-        rows_by_member,
-    } = ledger;
-    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
-    evidence_fingerprint.completed_heap_bound(&mut cost)?;
-    assigned_request_id_hashes.completed_heap_bound(&mut cost)?;
-    heap_layout_bound::tree_nodes::<String, Vec<&crate::claude_local_otel::ClaudeLocalOtelEvidence>>(
-        rows_by_member.len(),
-        &mut cost,
-    )?;
-    for (member, rows) in rows_by_member {
-        member.completed_heap_bound(&mut cost)?;
-        cost.add(rows.capacity().checked_mul(std::mem::size_of::<
-            &crate::claude_local_otel::ClaudeLocalOtelEvidence,
-        >())?)?;
-    }
-    Some(cost.bytes)
-}
-
-// The exact same derivation decides both preflight eligibility and the
-// authoritative rebuild. It cannot change a body, index, or ownership witness.
 fn prepare_claude_reported_usage<
     R: std::borrow::Borrow<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
 >(
     item: &SnapshotItem,
     rows: &[R],
     excluded_request_hashes: &BTreeSet<String>,
-    sink: Option<&mut claude_request_identity::RequestSink<'_, '_>>,
-) -> Option<PreparedClaudeReportedUsage<'static>> {
-    prepare_claude_reported_usage_with_credit(item, rows, excluded_request_hashes, sink, None)
-}
-
-fn prepare_claude_reported_usage_with_credit<
-    'p,
-    R: std::borrow::Borrow<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
->(
-    item: &SnapshotItem,
-    rows: &[R],
-    excluded_request_hashes: &BTreeSet<String>,
     mut sink: Option<&mut claude_request_identity::RequestSink<'_, '_>>,
-    construction_credit: Option<ReportedUsageConstructionCredit<'p>>,
-) -> Option<PreparedClaudeReportedUsage<'p>> {
+) -> Option<PreparedClaudeReportedUsage> {
     let row_refs = || rows.iter().map(std::borrow::Borrow::borrow);
     let owned_request_ids = item
         .claude_usage_request_ids
@@ -6763,7 +5839,6 @@ fn prepare_claude_reported_usage_with_credit<
             cache_creation_cost_usd: None,
             evidence_source: "claude_code_api_request".to_string(),
         }),
-        _construction_credit: construction_credit,
     })
 }
 
@@ -6779,7 +5854,6 @@ fn rebuild_claude_reported_usage(
         usage_buckets,
         reported_activity,
         cost,
-        _construction_credit: _,
     }) = prepare_claude_reported_usage(item, rows, excluded_request_hashes, sink)
     else {
         return false;
@@ -12195,8 +11269,8 @@ impl SnapshotAccumulator {
             Vec::new()
         };
         if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
-            // An incomplete book (over 65,536 records, or an incomplete
-            // physical read report) cannot certify an exact omitted count.
+            // An incomplete physical read report cannot certify an exact
+            // omitted count.
             self.cache_observations = Some(cache_wire(
                 &source_session_id,
                 self.cache_requests.iter(),
@@ -13306,10 +12380,7 @@ fn prepare_owned_scan_candidate(
     candidate.source_file_fingerprint = sidecar_fingerprint;
 }
 
-pub(crate) mod claude_native_comparison;
-
 pub(crate) struct OwnedSourceScan {
-    native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
     source: SnapshotSource,
@@ -13381,7 +12452,6 @@ pub(crate) struct OwnedSourceScan {
 }
 struct OwnedActiveFile {
     first_read: Option<crate::local_resource_diagnostics::FirstRead>,
-    comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
     candidate: CandidateFile,
     decision: CandidateDecision,
@@ -13390,7 +12460,6 @@ struct OwnedActiveFile {
     previous_upload_body_witness: Option<String>,
     projection_adoption_required: bool,
     source_file_fingerprint: String,
-    // Preserve heap ownership when this active file is moved into native finish.
     parser: Box<OwnedJsonlParser>,
     aliases: Vec<CandidateFile>,
     applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
@@ -13409,290 +12478,10 @@ pub(crate) enum OwnedSourceScanStep {
     Complete {
         index: ScanIndex,
         scan: SourceScanResult,
-        terminal_native_traversal: Option<Box<claude_native_comparison::TerminalTraversal>>,
     },
 }
 
 impl OwnedSourceScan {
-    pub(crate) fn native_early_evidence_roots(&self) -> impl Iterator<Item = &str> + Clone {
-        self.native_comparison
-            .as_ref()
-            .into_iter()
-            .flat_map(move |phase| phase.early_evidence_roots(&self.snapshots))
-    }
-    pub(crate) fn native_capture_active(&self) -> bool {
-        self.native_comparison
-            .as_ref()
-            .is_some_and(|phase| phase.capture_active())
-    }
-
-    pub(crate) fn native_capture_disabled(&self) -> bool {
-        self.native_comparison
-            .as_ref()
-            .is_some_and(|phase| !phase.capture_active())
-    }
-
-    pub(crate) fn native_capture_bytes(&self) -> Option<usize> {
-        self.native_comparison
-            .as_ref()
-            .map_or(Some(0), |phase| phase.owned_capture_bytes())
-    }
-    pub(crate) fn enable_native_comparison(&mut self) {
-        if self.source == SnapshotSource::ClaudeCode {
-            self.native_comparison = Some(claude_native_comparison::NativePhase::default());
-        }
-    }
-
-    pub(crate) fn native_comparison_ready(&self) -> bool {
-        self.native_comparison
-            .as_ref()
-            .is_some_and(|phase| phase.ready())
-    }
-
-    pub(crate) fn native_comparison_support_dir(&self) -> Option<&Path> {
-        self.claude_effort_support_dir.as_deref()
-    }
-
-    pub(crate) fn native_comparison_context(&self) -> Option<&str> {
-        self.index
-            .traversal
-            .as_ref()
-            .map(|traversal| traversal.context_fingerprint.as_str())
-    }
-
-    pub(crate) fn resume_native_comparison_base(&mut self) {
-        if let Some(phase) = self.native_comparison.as_mut() {
-            phase.resume();
-        }
-    }
-
-    pub(crate) fn disable_native_comparison(&mut self) {
-        if let Some(phase) = self.native_comparison.as_mut() {
-            phase.disable();
-        }
-    }
-
-    pub(crate) fn native_comparison_inputs(&self) -> (&ScanIndex, &[SnapshotItem]) {
-        (&self.index, &self.snapshots)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepare_native_comparison(
-        &mut self,
-        rows: claude_native_comparison::PairedRows<'_>,
-    ) -> claude_native_comparison::Qualification {
-        self.prepare_native_comparison_with_window(rows, None)
-            .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepare_native_comparison_with_window(
-        &mut self,
-        rows: claude_native_comparison::PairedRows<'_>,
-        previous: Option<Box<claude_native_comparison::WindowEligibility>>,
-    ) -> Option<claude_native_comparison::Qualification> {
-        self.prepare_native_comparison_credit(rows, previous, None)
-            .expect("logical qualification has no paid workspace refusal")
-    }
-    pub(crate) fn prepare_native_comparison_paid(
-        &mut self,
-        rows: claude_native_comparison::PairedRows<'_>,
-        previous: Option<Box<claude_native_comparison::WindowEligibility>>,
-        credit: &mut Option<crate::source_rotation::PaidReservation>,
-    ) -> Result<Option<claude_native_comparison::Qualification>, crate::source_rotation::LocalRefusal>
-    {
-        self.prepare_native_comparison_credit(rows, previous, Some(credit))
-    }
-    fn prepare_native_comparison_credit(
-        &mut self,
-        rows: claude_native_comparison::PairedRows<'_>,
-        previous: Option<Box<claude_native_comparison::WindowEligibility>>,
-        mut credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
-    ) -> Result<Option<claude_native_comparison::Qualification>, crate::source_rotation::LocalRefusal>
-    {
-        let healthy = self.native_comparison_is_healthy();
-        let phase = self
-            .native_comparison
-            .as_mut()
-            .expect("native comparison opted in");
-        let imported = healthy
-            && match credit.as_deref_mut() {
-                Some(credit) => {
-                    phase.import_window_paid(previous, &self.index, &self.census_window_end, credit)
-                }
-                None => phase.import_window(previous, &self.index, &self.census_window_end),
-            };
-        let external = credit.as_deref().and_then(|slot| {
-            slot.as_ref()?
-                .allocated()
-                .checked_sub(phase.owned_capture_bytes()?)
-        });
-        let workspace = imported
-            .then(|| match credit.as_deref_mut() {
-                Some(credit) => {
-                    phase.prepay_qualification_workspace(&self.index, &self.snapshots, credit)
-                }
-                None => Some(0), // Logical fixtures carry no admission claim.
-            })
-            .flatten();
-        if imported && workspace.is_none() {
-            phase.disable();
-            phase.resume();
-            return Err(crate::source_rotation::LocalRefusal(
-                "native comparison qualification workspace cannot be prepaid",
-            ));
-        }
-        let mut qualification = if let Some(workspace) = workspace {
-            let qualification = phase.qualify_with_credit(
-                &self.index,
-                &self.snapshots,
-                &self.census_window_end,
-                rows,
-                credit.as_deref_mut(),
-                workspace,
-            );
-            phase.capture_active().then_some(qualification)
-        } else {
-            None
-        };
-        phase.resume();
-        if let Some(slot) = credit {
-            // All root-local temporaries and the old moved certificate buffer
-            // are gone. Replace their future reservation with actual retained
-            // qualification + current phase custody exactly once.
-            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-            let owned = (|| {
-                let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
-                if let Some(q) = qualification.as_ref() {
-                    q.completed_heap_bound(&mut cost)?;
-                }
-                external?
-                    .checked_add(phase.owned_capture_bytes()?)?
-                    .checked_add(cost.bytes)
-            })();
-            let recorded = slot
-                .as_mut()
-                .zip(owned)
-                .is_some_and(|(paid, bytes)| paid.record_allocated(bytes));
-            if !recorded {
-                drop(qualification.take());
-                phase.disable();
-                return Err(crate::source_rotation::LocalRefusal(
-                    "native comparison retained qualification cannot be reconciled",
-                ));
-            }
-            if let Some(paid) = slot.as_mut() {
-                paid.retire_speculation();
-            }
-        }
-        Ok(qualification)
-    }
-
-    fn native_comparison_is_healthy(&self) -> bool {
-        // Before census counters are folded into traversal, require no local
-        // read/parser loss and a healthy retained traversal. Unknown is base.
-        let local = &self.census;
-        self.state_census_complete
-            && self.sidecar_census_complete
-            && local.directory_entry_cap_exceeded_count == 0
-            && local.symlink_rejected_count == 0
-            && local.unreadable_path_count == 0
-            && local.disappeared_file_count == 0
-            && local.malformed_json_line_count == 0
-            && local.invalid_utf8_line_count == 0
-            && local.over_line_cap_count == 0
-            && local.recognized_usage_drop_count == 0
-            && local.ownership_incomplete_file_count == 0
-            && local.zero_snapshot_usage_evidence_count == 0
-            && local.dropped_usage_record_count == 0
-            && self
-                .index
-                .traversal
-                .as_ref()
-                .is_some_and(|traversal| !traversal.counts.has_errors())
-    }
-
-    pub(crate) fn take_native_comparison_acquisition(
-        &self,
-        qualification: &mut claude_native_comparison::Qualification,
-    ) -> claude_native_comparison::TargetAcquisition {
-        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
-        qualification.take_native_acquisition(
-            &self.snapshots,
-            &self.pending_finalization,
-            self.native_comparison_is_healthy(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn acquire_native_comparison_targets(
-        &mut self,
-        qualification: &mut claude_native_comparison::Qualification,
-    ) -> claude_native_comparison::TargetSelection {
-        self.acquire_native_comparison_targets_after(qualification, 0, None, &[])
-            .expect("logical target selection adapter")
-    }
-
-    fn acquire_native_comparison_targets_after(
-        &mut self,
-        qualification: &mut claude_native_comparison::Qualification,
-        frontier: usize,
-        mut recovery: Option<claude_native_comparison::RecoveryBudget<'_>>,
-        already_targets: &[CandidateFile],
-    ) -> Result<claude_native_comparison::TargetSelection, crate::source_rotation::LocalRefusal>
-    {
-        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
-        let (candidates, selection) = qualification.take_target_candidates_after(
-            &self.snapshots,
-            frontier,
-            self.file_limit.saturating_sub(self.scanned_file_count),
-            &self.pending_finalization,
-            self.file_limit,
-            recovery.as_mut(),
-        )?;
-        if selection.matched_roots > 0 || !selection.unresolved_sources.is_empty() {
-            if let Some(recovery) = recovery.as_mut() {
-                let reason = || {
-                    crate::source_rotation::LocalRefusal(
-                    "native comparison selected recovery cannot be prepaid before target or deferral",
-                )
-                };
-                let paid = recovery.credit.as_mut().ok_or_else(reason)?;
-                let targets = qualification
-                    .recovery_targets()
-                    .chain(already_targets.iter());
-                let peak = claude_native_comparison::SelectedFallback::recovery_peak(
-                    &self.index,
-                    recovery.previous,
-                    &self.pending_finalization,
-                    targets,
-                    paid,
-                )
-                .ok_or_else(reason)?;
-                if !paid.reserve_recovery(peak) {
-                    return Err(reason());
-                }
-            }
-        }
-        if !candidates.is_empty() {
-            let phase = self
-                .native_comparison
-                .as_mut()
-                .expect("native comparison opted in");
-            if let Some(recovery) = recovery {
-                phase.start_targets_paid(
-                    &candidates,
-                    &mut self.identified_candidates,
-                    recovery.credit,
-                )?;
-            } else {
-                phase.start_targets(&candidates);
-            }
-            self.identified_candidates.extend(candidates);
-        }
-        Ok(selection)
-    }
-
     #[cfg(test)]
     pub(crate) fn test_active_physical_lines(&self) -> usize {
         self.active_file
@@ -13823,7 +12612,6 @@ impl OwnedSourceScan {
         let mut codex_page = sampled_scan::codex_cursor::PageBudget::default();
         codex_page.set_continuation(ordinary_equivalent);
         Self {
-            native_comparison: None,
             resource_probe: crate::local_resource_diagnostics::Probe::start(),
             sampling: None,
             source: SnapshotSource::Codex,
@@ -14036,7 +12824,7 @@ impl OwnedSourceScan {
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
-        advance_bounded_directory_traversal_with_budget(
+        let unlisted = advance_bounded_directory_traversal_with_budget(
             source,
             index,
             backfill_window_days,
@@ -14209,45 +12997,6 @@ impl OwnedSourceScan {
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
-        // Recovery must be selected before audits consume the page. Only
-        // existing queued paths with durable rearm debt are eligible here.
-        // Unknown/outside-page paths are not injected, and no deadline, source
-        // fingerprint, census flag or budget is changed by selection.
-        if source == SnapshotSource::ClaudeCode && claude_native_comparison::enabled() {
-            if recovery_priority.is_empty() {
-                // Selected fallback persists A at the front of this SAME
-                // queue with existing empty-fp debt. A restarted process has
-                // no lease/certificate or separate recovery path list. Honor
-                // only that queued debt prefix before audits; never inject a
-                // path, scan for missing members or mint native eligibility.
-                while pending_paths.len() < selection_limit {
-                    let known_debt =
-                        traversal
-                            .pending_candidates
-                            .front()
-                            .is_some_and(|candidate| {
-                                index
-                                    .files
-                                    .get(&local_index_key(&candidate.path))
-                                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
-                            });
-                    if !known_debt {
-                        break;
-                    }
-                    if let Some(candidate) = traversal.pending_candidates.pop_front() {
-                        pending_paths.push(candidate);
-                    }
-                }
-            } else {
-                claude_native_comparison::select_recovery_before_audits(
-                    &mut traversal.pending_candidates,
-                    &mut pending_paths,
-                    &index.files,
-                    recovery_priority,
-                    selection_limit,
-                );
-            }
-        }
         // A growth Full deferred by its claim left the queue; once the claim
         // expires, its queued path rides this page instead of waiting behind
         // the census FIFO. The claim still admits one Full per interval.
@@ -14402,6 +13151,20 @@ impl OwnedSourceScan {
                 )
             })
             .collect::<Vec<_>>();
+        // A key missing from this page's directory reads and proven
+        // securely absent is the same removal as a NotFound census member; the
+        // page-end owner retires it. A custody move this page (the rekey seam)
+        // leaves the old key unindexed, so it is dropped here. The proof is
+        // newer than this page's candidate observations, so it clears them.
+        for key in unlisted {
+            if index.files.contains_key(&key)
+                && sampled_audit::proven_absent(Path::new(&key), roots)
+            {
+                census.observed_index_keys.remove(&key);
+                census.claude_vanished_index_keys.insert(key.clone());
+                census.removed_index_keys.insert(key);
+            }
+        }
 
         for candidate in &files {
             sampled_audit::retain_candidate_growth(source, index, candidate);
@@ -14691,7 +13454,6 @@ impl OwnedSourceScan {
             });
         resource_probe.page_events.merge(diagnostics.finish());
         Self {
-            native_comparison: None,
             resource_probe,
             sampling: None,
             source,
@@ -14765,31 +13527,29 @@ impl OwnedSourceScan {
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
-        self.step_with_capture_credit(attribution_context, None)
-            .expect("ordinary serial collection has no paid target retention")
+        self.step_inner(attribution_context)
+            .expect("ordinary serial collection is available")
     }
 
-    pub(crate) fn step_paid(
+    pub(crate) fn step_fallible(
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-        credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
         state_v2::before_collection(&self.index).map_err(|_| {
             crate::source_rotation::LocalRefusal("state_v2_maintenance_before_collection")
         })?;
-        self.step_with_capture_credit(attribution_context, Some(credit))
+        self.step_inner(attribution_context)
     }
 
-    fn step_with_capture_credit(
+    fn step_inner(
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-        capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let _acquire_window = state_v2::telemetry::acquire_window(&self.index);
         let mut result =
             crate::local_resource_diagnostics::jsonl::page(self.source.api_slug(), || {
-                self.step_with_capture_credit_inner(attribution_context, capture_credit)
+                self.step_inner_page(attribution_context)
             });
         match &result {
             Ok(OwnedSourceScanStep::Pending(scan)) => state_v2::telemetry::acquired(&scan.index),
@@ -14804,10 +13564,9 @@ impl OwnedSourceScan {
     }
 
     #[inline(never)]
-    fn step_with_capture_credit_inner(
+    fn step_inner_page(
         mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-        mut capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
         if !self.index.persistence_available() {
             return Err(crate::source_rotation::LocalRefusal(
@@ -14885,7 +13644,6 @@ impl OwnedSourceScan {
             );
         }
         let Self {
-            mut native_comparison,
             mut resource_probe,
             mut sampling,
             index: mut index_storage,
@@ -16659,7 +15417,6 @@ impl OwnedSourceScan {
                 });
                 let OwnedActiveFile {
                     first_read,
-                    comparison_target,
                     sampling: file_sampling,
                     candidate,
                     decision,
@@ -16703,34 +15460,6 @@ impl OwnedSourceScan {
                             pending!();
                         }
                     }
-                }
-                let retained_bytes = index
-                    .files
-                    .iter()
-                    .filter(|(key, _)| !applied_receipts.contains_key(*key))
-                    .filter_map(|(_, entry)| entry.codex_applied_tier_receipt.as_ref())
-                    .map(|receipt| receipt.retained_bytes())
-                    .sum::<usize>();
-                let incoming_bytes = applied_receipts
-                    .values()
-                    .flatten()
-                    .map(|receipt| receipt.retained_bytes())
-                    .sum::<usize>();
-                if retained_bytes.saturating_add(incoming_bytes)
-                    > codex_file_join::MAX_RECEIPT_BYTES
-                {
-                    if let Some((context, publication)) =
-                        sampling.as_ref().zip(cursor_publication.take())
-                    {
-                        context.cache.cursor_published(publication, false);
-                    }
-                    census.ownership_incomplete_file_count += aliases.len().max(1);
-                    census.causes.add(ownership::GROUP, aliases.len().max(1));
-                    census.record_unreadable(UnreadableCause::AliasParser, 1);
-                    residue_index_keys.insert(local_index_key(&candidate.path));
-                    residue_index_keys
-                        .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                    pending!();
                 }
                 // The existing copy budget funds two simultaneous allocations:
                 // retained reduction and native finish/output. Reserve the extra
@@ -17068,18 +15797,15 @@ impl OwnedSourceScan {
                 // birth: `created()` and identity of the descriptor this parse
                 // opened, taken at open (never a path); unknown is None.
                 let claude_opened_birth = (source == SnapshotSource::ClaudeCode
-                    && !comparison_target
                     && claude_index_path_family_member(&candidate.path).is_some())
                 .then_some(parser.claude_opened_birth)
                 .flatten();
-                let claude_itemless_request_hashes = if source == SnapshotSource::ClaudeCode
-                    && !comparison_target
-                    && !parser.positive_usage_evidence
-                {
-                    claude_request_census::claude_buffered_request_hashes(&parser)
-                } else {
-                    Vec::new()
-                };
+                let claude_itemless_request_hashes =
+                    if source == SnapshotSource::ClaudeCode && !parser.positive_usage_evidence {
+                        claude_request_census::claude_buffered_request_hashes(&parser)
+                    } else {
+                        Vec::new()
+                    };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
                 let finish_request = FinishRequest {
@@ -17107,7 +15833,7 @@ impl OwnedSourceScan {
                 let mut tail = completed_acquisition
                     .as_ref()
                     .zip(file_sampling.as_ref())
-                    .filter(|_| sampling.is_some() && !comparison_target)
+                    .filter(|_| sampling.is_some())
                     .and_then(|(completed, active)| {
                         // `None` off a Tail route.
                         tail_source::pending(
@@ -17158,7 +15884,7 @@ impl OwnedSourceScan {
                         .cursor_published(publication, parsed_file.is_ok());
                 }
                 if let Ok(parsed) = &parsed_file {
-                    if source == SnapshotSource::ClaudeCode && !comparison_target {
+                    if source == SnapshotSource::ClaudeCode {
                         for item in &parsed.snapshots {
                             if let Some(fold) = item.claude_money.as_deref() {
                                 claude_request_money::e2::remember_birth(
@@ -17192,72 +15918,6 @@ impl OwnedSourceScan {
                     }
                     census.codex_counting_v2 = Some(receipts);
                 }
-                let target_finalization_credit = if comparison_target {
-                    if source != SnapshotSource::ClaudeCode || !aliases.is_empty() {
-                        return Err(crate::source_rotation::LocalRefusal(
-                            "native comparison target metadata source mismatch",
-                        ));
-                    }
-                    if let Some(credit) = capture_credit.as_deref_mut() {
-                        let admitted = native_comparison
-                            .as_mut()
-                            .ok_or(crate::source_rotation::LocalRefusal(
-                                "native comparison target owner missing",
-                            ))
-                            .and_then(|phase| {
-                                phase.retain_target_output(&parsed_file, &mut snapshots, credit)
-                            });
-                        // Error abandons collection; it is never finalized as
-                        // an empty census or offered. Prior durable state stays.
-                        admitted?;
-                        let path_set_entries = index
-                            .files
-                            .len()
-                            .checked_add(residue_index_keys.len())
-                            .and_then(|n| n.checked_add(settled_residue_index_keys.len()))
-                            .and_then(|n| n.checked_add(census.observed_index_keys.len()))
-                            .and_then(|n| n.checked_add(index.confirmed_empty_files.len()))
-                            .and_then(|n| {
-                                n.checked_add(
-                                    index
-                                        .traversal
-                                        .as_ref()
-                                        .map_or(0, |t| t.observed_index_keys.len()),
-                                )
-                            })
-                            .and_then(|n| {
-                                n.checked_add(
-                                    index
-                                        .traversal
-                                        .as_ref()
-                                        .map_or(0, |t| t.residue.index_keys.len()),
-                                )
-                            })
-                            .ok_or(crate::source_rotation::LocalRefusal(
-                                "native target metadata path count overflow",
-                            ))?;
-                        Some(
-                            native_comparison
-                                .as_ref()
-                                .expect("checked target phase")
-                                .prepay_target_finalization_metadata(
-                                    claude_native_comparison::TargetFinalizationInputs {
-                                        candidate: &candidate,
-                                        revision: &source_file_fingerprint,
-                                        parsed: &parsed_file,
-                                        index,
-                                        pending: &mut pending_finalization,
-                                        path_set_entries,
-                                    },
-                                    credit,
-                                )?,
-                        )
-                    } else {
-                        None
-                    } // logical test adapter only
-                } else {
-                    None
-                };
                 // #667's peak-reserved finalization limit: from `budget_after`
                 // where this completion's deferred release actually ran (and
                 // its peak was reserved there), otherwise main's. `None`
@@ -17432,47 +16092,38 @@ impl OwnedSourceScan {
                         && sidecar_census_complete));
                 let mut parsed = parsed_file.snapshots;
                 if source == SnapshotSource::ClaudeCode {
-                    // Record only; no decision reads it. A #588
-                    // comparison target prepays no record, so it has none.
-                    if comparison_target {
-                        claude_request_census::invalidate_claude_request_census(
-                            index,
-                            &candidate.path,
-                        );
-                    } else {
-                        claude_request_census::record_claude_request_census(
-                            index,
-                            claude_request_census::ClaudeRequestCensusParse {
-                                path: &candidate.path,
-                                index_key: &index_key,
-                                source_file_fingerprint: &source_file_fingerprint,
-                                census_window_end: &census_window_end,
-                                complete: parse_complete,
-                                lossy: terminal_loss.is_some(),
-                                source_verified,
-                                // Unchanged already checked physical identity and
-                                // acquisition scope against the prior checkpoint.
-                                // Keep census authority separate from Full credit.
-                                unchanged_source: cursor_fragment.is_none()
-                                    && file_sampling.as_ref().is_some_and(|active| {
-                                        active.mode
-                                            == crate::transcript_acquisition::ReadMode::Unchanged
-                                    })
-                                    && completed_acquisition.as_ref().is_some_and(|completed| {
-                                        completed.checkpoint.audit_debt().is_none()
-                                    })
-                                    && sampled_jsonl::loss_free_source_report(
-                                        &report,
-                                        recognized_usage_drop_count,
-                                        dropped_usage_record_count,
-                                    ),
-                                itemless_request_hashes: claude_itemless_request_hashes,
-                                opened_birth: claude_opened_birth,
-                                modified_unix_seconds: candidate.modified_unix_seconds,
-                            },
-                            &parsed,
-                        );
-                    }
+                    claude_request_census::record_claude_request_census(
+                        index,
+                        claude_request_census::ClaudeRequestCensusParse {
+                            path: &candidate.path,
+                            index_key: &index_key,
+                            source_file_fingerprint: &source_file_fingerprint,
+                            census_window_end: &census_window_end,
+                            complete: parse_complete,
+                            lossy: terminal_loss.is_some(),
+                            source_verified,
+                            // Unchanged already checked physical identity and
+                            // acquisition scope against the prior checkpoint.
+                            // Keep census authority separate from Full credit.
+                            unchanged_source: cursor_fragment.is_none()
+                                && file_sampling.as_ref().is_some_and(|active| {
+                                    active.mode
+                                        == crate::transcript_acquisition::ReadMode::Unchanged
+                                })
+                                && completed_acquisition.as_ref().is_some_and(|completed| {
+                                    completed.checkpoint.audit_debt().is_none()
+                                })
+                                && sampled_jsonl::loss_free_source_report(
+                                    &report,
+                                    recognized_usage_drop_count,
+                                    dropped_usage_record_count,
+                                ),
+                            itemless_request_hashes: claude_itemless_request_hashes,
+                            opened_birth: claude_opened_birth,
+                            modified_unix_seconds: candidate.modified_unix_seconds,
+                        },
+                        &parsed,
+                    );
                 }
                 if source == SnapshotSource::Codex {
                     for snapshot in parsed.iter_mut() {
@@ -17891,17 +16542,6 @@ impl OwnedSourceScan {
                 if parse_complete {
                     snapshots.extend(parsed);
                 }
-                if let Some(bytes) = target_finalization_credit {
-                    native_comparison
-                        .as_mut()
-                        .expect("checked target phase")
-                        .retain_target_metadata(
-                            bytes,
-                            capture_credit
-                                .as_deref_mut()
-                                .expect("funded target metadata"),
-                        )?;
-                }
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
@@ -17926,7 +16566,6 @@ impl OwnedSourceScan {
                         .map(|evidence| Arc::new(Mutex::new(Some(evidence))));
                     return Ok(OwnedSourceScanStep::Complete {
                         index: index_storage,
-                        terminal_native_traversal: None,
                         scan: SourceScanResult {
                             discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
@@ -17934,12 +16573,6 @@ impl OwnedSourceScan {
                             ..SourceScanResult::empty(SnapshotSource::Codex)
                         },
                     });
-                }
-                if native_comparison
-                    .as_mut()
-                    .is_some_and(|phase| phase.pause_before_finalization())
-                {
-                    pending!();
                 }
                 // Current-page metadata/open uncertainty must reach every F4
                 // caller before any hold can retire. The remaining census fold
@@ -18116,20 +16749,31 @@ impl OwnedSourceScan {
                     {
                         continue;
                     }
+                    // Codex records its counting evidence before either exit
+                    // below, as terminal reconciliation does; a refusal keeps
+                    // the entry whole.
                     if !index
                         .files
                         .get(index_key)
                         .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                        && (source != SnapshotSource::Codex
+                            || codex_counting_version::tombstone_before_retire(index, index_key))
                     {
-                        // A Claude member that vanished beneath its present
-                        // parent also drops its unverified audit debt;
-                        // every other removal keeps that debt. Both
+                        // A member that vanished beneath its present parent
+                        // also drops its unverified audit debt, proven again
+                        // here; every other removal keeps that debt. Both
                         // retire its request-census record.
-                        let vanished = census.claude_vanished_index_keys.contains(index_key)
-                            && sampled_audit::proven_absent(Path::new(index_key), &roots);
+                        let vanished = census.claude_vanished_index_keys.contains(index_key);
                         let census_record =
                             vanished && index.claude_request_census.get(index_key).is_some();
-                        if vanished && index.retire_vanished_claude_audit_debt_entry(index_key) {
+                        if vanished
+                            && index
+                                .files
+                                .get(index_key)
+                                .is_some_and(ScanIndexEntry::has_unverified_source)
+                            && sampled_audit::proven_absent(Path::new(index_key), &roots)
+                            && index.retire_vanished_claude_audit_debt_entry(index_key)
+                        {
                             crate::local_resource_diagnostics::audit_retired_absent(
                                 source.api_slug(),
                             );
@@ -18137,9 +16781,7 @@ impl OwnedSourceScan {
                                 source,
                                 disappearance_diagnostics::Vanished::AuditDebtDropped,
                             );
-                        } else if source != SnapshotSource::Codex
-                            || codex_counting_version::tombstone_before_retire(index, index_key)
-                        {
+                        } else {
                             index.remove_file_entry_unless_held(index_key);
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
@@ -18373,7 +17015,6 @@ impl OwnedSourceScan {
                 if raw_census_complete {
                     index.record_scan_residue_witness(source, &traversal_snapshot);
                 }
-                let mut terminal_native_traversal = None;
                 let mut carried_next_generation = Vec::new();
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
@@ -18402,13 +17043,6 @@ impl OwnedSourceScan {
                             clean_followup: needs_clean_followup,
                             census_complete,
                         },
-                    );
-                    terminal_native_traversal = claude_native_comparison::TerminalTraversal::take(
-                        index,
-                        source,
-                        native_comparison.is_some(),
-                        raw_census_complete,
-                        &census_window_end,
                     );
                     // G1 carry: the closing generation's waiting re-reads
                     // (watcher hints, budget-deferred re-reads, growth past
@@ -18747,7 +17381,6 @@ impl OwnedSourceScan {
                 return Ok(OwnedSourceScanStep::Complete {
                     index: index_storage,
                     scan,
-                    terminal_native_traversal,
                 });
             };
             // Reject budget debt before opening/constructing any body parser.
@@ -18927,24 +17560,6 @@ impl OwnedSourceScan {
                 decision = logical;
                 parse_reason = reason;
             }
-            let target_match = native_comparison
-                .as_ref()
-                .and_then(|phase| phase.target_revision_matches(&candidate));
-            if target_match == Some(false) {
-                // Comparison requires this exact frozen object and sidecars.
-                // The ordinary path may reparse replacements, but a target
-                // cannot silently claim that it compared the frozen revision.
-                disappearance_diagnostics::increment(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Cause::ComparisonTargetRevisionChanged,
-                );
-                pending!();
-            }
-            let comparison_target = target_match == Some(true);
-            if comparison_target {
-                decision = CandidateDecision::Parse;
-            }
             // History-upgrade gate, whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
             // revision passes the list, the no-list birth hold, the family
@@ -18976,7 +17591,6 @@ impl OwnedSourceScan {
                         &mut history_upgrade,
                     )
                 } else if adoption_only
-                    && !comparison_target
                     && !history_upgrade.reserve_admitting_first_file(
                         &local_index_key(&candidate.path),
                         candidate.size_bytes,
@@ -18999,9 +17613,7 @@ impl OwnedSourceScan {
                 // A listed genuine change is never held (it is literal-only
                 // denied), so a held correction-only member is unchanged.
                 match history {
-                    HistoryDecision::Held(hold)
-                        if (adoption_only || correction_only) && !comparison_target =>
-                    {
+                    HistoryDecision::Held(hold) if adoption_only || correction_only => {
                         if source == SnapshotSource::ClaudeCode {
                             let carried = index
                                 .accepted_rebuild_incidence
@@ -19075,18 +17687,6 @@ impl OwnedSourceScan {
             match decision {
                 CandidateDecision::Skip => {
                     page_selection(source.api_slug(), PageSelection::Skipped, 1);
-                    if let Some(phase) = native_comparison.as_mut() {
-                        if let Some(credit) = capture_credit.as_deref_mut() {
-                            phase.record_actual_skip_paid(
-                                index,
-                                &candidate,
-                                &census_window_end,
-                                credit,
-                            );
-                        } else {
-                            phase.record_actual_skip(index, &candidate, &census_window_end);
-                        }
-                    }
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
                     }
@@ -19293,34 +17893,6 @@ impl OwnedSourceScan {
                     | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
                 }
             }
-            if let Some(phase) = native_comparison.as_mut() {
-                // This is an actual native acquisition attempt, before parser
-                // construction can fail or complete with no emitted entity.
-                if let Some(credit) = capture_credit.as_deref_mut() {
-                    let captured = phase.record_parse_attempt_paid(&candidate, credit);
-                    if !captured && comparison_target {
-                        // The ordinary candidate was a Skip. Refuse this extra
-                        // target before opening its parser or retaining bodies;
-                        // the controller's existing fallback preserves debt.
-                        pending!();
-                    }
-                } else {
-                    phase.record_parse_attempt(&candidate);
-                }
-            }
-            let target_input_credit = if comparison_target {
-                match capture_credit.as_deref_mut() {
-                    Some(credit) => Some(
-                        native_comparison
-                            .as_ref()
-                            .expect("checked target phase")
-                            .prepay_target_input_metadata(&candidate, index, credit)?,
-                    ),
-                    None => None, // logical test adapter only
-                }
-            } else {
-                None
-            };
             scanned_file_count += 1;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
@@ -19329,13 +17901,6 @@ impl OwnedSourceScan {
                     &candidate.path,
                 ));
             let source_file_fingerprint = candidate.source_file_fingerprint.clone();
-            if let Some(bytes) = target_input_credit {
-                native_comparison
-                    .as_mut()
-                    .expect("checked target phase")
-                    .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
-            }
-
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,
                 &candidate,
@@ -19529,18 +18094,14 @@ impl OwnedSourceScan {
                                 || claude_request_census::forced_member_needs_native(index, &key));
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
-                            && !forced_native
-                            && !comparison_target;
+                            && !forced_native;
                         context
                             .admission
                             .audit_metadata_supported
                             .observe(context.audit_metadata_supported);
                         context.admission.protected_history.observe(protected);
                         context.admission.forced_family.observe(forced_family);
-                        context
-                            .admission
-                            .comparison_target
-                            .observe(comparison_target);
+                        context.admission.comparison_target.observe(false);
 
                         context.admission.audit_debt_present.observe(debt.is_some());
                         context
@@ -19868,7 +18429,6 @@ impl OwnedSourceScan {
                     candidate.size_bytes,
                     !index.files.contains_key(&local_index_key(&candidate.path)),
                 ),
-                comparison_target,
                 sampling: file_sampling,
                 candidate,
                 decision,
@@ -20022,7 +18582,6 @@ impl OwnedSourceScan {
             delivery.left_active();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
-            native_comparison,
             resource_probe,
             sampling,
             source,
@@ -23079,11 +21638,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .and_then(|(end, start)| cache_observations::elapsed_seconds(end, start));
     }
     if let Some(request) = codex_cache_request(value, accumulator) {
-        if accumulator.cache_requests.len() < MAX_CODEX_CACHE_REQUESTS_PER_FILE {
-            accumulator.cache_requests.push(request);
-        } else {
-            accumulator.cache_requests_complete = false;
-        }
+        accumulator.cache_requests.push(request);
         accumulator.cache_pending_idle = None;
     }
     if accumulator.source_session_id.is_none() {
@@ -24296,7 +22851,6 @@ fn is_numeric(segment: &str) -> bool {
     !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
 }
 
-mod sources;
 use sources::codex::line::{
     codex_last_turn_input_context, codex_last_usage, codex_last_usage_root, codex_line_timestamp,
     codex_model_context_window, codex_total_usage, codex_total_usage_has_request_count,
@@ -26240,642 +24794,11 @@ fn codex_config_selector(document: &DocumentMut) -> SelectorCapture {
     selector
 }
 
-/// Display-safe Codex runtime defaults parsed from `~/.codex/config.toml`.
-///
-/// These are configured defaults, not evidence a session actually ran with
-/// them. `selector_context`/`selector_sources` carry the raw config-derived
-/// values with their `codex.config.*` provenance so downstream layers can keep
-/// defaults separate from observed selector evidence.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CodexConfigDefaults {
-    pub model: Option<String>,
-    pub service_tier: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub approval_policy: Option<String>,
-    pub fast_mode: Option<bool>,
-    pub fast_default_opt_out: bool,
-    pub selector_context: BTreeMap<String, String>,
-    pub selector_sources: BTreeMap<String, String>,
-}
-
-impl CodexConfigDefaults {
-    /// Effective Fast default for display. `service_tier` is authoritative when
-    /// set; otherwise fall back to the legacy `[features].fast_mode` flag minus
-    /// any fast-default opt-out. Returns `None` when nothing in config implies a
-    /// tier, so the UI can stay quiet rather than guess.
-    pub(crate) fn display_fast_mode(&self) -> Option<bool> {
-        if let Some(tier) = self.service_tier.as_deref() {
-            match tier.trim().to_ascii_lowercase().as_str() {
-                "priority" | "fast" | "premium" => return Some(true),
-                "default" | "standard" | "flex" | "batch" => return Some(false),
-                _ => {}
-            }
-        }
-        match self.fast_mode {
-            Some(true) => Some(!self.fast_default_opt_out),
-            Some(false) => Some(false),
-            None => {
-                if self.fast_default_opt_out {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaults> {
-    let document = raw.parse::<DocumentMut>().ok()?;
-    let read_top_str = |key: &str| {
-        document
-            .get(key)
-            .and_then(Item::as_value)
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let model = read_top_str("model").or_else(|| read_top_str("default_model"));
-    let service_tier = read_top_str("service_tier");
-    let reasoning_effort =
-        read_top_str("model_reasoning_effort").or_else(|| read_top_str("reasoning_effort"));
-    let approval_policy = read_top_str("approval_policy");
-    let fast_mode = document
-        .get("features")
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("fast_mode"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool());
-    let top_level_opt_out = document
-        .get("fast_default_opt_out")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let notice_opt_out = document
-        .get("notice")
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("fast_default_opt_out"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let fast_default_opt_out = top_level_opt_out || notice_opt_out;
-    let selector = codex_config_selector(&document);
-    let has_any = model.is_some()
-        || service_tier.is_some()
-        || reasoning_effort.is_some()
-        || approval_policy.is_some()
-        || fast_mode.is_some()
-        || fast_default_opt_out
-        || !selector.context.is_empty();
-    if !has_any {
-        return None;
-    }
-    Some(CodexConfigDefaults {
-        model,
-        service_tier,
-        reasoning_effort,
-        approval_policy,
-        fast_mode,
-        fast_default_opt_out,
-        selector_context: selector.context,
-        selector_sources: selector.sources,
-    })
-}
-
-/// Defensive size ceiling for a Claude Code settings file. Real settings files
-/// are a few KiB; anything larger is not a config file we should be parsing.
-const MAX_CLAUDE_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
-
-/// Most models reported in `reasoning_effort_by_model`. Real files hold a
-/// handful; the cap only bounds a pathological one.
-const MAX_CLAUDE_EFFORT_BY_MODEL_ENTRIES: usize = 16;
-
-/// Models that still take the user file's legacy top-level `effortLevel` when
-/// nothing else sets their effort, as listed by Claude Code 2.1.300. Newer models
-/// ignore that key, so its stale value is never reported for them.
-const CLAUDE_LEGACY_EFFORT_MODELS: &[&str] = &[
-    "claude-3-5-haiku",
-    "claude-3-5-sonnet",
-    "claude-3-7-sonnet",
-    "claude-haiku-4-5",
-    "claude-sonnet-4-0",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-opus-4-0",
-    "claude-opus-4-1",
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-fable-5",
-    "claude-fable-5-1",
-    "claude-mythos-5",
-    "claude-mythos-5-1",
-];
-
-/// Display-safe Claude Code runtime defaults resolved across the settings chain.
-///
-/// The Codex sibling is `CodexConfigDefaults`; the same rules apply. These are
-/// configured defaults, not evidence a session actually ran with them.
-/// `selector_context` carries the resolved value per field and
-/// `selector_sources` carries the `claude_code.<scope>.<json key path>`
-/// provenance of the file that won, so the UI can name the file each value came
-/// from instead of implying one global config.
-///
-/// `reasoning_effort` comes from Claude Code's durable effort setting. Current
-/// Claude Code saves `/effort` per model under `modelSettings.<model>.effortLevel`;
-/// the user file's top-level `effortLevel` is the legacy key it no longer
-/// updates. See `effort_for_key` and `resolve_claude_effort` for which value
-/// wins. The value is reported exactly as configured; nothing is normalized and
-/// no default is invented when the key is absent. `reasoning_effort_by_model` reports every saved per-model effort
-/// on its own, so a `/effort` change shows even when no model is saved.
-///
-/// `fast_mode_enabled` is the one field with a default: Claude Code's Fast is
-/// off until `fastMode` is saved, so a readable chain without that key reports
-/// `false` with the `claude_code.default.fastMode` source.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ClaudeConfigDefaults {
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    /// Canonical `modelSettings` key to its effort; see `claude_effort_by_model`.
-    pub reasoning_effort_by_model: BTreeMap<String, String>,
-    pub approval_policy: Option<String>,
-    pub fast_mode_enabled: Option<bool>,
-    pub sandbox_mode: Option<String>,
-    pub selector_context: BTreeMap<String, String>,
-    pub selector_sources: BTreeMap<String, String>,
-}
-
-/// `selector_sources` label for a Fast default that no settings key sets.
-const CLAUDE_FAST_MODE_DEFAULT_SOURCE: &str = "claude_code.default.fastMode";
-
-/// Result of reading the Claude Code settings chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClaudeConfigDefaultsOutcome {
-    /// At least one settings file parsed cleanly. Fast mode is always known
-    /// then: a chain without `fastMode` reports Claude Code's default, off.
-    Configured(ClaudeConfigDefaults),
-    /// No settings file in the chain could be read and parsed, so nothing is
-    /// reported, not even the Fast default.
-    Unreadable,
-}
-
-/// One Claude Code settings file in precedence order.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ClaudeSettingsScope<'a> {
-    /// `selector_sources` prefix identifying the file, e.g. `claude_code.settings`.
-    pub label: &'a str,
-    pub path: &'a Path,
-}
-
-/// Raw per-key capture with the scope label that supplied it. Kept separate from
-/// `ClaudeConfigDefaults` so a higher-precedence file that sets only one half of
-/// a derived pair (for example `sandbox.autoAllowBashIfSandboxed` without
-/// `sandbox.enabled`) still wins for the key it actually sets.
-#[derive(Debug, Clone, Default)]
-struct ClaudeSettingsRaw {
-    model: Option<(String, String)>,
-    /// `modelSettings` key for the highest-precedence `model`, even one too
-    /// unusual to display (such as `claude-opus-4-7[1m]`). Used only to look up
-    /// a saved effort; never reported.
-    model_key: Option<String>,
-    /// One entry per readable file, lowest precedence first. Effort is resolved
-    /// only after the winning `model` is known, because the per-model key it
-    /// selects may come from a different file.
-    effort_scopes: Vec<ClaudeEffortScope>,
-    /// The user file's top-level `effortLevel`, which Claude Code treats as
-    /// legacy; see `resolve_claude_effort`.
-    legacy_effort: Option<(String, String)>,
-    permission_mode: Option<(String, String)>,
-    fast_mode: Option<(bool, String)>,
-    fast_mode_per_session_opt_in: Option<(bool, String)>,
-    sandbox_enabled: Option<(bool, String)>,
-    sandbox_auto_allow_bash: Option<(bool, String)>,
-}
-
-/// Effort keys from one Claude Code settings file.
-#[derive(Debug, Clone, Default)]
-struct ClaudeEffortScope {
-    label: String,
-    /// Top-level `effortLevel`, except in the user file (see `legacy_effort`).
-    top_level: Option<String>,
-    /// `modelSettings.<key>.effortLevel` by canonical model key.
-    by_model: BTreeMap<String, String>,
-}
-
-/// Resolve display-safe Claude Code defaults from the settings chain.
-///
-/// `scopes` must be ordered lowest precedence first, starting with the user file
-/// (`~/.claude/settings.json`); each readable file overwrites the keys it sets,
-/// so the highest-precedence file wins per key.
-/// Only specifically-named keys are ever read: `model`, `effortLevel`,
-/// `modelSettings.<model>.effortLevel`, `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
-/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`. `env`,
-/// `permissions.allow`/`ask`/`deny`, `apiKeyHelper`, `statusLine`,
-/// `sandbox.credentials`, and `sandbox.filesystem` are never read, so no path,
-/// environment value, token, or permission rule can ride along. Environment
-/// variables are never consulted either, so `CLAUDE_CODE_EFFORT_LEVEL` cannot
-/// leak in through this path.
-pub(crate) fn load_claude_settings_defaults(
-    scopes: &[ClaudeSettingsScope<'_>],
-) -> ClaudeConfigDefaultsOutcome {
-    let mut raw = ClaudeSettingsRaw::default();
-    let mut any_readable = false;
-    for (index, scope) in scopes.iter().enumerate() {
-        let Some(document) = load_claude_settings_document(scope.path) else {
-            continue;
-        };
-        any_readable = true;
-        apply_claude_settings_scope(&mut raw, scope.label, index == 0, &document);
-    }
-    if !any_readable {
-        return ClaudeConfigDefaultsOutcome::Unreadable;
-    }
-
-    let mut defaults = ClaudeConfigDefaults::default();
-    let insert = |defaults: &mut ClaudeConfigDefaults, field: &str, value: String, source: &str| {
-        defaults.selector_context.insert(field.to_string(), value);
-        defaults
-            .selector_sources
-            .insert(field.to_string(), source.to_string());
-    };
-
-    if let Some((model, source)) = raw.model.clone() {
-        insert(&mut defaults, "model", model.clone(), &source);
-        defaults.model = Some(model);
-    }
-    // Reported exactly as configured. `low`/`medium`/`high`/`xhigh` persist
-    // across sessions; `max` is session-only unless the environment sets it, but
-    // if the settings file says `max` then that is what the file says, and the
-    // Configuration tab's contract is to show the config file. Normalizing or
-    // dropping a value here would misreport the customer's own config.
-    if let Some((effort, source)) = resolve_claude_effort(&raw) {
-        insert(&mut defaults, "reasoning_effort", effort.clone(), &source);
-        defaults.reasoning_effort = Some(effort);
-    }
-    if let Some((by_model, source)) = claude_effort_by_model(&raw.effort_scopes) {
-        defaults
-            .selector_sources
-            .insert("reasoning_effort_by_model".to_string(), source);
-        defaults.reasoning_effort_by_model = by_model;
-    }
-    if let Some((mode, source)) = raw.permission_mode.clone() {
-        insert(&mut defaults, "approval_policy", mode.clone(), &source);
-        defaults.approval_policy = Some(mode);
-    }
-    // `fastModePerSessionOptIn` means Fast never persists across sessions, so
-    // the durable default is off regardless of a stored `fastMode` flag. This
-    // mirrors how Codex's `fast_default_opt_out` overrides `[features].fast_mode`.
-    // At least one file was read, so a chain without `fastMode` means Claude
-    // Code's own default: off. That default is labelled as such, never as a key.
-    let (fast_mode_enabled, fast_mode_source) =
-        match (&raw.fast_mode_per_session_opt_in, &raw.fast_mode) {
-            (Some((true, source)), _) => (false, source.clone()),
-            (_, Some((enabled, source))) => (*enabled, source.clone()),
-            _ => (false, CLAUDE_FAST_MODE_DEFAULT_SOURCE.to_string()),
-        };
-    insert(
-        &mut defaults,
-        "fast_mode_enabled",
-        fast_mode_enabled.to_string(),
-        &fast_mode_source,
-    );
-    defaults.fast_mode_enabled = Some(fast_mode_enabled);
-    // `autoAllowBashIfSandboxed` only means something once the sandbox is on,
-    // so an unset `sandbox.enabled` stays quiet rather than guessing a mode.
-    let sandbox_mode = match &raw.sandbox_enabled {
-        Some((false, source)) => Some(("disabled", source.clone())),
-        Some((true, source)) => match &raw.sandbox_auto_allow_bash {
-            Some((false, auto_allow_source)) => {
-                Some(("regular_permissions", auto_allow_source.clone()))
-            }
-            // Auto-allow is Claude Code's default once the sandbox is enabled.
-            _ => Some(("auto_allow", source.clone())),
-        },
-        None => None,
-    };
-    if let Some((mode, source)) = sandbox_mode {
-        insert(&mut defaults, "sandbox_mode", mode.to_string(), &source);
-        defaults.sandbox_mode = Some(mode.to_string());
-    }
-
-    ClaudeConfigDefaultsOutcome::Configured(defaults)
-}
-
-/// Read one Claude Code settings file into JSON; `None` for any failure.
-fn load_claude_settings_document(path: &Path) -> Option<Value> {
-    match read_claude_settings_document(path) {
-        ClaudeSettingsDocument::Parsed(document) => Some(document),
-        ClaudeSettingsDocument::Missing | ClaudeSettingsDocument::Failed => None,
-    }
-}
-
-/// One Claude Code settings file: absent, present but not usable (unreadable,
-/// not a regular file, oversized or malformed), or parsed.
-#[derive(Debug)]
-pub(crate) enum ClaudeSettingsDocument {
-    Missing,
-    Failed,
-    Parsed(Value),
-}
-
-/// Read line-by-line to satisfy the streaming guard (no whole-file reads in this
-/// module); settings files are small, so the accumulated string is fine.
-pub(crate) fn read_claude_settings_document(path: &Path) -> ClaudeSettingsDocument {
-    let opened = fs::metadata(path).and_then(|metadata| {
-        if !metadata.is_file() || metadata.len() > MAX_CLAUDE_SETTINGS_FILE_BYTES {
-            return Err(std::io::Error::other("not a bounded settings file"));
-        }
-        File::open(path)
-    });
-    let file = match opened {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ClaudeSettingsDocument::Missing
-        }
-        Err(_) => return ClaudeSettingsDocument::Failed,
-    };
-    let mut raw = String::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            return ClaudeSettingsDocument::Failed;
-        };
-        raw.push_str(line.as_str());
-        raw.push('\n');
-    }
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(document) => ClaudeSettingsDocument::Parsed(document),
-        Err(_) => ClaudeSettingsDocument::Failed,
-    }
-}
-
-fn apply_claude_settings_scope(
-    raw: &mut ClaudeSettingsRaw,
-    label: &str,
-    user_file: bool,
-    document: &Value,
-) {
-    // The winning `model` both names the model and selects its effort, so a
-    // model too unusual to display clears a lower file's model rather than
-    // pairing it with this model's effort.
-    if let Some(model) = document
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-    {
-        raw.model =
-            display_safe_config_scalar(model).map(|model| (model, format!("{label}.model")));
-        raw.model_key = Some(claude_model_settings_key(model));
-    }
-    let mut top_level = document
-        .get("effortLevel")
-        .and_then(Value::as_str)
-        .and_then(display_safe_config_scalar);
-    if user_file {
-        raw.legacy_effort = top_level
-            .take()
-            .map(|level| (level, format!("{label}.effortLevel")));
-    }
-    let mut effort = ClaudeEffortScope {
-        label: label.to_string(),
-        top_level,
-        by_model: BTreeMap::new(),
-    };
-    if let Some(model_settings) = document.get("modelSettings").and_then(Value::as_object) {
-        for (key, settings) in model_settings {
-            let Some(canonical) = display_safe_config_scalar(&claude_model_settings_key(key))
-            else {
-                continue;
-            };
-            let Some(level) = settings
-                .get("effortLevel")
-                .and_then(Value::as_str)
-                .and_then(display_safe_config_scalar)
-            else {
-                continue;
-            };
-            // Like Claude Code, a key already in canonical form beats an alias
-            // spelling of the same model.
-            if *key == canonical || !effort.by_model.contains_key(&canonical) {
-                effort.by_model.insert(canonical, level);
-            }
-        }
-    }
-    raw.effort_scopes.push(effort);
-    if let Some(mode) = document
-        .get("permissions")
-        .and_then(|permissions| permissions.get("defaultMode"))
-        .and_then(Value::as_str)
-        .and_then(claude_permission_mode_default)
-    {
-        raw.permission_mode = Some((mode, format!("{label}.permissions.defaultMode")));
-    }
-    if let Some(fast_mode) = document.get("fastMode").and_then(Value::as_bool) {
-        raw.fast_mode = Some((fast_mode, format!("{label}.fastMode")));
-    }
-    if let Some(opt_in) = document
-        .get("fastModePerSessionOptIn")
-        .and_then(Value::as_bool)
-    {
-        raw.fast_mode_per_session_opt_in =
-            Some((opt_in, format!("{label}.fastModePerSessionOptIn")));
-    }
-    if let Some(sandbox) = document.get("sandbox") {
-        if let Some(enabled) = sandbox.get("enabled").and_then(Value::as_bool) {
-            raw.sandbox_enabled = Some((enabled, format!("{label}.sandbox.enabled")));
-        }
-        if let Some(auto_allow) = sandbox
-            .get("autoAllowBashIfSandboxed")
-            .and_then(Value::as_bool)
-        {
-            raw.sandbox_auto_allow_bash = Some((
-                auto_allow,
-                format!("{label}.sandbox.autoAllowBashIfSandboxed"),
-            ));
-        }
-    }
-}
-
-/// The effort Claude Code applies to the model with canonical `modelSettings`
-/// key `key`, as Claude Code 2.1.300 resolves it: the highest file that answers
-/// wins, with its entry for `key`, or else its top-level `effortLevel`. The user
-/// file's top-level value is legacy and never answers here. Returns the effort,
-/// the file's label, and whether the value is the file's per-model entry.
-fn effort_for_key<'a>(
-    scopes: &'a [ClaudeEffortScope],
-    key: &str,
-) -> Option<(&'a str, &'a str, bool)> {
-    scopes
-        .iter()
-        .rev()
-        .find_map(|scope| match scope.by_model.get(key) {
-            Some(effort) => Some((effort.as_str(), scope.label.as_str(), true)),
-            None => scope
-                .top_level
-                .as_deref()
-                .map(|effort| (effort, scope.label.as_str(), false)),
-        })
-}
-
-/// Pick the configured effort and the key that supplied it.
-///
-/// - With a saved `model`, `effort_for_key` for it. If no file answers, the
-///   user file's legacy top-level `effortLevel`, but only for the older models
-///   Claude Code still applies it to.
-/// - Without one, the effort depends on which model Claude Code starts with,
-///   which the settings do not say. It is reported only when a top-level
-///   `effortLevel` sets every model, that is, when its file is higher than
-///   every `modelSettings` entry. Each entry is still reported on its own in
-///   `reasoning_effort_by_model`.
-fn resolve_claude_effort(raw: &ClaudeSettingsRaw) -> Option<(String, String)> {
-    let Some(key) = raw.model_key.as_deref() else {
-        for scope in raw.effort_scopes.iter().rev() {
-            if !scope.by_model.is_empty() {
-                return None;
-            }
-            if let Some(effort) = &scope.top_level {
-                return Some((effort.clone(), format!("{}.effortLevel", scope.label)));
-            }
-        }
-        return None;
-    };
-    match effort_for_key(&raw.effort_scopes, key) {
-        Some((effort, label, true)) => Some((
-            effort.to_string(),
-            format!("{label}.modelSettings.{key}.effortLevel"),
-        )),
-        Some((effort, label, false)) => Some((effort.to_string(), format!("{label}.effortLevel"))),
-        None => raw
-            .legacy_effort
-            .clone()
-            .filter(|_| CLAUDE_LEGACY_EFFORT_MODELS.contains(&key)),
-    }
-}
-
-/// `effort_for_key` for every model with a `modelSettings` entry in any file,
-/// plus a source naming each file and field (`modelSettings` or `effortLevel`)
-/// that supplied a value, lowest precedence first. Keys are canonical
-/// `modelSettings` keys, already display-safe. Past
-/// `MAX_CLAUDE_EFFORT_BY_MODEL_ENTRIES` the first keys in sort order are kept.
-fn claude_effort_by_model(
-    scopes: &[ClaudeEffortScope],
-) -> Option<(BTreeMap<String, String>, String)> {
-    let keys: BTreeSet<&str> = scopes
-        .iter()
-        .flat_map(|scope| scope.by_model.keys().map(String::as_str))
-        .collect();
-    let mut by_model = BTreeMap::new();
-    let mut supplied = BTreeSet::new();
-    for key in keys.into_iter().take(MAX_CLAUDE_EFFORT_BY_MODEL_ENTRIES) {
-        if let Some((effort, label, per_model)) = effort_for_key(scopes, key) {
-            by_model.insert(key.to_string(), effort.to_string());
-            supplied.insert((label, per_model));
-        }
-    }
-    if by_model.is_empty() {
-        return None;
-    }
-    let mut sources = Vec::new();
-    for scope in scopes {
-        for (per_model, field) in [(true, "modelSettings"), (false, "effortLevel")] {
-            if supplied.contains(&(scope.label.as_str(), per_model)) {
-                sources.push(format!("{}.{field}", scope.label));
-            }
-        }
-    }
-    Some((by_model, sources.join(",")))
-}
-
-/// The `modelSettings` key Claude Code uses for a model id.
-///
-/// Mirrors Claude Code's canonical key: lowercase, without a `[1m]` context
-/// suffix, provider path or `<region>.anthropic.` prefix, release date, version,
-/// `-latest`, or `-fast` suffix. So `us.anthropic.claude-opus-4-1-20250805-v1:0`
-/// and `claude-opus-4-1[1m]` both select `claude-opus-4-1`. Aliases such as
-/// `opus` are left as written: what they resolve to depends on the Claude Code
-/// version and plan, so they only match a key saved under the alias itself.
-fn claude_model_settings_key(model: &str) -> String {
-    let lowered = model.trim().to_ascii_lowercase();
-    let mut key = lowered.as_str();
-    for suffix in ["[1m]", "[2m]"] {
-        if let Some(head) = key.strip_suffix(suffix) {
-            key = head;
-        }
-    }
-    key = key.rsplit('/').next().unwrap_or_default();
-    if let Some(index) = key.find("anthropic.claude-") {
-        let region = &key[..index];
-        if region.is_empty()
-            || region.strip_suffix('.').is_some_and(|region| {
-                !region.is_empty() && region.chars().all(|ch| ch.is_ascii_lowercase())
-            })
-        {
-            key = &key[index + "anthropic.".len()..];
-        }
-    }
-    let all_digits = |text: &str, min: usize, max: usize| {
-        (min..=max).contains(&text.len()) && text.chars().all(|ch| ch.is_ascii_digit())
-    };
-    // Bedrock version, e.g. `-v1:0`.
-    if let Some((head, version)) = key.rsplit_once("-v") {
-        let (major, minor) = version.split_once(':').unwrap_or((version, "0"));
-        if all_digits(major, 1, 3) && all_digits(minor, 1, 3) {
-            key = head;
-        }
-    }
-    // Release date, e.g. `-20250805` or Vertex `@20250805`.
-    if let Some(index) = key.rfind(['-', '@']) {
-        if all_digits(&key[index + 1..], 8, 8) {
-            key = &key[..index];
-        }
-    }
-    for suffix in ["-latest", "-fast"] {
-        if let Some(head) = key.strip_suffix(suffix) {
-            key = head;
-            break;
-        }
-    }
-    key.to_string()
-}
-
-/// Canonical display value for `permissions.defaultMode`.
-///
-/// `bypassPermissions` is a local safety posture, never a cost-relevant default,
-/// so it is dropped rather than uploaded. Unknown values are dropped too: a
-/// future mode name is not something we should forward blind.
-fn claude_permission_mode_default(value: &str) -> Option<String> {
-    match value.trim() {
-        // `manual` is the CLI alias for the canonical `default` config value.
-        "default" | "manual" => Some("default".to_string()),
-        "acceptEdits" => Some("acceptEdits".to_string()),
-        "plan" => Some("plan".to_string()),
-        "auto" => Some("auto".to_string()),
-        "dontAsk" => Some("dontAsk".to_string()),
-        _ => None,
-    }
-}
-
-/// Accept only short, scalar, display-safe config text.
-///
-/// Anything path-like, URL-like, quoted, whitespace-bearing, or long is dropped
-/// instead of forwarded, so free-form settings text can never leak a path, an
-/// environment value, or a credential through a config-defaults field. The
-/// backend-facing `redacted_for_backend` guard is the second line of defence.
-fn display_safe_config_scalar(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 64 {
-        return None;
-    }
-    if !trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':'))
-    {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
+pub(crate) use sources::claude::settings_defaults::{
+    load_claude_settings_defaults, read_claude_settings_document, ClaudeConfigDefaultsOutcome,
+    ClaudeSettingsDocument, ClaudeSettingsScope,
+};
+pub(crate) use sources::codex::config_defaults::parse_codex_config_defaults;
 
 fn insert_codex_sidecar_title(
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
@@ -27626,7 +25549,6 @@ fn refresh_retained_codex_directories(
         _ => return,
     };
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
-    let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
     for directory in moved {
         let Some(scan_root) = traversal.owning_scan_root(&directory).cloned() else {
             continue;
@@ -27651,11 +25573,7 @@ fn refresh_retained_codex_directories(
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
-        let entries = entries.take(remaining + 1).collect::<Vec<_>>();
-        if entries.len() > remaining {
-            break;
-        }
-        remaining -= entries.len();
+        let entries = entries.collect::<Vec<_>>();
         let mut present = BTreeSet::new();
         let mut appeared = Vec::new();
         let mut new_directories = Vec::new();
@@ -27969,20 +25887,50 @@ impl DiscoveryRecovery<'_> {
     }
 }
 
+/// Returns the indexed keys this tick's directory reads did not list.
 #[cfg(test)]
 fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
     advance_bounded_directory_traversal_with_budget(
         source,
         index,
         backfill_window_days,
         directory_entries_per_tick(),
         growth,
-    );
+    )
+}
+
+/// Adds to `unlisted` each indexed key beneath `directory` whose first
+/// component there is not in `names`, the names listed in `directory`
+/// (empty for a directory now gone). A listed child's subtree is skipped by
+/// seeking past its prefix; its own read covers it. Nomination only: the
+/// secure absence proof decides.
+fn unlisted_index_keys(
+    files: &SharedMap<String, ScanIndexEntry>,
+    directory: &Path,
+    names: &BTreeSet<String>,
+    unlisted: &mut BTreeSet<String>,
+) {
+    use std::ops::Bound;
+    use std::path::MAIN_SEPARATOR;
+    let prefix = format!("{}{MAIN_SEPARATOR}", directory.to_string_lossy());
+    let mut keys = files.range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded));
+    while let Some((key, _)) = keys.next() {
+        let Some(rest) = key.strip_prefix(prefix.as_str()) else {
+            break;
+        };
+        let child = rest.split(MAIN_SEPARATOR).next().unwrap_or(rest);
+        if !names.contains(child) {
+            unlisted.insert(key.clone());
+        } else if child.len() < rest.len() {
+            let past = format!("{prefix}{child}{}", char::from(MAIN_SEPARATOR as u8 + 1));
+            keys = files.range::<str, _>((Bound::Included(past.as_str()), Bound::Unbounded));
+        }
+    }
 }
 
 fn directory_entries_per_tick() -> usize {
@@ -28013,17 +25961,66 @@ fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     run()
 }
 
+#[cfg(test)]
+type DirectoryReadFault = Box<dyn FnMut(&Path, bool) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIRECTORY_READ_FAULT: std::cell::RefCell<Option<DirectoryReadFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `result` itself outside tests. A test fault sees each listed entry's read
+/// (`false`) and type read (`true`) of `directory` and fails it with `true`.
+#[cfg_attr(
+    not(test),
+    allow(unused_variables, reason = "only a test fault reads them")
+)]
+fn directory_read_fault<T>(
+    directory: &Path,
+    type_read: bool,
+    result: std::io::Result<T>,
+) -> std::io::Result<T> {
+    #[cfg(test)]
+    if TEST_DIRECTORY_READ_FAULT.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|fault| fault(directory, type_read))
+    }) {
+        return Err(std::io::Error::other("injected directory read fault"));
+    }
+    result
+}
+
+/// Runs `run` with a directory entry/type read fault, for tests only.
+#[cfg(test)]
+fn with_directory_read_fault<T>(
+    fault: impl FnMut(&Path, bool) -> bool + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DIRECTORY_READ_FAULT.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    TEST_DIRECTORY_READ_FAULT.with(|slot| *slot.borrow_mut() = Some(Box::new(fault)));
+    let _reset = Reset;
+    run()
+}
+
 fn advance_bounded_directory_traversal_with_budget(
     source: SnapshotSource,
     index: &mut ScanIndex,
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
-) {
+) -> BTreeSet<String> {
     let mut traversal = index
         .traversal
         .take()
         .expect("bounded traversal initialized");
+    let mut unlisted = BTreeSet::new();
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
             counts.directory_entry_cap_exceeded_count,
@@ -28090,28 +26087,20 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A queued directory gone below its live parent, in a strictly
-                // later walk too, is a removal; its files settle one by one
-                // through the missing-parent rule.
-                if vanished_directory_removal()
-                    && matches!(
-                        claude_absence_is_removal(source, &directory.path),
-                        Parent::Live
-                    )
-                    && claude_vanished_confirmed(&index.withheld_memo, &traversal, &directory.path)
-                {
-                    disappearance_diagnostics::not_found_removal(
-                        source,
-                        disappearance_diagnostics::Site::WalkDirectory,
-                    );
-                } else {
-                    debt.unlisted();
-                    disappearance_diagnostics::not_found(
-                        &mut traversal.counts.disappeared_file_count,
-                        source,
-                        disappearance_diagnostics::Site::WalkDirectory,
-                    );
-                }
+                // A queued directory gone mid-walk still counts as a lost
+                // listing; its indexed subtree is offered to the absence proof.
+                debt.unlisted();
+                disappearance_diagnostics::not_found(
+                    &mut traversal.counts.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Site::WalkDirectory,
+                );
+                unlisted_index_keys(
+                    &index.files,
+                    &directory.path,
+                    &BTreeSet::new(),
+                    &mut unlisted,
+                );
                 continue;
             }
             Err(_) => {
@@ -28177,8 +26166,11 @@ fn advance_bounded_directory_traversal_with_budget(
                     .map(|entry| local_index_key(&entry.path())),
             )
             .collect();
+        // Listed names. A key missing only from a partial listing is just a
+        // nominee: the absence proof refuses any key still present.
+        let mut names = BTreeSet::new();
         for entry in entries {
-            let entry = match entry {
+            let entry = match directory_read_fault(&directory.path, false, entry) {
                 Ok(entry) => entry,
                 Err(_) => {
                     traversal
@@ -28188,7 +26180,8 @@ fn advance_bounded_directory_traversal_with_budget(
                 }
             };
             let path = entry.path();
-            let file_type = match entry.file_type() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+            let file_type = match directory_read_fault(&directory.path, true, entry.file_type()) {
                 Ok(file_type) => file_type,
                 Err(_) => {
                     traversal
@@ -28380,6 +26373,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
             }
         }
+        unlisted_index_keys(&index.files, &directory.path, &names, &mut unlisted);
     }
     debt.counts(&traversal.counts, relisted_counts.as_ref());
     restore(
@@ -28399,6 +26393,7 @@ fn advance_bounded_directory_traversal_with_budget(
         freshness.page_end(source, walk_ended, debt);
     }
     index.traversal = Some(traversal);
+    unlisted
 }
 
 /// A Claude transcript that is NotFound while its parent is still a real
@@ -28419,38 +26414,6 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
         Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => Parent::MetadataError,
         _ => Parent::Missing,
     }
-}
-
-/// Default OFF: a member below a deleted directory settles as a removal
-/// once a strictly later walk proves the same absence beneath the same pinned
-/// ancestor of a live configured root with no symlink, on its device, >=600 s
-/// on, even while discovery is still pending (deleted directories are found
-/// then). Every other case, including the first NotFound, stays loss as on main.
-fn claude_missing_parent_is_removal(index: &ScanIndex, parent: Parent, path: &Path) -> bool {
-    if !matches!(parent, Parent::Missing) || !vanished_directory_removal() {
-        return false;
-    }
-    let Some(walk) = index.traversal.as_ref() else {
-        return false;
-    };
-    if !claude_vanished_confirmed(&index.withheld_memo, walk, path) {
-        return false;
-    }
-    disappearance_diagnostics::parent_missing_removal(SnapshotSource::ClaudeCode);
-    true
-}
-
-/// Later-walk confirmation for a vanished member or queued directory.
-fn claude_vanished_confirmed(
-    memo: &withheld_account::Memo,
-    walk: &ScanTraversalCheckpoint,
-    path: &Path,
-) -> bool {
-    let Some(walk_window) = rfc3339_unix_seconds(&walk.census_window_end) else {
-        return false;
-    };
-    let ancestor = sampled_audit::absence_parent_on_root_device(path, &walk.scan_roots);
-    memo.vanished_absence_eligible(&local_index_key(path), ancestor, walk_window)
 }
 
 /// Mutable candidate-boundary owner plus the same bounded member view used by
@@ -28522,9 +26485,7 @@ fn candidate_from_traversal_path_at(
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
                 let parent = claude_absence_is_removal(source, &pending.path);
-                if parent.is_removal(&pending.path)
-                    || claude_missing_parent_is_removal(discovery.index, parent, &pending.path)
-                {
+                if parent.is_removal(&pending.path) {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);
@@ -28749,7 +26710,6 @@ fn reconcile_missing_index_entries_with_side(
         // An unobserved marked entry still needs positive filesystem proof;
         // unsafe ancestors, missing roots and permission failures keep debt.
         if !observed
-            && !index.decode_holds_file(key)
             && index
                 .files
                 .get(key)
@@ -29011,7 +26971,7 @@ impl<'a> DiscoveryRetention<'a> {
         stamp: Option<codex_fragment::Stamp>,
     ) {
         let key = local_index_key(path);
-        if self.account_holds.contains_key(&key) || vanished_directory_removal() {
+        if self.account_holds.contains_key(&key) {
             // This gate already has physical presence; invalidate an earlier
             // absence even if the file disappears again before page completion.
             if let Some(memo) = self.memo {
@@ -31820,7 +29780,8 @@ impl ScanIndex {
             .collect()
     }
 
-    /// Mirror the upload ledger's open head-CAS challenge sessions.
+    /// Mirror the upload ledger's open head-CAS challenge sessions that hold a
+    /// saved base, the only ones whose upload can carry the answer.
     pub(crate) fn activate_head_conflict_sessions(&mut self, sessions: BTreeSet<String>) {
         self.head_conflict_sessions = sessions;
     }
@@ -32203,21 +30164,6 @@ impl ScanIndex {
         now: SystemTime,
         custody: Option<bool>,
     ) -> Result<(Self, LoadOrigin)> {
-        if !path.exists() {
-            let persistence_root = scan_index_integration::check_missing(
-                path,
-                scan_index_source_label(source),
-                support_dir,
-                custody,
-            )?;
-            return Ok((
-                Self {
-                    persistence_root,
-                    ..Self::default()
-                },
-                LoadOrigin::Missing,
-            ));
-        }
         let _lock = CheckpointLock::acquire_with_custody(path, false, custody)?;
         let (v2_index, try_import) =
             state_v2::load_locked(path, support_dir.is_some(), _lock.custody)?;
@@ -32229,19 +30175,34 @@ impl ScanIndex {
             }
             return Ok((index, LoadOrigin::Loaded));
         }
-        let decoded =
-            read_scan_index_representation(path, "load", scan_index_source_label(source), None)
-                .map_err(|error| match error.downcast::<lenient_decode::Error>() {
-                    Ok(error) => error,
-                    Err(error)
-                        if error.chain().any(|cause| {
-                            cause.to_string() == "scan_index_representation_refused"
-                        }) =>
-                    {
-                        lenient_decode::Error::Refused("schema_version")
-                    }
-                    Err(_) => lenient_decode::Error::Refused("storage generation requires repair"),
-                });
+        let (decoded, origin) = if !path.exists() {
+            let persistence_root =
+                scan_index_integration::check_missing(path, scan_index_source_label(source))?;
+            (
+                Ok(Self {
+                    persistence_root,
+                    ..Self::default()
+                }),
+                LoadOrigin::Missing,
+            )
+        } else {
+            let decoded =
+                read_scan_index_representation(path, "load", scan_index_source_label(source), None)
+                    .map_err(|error| match error.downcast::<lenient_decode::Error>() {
+                        Ok(error) => error,
+                        Err(error)
+                            if error.chain().any(|cause| {
+                                cause.to_string() == "scan_index_representation_refused"
+                            }) =>
+                        {
+                            lenient_decode::Error::Refused("schema_version")
+                        }
+                        Err(_) => {
+                            lenient_decode::Error::Refused("storage generation requires repair")
+                        }
+                    });
+            (decoded, LoadOrigin::Loaded)
+        };
         match decoded {
             Ok(index) if index.schema_version != SCAN_INDEX_SCHEMA_VERSION => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
@@ -32287,7 +30248,7 @@ impl ScanIndex {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }
                 index.clear_retired_file_size_debt();
-                Ok((index, LoadOrigin::Loaded))
+                Ok((index, origin))
             }
             Err(error) if error.quarantines() => {
                 let cause = if matches!(error, lenient_decode::Error::HoldBudget) {
@@ -32704,10 +30665,9 @@ impl ScanIndex {
         &self,
         previous: &ScanIndex,
         snapshots: &[SnapshotItem],
-    ) -> (ScanIndex, BTreeSet<String>, BTreeSet<String>) {
+    ) -> (ScanIndex, BTreeSet<String>) {
         let mut staged = previous.clone();
         let mut changed = BTreeSet::new();
-        let mut held = BTreeSet::new();
         let by_source = snapshots
             .iter()
             .filter_map(|item| {
@@ -32779,59 +30739,13 @@ impl ScanIndex {
                 .or_default()
                 .push((key.clone(), capture));
         }
-        let bytes = |files: &SharedMap<String, ScanIndexEntry>| {
-            files
-                .values()
-                .flat_map(|entry| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                })
-        };
-        let mut retained = bytes(&staged.files);
         for (owner, entries) in by_owner {
-            let old = entries
-                .iter()
-                .filter_map(|(key, _)| staged.files.get(key))
-                .flat_map(|entry| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                });
-            let new = entries
-                .iter()
-                .flat_map(|(_, entry)| {
-                    [
-                        entry.codex_applied_tier_receipt.as_ref(),
-                        entry.codex_captured_tier_receipt.as_ref(),
-                    ]
-                })
-                .flatten()
-                .fold(0usize, |sum, receipt| {
-                    sum.saturating_add(receipt.retained_bytes())
-                });
-            let next = retained.saturating_sub(old).saturating_add(new);
-            if next > codex_file_join::MAX_RECEIPT_BYTES {
-                held.insert(owner);
-                continue;
-            }
-            retained = next;
             changed.insert(owner);
             for (key, entry) in entries {
                 staged.files.insert(key, entry);
             }
         }
-        (staged, changed, held)
+        (staged, changed)
     }
     pub(crate) fn reconcile_codex_recovery_settlement(
         &mut self,
@@ -34093,6 +32007,11 @@ impl ScanIndex {
         {
             return false;
         }
+        // A decode hold keeps the entry, its obligation and memo: nothing is
+        // released or disclosed as deleted while its stored record is unread.
+        if self.decode_holds_file(key) {
+            return false;
+        }
         let census_record = self.claude_request_census.get(key).is_some();
         let protected = self
             .files
@@ -34147,9 +32066,9 @@ impl ScanIndex {
     /// which drops its fingerprints and hold just as main's reconciliation
     /// does at the next healthy terminal. The hold is later dropped by a
     /// complete census. Returns false, retiring nothing, for an entry
-    /// without audit debt.
+    /// without audit debt or one a decode hold keeps.
     fn retire_vanished_claude_audit_debt_entry(&mut self, key: &str) -> bool {
-        if !self.persistence_available() {
+        if !self.persistence_available() || self.decode_holds_file(key) {
             return false;
         }
 
@@ -34919,35 +32838,13 @@ fn codex_rows_all(item: &SnapshotItem, mode: impl Fn(Option<&str>) -> bool) -> b
         && rows.all(|row| mode(row.auth_mode.as_deref()))
 }
 
-/// A Codex item's complete positive creator pair: (account, workspace).
-pub(crate) fn codex_creator_pair(item: &SnapshotItem) -> Option<(&str, &str)> {
-    let evidence = item.session_account_evidence.as_ref().filter(|evidence| {
-        evidence.evidence_source == "codex_creator_header:v1"
-            && !matches!(evidence.identity_disposition, Some("missing" | "conflict"))
-    })?;
-    Some((
-        evidence.account_identifier_hash.as_deref()?,
-        evidence.provider_workspace_hash.as_deref()?,
-    ))
-}
-
-/// Only exactly one slot matching the pair names it, by its login cause.
-fn codex_creator_slot(
-    account: &str,
-    workspace: &str,
-    slots: &[(String, String, usize)],
-) -> Result<SessionAccountBinding, usize> {
-    let mut matches = slots.iter().filter(|s| s.0 == account && s.1 == workspace);
-    match (matches.next(), matches.next()) {
-        (None, _) => Err(CREATOR_NO_MATCH),
-        (Some(_), Some(_)) => Err(CREATOR_MULTI_MATCH),
-        (Some(slot), None) if slot.2 != CREATOR_NAMED => Err(slot.2),
-        (Some(_), None) => Ok(SessionAccountBinding {
-            account_identifier_hash: account.to_string(),
-            workspace_identifier_hash: Some(workspace.to_string()),
-        }),
-    }
-}
+pub(crate) use sources::codex::identity::codex_creator_pair;
+use sources::codex::identity::{
+    codex_archive_path, codex_creator_slot, codex_digest_from_hex, codex_identity_at,
+    codex_reasoning_effort, codex_rollout_thread_id, codex_session_id_candidates_from_path,
+    codex_session_id_from_path, resolve_codex_identity, resolve_codex_identity_option,
+    safe_codex_agent_display_label,
+};
 
 mod scan_index;
 pub use scan_index::source_fingerprint::source_file_fingerprint;
@@ -34998,498 +32895,23 @@ fn first_prompt_title(source: SnapshotSource, value: &str, full_prompt: bool) ->
     normalize_display_title(normalized, "first_prompt")
 }
 
-/// The one state-row id a rollout path can name: its only UUID-shaped
-/// filename candidate. Codex state ids are UUIDs, so the timestamped raw
-/// reading of a modern name cannot name a state row.
-fn codex_rollout_thread_id(path: &Path) -> Option<String> {
-    let mut ids = codex_session_id_candidates_from_path(path)
-        .into_iter()
-        .filter(|identity| codex_identity_is_uuid_shaped(identity));
-    match (ids.next(), ids.next()) {
-        (Some(identity), None) => Some(identity),
-        _ => None,
-    }
-}
-
 mod scan;
 use scan::source_session_id::codex_identity_is_uuid_shaped;
 
-/// Resolve one raw Codex session/thread identity to its comparison key.
-///
-/// Codex UUIDs are ASCII hex and are semantically case-insensitive. Restrict
-/// normalization to the exact hyphenated UUID shape so arbitrary provider or
-/// future non-UUID identifiers remain byte-exact and cannot acquire aliases
-/// through Unicode or general-purpose case folding.
-fn resolve_codex_identity(value: &str) -> String {
-    if codex_identity_is_uuid_shaped(value) {
-        value.to_ascii_lowercase()
-    } else {
-        value.to_string()
-    }
-}
-
-fn resolve_codex_identity_option(value: Option<String>) -> Option<String> {
-    value.map(|value| resolve_codex_identity(value.as_str()))
-}
-
-/// Parse every identity allowed by the provider filename grammars without
-/// discarding bytes on a timestamp guess. Current rollouts use
-/// `rollout-YYYY-MM-DDTHH-MM-SS-<identity>.jsonl`; legacy rollouts use
-/// `rollout-<identity>.jsonl`. A timestamp-shaped legacy identity therefore
-/// yields both the complete legacy remainder and the modern remainder. Callers
-/// with trusted state/header evidence must select the unique supported key.
-fn codex_session_id_candidates_from_path(path: &Path) -> Vec<String> {
-    let logical;
-    let path = if codex_archive_path(path) {
-        logical = path.with_extension("");
-        logical.as_path()
-    } else {
-        path
-    };
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return Vec::new();
-    };
-    let Some(raw_identity) = stem.strip_prefix("rollout-") else {
-        return Vec::new();
-    };
-    if raw_identity.is_empty() {
-        return Vec::new();
-    }
-    let bytes = raw_identity.as_bytes();
-    let timestamp_prefix = bytes.len() > 20
-        && bytes[0..4].iter().all(u8::is_ascii_digit)
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(u8::is_ascii_digit)
-        && bytes[10] == b'T'
-        && bytes[11..13].iter().all(u8::is_ascii_digit)
-        && bytes[13] == b'-'
-        && bytes[14..16].iter().all(u8::is_ascii_digit)
-        && bytes[16] == b'-'
-        && bytes[17..19].iter().all(u8::is_ascii_digit)
-        && bytes[19] == b'-';
-    let mut candidates = vec![resolve_codex_identity(raw_identity)];
-    if timestamp_prefix {
-        let modern_identity = &raw_identity[20..];
-        if !modern_identity.is_empty() {
-            let modern_identity = resolve_codex_identity(modern_identity);
-            if !candidates.contains(&modern_identity) {
-                candidates.push(modern_identity);
-            }
-        }
-    }
-    candidates
-}
-
-/// Return a path identity only when the filename grammar is syntactically
-/// unique. Timestamp-shaped names require state/header evidence and are never
-/// shortened by this evidence-free helper.
-fn codex_session_id_from_path(path: &Path) -> Option<String> {
-    let candidates = codex_session_id_candidates_from_path(path);
-    (candidates.len() == 1).then(|| candidates[0].clone())
-}
-
-/// Where a Claude Code subagent transcript sits inside its parent session's
-/// on-disk tree.
-///
-/// Claude Code writes exactly four JSONL layouts under `~/.claude/projects`:
-///
-/// 1. `<projectDir>/<sessionId>.jsonl` — the human top-level session.
-/// 2. `<projectDir>/<sessionId>/subagents/agent-<agentId>.jsonl` — Task tool.
-/// 3. `<projectDir>/<sessionId>/subagents/workflows/<wfId>/agent-<agentId>.jsonl`
-///    — Workflow tool (dynamic multi-agent orchestration).
-/// 4. `<projectDir>/<sessionId>/subagents/workflows/<wfId>/journal.jsonl` — the
-///    Workflow tool's bookkeeping log (no usage rows; excluded from snapshots,
-///    see `claude_transcript_excluded_from_snapshots`).
-///
-/// Every line of layouts 2-4 is stamped with the *parent's* `sessionId`, so the
-/// path -- not the file contents -- is the authority on which session a
-/// transcript belongs to. `root_session_id` is therefore read from the directory
-/// whose child is `subagents`; the in-file `sessionId` is corroboration only and
-/// is deliberately never used to build the id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClaudeSubagentIdentity {
-    /// Directory name of the top-level session that owns this `subagents` tree.
-    /// Always the raw human-session UUID, at any nesting depth.
-    root_session_id: String,
-    /// The transcript's file stem, e.g. `agent-a4d1585d310070d0f`. Stems are
-    /// unique within one parent session across all of its subagent directories.
-    file_stem: String,
-    /// The `wf_*` directory name when the transcript sits under a `workflows/`
-    /// directory inside the `subagents` tree (layout 3), else `None`.
-    workflow_ref: Option<String>,
-}
-
-impl ClaudeSubagentIdentity {
-    /// The re-keyed `source_session_id`, `<parentSessionId>_<fileStem>`.
-    ///
-    /// The id must stay URL-path-safe: the backend uses `source_session_id`
-    /// verbatim as its `Session.session_id`, which rides in
-    /// `/sessions/{session_id}/...` routes, so the join uses `_` (never `/`).
-    /// The scheme is unchanged from v13 so ids already minted for layout 2 keep
-    /// resolving to the same backend session.
-    fn source_session_id(&self) -> String {
-        format!("{}_{}", self.root_session_id, self.file_stem)
-    }
-
-    /// The bare provider agent id (`agent-` prefix stripped), when the stem
-    /// carries one.
-    fn agent_ref(&self) -> Option<&str> {
-        self.file_stem
-            .strip_prefix("agent-")
-            .filter(|value| !value.is_empty())
-    }
-}
-
-/// Resolve a Claude Code transcript path to its subagent identity.
-///
-/// Fires when ANY ancestor directory (not merely the immediate parent) is named
-/// `subagents`, which is what separates this from the v13 behaviour: layouts 3
-/// and 4 nest one or two directories deeper and were previously left keyed on
-/// their parent's `sessionId`. Ordinary top-level transcripts return `None` and
-/// keep their raw in-file `sessionId`.
-pub(crate) fn claude_subagent_identity(path: &Path) -> Option<ClaudeSubagentIdentity> {
-    let file_stem = path.file_stem()?.to_str()?;
-    if file_stem.is_empty() {
-        return None;
-    }
-    let directories: Vec<&str> = path
-        .parent()?
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect();
-    // Nearest enclosing `subagents` directory wins, so a project directory that
-    // happens to contain the word higher up cannot capture the transcript.
-    let marker = directories
-        .iter()
-        .rposition(|value| *value == "subagents")?;
-    let root_session_id = *directories.get(marker.checked_sub(1)?)?;
-    if root_session_id.is_empty() {
-        return None;
-    }
-    // Segments BETWEEN `subagents` and the file. Layout 2 has none; layout 3/4
-    // has `workflows/<wfId>`.
-    let nested = &directories[marker + 1..];
-    let workflow_ref = nested
-        .iter()
-        .position(|value| *value == "workflows")
-        .and_then(|index| nested.get(index + 1))
-        .filter(|value| !value.is_empty())
-        .map(|value| (*value).to_string());
-    Some(ClaudeSubagentIdentity {
-        root_session_id: root_session_id.to_string(),
-        file_stem: file_stem.to_string(),
-        workflow_ref,
-    })
-}
+#[cfg(test)]
+use sources::claude::subagent_identity::claude_subagent_source_session_id;
+pub(crate) use sources::claude::subagent_identity::{
+    claude_subagent_identity, claude_transcript_excluded_from_snapshots,
+};
+use sources::claude::subagent_identity::{
+    claude_subagent_sidecar_fingerprint, claude_workflow_agent_label, read_claude_agent_meta,
+};
 
 pub(crate) use scan::source_session_id::snapshot_source_session_id;
 
 #[cfg(test)]
 #[path = "snapshots/source_session_id_tests.rs"]
 mod source_session_id_tests;
-
-/// Convenience wrapper: the re-keyed `source_session_id` for a subagent
-/// transcript, or `None` for an ordinary top-level transcript. The production
-/// path uses `claude_subagent_identity` directly because it also needs the
-/// workflow and agent references.
-#[cfg(test)]
-fn claude_subagent_source_session_id(path: &Path) -> Option<String> {
-    claude_subagent_identity(path).map(|identity| identity.source_session_id())
-}
-
-/// Claude transcripts that must never produce a snapshot.
-///
-/// The Workflow tool's `journal.jsonl` (layout 4) is bookkeeping, not a
-/// transcript: it has no `message.usage` rows and no `sessionId` field at all,
-/// and its `journal` file stem is NOT unique within a parent session -- a
-/// session with two workflow directories has two `journal.jsonl` files that
-/// would both re-key to `<parentSessionId>_journal` and fight over one backend
-/// session. Excluding it at collection time keeps that id from ever existing.
-pub(crate) fn claude_transcript_excluded_from_snapshots(path: &Path) -> bool {
-    path.file_name().and_then(|value| value.to_str()) == Some("journal.jsonl")
-        && claude_subagent_identity(path).is_some()
-}
-
-/// Upper bound for a subagent `*.meta.json` sidecar read. The observed files are
-/// a few hundred bytes; the cap only stops a pathological local file from being
-/// slurped into the per-user daemon.
-const MAX_CLAUDE_AGENT_META_BYTES: u64 = 64 * 1024;
-
-/// Provider-written sidecar describing one Claude Code subagent, read from
-/// `<transcript>.meta.json` (e.g. `agent-a4d15....meta.json`).
-///
-/// Only the fields that are safe to forward are retained. `worktreePath` and
-/// `worktreeBranch` are deliberately NOT read: they carry local filesystem
-/// paths. `description` (the Task tool's 3-8 word task summary) IS read as
-/// display-title material — an operator decision (2026-07-27) that partially
-/// revisits the original exclusion: short agent titles are wanted, full prompt
-/// bodies and paths stay out, and `safe_claude_agent_display_label` enforces
-/// that shape (char allowlist + hard truncation) so a pathological description
-/// cannot smuggle prompt content.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ClaudeAgentMeta {
-    /// `agentType`, e.g. `workflow-subagent`, `Explore`, `general-purpose`.
-    agent_kind: Option<String>,
-    /// `spawnDepth` rendered as a string (1 for a directly spawned agent).
-    spawn_depth: Option<String>,
-    /// `parentAgentId` when this agent was spawned by another agent rather than
-    /// by the top-level session.
-    parent_agent_id: Option<String>,
-    /// `description` — the short title-shaped Task summary (e.g. "Fix flaky
-    /// backend tests"). Sanitized display-label material, never a prompt body.
-    description: Option<String>,
-}
-
-/// Best-effort read of a subagent's `*.meta.json` sidecar.
-///
-/// Every failure mode (absent file, oversized file, unreadable bytes, invalid
-/// JSON, unexpected value types, unsafe characters) degrades to an absent field.
-/// A malformed sidecar must never drop or fail the session it describes.
-fn read_claude_agent_meta(transcript_path: &Path) -> ClaudeAgentMeta {
-    let meta_path = transcript_path.with_extension("meta.json");
-    let Ok(metadata) = fs::metadata(&meta_path) else {
-        return ClaudeAgentMeta::default();
-    };
-    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_AGENT_META_BYTES {
-        return ClaudeAgentMeta::default();
-    }
-    let Ok(file) = File::open(&meta_path) else {
-        return ClaudeAgentMeta::default();
-    };
-    // Bounded read, never a slurp: the same streaming discipline the transcript
-    // reader uses, so a sidecar that grew pathologically cannot be materialized
-    // whole in the per-user daemon.
-    let mut raw = Vec::new();
-    if file
-        .take(MAX_CLAUDE_AGENT_META_BYTES)
-        .read_to_end(&mut raw)
-        .is_err()
-    {
-        return ClaudeAgentMeta::default();
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
-        return ClaudeAgentMeta::default();
-    };
-    ClaudeAgentMeta {
-        agent_kind: string_at(&value, &["agentType"]).and_then(safe_attribution_token),
-        spawn_depth: value
-            .get("spawnDepth")
-            .and_then(Value::as_u64)
-            .map(|depth| depth.to_string()),
-        parent_agent_id: string_at(&value, &["parentAgentId"]).and_then(safe_attribution_token),
-        description: string_at(&value, &["description"]).and_then(safe_claude_agent_display_label),
-    }
-}
-
-/// Hard cap for a subagent display label (workflow `label` or Task
-/// `description`). Longer values are truncated, not rejected: the leading
-/// characters of a title-shaped value are still a useful title, and the cap is
-/// what keeps a pathological description from smuggling prompt content.
-const MAX_CLAUDE_AGENT_LABEL_CHARS: usize = 80;
-
-/// Sanitize a provider-supplied subagent display label.
-///
-/// Unlike `safe_attribution_token` (identifiers only), a label is short human
-/// text: whitespace is collapsed, then the value must pass a conservative
-/// printable-ASCII allowlist — anything with control characters, non-ASCII, or
-/// separator-smuggling backslashes is dropped rather than repaired. Values are
-/// truncated to `MAX_CLAUDE_AGENT_LABEL_CHARS`, and anything that still looks
-/// like a path escapes the allowlist via the same forbidden fragments the
-/// attribution tokens use.
-fn safe_claude_agent_display_label(value: String) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    if !normalized.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                ' ' | '.'
-                    | ','
-                    | ':'
-                    | ';'
-                    | '_'
-                    | '-'
-                    | '+'
-                    | '#'
-                    | '('
-                    | ')'
-                    | '\''
-                    | '&'
-                    | '/'
-                    | '?'
-                    | '!'
-            )
-    }) {
-        return None;
-    }
-    let truncated: String = normalized
-        .chars()
-        .take(MAX_CLAUDE_AGENT_LABEL_CHARS)
-        .collect();
-    let lowered = truncated.to_ascii_lowercase();
-    if crate::session_attribution::ATTRIBUTION_FORBIDDEN_FRAGMENTS
-        .iter()
-        .any(|fragment| lowered.contains(fragment))
-        || lowered.contains("/users/")
-        || lowered.contains("/home/")
-    {
-        return None;
-    }
-    Some(truncated)
-}
-
-/// Derive a useful, content-free label from Codex's logical agent path.
-///
-/// `spawn_agent` constrains task names to compact tokens and records them as
-/// `/root/<task_name>` (possibly with more nested agent segments). Only the
-/// final token is retained; nicknames, parent titles, and task prompts are not
-/// used. Requiring the logical `root` prefix prevents arbitrary filesystem
-/// paths from becoming title material.
-fn safe_codex_agent_display_label(agent_path: String) -> Option<String> {
-    let parts = agent_path
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.len() < 2 || parts.first().copied() != Some("root") {
-        return None;
-    }
-    if parts[1..].iter().any(|part| {
-        part.is_empty()
-            || part.len() > MAX_CLAUDE_AGENT_LABEL_CHARS
-            || !part.chars().all(|character| {
-                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
-            })
-    }) {
-        return None;
-    }
-    let task_name = parts.last().copied()?;
-    if task_name == "root" {
-        return None;
-    }
-    safe_claude_agent_display_label(task_name.replace('_', " "))
-}
-
-/// Upper bound for a Workflow run-manifest read (`workflows/wf_*.json`).
-/// Observed manifests are a few hundred KB (they carry per-agent progress rows
-/// including result previews); the cap only stops a pathological file from
-/// being slurped into the per-user daemon.
-const MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
-
-/// `<sessionDir>/workflows/<wfId>.json` — the Workflow tool's run manifest,
-/// sibling of the `subagents/` tree that holds the agent transcripts. Resolved
-/// from the transcript path by walking up to the nearest `subagents` ancestor
-/// (the same anchor `claude_subagent_identity` keys on).
-fn claude_workflow_manifest_path(transcript_path: &Path, workflow_ref: &str) -> Option<PathBuf> {
-    let mut directory = transcript_path.parent();
-    while let Some(current) = directory {
-        if current.file_name().and_then(|value| value.to_str()) == Some("subagents") {
-            return Some(
-                current
-                    .parent()?
-                    .join("workflows")
-                    .join(format!("{workflow_ref}.json")),
-            );
-        }
-        directory = current.parent();
-    }
-    None
-}
-
-/// The human-readable label a Workflow run assigned to one of its agents (e.g.
-/// `probe:data-model`, `verify:daemon-scan-claim`).
-///
-/// Labels are durably recorded in the run manifest's `workflowProgress` array
-/// as `{type:"workflow_agent", agentId, label, ...}` rows — the agent's own
-/// `meta.json` sidecar does NOT carry them. Only `label` is extracted; the
-/// prompt/result previews that ride the same rows are never read past the
-/// serde parse. Best-effort: every failure mode degrades to `None`.
-fn claude_workflow_agent_label(
-    transcript_path: &Path,
-    identity: &ClaudeSubagentIdentity,
-) -> Option<String> {
-    let workflow_ref = identity.workflow_ref.as_deref()?;
-    let agent_ref = identity.agent_ref()?;
-    let manifest_path = claude_workflow_manifest_path(transcript_path, workflow_ref)?;
-    let metadata = fs::metadata(&manifest_path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES {
-        return None;
-    }
-    let file = File::open(&manifest_path).ok()?;
-    let mut raw = Vec::new();
-    file.take(MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES)
-        .read_to_end(&mut raw)
-        .ok()?;
-    let value = serde_json::from_slice::<Value>(&raw).ok()?;
-    let progress = value.get("workflowProgress")?.as_array()?;
-    progress
-        .iter()
-        .find(|entry| {
-            string_eq_at(entry, &["type"], "workflow_agent")
-                && string_eq_at(entry, &["agentId"], agent_ref)
-        })
-        .and_then(|entry| string_at(entry, &["label"]))
-        .and_then(safe_claude_agent_display_label)
-}
-
-/// `size:mtime_nanos` stat token for a naming-material sidecar, or empty when
-/// the file is absent/unreadable. Stat-only on purpose: this runs during
-/// candidate enumeration for every subagent transcript on every scan cycle, so
-/// it must never read file contents.
-fn file_stat_token(path: &Path) -> String {
-    fs::metadata(path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| {
-            let nanos = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_nanos())
-                .unwrap_or_default();
-            format!("{}:{nanos}", metadata.len())
-        })
-        .unwrap_or_default()
-}
-
-/// Scan-fingerprint contribution of a subagent transcript's naming material:
-/// the `meta.json` sidecar (Task `description` / `agentType`) and the Workflow
-/// run manifest (agent `label`). Changing either re-selects the transcript even
-/// when the transcript bytes are unchanged.
-fn claude_subagent_sidecar_fingerprint(
-    transcript_path: &Path,
-    identity: &ClaudeSubagentIdentity,
-    claude_effort_support_dir: Option<&Path>,
-) -> String {
-    let meta_stat = file_stat_token(&transcript_path.with_extension("meta.json"));
-    let manifest_stat = identity
-        .workflow_ref
-        .as_deref()
-        .and_then(|workflow_ref| claude_workflow_manifest_path(transcript_path, workflow_ref))
-        .map(|manifest_path| file_stat_token(&manifest_path))
-        .unwrap_or_default();
-    // Claude emits Task/Workflow API-request telemetry under the root session
-    // id. Make every explicit child depend on that same sidecar so late account
-    // evidence re-selects the complete family, even if the child transcript was
-    // indexed before the final provider event arrived.
-    let effort_fingerprint = claude_effort_support_dir
-        .map(|support_dir| {
-            claude_usage_sidecars_fingerprint(support_dir, &identity.root_session_id)
-        })
-        .unwrap_or_default();
-    sha256_hex(&[
-        "claude_subagent_sidecar:v2",
-        &meta_stat,
-        &manifest_stat,
-        &effort_fingerprint,
-    ])
-}
 
 fn claude_usage_sidecars_fingerprint(support_dir: &Path, session_id: &str) -> String {
     let api = crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id);
@@ -35504,81 +32926,7 @@ fn claude_usage_sidecars_fingerprint(support_dir: &Path, session_id: &str) -> St
     }
 }
 
-/// Conservative allowlist for provider-supplied identifiers that become
-/// attribution fact values. Anything outside `[A-Za-z0-9._:-]`, or longer than
-/// 64 characters, is dropped rather than sanitized: a value that does not look
-/// like a provider identifier is not one, and no local path can survive this.
-fn safe_attribution_token(value: String) -> Option<String> {
-    if value.is_empty() || value.len() > 64 {
-        return None;
-    }
-    if !value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-')
-    }) {
-        return None;
-    }
-    let lowered = value.to_ascii_lowercase();
-    crate::session_attribution::ATTRIBUTION_FORBIDDEN_FRAGMENTS
-        .iter()
-        .all(|fragment| !lowered.contains(fragment))
-        .then_some(value)
-}
-
 use scan::json_fields::{string_at, string_eq_at, u64_at};
-
-/// Read provider identity bytes without the display/config normalization in
-/// `string_at`. Empty is absent; every other string, including leading or
-/// trailing whitespace and Unicode, reaches `resolve_codex_identity` intact.
-fn codex_identity_at(value: &Value, path: &[&str]) -> Option<String> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    match current {
-        Value::String(value) if !value.is_empty() => Some(value.clone()),
-        _ => None,
-    }
-}
-
-// Per-turn Codex reasoning effort tier. Codex emits it co-located with the
-// turn's `total_token_usage` (token_count.info / payload.info) and also on the
-// `turn_context` payload (directly as `effort` or nested under
-// collaboration_mode.settings.reasoning_effort). Read the usage-co-located form
-// first so the effort attaches to the same turn's usage row.
-fn codex_reasoning_effort(value: &Value) -> Option<String> {
-    string_at(value, &["token_count", "info", "reasoning_effort"])
-        .or_else(|| string_at(value, &["payload", "info", "reasoning_effort"]))
-        .or_else(|| string_at(value, &["turn_context", "payload", "effort"]))
-        .or_else(|| string_at(value, &["payload", "effort"]))
-        .or_else(|| {
-            string_at(
-                value,
-                &[
-                    "turn_context",
-                    "payload",
-                    "collaboration_mode",
-                    "settings",
-                    "reasoning_effort",
-                ],
-            )
-        })
-        // Rollout `turn_context` lines carry `payload` at the top level (no
-        // wrapping `turn_context` key) — mirror how the model field is read via
-        // both `turn_context.payload.model` and the unwrapped `payload.model`.
-        .or_else(|| {
-            string_at(
-                value,
-                &[
-                    "payload",
-                    "collaboration_mode",
-                    "settings",
-                    "reasoning_effort",
-                ],
-            )
-        })
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
 
 #[cfg(test)]
 use scan_index::file_set_digest::snapshot_file_entity_set_digest;
@@ -35587,26 +32935,6 @@ use scan_index::file_set_digest::{
     snapshot_file_upload_body_set_digest, snapshot_file_upload_body_set_hex,
     update_length_prefixed, PrefixDigest,
 };
-
-/// Lower-case 64-hex only.
-fn codex_digest_from_hex(hex: &str) -> Option<PrefixDigest> {
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let mut out = [0_u8; 32];
-    for (at, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
-fn codex_archive_path(path: &Path) -> bool {
-    is_compressed_codex_rollout(Some(path), None)
-}
 
 pub fn paths_from_events(
     source: SnapshotSource,
@@ -46805,6 +44133,46 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [regress] A file past the former 65,536-request limit keeps every owned
+    /// request and certifies complete cache coverage.
+    #[test]
+    fn cache_codex_file_past_former_request_limit_keeps_every_request() {
+        let root = temp_dir("cache-codex-request-limit");
+        let id = "00000000-0000-7000-8000-000000000002";
+        let path = root.join(format!("rollout-{id}.jsonl"));
+        let mut body = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","timestamp":"2026-09-30T00:00:00Z","payload":{"id":id}}),
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}})
+        );
+        let requests = 65_537;
+        for index in 0..requests {
+            let n = index as u64 + 1;
+            let timestamp = format!(
+                "2026-09-30T{:02}:{:02}:{:02}Z",
+                n / 3600,
+                n / 60 % 60,
+                n % 60
+            );
+            body.push_str(&format!(
+                "{}\n{}\n",
+                json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"cache_write_input_tokens":0,"output_tokens":1}}}),
+                json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*n,"cached_input_tokens":90_000*n,"output_tokens":n},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":90_000,"output_tokens":1}}}})
+            ));
+        }
+        fs::write(&path, body).unwrap();
+        let parsed = parse_codex_test(&path);
+        fs::remove_dir_all(root).unwrap();
+        assert!(parsed.report.complete());
+        let item = &parsed.snapshots[0];
+        assert_eq!(item.cache_requests.len(), requests);
+        assert!(item.cache_requests_complete);
+        assert_eq!(
+            item.cache_observations.as_ref().unwrap().coverage,
+            "complete"
+        );
     }
 
     #[test]
@@ -58623,7 +55991,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     codex_parent_session_ref,
     source_session_id_seen);
-crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
+crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);

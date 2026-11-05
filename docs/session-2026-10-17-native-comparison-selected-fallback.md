@@ -1,5 +1,7 @@
 # Deferred-only native comparison cut (2026-10-18)
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 The current candidate uses selected C3 fallback on every genuine hit; no
 optional target bodies are acquired in that pass. Process-only family policy
 latched across selected saves guarantees BASE recovery and the existing bounded
@@ -18,7 +20,7 @@ includes enablement only on validated layouts; installed behavior is unchanged. 
 The old literal additive-equality diagnostic remains FAIL/SUPERSEDED: exact
 identity and own-body ACK conservation pass, while BASE's fixed nonterminal
 ordering does not reach the candidate's earned terminal curves in three ordinary
-followups. See [the current contract](development/native-comparison-driver.md).
+followups. See the historical contract described below.
 
 The earlier source checkpoint is retained in Git history. No persisted schema,
 provider/account action, replay, release or installed-runtime change is part of

@@ -213,7 +213,7 @@ fn bootstrap_cache_heads_with_budget(
                 |item| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |item| Some(item.source_session_id.as_str()),
-                |_| false,
+                |_| 0,
                 |_| None,
                 inplace_retry,
                 |items| upload(items, enforce_head_cas),
@@ -941,7 +941,6 @@ pub(crate) fn accept_account_release_for_test(
     scan: &mut SourceScanResult,
     cache: &crate::snapshots::sampled_scan::SharedCache,
     roots: &[PathBuf],
-    fallback: Option<&mut crate::snapshots::claude_native_comparison::SelectedFallback>,
 ) -> ScanIndex {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
     progress.accepted_fingerprints.extend(
@@ -952,11 +951,6 @@ pub(crate) fn accept_account_release_for_test(
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     let mut settled = settle_completed_upload(index, previous, &progress, &holds);
     assert!(settled.fully_settled);
-    if let Some(fallback) = fallback {
-        fallback
-            .restore_selected(&mut settled.index, previous)
-            .unwrap();
-    }
     scan.preserve_released_account_audits(
         &mut settled.index,
         previous,
@@ -974,7 +968,6 @@ pub(crate) fn checkpoint_account_release_for_test(
     scan: &mut SourceScanResult,
     cache: &crate::snapshots::sampled_scan::SharedCache,
     roots: &[PathBuf],
-    fallback: &mut crate::snapshots::claude_native_comparison::SelectedFallback,
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
@@ -992,7 +985,6 @@ pub(crate) fn checkpoint_account_release_for_test(
         paths.1,
         || Ok(()),
         None,
-        Some(NativeSelectedRestore::Logical(fallback)),
         Some(UnsettledUploadCause::UploadError),
         Some(AccountAuditRelease {
             previous,
@@ -1173,19 +1165,14 @@ struct SelectedSettlementInputs<'a> {
     cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
-    comparison: Option<&'a mut crate::snapshots::claude_native_comparison::Completion>,
     audit_release: Option<AccountAuditRelease<'a>>,
 }
 
 /// The finish order after save selection, shared with the proof-correction
 /// pipeline harness so its regressions guard this order: correction settle,
-/// native paid restore, account-audit release (which can clear a drained
-/// entry's revision), then the body-drain restore. Returns whether the page
-/// is fully settled.
-fn finish_selected_settlement(
-    index: &mut ScanIndex,
-    inputs: SelectedSettlementInputs<'_>,
-) -> Result<bool, crate::source_rotation::LocalRefusal> {
+/// account-audit release (which can clear a drained entry's revision), then the
+/// body-drain restore. Returns whether the page is fully settled.
+fn finish_selected_settlement(index: &mut ScanIndex, inputs: SelectedSettlementInputs<'_>) -> bool {
     let SelectedSettlementInputs {
         scan,
         committed_index,
@@ -1194,7 +1181,6 @@ fn finish_selected_settlement(
         cutoff_candidates,
         transport_fully_settled,
         mut body_drains,
-        comparison,
         audit_release,
     } = inputs;
     let mut fully_settled = settle_upload_corrections_after_selection(
@@ -1207,11 +1193,6 @@ fn finish_selected_settlement(
         transport_fully_settled,
         &mut body_drains,
     );
-    if let Some(comparison) = comparison {
-        if comparison.restore_selected_paid(index, committed_index)? {
-            fully_settled = false;
-        }
-    }
     if let Some(release) = audit_release {
         scan.preserve_released_account_audits(
             index,
@@ -1227,7 +1208,7 @@ fn finish_selected_settlement(
     if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
     }
-    Ok(fully_settled)
+    fully_settled
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -1346,6 +1327,20 @@ fn identity_cache_wire_reserve(
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
+}
+
+/// Request class of one main-upload body: 2 for a legacy reconciliation,
+/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
+/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
+/// for a whole request when one body carries a patch, so the packer never
+/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
+/// with a server head it never claimed.
+fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+    if legacy {
+        2
+    } else {
+        u8::from(crate::snapshot_client::declares_head_cas(snapshot))
+    }
 }
 
 /// Answer each owed head-CAS challenge on the outgoing body of its session.
@@ -3521,11 +3516,10 @@ pub(crate) fn decode_hold_manifest_published_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn comparison_partial_fallback_for_test(
+pub(crate) fn checkpoint_unselected_for_test(
     index: &ScanIndex,
     committed: &ScanIndex,
     scan: &SourceScanResult,
-    fallback: &mut crate::snapshots::claude_native_comparison::SelectedFallback,
     index_path: &Path,
     progress_path: &Path,
 ) -> Result<ScanIndex> {
@@ -3546,7 +3540,6 @@ pub(crate) fn comparison_partial_fallback_for_test(
         progress_path,
         || Ok(()),
         None,
-        Some(NativeSelectedRestore::Logical(fallback)),
         None,
         None,
         Default::default(),
@@ -3582,30 +3575,8 @@ fn checkpoint_partial_snapshot_index(
         None,
         None,
         None,
-        None,
         Default::default(),
     )
-}
-
-enum NativeSelectedRestore<'a> {
-    Paid(&'a mut crate::snapshots::claude_native_comparison::Completion),
-    // Primitive save fixtures carry no source/lifecycle admission claim.
-    #[cfg(test)]
-    Logical(&'a mut crate::snapshots::claude_native_comparison::SelectedFallback),
-}
-impl NativeSelectedRestore<'_> {
-    fn restore(self, index: &mut ScanIndex, previous: &ScanIndex) -> Result<()> {
-        match self {
-            Self::Paid(completion) => completion
-                .restore_selected_paid(index, previous)
-                .map(|_| ())
-                .map_err(anyhow::Error::from),
-            #[cfg(test)]
-            Self::Logical(fallback) => fallback
-                .restore_selected(index, previous)
-                .map_err(|reason| anyhow!(reason)),
-        }
-    }
 }
 
 /// Fixed labels for the partial-checkpoint steps whose own error carries no
@@ -3613,21 +3584,19 @@ impl NativeSelectedRestore<'_> {
 /// fixed messages naming the partial checkpoint (listed in
 /// `PARTIAL_CHECKPOINT_FAILURES`).
 const CHECKPOINT_PROGRESS_LOCK: &str = "partial checkpoint: acquire progress lock";
-const CHECKPOINT_NATIVE_RESTORE: &str = "partial checkpoint: restore native selection";
 const CHECKPOINT_ACK_HANDOFF: &str = "partial checkpoint: stage ACK retirement handoff";
 const CHECKPOINT_VALIDATE_DESTINATION: &str = "partial checkpoint: validate destination";
 const CHECKPOINT_INDEX_SAVE: &str = "partial checkpoint: save scan index";
 
 /// Every partial-checkpoint failure label `safe_error` may print, so a failed
 /// checkpoint names its step instead of the bare "sync failed".
-const PARTIAL_CHECKPOINT_FAILURES: [&str; 10] = [
+const PARTIAL_CHECKPOINT_FAILURES: [&str; 9] = [
     CHECKPOINT_PROGRESS_LOCK,
     "read snapshot progress for partial checkpoint",
     "parse snapshot progress for partial checkpoint",
     "partial checkpoint lacks a source witness",
     "snapshot progress changed before partial checkpoint",
     "conflicting snapshot bodies before partial checkpoint",
-    CHECKPOINT_NATIVE_RESTORE,
     CHECKPOINT_ACK_HANDOFF,
     CHECKPOINT_VALIDATE_DESTINATION,
     CHECKPOINT_INDEX_SAVE,
@@ -3648,7 +3617,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
-    fallback: Option<NativeSelectedRestore<'_>>,
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
@@ -3733,11 +3701,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         // Settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
-    }
-    if let Some(fallback) = fallback {
-        fallback
-            .restore(&mut committable, committed_index)
-            .context(CHECKPOINT_NATIVE_RESTORE)?;
     }
     if let (Some(scan), Some(release)) = (correction_scan, audit_release) {
         scan.preserve_released_account_audits(
@@ -5059,23 +5022,7 @@ fn sync_once_with_retry(
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
-    let enabled_sources = enabled_snapshot_sources(&device);
-
-    if let Some(source) = enabled_sources.first().copied() {
-        if let Err(error) = upload_local_health_projection_reporting(
-            &client,
-            &device,
-            &device_secret,
-            source,
-            &machine_id,
-            daemon,
-        ) {
-            eprintln!(
-                "local health projection upload skipped: {}",
-                safe_error(&error)
-            );
-        }
-    }
+    let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
 
     // Cycle-start scan receipts: one cheap non-terminal status per enabled
     // source before any scanning. Sources late in the sequential cycle would
@@ -5133,6 +5080,33 @@ fn sync_once_with_retry(
     }
     continuation_cycle.succeeded(enabled_sources.contains(&SnapshotSource::Codex));
     Ok(())
+}
+
+/// The cycle's heartbeat, then the sources this cycle collects: an OFF its
+/// reply carries stops that source in this same cycle.
+fn cycle_heartbeat(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Vec<SnapshotSource> {
+    if let Some(source) = heartbeat_source(device) {
+        if let Err(error) = upload_local_health_projection_reporting(
+            client,
+            device,
+            device_secret,
+            source,
+            machine_id,
+            daemon,
+        ) {
+            eprintln!(
+                "local health projection upload skipped: {}",
+                safe_error(&error)
+            );
+        }
+    }
+    enabled_snapshot_sources(device)
 }
 
 /// The cycle's API client, with the receipt state and context every cycle uses.
@@ -5322,7 +5296,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn prepare(
         &mut self,
         source: SnapshotSource,
-        remaining: Option<usize>,
+        _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
         if source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
@@ -5336,7 +5310,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             &self.account_witness,
             self.daemon,
         )?;
-        let mut prepared = prepare_sync_source(
+        prepare_sync_source(
             self.client,
             self.device,
             self.device_secret,
@@ -5348,11 +5322,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.transport_cycle,
             self.account_witness,
             self.retry.enabled(),
-        )?;
-        if let Some(frame) = prepared.as_mut() {
-            frame.accept_native_rotation_turn(remaining);
-        }
-        Ok(prepared)
+        )
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
         ensure_snapshot_scan_authority(
@@ -5365,10 +5335,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn step(
         &mut self,
-        mut frame: SourcePreparation,
-        remaining: Option<usize>,
+        frame: SourcePreparation,
+        _remaining: Option<usize>,
     ) -> crate::source_rotation::Step<SourcePreparation, Self::Completed> {
-        frame.accept_native_rotation_turn(remaining);
         match frame.step() {
             SourcePreparationStep::Pending(frame) => crate::source_rotation::Step::Pending(frame),
             SourcePreparationStep::Refused(frame, reason) => {
@@ -5383,7 +5352,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         }
     }
     fn finish(&mut self, mut completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
-        completed.0.accept_native_rotation_turn(remaining);
         let source = completed.0.source;
         // Read before the scan is consumed; kept only if the finish succeeds.
         let continuation_ticket = (source == SnapshotSource::Codex
@@ -5457,16 +5425,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             limit,
             |limit| {
                 let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
-                let native = if crate::snapshots::claude_native_comparison::enabled() {
-                    self.daemon
-                        .native_comparison
-                        .retained_bound(limit.checked_sub(versions)?)?
-                } else {
-                    0
-                };
-                let owned = versions.checked_add(native)?;
-                let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
-                owned.checked_add(continuation)
+                let continuation = continuation::retained_bound(limit.checked_sub(versions)?)?;
+                versions.checked_add(continuation)
             },
         )
     }
@@ -5478,9 +5438,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.discard_retained();
     }
     fn discard_retained(&mut self) {
-        if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.discard_retained();
-        }
         continuation::discard_retained();
         self.daemon
             .transcript_cache
@@ -5520,7 +5477,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
+    let Some(source) = heartbeat_source(&device) else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
     let client = SnapshotApiClient::new(snapshot_api_base_url()?);
@@ -5851,7 +5808,8 @@ fn upload_local_health_projection_with(
         .as_ref()
         .ok_or_else(|| anyhow!("canonical local health projection is missing"))?;
 
-    client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    let reply = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    apply_source_control(&default_support_dir(), &reply);
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
@@ -5956,15 +5914,9 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
     }
 }
 
-// Preparation stays owned by the existing cycle. No token/report lease or
-// partially finalized body crosses a collection step.
+// Preparation stays owned by the existing cycle. No partially finalized body
+// crosses a collection step.
 struct SourcePreparation {
-    native_comparison_reservation: Option<crate::source_rotation::PaidReservation>,
-    native_comparison_lease: Option<crate::snapshots::claude_native_comparison::lifecycle::Lease>,
-    prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
-    terminal_native_traversal:
-        Option<Box<crate::snapshots::claude_native_comparison::TerminalTraversal>>,
-    native_comparison_controller: Option<crate::snapshots::claude_native_comparison::Controller>,
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     claude_scan_roots: Option<Vec<PathBuf>>,
@@ -6000,283 +5952,24 @@ enum SourcePreparationStep {
     },
 }
 impl SourcePreparation {
-    fn accept_native_rotation_turn(&mut self, remaining: Option<usize>) {
-        if self.native_comparison_reservation.is_none()
-            && self
-                .scan
-                .as_ref()
-                .is_some_and(|scan| scan.native_capture_active())
-            && crate::heap_layout_bound::layout_supported()
-        {
-            self.native_comparison_reservation =
-                crate::source_rotation::PaidReservation::from_remainder(remaining, 0, 0);
-        }
-        if let Some(paid) = self.native_comparison_reservation.as_mut() {
-            paid.at_turn(remaining);
-        }
-    }
-    fn native_incremental_owned_bytes(
-        &self,
-        state: &crate::snapshots::OwnedSourceScan,
-    ) -> Option<usize> {
-        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-        if !crate::heap_layout_bound::layout_supported() {
-            return None;
-        }
-        let mut counter = Counter::new(usize::MAX);
-        // No working/committed index or ordinary active parser is charged a
-        // second time. These are the optional moving/retained native owners.
-        self.native_comparison_lease.heap_bound(&mut counter)?;
-        self.prepared_claude_evidence.heap_bound(&mut counter)?;
-        self.terminal_native_traversal.heap_bound(&mut counter)?;
-        self.native_comparison_controller.heap_bound(&mut counter)?;
-        counter.add(state.native_capture_bytes()?)?;
-        Some(counter.bytes)
-    }
-
     fn step(self) -> SourcePreparationStep {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
         let result = self.step_inner();
         let counts = diagnostics.finish();
-        let preparation = match &result {
-            SourcePreparationStep::Pending(preparation)
-            | SourcePreparationStep::Refused(preparation, _)
-            | SourcePreparationStep::Complete { preparation, .. } => preparation,
-        };
-        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
-            lease.diagnostic.add_page_events(counts);
-        } else {
-            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
-        }
+        crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
         result
     }
     fn step_inner(mut self) -> SourcePreparationStep {
-        let mut state = self.scan.take().expect("active source preparation");
-        if state.native_capture_active() {
-            let initialize = self
-                .native_comparison_reservation
-                .as_ref()
-                .is_some_and(|paid| paid.allocated() == 0);
-            let occupied = initialize
-                .then(|| self.native_incremental_owned_bytes(&state))
-                .flatten();
-            #[cfg(test)]
-            let remaining = self
-                .native_comparison_reservation
-                .as_ref()
-                .and_then(crate::source_rotation::PaidReservation::remaining_for_test);
-            let paid = self
-                .native_comparison_reservation
-                .as_mut()
-                .is_some_and(|paid| {
-                    if !initialize {
-                        return true;
-                    }
-                    occupied
-                        .is_some_and(|bytes| paid.grow_for(bytes) && paid.record_allocated(bytes))
-                });
-            #[cfg(test)]
-            if initialize {
-                tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::note_native_allowance(
-                    remaining, occupied, paid,
-                );
-            }
-            if !paid {
-                state.disable_native_comparison();
-            }
-        }
-        if state.native_capture_disabled() {
-            if let Some(lease) = self.native_comparison_lease.as_mut() {
-                lease.revoke();
-            }
-        }
-        if state.native_comparison_ready() {
-            if let Some(support_dir) = state.native_comparison_support_dir().map(Path::to_path_buf)
-            {
-                if self.prepared_claude_evidence.is_none() {
-                    let permitted = self
-                        .native_comparison_lease
-                        .as_ref()
-                        .is_some_and(|lease| lease.allowed());
-                    let roots = state
-                        .native_early_evidence_roots()
-                        .chain(
-                            self.native_comparison_lease
-                                .as_ref()
-                                .into_iter()
-                                .flat_map(|lease| lease.early_evidence_roots()),
-                        )
-                        .filter(|root| {
-                            permitted
-                                && self
-                                    .native_comparison_lease
-                                    .as_ref()
-                                    .is_some_and(|lease| lease.family_can_optimize(root))
-                        });
-                    let occupied = self
-                        .native_comparison_reservation
-                        .as_ref()
-                        .map(|paid| paid.allocated());
-                    let loaded = self
-                        .native_comparison_reservation
-                        .as_mut()
-                        .and_then(|paid| {
-                            let (index, _) = state.native_comparison_inputs();
-                            PreparedClaudeLocalEvidence::load_paid_eligible(
-                                &support_dir,
-                                index,
-                                roots,
-                                paid,
-                                occupied?,
-                            )
-                        });
-                    if loaded.is_none() {
-                        // No controller/deferral has been created at this first
-                        // preparation seam. Drop all speculative rows and keep
-                        // the ordinary final cohort/loader authoritative.
-                        state.disable_native_comparison();
-                        if let Some(lease) = self.native_comparison_lease.as_mut() {
-                            lease.revoke();
-                        }
-                        if let (Some(paid), Some(occupied)) =
-                            (self.native_comparison_reservation.as_mut(), occupied)
-                        {
-                            let _ = paid.record_allocated(occupied);
-                            paid.retire_speculation();
-                        }
-                    }
-                    self.prepared_claude_evidence = loaded;
-                    let allowed = self
-                        .native_comparison_lease
-                        .as_ref()
-                        .is_some_and(|lease| lease.allowed());
-                    if let (true, Some(evidence)) =
-                        (allowed, self.prepared_claude_evidence.as_ref())
-                    {
-                        let previous = self
-                            .native_comparison_lease
-                            .as_mut()
-                            .and_then(|lease| lease.take_window());
-                        let qualification = match state.prepare_native_comparison_paid(
-                            evidence.rows(),
-                            previous,
-                            &mut self.native_comparison_reservation,
-                        ) {
-                            Ok(qualification) => qualification,
-                            Err(_) => {
-                                // No controller, target or deferral exists at
-                                // this boundary. Finish the ordinary BASE pass
-                                // and suppress repeated optional admission for
-                                // this Lifecycle, even if capacity improves.
-                                state.disable_native_comparison();
-                                if let Some(lease) = self.native_comparison_lease.as_mut() {
-                                    lease.refuse_admission();
-                                }
-                                None
-                            }
-                        };
-                        if let Some(mut qualification) = qualification {
-                            if let Some(lease) = self.native_comparison_lease.as_ref() {
-                                lease.apply_family_policy(&mut qualification);
-                            }
-                            match crate::snapshots::claude_native_comparison::Controller::new_paid(
-                                qualification,
-                                &mut self.native_comparison_reservation,
-                            ) {
-                                Ok(controller) => {
-                                    if let Some(lease) = self.native_comparison_lease.as_ref() {
-                                        lease.diagnostic.update(|d| d.controller_created = true);
-                                    }
-                                    self.native_comparison_controller = Some(controller)
-                                }
-                                Err(_) => {
-                                    state.disable_native_comparison();
-                                    if let Some(lease) = self.native_comparison_lease.as_mut() {
-                                        lease.refuse_admission();
-                                    }
-                                }
-                            }
-                        } else {
-                            state.disable_native_comparison();
-                            if let Some(lease) = self.native_comparison_lease.as_mut() {
-                                lease.revoke();
-                            }
-                        }
-                    }
-                }
-                if let Some(controller) = self.native_comparison_controller.as_mut() {
-                    // The prepared owner and PRE-MUTATION proof survive every
-                    // target yield. No second load/requalification from P_new.
-                    let current = self
-                        .native_comparison_lease
-                        .as_ref()
-                        .is_some_and(|lease| lease.allowed())
-                        && self
-                            .prepared_claude_evidence
-                            .as_ref()
-                            .is_some_and(|evidence| {
-                                evidence.frozen_roots_are_current(
-                                    &support_dir,
-                                    controller.required_roots(),
-                                )
-                            });
-                    match controller.advance_paid(
-                        &mut state,
-                        current,
-                        &self.committed_index,
-                        &mut self.native_comparison_reservation,
-                        self.native_comparison_lease
-                            .as_mut()
-                            .expect("paid controller has bound lease"),
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Some(lease) = self.native_comparison_lease.as_mut() {
-                                lease.revoke();
-                            }
-                        }
-                        Err(reason) => {
-                            if let Some(lease) = self.native_comparison_lease.as_mut() {
-                                lease.refuse_admission();
-                            }
-                            drop(state);
-                            return SourcePreparationStep::Refused(self, reason);
-                        }
-                    }
-                } else {
-                    state.resume_native_comparison_base();
-                }
-            } else {
-                state.disable_native_comparison();
-                if let Some(lease) = self.native_comparison_lease.as_mut() {
-                    lease.revoke();
-                }
-            }
-            self.scan = Some(state);
-            return SourcePreparationStep::Pending(self);
-        }
-        match state.step_paid(
-            self.attribution_context.as_ref(),
-            &mut self.native_comparison_reservation,
-        ) {
-            Err(reason) => {
-                if let Some(lease) = self.native_comparison_lease.as_mut() {
-                    lease.refuse_admission();
-                }
-                SourcePreparationStep::Refused(self, reason)
-            }
+        let state = self.scan.take().expect("active source preparation");
+        match state.step_fallible(self.attribution_context.as_ref()) {
+            Err(reason) => SourcePreparationStep::Refused(self, reason),
             Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Complete {
-                index,
-                scan,
-                terminal_native_traversal,
-            }) => {
-                self.terminal_native_traversal = terminal_native_traversal;
+            Ok(crate::snapshots::OwnedSourceScanStep::Complete { index, scan }) => {
                 SourcePreparationStep::Complete {
                     preparation: self,
                     index,
@@ -6287,13 +5980,13 @@ impl SourcePreparation {
     }
 }
 #[cfg(test)]
-fn collect_native_preparation_with_rotation(
+fn collect_preparation_with_rotation(
     frame: SourcePreparation,
 ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-    try_collect_native_preparation_with_rotation(frame).expect("owned source completion")
+    try_collect_preparation_with_rotation(frame).expect("owned source completion")
 }
 #[cfg(test)]
-fn try_collect_native_preparation_with_rotation(
+fn try_collect_preparation_with_rotation(
     frame: SourcePreparation,
 ) -> Result<(SourcePreparation, ScanIndex, SourceScanResult)> {
     struct Collect {
@@ -6310,28 +6003,23 @@ fn try_collect_native_preparation_with_rotation(
         fn prepare(
             &mut self,
             _: SnapshotSource,
-            remaining: Option<usize>,
+            _remaining: Option<usize>,
         ) -> Result<Option<Self::Frame>> {
-            let mut frame = self.frame.take();
-            if let Some(frame) = frame.as_mut() {
-                frame.accept_native_rotation_turn(remaining);
-            }
-            Ok(frame)
+            Ok(self.frame.take())
         }
         fn validate(&mut self, _: &Self::Frame) -> Result<()> {
             Ok(())
         }
         fn step(
             &mut self,
-            mut frame: Self::Frame,
-            remaining: Option<usize>,
+            frame: Self::Frame,
+            _remaining: Option<usize>,
         ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
             self.steps += 1;
             assert!(
                 self.steps <= 1024,
                 "same owned scanner must finish within existing fixture steps"
             );
-            frame.accept_native_rotation_turn(remaining);
             match frame.step() {
                 SourcePreparationStep::Pending(frame) => {
                     crate::source_rotation::Step::Pending(frame)
@@ -6347,12 +6035,7 @@ fn try_collect_native_preparation_with_rotation(
                 } => crate::source_rotation::Step::Complete((preparation, index, scan)),
             }
         }
-        fn finish(
-            &mut self,
-            mut completed: Self::Completed,
-            remaining: Option<usize>,
-        ) -> Result<()> {
-            completed.0.accept_native_rotation_turn(remaining);
+        fn finish(&mut self, completed: Self::Completed, _remaining: Option<usize>) -> Result<()> {
             self.completed = Some(completed);
             Ok(())
         }
@@ -6374,7 +6057,7 @@ fn try_collect_native_preparation_with_rotation(
         steps: 0,
     };
     // The original rotation calculates queue/retained deductions. No
-    // independently fabricated full-budget argument reaches the native caller.
+    // independently fabricated full-budget argument reaches the collector.
     let budget =
         tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::rotation_budget();
     crate::source_rotation::run(&mut owner, &[source], budget);
@@ -6475,10 +6158,6 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
-    // The gate is fixed for this synchronous preparation. A lease reports
-    // errors while unwinding; without one, the wrapper must emit the counts.
-    let report_without_lease = source == SnapshotSource::ClaudeCode
-        && !crate::snapshots::claude_native_comparison::enabled();
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
     );
@@ -6510,13 +6189,7 @@ fn prepare_sync_source(
         },
     );
     let counts = diagnostics.finish();
-    if let Ok(Some(preparation)) = &result {
-        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
-            lease.diagnostic.add_page_events(counts);
-        } else {
-            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
-        }
-    } else if report_without_lease {
+    if source == SnapshotSource::ClaudeCode {
         crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
     }
     result
@@ -6599,20 +6272,6 @@ fn prepare_sync_source_inner(
             remaining.as_secs()
         );
         return Ok(None);
-    }
-    // Capture before fallible provider/destination/root work. Errors and an
-    // abandoned scan revoke reuse; a normal cadence wait returns the untouched
-    // lease below. Backend backoff above starts no preparation at all.
-    let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
-        && crate::snapshots::claude_native_comparison::enabled())
-    .then(|| daemon.native_comparison.begin());
-    if source == SnapshotSource::ClaudeCode && native_comparison_lease.is_none() {
-        let diagnostic = crate::local_resource_diagnostics::NativeDecision::new();
-        diagnostic.update(|d| {
-            d.outcome =
-                crate::local_resource_diagnostics::NativeDecisionOutcome::DisabledBeforeLease
-        });
-        diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
@@ -6721,9 +6380,6 @@ fn prepare_sync_source_inner(
             source.api_slug(),
             remaining.as_secs()
         );
-        if let Some(lease) = native_comparison_lease.take() {
-            lease.defer_without_scan();
-        }
         return Ok(None);
     }
 
@@ -7088,23 +6744,7 @@ fn prepare_sync_source_inner(
     } else if source == SnapshotSource::Codex {
         scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
-    if crate::snapshots::claude_native_comparison::enabled() {
-        scan.enable_native_comparison();
-    }
-    if let Some(lease) = native_comparison_lease.as_mut() {
-        if let Some(native_context) = scan.native_comparison_context() {
-            let scope = crate::snapshots::claude_native_comparison::lifecycle::Scope::from_arguments(format_args!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:false"));
-            lease.bind_scope(scope);
-        } else {
-            lease.revoke();
-        }
-    }
     Ok(Some(SourcePreparation {
-        native_comparison_reservation: None,
-        native_comparison_lease,
-        prepared_claude_evidence: None,
-        terminal_native_traversal: None,
-        native_comparison_controller: None,
         retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
@@ -7485,11 +7125,6 @@ fn prepare_continuation_source(
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
-        native_comparison_reservation: None,
-        native_comparison_lease: None,
-        prepared_claude_evidence: None,
-        terminal_native_traversal: None,
-        native_comparison_controller: None,
         retry_authority: None,
         source,
         claude_scan_roots: None,
@@ -7523,14 +7158,8 @@ fn capture_codex_recovery_evidence(
     progress_path: &Path,
     validate_authority: impl Fn() -> Result<()>,
 ) {
-    let (mut captured, changed, held) =
+    let (mut captured, changed) =
         index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
-    scan_result.hold_codex_groups(
-        index,
-        committed_index,
-        &held,
-        "recovery capture exceeds retained evidence cap",
-    );
     if !changed.is_empty() {
         let protected = scan_result
             .snapshots
@@ -7602,14 +7231,8 @@ fn finish_sync_source(
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
-        preparation.native_comparison_lease.is_some(),
     );
     let SourcePreparation {
-        mut native_comparison_reservation,
-        mut native_comparison_lease,
-        prepared_claude_evidence,
-        terminal_native_traversal,
-        native_comparison_controller,
         retry_authority,
         source,
         claude_scan_roots,
@@ -7669,62 +7292,6 @@ fn finish_sync_source(
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
-    if let Some(lease) = native_comparison_lease.as_mut() {
-        lease.observe_policy_page(
-            &scan_result.census_window_end,
-            scan_result.scanned_file_count,
-        );
-    }
-    // Recheck the same owner after native continuation. A failed comparison
-    // carries its unresolved exact dependencies into selected-state fallback.
-    let comparison_current = native_comparison_controller
-        .as_ref()
-        .is_some_and(|controller| {
-            native_comparison_lease
-                .as_ref()
-                .is_some_and(|lease| lease.allowed())
-                && prepared_claude_evidence.as_ref().is_some_and(|evidence| {
-                    evidence.frozen_roots_are_current(support_dir, controller.required_roots())
-                })
-        });
-    if let Some(lease) = native_comparison_lease.as_ref() {
-        lease
-            .diagnostic
-            .update(|d| d.controller_current_at_finish = Some(comparison_current));
-    }
-    if !comparison_current {
-        if let Some(lease) = native_comparison_lease.as_mut() {
-            lease.revoke();
-        }
-    }
-    let mut comparison_completion = match native_comparison_controller {
-        Some(controller) => match controller.complete_paid(
-            &scan_result,
-            terminal_native_traversal,
-            comparison_current,
-            &mut native_comparison_reservation,
-        ) {
-            Ok(completion) => Some(completion),
-            Err(reason) => {
-                if let Some(lease) = native_comparison_lease.as_mut() {
-                    lease.refuse_admission();
-                }
-                return Err(reason.into());
-            }
-        },
-        None => {
-            crate::snapshots::claude_native_comparison::Completion::base(terminal_native_traversal)
-        }
-    };
-    if let Some(completion) = comparison_completion.as_mut() {
-        completion.attach_reservation(native_comparison_reservation);
-        if let Err(reason) = completion.require_paid_recovery() {
-            if let Some(lease) = native_comparison_lease.as_mut() {
-                lease.refuse_admission();
-            }
-            return Err(reason.into());
-        }
-    }
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -7794,32 +7361,18 @@ fn finish_sync_source(
                 0
             }
         };
-        let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
-            support_dir,
-            &mut scan_result,
-            &mut index,
-            prepared_claude_evidence,
-            comparison_completion.as_mut(),
-            native_comparison_lease.as_ref(),
-            Some((&daemon.transcript_cache, &committed_index)),
-            Some(&upload_progress.accepted_identity_buckets),
-            crate::snapshots::claude_request_identity::WireBudget {
-                max_item_bytes: identity_item_cap,
-                reservation: Some(&reserve_cache_bytes),
-            },
-        );
-        let (mut disposition, census_withheld, stats) = match applied {
-            Ok(applied) => applied,
-            Err(reason) => {
-                if let Some(lease) = native_comparison_lease.as_mut() {
-                    lease.refuse_admission();
-                }
-                // No new body was offered. Do not reinterpret an allocation
-                // refusal as semantic identity ineligibility or upload stripped
-                // identities. The last selected durable checkpoint is intact.
-                return Err(reason.into());
-            }
-        };
+        let (mut disposition, census_withheld, stats) =
+            apply_claude_local_evidence_to_scan_with_retained(
+                support_dir,
+                &mut scan_result,
+                &mut index,
+                Some((&daemon.transcript_cache, &committed_index)),
+                Some(&upload_progress.accepted_identity_buckets),
+                crate::snapshots::claude_request_identity::WireBudget {
+                    max_item_bytes: identity_item_cap,
+                    reservation: Some(&reserve_cache_bytes),
+                },
+            );
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -7976,30 +7529,19 @@ fn finish_sync_source(
     } else {
         Vec::new()
     };
-    if let Some(comparison) = comparison_completion.as_mut() {
-        comparison.prepare_native_corrections(
-            &scan_result,
-            &committed_index,
-            &claude_authority_disposition,
-        );
-    }
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
         &mut index,
         |snapshot| {
-            let witness = effective_snapshot_upload_body_witness(
+            effective_snapshot_upload_body_witness(
                 snapshot,
                 &upload_progress,
                 cache_observations_enabled,
                 activity_hint.snapshot_head_cas_required,
                 &legacy_reconciliation_pending,
                 &claude_authority_disposition,
-            );
-            if let Some(comparison) = comparison_completion.as_mut() {
-                comparison.observe_native_correction(snapshot, &witness);
-            }
-            witness
+            )
         },
     );
     index.advance_empty_claude_proof_corrections(&scan_result);
@@ -8099,9 +7641,6 @@ fn finish_sync_source(
                 ensure_destination_authority()
             },
             None,
-            comparison_completion
-                .as_mut()
-                .map(NativeSelectedRestore::Paid),
             Some(UnsettledUploadCause::UploadError),
             (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                 previous: &committed_index,
@@ -8357,7 +7896,12 @@ fn finish_sync_source(
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
-            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            |snapshot| {
+                snapshot_upload_batch_class(
+                    snapshot,
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+                )
+            },
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
@@ -8495,9 +8039,6 @@ fn finish_sync_source(
                     scan_result.validate_codex_checkpoint()
                 },
                 None,
-                comparison_completion
-                    .as_mut()
-                    .map(NativeSelectedRestore::Paid),
                 Some(cause),
                 (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                     previous: &committed_index,
@@ -8832,7 +8373,6 @@ fn finish_sync_source(
             cutoff_candidates: &claude_cutoff_corrections,
             transport_fully_settled: upload_fully_settled,
             body_drains: claude_proof_body_drains,
-            comparison: comparison_completion.as_mut(),
             audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                 previous: &committed_index,
                 cache: &daemon.transcript_cache,
@@ -8840,7 +8380,7 @@ fn finish_sync_source(
                 backfill_window_days: receipt_window_days,
             }),
         },
-    )?;
+    );
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
@@ -8848,10 +8388,8 @@ fn finish_sync_source(
         locally_held_fingerprints,
         &census_absent_upload_acks,
     )?;
-    // Every selected-state restoration above has finished. A non-current
-    // comparison already revoked this lease locally and cannot mint a native
-    // correction later in this finish. Retire only that Claude prior index
-    // before the full disk-index CAS decode; keep every possible receipt path.
+    // Every selected-state restoration above has finished. Retire the Claude
+    // prior index before the full disk-index CAS decode.
     let context_rearm_counts = index.accept_file_upload_context_acks(
         &upload_progress.split_context_receipt_candidates(),
         &upload_progress.fresh_context_body_acks,
@@ -8864,11 +8402,11 @@ fn finish_sync_source(
     let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
         crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
     });
-    let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
+    let retire_prior_index = source == SnapshotSource::ClaudeCode;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
         && !tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::keep_prior();
-    let committed_index = if retire_prior_index {
+    let _committed_index = if retire_prior_index {
         drop(committed_index);
         None
     } else {
@@ -8876,7 +8414,7 @@ fn finish_sync_source(
     };
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::after_retirement(
-        committed_index.is_some(),
+        _committed_index.is_some(),
     );
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
@@ -8932,56 +8470,7 @@ fn finish_sync_source(
         );
     }
     #[cfg(test)]
-    tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
-    if upload_fully_settled
-        && native_comparison_lease
-            .as_ref()
-            .is_some_and(|lease| lease.allowed())
-    {
-        if let Some(comparison) = comparison_completion.as_mut() {
-            let mint = comparison.note_native_corrections_after_save(
-                &index,
-                committed_index.as_ref().ok_or_else(|| {
-                    anyhow!("native correction receipt lacks its retained prior index")
-                })?,
-                |fp, witness| {
-                    if upload_progress.quarantined_fingerprints.contains_key(fp)
-                        || upload_progress.permanent_rejections.contains_key(fp)
-                        || upload_progress.active_quarantine_retries.contains(fp)
-                    {
-                        None
-                    } else {
-                        Some(
-                            upload_progress.accepted_fingerprints.contains(fp)
-                                && upload_progress
-                                    .accepted_body_witnesses
-                                    .get(fp)
-                                    .is_some_and(|accepted| accepted == witness),
-                        )
-                    }
-                },
-            );
-            if let Some(lease) = native_comparison_lease.as_ref() {
-                lease.diagnostic.update(|d| d.correction_mint = Some(mint));
-            }
-        }
-    }
-    if let Some(lease) = native_comparison_lease.as_mut() {
-        lease
-            .diagnostic
-            .update(|d| d.upload_fully_settled = Some(upload_fully_settled));
-        lease.note_policy_settled(
-            scan_result.census_complete,
-            upload_fully_settled
-                && crate::snapshots::claude_native_comparison::selected_page_is_clean(
-                    &scan_result,
-                    &index,
-                ),
-            false,
-        );
-        // No fold proves a native census, so a save never bootstraps a permit.
-        lease.note_selected_save(false);
-    }
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("selected_save")?;
     // Tail state staged after this pass's last full save commits here, once.
     // On error the guard's drop discards and counts it; the next read replays
     // from the previous head. Never print private engine errors.
@@ -9109,7 +8598,7 @@ fn finish_sync_source(
         // facts are durable: returning earlier would recreate the per-source
         // starvation wedge, while reporting success would hide the backend's
         // capacity condition from source-level isolation and cadence handling.
-        let status_result = report_status_with_fresh_relay_token(
+        let _ = report_status_with_fresh_relay_token(
             client,
             device,
             device_secret,
@@ -9131,21 +8620,9 @@ fn finish_sync_source(
         if !resolved_permanent_rejections {
             return Err(snapshot_entity_deferred(count));
         }
-        // Permanent refusals still finish transport successfully and remain
-        // disclosed as errors. Only an otherwise earned, clean selected save
-        // may reach the common finalizer; every ineligible exit keeps Drop.
-        if status_result.is_err()
-            || !upload_fully_settled
-            || !crate::snapshots::claude_native_comparison::selected_page_is_clean(
-                &scan_result,
-                &index,
-            )
-            || !native_comparison_lease
-                .as_ref()
-                .is_some_and(|lease| lease.allowed())
-        {
-            return Ok(());
-        }
+        // Permanent refusals remain disclosed after the durable save; a
+        // reporting failure does not change the resolved transport outcome.
+        return Ok(());
     } else {
         report_status_with_fresh_relay_token(
             client,
@@ -9166,22 +8643,6 @@ fn finish_sync_source(
                 state: CollectorState::Success,
             },
         )?;
-    }
-    if let Some(mut lease) = native_comparison_lease {
-        lease.stage_window_after_save(
-            comparison_completion.and_then(|comparison| comparison.window),
-            &index,
-            scan_result.census_complete,
-        );
-        // Only an existing permit may survive a known, saved bounded page.
-        // The actual terminal native conjunction remains the sole bootstrap.
-        lease.finish(
-            upload_fully_settled
-                && crate::snapshots::claude_native_comparison::selected_page_is_clean(
-                    &scan_result,
-                    &index,
-                ),
-        );
     }
     Ok(())
 }
@@ -9252,9 +8713,16 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
-    // A session that owes a head-CAS answer reads natively, never from Tail.
+    // A session whose upload can carry a head-CAS answer reads natively, never
+    // from Tail. The answer replaces a saved base (`attach_head_conflict_answers`);
+    // a challenge without one never answers, and an ordinary accept clears it.
     index.activate_head_conflict_sessions(
-        progress.head_conflict_challenges.keys().cloned().collect(),
+        progress
+            .head_conflict_challenges
+            .keys()
+            .filter(|key| progress.accepted_cache_heads.contains_key(*key))
+            .cloned()
+            .collect(),
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
@@ -9383,341 +8851,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
 }
 
-struct PreparedTraceRead {
-    generation: Option<crate::claude_local_otel::ClaudeTraceReadGeneration>,
-    report: crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-}
-
-/// One moving owner for the permissive effort rows and strict paired view.
-/// Preflight borrows rows; finish consumes them after the original effort fold.
-/// A changed/unknown opened generation always falls back to the existing load.
-struct PreparedClaudeLocalEvidence {
-    sessions: BTreeSet<String>,
-    api: crate::claude_local_otel::ClaudeApiEvidenceRead,
-    api_failed: bool,
-    trace_rows: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
-    traces: BTreeMap<String, PreparedTraceRead>,
-    healthy_roots: BTreeSet<String>,
-}
-
-impl PreparedClaudeLocalEvidence {
-    fn load_paid_eligible<'a>(
-        support_dir: &Path,
-        index: &ScanIndex,
-        roots: impl Iterator<Item = &'a str> + Clone,
-        paid: &mut crate::source_rotation::PaidReservation,
-        occupied: usize,
-    ) -> Option<Self> {
-        use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
-        if !heap_layout_bound::layout_supported() {
-            return None;
-        }
-        // The legacy exclusion validator needs the global owner universe.
-        // Early optional work covers E-empty only; final consumption still
-        // loads/validates the entire canonical cohort, including legacy roots.
-        let eligible = roots.filter(|root| {
-            crate::snapshots::claude_native_comparison::early_root_is_eligible(index, root)
-        });
-        let mut prepared = Self {
-            sessions: BTreeSet::new(),
-            api: Default::default(),
-            api_failed: false,
-            trace_rows: BTreeMap::new(),
-            traces: BTreeMap::new(),
-            healthy_roots: BTreeSet::new(),
-        };
-        let mut root_string_bytes = 0usize;
-        let mut retained_decoded_bytes = 0usize;
-        // Even an empty BTreeMap may own an allocated empty root according
-        // to the existing conservative layout contract. Fund that bound too;
-        // a first natural bootstrap has no retained family roots yet.
-        let mut retained_charge =
-            occupied.checked_add(heap_layout_bound::completed_bound(&prepared, usize::MAX)?)?;
-        if !paid.grow_for(retained_charge) || !paid.record_allocated(retained_charge) {
-            return None;
-        }
-        for root in eligible {
-            if prepared.sessions.contains(root) {
-                continue;
-            }
-            let loaded = (|| {
-                let count = prepared.sessions.len().checked_add(1)?;
-                let key_bytes = root_string_bytes.checked_add(root.len())?;
-                let mut infrastructure = Counter::new(usize::MAX);
-                heap_layout_bound::tree_nodes::<String, ()>(count, &mut infrastructure)?;
-                heap_layout_bound::tree_nodes::<String, ()>(count, &mut infrastructure)?;
-                heap_layout_bound::tree_nodes::<String, PreparedTraceRead>(
-                    count,
-                    &mut infrastructure,
-                )?;
-                heap_layout_bound::tree_nodes::<
-                    String,
-                    Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
-                >(count, &mut infrastructure)?;
-                crate::claude_local_otel::ClaudeApiEvidenceRead::paid_root_map_storage(
-                    count,
-                    &mut infrastructure,
-                )?;
-                // Six destination keys per root: sessions, health, trace rows,
-                // trace generation/report and both API maps. A report's own
-                // empty nodes remain included in retained_decoded_bytes.
-                infrastructure.add(key_bytes.checked_mul(6)?)?;
-                // One temporary root set for the existing canonical paid
-                // decoder. Its nodes/key overlap the destination containers.
-                heap_layout_bound::tree_nodes::<String, ()>(1, &mut infrastructure)?;
-                infrastructure.add(root.len())?;
-                let fixed = occupied
-                    .checked_add(infrastructure.bytes)?
-                    .checked_add(retained_decoded_bytes)?;
-                if !paid.grow_for(fixed) {
-                    return None;
-                }
-                let cohort = std::iter::once(root.to_owned()).collect::<BTreeSet<_>>();
-                let api = crate::claude_local_otel::ClaudeApiEvidenceRead::load_paid_for_roots(
-                    support_dir,
-                    &cohort,
-                    paid,
-                    fixed,
-                )?;
-                let api_bytes = heap_layout_bound::completed_bound(&api, usize::MAX)?;
-                let before_trace = fixed.checked_add(api_bytes)?;
-                let (mut report, generation) = crate::claude_local_otel::load_claude_trace_paid(
-                    support_dir,
-                    root,
-                    paid,
-                    before_trace,
-                )?;
-                let trace_bytes = heap_layout_bound::completed_bound(&report, usize::MAX)?;
-                let decoded = retained_decoded_bytes
-                    .checked_add(api_bytes)?
-                    .checked_add(trace_bytes)?;
-                let charge = occupied
-                    .checked_add(infrastructure.bytes)?
-                    .checked_add(decoded)?;
-                if !paid.permits(charge) {
-                    return None;
-                }
-                let healthy =
-                    report.is_complete() && api.strict_generation_matches(support_dir, root);
-                // No append/sort workspace or clone of decoded evidence: all
-                // destination nodes/keys were covered before decoding began.
-                prepared.api.move_disjoint_paid_root(api);
-                if healthy {
-                    prepared.healthy_roots.insert(root.to_owned());
-                }
-                if let Some(rows) = report.evidence.remove(root) {
-                    prepared.trace_rows.insert(root.to_owned(), rows);
-                }
-                prepared.traces.insert(
-                    root.to_owned(),
-                    PreparedTraceRead {
-                        generation: Some(generation),
-                        report,
-                    },
-                );
-                prepared.sessions.insert(root.to_owned());
-                paid.record_allocated(charge)
-                    .then_some((key_bytes, decoded, charge))
-            })();
-            let Some((keys, decoded, charge)) = loaded else {
-                // Keep already-paid healthy roots. A refused/unknown root
-                // contributes no eligibility; final canonical loading still
-                // covers it. Stop this optional batch rather than retrying all
-                // roots or dropping valid certificates from earlier roots.
-                let _ = paid.record_allocated(retained_charge);
-                paid.retire_speculation();
-                break;
-            };
-            root_string_bytes = keys;
-            retained_decoded_bytes = decoded;
-            retained_charge = charge;
-        }
-        let mut actual = Counter::new(usize::MAX);
-        prepared.completed_heap_bound(&mut actual)?;
-        if !paid.record_allocated(occupied.checked_add(actual.bytes)?) {
-            return None;
-        }
-        // All opened byte buffers, decoder workspaces and temporary cohorts
-        // have dropped. Preserve only the returned owner and recovery credit.
-        paid.retire_speculation();
-        Some(prepared)
-    }
-
-    #[cfg(test)]
-    fn load(support_dir: &Path, native: &[SnapshotItem]) -> Self {
-        let sessions = claude_evidence_session_ids(native)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let loaded =
-            crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone());
-        let api_failed = loaded.is_err();
-        let api = loaded.unwrap_or_default();
-        let roots = claude_evidence_root_session_ids(native)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut trace_rows = BTreeMap::new();
-        let mut traces = BTreeMap::new();
-        let mut healthy_roots = BTreeSet::new();
-        for root in roots {
-            if crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, &root)
-                .is_empty()
-                || crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
-                    support_dir,
-                    &root,
-                )
-                .is_empty()
-            {
-                continue;
-            }
-            let before = crate::claude_local_otel::claude_trace_read_generation(support_dir, &root);
-            let mut report = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                support_dir,
-                [root.clone()],
-            );
-            let after = crate::claude_local_otel::claude_trace_read_generation(support_dir, &root);
-            let generation = if before.is_some() && before == after {
-                before
-            } else {
-                None
-            };
-            if generation.is_some()
-                && report.is_complete()
-                && api.strict_generation_matches(support_dir, &root)
-            {
-                healthy_roots.insert(root.clone());
-            }
-            if let Some(rows) = report.evidence.remove(&root) {
-                trace_rows.insert(root.clone(), rows);
-            }
-            traces.insert(root, PreparedTraceRead { generation, report });
-        }
-        Self {
-            sessions,
-            api,
-            api_failed,
-            trace_rows,
-            traces,
-            healthy_roots,
-        }
-    }
-
-    fn rows(&self) -> crate::snapshots::claude_native_comparison::PairedRows<'_> {
-        crate::snapshots::claude_native_comparison::PairedRows {
-            api: &self.api.evidence,
-            trace: &self.trace_rows,
-            healthy_roots: &self.healthy_roots,
-        }
-    }
-
-    /// Check every root used by a frozen negative, including retained legacy
-    /// predecessors. This validates opened generations without reloading rows
-    /// or replacing P. It returns no new paired view or proof. A controller must
-    /// revoke and take the base path on false; unrelated ineligible roots do
-    /// not expand the qualified population or poison healthy-family evidence.
-    fn frozen_roots_are_current(
-        &self,
-        support_dir: &Path,
-        required_roots: &BTreeSet<String>,
-    ) -> bool {
-        !self.api_failed
-            && required_roots.iter().all(|root| {
-                self.healthy_roots.contains(root)
-                    && self.api.strict_generation_matches(support_dir, root)
-                    && self.traces.get(root).is_some_and(|read| {
-                        read.report.is_complete()
-                            && read.generation.is_some()
-                            && read.generation
-                                == crate::claude_local_otel::claude_trace_read_generation(
-                                    support_dir,
-                                    root,
-                                )
-                    })
-            })
-    }
-
-    #[cfg(test)]
-    fn take_api(
-        &mut self,
-        support_dir: &Path,
-    ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
-        self.take_api_for_sessions(support_dir, &self.sessions.clone())
-    }
-
-    fn take_api_for_sessions(
-        &mut self,
-        support_dir: &Path,
-        session_ids: &BTreeSet<String>,
-    ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
-        if self.api_failed {
-            self.api = Default::default();
-        }
-        self.api.complete_permissive(support_dir, session_ids)
-    }
-
-    fn take_trace(
-        &mut self,
-        support_dir: &Path,
-        root: &str,
-    ) -> crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
-        if let Some(mut read) = self.traces.remove(root) {
-            if read.generation.is_some()
-                && read.generation
-                    == crate::claude_local_otel::claude_trace_read_generation(support_dir, root)
-            {
-                if let Some(rows) = self.trace_rows.remove(root) {
-                    read.report.evidence.insert(root.to_owned(), rows);
-                }
-                return read.report;
-            }
-        }
-        self.trace_rows.remove(root);
-        crate::claude_local_otel::load_claude_trace_ownership_evidence(
-            support_dir,
-            [root.to_owned()],
-        )
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn prepared_claude_negative_rows_for_test(
-    support_dir: &Path,
-    native: &[SnapshotItem],
-    required_roots: &BTreeSet<String>,
-    after_load: impl FnOnce(),
-) -> (bool, bool) {
-    let prepared = PreparedClaudeLocalEvidence::load(support_dir, native);
-    let before = prepared.frozen_roots_are_current(support_dir, required_roots);
-    after_load();
-    let after = prepared.frozen_roots_are_current(support_dir, required_roots);
-    (before, after)
-}
-
-#[cfg(test)]
-pub(crate) fn prepared_claude_pair_for_test(
-    support_dir: &Path,
-    native: &[SnapshotItem],
-    root: &str,
-    after_load: impl FnOnce(),
-) -> (
-    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
-    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
-    bool,
-    usize,
-) {
-    let mut prepared = PreparedClaudeLocalEvidence::load(support_dir, native);
-    let healthy = prepared.rows().healthy_roots.contains(root);
-    after_load();
-    let mut api = prepared.take_api(support_dir).expect("synthetic API read");
-    let permissive_rows = api.evidence.get(root).map_or(0, Vec::len);
-    (
-        api.take_strict_report(support_dir, root),
-        prepared.take_trace(support_dir, root),
-        healthy,
-        permissive_rows,
-    )
-}
-
-/// The dark path: contract-5 bodies are never built.
+/// The ordinary evidence stage without retained cache or identity ledger inputs.
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -9727,7 +8861,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
+    apply_claude_local_evidence_to_scan_with_retained(
+        support_dir,
+        scan_result,
+        index,
+        None,
+        None,
+        Default::default(),
+    )
 }
 
 /// The production evidence stage with this cycle's accepted-identity ledger.
@@ -9742,64 +8883,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    try_apply_claude_local_evidence_to_scan_with_comparison(
+    apply_claude_local_evidence_to_scan_with_retained(
         support_dir,
         scan_result,
         index,
-        None,
-        None,
-        None,
         None,
         accepted_identity_buckets,
         Default::default(),
     )
-    .expect("evidence fixture has no resource refusal")
-}
-
-fn apply_claude_local_evidence_to_scan_with_prepared(
-    support_dir: &Path,
-    scan_result: &mut crate::snapshots::SourceScanResult,
-    index: &mut ScanIndex,
-    prepared: Option<PreparedClaudeLocalEvidence>,
-) -> (
-    crate::snapshots::ClaudeUsageAuthorityDisposition,
-    bool,
-    ClaudeLocalEvidenceStats,
-) {
-    apply_claude_local_evidence_to_scan_with_comparison(
-        support_dir,
-        scan_result,
-        index,
-        prepared,
-        None,
-        None,
-    )
-}
-
-fn apply_claude_local_evidence_to_scan_with_comparison(
-    support_dir: &Path,
-    scan_result: &mut SourceScanResult,
-    index: &mut ScanIndex,
-    prepared: Option<PreparedClaudeLocalEvidence>,
-    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
-) -> (
-    crate::snapshots::ClaudeUsageAuthorityDisposition,
-    bool,
-    ClaudeLocalEvidenceStats,
-) {
-    try_apply_claude_local_evidence_to_scan_with_comparison(
-        support_dir,
-        scan_result,
-        index,
-        prepared,
-        comparison,
-        lease,
-        None,
-        None,
-        Default::default(),
-    )
-    .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
 
 // Test-only file repair at the real attachment/strict-read boundary. It
@@ -9834,31 +8925,18 @@ fn whole_corpus_evidence() -> bool {
     false
 }
 
-#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
-fn try_apply_claude_local_evidence_to_scan_with_comparison(
+fn apply_claude_local_evidence_to_scan_with_retained(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    mut prepared: Option<PreparedClaudeLocalEvidence>,
-    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
-) -> std::result::Result<
-    (
-        crate::snapshots::ClaudeUsageAuthorityDisposition,
-        bool,
-        ClaudeLocalEvidenceStats,
-    ),
-    crate::source_rotation::LocalRefusal,
-> {
-    if let Some(fallback) = comparison
-        .as_deref()
-        .and_then(|comparison| comparison.fallback.as_ref())
-    {
-        fallback.withhold(scan_result);
-    }
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -9904,10 +8982,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
     let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
-    let api_load = match prepared.as_mut() {
-        Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
-        None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
-    };
+    let api_load = crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids);
     match api_load {
         Ok(evidence) => {
             crate::snapshots::claude_request_money::e2::attach_page(
@@ -10032,9 +9107,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     }
     api_read.retain_roots(&paired_roots);
-    if let Some(early) = prepared.as_mut() {
-        api_read.move_remaining_for_strict(&mut early.api, &paired_roots);
-    }
     // Health is family-scoped: one malformed historical sidecar must make
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
@@ -10049,13 +9121,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     for root_session_id in usage_roots {
         let (mut api, mut trace) = decode_window.time(|| {
             let api = api_read.take_strict_report(support_dir, &root_session_id);
-            let trace = match prepared.as_mut() {
-                Some(read) => read.take_trace(support_dir, &root_session_id),
-                None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                    support_dir,
-                    [root_session_id.clone()],
-                ),
-            };
+            let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                support_dir,
+                [root_session_id.clone()],
+            );
             (api, trace)
         });
         if !api.health.is_complete() {
@@ -10190,33 +9259,18 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
     });
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_rows(
         scan_result,
         &api_report,
         &trace_report,
         index,
         identity_evidence.as_ref(),
-        comparison
-            .as_deref()
-            .map(|comparison| comparison.fold_view(lease))
-            .or_else(|| {
-                lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
-            }),
         match &whole_corpus {
             Some(veto_api_rows) => crate::snapshots::ClaudeEvidenceRows::Whole(veto_api_rows),
             None => crate::snapshots::ClaudeEvidenceRows::Streamed(&cross),
         },
     );
     drop(whole_corpus);
-    if let Some(fallback) = comparison
-        .as_deref()
-        .and_then(|comparison| comparison.fallback.as_ref())
-    {
-        fallback.after_native_fold(scan_result, index);
-    }
-    if let Some(comparison) = comparison {
-        comparison.retire_native_fold_owner();
-    }
     if let Some(evidence) = &identity_evidence {
         crate::snapshots::claude_request_identity::reconcile_request_accounts(
             &mut scan_result.snapshots,
@@ -10381,9 +9435,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    // All local consumers (comparison/fallback, finalizer, identity, account
-    // qualification and the optional shadow) have finished. Release native
-    // inputs only for emitted `e2` bodies before upload clones/checkpoints.
+    // All local consumers (finalizer, identity, account qualification and the
+    // optional shadow) have finished. Release native inputs only for emitted
+    // `e2` bodies before upload clones/checkpoints.
     // Held and legacy bodies retain their inputs for their existing owners.
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
@@ -10396,7 +9450,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     drop(fold_window);
     drop(evidence_window);
-    Ok((disposition, census_withheld, stats))
+    (disposition, census_withheld, stats)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10756,7 +9810,7 @@ where
         fingerprint,
         body_witness,
         |_| None,
-        |_| false,
+        |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
         upload,
@@ -11214,9 +10268,9 @@ pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
 /// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
 /// group. A single body over the byte bound is its own group and meets the
 /// existing request preflight.
-fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+fn literal_family_groups(members: Vec<(usize, usize, u8)>) -> Vec<Vec<(usize, usize, u8)>> {
     let mut groups = Vec::new();
-    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut group = Vec::<(usize, usize, u8)>::new();
     let mut bytes = 2usize;
     for member in members {
         if !group.is_empty()
@@ -11267,7 +10321,7 @@ where
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
-    BatchClass: Fn(&T) -> bool,
+    BatchClass: Fn(&T) -> u8,
     LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -11382,9 +10436,11 @@ where
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so
     // without literal items (gate off) packing is the previous order.
-    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
-    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
-    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
+    // Each unit also carries its family key: the class of its family's first
+    // group, or its own class for a single body (see the class sort below).
+    let mut order = Vec::<(usize, usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<(usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, u8)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
         let item = (
             index,
@@ -11395,7 +10451,7 @@ where
             Some(root) => literal_families.entry(root).or_default().push(item),
             None => {
                 order.push(item);
-                unit_ends.push(order.len());
+                unit_ends.push((order.len(), item.2));
             }
         }
     }
@@ -11404,15 +10460,16 @@ where
             let member = session_id(&items[*index]);
             (member != Some(root), member)
         });
+        let family_key = members[0].2;
         for group in literal_family_groups(members) {
             order.extend(group);
-            unit_ends.push(order.len());
+            unit_ends.push((order.len(), family_key));
         }
     }
     let mut units = Vec::with_capacity(unit_ends.len());
     let mut start = 0;
-    for end in unit_ends {
-        units.push(order[start..end].to_vec());
+    for (end, family_key) in unit_ends {
+        units.push((order[start..end].to_vec(), family_key));
         start = end;
     }
     // Preserve the native census/family selection. At this transport boundary
@@ -11420,22 +10477,29 @@ where
     // body shares a request (and its retry latency) with context catch-up.
     let mut ordinary_units = Vec::new();
     let mut catchup_units = Vec::new();
-    for unit in units {
+    for (unit, family_key) in units {
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             progress
                 .context_resend
                 .is_catchup(fingerprint(&items[*index]))
         });
         if !ordinary.is_empty() {
-            ordinary_units.push(ordinary);
+            ordinary_units.push((ordinary, family_key));
         }
         if !catchup.is_empty() {
-            catchup_units.push(catchup);
+            catchup_units.push((catchup, family_key));
         }
     }
+    // A request declares head CAS when any body in it carries a cache patch,
+    // so every request is class-pure: an unpatched body never travels under
+    // another body's CAS contract. Stable-sort each lane by family key so
+    // single bodies form one run per class, each family's groups stay
+    // contiguous and root first, and a single-class page keeps its order.
+    ordinary_units.sort_by_key(|(_, family_key)| *family_key);
+    catchup_units.sort_by_key(|(_, family_key)| *family_key);
     let ordinary_entities = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .map(|(index, _, _)| fingerprint(&items[*index]))
         .collect::<BTreeSet<_>>();
     // A bootstrap invocation sees only its probes. It cannot send catch-up
@@ -11445,7 +10509,7 @@ where
         .ordinary_work_is_in(&ordinary_entities);
     let ordinary_bytes = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .fold(0usize, |sum, (_, bytes, _)| {
             sum.saturating_add(bytes.saturating_add(2))
         });
@@ -11458,11 +10522,11 @@ where
         .reserve_ordinary_bytes(ordinary_bytes);
     let mut unit_ends = Vec::new();
     order.clear();
-    for unit in ordinary_units {
+    for (unit, _) in ordinary_units {
         order.extend(unit);
         unit_ends.push((order.len(), false));
     }
-    for unit in catchup_units {
+    for (unit, _) in catchup_units {
         let start = order.len();
         for item in unit {
             if ordinary_in_this_call
@@ -12461,6 +11525,19 @@ fn source_granted(device: &LocalDeviceBinding, source: SnapshotSource) -> bool {
     device.sources.iter().any(|slug| slug == source.api_slug())
 }
 
+/// The heartbeat's relay-token source: the first enabled one, else the first
+/// granted one, so a device with every source paused still hears an ON.
+fn heartbeat_source(device: &LocalDeviceBinding) -> Option<SnapshotSource> {
+    enabled_snapshot_sources(device)
+        .first()
+        .copied()
+        .or_else(|| {
+            SNAPSHOT_SOURCES
+                .into_iter()
+                .find(|source| source_granted(device, *source))
+        })
+}
+
 /// Consecutive resume failures per marker. Held across each resume turn, so a
 /// concurrent control-thread marker change cannot be overwritten by that
 /// turn's completion.
@@ -12487,15 +11564,82 @@ pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Optio
     }
 }
 
+/// This source alone is paused: a marker that is not already resuming.
+pub(crate) fn source_paused(support_dir: &Path, source: SnapshotSource) -> bool {
+    source_marker(support_dir, source).is_some_and(|marker| marker != "reconnect")
+}
+
 fn write_source_marker(path: &Path, state: &str) -> Result<()> {
     ottto_core::write_owner_only_file_atomic(path, state.as_bytes())?;
     sync_progress_parent(path)
 }
 
-/// Stops collection now and keeps every local file.
+/// Stops collection now and keeps every local file. Claude's legacy relay
+/// closes after the marker is written and the guard is dropped.
 pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    let _turn = source_erasure_turn();
-    write_source_marker(&source_marker_path(support_dir, source), "pending")
+    {
+        let _turn = source_erasure_turn();
+        write_source_marker(&source_marker_path(support_dir, source), "pending")?;
+    }
+    if source == SnapshotSource::ClaudeCode {
+        crate::otlp_relay::legacy::revoke_now();
+    }
+    Ok(())
+}
+
+/// Applies the web's per-source OFF/ON from a heartbeat reply. Revisions are
+/// per device and source; each newer one applies once, recorded in
+/// `snapshots/<slug>.source-control` after its marker (a crash between them
+/// re-applies the same revision). A missing or another device's record reads
+/// as revision 0. OFF pauses like a local disable; ON resumes a paused source
+/// and changes nothing for a running one. A block for another device, an
+/// unknown source or a malformed entry is ignored.
+pub(crate) fn apply_source_control(support_dir: &Path, reply: &serde_json::Value) {
+    let block = &reply["source_control"];
+    let (Some("source_control:v1"), Some(device_id), Some(entries)) = (
+        block["contract"].as_str(),
+        block["device_id"].as_str(),
+        block["sources"]
+            .as_array()
+            .filter(|entries| !entries.is_empty()),
+    ) else {
+        return;
+    };
+    // Identity, then source: the marker writers take the erasure turn.
+    let _binding = crate::control::lock_setup_run_binding();
+    let current = ottto_core::FileDeviceStore::default().load().ok().flatten();
+    if !current.is_some_and(|current| current.device_id == device_id) {
+        return;
+    }
+    for entry in entries {
+        let source = SNAPSHOT_SOURCES
+            .into_iter()
+            .find(|source| entry["source"].as_str() == Some(source.api_slug()));
+        let (Some(source), Some(revision @ 1..), Some(state @ ("enabled" | "disabled"))) = (
+            source,
+            entry["revision"].as_u64(),
+            entry["desired_state"].as_str(),
+        ) else {
+            continue;
+        };
+        let record = source_marker_path(support_dir, source)
+            .with_file_name(format!("{}.source-control", source.api_slug()));
+        let last = std::fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|record| record["device_id"] == device_id)
+            .and_then(|record| record["revision"].as_u64())
+            .unwrap_or(0);
+        if revision <= last {
+            continue;
+        }
+        let applied = match state {
+            "disabled" => disable_snapshot_source(support_dir, source),
+            _ => reconnect_snapshot_source(support_dir, source),
+        };
+        let body = serde_json::json!({"device_id": device_id, "revision": revision});
+        let _ = applied.and_then(|()| write_source_marker(&record, &body.to_string()));
+    }
 }
 
 /// The explicit way back. A source that was never paused has nothing to resume.
@@ -12519,12 +11663,12 @@ pub(crate) fn disable_sources_dropped_from_grant(
         .try_for_each(|source| disable_snapshot_source(support_dir, source))
 }
 
-/// One attempt per re-enabled source, under the cycle lock. The kept index,
-/// Tail rows and backfill progress make its next pass a warm Tail. Its upload
-/// witnesses go first and are synced, so what the server erased at source-off
-/// is sent again at each loop's own cadence; then the marker goes. A failure
-/// keeps the source paused for the next cycle. Errors can name paths, so only
-/// counts are logged.
+/// One attempt per re-enabled source, under the cycle lock. Only the marker
+/// goes: the kept index, Tail rows, backfill progress and upload witnesses
+/// make its next pass a warm Tail that re-sends nothing already sent (the
+/// server keeps data while a source is off). A failure keeps the source
+/// paused for the next cycle. Errors can name paths, so only counts are
+/// logged.
 pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
     for source in SNAPSHOT_SOURCES {
         let mut turn = source_erasure_turn();
@@ -12532,45 +11676,15 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
             continue;
         }
         let marker = source_marker_path(support_dir, source);
-        let resumed = drop_upload_witnesses(support_dir, source).and_then(|()| {
-            std::fs::remove_file(&marker)?;
-            sync_progress_parent(&marker)
-        });
+        let resumed = std::fs::remove_file(&marker)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| sync_progress_parent(&marker));
         let failures = turn.entry(marker).or_default();
         *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {
             crate::snapshots::state_v2::source_erasure_alarm(*failures);
         }
     }
-}
-
-/// Every per-destination upload witness of `source`, each folder synced: its
-/// composition scope ACKs, its MCP inventory upload time (identity and version
-/// seed stay) and its footprint witnesses. No collected state is touched.
-fn drop_upload_witnesses(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    crate::context_composition::drop_upload_acks(support_dir, source)?;
-    crate::mcp_inventory::invalidate_upload_witness(support_dir, source)?;
-    let footprint = crate::snapshots::durable_sources::DurableSource::from_snapshot(source)
-        .map_or(&[][..], |row| row.properties().footprint_witnesses);
-    for dir in footprint {
-        let dir = support_dir.join(dir);
-        let entries = match std::fs::read_dir(&dir) {
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            entries => entries?,
-        };
-        // Opt-out markers beside them have no extension.
-        for entry in entries {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                std::fs::remove_file(&path)?;
-            }
-        }
-        crate::context_composition::sync_dir(&dir)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn snapshot_api_base_url() -> Result<String> {
@@ -16749,6 +15863,11 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
+    mod class_split_tests {
+        use super::*;
+        include!("snapshot_sync/class_split_tests.rs");
+    }
+
     #[derive(Clone, Serialize)]
     struct SizedUploadItem {
         fingerprint: String,
@@ -18379,7 +17498,7 @@ mod tests {
             String::as_str,
             |item| item.clone(),
             |_| None,
-            |item| reconcile_class.contains(item),
+            |item| 2 * u8::from(reconcile_class.contains(item)),
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
@@ -19490,6 +18609,130 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// A registered device granted `sources` against a backend whose
+    /// heartbeat replies are `replies`, in order. Holds the env guards.
+    struct SourceControlBackend {
+        root: PathBuf,
+        support_dir: PathBuf,
+        device: LocalDeviceBinding,
+        api_base_url: String,
+        captured: Arc<Mutex<Vec<String>>>,
+        _guards: [EnvVarGuard; 2],
+    }
+
+    fn source_control_backend(
+        sources: &[&str],
+        replies: &[(&str, u64, &str)],
+    ) -> SourceControlBackend {
+        clear_setup_run_refresh_hold();
+        let root = test_dir("source-control-heartbeat");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let guards = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir),
+        ];
+        let replies = replies
+            .iter()
+            .map(|(source, revision, state)| {
+                serde_json::json!({"accepted": true, "source_control": {"contract": "source_control:v1",
+                    "device_id": "device_test", "sources": [{"source": source,
+                    "revision": revision, "desired_state": state}]}})
+            })
+            .collect();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = source_control_heartbeat_server(captured.clone(), replies);
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+        };
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save device");
+        FileConnectionStore::default()
+            .save(&LocalConnectionBinding {
+                setup_run_id: "setup_source_control".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            })
+            .expect("save connection");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+        SourceControlBackend {
+            root,
+            support_dir,
+            device,
+            api_base_url,
+            captured,
+            _guards: guards,
+        }
+    }
+
+    /// [behaviour] The heartbeat lists `source_control:v1` and keeps running
+    /// on a granted source's token while every source is paused, so a web ON
+    /// still arrives: OFF then ON pauses and resumes the source.
+    #[test]
+    #[serial]
+    fn all_sources_paused_heartbeat_still_runs() {
+        let backend = source_control_backend(
+            &["codex"],
+            &[("codex", 1, "disabled"), ("codex", 2, "enabled")],
+        );
+        let codex = SnapshotSource::Codex;
+        let daemon = test_daemon("otm_test");
+        upload_local_health_projection_now(&daemon).expect("heartbeat");
+        assert_eq!(
+            source_marker(&backend.support_dir, codex).as_deref(),
+            Some("pending")
+        );
+        assert!(enabled_snapshot_sources(&backend.device).is_empty());
+        assert_eq!(heartbeat_source(&backend.device), Some(codex));
+        upload_local_health_projection_now(&daemon).expect("heartbeat while all paused");
+        assert_eq!(
+            source_marker(&backend.support_dir, codex).as_deref(),
+            Some("reconnect")
+        );
+        resume_reconnected_sources(&backend.support_dir);
+        assert_eq!(enabled_snapshot_sources(&backend.device), vec![codex]);
+        let requests = backend.captured.lock().expect("captured").clone();
+        let heartbeats = requests
+            .iter()
+            .filter(|request| request.contains("POST /api/v1/apps/health/heartbeat"))
+            .collect::<Vec<_>>();
+        assert_eq!(heartbeats.len(), 2);
+        assert!(heartbeats
+            .iter()
+            .all(|request| request.contains("\"source_control:v1\"")));
+        let _ = std::fs::remove_dir_all(&backend.root);
+    }
+
+    /// [behaviour] An OFF carried by the cycle's own heartbeat stops that
+    /// source in the same cycle; the other one still runs.
+    #[test]
+    #[serial]
+    fn cycle_heartbeat_off_skips_source_same_cycle() {
+        let backend =
+            source_control_backend(&["codex", "claude_code"], &[("codex", 1, "disabled")]);
+        assert_eq!(enabled_snapshot_sources(&backend.device).len(), 2);
+        let sources = cycle_heartbeat(
+            &SnapshotApiClient::new(backend.api_base_url.as_str()),
+            &backend.device,
+            "device-secret",
+            "otm_test",
+            &test_daemon("otm_test"),
+        );
+        assert_eq!(sources, vec![SnapshotSource::ClaudeCode]);
+        let _ = std::fs::remove_dir_all(&backend.root);
     }
 
     #[test]
@@ -21214,8 +20457,9 @@ mod tests {
         let requests = captured.lock().expect("captured requests").clone();
         assert!(!requests[1].contains("\"manifest\""));
 
+        let scratch = crate::test_scratch::ScratchDir::new("scan-manifest-index");
         let mut index =
-            ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
+            ScanIndex::load(&scratch.join("scan-index.json")).expect("empty scan index");
         index.file_snapshot_fingerprints.insert(
             "/tmp/rollout-session-1.jsonl".to_string(),
             BTreeSet::from(["a".repeat(64)]),
@@ -21956,6 +21200,38 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write local health response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// Answers relay tokens and projections, and each heartbeat with the
+    /// next of `replies` (then `{}`).
+    fn source_control_heartbeat_server(
+        captured: Arc<Mutex<Vec<String>>>,
+        replies: Vec<serde_json::Value>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind source control backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let request = read_complete_http_request(&mut stream);
+                let body = if request.contains("/relay-token") {
+                    serde_json::json!({"token": "relay-token-codex", "expires_at": "2026-06-01T10:15:00Z"})
+                } else if request.contains("/apps/health/heartbeat") {
+                    replies.next().unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::json!({"ok": true})
+                }
+                .to_string();
+                captured.lock().expect("capture request").push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         format!("http://{address}")
@@ -24291,6 +23567,3 @@ mod head_conflict_released_progress_fixture;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
 crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
-
-crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
-crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
