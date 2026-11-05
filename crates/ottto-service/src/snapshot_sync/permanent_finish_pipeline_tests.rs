@@ -999,7 +999,7 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
         });
         let (preparation, index, scan) = home.prepare(arm);
         let index_path = preparation.index_path.clone();
-        crate::snapshots::money_freshness::set_roster_for_test(
+        crate::snapshots::money_freshness::walk_ended_for_test(
             SnapshotSource::ClaudeCode,
             Some((u64::MAX / 2, BTreeMap::new())),
         );

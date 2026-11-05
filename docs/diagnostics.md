@@ -182,9 +182,11 @@ On the same line, `claude_telemetry_retired_roots` and
 every transcript of their session is gone, `claude_telemetry_held_roots` the
 candidate pairs kept (a live reader, a copy of their requests, a listed
 transcript with no loss-free census read, a write after the walk began, or a
-change while deleting),
+change while deleting), of which `claude_telemetry_held_copied` were kept by
+the copy rule,
 and `claude_telemetry_read_fault` the pairs kept because a member could not be
-read cleanly or unlinked.
+read cleanly or unlinked. A session with neither telemetry member is skipped.
+Every complete root walk makes the full recheck of stored pairs due again.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
