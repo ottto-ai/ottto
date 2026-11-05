@@ -8,9 +8,15 @@ fn historical_decisions_remain_guarded_in_the_integrated_production_decoder() {
     ))
     .unwrap();
     assert_eq!(frozen["commit"], "f174d111fbcdfb0ab9c2abeb299c12d50b435c29");
+    let scan_index = include_str!("../../src/snapshots/scan_index.rs");
+    let scan_index_entry = include_str!("../../src/snapshots/scan_index/entry.rs");
+    assert!(scan_index.contains("pub struct ScanIndex {"));
+    assert!(scan_index_entry.contains("pub struct ScanIndexEntry {"));
     for snippet in frozen["snippets"].as_array().unwrap() {
         let source = match snippet["file"].as_str().unwrap() {
             "crates/ottto-service/src/snapshots.rs" => include_str!("../../src/snapshots.rs"),
+            "crates/ottto-service/src/snapshots/scan_index.rs" => scan_index,
+            "crates/ottto-service/src/snapshots/scan_index/entry.rs" => scan_index_entry,
             "crates/ottto-service/src/snapshots/lenient_decode.rs" => {
                 include_str!("../../src/snapshots/lenient_decode.rs")
             }
