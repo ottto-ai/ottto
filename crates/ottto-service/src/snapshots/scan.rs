@@ -1,5 +1,7 @@
-//! Scan-time readers shared by the source scanners: JSON field readers and
-//! the source session id a transcript resolves to.
+//! Scan-time readers and limits shared by the source scanners: JSON field
+//! readers, the source session id a transcript resolves to, and the epoch
+//! gates and listing/retry limits.
 
 pub(super) mod json_fields;
+pub(super) mod limits;
 pub(super) mod source_session_id;

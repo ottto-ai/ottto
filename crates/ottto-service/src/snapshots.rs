@@ -723,287 +723,30 @@ pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 /// count, and the comparison is the consumer's to scope.
 pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 
-/// Effective per-turn input context (uncached input + cache reads + cache
-/// writes) above which a Claude turn could only have run with the "(1M
-/// context)" window enabled — the regular Claude context cap is 200K tokens.
-/// For the flat-priced 1M-window models in `PROVIDER_PRICE_LINES`, turns
-/// strictly over this boundary tag `context_bucket=long`; everything at or
-/// below tags `short`. 1M usage bills at standard per-token rates but drives
-/// cost via token VOLUME, so the product analyzes it separately.
-///
-/// MUST stay in lockstep with the backend pricing catalog's
-/// `context_bucket_threshold_tokens` for the 1M-capable Claude models and the
-/// cost projector's `_derive_context_bucket`, which honors this daemon-supplied
-/// bucket ahead of its own (request_count==1-gated) derivation.
-pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
-
-/// How a model's price line bills a request over it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderPriceLineKind {
-    /// Prompt-length tiered: a request strictly over the line bills ALL of
-    /// its tokens at the provider's long-context rate.
-    Tiered,
-    /// `Tiered`, but only for usage dated from
-    /// `CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS`: a line added after usage
-    /// was accepted without a bucket must not restate that usage on a re-read.
-    TieredForward,
-    /// Flat price at every prompt length: the line only separates 1M-window
-    /// usage for analysis (the Claude 200K boundary above).
-    Analysis,
-}
-
+mod usage;
 #[cfg(test)]
-impl ProviderPriceLineKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Tiered | Self::TieredForward => "tiered",
-            Self::Analysis => "analysis",
-        }
-    }
-}
+use scan::limits::CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS;
+pub(crate) use scan::limits::LISTING_INTERVAL_SECONDS;
+use scan::limits::{
+    dated_on_or_after, in_codex_forward_evidence_epoch, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS,
+    LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
+    UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS, UNHEALTHY_SCAN_RETRY_MAX_SECONDS,
+};
+pub use scan::limits::{
+    BACKFILL_WINDOW_DAYS, MAX_BACKFILL_FILES_PER_SOURCE, MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
+    MAX_WATCHER_HINTED_FILES_PER_TICK,
+};
+pub(crate) use usage::provider_context_bucket;
+pub use usage::CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS;
+use usage::PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS;
+#[cfg(test)]
+use usage::{
+    provider_price_line, provider_price_line_model_key, ProviderPriceLineKind, PROVIDER_PRICE_LINES,
+};
 
-/// Provider prompt-length price lines: the one table every source stamps its
-/// per-request `context_bucket` from, keyed by the pricing catalog's canonical
-/// model key. A model is listed only where the catalog publishes a
-/// `context_bucket_threshold_tokens` for it, at that exact value; every other
-/// model (GPT-5.4 mini/nano, codex variants, Claude 4.5 and earlier, unknown
-/// models) gets no bucket. The prompt counts uncached input, cache reads and
-/// cache writes (Codex `input_tokens` already includes its cached prefix).
-///
-/// The table is pinned as `fixtures/snapshot-audit/provider-price-lines-v1.json`
-/// and the backend compares that artifact with the catalog thresholds
-/// (backend/tests/unit/test_daemon_price_line_mirror.py). Change both together.
-const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
-    // OpenAI: 2x input and cache, 1.5x output for the whole request.
-    ("gpt-5-4", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-4-pro", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-5", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-5-pro", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-6-luna", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-6-sol", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-5-6-terra", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-6-astra", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-6-luna", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-6-sol", 272_000, ProviderPriceLineKind::Tiered),
-    ("gpt-6-1-sol", 272_000, ProviderPriceLineKind::Tiered),
-    (
-        "gpt-6-1-terra",
-        272_000,
-        ProviderPriceLineKind::TieredForward,
-    ),
-    (
-        "gpt-6-rosalind",
-        272_000,
-        ProviderPriceLineKind::TieredForward,
-    ),
-    // Anthropic: every Haiku 5.5 rate 5x above 100K.
-    ("claude-haiku-5-5", 100_000, ProviderPriceLineKind::Tiered),
-    // Anthropic full 1M window at standard rates.
-    (
-        "claude-fable-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-fable-5-1",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-mythos-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-mythos-5-1",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-opus-4-6",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-opus-4-7",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-opus-4-8",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-opus-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-opus-5-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-sonnet-4-6",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-sonnet-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-    (
-        "claude-sonnet-5-5",
-        CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS,
-        ProviderPriceLineKind::Analysis,
-    ),
-];
-
-/// The catalog's canonical key for a raw model id: provider and Bedrock route
-/// prefixes, a Bedrock `-vN:M` suffix, a dated snapshot (`-YYYY-MM-DD`,
-/// `-YYYYMMDD`, `@YYYYMMDD`) and `-latest` dropped; dots become dashes.
-fn provider_price_line_model_key(model: &str) -> String {
-    // Byte checks only: model ids come from transcripts and may be non-ASCII,
-    // and every cut below lands just before an ASCII `-`/`@`, a char boundary.
-    let all_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
-    let mut key = model.trim().to_ascii_lowercase();
-    for marker in ["anthropic.", "anthropic/", "openai/"] {
-        if let Some(index) = key.find(marker) {
-            key = key[index + marker.len()..].to_string();
-        }
-    }
-    if let Some((head, version)) = key.rsplit_once("-v") {
-        if version.split_once(':').is_some_and(|(major, minor)| {
-            all_digits(major.as_bytes()) && all_digits(minor.as_bytes())
-        }) {
-            key = head.to_string();
-        }
-    }
-    if let Some(head) = key.strip_suffix("-latest") {
-        key = head.to_string();
-    }
-    let bytes = key.as_bytes();
-    let dated_suffix = if bytes.len() > 11
-        && bytes[bytes.len() - 11] == b'-'
-        && bytes[bytes.len() - 6] == b'-'
-        && bytes[bytes.len() - 3] == b'-'
-        && all_digits(&bytes[bytes.len() - 10..bytes.len() - 6])
-        && all_digits(&bytes[bytes.len() - 5..bytes.len() - 3])
-        && all_digits(&bytes[bytes.len() - 2..])
-    {
-        11
-    } else if bytes.len() > 9
-        && matches!(bytes[bytes.len() - 9], b'-' | b'@')
-        && all_digits(&bytes[bytes.len() - 8..])
-    {
-        9
-    } else {
-        0
-    };
-    key.truncate(key.len() - dated_suffix);
-    key.replace('.', "-")
-}
-
-fn provider_price_line(model: &str) -> Option<(u64, ProviderPriceLineKind)> {
-    let key = provider_price_line_model_key(model);
-    PROVIDER_PRICE_LINES
-        .iter()
-        .find(|(listed, _, _)| *listed == key)
-        .map(|&(_, tokens, kind)| (tokens, kind))
-}
-
-/// Tiered price lines apply to requests whose own usage time is on or after
-/// 2026-09-01T00:00:00Z (the start of the previous month at release). Earlier
-/// usage keeps exactly the rows it had, even when its file is re-read, so
-/// restating the price split never touches older history.
-const PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS: u64 = 1_788_220_800;
-
-/// 2026-11-09T00:00:00Z, a 00:00Z expected on/after install on every machine.
-/// Codex thread-settings tiers and
-/// `TieredForward` lines count only evidence and usage dated from here, so a
-/// request's row is a function of its file's bytes on every read route and
-/// usage accepted before the release keeps exactly the row it had.
-const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_794_182_400;
-
-/// 2026-11-04T00:00:00Z, a 00:00Z expected on/after install of the release
-/// that carries the Legacy repeat gate. Legacy drops an equal-total repeat
-/// only when the repeated line itself is dated from here, so its row is a
-/// function of its file's bytes on every read route and history before this
-/// keeps exactly the rows it had. Correcting older repeats is an operator
-/// decision.
-const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
-
-/// `false` for a missing or unparsable timestamp.
-fn dated_on_or_after(timestamp: Option<&str>, from_unix_seconds: u64) -> bool {
-    timestamp
-        .and_then(rfc3339_unix_seconds)
-        .is_some_and(|seconds| seconds >= from_unix_seconds)
-}
-
-fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
-    dated_on_or_after(timestamp, CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)
-}
-
-/// One request's bucket from its prompt size, its model and its own usage
-/// timestamp. `None` when the model has no catalog line. A tiered line also
-/// needs a known, non-zero prompt dated on or after the effective date: an
-/// unmeasured request is never silently short. Flat Claude analysis lines keep
-/// the stamp they always had (every request, any date).
-pub(crate) fn provider_context_bucket(
-    model: &str,
-    prompt_tokens: u64,
-    observed_at: Option<&str>,
-) -> Option<&'static str> {
-    let (line, kind) = provider_price_line(model)?;
-    if kind == ProviderPriceLineKind::Tiered
-        && (prompt_tokens == 0
-            || observed_at.and_then(rfc3339_unix_seconds)?
-                < PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS)
-    {
-        return None;
-    }
-    if kind == ProviderPriceLineKind::TieredForward
-        && (prompt_tokens == 0 || !in_codex_forward_evidence_epoch(observed_at))
-    {
-        return None;
-    }
-    Some(if prompt_tokens > line {
-        "long"
-    } else {
-        "short"
-    })
-}
-// Per-page read budget, not a history bound: discovery queues every file in
-// the window into the durable traversal and the rest continues next page.
-pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
-// Directory discovery has its own per-tick pacing budget, never a refusal.
-// Recursively walking an arbitrarily large tree in one tick made it O(all
-// paths); the durable traversal below spends about this many directory entries
-// and resumes next tick. One directory wider than the whole budget is listed
-// in full on a fresh tick, and that overdraw ends the tick.
-pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
-pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
-/// The gap between metadata-only re-listing passes of one kept generation
-/// (the cold cadence tier).
-pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 30 * 60;
-/// A re-listing pass queues an owed file whose stamp is unchanged at most
-/// once per this interval.
-const LISTING_OWED_PACE_SECONDS: u64 = 6 * 60 * 60;
-const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
-const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
-/// The retry attempt at which the exponential delay reaches its ceiling
-/// (`60 * 2^6` seconds is clamped to one hour). The attempt counter saturates
-/// here: a traversal that stays terminal-unhealthy is re-walked at most hourly
-/// and its persisted witness never grows past this value. The counter clears
-/// only when a generation completes (the traversal is dropped) or the scan
-/// context changes (a fresh traversal starts at zero).
-const UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS: u8 = 7;
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
-pub const BACKFILL_WINDOW_DAYS: u64 = 730;
 
 pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
     timestamps.sort();
