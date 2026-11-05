@@ -55,6 +55,7 @@ impl ClaudePostureAdmission {
             Self::FileBirth(ClaudeFileBirthVerdict::MultiFile) => "withheld_multi_file",
             Self::FileBirth(ClaudeFileBirthVerdict::Tripwire) => "withheld_tripwire",
             Self::FileBirth(ClaudeFileBirthVerdict::EvidenceBound) => "withheld_evidence_bound",
+            Self::FileBirth(ClaudeFileBirthVerdict::Uncertified) => "withheld_uncertified",
         }
     }
 }
