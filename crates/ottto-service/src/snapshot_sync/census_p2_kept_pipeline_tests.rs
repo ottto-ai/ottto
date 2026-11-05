@@ -151,7 +151,7 @@ impl PipelineFixture {
             "account_identifier_hash": "a".repeat(64),
             "workspace_identifier_hash": null
         });
-        let index: ScanIndex = serde_json::from_value(saved).unwrap();
+        let mut index: ScanIndex = serde_json::from_value(saved).unwrap();
         index.save(&self.index_path).unwrap();
     }
 
