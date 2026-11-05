@@ -573,8 +573,6 @@ pub(crate) enum ClaudeFileBirthVerdict {
     MultiFile,
     Tripwire,
     EvidenceBound,
-    /// The family root's ownership is uncertified; set by the fold, never here.
-    Uncertified,
 }
 
 crate::heap_layout_bound::no_heap!(true; ClaudeFileBirthVerdict);
@@ -585,13 +583,7 @@ impl ClaudeFileBirthVerdict {
     pub(crate) fn posture_not_withheld(verdict: &Option<Self>) -> bool {
         !matches!(
             verdict,
-            Some(
-                Self::UnknownBirth
-                    | Self::UntimedRecord
-                    | Self::MultiFile
-                    | Self::EvidenceBound
-                    | Self::Uncertified
-            )
+            Some(Self::UnknownBirth | Self::UntimedRecord | Self::MultiFile | Self::EvidenceBound)
         )
     }
 }
@@ -1000,10 +992,7 @@ impl ClaudeContextBasisCounts {
         }
         let counter = match verdict {
             ClaudeFileBirthVerdict::Admitted => &mut self.file_birth_rule_session_count,
-            // Uncertified is set outside admission and never recorded here.
-            ClaudeFileBirthVerdict::UnknownBirth | ClaudeFileBirthVerdict::Uncertified => {
-                &mut self.withheld_unknown_birth_session_count
-            }
+            ClaudeFileBirthVerdict::UnknownBirth => &mut self.withheld_unknown_birth_session_count,
             ClaudeFileBirthVerdict::UntimedRecord => {
                 &mut self.withheld_untimed_record_session_count
             }

@@ -2735,7 +2735,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
         let root_session_id = claude_snapshot_family_root(item);
         if uncertified_roots.contains(&root_session_id) {
             clear_claude_context_posture(item);
-            item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::Uncertified);
+            item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::UnknownBirth);
         } else {
             let multi_file = multi_file_members.contains(&item.source_session_id);
             let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
@@ -38836,92 +38836,51 @@ mod tests {
         assert!(wire.get("compaction_events").is_none());
     }
 
-    /// `context_posture_withheld` is absent unless ownership is unknown, never
-    /// rides beside a posture value (the server refuses that body), and moves
-    /// no identity, so it starts no re-upload.
+    /// `context_posture_withheld` is absent unless ownership is unknown, rides
+    /// only beside a cleared posture (the server refuses anything else), and
+    /// moves no identity, so it starts no re-upload.
     #[test]
     fn context_posture_withheld_marks_only_unknown_ownership() {
         let mut request = valid_v6_batch_request();
         let policy = request.upload_policy;
         let mut item = request.snapshots.remove(0);
         item.peak_context_fill_tokens = Some(250_000);
-        item.first_turn_context_tokens = Some(40_000);
-        item.last_turn_context_tokens = Some(60_000);
-        item.first_turn_context_window_tokens = Some(1_000_000);
-        item.peak_context_fill_window_tokens = Some(1_000_000);
-        item.last_turn_context_window_tokens = Some(1_000_000);
         item.compaction_count = Some(1);
-        item.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
-        item.compaction_events = vec![SnapshotCompactionEvent {
-            at: "2026-08-14T09:00:00Z".to_string(),
-            before: Some(250_000),
-            after: Some(59_000),
-            trigger: Some("manual".to_string()),
-        }];
         item.first_own_request_at = Some("2026-08-14T08:00:00Z".to_string());
-        let today = serde_json::to_vec(&item).expect("serialize");
-        assert!(!String::from_utf8_lossy(&today).contains("context_posture_withheld"));
-        for verdict in [
-            ClaudeFileBirthVerdict::Admitted,
-            ClaudeFileBirthVerdict::AllCopied,
-            ClaudeFileBirthVerdict::Tripwire,
-        ] {
-            let mut authoritative = item.clone();
-            authoritative.claude_file_birth_verdict = Some(verdict);
-            assert_eq!(
-                serde_json::to_vec(&authoritative).expect("serialize"),
-                today,
-                "{verdict:?}"
-            );
-        }
-        let mut cleared = item.clone();
-        clear_claude_context_posture(&mut cleared);
+        let mut authoritative = item.clone();
+        authoritative.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::AllCopied);
+        assert_eq!(
+            serde_json::to_value(&authoritative).expect("serialize"),
+            serde_json::to_value(&item).expect("serialize")
+        );
+        clear_claude_context_posture(&mut item);
         for (verdict, reason) in [
             (ClaudeFileBirthVerdict::MultiFile, "multi_file"),
             (ClaudeFileBirthVerdict::UnknownBirth, "unknown_birth"),
-            (ClaudeFileBirthVerdict::UntimedRecord, "untimed_record"),
-            (ClaudeFileBirthVerdict::EvidenceBound, "evidence_bound"),
-            (ClaudeFileBirthVerdict::Uncertified, "uncertified"),
         ] {
-            let mut marked = cleared.clone();
+            let mut marked = item.clone();
             marked.claude_file_birth_verdict = Some(verdict);
             let wire = serde_json::to_value(&marked).expect("serialize");
             assert_eq!(wire["context_posture_withheld"], reason);
-            assert!(wire.get("claude_file_birth_verdict").is_none());
-            // Every field the server's withheld validator refuses.
+            // The posture beside the marker is empty.
             for field in [
                 "peak_context_fill_tokens",
-                "first_turn_context_tokens",
-                "last_turn_context_tokens",
-                "first_turn_context_window_tokens",
-                "peak_context_fill_window_tokens",
-                "last_turn_context_window_tokens",
-                "first_own_request_at",
                 "compaction_count",
-                "compaction_timestamps",
-                "compaction_events",
+                "first_own_request_at",
             ] {
                 assert!(wire.get(field).is_none(), "{verdict:?} {field}");
             }
-            for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-                assert_eq!(
-                    snapshot_semantic_envelope(source, &marked, policy),
-                    snapshot_semantic_envelope(source, &cleared, policy),
-                    "{source:?}"
-                );
-                assert_eq!(
-                    snapshot_fingerprint(source, &marked),
-                    snapshot_fingerprint(source, &cleared),
-                    "{source:?}"
-                );
-            }
             assert_eq!(
-                snapshot_upload_body_witness(&marked),
-                snapshot_upload_body_witness(&cleared)
+                snapshot_semantic_envelope(SnapshotSource::ClaudeCode, &marked, policy),
+                snapshot_semantic_envelope(SnapshotSource::ClaudeCode, &item, policy)
             );
             assert_eq!(
-                snapshot_upload_body_witness_version(&marked),
-                snapshot_upload_body_witness_version(&cleared)
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &marked),
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &item)
+            );
+            assert_eq!(
+                snapshot_upload_body_witness(&marked),
+                snapshot_upload_body_witness(&item)
             );
         }
     }

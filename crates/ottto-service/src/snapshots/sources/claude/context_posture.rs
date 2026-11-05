@@ -184,9 +184,6 @@ pub(in crate::snapshots) fn clear_claude_context_posture(item: &mut SnapshotItem
     item.peak_context_fill_tokens = None;
     item.first_turn_context_tokens = None;
     item.last_turn_context_tokens = None;
-    item.first_turn_context_window_tokens = None;
-    item.peak_context_fill_window_tokens = None;
-    item.last_turn_context_window_tokens = None;
     item.compaction_count = None;
     item.compaction_timestamps.clear();
     item.compaction_events.clear();
