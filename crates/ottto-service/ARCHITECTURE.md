@@ -40,13 +40,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups across every registered home. New files
-  outside the scan roster and changed headers fail when their old or new owner
-  belongs to this page; unrelated changes defer to the next roster refresh.
-  Refresh and checkpoint share the directory listing helper. A page-local memo
-  shares re-listed directory witnesses and path/stat classifications across
-  pre-upload and post-ACK checks; unchanged facts require no repeat header reads.
-  Neither the roster snapshot nor this memo changes persisted traversal state.
+  singleton sessions and joined groups across every registered home. A new file
+  naming a page owner fails; unrelated new files defer to the next roster refresh.
+  Every header ownership change and vanished census directory fails closed.
+  Refresh and checkpoint share the stable `DirectoryCensus::relist` helper.
+  Each boundary re-lists changed directories and re-reads new or changed headers.
+  The page roster moves from the traversal snapshot into validation; clones share
+  it in memory, and no additional traversal state is persisted.
   New archives use every filename ownership candidate, like held archives;
   archives beside known, still-present plaintext defer. If unrelated plaintext
   vanishes and activates its roster archive, that archive uses the same filename

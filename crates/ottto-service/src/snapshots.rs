@@ -15940,7 +15940,7 @@ impl OwnedSourceScan {
                             inventory,
                             codex_join_completed,
                             &surviving,
-                            &traversal_snapshot.codex_rollout_paths,
+                            traversal_snapshot.codex_rollout_paths,
                         )
                     })
                 });
@@ -23821,27 +23821,19 @@ fn refresh_retained_codex_directories(
             .codex_join_directory_census
             .as_mut()
             .expect("census checked above");
-        let before = match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && directory != scan_root =>
-            {
-                census.retire(&directory);
-                traversal
-                    .codex_rollout_paths
-                    .retain(|key| !Path::new(key).starts_with(&directory));
-                continue;
-            }
-            _ => continue,
-        };
-        let Some((present, appeared, new_directories)) =
-            census.listing(&directory, &traversal.codex_rollout_paths)
-        else {
-            continue;
-        };
-        if !census.refresh(&directory, &before) {
-            continue;
-        }
+        let (before, (present, appeared, new_directories)) =
+            match census.relist(&directory, &traversal.codex_rollout_paths) {
+                Ok(Some(listing)) => listing,
+                Ok(None) if directory != scan_root => {
+                    census.retire(&directory);
+                    traversal
+                        .codex_rollout_paths
+                        .retain(|key| !Path::new(key).starts_with(&directory));
+                    continue;
+                }
+                _ => continue,
+            };
+        census.refresh(&directory, &before);
         traversal.codex_rollout_paths.retain(|key| {
             Path::new(key).parent() != Some(directory.as_path()) || present.contains(key)
         });

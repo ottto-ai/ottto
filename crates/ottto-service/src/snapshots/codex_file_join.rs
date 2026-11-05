@@ -113,19 +113,11 @@ impl DirectoryCensus {
             .map(|(path, _)| PathBuf::from(path))
             .collect()
     }
-    /// Re-certify one directory after a complete re-listing. The listing
-    /// counts only if `before` (taken ahead of it) still matches the
-    /// directory afterwards; otherwise the old witness stays for a later refresh
-    /// or boundary check.
-    pub(super) fn refresh(&mut self, path: &Path, before: &fs::Metadata) -> bool {
-        let witness = metadata_witness(before);
-        let unchanged = fs::symlink_metadata(path).is_ok_and(|after| {
-            after.is_dir() && !after.file_type().is_symlink() && metadata_witness(&after) == witness
-        });
-        if unchanged {
-            self.directories.insert(local_index_key(path), witness);
-        }
-        unchanged
+    /// Adopt the witness from a successful `relist`; checkpoint callers only
+    /// inspect that proof and leave the frozen census unchanged.
+    pub(super) fn refresh(&mut self, path: &Path, before: &fs::Metadata) {
+        self.directories
+            .insert(local_index_key(path), metadata_witness(before));
     }
     /// Drop a directory that no longer exists, with every census directory
     /// beneath it. A fresh walk would not list them either.
@@ -133,25 +125,30 @@ impl DirectoryCensus {
         self.directories
             .retain(|directory, _| !Path::new(directory).starts_with(path));
     }
-    /// Pure listing shared by roster refresh and page validation. Callers own
-    /// witness bracketing and decide whether newly seen directories can wait.
-    pub(super) fn listing(
+    /// Stable listing shared by roster refresh and boundary validation.
+    /// A missing directory is distinct from an unreadable or unstable listing.
+    pub(super) fn relist(
         &self,
         directory: &Path,
         paths: &BTreeSet<String>,
-    ) -> Option<DirectoryListing> {
-        #[cfg(all(test, unix))]
-        header_cache_tests::LIST_CALLS.with(|calls| calls.set(calls.get() + 1));
+    ) -> Result<Option<(fs::Metadata, DirectoryListing)>> {
+        let before = match fs::symlink_metadata(directory) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            before.is_dir() && !before.file_type().is_symlink(),
+            DIRECTORY_MEMBERSHIP_CHANGED
+        );
         let mut present = BTreeSet::new();
         let mut appeared = Vec::new();
         let mut new_directories = Vec::new();
-        for entry in fs::read_dir(directory).ok()? {
-            let entry = entry.ok()?;
-            let kind = entry.file_type().ok()?;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
             let path = entry.path();
-            if kind.is_symlink() {
-                return None;
-            }
+            anyhow::ensure!(!kind.is_symlink(), DIRECTORY_MEMBERSHIP_CHANGED);
             if kind.is_dir() {
                 if !self.contains(&path) {
                     new_directories.push(path);
@@ -159,16 +156,21 @@ impl DirectoryCensus {
             } else if kind.is_file() && transcript_path_admitted(SnapshotSource::Codex, &path) {
                 let key = local_index_key(&path);
                 if !paths.contains(&key) {
-                    let stat = fs::symlink_metadata(&path).ok()?;
-                    if !stat.is_file() {
-                        return None;
-                    }
+                    let stat = fs::symlink_metadata(&path)?;
+                    anyhow::ensure!(stat.is_file(), DIRECTORY_MEMBERSHIP_CHANGED);
                     appeared.push((path, stat));
                 }
                 present.insert(key);
             }
         }
-        Some((present, appeared, new_directories))
+        let after = fs::symlink_metadata(directory)?;
+        anyhow::ensure!(
+            after.is_dir()
+                && !after.file_type().is_symlink()
+                && metadata_witness(&after) == metadata_witness(&before),
+            DIRECTORY_MEMBERSHIP_CHANGED
+        );
+        Ok(Some((before, (present, appeared, new_directories))))
     }
 }
 
@@ -754,28 +756,10 @@ impl HeaderInventory {
             .max_by_key(|root| root.components().count())
             .cloned()
     }
-    #[cfg(test)]
-    pub(super) fn validate_membership(&self, owner: &str, _home: &Path) -> Result<()> {
-        let paths = self
-            .headers
-            .iter()
-            .map(|h| local_index_key(&h.candidate.path))
-            .collect();
-        self.validate_memberships(
-            &BTreeSet::from([owner.to_owned()]),
-            &paths,
-            &mut PageMemo {
-                directories: self.directories.clone(),
-                ..PageMemo::default()
-            },
-        )
-        .map(|_| ())
-    }
     fn validate_memberships(
         &self,
         owners: &BTreeSet<String>,
         paths: &BTreeSet<String>,
-        memo: &mut PageMemo,
     ) -> Result<usize> {
         if owners.is_empty() {
             return Ok(0);
@@ -793,44 +777,19 @@ impl HeaderInventory {
             anyhow::ensure!(self.directories.contains(root), ROOT_UNPROVED);
         }
         anyhow::ensure!(self.directories.stable, DIRECTORY_CENSUS_UNPROVED);
-        for directory in memo.directories.moved_directories() {
-            let before = match fs::symlink_metadata(&directory) {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && !self.roots.contains(&directory) =>
-                {
-                    continue
-                }
-                result => result.context(DIRECTORY_MEMBERSHIP_CHANGED)?,
-            };
-            anyhow::ensure!(
-                before.is_dir() && !before.file_type().is_symlink(),
-                DIRECTORY_MEMBERSHIP_CHANGED
-            );
-            let (_, appeared, new_directories) = self
+        for directory in self.directories.moved_directories() {
+            let (_, (_, appeared, new_directories)) = self
                 .directories
-                .listing(&directory, paths)
+                .relist(&directory, paths)
+                .context(DIRECTORY_MEMBERSHIP_CHANGED)?
                 .context(DIRECTORY_MEMBERSHIP_CHANGED)?;
             anyhow::ensure!(new_directories.is_empty(), DIRECTORY_MEMBERSHIP_CHANGED);
             for (path, stat) in appeared {
-                memo.classify(self, &path, &stat, paths)?;
-            }
-            anyhow::ensure!(
-                memo.directories.refresh(&directory, &before),
-                DIRECTORY_MEMBERSHIP_CHANGED
-            );
-        }
-        // Directory witnesses never replace per-file checks: an append or
-        // rewrite need not move the parent. Reuse facts only at the same stamp.
-        for path in memo.entries.keys().cloned().collect::<Vec<_>>() {
-            match fs::symlink_metadata(&path) {
-                Ok(stat) => {
-                    memo.classify(self, Path::new(&path), &stat, paths)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    memo.entries.remove(&path);
-                }
-                Err(error) => return Err(error).context(HEADER_STAT_FAILED),
+                anyhow::ensure!(
+                    self.new_member_owners(&path, &stat, paths)?
+                        .is_disjoint(owners),
+                    DIRECTORY_MEMBERSHIP_CHANGED
+                );
             }
         }
         for header in &self.headers {
@@ -848,7 +807,11 @@ impl HeaderInventory {
                     {
                         match fs::symlink_metadata(&archive) {
                             Ok(stat) => {
-                                memo.classify(self, &archive, &stat, paths)?;
+                                anyhow::ensure!(
+                                    self.new_member_owners(&archive, &stat, paths)?
+                                        .is_disjoint(owners),
+                                    DIRECTORY_MEMBERSHIP_CHANGED
+                                );
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => return Err(error).context(HEADER_STAT_FAILED),
@@ -861,21 +824,36 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let current = memo.classify(self, &header.candidate.path, &stat, paths)?;
-            anyhow::ensure!(
-                current.contains(&header.owner)
-                    || (!owners.contains(&header.owner) && current.is_disjoint(owners)),
-                HEADER_OWNERSHIP_CHANGED
-            );
+            let (current, _) = read_header_settled(&header.candidate, None)
+                .0
+                .context(HEADER_REREAD_FAILED)?;
+            anyhow::ensure!(current.owner == header.owner, HEADER_OWNERSHIP_CHANGED);
         }
-        anyhow::ensure!(
-            memo.entries.iter().all(|(path, (_, current))| self
-                .owner_for_path(Path::new(path))
-                .is_some()
-                || current.is_disjoint(owners)),
-            DIRECTORY_MEMBERSHIP_CHANGED
-        );
         Ok(self.headers.len())
+    }
+    fn new_member_owners(
+        &self,
+        path: &Path,
+        stat: &fs::Metadata,
+        paths: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if codex_archive_path(path) {
+            if shadowed_compressed_path(path, paths)
+                && fs::symlink_metadata(path.with_extension(""))
+                    .is_ok_and(|stat| stat.is_file() && !stat.file_type().is_symlink())
+            {
+                return Ok(BTreeSet::new());
+            }
+            let names = codex_session_id_candidates_from_path(path);
+            anyhow::ensure!(!names.is_empty(), HEADER_REREAD_FAILED);
+            return Ok(names.into_iter().collect());
+        }
+        let root = self.scan_root(path).context(ROOT_UNPROVED)?;
+        let (current, _) =
+            read_header_settled(&header_candidate(root, path.to_path_buf(), stat), None)
+                .0
+                .context(HEADER_REREAD_FAILED)?;
+        Ok(BTreeSet::from([current.owner]))
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
@@ -892,65 +870,11 @@ pub(super) struct Group {
     /// growth past the frozen extent on the same object, like `finish`.
     pub(super) live: Option<(String, sampled_scan::codex_cursor::SealedPrefix)>,
 }
-/// Boundary facts live only for this page, shared by pre-upload clones and
-/// the final checkpoint. The frozen inventory and traversal remain untouched.
-#[derive(Debug, Default)]
-struct PageMemo {
-    directories: DirectoryCensus,
-    entries: BTreeMap<String, (String, BTreeSet<String>)>,
-}
-impl PageMemo {
-    fn classify<'a>(
-        &'a mut self,
-        inventory: &HeaderInventory,
-        path: &Path,
-        stat: &fs::Metadata,
-        paths: &BTreeSet<String>,
-    ) -> Result<&'a BTreeSet<String>> {
-        let key = local_index_key(path);
-        let stamp = metadata_witness(stat);
-        let archive_fence = codex_archive_path(path)
-            && (!paths.contains(&key) || shadowed_compressed_path(path, paths));
-        if archive_fence
-            || !self
-                .entries
-                .get(&key)
-                .is_some_and(|(seen, _)| *seen == stamp)
-        {
-            let owners = if archive_fence {
-                if shadowed_compressed_path(path, paths)
-                    && fs::symlink_metadata(path.with_extension(""))
-                        .is_ok_and(|s| s.is_file() && !s.file_type().is_symlink())
-                {
-                    BTreeSet::new()
-                } else {
-                    let names = codex_session_id_candidates_from_path(path);
-                    anyhow::ensure!(!names.is_empty(), HEADER_REREAD_FAILED);
-                    names.into_iter().collect()
-                }
-            } else {
-                let root = inventory.scan_root(path).context(ROOT_UNPROVED)?;
-                let (current, witness) =
-                    read_header_settled(&header_candidate(root, path.to_path_buf(), stat), None)
-                        .0
-                        .context(HEADER_REREAD_FAILED)?;
-                self.entries
-                    .insert(key.clone(), (witness, BTreeSet::from([current.owner])));
-                return Ok(&self.entries[&key].1);
-            };
-            self.entries.insert(key.clone(), (stamp, owners));
-        }
-        Ok(&self.entries[&key].1)
-    }
-}
-crate::heap_layout_bound::fields!(PageMemo; directories, entries);
-
 #[derive(Clone, Debug)]
 pub(super) struct Validation {
     pub(super) inventory: HeaderInventory,
     pub(super) groups: Vec<Group>,
     owners: BTreeSet<String>,
-    memo: Arc<Mutex<PageMemo>>,
     paths: Arc<BTreeSet<String>>,
 }
 impl Validation {
@@ -960,23 +884,18 @@ impl Validation {
         inventory: HeaderInventory,
         groups: Vec<Group>,
         owners: &BTreeSet<String>,
-        paths: &BTreeSet<String>,
+        paths: BTreeSet<String>,
     ) -> Self {
         let owners = owners
             .iter()
             .cloned()
             .chain(groups.iter().map(|group| group.owner.clone()))
             .collect();
-        let memo = Arc::new(Mutex::new(PageMemo {
-            directories: inventory.directories.clone(),
-            ..PageMemo::default()
-        }));
         Self {
             inventory,
             groups,
             owners,
-            memo,
-            paths: Arc::new(paths.clone()),
+            paths: Arc::new(paths),
         }
     }
     pub(super) fn validate_all(&self) -> Result<usize> {
@@ -988,15 +907,9 @@ impl Validation {
             .intersection(owners)
             .cloned()
             .collect::<BTreeSet<_>>();
-        // Always stat across boundaries; reuse only unchanged page-local facts.
-        let checked_headers = self.inventory.validate_memberships(
-            &selected,
-            &self.paths,
-            &mut *self
-                .memo
-                .lock()
-                .map_err(|_| anyhow::anyhow!(DIRECTORY_CENSUS_UNPROVED))?,
-        )?;
+        let checked_headers = self
+            .inventory
+            .validate_memberships(&selected, &self.paths)?;
         for group in self
             .groups
             .iter()
@@ -1025,7 +938,7 @@ impl Validation {
     }
 }
 crate::heap_layout_bound::fields!(Group; owner, home, members, live);
-crate::heap_layout_bound::fields!(Validation; inventory, groups, owners, memo, paths);
+crate::heap_layout_bound::fields!(Validation; inventory, groups, owners, paths);
 
 pub(super) fn captured_join(witness: &str) -> String {
     format!("codex_captured_join:v1:{witness}")
@@ -2306,10 +2219,10 @@ pub(super) mod tests {
     #[test]
     fn header_inventory_detects_late_members_and_owner_changes() {
         let (root, inventory) = fixture();
-        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        inventory.validate_membership(owner, &root).unwrap();
+        let validation = validator(inventory);
+        validation.validate_all().unwrap();
         fs::write(root.join("sessions/new.jsonl"), "new member").unwrap();
-        assert!(inventory.validate_membership(owner, &root).is_err());
+        assert!(validation.validate_all().is_err());
         fs::remove_dir_all(root).unwrap();
         let (root, inventory) = fixture();
         let rows = member("ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
@@ -2320,7 +2233,7 @@ pub(super) mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        assert!(inventory.validate_membership(owner, &root).is_err());
+        assert!(validator(inventory).validate_all().is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2374,7 +2287,7 @@ pub(super) mod tests {
             inventory.clone(),
             Vec::new(),
             &BTreeSet::from([healthy.into()]),
-            &paths,
+            paths,
         );
         assert!(validation.validate_all().is_ok());
         fs::write(&healthy_path, b"{malformed}\n").unwrap();
@@ -2399,10 +2312,10 @@ pub(super) mod tests {
             .map(|h| local_index_key(&h.candidate.path))
             .collect()
     }
-    fn validator(inventory: HeaderInventory) -> Validation {
+    pub(super) fn validator(inventory: HeaderInventory) -> Validation {
         let paths = roster(&inventory);
         let owners = BTreeSet::from([inventory.headers[0].owner.clone()]);
-        Validation::new(inventory, Vec::new(), &owners, &paths)
+        Validation::new(inventory, Vec::new(), &owners, paths)
     }
     fn validation_error(validation: &Validation) -> String {
         crate::snapshot_sync::safe_error(&validation.validate_all().unwrap_err())
@@ -2437,7 +2350,7 @@ pub(super) mod tests {
         while !inventory.step(&CodexTitleMetadata::default()) {}
         let owner = original.headers[0].owner.clone();
         let selected = BTreeSet::from([owner.clone(), healthy.into()]);
-        let validation = Validation::new(inventory.clone(), Vec::new(), &selected, &paths);
+        let validation = Validation::new(inventory.clone(), Vec::new(), &selected, paths.clone());
         // Count flips 3 -> 4: remote headers now participate too.
         assert_eq!(validation.validate_all().unwrap(), 4);
         write_owner(&remote_path, healthy);
@@ -2463,12 +2376,14 @@ pub(super) mod tests {
             ),
             HEADER_OWNERSHIP_CHANGED
         );
-        // An unrelated old/new owner can defer even in this page's home.
+        // Every owner rewrite remains fail-closed, even for unrelated owners.
         assert_eq!(
-            validation
-                .validate(&BTreeSet::from([owner.clone()]))
-                .unwrap(),
-            4
+            crate::snapshot_sync::safe_error(
+                &validation
+                    .validate(&BTreeSet::from([owner.clone()]))
+                    .unwrap_err()
+            ),
+            HEADER_OWNERSHIP_CHANGED
         );
         write_owner(&healthy_path, healthy);
         assert!(validation.validate_all().is_ok());
@@ -2486,6 +2401,7 @@ pub(super) mod tests {
         fs::remove_dir_all(other_root).unwrap();
     }
 
+    /// [regress] An unrelated session created mid-page no longer rejects the page.
     #[test]
     fn owner_scoped_unrelated_new_session_mid_page_saves() {
         let (root, _) = fixture();
@@ -2506,21 +2422,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn owner_scoped_new_file_and_same_owner_subagent_fail() {
-        for subagent in [false, true] {
-            let (root, inventory) = fixture();
-            let owner = inventory.headers[0].owner.clone();
-            let validation = validator(inventory);
-            fs::write(root.join("sessions/new.jsonl"), format!("{}\n", json!({"type":"session_meta","payload":{"id":owner,"source":if subagent {json!({"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}})} else {json!("cli")}}}))).unwrap();
-            // The pre-upload subset must reject a new member before upload.
-            assert_eq!(
-                crate::snapshot_sync::safe_error(
-                    &validation.validate(&BTreeSet::from([owner])).unwrap_err()
-                ),
-                DIRECTORY_MEMBERSHIP_CHANGED
-            );
-            fs::remove_dir_all(root).unwrap();
-        }
+    fn owner_scoped_new_file_naming_page_owner_fails_before_upload() {
+        let (root, inventory) = fixture();
+        let owner = inventory.headers[0].owner.clone();
+        let validation = validator(inventory);
+        write_owner(&root.join("sessions/new.jsonl"), &owner);
+        assert_eq!(
+            crate::snapshot_sync::safe_error(
+                &validation.validate(&BTreeSet::from([owner])).unwrap_err()
+            ),
+            DIRECTORY_MEMBERSHIP_CHANGED
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2538,7 +2451,7 @@ pub(super) mod tests {
             HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
         while !inventory.step(&CodexTitleMetadata::default()) {}
         let owners = BTreeSet::from([original.headers[0].owner.clone()]);
-        let validation = Validation::new(inventory, Vec::new(), &owners, &paths);
+        let validation = Validation::new(inventory, Vec::new(), &owners, paths);
         let archive = plain.with_extension("jsonl.zst");
         fs::write(
             &archive,
@@ -2583,29 +2496,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn owner_scoped_new_midnight_subdirectory_fails() {
-        let (root, inventory) = fixture();
-        let validation = validator(inventory);
-        fs::create_dir(root.join("sessions/new-day")).unwrap();
-        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn owner_scoped_symlink_entry_still_fails() {
-        let (root, inventory) = fixture();
-        let validation = validator(inventory);
-        std::os::unix::fs::symlink(
-            root.join("sessions/a.jsonl"),
-            root.join("sessions/link.jsonl"),
-        )
-        .unwrap();
-        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn owner_scoped_known_roster_entries_need_no_header_proof() {
         let (root, original) = fixture();
         let owner = original.headers[0].owner.clone();
@@ -2623,7 +2513,7 @@ pub(super) mod tests {
             &root.join("sessions"),
             &fs::metadata(root.join("sessions")).unwrap(),
         );
-        let validation = Validation::new(inventory, Vec::new(), &BTreeSet::from([owner]), &paths);
+        let validation = Validation::new(inventory, Vec::new(), &BTreeSet::from([owner]), paths);
         write_owner(&root.join("sessions/new.jsonl"), "unrelated");
         assert!(validation.validate_all().is_ok());
         fs::remove_dir_all(root).unwrap();
@@ -2642,7 +2532,7 @@ pub(super) mod tests {
         directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
         let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
         while !inventory.step(&CodexTitleMetadata::default()) {}
-        let validation = Validation::new(inventory, Vec::new(), &BTreeSet::from([owner]), &paths);
+        let validation = Validation::new(inventory, Vec::new(), &BTreeSet::from([owner]), paths);
         fs::write(plain.with_extension("jsonl.zst"), b"held").unwrap();
         assert!(validation.validate_all().is_ok());
         fs::remove_file(plain).unwrap();
@@ -2689,7 +2579,7 @@ pub(super) mod tests {
                 inventory,
                 Vec::new(),
                 &BTreeSet::from([owner.clone()]),
-                &paths,
+                paths,
             );
             assert!(validation.validate_all().is_ok());
             fs::remove_file(plain).unwrap();
@@ -2711,66 +2601,6 @@ pub(super) mod tests {
             }
             fs::remove_dir_all(root).unwrap();
         }
-    }
-
-    #[test]
-    fn owner_scoped_archive_keeps_all_filename_candidates() {
-        let (root, inventory) = fixture();
-        let owner = inventory.headers[0].owner.clone();
-        let validation = validator(inventory);
-        fs::write(
-            root.join(format!(
-                "sessions/rollout-2026-11-05T01-02-03-{owner}.jsonl.zst"
-            )),
-            b"held",
-        )
-        .unwrap();
-        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn owner_scoped_boundary_memo_reuses_reads_and_directory_listing() {
-        let (root, inventory) = fixture();
-        let validation = validator(inventory);
-        let path = root.join("sessions/new.jsonl");
-        write_owner(&path, "unrelated");
-        let old = root.join("sessions/a.jsonl");
-        let mut body = fs::read_to_string(&old).unwrap();
-        body.push('\n');
-        fs::write(&old, body).unwrap();
-        header_cache_tests::READ_CALLS.with(|n| n.set(0));
-        header_cache_tests::LIST_CALLS.with(|n| n.set(0));
-        assert!(validation.validate_all().is_ok());
-        header_cache_tests::READ_CALLS.with(|n| assert_eq!(n.get(), 2));
-        assert!(validation
-            .memo
-            .lock()
-            .unwrap()
-            .directories
-            .moved_directories()
-            .is_empty());
-        let before = validation
-            .memo
-            .lock()
-            .unwrap()
-            .directories
-            .directories
-            .clone();
-        assert!(validation.clone().validate(&validation.owners).is_ok());
-        assert!(validation.validate_all().is_ok());
-        header_cache_tests::READ_CALLS.with(|n| assert_eq!(n.get(), 2));
-        header_cache_tests::LIST_CALLS.with(|n| assert_eq!(n.get(), 1));
-        assert_eq!(
-            validation.memo.lock().unwrap().directories.directories,
-            before
-        );
-        // A rewrite moves only the file witness, and must not hide in the memo.
-        write_owner(&path, validation.owners.first().unwrap());
-        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
-        header_cache_tests::READ_CALLS.with(|n| assert_eq!(n.get(), 3));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5014,7 +4844,6 @@ pub(super) mod tests {
 pub(in crate::snapshots) mod header_cache_tests {
     use super::*;
     thread_local! {
-        pub(in crate::snapshots) static LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
     pub(in crate::snapshots) fn page(
@@ -5177,9 +5006,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert_eq!(unchanged.read_bytes, 0);
         // A refreshed ctime witness also avoids validation's fallback read.
         READ_CALLS.with(|calls| calls.set(0));
-        unchanged
-            .validate_membership(&fixture.headers[0].owner, &root)
-            .unwrap();
+        tests::validator(unchanged).validate_all().unwrap();
         READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         let modified = stat.modified().unwrap() + std::time::Duration::from_nanos(1);
         fs::File::options()
