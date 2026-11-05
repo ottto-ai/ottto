@@ -803,6 +803,24 @@ fn generation_unchanged(file: &File, path: &Path, generation: Option<&ApiFileGen
 }
 
 impl ClaudeApiEvidenceRead {
+    /// Counts-only diagnostics may distinguish a known absent file from a
+    /// failed/limited read. No missing-file relaxation enters identity readers.
+    pub(crate) fn capture_report(
+        &self,
+        root: &str,
+    ) -> Option<crate::telemetry_attach::SessionReport<'_, ClaudeLocalOtelEvidence>> {
+        let mut report = self.session_report(root)?;
+        let h = &self.reads.get(root)?.health;
+        report.complete = h.malformed_lines
+            + h.unreadable_lines
+            + h.oversized_files
+            + h.invalid_session_rows
+            + h.missing_request_ids
+            == 0
+            && h.conflicting_request_ids.is_empty();
+        Some(report)
+    }
+
     /// Borrow the existing decode and its full health witness without I/O.
     /// Missing/malformed reads remain present but incomplete; a root outside
     /// this reader's cohort has no report. The reader owns strict allowance

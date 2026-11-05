@@ -12,6 +12,7 @@ mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
+mod claude_shell_telemetry;
 pub(crate) mod claude_spawn_gate;
 pub mod claude_upkeep;
 pub mod client_report;
@@ -1199,6 +1200,7 @@ impl LocalDaemon {
                 }
             }
         }
+        claude_shell_telemetry::project(&mut health, &state.relay);
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -1292,6 +1294,7 @@ impl LocalDaemon {
         config: SourceConfigState,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
+        let relay = state.relay.clone();
         let Some(existing) = state
             .sources
             .iter_mut()
@@ -1316,6 +1319,7 @@ impl LocalDaemon {
                 existing.grade = HealthGrade::Ok;
             }
         }
+        claude_shell_telemetry::project(existing, &relay);
         state.persist_source_state(source);
         Ok(())
     }
@@ -3042,6 +3046,9 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
 }
 
 fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
+    if claude_shell_telemetry::is_problem(problem) {
+        return claude_shell_telemetry::CODE;
+    }
     if problem.code == StableProblemCode::TelemetryNotVerified
         && problem_detail_is_usage_limited(&problem.detail)
     {
@@ -3219,6 +3226,22 @@ fn local_health_blockers_for_status(
             &status.generated_at,
             "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions",
         ));
+    }
+    for source in &status.sources {
+        if let Some(problem) = source
+            .problems
+            .iter()
+            .find(|p| claude_shell_telemetry::is_problem(p))
+        {
+            blockers.push(blocker(
+                claude_shell_telemetry::CODE,
+                LocalHealthSeverity::Warning,
+                "source",
+                LocalHealthAuthority::Runtime,
+                &status.generated_at,
+                &problem.detail,
+            ));
+        }
     }
     if account.state == LocalHealthAccountState::Connected {
         if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
@@ -4314,10 +4337,12 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
         preserve_blocking_verification_state(&mut refreshed, &existing);
+        claude_shell_telemetry::project(&mut refreshed, &state.relay);
         state.sources[index] = refreshed;
         return;
     }
-    let health = source_health_from_agent_status(state, snapshot);
+    let mut health = source_health_from_agent_status(state, snapshot);
+    claude_shell_telemetry::project(&mut health, &state.relay);
     state.sources.push(health);
 }
 
@@ -8937,6 +8962,60 @@ mod tests {
             route_results: Vec::new(),
             check: None,
         }
+    }
+
+    /// [regress] SDK verification/config success cannot erase shell-profile diagnostics.
+    #[test]
+    #[serial_test::serial]
+    fn shell_telemetry_survives_sdk_and_config_success_and_clears_after_removal() {
+        let home = crate::test_scratch::ScratchDir::new("shell-health-refresh");
+        let _home = TestEnvVar::set("HOME", &home);
+        let daemon = daemon();
+        let profile = home.join(".zshrc");
+        fs::write(
+            &profile,
+            "export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318\n",
+        )
+        .unwrap();
+        let mut verified = verified_codex("2026-05-05T10:20:00Z");
+        verified.source = SourceKind::ClaudeCode;
+        daemon.record_verification_result(&verified).unwrap();
+        daemon
+            .record_config_repair_result(&SourceKind::ClaudeCode, verified.config.clone())
+            .unwrap();
+        let assert_finding = || {
+            let state = daemon.state().unwrap();
+            assert_eq!(
+                state.sources[0]
+                    .problems
+                    .iter()
+                    .filter(|p| claude_shell_telemetry::is_problem(p))
+                    .count(),
+                1
+            );
+        };
+        assert_finding();
+        {
+            let mut state = daemon.state().unwrap();
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:21:00Z"),
+            );
+        }
+        assert_finding();
+        let status = daemon.status(TOKEN).unwrap();
+        assert!(status
+            .canonical_health
+            .unwrap()
+            .blockers
+            .iter()
+            .any(|b| b.code == claude_shell_telemetry::CODE));
+        fs::remove_file(profile).unwrap();
+        daemon.record_verification_result(&verified).unwrap();
+        assert!(!daemon.state().unwrap().sources[0]
+            .problems
+            .iter()
+            .any(claude_shell_telemetry::is_problem));
     }
 
     fn failed_codex_reconnect() -> SourceVerificationResult {

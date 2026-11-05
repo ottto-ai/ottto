@@ -8992,6 +8992,11 @@ fn apply_claude_local_evidence_to_scan_with_retained(
         }
     });
     let telemetry_read_failed = stats.effort_evidence_load_failed;
+    crate::snapshots::note_desktop_capture(
+        &scan_result.snapshots,
+        &api_read,
+        telemetry_read_failed,
+    );
     // Only the page's own roots keep their rows (both root spellings, so a
     // page family can never lose its own rows).
     let kept_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
