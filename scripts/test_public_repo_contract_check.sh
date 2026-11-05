@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUNDLE_SCRIPT="$ROOT/scripts/public_repo_export_bundle.sh"
+MANIFEST_SCRIPT="$ROOT/scripts/public_repo_manifest.sh"
 CONTRACT_SCRIPT="$ROOT/scripts/public_repo_contract_check.sh"
 PRIVATE_ROOT="$(cd "$ROOT/../.." && pwd)"
 # shellcheck source=scripts/public_repo_temp_cleanup.sh
@@ -22,20 +22,45 @@ cleanup_tmp_dir() {
 }
 trap cleanup_tmp_dir EXIT
 
+# Synthetic roots copy the committed tree. Broken cases edit plain copies; pin
+# cases use a git checkout so the manifest facts derive from its HEAD tree.
 output_dir="$tmp_dir/public-ottto"
-"$BUNDLE_SCRIPT" --output-dir "$output_dir" --force >/tmp/public-contract-bundle.out
+mkdir -p "$output_dir"
+git -C "$ROOT" archive HEAD | tar -x -C "$output_dir"
+public_git="$tmp_dir/public-git"
+cp -R "$output_dir" "$public_git"
+git -C "$public_git" init -q
+git -C "$public_git" config user.email "public-contract@example.invalid"
+git -C "$public_git" config user.name "Public Contract"
+# Disposable fixture: keep commit-triggered background gc/maintenance from
+# writing into .git while the EXIT trap removes it.
+git -C "$public_git" config gc.auto 0
+git -C "$public_git" config gc.autoDetach false
+git -C "$public_git" config maintenance.auto false
+git -C "$public_git" config core.fsmonitor false
+for key_value in "gc.auto=0" "gc.autoDetach=false" "maintenance.auto=false" "core.fsmonitor=false"; do
+  if [[ "$(git -C "$public_git" config --local --get "${key_value%%=*}")" != "${key_value#*=}" ]]; then
+    echo "Expected fixture repo to set ${key_value} locally" >&2
+    exit 1
+  fi
+done
+git -C "$public_git" add .
+git -C "$public_git" commit -qm "public runtime"
+public_commit="$(git -C "$public_git" rev-parse HEAD)"
+public_facts="$tmp_dir/public-facts.json"
+"$MANIFEST_SCRIPT" --repo "$public_git" --facts >"$public_facts"
 
 write_valid_pin() {
-  local manifest_path="$1"
+  local facts_path="$1"
   local pin_path="$2"
-  python3 - "$manifest_path" "$pin_path" <<'PY'
+  python3 - "$facts_path" "$pin_path" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
+facts_path = Path(sys.argv[1])
 pin_path = Path(sys.argv[2])
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+facts = json.loads(facts_path.read_text(encoding="utf-8"))
 pin_path.parent.mkdir(parents=True, exist_ok=True)
 pin = {
     "schema_version": 1,
@@ -43,9 +68,9 @@ pin = {
     "expected_repository": "ottto-ai/ottto",
     "authority_state": "pre_public_repo_export",
     "public_export_manifest": {
-        "content_sha256": manifest["content_sha256"],
-        "output_file_count": manifest["output_file_count"],
-        "file_record_count": len(manifest["files"]),
+        "content_sha256": facts["content_sha256"],
+        "output_file_count": facts["output_file_count"],
+        "file_record_count": facts["file_record_count"],
     },
 }
 pin_path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -53,18 +78,18 @@ PY
 }
 
 write_public_commit_pin() {
-  local manifest_path="$1"
+  local facts_path="$1"
   local pin_path="$2"
   local commit="$3"
-  python3 - "$manifest_path" "$pin_path" "$commit" <<'PY'
+  python3 - "$facts_path" "$pin_path" "$commit" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
+facts_path = Path(sys.argv[1])
 pin_path = Path(sys.argv[2])
 commit = sys.argv[3]
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+facts = json.loads(facts_path.read_text(encoding="utf-8"))
 pin_path.parent.mkdir(parents=True, exist_ok=True)
 pin = {
     "schema_version": 1,
@@ -75,12 +100,12 @@ pin = {
         "repository": "ottto-ai/ottto",
         "commit": commit,
         "manifest_path": "PUBLIC_EXPORT_MANIFEST.json",
-        "manifest_content_sha256": manifest["content_sha256"],
+        "manifest_content_sha256": facts["content_sha256"],
     },
     "public_export_manifest": {
-        "content_sha256": manifest["content_sha256"],
-        "output_file_count": manifest["output_file_count"],
-        "file_record_count": len(manifest["files"]),
+        "content_sha256": facts["content_sha256"],
+        "output_file_count": facts["output_file_count"],
+        "file_record_count": facts["file_record_count"],
     },
 }
 pin_path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -89,7 +114,7 @@ PY
 
 write_valid_private_consumers() {
   local private_root="$1"
-  local manifest_path="$2"
+  local facts_path="$2"
   mkdir -p \
     "$private_root/backend/app/domain/connectors" \
     "$private_root/backend/app/domain/local_platform" \
@@ -97,7 +122,7 @@ write_valid_private_consumers() {
     "$private_root/backend/app/schemas" \
     "$private_root/frontend/src/lib/apps"
   write_valid_pin \
-    "$manifest_path" \
+    "$facts_path" \
     "$private_root/backend/app/domain/local_platform/public_runtime_pin.json"
   cat > "$private_root/backend/app/domain/connectors/registry.py" <<'PY'
 from typing import Literal
@@ -128,21 +153,17 @@ TS
 }
 
 if [[ -d "$PRIVATE_ROOT/backend" && -d "$PRIVATE_ROOT/frontend" ]]; then
-  "$CONTRACT_SCRIPT" \
-    --staged-output "$output_dir" \
+  PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
     --private-repo-root "$PRIVATE_ROOT" \
     >/tmp/public-contract-private-script.out
-  "$output_dir/scripts/public_repo_contract_check.sh" \
-    --staged-output "$output_dir" \
+  "$public_git/scripts/public_repo_contract_check.sh" \
     --private-repo-root "$PRIVATE_ROOT" \
-    >/tmp/public-contract-exported-script.out
+    >/tmp/public-contract-copied-script.out
 else
-  "$CONTRACT_SCRIPT" \
-    --staged-output "$output_dir" \
+  PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" \
     >/tmp/public-contract-private-script.out
   "$output_dir/scripts/public_repo_contract_check.sh" \
-    --staged-output "$output_dir" \
-    >/tmp/public-contract-exported-script.out
+    >/tmp/public-contract-copied-script.out
 fi
 
 broken_protocol="$tmp_dir/broken-protocol"
@@ -157,7 +178,7 @@ payload = json.loads(path.read_text(encoding="utf-8"))
 payload["protocol_version"] = 10
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-broken-protocol.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_protocol" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-protocol.out 2>&1; then
   echo "Expected contract check to fail when control protocol drifts" >&2
   exit 1
 fi
@@ -177,7 +198,7 @@ payload["error"]["retryable"] = True
 payload["error"]["details"] = {"socket": "/tmp/ottto.sock"}
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_watch_without_json" >/tmp/public-contract-broken-watch-without-json.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_watch_without_json" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-watch-without-json.out 2>&1; then
   echo "Expected contract check to fail when watch-without-json error semantics drift" >&2
   exit 1
 fi
@@ -201,7 +222,7 @@ payload["properties"]["uploads_raw_content"] = {"type": "boolean"}
 payload.pop("allOf", None)
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_collector_safety_schema" >/tmp/public-contract-broken-collector-safety-schema.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_collector_safety_schema" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-collector-safety-schema.out 2>&1; then
   echo "Expected contract check to fail when collector safety schema loosens" >&2
   exit 1
 fi
@@ -224,7 +245,7 @@ payload["error"]["retryable"] = True
 payload["error"]["details"] = {"command": "context"}
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_agent_only_json" >/tmp/public-contract-broken-agent-only-json.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_agent_only_json" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-agent-only-json.out 2>&1; then
   echo "Expected contract check to fail when agent-only JSON error semantics drift" >&2
   exit 1
 fi
@@ -248,7 +269,7 @@ payload["command"] = "uninstall"
 payload["confirm"] = False
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_uninstall" >/tmp/public-contract-broken-uninstall.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_uninstall" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-uninstall.out 2>&1; then
   echo "Expected contract check to fail when uninstall is not a confirmed execute request" >&2
   exit 1
 fi
@@ -274,7 +295,7 @@ path.write_text(
     encoding="utf-8",
 )
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_uninstall_output" >/tmp/public-contract-broken-uninstall-output.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_uninstall_output" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-uninstall-output.out 2>&1; then
   echo "Expected contract check to fail when uninstall incomplete output stops being an error" >&2
   exit 1
 fi
@@ -310,7 +331,7 @@ payload["sections"].append({
 })
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_bundle" >/tmp/public-contract-broken-diagnostics-bundle.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_bundle" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-bundle.out 2>&1; then
   echo "Expected contract check to fail when diagnostics bundle exposes raw support data" >&2
   exit 1
 fi
@@ -340,7 +361,7 @@ payload["source"] = "claude_code"
 payload["dry_run"] = True
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_fix" >/tmp/public-contract-broken-fix.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_fix" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-fix.out 2>&1; then
   echo "Expected contract check to fail when fix request source or dry_run drifts" >&2
   exit 1
 fi
@@ -401,7 +422,7 @@ update = json.loads(update_path.read_text(encoding="utf-8"))
 update["command"] = "update"
 update_path.write_text(json.dumps(update, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_cli_requests" >/tmp/public-contract-broken-cli-requests.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_cli_requests" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-cli-requests.out 2>&1; then
   echo "Expected contract check to fail when CLI request fixture semantics drift" >&2
   exit 1
 fi
@@ -436,7 +457,7 @@ payload = json.loads(path.read_text(encoding="utf-8"))
 payload["next_action"] = {"type": "browser_claim"}
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_state" >/tmp/public-contract-broken-setup-state.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_state" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-state.out 2>&1; then
   echo "Expected contract check to fail when setup output has ambiguous next state" >&2
   exit 1
 fi
@@ -482,7 +503,7 @@ failed["agent_action"]["requires_user"] = True
 failed["agent_action"]["description"] = "Ask the user to decide how to repair setup."
 failed_path.write_text(json.dumps(failed, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_agent_action" >/tmp/public-contract-broken-setup-agent-action.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_agent_action" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-agent-action.out 2>&1; then
   echo "Expected contract check to fail when setup agent_action semantics drift" >&2
   exit 1
 fi
@@ -610,7 +631,7 @@ text = text.replace(
 )
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_docs" >/tmp/public-contract-broken-setup-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-docs.out 2>&1; then
   echo "Expected contract check to fail when setup docs lose agent-action semantics" >&2
   exit 1
 fi
@@ -800,7 +821,7 @@ troubleshooting = troubleshooting.replace(
 )
 troubleshooting_path.write_text(troubleshooting, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_docs" >/tmp/public-contract-broken-diagnostics-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-docs.out 2>&1; then
   echo "Expected contract check to fail when diagnostics docs lose upload/redaction constraints" >&2
   exit 1
 fi
@@ -891,7 +912,7 @@ for old, new in replacements.items():
     text = text.replace(old, new)
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_support_docs" >/tmp/public-contract-broken-support-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_support_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-support-docs.out 2>&1; then
   echo "Expected contract check to fail when support docs lose public-safe triage boundaries" >&2
   exit 1
 fi
@@ -976,7 +997,7 @@ upload["support_claim_provided"] = True
 upload["support_claim"] = "support_unredactedfixture"
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_upload" >/tmp/public-contract-broken-diagnostics-upload.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_upload" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-upload.out 2>&1; then
   echo "Expected contract check to fail when diagnostics upload state exposes support authorization" >&2
   exit 1
 fi
@@ -1006,7 +1027,7 @@ metadata["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.s
 metadata["auth_header"] = "Be" + "arer setupfixturetoken123"
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_redaction" >/tmp/public-contract-broken-setup-redaction.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_redaction" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-redaction.out 2>&1; then
   echo "Expected contract check to fail when setup events expose raw private values" >&2
   exit 1
 fi
@@ -1174,7 +1195,7 @@ release = release.replace(
 )
 release_path.write_text(release, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_install_docs" >/tmp/public-contract-broken-install-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_install_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-install-docs.out 2>&1; then
   echo "Expected contract check to fail when install docs lose owner and installer boundaries" >&2
   exit 1
 fi
@@ -1273,7 +1294,7 @@ text = text.replace("ottto diagnostics collect --json", "ottto diagnostics colle
 text = text.replace("public docs should prefer `apps` and `--app`", "public docs may prefer sources")
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_docs_index" >/tmp/public-contract-broken-docs-index.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_docs_index" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-docs-index.out 2>&1; then
   echo "Expected contract check to fail when docs index loses public entrypoint guidance" >&2
   exit 1
 fi
@@ -1365,7 +1386,7 @@ for old, new in replacements.items():
     text = text.replace(old, new)
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_examples_docs" >/tmp/public-contract-broken-examples-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_examples_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-examples-docs.out 2>&1; then
   echo "Expected contract check to fail when examples docs lose JSON/setup/diagnostics boundaries" >&2
   exit 1
 fi
@@ -1436,7 +1457,7 @@ for old, new in replacements.items():
     text = text.replace(old, new)
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_privacy_docs" >/tmp/public-contract-broken-privacy-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_privacy_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-privacy-docs.out 2>&1; then
   echo "Expected contract check to fail when privacy docs lose local ownership and redaction boundaries" >&2
   exit 1
 fi
@@ -1522,7 +1543,7 @@ readme = readme.replace(
 )
 readme_path.write_text(readme, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_docs" >/tmp/public-contract-broken-connector-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-docs.out 2>&1; then
   echo "Expected contract check to fail when connector docs lose SDK/testkit guidance" >&2
   exit 1
 fi
@@ -1555,7 +1576,7 @@ payload["sources"] = [
 ]
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_registry" >/tmp/public-contract-broken-registry.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_registry" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-registry.out 2>&1; then
   echo "Expected contract check to fail when a required source is missing" >&2
   exit 1
 fi
@@ -1587,7 +1608,7 @@ policy = policy.replace("## Upload Boundaries", "## Upload Notes")
 policy = policy.replace("Do not upload", "Avoid uploading")
 policy_path.write_text(policy, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_source_docs" >/tmp/public-contract-broken-source-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_source_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-source-docs.out 2>&1; then
   echo "Expected contract check to fail when source package docs lose governance content" >&2
   exit 1
 fi
@@ -1629,7 +1650,7 @@ collector_text = collector_text.replace('uploads_raw_content = false', 'uploads_
 collector_text = collector_text.replace('"local_usage_snapshots"', '"local_usage_snapshots_drift"', 1)
 collector_path.write_text(collector_text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_manifest" >/tmp/public-contract-broken-connector-manifest.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_manifest" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-manifest.out 2>&1; then
   echo "Expected contract check to fail when connector manifests drift from registry" >&2
   exit 1
 fi
@@ -1664,7 +1685,7 @@ payload["upload_policy"]["redacts"].remove("credential")
 payload["upload_policy"]["redacts"].append("prompt")
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_fixture" >/tmp/public-contract-broken-connector-fixture.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_fixture" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-fixture.out 2>&1; then
   echo "Expected contract check to fail when connector fixtures drift from registry" >&2
   exit 1
 fi
@@ -1704,7 +1725,7 @@ for section in payload["sections"]:
         section["items"]["support_claim"] = "support_unredactedfixture"
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_redaction" >/tmp/public-contract-broken-diagnostics-redaction.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_redaction" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-redaction.out 2>&1; then
   echo "Expected contract check to fail when diagnostics expose unredacted values" >&2
   exit 1
 fi
@@ -1752,7 +1773,7 @@ for case in payload:
     break
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_local_health_diagnostics" >/tmp/public-contract-broken-local-health-diagnostics.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_local_health_diagnostics" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-local-health-diagnostics.out 2>&1; then
   echo "Expected contract check to fail when local-health diagnostics redaction contract drifts" >&2
   exit 1
 fi
@@ -1779,7 +1800,7 @@ broken_mcp="$tmp_dir/broken-mcp"
 cp -R "$output_dir" "$broken_mcp"
 mkdir -p "$broken_mcp/agent-adapters/mcp-server"
 printf 'deferred\n' > "$broken_mcp/agent-adapters/mcp-server/README.md"
-if "$CONTRACT_SCRIPT" --staged-output "$broken_mcp" >/tmp/public-contract-broken-mcp.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_mcp" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-mcp.out 2>&1; then
   echo "Expected contract check to fail when an MCP adapter is exported for v1" >&2
   exit 1
 fi
@@ -1792,7 +1813,7 @@ cat >> "$broken_adapter_path/agent-adapters/codex-skill/SKILL.md" <<'EOF'
 Private install path regression:
 tools/ottto-local-platform/scripts/macos_dev_install.sh
 EOF
-if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_path" >/tmp/public-contract-broken-adapter-path.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_path" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-path.out 2>&1; then
   echo "Expected contract check to fail when an adapter skill references private install paths" >&2
   exit 1
 fi
@@ -1816,7 +1837,7 @@ tools:
 status-line:
   command: ottto status --json
 EOF
-if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_metadata" >/tmp/public-contract-broken-adapter-metadata.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_metadata" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-metadata.out 2>&1; then
   echo "Expected contract check to fail when adapter metadata pregrants tools or hooks" >&2
   exit 1
 fi
@@ -1863,7 +1884,7 @@ text = text.replace(
 )
 path.write_text(text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_docs" >/tmp/public-contract-broken-adapter-docs.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-docs.out 2>&1; then
   echo "Expected contract check to fail when adapter docs lose safety boundaries" >&2
   exit 1
 fi
@@ -1901,7 +1922,7 @@ claude_text = claude_text.replace(
 )
 claude_skill.write_text(claude_text, encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_required" >/tmp/public-contract-broken-adapter-required.out 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_required" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-required.out 2>&1; then
   echo "Expected contract check to fail when adapter skills lose required safety instructions" >&2
   exit 1
 fi
@@ -1911,9 +1932,9 @@ grep -q "Claude Code skill must keep support claims out of chat" \
   /tmp/public-contract-broken-adapter-required.out
 
 pin_private="$tmp_dir/pin-private"
-write_valid_private_consumers "$pin_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$pin_private" "$public_facts"
 pin_private_v2="$tmp_dir/pin-private-v2"
-write_valid_private_consumers "$pin_private_v2" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$pin_private_v2" "$public_facts"
 python3 - "$pin_private_v2/backend/app/domain/local_platform/public_runtime_pin.json" <<'PY'
 import json
 import sys
@@ -1926,8 +1947,7 @@ pin["stable_version"] = "0.1.100"
 pin["provider_daily_reference_admission_required"] = True
 path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-"$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$pin_private_v2" \
   >/tmp/public-contract-pin-v2.out
 
@@ -1942,8 +1962,7 @@ pin = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 pin.pop("stable_version")
 Path(sys.argv[2]).write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$pin_private_v2" \
   --private-runtime-pin "$bad_pin_v2" \
   >/tmp/public-contract-bad-pin-v2.out 2>&1; then
@@ -1963,8 +1982,7 @@ pin = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 pin["public_export_manifest"]["content_sha256"] = "0" * 64
 Path(sys.argv[2]).write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$pin_private" \
   --private-runtime-pin "$bad_pin" \
   >/tmp/public-contract-bad-pin.out 2>&1; then
@@ -1974,8 +1992,7 @@ fi
 grep -q "private runtime pin content_sha256 must match public manifest content_sha256" \
   /tmp/public-contract-bad-pin.out
 
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$pin_private" \
   --require-public-authority \
   >/tmp/public-contract-require-public-authority.out 2>&1; then
@@ -1985,46 +2002,24 @@ fi
 grep -q "private runtime pin authority_state must be public_repo_commit when public authority is required" \
   /tmp/public-contract-require-public-authority.out
 
-public_git="$tmp_dir/public-git"
-cp -R "$output_dir" "$public_git"
-git -C "$public_git" init -q
-git -C "$public_git" config user.email "public-contract@example.invalid"
-git -C "$public_git" config user.name "Public Contract"
-# Disposable fixture: keep commit-triggered background gc/maintenance from
-# writing into .git while the EXIT trap removes it.
-git -C "$public_git" config gc.auto 0
-git -C "$public_git" config gc.autoDetach false
-git -C "$public_git" config maintenance.auto false
-git -C "$public_git" config core.fsmonitor false
-for key_value in "gc.auto=0" "gc.autoDetach=false" "maintenance.auto=false" "core.fsmonitor=false"; do
-  if [[ "$(git -C "$public_git" config --local --get "${key_value%%=*}")" != "${key_value#*=}" ]]; then
-    echo "Expected fixture repo to set ${key_value} locally" >&2
-    exit 1
-  fi
-done
-git -C "$public_git" add .
-git -C "$public_git" commit -qm "public runtime"
-public_commit="$(git -C "$public_git" rev-parse HEAD)"
 public_authority_private="$tmp_dir/public-authority-private"
-write_valid_private_consumers "$public_authority_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$public_authority_private" "$public_facts"
 write_public_commit_pin \
-  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$public_facts" \
   "$public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
   "$public_commit"
-"$CONTRACT_SCRIPT" \
-  --staged-output "$public_git" \
+PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$public_authority_private" \
   --require-public-authority \
   >/tmp/public-contract-public-authority.out
 
 short_public_authority_private="$tmp_dir/short-public-authority-private"
-write_valid_private_consumers "$short_public_authority_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$short_public_authority_private" "$public_facts"
 write_public_commit_pin \
-  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$public_facts" \
   "$short_public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
   "$(git -C "$public_git" rev-parse --short=12 HEAD)"
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$public_git" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$short_public_authority_private" \
   --require-public-authority \
   >/tmp/public-contract-short-public-authority.out 2>&1; then
@@ -2035,13 +2030,12 @@ grep -q "private runtime pin public_repo_commit.commit must be a full 40-charact
   /tmp/public-contract-short-public-authority.out
 
 bad_public_authority_private="$tmp_dir/bad-public-authority-private"
-write_valid_private_consumers "$bad_public_authority_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$bad_public_authority_private" "$public_facts"
 write_public_commit_pin \
-  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$public_facts" \
   "$bad_public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
   "0000000000000000000000000000000000000000"
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$public_git" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$bad_public_authority_private" \
   --require-public-authority \
   >/tmp/public-contract-bad-public-authority.out 2>&1; then
@@ -2051,61 +2045,16 @@ fi
 grep -q "private runtime pin public_repo_commit.commit must match public root HEAD" \
   /tmp/public-contract-bad-public-authority.out
 
-# Without --staged-output the root is a git checkout and the manifest facts are
-# derived from its HEAD tree. Legacy match: the commit still tracks a manifest
-# that matches its tree.
-PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
-  --private-repo-root "$public_authority_private" \
-  --require-public-authority \
-  >/tmp/public-contract-git-legacy-match.out
-grep -q "private consumer file(s)" /tmp/public-contract-git-legacy-match.out
-
-# Derived: the public commit no longer tracks PUBLIC_EXPORT_MANIFEST.json, and
-# the pin digest still matches because the manifest never covers itself.
-public_derived="$tmp_dir/public-derived"
-cp -R "$public_git" "$public_derived"
-git -C "$public_derived" rm -q PUBLIC_EXPORT_MANIFEST.json
-git -C "$public_derived" commit -qm "derive public manifest"
-derived_private="$tmp_dir/public-derived-private"
-write_valid_private_consumers "$derived_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
-write_public_commit_pin \
-  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
-  "$derived_private/backend/app/domain/local_platform/public_runtime_pin.json" \
-  "$(git -C "$public_derived" rev-parse HEAD)"
-PUBLIC_CONTRACT_REPO_ROOT="$public_derived" "$CONTRACT_SCRIPT" \
-  --private-repo-root "$derived_private" \
-  --require-public-authority \
-  >/tmp/public-contract-git-derived.out
-grep -q "private consumer file(s)" /tmp/public-contract-git-derived.out
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$public_derived" \
-  --private-repo-root "$derived_private" \
-  --require-public-authority \
-  >/tmp/public-contract-staged-without-manifest.out 2>&1; then
-  echo "Expected staged contract check to fail when the bundle carries no manifest" >&2
-  exit 1
-fi
-grep -q "required file is missing: PUBLIC_EXPORT_MANIFEST.json" \
-  /tmp/public-contract-staged-without-manifest.out
-if PUBLIC_CONTRACT_REPO_ROOT="$public_derived" "$CONTRACT_SCRIPT" \
-  --private-repo-root "$derived_private" \
-  --private-runtime-pin "$bad_pin" \
-  >/tmp/public-contract-git-derived-bad-pin.out 2>&1; then
-  echo "Expected derived contract check to fail when the private runtime pin drifts" >&2
-  exit 1
-fi
-grep -q "private runtime pin content_sha256 must match public manifest content_sha256" \
-  /tmp/public-contract-git-derived-bad-pin.out
-
-# Legacy mismatch: the commit tracks a manifest that no longer matches its tree.
+# Legacy mismatch: the commit tracks a manifest that does not match its tree.
 public_stale="$tmp_dir/public-stale"
 cp -R "$public_git" "$public_stale"
-printf '\nEdited after the manifest was written.\n' >> "$public_stale/README.md"
-git -C "$public_stale" commit -qam "edit without regenerating the manifest"
+printf '{"files": []}\n' > "$public_stale/PUBLIC_EXPORT_MANIFEST.json"
+git -C "$public_stale" add PUBLIC_EXPORT_MANIFEST.json
+git -C "$public_stale" commit -qm "track a stale manifest"
 stale_private="$tmp_dir/public-stale-private"
-write_valid_private_consumers "$stale_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$stale_private" "$public_facts"
 write_public_commit_pin \
-  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$public_facts" \
   "$stale_private/backend/app/domain/local_platform/public_runtime_pin.json" \
   "$(git -C "$public_stale" rev-parse HEAD)"
 if PUBLIC_CONTRACT_REPO_ROOT="$public_stale" "$CONTRACT_SCRIPT" \
@@ -2120,8 +2069,7 @@ grep -q "public export manifest could not be derived from the public root HEAD" 
 grep -q "tracked PUBLIC_EXPORT_MANIFEST.json at [0-9a-f]* does not match the commit tree" \
   /tmp/public-contract-git-legacy-mismatch.out
 
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$pin_private" \
   --private-runtime-pin "$tmp_dir/missing-pin.json" \
   >/tmp/public-contract-missing-pin.out 2>&1; then
@@ -2131,7 +2079,7 @@ fi
 grep -q "private runtime pin is missing" /tmp/public-contract-missing-pin.out
 
 fake_private="$tmp_dir/private"
-write_valid_private_consumers "$fake_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
+write_valid_private_consumers "$fake_private" "$public_facts"
 cat > "$fake_private/backend/app/domain/connectors/registry.py" <<'PY'
 DEFAULT_CONNECTOR_REGISTRY_PATH = REPO_ROOT / "tools" / "ottto-local-platform" / "connectors" / "registry.generated.json"
 PY
@@ -2145,8 +2093,7 @@ PY
 cat > "$fake_private/frontend/src/lib/apps/local-telemetry-control.ts" <<'TS'
 const LOCAL_CONTROL_PROTOCOL_VERSION = 10;
 TS
-if "$CONTRACT_SCRIPT" \
-  --staged-output "$output_dir" \
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
   --private-repo-root "$fake_private" \
   >/tmp/public-contract-broken-private.out 2>&1; then
   echo "Expected contract check to fail when private consumers drift" >&2
@@ -2159,7 +2106,7 @@ grep -q "private frontend local-control client must send protocol version 15" /t
 for relative in Cargo.lock crates/Cargo.lock release/manifest.schema.json \
   agent-adapters/codex-skill/agents/openai.yaml; do
   mv "$output_dir/$relative" "$tmp_dir/required-file"
-  if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/required.out" 2>&1; then
+  if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/required.out" 2>&1; then
     echo "Expected missing stable public file to fail contracts" >&2
     exit 1
   fi
@@ -2169,7 +2116,7 @@ done
 for manifest in Cargo.toml crates/Cargo.toml; do
   cp "$output_dir/$manifest" "$tmp_dir/workspace.toml"
   sed '/^\[workspace\]$/d' "$tmp_dir/workspace.toml" > "$output_dir/$manifest"
-  if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/workspace.out" 2>&1; then
+  if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/workspace.out" 2>&1; then
     echo "Expected missing workspace declaration to fail contracts" >&2
     exit 1
   fi
@@ -2177,7 +2124,7 @@ for manifest in Cargo.toml crates/Cargo.toml; do
   cp "$tmp_dir/workspace.toml" "$output_dir/$manifest"
 done
 chmod -x "$output_dir/scripts/public_repo_manifest.sh"
-if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/executable.out" 2>&1; then
+if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/executable.out" 2>&1; then
   echo "Expected missing executable permission to fail contracts" >&2
   exit 1
 fi
