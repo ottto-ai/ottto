@@ -615,13 +615,20 @@ fn trace_evidence_from_attrs(
     attrs: &BTreeMap<String, String>,
     observed_at: Option<String>,
 ) -> Option<ClaudeTraceOwnershipEvidence> {
+    use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
     if first_attr(attrs, &["success"]).is_some_and(|value| value == "false") {
+        record(Event::LlmRequestSpanSuccessFalse);
         return None;
     }
     let session_id = bounded_attr(attrs, &["session.id", "session_id"], 256);
     if session_id.is_empty() {
+        record(Event::LlmRequestSpanMissingSessionId);
         return None;
     }
+    let Some(observed_at) = observed_at else {
+        record(Event::LlmRequestSpanMissingStartTime);
+        return None;
+    };
     let mut item = ClaudeTraceOwnershipEvidence {
         capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.to_string(),
         fingerprint: String::new(),
@@ -631,7 +638,7 @@ fn trace_evidence_from_attrs(
         agent_id: bounded_attr(attrs, &["agent.id", "agent_id"], 256),
         parent_agent_id: bounded_attr(attrs, &["parent_agent_id", "parent.agent.id"], 256),
         workflow_run_id: bounded_attr(attrs, &["workflow.run_id", "workflow_run_id"], 256),
-        observed_at: observed_at?,
+        observed_at,
     };
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
@@ -2864,6 +2871,45 @@ mod tests {
         assert_eq!(report.malformed_lines, 1);
         assert!(!report.is_complete());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// [behaviour] Each skipped `claude_code.llm_request` span counts its
+    /// closed reason and stores no ownership row.
+    #[test]
+    fn skipped_llm_request_spans_count_their_reason_without_a_row() {
+        use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+        let dir = std::env::temp_dir().join(format!("ottto-trace-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let attr = |key: &str, value: Value| serde_json::json!({"key": key, "value": value});
+        let session = attr(
+            "session.id",
+            serde_json::json!({"stringValue": "sess-skip"}),
+        );
+        let failed = attr("success", serde_json::json!({"boolValue": false}));
+        let start = Some("1785708000000000000");
+        let cases: [(Vec<Value>, Option<&str>, fn(&Counts) -> u64); 3] = [
+            (vec![session.clone(), failed], start, |c| {
+                c.llm_request_span_success_false
+            }),
+            (vec![], start, |c| c.llm_request_span_missing_session_id),
+            (vec![session], None, |c| {
+                c.llm_request_span_missing_start_time
+            }),
+        ];
+        for (attributes, start, counter) in cases {
+            let mut span =
+                serde_json::json!({"name": "claude_code.llm_request", "attributes": attributes});
+            if let Some(start) = start {
+                span["startTimeUnixNano"] = Value::from(start);
+            }
+            let body = serde_json::json!({"resourceSpans": [{"scopeSpans": [{"spans": [span]}]}]});
+            let body = serde_json::to_vec(&body).unwrap();
+            let (stored, counts) =
+                observe(|| capture_claude_llm_request_traces(&dir, &body, "application/json"));
+            assert_eq!(stored.unwrap(), 0);
+            assert_eq!(counter(&counts), 1, "{counts:?}");
+        }
+        assert!(!dir.exists());
     }
 
     #[test]
