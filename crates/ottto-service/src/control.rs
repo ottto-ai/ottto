@@ -2082,6 +2082,7 @@ fn remove_claude_account(
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
     crate::claude_refresher::prune_slot(slot_id);
+    crate::agent_status::forget_claude_slot_token_owner(slot_id);
     Ok(complete_claude_registry_mutation(status))
 }
 
