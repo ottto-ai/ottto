@@ -3283,7 +3283,8 @@ fn reserved_plain_sessions_and_archives_drain_to_cold_money() {
     while queued(&index) {
         page += 1;
         assert!(page <= 6, "the backlog drains");
-        let selected = four_path_page(&fixture, index, page)
+        // Collected at `NOW`, like the cold Full below.
+        let selected = four_path_page(&fixture, index, 0)
             .with_sampled_acquisition(Arc::clone(&cache), scope());
         if page <= 3 {
             let n = 2 * (page as usize - 1);
@@ -3320,6 +3321,17 @@ fn reserved_plain_sessions_and_archives_drain_to_cold_money() {
         &[],
     );
     assert_eq!(cold_scan.snapshots.len(), all.len());
+    // One batch of the drained bodies in cold order: the bodies are compared,
+    // not how the pages split them.
+    let order = |id: &str| {
+        cold_scan
+            .snapshots
+            .iter()
+            .position(|item| item.source_session_id == id)
+    };
+    drained
+        .snapshots
+        .sort_by_key(|item| order(&item.source_session_id));
     let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
     let route = scan_money(SnapshotSource::Codex, &index, &drained);
     money_oracle::assert_equivalent(&cold, &route);
