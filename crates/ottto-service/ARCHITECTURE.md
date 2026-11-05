@@ -136,6 +136,11 @@ switches. Per-source code is limited to the root layout, the file reader and red
 rules that really differ: copied-prefix deduplication for Claude, cumulative deltas for Codex and
 forks for Pi. Source capabilities are table fields, not `== Source::Claude` checks in shared code.
 
+Claude subagent path twins retain a native copied-request skip only when an earlier
+same-member page fold holds that id and the occurrence's usable provider timestamp is at
+or after 2026-11-05T00:00:00Z. Other requests and idless copies count through the existing
+restoration path; the parent-repeat rule and listed-family behavior remain unchanged.
+
 ## Module map: snapshots/ (target; migration in progress)
 
 `snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is

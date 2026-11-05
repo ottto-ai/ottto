@@ -971,8 +971,8 @@ impl FileFold {
             }
         }
         // A lone subagent keeps the context birth exemption. A later same-member
-        // path twin uses the normal money cutoff; finish_native still requires
-        // the earlier object's current identity/extent to validate the skip.
+        // path twin holds the native skip until the page proves each request
+        // against an earlier same-member fold, or restores it.
         let subagent_twin = context.is_some_and(|context| {
             claude_index_path_member_ref(context.path).is_some_and(|m| m.subagent_stem.is_some())
                 && physical.is_some_and(|physical| {
@@ -1318,6 +1318,13 @@ impl FileFold {
             // individual requests; provisional markers must not become own
             // account evidence before proof removes their copied request.
             self.copy = None;
+            return;
+        }
+        if context.is_some_and(|context| {
+            claude_index_path_member_ref(context.path).is_some_and(|m| m.subagent_stem.is_some())
+        }) {
+            self.copy = None;
+            self.finish_identity_start(false, markers);
             return;
         }
         if let Some(mut copy) = self.copy.take() {
@@ -1853,7 +1860,10 @@ pub(crate) fn decide_page_copies(
         }
         match proof {
             Some(CopyProof::Holders { .. }) => holders.push(at),
-            Some(CopyProof::Family(root)) => decide_family(items, at, &root, index),
+            Some(CopyProof::Family(root)) => {
+                decide_subagent_twins(items, at);
+                decide_family(items, at, &root, index);
+            }
             None => {}
         }
     }
@@ -2081,6 +2091,47 @@ fn current_witness<'a>(
             .filter(|record| scan_evidence(index, key, record) == Evidence::Current)
             .map(Witness::Census),
     }
+}
+
+/// Activation boundary: 2026-11-05T00:00:00Z, the ship date (UTC ns).
+const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
+
+/// Retain native skips only for eligible requests an earlier member counts.
+fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
+    let item = &items[at];
+    let group = items
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| other.source_session_id == item.source_session_id)
+        .map(|(other, _)| other)
+        .collect::<Vec<_>>();
+    let earlier = item
+        .claude_money
+        .as_deref()
+        .and_then(FileFold::copy_order)
+        .map(|order| {
+            earlier_holders(items, &group, &order, |other| {
+                items[other].claude_money.as_deref()?.copy_order()
+            })
+        })
+        .unwrap_or_default();
+    let mut kept = 0;
+    let uncovered = skipped_ids(item)
+        .filter(|id| {
+            let eligible = item.claude_usage_occurrences[*id]
+                .timestamp
+                .as_deref()
+                .and_then(rfc3339_unix_nanos)
+                .is_some_and(|at| at >= SUBAGENT_TWIN_FROM);
+            let held = eligible && earlier.iter().any(|ids| ids.contains(*id));
+            kept += u64::from(held);
+            !held
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    restore_uncovered(&mut items[at], &uncovered);
+    record_counts(Counts::one(27, kept));
+    diag("copy_prefix_twin_page_removed", kept);
 }
 
 /// A forked subagent's first line repeats the parent's last response: the
