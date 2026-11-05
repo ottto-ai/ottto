@@ -33,11 +33,31 @@ authentication for native loopback clients, so the id is treated only as a
 non-secret binding label. The endpoint never returns the relay secret, account
 ids, or hardware UUID.
 
+## Device Details
+
+Connecting a Mac (setup, claim completion and device registration) uploads:
+
+- the Mac name, which is the macOS hostname, read for each request so it
+  follows a rename;
+- the Mac's hardware UUID (`IOPlatformUUID`), sent as-is, not hashed;
+- the OS family (`macos`), the CPU architecture and the Ottto version;
+- `machine_id`, a one-way hash of the hardware UUID (of the hostname if the
+  UUID cannot be read), a random installation id, and a one-way id for the
+  macOS user account that runs Ottto.
+
+Routine health reports carry `machine_id` but not the Mac name or hardware
+UUID. They do include the full path of the running `ottto-service` binary and
+its process id; for an install under your home folder, that path contains the
+home folder name. The other health fields are Ottto account and organization
+ids, versions, states, codes, timestamps and short status messages; command
+output in those messages has local paths removed.
+
 ## What Stays Local
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths.
+absolute local paths. Health reports are an exception: they carry the full
+path of the running `ottto-service` binary, as described under Device Details.
 
 Raw provider account and organization ids are identifiers, not credentials.
 Agent status uploads carry them on the account block and on plan observations,
@@ -69,6 +89,18 @@ fields. Tokens and credentials stay local.
 Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
+
+Snapshots also carry per-session activity counts, whatever the Readable labels
+setting: tool calls, shell commands, patch operations, files changed, lines
+added and removed, web searches, MCP calls and subagent starts. These are
+numbers only; the commands, arguments, paths, patches and tool output behind
+them stay local.
+
+Session links are off by default. When they are on, each session can upload up
+to 50 links to pull requests, issues or merge requests (the URL's host,
+repository path and number) and commit hashes found in tool output. These
+include other people's work that a session only viewed. The daemon finds them
+locally either way and uploads them only while session links are on.
 
 The snapshot format keeps an optional `session_context_curve:v1` field, but
 the daemon builds and fits no context curves, so none are uploaded.
@@ -237,7 +269,11 @@ invoking the provider.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
-definitions to derive tenant-scoped HMAC identifiers. Bounded native skill labels
+definitions to derive tenant-scoped HMAC identifiers. The prompt grouping id is
+an HMAC of the normalized first prompt, keyed by a key the Ottto server issues
+and shares across your Macs, so the server can compute the id for a prompt text
+it already knows. It uploads only while session attribution is on, and it stays
+when Readable labels is off. Bounded native skill labels
 are kept in owner-only local records independently of upload settings; retirement
 and uninstall erase those records. The Companion
 session list also keeps local titles and workspace labels when uploads omit them. When the
