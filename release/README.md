@@ -455,21 +455,24 @@ AWS/CDN prerequisites before publish:
    `min_protocol_version: 15`, non-empty `supported_install_owners`, and
    rollback metadata for the immutable versioned prefix plus channel latest
    pointer.
-6. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
-   SHA-256, is uploaded under the immutable prefix, and is attested with
-   predicate `https://cyclonedx.org/bom`.
-7. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
-   Build L2 or better, covers every artifact plus `release-manifest.json` and
-   the SBOM, and has verified GitHub attestation evidence.
-8. Update `quality_gates.stable_candidate_rc` in the stable manifest to point
+6. Update `quality_gates.stable_candidate_rc` in the stable manifest to point
    at the passing stable-candidate RC evidence file and the candidate manifest
    SHA-256 from the same commit.
-9. Run `macos_release_gate.sh` and `macos_stable_preflight.sh` against the exact
+7. Generate `install-macos.sh` from the exact manifest with
+   `hosted_native_installer.sh --record-sha256` and run its dry-run/static QA
+   before attestation generation, attestation binding, and manifest signing.
+8. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
+   SHA-256, is uploaded under the immutable prefix, and is attested with
+   predicate `https://cyclonedx.org/bom`.
+9. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
+   Build L2 or better, covers every artifact plus `release-manifest.json` and
+   the SBOM, and has verified GitHub attestation evidence. Bind that evidence
+   and sign the final manifest with `macos_manifest_signature.sh`.
+10. Run `macos_release_gate.sh` and
+   `macos_stable_preflight.sh --require-installer-sha256` against the exact
    manifest to publish.
-10. Generate the Homebrew tap formula from the exact manifest and run the tap QA
+11. Generate the Homebrew tap formula from the exact manifest and run the tap QA
    checklist.
-11. Generate `install-macos.sh` from the exact manifest with
-   `hosted_native_installer.sh --record-sha256` and run its dry-run/static QA.
 12. Upload the app, CLI, daemon archives, `release-manifest.json`, the
     CycloneDX SBOM, the Homebrew formula output, and `install-macos.sh` to the
     immutable versioned prefix.
