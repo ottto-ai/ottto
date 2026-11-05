@@ -5755,59 +5755,8 @@ fn semantic_usage_buckets(item: &SnapshotItem) -> Vec<Value> {
         .collect()
 }
 
-fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Value {
-    let mut payload = serde_json::Map::new();
-    if let Some(evidence) = &item.session_account_evidence {
-        payload.insert("session_account_evidence".to_string(), json!(evidence));
-    }
-    if let Some(observations) = &item.cache_observations {
-        payload.insert(
-            "cache_observations_state".into(),
-            item.cache_observations_state.clone().unwrap_or_else(|| {
-                cache_state_from_patch(None, observations).expect("no accepted rows to parse")
-            }),
-        );
-    }
-    // Legacy tool witnesses include both defaults whenever either tool leaf
-    // is declared. Creator/cache domains retain wire presence.
-    if payload.is_empty() && (item.tool_usage.is_some() || item.tool_usage_truncated) {
-        payload.insert(
-            "tool_usage".into(),
-            json!(item.tool_usage.as_deref().unwrap_or(&[])),
-        );
-        payload.insert(
-            "tool_usage_truncated".into(),
-            json!(item.tool_usage_truncated),
-        );
-        return Value::Object(payload);
-    }
-    // Mirror wire declaration exactly. Serde omits `None` and false; backend
-    // witnesses include only fields actually declared in the accepted item.
-    if let Some(tool_usage) = &item.tool_usage {
-        payload.insert("tool_usage".to_string(), json!(tool_usage));
-    }
-    if item.tool_usage_truncated {
-        payload.insert(
-            "tool_usage_truncated".to_string(),
-            serde_json::Value::Bool(true),
-        );
-    }
-    serde_json::Value::Object(payload)
-}
-
-impl SnapshotItem {
-    /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
-    /// The backend refuses a base token combined with a challenge; the answer
-    /// replaces the stale base rather than adding to it.
-    fn cache_handshake(&self) -> (Option<String>, Option<String>, Option<String>, bool) {
-        match &self.cache_conflict_answer {
-            Some((challenge, revision)) => {
-                (None, Some(challenge.clone()), Some(revision.clone()), true)
-            }
-            None => (self.cache_base_head_etag.clone(), None, None, false),
-        }
-    }
-}
+#[cfg(test)]
+use wire::content_hash::snapshot_upload_body_witness_payload;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UsageTotals {
@@ -6025,100 +5974,7 @@ impl UsageTotals {
     }
 }
 
-fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), String> {
-    if item.model_usage.len() > MAX_MODEL_USAGE_ROWS {
-        return Err(format!(
-            "snapshot[{index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
-        ));
-    }
-    if item.compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
-        return Err(format!(
-            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
-        ));
-    }
-    if item.compaction_events.len() > MAX_COMPACTION_TIMESTAMPS {
-        return Err(format!(
-            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_events"
-        ));
-    }
-    crate::session_attribution::validate_fact_limits(&item.attribution_facts)
-        .map_err(|error| format!("snapshot[{index}] {error}"))?;
-    let expected = usage_totals_from_item(item);
-    let expected_has_usage = usage_totals_has_usage(&expected);
-    if expected_has_usage && item.usage_buckets.is_empty() {
-        return Err(format!(
-            "snapshot[{index}] has usage totals but no usage_buckets"
-        ));
-    }
-
-    let mut top_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
-    for row in &item.model_usage {
-        let row_key = row_key_from_model_usage(row);
-        if top_rows
-            .insert(row_key, usage_totals_from_model_usage(row))
-            .is_some()
-        {
-            return Err(format!(
-                "snapshot[{index}] has duplicate top-level model_usage rows"
-            ));
-        }
-    }
-
-    let mut bucket_totals = UsageTotals::default();
-    let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
-    for (bucket_index, bucket) in item.usage_buckets.iter().enumerate() {
-        if bucket.model_usage.len() > MAX_MODEL_USAGE_ROWS {
-            return Err(format!(
-                "snapshot[{index}].usage_buckets[{bucket_index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
-            ));
-        }
-        if bucket.model_usage.is_empty() {
-            return Err(format!(
-                "snapshot[{index}].usage_buckets[{bucket_index}] has no model_usage rows"
-            ));
-        }
-        let mut seen_bucket_rows = BTreeSet::new();
-        for row in &bucket.model_usage {
-            let row_key = row_key_from_model_usage(row);
-            if !seen_bucket_rows.insert(row_key.clone()) {
-                return Err(format!(
-                    "snapshot[{index}].usage_buckets[{bucket_index}] has duplicate model_usage rows"
-                ));
-            }
-            let totals = usage_totals_from_model_usage(row);
-            if !bucket_totals.add(&totals) || !bucket_rows.entry(row_key).or_default().add(&totals)
-            {
-                return Err(format!(
-                    "snapshot[{index}] usage_buckets counters overflow wire bounds"
-                ));
-            }
-        }
-    }
-
-    if !usage_totals_equal(&bucket_totals, &expected) {
-        return Err(format!(
-            "snapshot[{index}] usage_buckets totals do not match snapshot totals"
-        ));
-    }
-
-    if !bucket_rows.is_empty() {
-        if top_rows.keys().collect::<Vec<_>>() != bucket_rows.keys().collect::<Vec<_>>() {
-            return Err(format!(
-                "snapshot[{index}] usage_buckets model rows do not match top-level model_usage rows"
-            ));
-        }
-        for (row_key, top_totals) in &top_rows {
-            let bucket_row = bucket_rows.get(row_key).expect("checked key set");
-            if !usage_totals_equal(bucket_row, top_totals) {
-                return Err(format!(
-                    "snapshot[{index}] usage_buckets model row totals do not match top-level model_usage"
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
+use wire::batch_validation::validate_snapshot_item;
 
 fn usage_totals_from_item(item: &SnapshotItem) -> UsageTotals {
     UsageTotals {
@@ -19950,417 +19806,18 @@ fn claude_response_key(value: &Value, sequence: u64) -> String {
         }
     }
 }
-fn claude_title_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
-    accumulator.set_title(
-        string_at(value, &["customTitle"]).and_then(claude_custom_title_display_title),
-        "transcript_title",
-    );
-    accumulator.set_title_if_absent(
-        string_at(value, &["summary"])
-            .or_else(|| string_at(value, &["title"]))
-            .or_else(|| string_at(value, &["metadata", "title"])),
-        "summary",
-    );
-}
-fn claude_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    claude_title_content(value, accumulator);
-    let real_prompt = claude_first_user_prompt(value);
-    if real_prompt.is_some() {
-        accumulator.session_start.note_user_turn();
-    }
-    accumulator.set_first_prompt_title(real_prompt);
-}
-fn claude_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_workspace_hash(
-        string_at(value, &["cwd"])
-            .or_else(|| string_at(value, &["projectPath"]))
-            .or_else(|| string_at(value, &["workspace"])),
-    );
-}
-fn codex_opening_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator
-        .session_start
-        .observe_codex_line(value, accumulator.workspace_path.as_deref());
-}
-fn codex_user_turn_content(_: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.session_start.note_user_turn();
-}
-fn codex_prompt_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_title(codex_transcript_title(value), "transcript_title");
-    accumulator.set_first_prompt_title(codex_first_user_prompt(value));
-}
-fn codex_workspace_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.set_workspace_hash(
-        string_at(value, &["turn_context", "payload", "cwd"])
-            .or_else(|| string_at(value, &["payload", "cwd"]))
-            .or_else(|| string_at(value, &["cwd"])),
-    );
-}
-fn codex_agent_content(src: &Value, accumulator: &mut SnapshotAccumulator) {
-    accumulator.codex_agent_label = string_at(src, &["subagent", "thread_spawn", "agent_path"])
-        .and_then(safe_codex_agent_display_label);
-}
-fn pi_prompt_content(value: &Value, role: Option<&str>, accumulator: &mut SnapshotAccumulator) {
-    if role == Some("user") {
-        accumulator.set_first_prompt_title(pi_message_text(value));
-    }
-}
 
-/// First physical header remains the identity/graph owner. Later copied headers
-/// cannot replace it, and contradictory creator evidence permanently clears
-/// only the optional creator witness for this scan.
-fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    let first_record = !accumulator.codex_record_seen;
-    accumulator.codex_record_seen = true;
-    let Some(meta) = codex_session_meta_payload(value) else {
-        return;
-    };
-    let header_id = resolve_codex_identity_option(codex_identity_at(meta, &["id"]));
-    let evidence = codex_creator_header_evidence(value, meta);
-    if accumulator.codex_session_meta_seen {
-        // Native forks copy the parent's header into their inherited ordinal
-        // prefix. It is neither an own-header claim nor creator evidence for
-        // this child. Both first-header parent declarations must agree.
-        let inherited_parent_header = accumulator.origin.thread_source.as_deref()
-            == Some("subagent")
-            && accumulator.origin.source_subagent == Some(true)
-            && header_id.is_some()
-            && header_id != accumulator.codex_creator_header_id
-            && header_id == accumulator.codex_parent_session_ref
-            && header_id == accumulator.origin.parent_session_ref
-            && matches!(
-                (accumulator.codex_ownership_boundary, u64_at(value, &["ordinal"])),
-                (CodexOwnershipBoundary::Ordinal { start }, Some(ordinal))
-                    if ordinal > 0 && ordinal < start
-            );
-        if inherited_parent_header {
-            return;
-        }
-        if header_id != accumulator.codex_creator_header_id
-            || evidence != accumulator.codex_creator_evidence
-        {
-            accumulator.codex_creator_evidence_conflicted = true;
-        }
-        return;
-    }
-    if first_record {
-        accumulator.codex_creator_header_id = header_id;
-        accumulator.codex_creator_evidence = evidence;
-    }
-    accumulator.source_session_id = resolve_codex_identity_option(
-        codex_identity_at(meta, &["id"]).or_else(|| codex_identity_at(meta, &["session_id"])),
-    )
-    .or_else(|| accumulator.source_session_id.clone());
-    accumulator.origin.thread_source = string_at(meta, &["thread_source"]);
-    if let Some(src) = meta.get("source") {
-        if let Some(text) = src.as_str() {
-            accumulator.origin.source = Some(text.to_string());
-        } else if src.is_object() {
-            accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
-            accumulator.origin.parent_session_ref = resolve_codex_identity_option(
-                codex_identity_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
-                    .or_else(|| codex_identity_at(meta, &["parent_thread_id"])),
-            );
-            codex_agent_content(src, accumulator);
-        }
-    }
-    accumulator.origin.originator = string_at(meta, &["originator"]);
-    accumulator.origin.agent_role =
-        string_at(meta, &["agent_role"]).or_else(|| string_at(meta, &["agent_type"]));
-    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
-    accumulator
-        .note_time(string_at(value, &["timestamp"]).or_else(|| string_at(meta, &["timestamp"])));
-    accumulator.codex_session_meta_seen = true;
-}
-
-/// Refuse a malformed accepted row rather than silently dropping its bytes/row
-/// from the cumulative bound. No patch can authorize that implicit deletion.
-pub(crate) fn cache_state_from_patch(
-    previous: Option<&Value>,
-    patch: &CacheObservations,
-) -> Option<Value> {
-    let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    if let Some(previous) = previous {
-        for row in previous.get("observations")?.as_array()? {
-            let row =
-                serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
-            observations.insert(row.event_id.clone(), row);
-        }
-    }
-    for operation in &patch.operations {
-        match operation {
-            cache_observations::Operation::Upsert { observation } => {
-                if observation.status == "retracted" {
-                    observations.remove(&observation.event_id);
-                } else {
-                    observations.insert(observation.event_id.clone(), observation.as_ref().clone());
-                }
-            }
-            cache_observations::Operation::Retract { event_id } => {
-                observations.remove(event_id);
-            }
-        }
-    }
-    Some(
-        json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
-    )
-}
-
-/// Preflight the exact wire and its completion against the ACKed predecessor.
-/// Partial coverage never authorizes deletion, including after budget trimming.
-pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {
-    let Some(patch) = item.cache_observations.as_ref() else {
-        return;
-    };
-    let desired = cache_state_from_patch(None, patch).expect("no accepted rows to parse");
-    let ids = desired["observations"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["event_id"].as_str())
-        .collect::<BTreeSet<_>>();
-    let mut wire = patch.clone();
-    if patch.coverage == "complete" {
-        // Keep the established complete-patch wire order. The selected Codex
-        // patch stays in session order for the partial fallback below.
-        wire.operations.sort_by(|a, b| {
-            let a = match a {
-                cache_observations::Operation::Upsert { observation } => &observation.event_id,
-                cache_observations::Operation::Retract { event_id } => event_id,
-            };
-            let b = match b {
-                cache_observations::Operation::Upsert { observation } => &observation.event_id,
-                cache_observations::Operation::Retract { event_id } => event_id,
-            };
-            a.cmp(b)
-        });
-        for row in prior
-            .and_then(|p| p["observations"].as_array())
-            .into_iter()
-            .flatten()
-        {
-            if let Some(id) = row["event_id"].as_str() {
-                if !ids.contains(id) {
-                    wire.operations
-                        .push(cache_observations::Operation::Retract {
-                            event_id: id.into(),
-                        });
-                }
-            }
-        }
-        if !wire.validate() {
-            // Over the server's per-patch bound: send only what it lacks, so
-            // the rest of a long session follows on its next upload.
-            let held = cache_rows_held(prior);
-            wire.operations
-                .retain(|operation| !cache_row_held(&held, operation));
-        }
-        let Some(state) = cache_state_from_patch(prior, &wire) else {
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        };
-        if wire.validate() && cache_state_within_limits(&state) {
-            item.cache_observations_state = Some(state);
-            item.cache_observations = Some(wire);
-            return;
-        }
-    }
-
-    // Preserve all accepted evidence on partial/refused corrections. A prior ID
-    // outside the selected prefix prevents an exact missing-observation count.
-    let prior_is_prefix = prior
-        .and_then(|p| p["observations"].as_array())
-        .into_iter()
-        .flatten()
-        .all(|row| row["event_id"].as_str().is_some_and(|id| ids.contains(id)));
-    let overflow = if prior_is_prefix {
-        if patch.coverage == "complete" {
-            Some(0)
-        } else {
-            patch.omitted_observation_count
-        }
-    } else {
-        None
-    };
-    wire = patch.clone();
-    wire.coverage = "partial".into();
-    let held = cache_rows_held(prior);
-    wire.operations.retain(|operation| {
-        matches!(operation,
-        cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
-            && !cache_row_held(&held, operation)
-    });
-    // The earliest rows the server lacks, at most one patch's worth; later
-    // rows follow on the next upload.
-    wire.operations.truncate(cache_observations::MAX_OPERATIONS);
-    loop {
-        let Some(mut state) = cache_state_from_patch(prior, &wire) else {
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        };
-        let present = state["observations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|row| row["event_id"].as_str())
-            .collect::<BTreeSet<_>>();
-        let missing = ids.difference(&present).count() as u64;
-        wire.omitted_observation_count = overflow.and_then(|count| count.checked_add(missing));
-        state["omitted_observation_count"] = json!(wire.omitted_observation_count);
-        if wire.validate() && cache_state_within_limits(&state) {
-            item.cache_observations_state = Some(state);
-            item.cache_observations = Some(wire);
-            return;
-        }
-        // Removing a shrinking replacement can INCREASE completed bytes. Always
-        // recompute the actual merge; do not assume monotonic sizes.
-        if wire.operations.pop().is_none() {
-            // Withholding preserves accepted evidence, including possibly stale
-            // server coverage="complete": no cache metadata reaches the server.
-            // The Claude-only reread diagnostics do not count this upload refusal.
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        }
-    }
-}
-
-/// The accepted rows by event id. An unreadable row is left out, so its
-/// replacement is sent.
-fn cache_rows_held(prior: Option<&Value>) -> BTreeMap<String, cache_observations::Observation> {
-    prior
-        .and_then(|prior| prior["observations"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()
-        })
-        .map(|row| (row.event_id.clone(), row))
-        .collect()
-}
-
-/// An upsert of a row the server already holds unchanged.
-fn cache_row_held(
-    held: &BTreeMap<String, cache_observations::Observation>,
-    operation: &cache_observations::Operation,
-) -> bool {
-    matches!(operation, cache_observations::Operation::Upsert { observation }
-        if held.get(&observation.event_id) == Some(observation.as_ref()))
-}
-
-fn cache_state_within_limits(state: &Value) -> bool {
-    state["observations"].as_array().is_some_and(|rows| {
-        rows.len() <= cache_observations::MAX_ROWS
-            && rows.iter().all(|row| row["status"] != "retracted")
-    }) && crate::canonical_json::canonicalize(state)
-        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_STATE_BYTES)
-}
-
-/// One session's cache wire, shared by every source. A replayed request is
-/// one request; a conflicting replay or an unparseable time cannot certify
-/// an omitted count, nor can an incomplete request book: those ship
-/// `partial` with no rows. Rows stay in session order, so an upload that
-/// must trim drops the latest first.
-fn cache_wire<'a>(
-    session: &str,
-    requests: impl IntoIterator<Item = &'a OwnedRequest>,
-    complete: bool,
-) -> CacheObservations {
-    let mut seen = BTreeMap::new();
-    let mut unique = Vec::new();
-    for request in requests {
-        if OffsetDateTime::parse(&request.slot.occurred_at, &Rfc3339).is_err() {
-            return CacheObservations::partial(None);
-        }
-        match seen.get(&request.slot.request_ref) {
-            Some(prior) if prior != &request.slot => return CacheObservations::partial(None),
-            Some(_) => {}
-            None => {
-                seen.insert(request.slot.request_ref.clone(), request.slot.clone());
-                unique.push(request.clone());
-            }
-        }
-    }
-    if !complete {
-        return CacheObservations::partial(None);
-    }
-    CacheObservations {
-        schema_version: 1,
-        operations: cache_observations::detect_unique(session, &unique)
-            .into_iter()
-            .map(|observation| cache_observations::Operation::Upsert {
-                observation: Box::new(observation),
-            })
-            .collect(),
-        coverage: "complete".into(),
-        omitted_observation_count: None,
-    }
-}
-
-fn codex_cache_request(value: &Value, accumulator: &SnapshotAccumulator) -> Option<OwnedRequest> {
-    let slot = cache_observations::codex_slot(
-        value,
-        accumulator.latest_model.clone(),
-        accumulator.latest_reasoning_effort.clone(),
-    )?;
-    let compaction_before = accumulator
-        .compaction_timestamps
-        .last()
-        .is_some_and(|timestamp| {
-            accumulator.cache_requests.last().map_or(true, |prior| {
-                timestamp_is_after(timestamp, &prior.slot.occurred_at)
-            })
-        });
-    Some(OwnedRequest {
-        slot,
-        ordering: if accumulator.cache_active_turns.len() > 1 {
-            "ambiguous"
-        } else {
-            "sequential"
-        }
-        .into(),
-        compaction_before,
-        configuration_changed: false,
-        configuration_witness: accumulator.cache_configuration_witness.clone(),
-        idle_seconds: accumulator.cache_pending_idle,
-    })
-}
-
-fn claude_cache_request_slot(
-    value: &Value,
-    model: Option<String>,
-    effort: Option<String>,
-    timestamp: Option<String>,
-) -> RequestSlot {
-    let usage = claude_code_usage_root(value);
-    let field = |name: &str| {
-        usage
-            .and_then(|usage| usage.get(name))
-            .and_then(Value::as_u64)
-    };
-    let uncached = field("input_tokens");
-    let read = field("cache_read_input_tokens");
-    let write = field("cache_creation_input_tokens");
-    RequestSlot {
-        request_ref: string_at(value, &["requestId"])
-            .or_else(|| string_at(value, &["request_id"]))
-            .unwrap_or_default(),
-        occurred_at: timestamp.unwrap_or_default(),
-        model,
-        effort,
-        prompt_tokens: uncached
-            .zip(read)
-            .zip(write)
-            .and_then(|((u, r), w)| u.checked_add(r)?.checked_add(w)),
-        cache_read_tokens: read,
-        cache_creation_tokens: write,
-        uncached_tokens: uncached,
-        output_tokens: field("output_tokens"),
-    }
-}
+use scan::lines::apply::{
+    apply_codex_envelope_line, claude_prompt_content, claude_workspace_content,
+    codex_opening_content, codex_prompt_content, codex_user_turn_content, codex_workspace_content,
+    pi_prompt_content,
+};
+use sources::claude::line::claude_cache_request_slot;
+use sources::codex::line::codex_cache_request;
+#[cfg(test)]
+use usage::cache_observations::cache_state_within_limits;
+use usage::cache_observations::cache_wire;
+pub(crate) use usage::cache_observations::{cache_state_from_patch, prepare_cache_observations};
 
 fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     apply_codex_envelope_line(value, accumulator);
@@ -21639,9 +21096,7 @@ use sources::codex::line::{
     codex_usage_event_identity,
 };
 
-use sources::pi::{
-    apply_pi_line, pi_message_text, pi_message_usage, pi_usage_event, pi_usage_value,
-};
+use sources::pi::{apply_pi_line, pi_message_usage, pi_usage_event, pi_usage_value};
 
 fn timestamp_is_before(candidate: &str, current: &str) -> bool {
     match (
@@ -25875,118 +25330,9 @@ use discovery::candidate_open::{
     unix_seconds, OpenedContentSamples,
 };
 
-#[cfg(unix)]
-fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
-    let relative = candidate
-        .path
-        .strip_prefix(&candidate.scan_root)
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "snapshot candidate escaped configured root",
-            )
-        })?;
-    let components = relative.components().collect::<Vec<_>>();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "snapshot candidate path is not root-relative",
-        ));
-    }
-
-    let mut root_options = fs::OpenOptions::new();
-    root_options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut directory = root_options.open(&candidate.scan_root)?;
-    for (position, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            unreachable!("components validated above")
-        };
-        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "snapshot candidate contains a NUL byte",
-            )
-        })?;
-        let is_final = position + 1 == components.len();
-        let flags = if is_final {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
-        } else {
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        };
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let opened = unsafe { File::from_raw_fd(fd) };
-        if is_final {
-            return Ok(opened);
-        }
-        directory = opened;
-    }
-    unreachable!("non-empty component list returns its final object")
-}
-
-#[cfg(not(unix))]
-fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
-    let relative = candidate
-        .path
-        .strip_prefix(&candidate.scan_root)
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "snapshot candidate escaped configured root",
-            )
-        })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "snapshot candidate path is not root-relative",
-        ));
-    }
-    fs::OpenOptions::new().read(true).open(&candidate.path)
-}
-
-fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::Result<String> {
-    opened_object_identity_and_stat(source, file).map(|(identity, _)| identity)
-}
-
+use discovery::candidate_open::{open_candidate_beneath_root, opened_object_identity};
 #[cfg(test)]
-thread_local! {
-    static START_IDENTITY_SAMPLE_FOR_TEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-fn read_opened_content_samples(file: &mut File, len: u64) -> std::io::Result<OpenedContentSamples> {
-    let mut head = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
-    let first_len = file.read(&mut head)?;
-    head.truncate(first_len);
-    #[cfg(test)]
-    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterIdentityHead);
-    let tail = if len > FILE_CONTENT_SAMPLE_BYTES as u64 {
-        file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
-        let mut tail = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
-        let last_len = file.read(&mut tail)?;
-        tail.truncate(last_len);
-        Some(tail)
-    } else {
-        None
-    };
-    #[cfg(test)]
-    START_IDENTITY_SAMPLE_FOR_TEST.with(|v| {
-        let (samples, bytes) = v.get();
-        let read = (head.len() + tail.as_ref().map_or(0, Vec::len)) as u64;
-        v.set((samples + 1, bytes + read));
-    });
-    Ok(OpenedContentSamples { head, tail })
-}
+use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
 // The stop latch of the one-time Claude re-read.
 // The first Claude fold whose counts report `resource_withheld()` (a family
@@ -31620,23 +30966,14 @@ impl ScanIndex {
     }
 }
 
-fn codex_rows_all(item: &SnapshotItem, mode: impl Fn(Option<&str>) -> bool) -> bool {
-    let mut rows = item.model_usage.iter().chain(
-        item.usage_buckets
-            .iter()
-            .flat_map(|bucket| bucket.model_usage.iter()),
-    );
-    rows.next()
-        .is_some_and(|row| mode(row.auth_mode.as_deref()))
-        && rows.all(|row| mode(row.auth_mode.as_deref()))
-}
-
 pub(crate) use sources::codex::identity::codex_creator_pair;
+#[cfg(test)]
+use sources::codex::identity::safe_codex_agent_display_label;
 use sources::codex::identity::{
     codex_archive_path, codex_creator_slot, codex_digest_from_hex, codex_identity_at,
-    codex_reasoning_effort, codex_rollout_thread_id, codex_session_id_candidates_from_path,
-    codex_session_id_from_path, resolve_codex_identity, resolve_codex_identity_option,
-    safe_codex_agent_display_label,
+    codex_reasoning_effort, codex_rollout_thread_id, codex_rows_all,
+    codex_session_id_candidates_from_path, codex_session_id_from_path, resolve_codex_identity,
+    resolve_codex_identity_option,
 };
 
 mod scan_index;
@@ -31644,49 +30981,14 @@ pub use scan_index::source_fingerprint::source_file_fingerprint;
 use scan_index::source_fingerprint::{local_index_key, source_file_fingerprint_with_context};
 
 mod session_facts;
-use session_facts::display_title::{
-    agent_role_prompt_display_title, claude_custom_title_display_title,
-    contains_blocked_prompt_fragment, looks_like_resume_boilerplate, normalize_display_title,
-    normalize_title,
-};
+#[cfg(test)]
+use session_facts::display_title::claude_custom_title_display_title;
 pub(crate) use session_facts::display_title::{
     claude_registration_display_title, prompt_prefix_display_title,
 };
-
-fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
-    first_prompt_title(source, &value, true)
-}
-
-/// The one first-prompt title rule. `full_prompt` adds the Codex role rewrite
-/// and the 80-char / 12-word gate that only a whole first message needs.
-fn first_prompt_title(source: SnapshotSource, value: &str, full_prompt: bool) -> Option<String> {
-    let raw = value.trim();
-    if raw.is_empty()
-        || contains_blocked_prompt_fragment(raw)
-        || looks_like_resume_boilerplate(&raw.to_ascii_lowercase())
-    {
-        return None;
-    }
-    if full_prompt && source == SnapshotSource::Codex {
-        if let Some(role_title) = agent_role_prompt_display_title(raw) {
-            return Some(role_title);
-        }
-    }
-    let first_line = raw.lines().find_map(|line| {
-        let trimmed = line
-            .trim()
-            .trim_start_matches(['#', '-', '*', '>', ' '])
-            .trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    })?;
-    let normalized = normalize_title(first_line.to_string())?;
-    if full_prompt
-        && (normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12)
-    {
-        return None;
-    }
-    normalize_display_title(normalized, "first_prompt")
-}
+use session_facts::display_title::{
+    first_prompt_display_title, normalize_display_title, normalize_title,
+};
 
 mod scan;
 use scan::source_session_id::codex_identity_is_uuid_shaped;
@@ -31697,7 +30999,8 @@ pub(crate) use sources::claude::subagent_identity::{
     claude_subagent_identity, claude_transcript_excluded_from_snapshots,
 };
 use sources::claude::subagent_identity::{
-    claude_subagent_sidecar_fingerprint, claude_workflow_agent_label, read_claude_agent_meta,
+    claude_subagent_sidecar_fingerprint, claude_usage_sidecars_fingerprint,
+    claude_workflow_agent_label, read_claude_agent_meta,
 };
 
 pub(crate) use scan::source_session_id::snapshot_source_session_id;
@@ -31705,19 +31008,6 @@ pub(crate) use scan::source_session_id::snapshot_source_session_id;
 #[cfg(test)]
 #[path = "snapshots/source_session_id_tests.rs"]
 mod source_session_id_tests;
-
-fn claude_usage_sidecars_fingerprint(support_dir: &Path, session_id: &str) -> String {
-    let api = crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id);
-    let trace = crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
-        support_dir,
-        session_id,
-    );
-    if api.is_empty() && trace.is_empty() {
-        String::new()
-    } else {
-        sha256_hex(&["claude_usage_sidecars:v1", api.as_str(), trace.as_str()])
-    }
-}
 
 use scan::json_fields::{string_at, string_eq_at, u64_at};
 

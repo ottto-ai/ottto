@@ -14,17 +14,21 @@ use crate::snapshots::shared_value::SharedMap;
 use crate::snapshots::transcript_io_allowed;
 use crate::snapshots::{
     candidate_scan_identity, claude_absence_is_removal, claude_history_upgrade, codex_archive_path,
-    codex_fragment, disappearance_diagnostics, open_candidate_beneath_root,
-    opened_candidate_is_within_frozen_window, read_opened_content_samples, sampled_audit,
-    sampled_scan, withheld_account, CandidateFile, CandidateWindow, DiscoveryRecovery,
-    OpenedObjectStat, ScanCensus, ScanIndexEntry, SnapshotSource, OPENED_OBJECT_IDENTITY_VERSION,
+    codex_fragment, disappearance_diagnostics, opened_candidate_is_within_frozen_window,
+    sampled_audit, sampled_scan, withheld_account, CandidateFile, CandidateWindow,
+    DiscoveryRecovery, OpenedObjectStat, ScanCensus, ScanIndexEntry, SnapshotSource,
+    FILE_CONTENT_SAMPLE_BYTES, OPENED_OBJECT_IDENTITY_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Resolve one operator-configured root before discovery. A configured root
@@ -288,6 +292,90 @@ pub(in crate::snapshots) fn open_and_identify_scan_candidate_with_rescue_at(
     Some((candidate, opened_file))
 }
 
+#[cfg(unix)]
+pub(in crate::snapshots) fn open_candidate_beneath_root(
+    candidate: &CandidateFile,
+) -> std::io::Result<File> {
+    let relative = candidate
+        .path
+        .strip_prefix(&candidate.scan_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot candidate escaped configured root",
+            )
+        })?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot candidate path is not root-relative",
+        ));
+    }
+
+    let mut root_options = fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directory = root_options.open(&candidate.scan_root)?;
+    for (position, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("components validated above")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot candidate contains a NUL byte",
+            )
+        })?;
+        let is_final = position + 1 == components.len();
+        let flags = if is_final {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        if is_final {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    unreachable!("non-empty component list returns its final object")
+}
+
+#[cfg(not(unix))]
+pub(in crate::snapshots) fn open_candidate_beneath_root(
+    candidate: &CandidateFile,
+) -> std::io::Result<File> {
+    let relative = candidate
+        .path
+        .strip_prefix(&candidate.scan_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot candidate escaped configured root",
+            )
+        })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot candidate path is not root-relative",
+        ));
+    }
+    fs::OpenOptions::new().read(true).open(&candidate.path)
+}
+
 /// Replay readers fail before a parser or decoder is opened.
 pub(in crate::snapshots) fn reopen_for_replay(
     source: SnapshotSource,
@@ -304,11 +392,50 @@ pub(in crate::snapshots) fn reopen_for_replay(
     open_candidate_file(source, &mut candidate.clone())
 }
 
+pub(in crate::snapshots) fn opened_object_identity(
+    source: SnapshotSource,
+    file: &mut File,
+) -> std::io::Result<String> {
+    opened_object_identity_and_stat(source, file).map(|(identity, _)| identity)
+}
+
 /// Bounded content samples of one opened object: the first and, past one
 /// sample, the last `FILE_CONTENT_SAMPLE_BYTES`.
 pub(in crate::snapshots) struct OpenedContentSamples {
     pub(in crate::snapshots) head: Vec<u8>,
     pub(in crate::snapshots) tail: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::snapshots) static START_IDENTITY_SAMPLE_FOR_TEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+pub(in crate::snapshots) fn read_opened_content_samples(
+    file: &mut File,
+    len: u64,
+) -> std::io::Result<OpenedContentSamples> {
+    let mut head = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
+    let first_len = file.read(&mut head)?;
+    head.truncate(first_len);
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterIdentityHead);
+    let tail = if len > FILE_CONTENT_SAMPLE_BYTES as u64 {
+        file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
+        let mut tail = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
+        let last_len = file.read(&mut tail)?;
+        tail.truncate(last_len);
+        Some(tail)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    START_IDENTITY_SAMPLE_FOR_TEST.with(|v| {
+        let (samples, bytes) = v.get();
+        let read = (head.len() + tail.as_ref().map_or(0, Vec::len)) as u64;
+        v.set((samples + 1, bytes + read));
+    });
+    Ok(OpenedContentSamples { head, tail })
 }
 
 /// The opened-object identity. `object` carries the unix device, inode and
