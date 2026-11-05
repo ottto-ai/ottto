@@ -1061,7 +1061,7 @@ mod tests {
             "five_hour": window(0, None),
             "seven_day": window(100, Some("2026-10-10T05:00:00.377761+00:00")),
             "seven_day_opus": null,
-            "iguana_necktie": pool(250.0, 0.0, 250.0, "2026-11-05T07:59:00+00:00"),
+            "iguana_necktie": pool(250.0, 0.0, 250.0, "2036-11-05T07:59:00+00:00"),
             "amber_ladder": {
                 "utilization": 100, "resets_at": "2026-10-02T06:59:59+00:00",
                 "limit_dollars": 2500, "used_dollars": 2501.367212,
@@ -1097,7 +1097,7 @@ mod tests {
         json!({
             "five_hour": window(38, Some("2026-10-04T20:20:00.508208+00:00")),
             "seven_day": window(100, Some("2026-10-08T17:00:00.508227+00:00")),
-            "iguana_necktie": pool(250.0, 0.0, 250.0, "2026-11-05T07:59:00+00:00"),
+            "iguana_necktie": pool(250.0, 0.0, 250.0, "2036-11-05T07:59:00+00:00"),
             "cedar_ember": cedar,
             "extra_usage": null,
             "spend": null
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(credit.quota, Some(25_000));
         assert_eq!(credit.used, Some(0));
         assert_eq!(credit.remaining, Some(25_000));
-        assert_eq!(credit.expires_at.as_deref(), Some("2026-11-05T07:59:00Z"));
+        assert_eq!(credit.expires_at.as_deref(), Some("2036-11-05T07:59:00Z"));
         assert_eq!(credit.resets_at, None);
         assert_eq!(credit.enabled, None);
         assert_eq!(credit.status, AgentCreditBalanceStatus::Ok);
