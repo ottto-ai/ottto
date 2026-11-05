@@ -682,6 +682,21 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         )
         .unwrap_err();
         assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
+        // A partial page can retain a queued key while the delivery-only
+        // owner earns its exact ACK. The later ordinary page must only stat it.
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+            &mut f.working,
+            SnapshotSource::Pi,
+            &f.roots,
+            "2026-10-06T10:05:00Z",
+            30,
+        );
+        let scanned = f.working.clone();
+        let key = f.working.files.keys().next().unwrap().clone();
+        let entry = f.working.files.remove(&key).unwrap();
+        f.working
+            .requeue_unkept_scanned_keys(SnapshotSource::Pi, &scanned, &BTreeSet::new());
+        f.working.files.insert(key, entry);
         let mut owner = f.capture(Duration::from_millis(30));
         assert!(owner.enabled());
         let opens_before_retry = crate::snapshots::all_transcript_opens_for_test();
@@ -791,15 +806,30 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let checkpoint = ScanIndex::load(&f.index_path).unwrap();
         assert!(checkpoint.files.len() == 1);
         let mut recovered = checkpoint.clone();
-        let scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::Pi,
-            &f.roots,
-            &mut recovered,
-            "2026-10-06T10:06:00Z",
-            30,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-        )
-        .unwrap();
+        let ((scan, consumed), samples) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
+                    crate::snapshots::scan_source_roots_with_test_limit(
+                        SnapshotSource::Pi,
+                        &f.roots,
+                        &mut recovered,
+                        "2026-10-06T10:06:00Z",
+                        30,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                    )
+                    .unwrap()
+                })
+            });
+        assert_eq!(
+            scan.scanned_file_count, 0,
+            "ACKed queued key skips at candidate stat"
+        );
+        assert_eq!(consumed, 0);
+        assert!(samples.is_empty());
+        assert_eq!(
+            crate::snapshots::all_transcript_opens_for_test(),
+            opens_before_retry
+        );
         assert!(scan.snapshots.is_empty());
         assert!(serde_json::to_value(checkpoint)
             .unwrap()

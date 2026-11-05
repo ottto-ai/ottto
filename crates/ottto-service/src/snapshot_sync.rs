@@ -3688,8 +3688,8 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         locally_held,
         false,
     );
-    if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
-        committable.keep_unacknowledged_codex_files_owed(index, locally_held);
+    if let Some(scan) = correction_scan {
+        committable.requeue_unkept_scanned_keys(scan.source, index, locally_held);
     }
     if let Some(scan) = correction_scan {
         // Settle no-body grants only against the file/empty/map facts

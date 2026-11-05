@@ -1,0 +1,833 @@
+//! Native partial-checkpoint transitions, using the shared emitted-money oracle.
+use super::*;
+
+const SESSIONS: [&str; 3] = [
+    "019fa111-2222-7333-8444-555555555551",
+    "019fa111-2222-7333-8444-555555555552",
+    "019fa111-2222-7333-8444-555555555553",
+];
+
+fn response_line(source: SnapshotSource, session: &str, turn: u64) -> String {
+    match source {
+        SnapshotSource::ClaudeCode => line(session, &format!("req-{session}-{turn}"), AT, 10),
+        SnapshotSource::Codex => {
+            json!({"timestamp":AT,"type":"event_msg",
+            "payload":{"type":"token_count","info":{"model":"gpt-5.2",
+                "total_token_usage":{"input_tokens":turn*10,"output_tokens":turn*2},
+                "last_token_usage":{"input_tokens":10,"output_tokens":2}}}})
+            .to_string()
+                + "\n"
+        }
+        SnapshotSource::Pi => {
+            json!({"type":"message","id":format!("a{turn}"),
+            "parentId":"u0","timestamp":AT,"message":{"role":"assistant",
+                "provider":"openai","model":"gpt-5.4","api":"openai-responses",
+                "responseId":format!("response-{turn}"),"timestamp":AT,"stopReason":"stop",
+                "usage":{"input":10,"output":2,"totalTokens":12,"cost":{"total":0.001}}}})
+            .to_string()
+                + "\n"
+        }
+    }
+}
+
+fn native_corpus(source: SnapshotSource) -> (Corpus, Vec<PathBuf>) {
+    let mut c = corpus("unkept-native-oracle");
+    let paths = SESSIONS
+        .iter()
+        .map(|session| {
+            let header = match source {
+                SnapshotSource::ClaudeCode => String::new(),
+                SnapshotSource::Codex => {
+                    json!({"type":"session_meta","timestamp":AT,
+                "payload":{"id":session,"timestamp":AT}})
+                    .to_string()
+                        + "\n"
+                }
+                SnapshotSource::Pi => {
+                    json!({"type":"session","version":3,"id":session,
+                "timestamp":AT,"cwd":"/tmp/synthetic"})
+                    .to_string()
+                        + "\n"
+                        + &json!({"type":"message","id":"u0","timestamp":AT,
+                    "message":{"role":"user","content":[]}})
+                        .to_string()
+                        + "\n"
+                }
+            };
+            c.root(session, &(header + &response_line(source, session, 1)))
+        })
+        .collect();
+    (c, paths)
+}
+
+fn native_page(
+    source: SnapshotSource,
+    c: &Corpus,
+    prior: ScanIndex,
+    limit: usize,
+    sampled: bool,
+) -> Page {
+    let scanner = E2ScanFixture::capturing_identity();
+    if source == SOURCE {
+        let mut page = c.raw(&scanner, prior, limit, sampled, &[]);
+        page.enrich(c);
+        assert!(page.finish().held_fingerprints.is_empty());
+        assert_eq!(scanner.full_reasons().iter().sum::<usize>(), page.modes.0);
+        eprintln!("unkept Full reasons: {:?}", scanner.full_reasons());
+        return page;
+    }
+    let committed = prior.clone();
+    let (mut index, mut scan, modes) = scanner.scan_other_page(
+        source,
+        std::slice::from_ref(&c.root),
+        &c.support,
+        prior,
+        sampled,
+        limit,
+        &[],
+    );
+    apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+    finalize_scan_after_policy(source, &mut scan, &mut index);
+    scan.finish_codex_capture_boundary(&mut index);
+    assert_eq!(scanner.full_reasons().iter().sum::<usize>(), modes.0);
+    eprintln!("unkept Full reasons: {:?}", scanner.full_reasons());
+    Page {
+        cache: scanner.cache.clone(),
+        committed,
+        index,
+        scan,
+        modes,
+        disposition: Default::default(),
+        released: Default::default(),
+        stats: Default::default(),
+        delivered: None,
+        upload_policy: SnapshotUploadPolicy::default(),
+    }
+}
+
+fn progress(source: SnapshotSource) -> SnapshotUploadProgress {
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(source));
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    progress
+}
+
+fn send(
+    source: SnapshotSource,
+    page: &Page,
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, RouteResult) {
+    let (status, batches, _) = upload_source_under(
+        source,
+        SnapshotUploadPolicy::default(),
+        &page.scan.snapshots,
+        progress,
+        respond,
+    );
+    let sent = batches
+        .iter()
+        .flat_map(|bytes| {
+            let wire: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            wire["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    let items = page
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| sent.contains(&item.snapshot_fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut route = RouteResult::emitted(Mode::Ram, source, batches, &items);
+    if source == SnapshotSource::Codex {
+        route.codex_evidence = fixture::codex_evidence(&page.index, &page.scan);
+    }
+    route.modes = page.modes;
+    route.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    (status, route)
+}
+
+fn accept(source: SnapshotSource, page: &Page) -> RouteResult {
+    let (status, result) = send(source, page, &mut progress(source), ack);
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    result
+}
+
+fn checkpoint(
+    page: &Page,
+    progress: &mut SnapshotUploadProgress,
+    index_path: &Path,
+    cause: Option<crate::snapshots::UnsettledUploadCause>,
+) -> ScanIndex {
+    let progress_path = index_path.with_extension("progress.json");
+    progress.save(&progress_path).unwrap();
+    checkpoint_partial_snapshot_index_with_audit_release(
+        &page.index,
+        &page.committed,
+        progress,
+        &page.scan.snapshots,
+        Some(&page.scan),
+        &BTreeSet::new(),
+        index_path,
+        &progress_path,
+        || Ok(()),
+        None,
+        cause,
+        None,
+        Default::default(),
+    )
+    .unwrap()
+}
+
+fn commit_native(
+    source: SnapshotSource,
+    session: &StateV2ColdSession,
+    mut page: Page,
+) -> ScanIndex {
+    let mut progress = progress(source);
+    assert_eq!(
+        send(source, &page, &mut progress, ack).0.unwrap(),
+        ResumableUploadResult::Completed
+    );
+    page.index
+        .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    accept_upload_context_acks_for_test(
+        &mut page.index,
+        &page.scan.snapshots,
+        &progress.fresh_context_body_acks,
+    );
+    session.save_reload(&mut page.index)
+}
+
+/// [regress] New and updated files stay queued on a retained traversal after
+/// shed, upload error or pre-upload recovery, across an in-process page or restart.
+/// [money] Each native retry equals cold Full, including the accepted placement ledger.
+#[test]
+#[serial]
+fn retained_unkept_revisions_requeue_for_every_source_and_failure() {
+    use crate::snapshots::UnsettledUploadCause::{Shed, UploadError};
+    with_e2(|| {
+        for source in [SOURCE, SnapshotSource::Codex, SnapshotSource::Pi] {
+            for updated in [false, true] {
+                for cause in [Some(Shed), Some(UploadError), None] {
+                    for restart in [false, true] {
+                        let (c, paths) = native_corpus(source);
+                        let db_source = match source {
+                            SOURCE => Source::Claude,
+                            SnapshotSource::Codex => Source::Codex,
+                            SnapshotSource::Pi => Source::Pi,
+                        };
+                        let (session, mut prior) = StateV2ColdSession::publish(
+                            db_source,
+                            &ScanIndex::default(),
+                            &c.base.join("state"),
+                        );
+                        if updated {
+                            prior = commit_native(
+                                source,
+                                &session,
+                                native_page(source, &c, prior, 100, true),
+                            );
+                            for (path, session) in paths.iter().zip(SESSIONS) {
+                                append(path, &response_line(source, session, 2));
+                            }
+                        }
+                        let cold = accept(
+                            source,
+                            &native_page(source, &c, ScanIndex::default(), 100, false),
+                        );
+                        assert_eq!(cold.snapshots.len(), 3, "nonempty cold control");
+                        let (first, first_bytes) =
+                            fixture::observe_consumed(|| native_page(source, &c, prior, 2, true));
+                        assert_eq!(first.scan.scanned_file_count, 2);
+                        assert!(!first.scan.census_complete, "retained traversal");
+                        assert!(first_bytes > 0, "native transcript acquisition");
+                        let mut progress = progress(source);
+                        if cause.is_some() {
+                            let outcome = if cause == Some(Shed) {
+                                PipelineUpload::Shed
+                            } else {
+                                PipelineUpload::UploadError
+                            };
+                            let (status, _) = send(source, &first, &mut progress, |_| {
+                                if outcome == PipelineUpload::Shed {
+                                    Err(anyhow::Error::new(UploadShed {
+                                        status: 503,
+                                        retry_after: None,
+                                        code: None,
+                                    }))
+                                } else {
+                                    Err(anyhow!("synthetic upload error"))
+                                }
+                            });
+                            if cause == Some(Shed) {
+                                assert!(matches!(
+                                    status.unwrap(),
+                                    ResumableUploadResult::Shed { .. }
+                                ));
+                            } else {
+                                assert!(status.is_err());
+                            }
+                        }
+                        let mut owed = checkpoint(&first, &mut progress, session.path(), cause);
+                        let mut cadence = crate::adaptive_collector::SourceCadence::new(
+                            crate::adaptive_collector::CadenceConfig::cost_first(
+                                Duration::from_secs(60),
+                            ),
+                        );
+                        let mut now = Instant::now();
+                        for repeated in 0..2 {
+                            cadence.record_scan_failure(now);
+                            let wait = cadence.next_scan_after(now);
+                            assert!(!wait.is_zero());
+                            let (((), bytes), samples) =
+                                crate::transcript_acquisition::capture_sample_reads(|| {
+                                    fixture::observe_consumed(|| {
+                                        assert!(
+                                            cadence.next_scan_after(
+                                                now + wait - Duration::from_nanos(1)
+                                            ) > Duration::ZERO
+                                        );
+                                        if cause == Some(Shed) {
+                                            let previous_deadline = source_upload_deadlines()
+                                                .lock()
+                                                .unwrap()
+                                                .get(source.api_slug())
+                                                .copied();
+                                            defer_source_uploads(source, Duration::from_secs(60));
+                                            assert!(
+                                                source_upload_backoff_remaining(source).is_some()
+                                            );
+                                            // Test clock release through the existing source deadline owner.
+                                            source_upload_deadlines().lock().unwrap().insert(
+                                                source.api_slug(),
+                                                Instant::now() - Duration::from_secs(1),
+                                            );
+                                            assert!(
+                                                source_upload_backoff_remaining(source).is_none()
+                                            );
+                                            if let Some(previous) = previous_deadline {
+                                                source_upload_deadlines()
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(source.api_slug(), previous);
+                                            }
+                                        }
+                                    })
+                                });
+                            assert_eq!(bytes, 0, "no scan before ordinary/source eligibility");
+                            assert!(samples.is_empty());
+                            now += wait;
+                            assert_eq!(cadence.next_scan_after(now), Duration::ZERO);
+                            if cause.is_some() {
+                                let (again, bytes) = fixture::observe_consumed(|| {
+                                    native_page(source, &c, owed, 2, true)
+                                });
+                                assert!(!again.scan.census_complete);
+                                let mut posts = 0;
+                                let (status, _) = send(source, &again, &mut progress, |_| {
+                                    posts += 1;
+                                    if cause == Some(Shed) {
+                                        Err(anyhow::Error::new(UploadShed {
+                                            status: 503,
+                                            retry_after: None,
+                                            code: None,
+                                        }))
+                                    } else {
+                                        Err(anyhow!("synthetic repeated upload error"))
+                                    }
+                                });
+                                assert!(posts > 0);
+                                assert!(
+                                    status.is_err()
+                                        || matches!(status, Ok(ResumableUploadResult::Shed { .. }))
+                                );
+                                eprintln!(
+                                    "repeated={repeated} bytes={bytes} modes={:?}",
+                                    again.modes
+                                );
+                                owed = checkpoint(&again, &mut progress, session.path(), cause);
+                            }
+                        }
+                        if restart {
+                            owed = ScanIndex::load(session.path()).unwrap();
+                        }
+                        let (retry, consumed) =
+                            fixture::observe_consumed(|| native_page(source, &c, owed, 100, true));
+                        assert_eq!(
+                            retry.scan.scanned_file_count, 3,
+                            "two owed files plus unread sibling"
+                        );
+                        let mut route = accept(source, &retry);
+                        route.mode = if restart { Mode::Restart } else { Mode::Ram };
+                        route.io.consumed = consumed;
+                        money_oracle::assert_equivalent(&cold, &route);
+                        for entity in &SESSIONS {
+                            money_oracle::assert_no_smaller_reemit(
+                                entity, &cold, &route, &cold, false,
+                            );
+                        }
+                        eprintln!("unkept {source:?} updated={updated} cause={cause:?} restart={restart}: bytes={consumed} modes={:?}", retry.modes);
+                        let settled = commit_native(source, &session, retry);
+                        let opens = crate::snapshots::all_transcript_opens_for_test();
+                        let ((quiet, quiet_bytes), samples) =
+                            crate::transcript_acquisition::capture_sample_reads(|| {
+                                fixture::observe_consumed(|| {
+                                    native_page(source, &c, settled, 100, true)
+                                })
+                            });
+                        assert!(quiet.scan.snapshots.is_empty());
+                        assert_eq!(quiet.modes.0, 0);
+                        assert_eq!(quiet_bytes, 0, "settled restart consumes no transcript");
+                        if source == SOURCE {
+                            assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+                            assert!(samples.is_empty());
+                            let mut control = accept(source, &quiet);
+                            control.mode = Mode::Restart;
+                            control.io = fixture::IoBytes {
+                                consumed: quiet_bytes,
+                                cheap_checks: Some(0),
+                                anchor_reads: Some(0),
+                                other_reads: Some(0),
+                                ..Default::default()
+                            };
+                            money_oracle::assert_quiet_restart_zero_bytes(&control);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// [money] A receiver-stored body with a lost ACK is an idempotent replacement;
+/// growth before retry follows ordinary update rules and preserves accepted buckets.
+#[test]
+fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
+    with_e2(|| {
+        for grows in [false, true] {
+            let (mut c, path) = placement_corpus("unkept-lost-ack");
+            // Independent pending roots keep the walk alive after root + agent.
+            c.root(COPY, &line(COPY, "sibling", AT, 9));
+            let (session, prior) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut first = c.raw(&scanner, prior, 1, true, std::slice::from_ref(&path));
+            first.enrich(&c);
+            assert!(first.finish().held_fingerprints.is_empty());
+            assert!(!first.scan.census_complete);
+            let mut destination = BTreeMap::new();
+            let mut receiver = progress(SOURCE);
+            let mut sender = progress(SOURCE);
+            let (status, _) = send(SOURCE, &first, &mut sender, |items| {
+                for item in items {
+                    destination.insert(item.source_session_id.clone(), item.clone());
+                }
+                // The receiver records the stored identity shares; this exact
+                // response is lost before the sender can validate it.
+                let (status, _, _) = upload(items, &mut receiver, ack);
+                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+                Err(anyhow!("synthetic lost ACK"))
+            });
+            assert!(status.is_err());
+            assert!(sender.accepted_fingerprints.is_empty());
+            let receiver_before = first
+                .scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        item.source_session_id.clone(),
+                        serde_json::to_value(
+                            receiver
+                                .accepted_identity_buckets
+                                .get(&item.source_session_id),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut owed = checkpoint(
+                &first,
+                &mut sender,
+                session.path(),
+                Some(crate::snapshots::UnsettledUploadCause::UploadError),
+            );
+            if grows {
+                append(
+                    &path,
+                    &line(ROOT, "after-switch", "2026-08-02T07:04:00Z", 6),
+                );
+                c.evidence(
+                    &[
+                        api_login(ROOT, "a", 10, '1', Some('7')),
+                        api_login(ROOT, "b", 20, '2', Some('8')),
+                        api_login(ROOT, "agent", 5, '2', Some('8')),
+                        api_login(ROOT, "side", 4, '2', Some('8')),
+                        api_login(ROOT, "after-switch", 6, '3', Some('9')),
+                    ],
+                    &[
+                        trace("a", ""),
+                        trace("b", ""),
+                        trace("agent", "agent-000"),
+                        trace("side", ""),
+                        trace("after-switch", ""),
+                    ],
+                );
+            }
+            owed = ScanIndex::load(session.path())
+                .map(|loaded| {
+                    assert_eq!(loaded.generation, owed.generation);
+                    loaded
+                })
+                .unwrap();
+            let mut retry = page(&c, owed, 100, true);
+            assert!(retry.finish().held_fingerprints.is_empty());
+            let cold_page = page(&c, ScanIndex::default(), 100, false);
+            let cold = result(&cold_page, Mode::ColdFull);
+            assert!(
+                accounts(&cold).len() >= 2,
+                "switch and independent accounts"
+            );
+            assert!(
+                cold.snapshots
+                    .values()
+                    .any(|body| body["request_identity_refusals"].as_u64().unwrap_or(0) > 0),
+                "evidence gap"
+            );
+            assert!(
+                cold.snapshots
+                    .values()
+                    .any(|body| body["request_count"].as_u64().unwrap_or(0) >= 4),
+                "native side call"
+            );
+            let (status, route) = send(SOURCE, &retry, &mut sender, |items| {
+                for item in items {
+                    if !grows {
+                        if let Some(stored) = destination.get(&item.source_session_id) {
+                            assert_eq!(
+                                canonical(stored),
+                                canonical(item),
+                                "stable reconstructed body"
+                            );
+                        }
+                    }
+                    destination.insert(item.source_session_id.clone(), item.clone());
+                }
+                let (status, _, _) = upload(items, &mut receiver, ack);
+                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+                ack(items)
+            });
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            money_oracle::assert_equivalent(&cold, &route);
+            for entity in cold.snapshots.keys() {
+                let actual =
+                    serde_json::to_value(receiver.accepted_identity_buckets.get(entity)).unwrap();
+                let expected =
+                    serde_json::to_value(sender.accepted_identity_buckets.get(entity)).unwrap();
+                for field in ["shares", "proved", "missing", "incomplete", "key_epoch"] {
+                    assert_eq!(actual[field], expected[field], "receiver identity/{field}");
+                    if !grows {
+                        if let Some(before) = receiver_before.get(entity) {
+                            assert_eq!(
+                                actual[field], before[field],
+                                "stable accepted prefix/{field}"
+                            );
+                        }
+                    }
+                }
+            }
+            for (entity, body) in &cold.snapshots {
+                let stored = destination
+                    .get(entity)
+                    .expect("receiver stored every entity");
+                assert_eq!(
+                    stored.request_count,
+                    body["request_count"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&stored.model_usage).unwrap(),
+                    body["model_usage"]
+                );
+                assert_eq!(
+                    serde_json::to_value(&stored.usage_buckets).unwrap(),
+                    body["usage_buckets"]
+                );
+            }
+        }
+    });
+}
+
+/// [regress] A Claude append selected only by a watcher hint is observed at
+/// candidate stat and is requeued after failure without another directory walk.
+#[test]
+fn watcher_only_append_requeues_after_a_partial_checkpoint() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("unkept-watcher-only");
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let prior = commit(&session, page(&c, prior, 100, true));
+        let mut retained = prior.clone();
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+            &mut retained,
+            SOURCE,
+            std::slice::from_ref(&c.root),
+            "2026-08-02T08:00:00Z",
+            183,
+        );
+        append(&path, &line(ROOT, "hint-append", "2026-08-02T07:04:00Z", 6));
+        let mut first = hinted(&c, retained, 1, true, std::slice::from_ref(&path));
+        assert!(first.finish().held_fingerprints.is_empty());
+        assert_eq!(first.scan.scanned_file_count, 1);
+        assert!(!first.scan.census_complete);
+        let mut progress = progress(SOURCE);
+        let owed = checkpoint(
+            &first,
+            &mut progress,
+            session.path(),
+            Some(crate::snapshots::UnsettledUploadCause::Shed),
+        );
+        let mut retry = page(&c, owed, 100, true);
+        assert!(retry.finish().held_fingerprints.is_empty());
+        assert!(retry
+            .scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == ROOT));
+        let first_route = accept(SOURCE, &first);
+        let retry_route = accept(SOURCE, &retry);
+        money_oracle::assert_equivalent(&first_route, &retry_route);
+    });
+}
+
+/// [money] Only exact durable stored-body ACKs settle a file's full incidence.
+/// Invalid/partial responses, not-stored custody and a mixed file retain the
+/// accepted prefix while the ordinary retry produces cold Full money.
+#[test]
+fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
+    with_e2(|| {
+        for fault in [
+            "durable_ack",
+            "malformed_ack",
+            "partial_ack",
+            "not_stored",
+            "mixed_file",
+        ] {
+            let (mut c, root) = placement_corpus("unkept-ack-boundaries");
+            c.root(COPY, &line(COPY, "sibling", AT, 9));
+            let agent = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
+            let (session, prior) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let initial = page(&c, prior, 100, true);
+            let mut prior_body = result(&initial, Mode::ColdFull);
+            accepted(&mut prior_body, &initial.scan.snapshots);
+            let mut destination = initial
+                .scan
+                .snapshots
+                .iter()
+                .cloned()
+                .map(|item| (item.source_session_id.clone(), item))
+                .collect::<BTreeMap<_, _>>();
+            let (prior, mut sender) = commit_with_progress(&session, initial);
+            append(
+                &root,
+                &line(ROOT, "boundary-root", "2026-08-02T07:04:00Z", 6),
+            );
+            append(
+                &agent,
+                &line(ROOT, "boundary-agent", "2026-08-02T07:04:00Z", 3),
+            );
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut current = c.raw(&scanner, prior, 2, true, &[root.clone(), agent]);
+            current.enrich_with(&c, Some(&mut sender.accepted_identity_buckets));
+            assert!(current.finish().held_fingerprints.is_empty());
+            assert_eq!(current.scan.snapshots.len(), 2);
+            assert!(!current.scan.census_complete);
+            let all = current
+                .scan
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect::<BTreeSet<_>>();
+            // The shared ACK fixture's mixed-incidence seam: both real native
+            // entity bodies belong to ONE file's checkpoint, so one ACK cannot
+            // publish that file's revision.
+            if fault == "mixed_file" {
+                let mut wire = serde_json::to_value(&current.index).unwrap();
+                wire["file_snapshot_fingerprints"][root.to_str().unwrap()] = json!(all);
+                let altered: ScanIndex = serde_json::from_value(wire).unwrap();
+                current.index.file_snapshot_fingerprints = altered.file_snapshot_fingerprints;
+                let item = &current.scan.snapshots[0];
+                assert_eq!(
+                    upload(std::slice::from_ref(item), &mut sender, ack)
+                        .0
+                        .unwrap(),
+                    ResumableUploadResult::Completed
+                );
+                assert!(sender.contains_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item)
+                ));
+                destination.insert(item.source_session_id.clone(), item.clone());
+            } else {
+                let (status, _) = send(SOURCE, &current, &mut sender, |items| {
+                    let mut response = ack(items)?;
+                    match fault {
+                        "malformed_ack" => {
+                            response.accepted_entities[0].body_witness_digest = Some("0".repeat(64))
+                        }
+                        "partial_ack" => {
+                            response.accepted_entities.pop();
+                            response.accepted -= 1;
+                        }
+                        "not_stored" => {
+                            response.unchanged_entities =
+                                std::mem::take(&mut response.accepted_entities);
+                            for entity in &mut response.unchanged_entities {
+                                entity.unchanged_basis = Some("usage_identical".into());
+                            }
+                        }
+                        _ => {
+                            for item in items {
+                                destination.insert(item.source_session_id.clone(), item.clone());
+                            }
+                        }
+                    }
+                    Ok(response)
+                });
+                if matches!(fault, "malformed_ack" | "partial_ack") {
+                    assert!(status.is_err());
+                } else {
+                    assert!(status.is_ok());
+                }
+            }
+            let current_credit = all.intersection(&sender.accepted_fingerprints).count();
+            assert_eq!(
+                current_credit,
+                match fault {
+                    "durable_ack" => 2,
+                    "mixed_file" => 1,
+                    _ => 0,
+                }
+            );
+            let owed = checkpoint(
+                &current,
+                &mut sender,
+                session.path(),
+                Some(crate::snapshots::UnsettledUploadCause::UploadError),
+            );
+            let loaded = ScanIndex::load(session.path()).unwrap();
+            assert_eq!(loaded.generation, owed.generation);
+            if fault == "mixed_file" {
+                assert_ne!(
+                    loaded.files[root.to_str().unwrap()].source_file_fingerprint,
+                    current.index.files[root.to_str().unwrap()].source_file_fingerprint,
+                    "one unaccepted sibling prevents file settlement"
+                );
+            }
+            if fault == "not_stored" {
+                // Receiver head dominance is custody, never stored-body credit.
+                // Existing refusal retry owns its next offer; this helper adds no release.
+                let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &[]);
+                held.accepted = prior_body.accepted.clone();
+                for entity in current
+                    .scan
+                    .snapshots
+                    .iter()
+                    .map(|item| &item.source_session_id)
+                {
+                    let mut cold = prior_body.clone();
+                    cold.snapshots.retain(|id, _| id == entity);
+                    let mut prior = prior_body.clone();
+                    prior.snapshots.retain(|id, _| id == entity);
+                    for route in [&mut cold, &mut prior] {
+                        for envelope in route.normalized.as_array_mut().unwrap() {
+                            envelope["snapshots"]
+                                .as_array_mut()
+                                .unwrap()
+                                .retain(|item| item["source_session_id"] == *entity);
+                        }
+                        route.normalized.as_array_mut().unwrap().retain(|envelope| {
+                            !envelope["snapshots"].as_array().unwrap().is_empty()
+                        });
+                    }
+                    // The held comparison preserves the exact accepted body/witness.
+                    money_oracle::assert_held(entity, &prior, &held, &cold);
+                }
+                continue;
+            }
+            let mut retry = page(&c, loaded, 100, true);
+            assert!(retry.finish().held_fingerprints.is_empty());
+            let already_acked = sender.accepted_fingerprints.clone();
+            let mut physical_posts = 0;
+            let (status, _) = send(SOURCE, &retry, &mut sender, |items| {
+                physical_posts += items.len();
+                if fault == "mixed_file" {
+                    for item in items {
+                        assert!(
+                            !already_acked.contains(&item.snapshot_fingerprint),
+                            "stored sibling filtered before POST"
+                        );
+                    }
+                }
+                for item in items {
+                    destination.insert(item.source_session_id.clone(), item.clone());
+                }
+                ack(items)
+            });
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            if fault == "durable_ack" {
+                assert_eq!(
+                    physical_posts, 0,
+                    "durable ACK before index save is not sent twice"
+                );
+            }
+            let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+            // Replacements applied at the receiver, assembled from the actual
+            // accepted POSTs above, rather than re-scanning an expected body.
+            let mut final_page = retry;
+            final_page.scan.snapshots = destination.into_values().collect();
+            for item in &final_page.scan.snapshots {
+                assert!(sender.contains_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item)
+                ));
+            }
+            let final_route = result(&final_page, Mode::Restart);
+            money_oracle::assert_equivalent(&cold, &final_route);
+        }
+    });
+}

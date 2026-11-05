@@ -371,6 +371,7 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    full_reasons: Mutex<[usize; 11]>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
     attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
@@ -395,6 +396,10 @@ impl E2ScanFixture {
         attribution: Option<crate::session_attribution::SessionAttributionContext>,
     ) {
         *self.attribution.lock().unwrap() = attribution;
+    }
+
+    pub(crate) fn full_reasons(&self) -> [usize; 11] {
+        *self.full_reasons.lock().unwrap()
     }
 
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
@@ -558,12 +563,16 @@ impl E2ScanFixture {
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |s| {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
+            let reasons = scan.sampling.as_ref().map_or([0; 11], |s| s.full_reasons);
             let attribution = self.attribution.lock().unwrap();
             let step = scan.step(attribution.as_ref());
             drop(attribution);
             match step {
                 OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    *self.full_reasons.lock().unwrap() = reasons;
+                    return (index, scan, modes);
+                }
             }
         }
         panic!("bounded synthetic E2 scan failed to finish");

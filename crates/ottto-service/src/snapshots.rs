@@ -29556,23 +29556,22 @@ impl ScanIndex {
         self
     }
 
-    /// F5 root: a partial checkpoint keeps this pass's traversal, in which
-    /// the page already dequeued and observed every file it read. A new Codex
-    /// file whose upload is not acknowledged gets no entry in the checkpoint,
-    /// so it stays queued instead and a later page reads it once, with or
-    /// without a restart. Locally held and decode-held files and entities keep
-    /// their holds.
-    pub(crate) fn keep_unacknowledged_codex_files_owed(
+    /// A partial checkpoint keeps the traversal after scanned keys were
+    /// dequeued. Requeue new or source-changed revisions this save did not
+    /// keep; ordinary candidate selection still owns reads and holds.
+    pub(crate) fn requeue_unkept_scanned_keys(
         &mut self,
+        source: SnapshotSource,
         working: &ScanIndex,
         locally_held: &BTreeSet<String>,
     ) {
-        let unacknowledged = working
+        let unkept = working
             .files
             .iter()
             .filter(|(key, entry)| {
-                !self.files.contains_key(*key)
-                    && !working.decode_holds_file(key)
+                self.files.get(*key).is_none_or(|kept| {
+                    kept.source_file_fingerprint != entry.source_file_fingerprint
+                }) && !working.decode_holds_file(key)
                     && !entry
                         .last_snapshot_fingerprint
                         .iter()
@@ -29591,12 +29590,7 @@ impl ScanIndex {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         if let Some(traversal) = self.traversal.as_mut() {
-            requeue_observed_keys(
-                SnapshotSource::Codex,
-                traversal,
-                unacknowledged,
-                "unacknowledged",
-            );
+            requeue_observed_keys(source, traversal, unkept, "unkept");
         }
     }
 
@@ -42703,7 +42697,7 @@ mod tests {
                 .unwrap()
                 .pending_candidates
                 .len();
-            selected.keep_unacknowledged_codex_files_owed(&working, &local);
+            selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &local);
             let after = selected
                 .traversal
                 .as_ref()
@@ -42715,7 +42709,7 @@ mod tests {
                 if guard == "none" { 2 } else { 0 },
                 "{guard}"
             );
-            selected.keep_unacknowledged_codex_files_owed(&working, &local);
+            selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &local);
             assert_eq!(
                 selected
                     .traversal
@@ -42754,7 +42748,7 @@ mod tests {
             .unwrap()
             .pending_candidates
             .len();
-        selected.keep_unacknowledged_codex_files_owed(&working, &BTreeSet::new());
+        selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &BTreeSet::new());
         assert_eq!(
             selected
                 .traversal
@@ -42790,7 +42784,7 @@ mod tests {
         assert!(working.traversal.is_none());
         let mut selected =
             working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
-        selected.keep_unacknowledged_codex_files_owed(&working, &BTreeSet::new());
+        selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &BTreeSet::new());
         assert!(selected.traversal.is_none());
         assert!(selected.files.is_empty());
         selected.save(&home.join("terminal-index.json")).unwrap();
