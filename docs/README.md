@@ -34,6 +34,21 @@ CLI and `ottto-service` daemon, not private development scripts.
 - [Troubleshooting](troubleshooting.md): common exit codes and recovery steps.
 - [Examples](examples.md): copy-ready JSON workflows for agents and support.
 
+## Design Notes
+
+Technical notes for contributors about local runtime behavior and contracts.
+
+- [Account-Bound Terminal Sessions](session-launch.md): local-control commands
+  that open Claude Code or Codex terminal sessions under a verified account.
+- [Session Account Binding](session-account-binding.md): hash-only records that
+  attribute running and past sessions to an account.
+- [Cache Observations v1](cache-observations-v1.md): numeric cache evidence from
+  transcripts and its upload capability gate.
+- [Claude Worker Outcome Diagnostics](claude-worker-outcome-diagnostics.md): the
+  local diagnostic published by registered Claude slot upkeep.
+- [Scan Index Record Decoding](scan-index-decoding.md): how the persistence
+  reader isolates damaged records.
+
 ## Automation Contract
 
 Automation should consume only `ottto --json` output. Human summaries are for
