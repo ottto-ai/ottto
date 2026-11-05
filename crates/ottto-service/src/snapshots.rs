@@ -7961,8 +7961,8 @@ struct SnapshotAccumulator {
     ended_at: Option<String>,
     last_activity_at: Option<String>,
     workspace_hash: Option<String>,
-    // In-memory only: used to derive privacy-safe repository identity. The raw
-    // path is never copied into SnapshotItem or uploaded.
+    // Local Workspace fact used to derive privacy-safe repository identity.
+    // The raw path is never copied into SnapshotItem or uploaded.
     workspace_path: Option<PathBuf>,
     // Session-owned observation, retained independently of the path cache.
     repository_binding: Option<crate::context_footprint::RepositoryIdentity>,
@@ -10724,11 +10724,7 @@ fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::Rep
         if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
             guard.clear();
         }
-        if identity.repository_hash.is_some()
-            || identity.workspace_kind.as_deref() == Some("non_git")
-        {
-            guard.insert(workspace.to_path_buf(), (now, identity.clone()));
-        }
+        guard.insert(workspace.to_path_buf(), (now, identity.clone()));
     }
     identity
 }
@@ -18112,16 +18108,16 @@ impl OwnedJsonlParser {
             Some(reader)
         };
         // Resolve before PRE stages the session facts, outside the store's
-        // transactions. Failed lookups remain retryable on ordinary selected work.
+        // transactions. Capture this session's live observation, not another
+        // session's path-cache entry. Failures retry on ordinary selected work.
         let repository_identity = accumulator
             .repository_binding
             .clone()
             .or(repository_identity)
             .or_else(|| {
-                accumulator
-                    .workspace_path
-                    .as_deref()
-                    .map(cached_repository_identity)
+                accumulator.workspace_path.as_deref().map(|workspace| {
+                    crate::context_footprint::resolve_repository_identity(workspace, true)
+                })
             });
         if let Some(identity) = &repository_identity {
             if identity.repository_hash.is_some()

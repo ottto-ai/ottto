@@ -776,14 +776,16 @@ pub(crate) fn resolve_repository_identity(
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
         return unresolved_repository_identity("unknown");
     };
-    let common_dir = absolutize_git_path(workspace, &common_dir_raw);
+    let Ok(common_dir) = absolutize_git_path(workspace, &common_dir_raw).canonicalize() else {
+        return unresolved_repository_identity("unknown");
+    };
     let Some(git_dir) = git_stdout(workspace, &["rev-parse", "--git-dir"])
-        .map(|raw| absolutize_git_path(workspace, &raw))
+        .and_then(|raw| absolutize_git_path(workspace, &raw).canonicalize().ok())
     else {
         return unresolved_repository_identity("unknown");
     };
     let common_text = common_dir.to_string_lossy();
-    let linked_worktree = canonical_or_self(&git_dir) != canonical_or_self(&common_dir);
+    let linked_worktree = git_dir != common_dir;
     let workspace_kind = if linked_worktree {
         "linked_worktree"
     } else if same_path(workspace, &toplevel) {
