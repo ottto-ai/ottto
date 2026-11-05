@@ -40,8 +40,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups across registered homes. A header owner that changes
-  during a pass holds that pass’s Codex publication until revalidation on the next pass.
+  singleton sessions and joined groups: it re-checks the directories and headers of the homes
+  holding them, and the inventory holds an owner seen in two homes. A change in an unrelated
+  home is the next pass's fact. A header owner that changes in a checked home during a pass
+  holds that pass’s Codex publication until revalidation on the next pass.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.
