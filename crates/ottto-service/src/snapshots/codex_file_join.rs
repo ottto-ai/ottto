@@ -2428,11 +2428,12 @@ pub(super) mod tests {
         use sampled_scan::transition_fixture::{money_oracle, scan_money};
 
         let (root, _) = fixture();
+        // Use one physical member per owner, as scan_money expects emitted
+        // entities rather than the joined group's pre-upload aliases.
+        fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
         let old_day = root.join("sessions/2026/10/06");
         fs::create_dir_all(&old_day).unwrap();
-        for name in ["a.jsonl", "b.jsonl"] {
-            fs::rename(root.join("sessions").join(name), old_day.join(name)).unwrap();
-        }
+        fs::rename(root.join("sessions/a.jsonl"), old_day.join("a.jsonl")).unwrap();
         let write_member = |path: &Path, owner: &str| {
             fs::write(
                 path,
@@ -2449,7 +2450,7 @@ pub(super) mod tests {
             "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb",
         );
         let previous = ScanIndex::default();
-        let (mut index, mut first) = scan(&root, previous.clone(), 2);
+        let (mut index, mut first) = scan(&root, previous.clone(), 1);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
         assert!(!first.census_complete);
         assert_eq!(first.snapshots.len(), 1);
