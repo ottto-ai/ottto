@@ -325,14 +325,10 @@ fn finding(home: Option<&Path>, relay_port: Option<u16>, capture: &str) -> Optio
     })
 }
 
-pub(crate) fn project(health: &mut SourceHealth, relay: &ottto_protocol::RelayState) {
+pub(crate) fn apply(health: &mut SourceHealth, finding: Option<HealthProblem>) {
     if health.source != SourceKind::ClaudeCode {
         return;
     }
-    apply(health, problem(relay));
-}
-
-pub(crate) fn apply(health: &mut SourceHealth, finding: Option<HealthProblem>) {
     let had_finding = health.problems.iter().any(is_problem);
     health.problems.retain(|problem| !is_problem(problem));
     if had_finding && health.problems.is_empty() && health.grade == HealthGrade::Warning {
@@ -346,7 +342,13 @@ pub(crate) fn apply(health: &mut SourceHealth, finding: Option<HealthProblem>) {
     }
 }
 
-pub(crate) fn problem(relay: &ottto_protocol::RelayState) -> Option<HealthProblem> {
+pub(crate) fn problem(
+    source: &SourceKind,
+    relay: &ottto_protocol::RelayState,
+) -> Option<HealthProblem> {
+    if *source != SourceKind::ClaudeCode {
+        return None;
+    }
     let home = crate::snapshot_sync::home_dir().ok();
     let port = relay
         .endpoint

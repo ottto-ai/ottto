@@ -4336,19 +4336,6 @@ fn repair_source(
     dry_run: bool,
 ) -> Result<RepairPlan, LocalApiError> {
     let plan = propose_repair_plan(daemon, authorization, source.clone(), dry_run)?;
-    if source == SourceKind::ClaudeCode {
-        let status = status_for(daemon, authorization)?;
-        if let Some(problem) = crate::claude_shell_telemetry::problem(&status.relay) {
-            let mut plan = plan;
-            plan.status = RepairPlanStatus::Blocked;
-            plan.actions.clear();
-            plan.authority.message = StableMessage {
-                code: crate::claude_shell_telemetry::CODE.into(),
-                text: problem.detail,
-            };
-            return Ok(plan);
-        }
-    }
     if dry_run {
         return Ok(plan);
     }
