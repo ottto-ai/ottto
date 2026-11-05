@@ -4533,6 +4533,7 @@ fn collect_claude_status(
                 stable.credential.access_token.clone(),
                 stable.credential.access_expires_at.clone(),
                 &caller,
+                current_unix_seconds,
             )
         }
         _ => {
@@ -6063,6 +6064,7 @@ fn collect_registered_claude_slot_step(
         access_token,
         resolved.credential.access_expires_at.clone(),
         &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
+        current_unix_seconds,
     );
     match custom_claude_snapshot_from_usage(
         resolved,
@@ -11110,17 +11112,20 @@ fn collect_claude_oauth_usage_with_access_token(
         access_token,
         None,
         caller,
+        current_unix_seconds,
     )
 }
 
 /// `credential_expires_at` is the access-token expiry metadata of the same
-/// credential, used only to notice rotation; it is never the token.
+/// credential, used only to notice rotation; it is never the token. `clock`
+/// is the wall clock (`current_unix_seconds`) outside fixed-instant tests.
 fn collect_claude_oauth_usage_with_credential(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     access_token: Option<String>,
     credential_expires_at: Option<String>,
     caller: &ClaudeOAuthUsageCaller,
+    clock: fn() -> u64,
 ) -> ClaudeOAuthUsageOutcome {
     let mut outcome = collect_claude_oauth_usage_unstamped(
         account_identifier_hash,
@@ -11128,6 +11133,7 @@ fn collect_claude_oauth_usage_with_credential(
         access_token,
         credential_expires_at.as_deref(),
         caller,
+        clock,
     );
     if let Ok(usage) = &mut outcome.result {
         claude_oauth_stamp_account_identity(
@@ -11181,8 +11187,9 @@ fn collect_claude_oauth_usage_unstamped(
     access_token: Option<String>,
     credential_expires_at: Option<&str>,
     caller: &ClaudeOAuthUsageCaller,
+    clock: fn() -> u64,
 ) -> ClaudeOAuthUsageOutcome {
-    let now = current_unix_seconds();
+    let now = clock();
     let mirror_legacy_default = caller.mirrors_legacy_default();
     // Every pass is evidence of where this caller's login is signed in; a
     // passive reading must have been fetched inside that continuous run.
@@ -11581,7 +11588,7 @@ fn collect_claude_oauth_usage_unstamped(
     // refresh token.
     // A fresh clock sample: cache, breaker and lock reads above can block, and
     // the Mac can sleep, after `now` was taken.
-    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
+    if claude_access_token_locally_expired(credential_expires_at, clock()) {
         drop(token);
         let result = match exact_stale_fallback {
             Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
@@ -11645,7 +11652,7 @@ fn collect_claude_oauth_usage_unstamped(
         hook();
     }
     // Last check, with a clock read immediately before the request.
-    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
+    if claude_access_token_locally_expired(credential_expires_at, clock()) {
         drop(token);
         let result = match exact_stale_fallback {
             Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
@@ -11661,7 +11668,7 @@ fn collect_claude_oauth_usage_unstamped(
         .with_check_outcome(
             "claude_oauth_usage_check_suppressed",
             "This Claude login's access token has expired locally and Claude Code has not refreshed it yet; no provider request was made, and any served readings are last-known local readings.",
-            current_unix_seconds(),
+            clock(),
         );
     }
     if claude_transient_failure_held(account_identifier_hash, organization_identifier_hash, now) {
@@ -11684,7 +11691,7 @@ fn collect_claude_oauth_usage_unstamped(
         return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
             "claude_oauth_usage_check_suppressed",
             "The latest Claude OAuth quota request failed moments ago; no provider request was made, and any served readings are last-known local readings.",
-            current_unix_seconds(),
+            clock(),
         );
     }
     // "Background limit refresh" off: the daemon's own passes read no
@@ -11766,7 +11773,7 @@ fn collect_claude_oauth_usage_unstamped(
                     organization_identifier_hash,
                     body: &value,
                     read: usage_read,
-                    observed_at_epoch_seconds: current_unix_seconds(),
+                    observed_at_epoch_seconds: clock(),
                     previous_credit_balances: &previous_credit_balances,
                     latest_activity_at,
                     now,
@@ -11854,7 +11861,7 @@ fn collect_claude_oauth_usage_unstamped(
                 now,
                 mirror_legacy_default,
             );
-            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", clock()));
             diagnostics.push(claude_oauth_usage_rate_limited_diagnostic(
                 usage_read,
                 retry_after,
@@ -11904,12 +11911,12 @@ fn collect_claude_oauth_usage_unstamped(
                         &mut claude_transient_failures(),
                         account_identifier_hash,
                         organization_identifier_hash,
-                        current_unix_seconds(),
+                        clock(),
                     );
                     Vec::new()
                 }
             };
-            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", clock()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
                 account_identifier_hash,
                 organization_identifier_hash,
@@ -11946,7 +11953,7 @@ fn collect_claude_oauth_usage_unstamped(
         .with_check_outcome(
             "claude_oauth_usage_check_failed",
             "The latest Claude OAuth response could not be read as quota data.",
-            current_unix_seconds(),
+            clock(),
         );
     };
     // This is the local successful response time, never a provider-supplied
@@ -11957,7 +11964,7 @@ fn collect_claude_oauth_usage_unstamped(
             organization_identifier_hash,
             body: &value,
             read: usage_read,
-            observed_at_epoch_seconds: current_unix_seconds(),
+            observed_at_epoch_seconds: clock(),
             previous_credit_balances: &previous_credit_balances,
             latest_activity_at,
             now,
@@ -30114,6 +30121,7 @@ for line in sys.stdin:
                 token,
                 expiry,
                 &caller,
+                current_unix_seconds,
             );
             assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
             assert!(result.diagnostics[0].retry_after.is_none());
@@ -37046,6 +37054,7 @@ exit 44
             Some("fixture-access".to_string()),
             Some(expires_at),
             &ClaudeOAuthUsageCaller::Default,
+            current_unix_seconds,
         );
         *CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap() = None;
         assert_eq!(provider_calls(), before, "the lapsed token was not sent");
