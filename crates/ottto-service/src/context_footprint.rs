@@ -162,6 +162,12 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
+impl RepositoryIdentity {
+    pub(crate) fn is_repository(&self) -> bool {
+        self.repository_hash.is_some()
+    }
+}
+
 impl SpawnEnv {
     fn claude_command(&self) -> Result<Command> {
         let Some(program) = crate::command_env::executable_path("claude") else {
@@ -751,35 +757,38 @@ pub(crate) fn resolve_repository_identity(
     workspace: &Path,
     labels_enabled: bool,
 ) -> RepositoryIdentity {
-    let Some(toplevel) = git_toplevel(workspace) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: None,
-            repository_label_source: None,
-            repository_identity_source: None,
-            workspace_kind: Some("non_git".to_string()),
-        };
+    if fs::read_dir(workspace).is_err() {
+        return unresolved_repository_identity("unknown");
+    }
+    let toplevel = git_stdout_capped(
+        workspace,
+        &["rev-parse", "--show-toplevel"],
+        GIT_STDOUT_MAX_BYTES,
+    );
+    let toplevel = match toplevel {
+        Ok(bytes) => match String::from_utf8(bytes)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => absolutize_git_path(workspace, raw.trim()),
+            None => return unresolved_repository_identity("unknown"),
+        },
+        Err(GitOutputError::Failed) => return unresolved_repository_identity("non_git"),
+        Err(_) => return unresolved_repository_identity("unknown"),
     };
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: labels_enabled
-                .then(|| toplevel.file_name()?.to_str())
-                .flatten()
-                .and_then(|name| safe_text(name, 255)),
-            repository_label_source: labels_enabled.then(|| "git_root".to_string()),
-            repository_identity_source: None,
-            workspace_kind: Some("unknown".to_string()),
-        };
+        return unresolved_repository_identity("unknown");
     };
-    let common_dir = absolutize_git_path(workspace, &common_dir_raw);
-    let git_dir = git_stdout(workspace, &["rev-parse", "--git-dir"])
-        .map(|raw| absolutize_git_path(workspace, &raw));
+    let Ok(common_dir) = absolutize_git_path(workspace, &common_dir_raw).canonicalize() else {
+        return unresolved_repository_identity("unknown");
+    };
+    let Some(git_dir) = git_stdout(workspace, &["rev-parse", "--git-dir"])
+        .and_then(|raw| absolutize_git_path(workspace, &raw).canonicalize().ok())
+    else {
+        return unresolved_repository_identity("unknown");
+    };
     let common_text = common_dir.to_string_lossy();
-    let linked_worktree = git_dir
-        .as_ref()
-        .map(|git_dir| canonical_or_self(git_dir) != canonical_or_self(&common_dir))
-        .unwrap_or(false);
+    let linked_worktree = git_dir != common_dir;
     let workspace_kind = if linked_worktree {
         "linked_worktree"
     } else if same_path(workspace, &toplevel) {
@@ -813,6 +822,16 @@ pub(crate) fn resolve_repository_identity(
             .to_string(),
         ),
         workspace_kind: Some(workspace_kind.to_string()),
+    }
+}
+
+fn unresolved_repository_identity(kind: &str) -> RepositoryIdentity {
+    RepositoryIdentity {
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: Some(kind.to_string()),
     }
 }
 
@@ -864,14 +883,14 @@ pub(crate) fn git_stdout_capped(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Vec<u8>, GitOutputError> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| GitOutputError::Failed)?;
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| GitOutputError::Failed)?;
     let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
     fn stop(
         mut child: std::process::Child,
@@ -1773,7 +1792,16 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| safe_text(name, 255))
-        .or_else(|| Some("workspace".to_string()))
+        .or_else(|| {
+            workspace
+                .file_name()
+                .is_none()
+                .then(|| "workspace".to_string())
+        })
+        .filter(|label| {
+            let lower = label.to_ascii_lowercase();
+            !lower.contains(".claude") && !lower.contains(".codex") && !label.contains('\\')
+        })
 }
 
 #[cfg(test)]
@@ -2246,6 +2274,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    /// [regress] An existing folder with a failed Git lookup is distinct from a missing cwd.
     #[test]
     fn repository_identity_marks_non_git_without_repository_hash() {
         let dir = temp_dir("repo-identity-non-git");
@@ -2257,6 +2286,11 @@ mod tests {
         assert!(identity.repository_label_source.is_none());
         assert!(identity.repository_identity_source.is_none());
         assert_eq!(identity.workspace_kind.as_deref(), Some("non_git"));
+        let missing = resolve_repository_identity(&dir.join("missing"), true);
+        assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
+        fs::write(dir.join(".git"), "gitdir: missing-metadata\n").unwrap();
+        let broken = resolve_repository_identity(&dir, true);
+        assert_eq!(broken.workspace_kind.as_deref(), Some("non_git"));
         let _ = fs::remove_dir_all(&dir);
     }
 

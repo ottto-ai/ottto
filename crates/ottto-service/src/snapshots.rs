@@ -7961,9 +7961,11 @@ struct SnapshotAccumulator {
     ended_at: Option<String>,
     last_activity_at: Option<String>,
     workspace_hash: Option<String>,
-    // In-memory only: used to derive privacy-safe repository identity. The raw
-    // path is never copied into SnapshotItem or uploaded.
+    // Local Workspace fact used to derive privacy-safe repository identity.
+    // The raw path is never copied into SnapshotItem or uploaded.
     workspace_path: Option<PathBuf>,
+    // Session-owned observation, retained independently of the path cache.
+    repository_binding: Option<crate::context_footprint::RepositoryIdentity>,
     latest_model: Option<String>,
     // Most-recently-observed Codex per-turn reasoning effort tier. Updated as
     // lines stream past so the next usage row picks up the effort co-located
@@ -8234,6 +8236,7 @@ impl SnapshotAccumulator {
             last_activity_at: None,
             workspace_hash: None,
             workspace_path: None,
+            repository_binding: None,
             latest_model: None,
             latest_reasoning_effort: None,
             latest_turn_id: None,
@@ -10247,6 +10250,16 @@ impl SnapshotAccumulator {
         let repository_identity = self.workspace_path.as_deref().map(|workspace| {
             measured_repository_identity.unwrap_or_else(|| cached_repository_identity(workspace))
         });
+        let workspace_display_label = repository_identity
+            .as_ref()
+            .filter(|identity| {
+                matches!(
+                    identity.workspace_kind.as_deref(),
+                    Some("non_git" | "unknown")
+                )
+            })
+            .and(self.workspace_path.as_deref())
+            .and_then(crate::context_footprint::workspace_label);
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
@@ -10626,8 +10639,10 @@ impl SnapshotAccumulator {
             source_last_activity_at: self.last_activity_at.clone(),
             collected_at: collected_at.to_string(),
             workspace_hash: self.workspace_hash.clone(),
-            workspace_display_label: None,
-            workspace_label_source: None,
+            workspace_label_source: workspace_display_label
+                .as_ref()
+                .map(|_| "directory_name".into()),
+            workspace_display_label,
             repository_hash: repository_identity
                 .as_ref()
                 .and_then(|identity| identity.repository_hash.clone()),
@@ -10693,6 +10708,11 @@ fn fresh_repository_identity(
 }
 
 fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
+    // A cached path observation cannot locate a session whose cwd has gone.
+    // The shared resolver classifies this failure without spawning Git.
+    if fs::read_dir(workspace).is_err() {
+        return crate::context_footprint::resolve_repository_identity(workspace, true);
+    }
     let cache = repository_identity_cache();
     let now = SystemTime::now();
     if let Ok(guard) = cache.lock() {
@@ -10702,11 +10722,14 @@ fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::Rep
     }
 
     let identity = crate::context_footprint::resolve_repository_identity(workspace, true);
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
-            guard.clear();
+    // Negative observations must not delay a later git init or repaired lookup.
+    if identity.is_repository() {
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
+                guard.clear();
+            }
+            guard.insert(workspace.to_path_buf(), (now, identity.clone()));
         }
-        guard.insert(workspace.to_path_buf(), (now, identity.clone()));
     }
     identity
 }
@@ -18090,6 +18113,24 @@ impl OwnedJsonlParser {
         } else {
             Some(reader)
         };
+        // Resolve before PRE stages the session facts, outside the store's
+        // transactions. Only positive repository evidence is permanent;
+        // non-Git and unavailable lookups retry on ordinary selected work.
+        let repository_identity = accumulator
+            .repository_binding
+            .clone()
+            .or(repository_identity)
+            .or_else(|| {
+                accumulator
+                    .workspace_path
+                    .as_deref()
+                    .map(cached_repository_identity)
+            });
+        if let Some(identity) = &repository_identity {
+            if identity.is_repository() {
+                accumulator.repository_binding = Some(identity.clone());
+            }
+        }
         // PRE-finalization seam. The live scan-shared inputs are
         // detached exactly as a retained copy excludes them, then restored
         // before any finalization reads them; no early exit lies between.
@@ -54328,7 +54369,7 @@ crate::durable_tail_codec::durable_struct!(SessionAccountEvidence {
     N source_created_at: Option<String>,
 });
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, codex_dictionary_slots, codex_sidecar_binding);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, repository_binding, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, codex_dictionary_slots, codex_sidecar_binding);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
