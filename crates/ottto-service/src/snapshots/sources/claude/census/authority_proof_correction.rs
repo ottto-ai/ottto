@@ -272,7 +272,10 @@ impl ScanIndex {
 
     // Capture only changed no-body pairs, not an index clone. Used by every
     // restoration seam so a carried map revision cannot certify reverted facts.
-    pub(in crate::snapshots) fn claude_empty_map_advances(&self, previous: &ScanIndex) -> Vec<ClaudeEmptyMapAdvance> {
+    pub(in crate::snapshots) fn claude_empty_map_advances(
+        &self,
+        previous: &ScanIndex,
+    ) -> Vec<ClaudeEmptyMapAdvance> {
         if !self.claude_authority_proof_correction_pending() {
             return Vec::new();
         }
@@ -318,7 +321,10 @@ impl ScanIndex {
         advances
     }
 
-    pub(in crate::snapshots) fn restore_claude_empty_map_advances(&mut self, advances: Vec<ClaudeEmptyMapAdvance>) {
+    pub(in crate::snapshots) fn restore_claude_empty_map_advances(
+        &mut self,
+        advances: Vec<ClaudeEmptyMapAdvance>,
+    ) {
         for advance in advances {
             let carried = self.confirmed_empty_files.contains(&advance.key)
                 && self.files.get(&advance.key).is_some_and(|entry| {
