@@ -1540,12 +1540,11 @@ fn failed_pipeline_outcomes_checkpoint_without_acceptance() {
         }
         let saved = ScanIndex::load(&fixture.index_path).unwrap();
         assert!(saved.files.is_empty());
-        assert!(
-            serde_json::to_value(&saved).unwrap()["accepted_snapshot_fingerprints"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        // The persistence serializer omits an empty accepted ledger.
+        assert!(serde_json::to_value(&saved)
+            .unwrap()
+            .get("accepted_snapshot_fingerprints")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)));
         assert!(!saved.scan_traversal_in_progress_for_test());
         let recovered = fixture.page(
             "2026-08-02T08:01:00Z",
