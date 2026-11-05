@@ -2445,17 +2445,15 @@ fn pi_live_retry_commits_the_shed_head() {
         other_page(&c, &scanner, SnapshotSource::Pi, committed.clone());
     assert_eq!(modes, (1, 0, 0), "a new Pi session reads Full");
     let progress_path = snapshot_upload_progress_path(&disk.route);
-    // The route's own progress when it has one, as the daemon's checkpoint.
-    let durable = || {
-        std::fs::read(&progress_path).map_or_else(
-            |_| {
-                SnapshotUploadProgress::new(
-                    format!("{:064x}", 99),
-                    snapshot_quarantine_witness(SnapshotSource::Pi),
-                )
-            },
-            |bytes| serde_json::from_slice::<SnapshotUploadProgress>(&bytes).unwrap(),
+    // The route's progress, bound to its ACK receipts as the daemon loads it.
+    let durable = |index: &ScanIndex| {
+        SnapshotUploadProgress::load_with_recovery(
+            &progress_path,
+            &format!("{:064x}", 99),
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+            crate::snapshots::ProgressRecovery::for_index(index, &disk.route).unwrap(),
         )
+        .unwrap()
     };
     let checkpoint = |working: &ScanIndex,
                       committed: &ScanIndex,
@@ -2474,14 +2472,14 @@ fn pi_live_retry_commits_the_shed_head() {
         )
     };
     // The shed: no ACK, so the save keeps no entry and no head.
-    let saved = checkpoint(&working, &committed, &durable(), Some(&shed)).unwrap();
+    let saved = checkpoint(&working, &committed, &durable(&working), Some(&shed)).unwrap();
     assert!(
         !saved.files.contains_key(key),
         "the shed save keeps no entry"
     );
     let mut unstaged = crate::snapshots::UnstagedTails::take(&working);
     // The live retry: its exact ACK, then its save on the shed baseline.
-    let mut progress = durable();
+    let mut progress = durable(&saved);
     let (status, _, _) = upload_source_under(
         SnapshotSource::Pi,
         SnapshotUploadPolicy::default(),
