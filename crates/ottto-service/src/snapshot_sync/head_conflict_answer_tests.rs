@@ -483,15 +483,30 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         }
     );
     assert!(progress.accepted_body_witnesses.is_empty());
+    let parts = [
+        json!(&item.session_account_evidence),
+        json!((&item.tool_usage, item.tool_usage_truncated)),
+        json!((&item.cache_observations, &item.cache_observations_state)),
+    ]
+    .map(|part| {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).unwrap())
+        )[..8]
+            .to_owned()
+    });
     assert_eq!(
         refusals(),
         [format!(
             "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
              class=accepted session_hash={} fingerprint={} witness_version={version} \
-             echoed_witness_version={version} bad_refs=1 answered=true",
+             echoed_witness_version={version} bad_refs=1 answered=true expected_digest={} account_part={} tool_part={} cache_part={}",
             &key[..8],
-            &item.snapshot_fingerprint[..8]
-        )]
+            &item.snapshot_fingerprint[..8],
+                crate::snapshots::snapshot_upload_body_witness(&item),
+                parts[0], parts[1], parts[2],
+            )]
     );
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
     assert_eq!(

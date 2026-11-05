@@ -463,7 +463,7 @@ fn census_unchanged_preserves_only_matching_verified_records() {
                     complete: case != "incomplete",
                     lossy: case == "lossy",
                     source_verified: case == "full",
-                    unchanged_source: !matches!(case, "tail" | "debt" | "full"),
+                    continued_source: !matches!(case, "tail" | "debt" | "full"),
                     itemless_request_hashes: vec![],
                     opened_birth: None,
                     modified_unix_seconds: 0,
@@ -483,6 +483,215 @@ fn census_unchanged_preserves_only_matching_verified_records() {
                 !matches!(case, "same" | "full"),
                 "{case}"
             );
+        }
+    }
+}
+
+/// [regress] Native continuation needs the exact saved predecessor and a
+/// sealed loss-free source; reconstruction may establish fresh proof instead.
+#[test]
+fn census_continuation_rejects_unproven_native_bases() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{continuation_for_test, E2ScanFixture};
+    use crate::snapshots::scan_index_persistence::Source;
+    for case in [
+        "missing",
+        "unverified",
+        "lossy-prefix",
+        "fingerprint",
+        "entry-head",
+        "claim-only",
+        "quiet",
+        "unsealed",
+        "eof-applied",
+        "shrink",
+        "edit",
+        "replace",
+        "sample",
+    ] {
+        let scratch = crate::test_scratch::ScratchDir::canonical(&format!("census-proof-{case}"));
+        let root = scratch.join("projects");
+        let support = scratch.join("support");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&support).unwrap();
+        let path = root.join("quiet.jsonl");
+        let key = local_index_key(&path);
+        let prefix = census_response("quiet", None, "gap", 1, 10)
+            + "\n"
+            + &census_user_line("quiet", &"x".repeat(12000))
+            + "\n";
+        fs::write(
+            &path,
+            if case == "lossy-prefix" {
+                "invalid\n".to_owned() + &prefix
+            } else {
+                prefix.clone()
+            },
+        )
+        .unwrap();
+        let scanner = E2ScanFixture::capturing_identity();
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &scratch.join("state"),
+        );
+        let scan = |index| {
+            let (mut index, mut result, modes) = scanner.scan(
+                std::slice::from_ref(&root),
+                &support,
+                index,
+                100,
+                true,
+                &BTreeMap::new(),
+                std::slice::from_ref(&path),
+            );
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut result,
+                &mut index,
+                snapshot_upload_body_witness,
+            );
+            (index, result, modes)
+        };
+        let (mut first, first_result, _) = scan(index);
+        assert!(
+            !first_result.snapshots.is_empty(),
+            "{case}: positive native control"
+        );
+        let mut prior = session.save_reload(&mut first);
+        let before =
+            continuation_for_test(SnapshotSource::ClaudeCode, &scanner.cache, &prior, &key);
+        if case != "lossy-prefix" {
+            assert!(
+                !prior
+                    .claude_request_census
+                    .get(&key)
+                    .unwrap()
+                    .unverified_for_test(),
+                "{case}"
+            );
+        }
+        match case {
+            "missing" => {
+                prior
+                    .claude_request_census
+                    .invalidate_keeping_birth_for_test(&key);
+                assert!(claude_request_census::forced_member_needs_native(
+                    &prior, &key
+                ));
+                prior.insert_unproven_terminal_claude_authority_for_test("quiet", &"1".repeat(64));
+            }
+            "unverified" | "lossy-prefix" => {
+                let old = prior
+                    .claude_request_census
+                    .get(&key)
+                    .unwrap()
+                    .clone()
+                    .with_unverified_for_test(true);
+                prior.claude_request_census.insert_for_test(&key, old);
+            }
+            "fingerprint" => {
+                prior.files.get_mut(&key).unwrap().source_file_fingerprint = "b".repeat(64)
+            }
+            "entry-head" => prior.files.get_mut(&key).unwrap().modified_unix_nanos = Some(1),
+            _ => {}
+        }
+        let suffix = census_response("quiet", Some("later"), "later", 2, 12) + "\n";
+        match case {
+            "shrink" => {
+                fs::write(&path, census_response("quiet", None, "gap", 1, 9) + "\n").unwrap()
+            }
+            "edit" => fs::write(&path, prefix.replace("gap", "gop")).unwrap(),
+            "replace" => {
+                fs::rename(&path, scratch.join("old.jsonl")).unwrap();
+                fs::write(&path, prefix.clone() + &suffix).unwrap();
+            }
+            "sample" => fs::write(&path, prefix.replace("gap", "gop") + &suffix).unwrap(),
+            "unsealed" => fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"{\"type\":")
+                .unwrap(),
+            "eof-applied" => fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix.trim_end().as_bytes())
+                .unwrap(),
+            _ => fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix.as_bytes())
+                .unwrap(),
+        }
+        let (mut next, _, modes) = scan(prior);
+        if matches!(case, "missing" | "shrink" | "edit" | "replace" | "sample") {
+            assert!(modes.0 > 0, "{case}: certificate refuses continuation");
+        } else if case == "quiet" {
+            assert!(!next
+                .claude_request_census
+                .get(&key)
+                .unwrap()
+                .unverified_for_test());
+            let due = next.files[&key].unverified_deadline().unwrap();
+            let saved = session.save_reload(&mut next);
+            sampled_scan::set_test_now(Some(due + 1));
+            let (quiet, _, quiet_modes) = scan(saved);
+            sampled_scan::set_test_now(None);
+            assert_eq!(quiet_modes, (0, 0, 1));
+            assert!(!quiet
+                .claude_request_census
+                .get(&key)
+                .unwrap()
+                .unverified_for_test());
+            assert!(!quiet.files[&key].has_unverified_source());
+            assert_eq!(
+                continuation_for_test(SnapshotSource::ClaudeCode, &scanner.cache, &quiet, &key)
+                    .unwrap()
+                    .last_full_verified(),
+                before.unwrap().last_full_verified()
+            );
+        } else if case != "claim-only" {
+            assert!(
+                next.claude_request_census
+                    .get(&key)
+                    .map_or(true, |record| record.unverified_for_test()),
+                "{case}: no continuation proof"
+            );
+        } else {
+            assert!(!next
+                .claude_request_census
+                .get(&key)
+                .unwrap()
+                .unverified_for_test());
+            let custody = state_v2::published(session.path()).unwrap();
+            state_v2::save_locked(session.path(), &mut next, true, None, custody).unwrap();
+            state_v2::unstage_tail(session.path(), [key.clone()]).unwrap();
+            // Simulate a crash losing the staged Tail after the claim-only save.
+            let restored = ScanIndex::load(session.path()).unwrap();
+            assert_eq!(
+                restored.files[&key].size_bytes,
+                (prefix.len() + suffix.len()) as u64
+            );
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(census_response("quiet", Some("third"), "third", 3, 14).as_bytes())
+                .unwrap();
+            let (replayed, _, replay_modes) = scan(restored);
+            assert_eq!(replay_modes.0, 0);
+            assert_eq!(replay_modes.1, 1);
+            assert!(
+                replayed
+                    .claude_request_census
+                    .get(&key)
+                    .unwrap()
+                    .unverified_for_test(),
+                "entry/head mismatch must re-derive without the detached carry"
+            );
+            assert_eq!(before.unwrap().sealed_offset(), prefix.len() as u64);
         }
     }
 }
