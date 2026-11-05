@@ -718,6 +718,14 @@ mod unix {
                 fs::read_to_string(&path).unwrap(),
                 r#"{"user":"concurrent"}"#
             );
+            // Unlike managed roots, the user's root may sit behind a link.
+            let alias = root.with_extension("alias");
+            symlink(&root, &alias).unwrap();
+            assert_eq!(
+                reconcile_default(&alias, &env(), false, |_| Ok(()), || Ok(())).unwrap(),
+                Outcome::Changed
+            );
+            fs::remove_file(alias).unwrap();
             fs::remove_dir_all(root).unwrap();
         }
 
