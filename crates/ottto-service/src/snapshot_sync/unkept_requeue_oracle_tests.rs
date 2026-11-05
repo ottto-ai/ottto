@@ -744,7 +744,8 @@ fn watcher_only_append_requeues_after_a_partial_checkpoint() {
 
 /// [money] Only exact durable stored-body ACKs settle a file's full incidence.
 /// Invalid/partial responses, not-stored custody and a mixed file retain the
-/// accepted prefix while the ordinary retry produces cold Full money.
+/// accepted prefix while the ordinary retry produces cold Full money; a
+/// refused ref's debt is its exact-body custody, re-offered when due.
 #[test]
 fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
     with_e2(|| {
@@ -831,6 +832,12 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                                 faulted = Some(entity.snapshot_fingerprint.clone());
                                 entity.body_witness_digest = Some("0".repeat(64));
                             }
+                            for item in items {
+                                if faulted.as_ref() != Some(&item.snapshot_fingerprint) {
+                                    destination
+                                        .insert(item.source_session_id.clone(), item.clone());
+                                }
+                            }
                         }
                         "partial_ack" => {
                             response.accepted_entities.pop();
@@ -913,7 +920,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 session.path(),
                 Some(crate::snapshots::UnsettledUploadCause::UploadError),
             );
-            let loaded = ScanIndex::load(session.path()).unwrap();
+            let mut loaded = ScanIndex::load(session.path()).unwrap();
             assert_eq!(loaded.generation, owed.generation);
             if fault == "mixed_file" {
                 assert_ne!(
@@ -922,34 +929,46 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     "one unaccepted sibling prevents file settlement"
                 );
             }
+            let mut reoffer = None;
             if let Some(faulted) = faulted.as_deref() {
-                // The refused ref keeps its file debt: no settlement.
-                let members = serde_json::to_value(&current.index).unwrap();
-                let owing = [root.to_str().unwrap(), agent.to_str().unwrap()]
-                    .into_iter()
-                    .filter(|key| {
-                        members["file_snapshot_fingerprints"][*key]
-                            .as_array()
-                            .is_some_and(|set| set.iter().any(|fp| fp == faulted))
-                    })
-                    .collect::<Vec<_>>();
-                for key in [root.to_str().unwrap(), agent.to_str().unwrap()] {
-                    let kept = loaded.files[key].source_file_fingerprint
-                        != current.index.files[key].source_file_fingerprint;
-                    assert!(
-                        kept || !owing.contains(&key),
-                        "refused ref keeps its file debt"
+                // The refused ref's debt is its exact-body quarantine custody,
+                // not the file fingerprint: the RetryPending record and its
+                // witness survive the checkpoint and a durable reload.
+                let item = current
+                    .scan
+                    .snapshots
+                    .iter()
+                    .find(|item| item.snapshot_fingerprint == faulted)
+                    .unwrap();
+                let body = snapshot_upload_body_witness(item);
+                let held = &sender.quarantined_fingerprints[faulted];
+                for index in [&owed, &loaded] {
+                    let record = &index.quarantined_snapshot_fingerprints[faulted];
+                    assert_eq!(
+                        record.disposition,
+                        SnapshotQuarantineDisposition::RetryPending
                     );
+                    assert_eq!(record.upload_body_witness.as_deref(), Some(body.as_str()));
+                    assert!(record.witness == held.witness, "same quarantine witness");
+                }
+                // Release the custody: the due retry re-reads the file and
+                // re-offers this exact body.
+                for record in [
+                    loaded
+                        .quarantined_snapshot_fingerprints
+                        .get_mut(faulted)
+                        .unwrap(),
+                    sender.quarantined_fingerprints.get_mut(faulted).unwrap(),
+                ] {
+                    record.retry_after_unix_seconds = 0;
                 }
                 assert!(
-                    [root.to_str().unwrap(), agent.to_str().unwrap()]
-                        .into_iter()
-                        .any(|key| loaded.files[key].source_file_fingerprint
-                            != current.index.files[key].source_file_fingerprint),
-                    "no settlement for the refused file"
+                    sender.prepare_quarantine_retries(&loaded.quarantined_snapshot_fingerprints)
                 );
-                // The named-refusal retry owns its next offer; this helper adds no release.
-                continue;
+                // Released custody is not credit: no settlement before its ACK.
+                assert!(!sender.accepted_fingerprints.contains(faulted));
+                assert!(!sender.accepted_body_witnesses.contains_key(faulted));
+                reoffer = Some((faulted.to_string(), body));
             }
             if fault == "not_stored" {
                 // Receiver head dominance is custody, never stored-body credit.
@@ -987,8 +1006,15 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
             assert!(retry.finish().held_fingerprints.is_empty());
             let already_acked = sender.accepted_fingerprints.clone();
             let mut physical_posts = 0;
+            let mut reoffered = false;
             let (status, _) = send(SOURCE, &retry, &mut sender, |items| {
                 physical_posts += items.len();
+                if let Some((faulted, body)) = &reoffer {
+                    reoffered |= items.iter().any(|item| {
+                        item.snapshot_fingerprint == *faulted
+                            && snapshot_upload_body_witness(item) == *body
+                    });
+                }
                 if fault == "mixed_file" {
                     for item in items {
                         assert!(
@@ -1003,6 +1029,15 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 ack(items)
             });
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            if let Some((faulted, body)) = &reoffer {
+                assert!(reoffered, "the due retry re-offers the exact refused body");
+                assert_eq!(
+                    sender.accepted_body_witnesses.get(faulted),
+                    Some(body),
+                    "the refused ref settles on its exact ACK"
+                );
+                assert!(!sender.quarantined_fingerprints.contains_key(faulted));
+            }
             if fault == "durable_ack" {
                 assert_eq!(
                     physical_posts, 0,
