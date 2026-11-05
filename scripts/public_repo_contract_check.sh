@@ -391,8 +391,8 @@ def check_connector_docs_contracts() -> None:
                 "connector docs must document the collector manifest contract helper",
             ),
             (
-                "uv run python scripts/generate_connector_registry.py --check",
-                "connector docs must preserve registry generator check command",
+                "a maintainer regenerates the registry before merge",
+                "connector docs must say who regenerates the registry",
             ),
             (
                 "Official first-party fixtures must not expose raw prompts, responses, tool\n  output, command output, local paths, credentials, cookies, API keys,\n  passwords, or secrets.",
