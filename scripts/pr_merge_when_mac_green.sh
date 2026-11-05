@@ -299,13 +299,20 @@ queue_query() {
 
 # True when the PR's current head is queued or already merged. Any read error
 # or head mismatch is false, so the caller reports the enqueue failure.
-# True when every finished, unsuccessful job of queue run $1 never ran a step
-# and GitHub annotated it as not acquired by a runner. Any read error is false.
+# Returns 0 when queue run $1 has finished, every one of its jobs is listed,
+# and every unsuccessful job never ran a step and GitHub annotated it as not
+# acquired by a runner; 2 while any job is unfinished; 1 otherwise, including
+# any read error.
 not_acquired_only() {
   local jobs bad id
   jobs="$(gh api "repos/{owner}/{repo}/actions/runs/$1/jobs?per_page=100")" || return 1
+  printf '%s' "$jobs" | jq -e '(.jobs | type) == "array" and .total_count == (.jobs | length)' >/dev/null \
+    || return 1
+  if printf '%s' "$jobs" | jq -e 'any(.jobs[]; .status != "completed")' >/dev/null; then
+    return 2
+  fi
   bad="$(printf '%s' "$jobs" | jq -r '
-    [.jobs[]? | select(.status == "completed")
+    [.jobs[]
      | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")]
     | if length == 0 or any(.[]; any(.steps[]?; .conclusion != null)) then "no"
       else .[].id end')" || return 1
@@ -331,7 +338,8 @@ already_queued() {
 # head-movement protection, and the resulting merge SHA. API errors are retried
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
-  local response queued_pr state current_sha entry seen_queue=false absent=0 requeues=0
+  local response queued_pr state current_sha entry seen_queue=false absent=0
+  local requeues=0 used_run=0 unfinished=0 verdict
   while :; do
     if response="$(queue_query)" && queued_pr="$(printf '%s' "$response" | jq -ce '
         select((.errors // [] | length) == 0)
@@ -364,9 +372,22 @@ wait_for_queue() {
           log "PR #$pr not visible in the merge queue; rechecking before reporting removal"
         else
           report_queue_failure
-          if [ -n "$queue_run_id" ] && [ "$requeues" -lt "$MAX_NOT_ACQUIRED_REQUEUES" ] \
-            && not_acquired_only "$queue_run_id"; then
+          verdict=1
+          # Only a run newer than the one behind the last re-enqueue counts:
+          # the old run says nothing about why the new entry left the queue.
+          if [ -n "$queue_run_id" ] && [ "$queue_run_id" -gt "$used_run" ] \
+            && [ "$requeues" -lt "$MAX_NOT_ACQUIRED_REQUEUES" ]; then
+            verdict=0
+            not_acquired_only "$queue_run_id" || verdict=$?
+          fi
+          if [ "$verdict" = 2 ] && [ "$unfinished" -lt 10 ]; then
+            unfinished=$((unfinished + 1))
+            absent=1
+            log "merge_group run $queue_run_id still has unfinished jobs; waiting before judging the removal"
+          elif [ "$verdict" = 0 ]; then
             requeues=$((requeues + 1))
+            used_run="$queue_run_id"
+            unfinished=0
             log "merge_group run $queue_run_id never got a runner (GitHub capacity); enqueuing PR #$pr again ($requeues of $MAX_NOT_ACQUIRED_REQUEUES)"
             enqueue || already_queued \
               || die "$EXIT_GH" "re-enqueueing PR #$pr at $head_sha failed"

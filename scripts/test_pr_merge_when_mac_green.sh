@@ -283,7 +283,7 @@ expect_output 'merge_group run 800: failure https://example.invalid/actions/runs
 
 # GitHub never started the queue's Mac job: enqueue the same head again.
 QUEUE_RUN='{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}'
-NOT_ACQUIRED_JOBS='{"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":92,"status":"completed","conclusion":"success","steps":[{"conclusion":"success"}]}]}'
+NOT_ACQUIRED_JOBS='{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":92,"status":"completed","conclusion":"success","steps":[{"conclusion":"success"}]}]}'
 NOT_ACQUIRED_NOTE='[{"message":"The job was not acquired by Runner of type hosted even after multiple attempts"}]'
 
 # removed_case <name> <jobs json> <annotations json>: queued once, then gone.
@@ -307,12 +307,37 @@ expect_no_log 'check-runs/92/annotations'
 expect_output 'never got a runner (GitHub capacity); enqueuing PR #7 again (1 of 2)'
 expect_output "merged PR #7 at merge SHA $NEW_SHA"
 
-# At most two re-enqueues; then the removal is reported.
+# At most two re-enqueues, each on a newer run; then the removal is reported.
 removed_case not-acquired-gives-up "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 801' > "$case_dir/queue_runs.2"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 802' > "$case_dir/queue_runs.3"
 run_guard 4 7
 expect_count "$ENQUEUE_CALL" 3
 expect_output '(2 of 2)'
 expect_output 'removed from merge queue'
+
+# A removal with no newer run than the one already used is not re-enqueued.
+removed_case stale-run-is-not-reused "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 2
+expect_output '(1 of 2)'
+expect_count 'actions/runs/800/jobs' 1
+
+# An unfinished job (it may still fail) defers the verdict; a partial job
+# list is never evidence.
+removed_case unfinished-job-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$NOT_ACQUIRED_JOBS" | jq '.jobs[1].status = "in_progress" | .jobs[1].conclusion = null' > "$case_dir/jobs.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_output '(1 of 2)'
+expect_count "$ENQUEUE_CALL" 2
+expect_count 'actions/runs/800/jobs' 2
+removed_case partial-job-list-is-not-requeued \
+  "$(printf '%s' "$NOT_ACQUIRED_JOBS" | jq -c '.total_count = 3')" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'annotations'
 
 # A job that ran a step failed for real: no re-enqueue, no annotation read.
 removed_case started-job-is-not-requeued \
