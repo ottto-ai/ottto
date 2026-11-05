@@ -3963,7 +3963,7 @@ fn parse_spanless(dir: &Path, lines: &[Value]) -> SnapshotItem {
 
 /// The page's money-fold steps before tagging: reconcile request accounts,
 /// then finish the page.
-fn fold_page(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+fn fold_page(items: &mut Vec<SnapshotItem>, evidence: &ScanEvidence<'_>) {
     identity::reconcile_request_accounts(items, evidence);
     crate::snapshots::claude_request_money::e2::finish_page(
         items,
