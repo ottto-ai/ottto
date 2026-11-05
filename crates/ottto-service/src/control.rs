@@ -4285,22 +4285,26 @@ fn apply_telemetry_config(
     source: &SourceKind,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     if source_patch_disabled(source) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
             // Explicit, backend-authorized enable also clears the default
-            // JSON opt-out written by disable. Per-root user opt-outs survive.
-            patch.changed |=
-                patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)?.changed;
+            // JSON opt-out written by disable. Per-root user opt-outs and
+            // external exporters survive. Settings go first, so kept settings
+            // never get the shell env either.
+            let settings =
+                patch_claude_code_settings_with_relay_base(&machine, &relay_base_url, true)?;
+            if let Some(kept) = settings.kept {
+                return Err(LocalApiError::LocalOperationFailed(
+                    claude_settings_kept_reason(kept).1.to_string(),
+                ));
+            }
+            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
+            patch.changed |= settings.changed;
             Ok(patch)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
@@ -4378,11 +4382,7 @@ fn repair_source(
 
     let before = source_config_state_for_daemon(daemon, &source)?;
     let patch = if before.drift.is_empty() {
-        ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        }
+        ConfigPatchResult::default()
     } else {
         execute_write_config_repair(daemon, authorization, &source)?
     };
@@ -4409,6 +4409,8 @@ fn repair_source(
                     source_display_name(&source)
                 )
             }
+        } else if let Some(kept) = patch.kept {
+            claude_settings_kept_reason(kept).1.to_string()
         } else {
             format!(
                 "{} telemetry config still has drift after repair.",
@@ -4589,7 +4591,7 @@ fn repair_source_config(
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)
+            patch_claude_code_settings_with_relay_base(&machine, &relay_base_url, false)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "Pi does not support local config repair".to_string(),
@@ -11092,11 +11094,14 @@ fn run_install_source_action(
     let patch = match source_kind {
         SourceKind::Codex => reconcile_codex_source_off()?,
         SourceKind::ClaudeCode => {
-            patch_claude_code_settings_with_relay_base(machine, &relay_base_url)?
+            patch_claude_code_settings_with_relay_base(machine, &relay_base_url, false)?
         }
         SourceKind::Pi => unreachable!("Pi install actions do not patch OTLP config"),
     };
-    let config_event_message = if patch.changed {
+    let kept = patch.kept.map(claude_settings_kept_reason);
+    let config_event_message = if let Some((_, text)) = kept {
+        text.to_string()
+    } else if patch.changed {
         format!(
             "Patched {} telemetry settings",
             source_display_name(&source_kind)
@@ -11107,31 +11112,37 @@ fn run_install_source_action(
             source_display_name(&source_kind)
         )
     };
+    let mut metadata = json!({
+        "source": source,
+        "settings": match source_kind {
+            SourceKind::Codex => "codex_config",
+            SourceKind::ClaudeCode => "claude_settings",
+            SourceKind::Pi => "none",
+        },
+        "changed": patch.changed,
+        "created": patch.created,
+        "backup_created": patch.backup_created,
+        "backup_scope": "source_config",
+        "restore_operation": "uninstall_restore",
+    });
+    if let Some((reason, _)) = kept {
+        metadata["reason"] = json!(reason);
+    }
     record_install_session_event(
         api_base_url,
         &install_session.install_session_id,
         &install_session.install_session_token,
         InstallSessionEvent {
-            event_type: if patch.changed {
+            event_type: if kept.is_some() {
+                "config.patch.skipped"
+            } else if patch.changed {
                 "config.patched"
             } else {
                 "config.unchanged"
             },
             status: "succeeded",
             message: &config_event_message,
-            metadata: Some(json!({
-                "source": source,
-                "settings": match source_kind {
-                    SourceKind::Codex => "codex_config",
-                    SourceKind::ClaudeCode => "claude_settings",
-                    SourceKind::Pi => "none",
-                },
-                "changed": patch.changed,
-                "created": patch.created,
-                "backup_created": patch.backup_created,
-                "backup_scope": "source_config",
-                "restore_operation": "uninstall_restore",
-            })),
+            metadata: Some(metadata),
             device_id: Some(&device_id),
         },
     )?;
@@ -11159,7 +11170,13 @@ fn run_install_source_action(
     }
 
     let status = if relay_running { "succeeded" } else { "failed" }.to_string();
-    let message = if relay_running {
+    let message = if let Some((_, text)) = kept {
+        if relay_running {
+            text.to_string()
+        } else {
+            format!("{text} The local OTLP relay is not listening.")
+        }
+    } else if relay_running {
         format!(
             "{} telemetry setup installed",
             source_display_name(&source_kind)
@@ -12118,11 +12135,14 @@ fn record_install_session_event(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ConfigPatchResult {
     changed: bool,
     created: bool,
     backup_created: bool,
+    /// Claude settings left untouched because the user opted out or exports
+    /// telemetry elsewhere.
+    kept: Option<crate::agent_configs::claude_managed_settings::Outcome>,
 }
 
 fn local_relay_base_url_for_daemon(daemon: &LocalDaemon) -> String {
@@ -12157,11 +12177,7 @@ pub fn reconcile_codex_source_off_at_startup() -> Result<bool, LocalApiError> {
 
 fn reconcile_codex_source_off() -> Result<ConfigPatchResult, LocalApiError> {
     if source_patch_disabled(&SourceKind::Codex) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     reconcile_codex_source_off_at(&home_path(".codex/config.toml"), &default_support_dir())
 }
@@ -12177,21 +12193,13 @@ fn reconcile_codex_source_off_at(
     let existing = match fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConfigPatchResult {
-                changed: false,
-                created: false,
-                backup_created: false,
-            })
+            return Ok(ConfigPatchResult::default())
         }
         Err(_) => return Err(LocalApiError::StatePoisoned),
     };
     let next = codex_source_off_body(&existing)?;
     if next == existing {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
     if fs::read_to_string(path).or_state_poisoned()? != existing {
@@ -12205,6 +12213,7 @@ fn reconcile_codex_source_off_at(
         changed: true,
         created: false,
         backup_created,
+        kept: None,
     })
 }
 
@@ -12341,6 +12350,7 @@ fn patch_codex_config_at_with_relay_base(
         changed: write.changed,
         created: write.created,
         backup_created,
+        kept: None,
     })
 }
 
@@ -12365,9 +12375,12 @@ fn render_codex_relay_toml_block_for_base(relay_base_url: &str) -> String {
     .join("\n")
 }
 
+/// `clear_opt_out` only for the explicit source Enable; every other caller
+/// leaves an opt-out or external exporter in place and reports it.
 fn patch_claude_code_settings_with_relay_base(
     machine: &MachineIdentity,
     relay_base_url: &str,
+    clear_opt_out: bool,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let _settings_guard = lock_managed_claude_settings();
     let backup_root = default_support_dir();
@@ -12376,6 +12389,7 @@ fn patch_claude_code_settings_with_relay_base(
         machine,
         &backup_root,
         relay_base_url,
+        clear_opt_out,
     )?;
     patch.changed |= repair_registered_managed_claude_relay_settings_locked()?;
     Ok(patch)
@@ -12388,13 +12402,9 @@ fn repair_claude_statusline_for_refresh_at(
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     if !claude_statusline_refresh_repair_needed(path, support_dir) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
-    patch_claude_code_settings_at_with_relay_base(path, machine, support_dir, relay_base_url)
+    patch_claude_code_settings_at_with_relay_base(path, machine, support_dir, relay_base_url, false)
 }
 
 fn claude_statusline_refresh_repair_needed(path: &Path, support_dir: &Path) -> bool {
@@ -12503,11 +12513,7 @@ fn patch_claude_code_env_at(
     let shell_would_change =
         claude_env::upsert_would_change(shell_rc_path, shell_body).map_err(agent_config_error)?;
     if !env_would_change && !shell_would_change {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let env_backup_created = if env_would_change {
         backup_existing_config(SourceKind::ClaudeCode, env_path, backup_root)?.is_some()
@@ -12535,6 +12541,7 @@ fn patch_claude_code_env_at(
         changed: env_write.changed || shell_write.changed,
         created: env_write.created || shell_write.created,
         backup_created: env_backup_created || shell_backup_created,
+        kept: None,
     })
 }
 
@@ -12565,6 +12572,7 @@ fn remove_claude_code_env_at(
         changed: env_write.changed || shell_write.changed || removed_empty_env,
         created: false,
         backup_created: false,
+        kept: None,
     })
 }
 
@@ -12586,6 +12594,7 @@ fn patch_claude_code_settings_at(
         machine,
         backup_root,
         &crate::otlp_relay::default_local_relay_base_url(),
+        false,
     )
 }
 
@@ -12594,19 +12603,49 @@ fn patch_claude_code_settings_at_with_relay_base(
     machine: &MachineIdentity,
     backup_root: &Path,
     relay_base_url: &str,
+    clear_opt_out: bool,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    use crate::agent_configs::claude_managed_settings::{reconcile_default, Outcome};
     let created = !path.exists();
-    let existing_settings = if created {
-        json!({})
-    } else {
-        let body = fs::read_to_string(path).or_state_poisoned()?;
-        serde_json::from_str::<serde_json::Value>(&body).or_state_poisoned()?
-    };
-    let mut settings = existing_settings.clone();
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    let delegated_statusline = match existing_claude_statusline_command(&settings) {
+    let root = path.parent().ok_or(LocalApiError::StatePoisoned)?;
+    let (mut wrapper_changed, mut backup_created) = (false, false);
+    let (written, kept) = reconcile_default(
+        root,
+        &claude_code_relay_env_with_base(machine, relay_base_url),
+        clear_opt_out,
+        |settings| {
+            wrapper_changed = point_claude_statusline_at_wrapper(settings, backup_root)
+                .map_err(io::Error::other)?;
+            Ok(())
+        },
+        || {
+            backup_created = backup_existing_config(SourceKind::ClaudeCode, path, backup_root)
+                .map_err(io::Error::other)?
+                .is_some();
+            Ok(())
+        },
+    )
+    .map_err(|error| {
+        LocalApiError::LocalOperationFailed(format!(
+            "Claude Code settings could not be safely updated: {error}"
+        ))
+    })?;
+    let written = written == Outcome::Changed;
+    Ok(ConfigPatchResult {
+        changed: written || wrapper_changed,
+        created: created && written,
+        backup_created,
+        kept,
+    })
+}
+
+/// Route the settings status line through Ottto's wrapper, delegating to the
+/// user's own command, and refresh the wrapper. Returns whether it changed.
+fn point_claude_statusline_at_wrapper(
+    settings: &mut serde_json::Value,
+    backup_root: &Path,
+) -> Result<bool, LocalApiError> {
+    let delegated_statusline = match existing_claude_statusline_command(settings) {
         Some(command) => Some(command),
         None => existing_claude_statusline_wrapper_delegated_command(backup_root)?,
     };
@@ -12629,45 +12668,30 @@ fn patch_claude_code_settings_at_with_relay_base(
         "command".to_string(),
         serde_json::Value::String(shell_quote_path(&statusline_script)),
     );
-
-    let env_value = object.entry("env").or_insert_with(|| json!({}));
-    if !env_value.is_object() {
-        *env_value = json!({});
-    }
-    let env = env_value
-        .as_object_mut()
-        .ok_or(LocalApiError::StatePoisoned)?;
-    for (key, value) in claude_code_relay_env_with_base(machine, relay_base_url) {
-        env.insert(key.to_string(), serde_json::Value::String(value));
-    }
-
-    let settings_changed = settings != existing_settings;
-    let backup_created = if settings_changed {
-        backup_existing_config(SourceKind::ClaudeCode, path, backup_root)?.is_some()
-    } else {
-        false
-    };
     let (_statusline_script, wrapper_changed) =
         write_claude_statusline_wrapper(backup_root, delegated_statusline.as_deref())?;
-    if !settings_changed {
-        return Ok(ConfigPatchResult {
-            changed: wrapper_changed,
-            created: false,
-            backup_created: false,
-        });
+    Ok(wrapper_changed)
+}
+
+/// Stable reason code and user text for Claude settings Ottto left untouched.
+fn claude_settings_kept_reason(
+    kept: crate::agent_configs::claude_managed_settings::Outcome,
+) -> (&'static str, &'static str) {
+    use crate::agent_configs::claude_managed_settings::Outcome;
+    match kept {
+        Outcome::OptedOut => (
+            "opted_out",
+            "Claude Code settings turn telemetry off, so Ottto left their telemetry settings unchanged.",
+        ),
+        Outcome::Linked => (
+            "linked_settings",
+            "Claude Code settings.json is a link or not a regular file, so Ottto left it unchanged.",
+        ),
+        _ => (
+            "external_telemetry",
+            "Claude Code settings send telemetry to another collector, so Ottto left their telemetry settings unchanged.",
+        ),
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).or_state_poisoned()?;
-    }
-    let body = serde_json::to_vec_pretty(&settings).or_state_poisoned()?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, body).or_state_poisoned()?;
-    fs::rename(tmp_path, path).or_state_poisoned()?;
-    Ok(ConfigPatchResult {
-        changed: true,
-        created,
-        backup_created,
-    })
 }
 
 fn existing_claude_statusline_command(settings: &serde_json::Value) -> Option<String> {
@@ -15161,7 +15185,7 @@ fn control_token_validation_base_url(requested: Option<&str>) -> Result<String, 
 /// optionally with a sub-path). Unlike [`is_trusted_api_base_url`] this excludes
 /// the loopback dev allowance, so it is safe to honor even from an untrusted
 /// request body when deciding where to validate a control token.
-fn is_production_api_base_url(value: &str) -> bool {
+pub(crate) fn is_production_api_base_url(value: &str) -> bool {
     if value.contains('@') || value.contains('?') || value.contains('#') {
         return false;
     }
@@ -28483,7 +28507,7 @@ X-API-Key = "otel_redacted"
         assert_eq!(fs::read(&default).unwrap(), default_body);
         assert!(!disable_managed_claude_relay_settings().unwrap());
         // Explicit source enable restores approval; root-specific off remains.
-        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123", true)
             .unwrap();
         assert!(!repair_registered_managed_claude_relay_settings().unwrap());
         let mut settings: serde_json::Value =
@@ -28491,7 +28515,7 @@ X-API-Key = "otel_redacted"
         settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] = json!("0");
         fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
         disable_managed_claude_relay_settings().unwrap();
-        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123", true)
             .unwrap();
         assert!(!repair_registered_managed_claude_relay_settings().unwrap());
         let settings: serde_json::Value =
@@ -28596,8 +28620,7 @@ X-API-Key = "otel_redacted"
 
     #[test]
     fn patch_claude_code_settings_writes_loopback_relay_without_dropping_env() {
-        let root =
-            std::env::temp_dir().join(format!("ottto-claude-settings-test-{}", std::process::id()));
+        let root = control_test_root("claude-settings-loopback");
         let path = root.join("settings.json");
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(
@@ -28988,6 +29011,7 @@ X-API-Key = "otel_redacted"
             &test_machine(),
             &support_dir,
             &default_base,
+            false,
         )
         .expect("seed clean settings");
         let clean_body = fs::read_to_string(&clean).expect("read clean settings");
@@ -29027,6 +29051,7 @@ X-API-Key = "otel_redacted"
             &test_machine(),
             &support_dir,
             &default_base,
+            false,
         )
         .expect("restore clean wrapper");
 
@@ -32646,4 +32671,6 @@ X-API-Key = "otel_redacted"
             account_scope: Some(TEST_ACCOUNT_SCOPE.to_string()),
         }
     }
+
+    mod claude_settings;
 }
