@@ -29738,6 +29738,13 @@ impl ScanIndex {
                 files.insert(key.clone(), committed.clone());
             }
         }
+        // A Tail head commits only for an entry this save keeps: a restored or
+        // omitted file keeps its committed head, and its next read starts
+        // there. A route error here also fails the save that would commit.
+        if let Ok(Some(route)) = state_v2::runtime_path(self) {
+            let unkept = self.files.keys().filter(|key| !safe_keys.contains(*key));
+            let _ = state_v2::unstage_tail(&route, unkept.cloned());
+        }
 
         // A complete census may prune vanished/aged paths from `self`, but a
         // partial upload must never make that deletion durable. Only the final

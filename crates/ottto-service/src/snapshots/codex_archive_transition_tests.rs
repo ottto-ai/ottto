@@ -1510,3 +1510,53 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
     );
     drop(session);
 }
+
+/// [regress] A shed partial save commits no Tail head for a file whose entry
+/// it does not keep, so the next page reads that file: a new rollout Full, an
+/// appended one from its kept head. The appended row is the [money] row: the
+/// owed turn posts as a cold Full does, never a Skip.
+#[test]
+fn shed_save_commits_heads_only_for_kept_entries() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for appended in [false, true] {
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        let key = local_index_key(&c.path(MAIN));
+        let (_session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let page_on =
+            |index: ScanIndex| page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+        let head = |index: &ScanIndex| {
+            state_v2::load_head(index, &key, REVISION)
+                .unwrap()
+                .map(|head| head.body)
+        };
+        let mut before = prior;
+        if appended {
+            let (working, first, ..) = page_on(before.clone());
+            before = working
+                .checkpoint_with_captured_posts(&first, &before, "accept")
+                .0;
+            append(&c.path(MAIN), &turn(3));
+            e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
+        }
+        let kept = head(&before);
+        assert_eq!(kept.is_some(), appended);
+        let (working, shed, ..) = page_on(before.clone());
+        assert_eq!(shed.snapshots.len(), 1);
+        let (mut index, _) = working.checkpoint_with_captured_posts(&shed, &before, "shed");
+        assert_eq!(head(&index), kept, "the shed save keeps the committed head");
+        e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let before = index.clone();
+        let (working, owed, ..) = page_on(index);
+        assert_eq!(owed.snapshots.len(), 1, "the next page reads the file");
+        let (index, posts) = working.checkpoint_with_captured_posts(&owed, &before, "accept");
+        let (_, cold, ..) = page_on(ScanIndex::default());
+        money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &owed, posts));
+    }
+}
