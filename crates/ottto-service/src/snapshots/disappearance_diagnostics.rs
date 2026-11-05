@@ -21,7 +21,6 @@ pub(super) enum Cause {
     NotFound,
     RootResolutionUnresolved,
     PreflightFingerprintChanged,
-    ComparisonTargetRevisionChanged,
 }
 impl Cause {
     fn index(self) -> usize {
@@ -29,7 +28,6 @@ impl Cause {
             Self::NotFound => 0,
             Self::RootResolutionUnresolved => 1,
             Self::PreflightFingerprintChanged => 2,
-            Self::ComparisonTargetRevisionChanged => 3,
         }
     }
 }

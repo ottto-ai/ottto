@@ -765,7 +765,7 @@ fn tail_active_at(full: &FullCache, modified: Option<u64>) -> OwnedSourceScan {
     panic!("precondition: the tail never became active");
 }
 
-/// Make the scan's shape-F tail a non-F one (a comparison target), so its
+/// Make the scan's shape-F tail a non-F one (an aliased file), so its
 /// step start keeps evict-to-fit and Path A (Q-PR14 exempts shape F only).
 fn make_non_f(scan: &mut OwnedSourceScan) {
     let active = scan.active_file.as_deref_mut().expect("the tail active");
@@ -773,7 +773,7 @@ fn make_non_f(scan: &mut OwnedSourceScan) {
         sampled_scan::borrows_only_retained_reduction(active),
         "precondition: shape F"
     );
-    active.comparison_target = true;
+    active.aliases.push(active.candidate.clone());
     assert!(!sampled_scan::borrows_only_retained_reduction(active));
 }
 

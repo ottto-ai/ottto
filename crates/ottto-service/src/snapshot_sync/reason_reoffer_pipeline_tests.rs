@@ -260,7 +260,6 @@ struct ReofferPipeline {
     transport: crate::net_resilience::TransportCycleOutcome,
     retry: live_snapshot_retry::LiveRetryOwner,
     _guards: Vec<EnvVarGuard>,
-    _native: crate::snapshots::claude_native_comparison::TestScope,
 }
 
 impl ReofferPipeline {
@@ -275,7 +274,6 @@ impl ReofferPipeline {
 
     fn build(name: &str, first: Answer, start: u64, capture: bool) -> Self {
         let fixture = IdentityPipelineHome::new();
-        let native = crate::snapshots::claude_native_comparison::enable_for_test();
         let cadence = IdentityPipelineCadence::new();
         let support = fixture.base.join(format!("{name}-support"));
         let secrets = fixture.base.join(format!("{name}-secrets"));
@@ -312,7 +310,6 @@ impl ReofferPipeline {
             transport: crate::net_resilience::TransportCycleOutcome::default(),
             retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _guards: guards,
-            _native: native,
         }
     }
 
@@ -358,7 +355,7 @@ impl ReofferPipeline {
             .prepare_cycle(now)
             .unwrap()
             .expect("real due preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
+        let (preparation, index, scan) = collect_preparation_with_rotation(frame);
         assert_eq!(
             scan.census_complete, complete,
             "synthetic census is complete unless authority debt withholds it"

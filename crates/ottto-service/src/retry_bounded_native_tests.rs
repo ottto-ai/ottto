@@ -966,7 +966,6 @@ fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_lo
         Some(crate::snapshot_retry::RESPONSE_BYTES),
         None,
         None,
-        None,
         Default::default(),
     );
     assert!(result.is_err());
