@@ -17,13 +17,18 @@ across files. Before comparing, only these glue classes are reversed:
   (e) the indentation an item loses when an inline module becomes a file.
 
 Then every base item must equal exactly one head item byte for byte (comments,
-attributes, cfgs), and items that land in one file keep their base order. An
-item rustfmt re-wraps (say once a visibility token makes its signature too
-long) still matches, listed as `reflowed`: its tokens must be equal once
-whitespace and a trailing `,` that ends a line before `)` or `>` are dropped;
-literals and comments stay exact. An item must sit under the same module
-attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
-literal must resolve, from its new file, to a target with the same bytes.
+attributes, cfgs), and items that land in one file keep their base order. One
+exception covers a fn signature rustfmt re-wraps (say once a visibility token
+makes it too long): a `fn` item whose body, from its opening `{`, is byte for
+byte equal and whose only visibility token is the leading one still matches,
+listed as `reflowed`, when its signature tokens are equal with whitespace
+dropped. Literals and comments stay exact, whitespace between two punctuation
+tokens that could join (`& &` vs `&&`) still counts, and only a trailing `,`
+closing the fn's own generic list or outer parameter list may be added or
+dropped. Every other item must match byte for byte. An item must sit under the
+same module attributes (`#[cfg(..)]` and the like), may only lose nesting, and
+every path literal must resolve, from its new file, to a target with the same
+bytes.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -43,7 +48,7 @@ import itertools
 import posixpath
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import rust_source_tree as rst
@@ -71,14 +76,11 @@ class Unit:
     text: str
     vis: list[tuple[int, str]] = field(default_factory=list)  # (offset in text, token)
     paths: list[tuple[str, str, bytes | None]] = field(default_factory=list)  # (macro, literal, target bytes)
+    kind: str = ""  # item kind (`fn`, `struct`, ..); "" for leading comments
 
     @property
     def key(self) -> tuple[str, str]:
         return self.container, self.text
-
-    @property
-    def reflow_key(self) -> tuple[str, tuple[str, ...]]:
-        return self.container, reflow_tokens(self.text)
 
     def where(self) -> str:
         return f"{self.file}:{self.line}"
@@ -89,21 +91,82 @@ def squash(text: str) -> str:
     return text.replace("( ", "(").replace(" )", ")")
 
 
-def reflow_tokens(text: str) -> tuple[str, ...]:
-    """The tokens of `text` without whitespace and without the trailing `,` rustfmt adds when it breaks
-    a list over lines (a `,` that ends a line before `)` or `>`). Literals and comments are tokens."""
-    tokens = rst.tokenize(text)
-    pieces = [(token.kind, text[token.start:token.end]) for token in tokens]
-    kept: list[str] = []
-    for index, (kind, piece) in enumerate(pieces):
-        if kind == "ws":
+# Punctuation that never joins a neighbour into one Rust token, so whitespace beside it is layout.
+JOINLESS = set("()[]{},;")
+
+
+def reflow_key(unit: Unit) -> tuple | None:
+    """What a rustfmt re-wrap of a fn signature keeps (see the module docs), or None when `unit` gets no
+    reflow pass: not a fn, no body, an unexpected signature shape, or a visibility token other than the
+    leading one."""
+    if unit.kind != "fn" or len(unit.vis) > 1:
+        return None
+    tokens = rst.tokenize(unit.text)
+    # (kind, text, whitespace before it, offset) of every non-whitespace token.
+    code = [(token.kind, unit.text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws",
+             token.start) for index, token in enumerate(tokens) if token.kind != "ws"]
+    fn_at = body_at = None
+    depth = 0
+    for index, (kind, piece, _, _) in enumerate(code):
+        if kind == "ident" and piece == "fn" and depth == 0 and fn_at is None:
+            fn_at = index
+        elif kind == "punct" and piece == "{" and depth == 0 and fn_at is not None:
+            body_at = index
+            break
+        if kind == "punct":
+            depth += (piece in "([{") - (piece in ")]}")
+    if fn_at is None or body_at is None or any(offset > code[fn_at][3] for offset, _ in unit.vis):
+        return None
+    drop = set()
+    at = fn_at + 2  # after `fn name`
+    if at < body_at and code[at][:2] == ("punct", "<"):
+        at = closing(code, at, body_at, angle=True)
+        if at is None:
+            return None
+        if code[at - 1][:2] == ("punct", ","):
+            drop.add(at - 1)
+        at += 1
+    if not (at < body_at and code[at][:2] == ("punct", "(")):
+        return None
+    at = closing(code, at, body_at, angle=False)
+    if at is None:
+        return None
+    if code[at - 1][:2] == ("punct", ","):
+        drop.add(at - 1)
+    signature: list[str] = []
+    prev = None
+    for index in range(body_at):
+        if index in drop:
             continue
-        after = pieces[index + 1:index + 3]
-        if (kind == "punct" and piece == "," and len(after) == 2 and after[0][0] == "ws" and "\n" in after[0][1]
-                and after[1] in (("punct", ")"), ("punct", ">"))):
+        kind, piece, spaced, _ = code[index]
+        if (spaced and index - 1 not in drop and prev is not None and prev[0] == kind == "punct"
+                and prev[1] not in JOINLESS and piece not in JOINLESS):
+            signature.append(" ")
+        signature.append(piece)
+        prev = (kind, piece)
+    return unit.container, tuple(signature), unit.text[code[body_at][3]:]
+
+
+def closing(code: list[tuple[str, str, bool, int]], open_at: int, stop: int, angle: bool) -> int | None:
+    """The index of the `>` (angle) or `)` that closes the list opened at `open_at`, before `stop`."""
+    nest = level = 0
+    for index in range(open_at, stop):
+        kind, piece, spaced, _ = code[index]
+        if kind != "punct":
             continue
-        kept.append(piece)
-    return tuple(kept)
+        if piece in "([{":
+            nest += 1
+        elif piece in ")]}":
+            nest -= 1
+            if not angle and nest == 0:
+                return index
+        elif angle and nest == 0 and piece == "<":
+            level += 1
+        elif angle and nest == 0 and piece == ">" and not (code[index - 1][1] == "-" and not spaced):
+            level -= 1
+            if level == 0:
+                return index
+    return None
 
 
 def dedent(text: str, columns: int) -> str:
@@ -194,11 +257,11 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
     units: list[Unit] = []
 
     def add(item_first: int, item_last: int, start: int, label: str, name: str, module, chain, depth,
-            container: str, strip_vis: bool = True) -> None:
+            container: str, strip_vis: bool = True, kind: str = "") -> None:
         text, vis, paths = normalise(lexed, item_first, item_last, depth, path, source, strip_vis)
         end_line = lexed.line(lexed.tokens[item_last].end - 1)
         units.append(Unit(path, lexed.line(start), end_line, len(units), label, name, module, chain,
-                          depth, container, text, vis, paths))
+                          depth, container, text, vis, paths, kind))
 
     def lead_comments(item: rst.Item, module, chain, container: str) -> None:
         if item.start >= item.lead:
@@ -232,7 +295,7 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
                 if container:
                     label = f"{squash(container.rstrip('{'))} :: {label}"
                 add(item.first_token, item.last_token, item.start, label, item.name, module, chain, item.depth,
-                    container, strip_vis=item.kind != "macro_rules")
+                    container, strip_vis=item.kind != "macro_rules", kind=item.kind)
 
     visit(lexed.items, context.module if context else None, context.chain if context else frozenset(), "")
     return units
@@ -328,7 +391,11 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
           allow_widened: set[str]) -> Ledger:
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
-    ledger.reflowed, lost, gained = match_units(lost, gained, key=lambda unit: unit.reflow_key)
+    # A unit with no reflow pass gets a key of its own, so it never pairs.
+    reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_key(unit) or (id(unit),))
+    # The only visibility of a reflowed unit is its leading one: compare it at one offset.
+    ledger.reflowed = [(replace(old, vis=[(0, token) for _, token in old.vis]),
+                        replace(new, vis=[(0, token) for _, token in new.vis])) for old, new in reflowed]
     ledger.pairs = sorted(pairs + ledger.reflowed, key=lambda pair: (pair[0].file, pair[0].seq))
     moves = module_moves(ledger.pairs, head_modules)
     explain_differences(ledger, lost, gained)
