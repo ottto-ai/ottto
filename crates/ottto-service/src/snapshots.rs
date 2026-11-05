@@ -15940,6 +15940,7 @@ impl OwnedSourceScan {
                             inventory,
                             codex_join_completed,
                             &surviving,
+                            traversal_snapshot.codex_rollout_paths,
                         )
                     })
                 });
@@ -23820,63 +23821,19 @@ fn refresh_retained_codex_directories(
             .codex_join_directory_census
             .as_mut()
             .expect("census checked above");
-        let before = match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && directory != scan_root =>
-            {
-                census.retire(&directory);
-                traversal
-                    .codex_rollout_paths
-                    .retain(|key| !Path::new(key).starts_with(&directory));
-                continue;
-            }
-            _ => continue,
-        };
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        let entries = entries.collect::<Vec<_>>();
-        let mut present = BTreeSet::new();
-        let mut appeared = Vec::new();
-        let mut new_directories = Vec::new();
-        let mut clean = true;
-        for entry in entries {
-            let Some((path, file_type)) = entry
-                .ok()
-                .and_then(|entry| entry.file_type().ok().map(|kind| (entry.path(), kind)))
-            else {
-                clean = false;
-                break;
+        let (before, (present, appeared, new_directories)) =
+            match census.relist(&directory, &traversal.codex_rollout_paths) {
+                Ok(Some(listing)) => listing,
+                Ok(None) if directory != scan_root => {
+                    census.retire(&directory);
+                    traversal
+                        .codex_rollout_paths
+                        .retain(|key| !Path::new(key).starts_with(&directory));
+                    continue;
+                }
+                _ => continue,
             };
-            if file_type.is_symlink() {
-                clean = false;
-                break;
-            }
-            if file_type.is_dir() {
-                if !census.contains(&path) {
-                    new_directories.push(path);
-                }
-                continue;
-            }
-            if !file_type.is_file() || !transcript_path_admitted(source, &path) {
-                continue;
-            }
-            let key = local_index_key(&path);
-            if !traversal.codex_rollout_paths.contains(&key) {
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => appeared.push((path, metadata)),
-                    _ => {
-                        clean = false;
-                        break;
-                    }
-                }
-            }
-            present.insert(key);
-        }
-        if !clean || !census.refresh(&directory, &before) {
-            continue;
-        }
+        census.refresh(&directory, &before);
         traversal.codex_rollout_paths.retain(|key| {
             Path::new(key).parent() != Some(directory.as_path()) || present.contains(key)
         });
