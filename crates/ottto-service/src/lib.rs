@@ -1785,10 +1785,8 @@ impl LocalDaemon {
         let state = self.state()?;
         let mut authority = repair_authority_for_state(&state);
         if let Some(problem) = shell_finding {
-            authority.message = StableMessage {
-                code: claude_shell_telemetry::CODE.into(),
-                text: problem.detail,
-            };
+            authority.message.text.push(' ');
+            authority.message.text.push_str(&problem.detail);
         }
         Ok(RepairPlan {
             plan_id: format!("repair_{}", source_slug(&source)),
@@ -9061,7 +9059,13 @@ mod tests {
             .propose_repair_for_trusted_client(SourceKind::ClaudeCode, false)
             .unwrap();
         assert_eq!(plan.status, RepairPlanStatus::Proposed);
-        assert_eq!(plan.authority.message.code, claude_shell_telemetry::CODE);
+        assert_eq!(plan.authority.message.code, "account_not_connected");
+        assert!(plan.authority.message.text.contains("Sign in to Ottto"));
+        assert!(plan
+            .authority
+            .message
+            .text
+            .contains("Claude Desktop inherits"));
         assert!(plan
             .actions
             .iter()
