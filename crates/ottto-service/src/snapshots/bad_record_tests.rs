@@ -193,26 +193,17 @@ fn regression<S: SourceFixture>() {
     while !p.step().unwrap() {}
     let reduction = p.durable_test_reduction_copy();
     let cp = p
-        .retain_reduction(
-            &scope(),
-            NOW,
-            sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
-        )
+        .retain_reduction(&scope(), NOW)
         .unwrap()
         .unwrap()
         .checkpoint;
-    let taken = crate::transcript_cache::Taken {
-        modified_hint: cp.modified_hint(),
-        retained: crate::transcript_cache::Retained {
-            checkpoint: cp,
-            state: reduction,
-        },
-        finalization_charge: 0,
-        e2_held_new_file: false,
-    };
+    let retained = Box::new(crate::transcript_cache::Retained {
+        checkpoint: cp,
+        state: reduction,
+    });
     let mut ram = parser::<S>(&path);
     assert_eq!(
-        ram.prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
+        ram.prepare_acquisition(Some(retained), &scope(), None, NOW)
             .unwrap(),
         ReadMode::Unchanged
     );
