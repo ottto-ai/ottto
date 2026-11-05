@@ -256,21 +256,15 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     Ok(())
 }
 
-/// Harvests and answers the delay before the next cycle. A harvest that began
-/// before snapshot sync delivered any usable input (daemon start) found none,
-/// so it waits for the first delivery and harvests once more.
+/// Waits for snapshot sync's first usable delivery (returns at once after it;
+/// the flag never resets), harvests, and answers the delay before the next.
 fn context_cycle(
     inputs: &FootprintInputs,
     harvest: &mut impl FnMut() -> Result<ContextHarvestOutcome>,
 ) -> Duration {
-    let had_inputs = *inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut result = harvest();
-    if !had_inputs && result.as_ref().is_ok_and(|outcome| outcome.refused == 0) {
-        let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
-        drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
-        result = harvest();
-    }
-    let refused = match result {
+    let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
+    let refused = match harvest() {
         Ok(outcome) => outcome.refused > 0,
         Err(error) => {
             eprintln!(
@@ -2443,10 +2437,11 @@ mod tests {
         (found, path_scopes)
     }
 
-    /// Regression: a daemon-start harvest runs before snapshot sync delivers
-    /// any transcript, so it finds nothing; it must not then sleep six hours.
+    /// Regression: at daemon start no snapshot pass has delivered a
+    /// transcript yet, so the thread must wait for the first delivery instead
+    /// of harvesting nothing and sleeping six hours.
     #[test]
-    fn empty_startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
+    fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
         let home = temp_dir("startup-wake");
         let now = SystemTime::now();
         let dir = home.join("work").join("repo");
@@ -2456,26 +2451,26 @@ mod tests {
         let projects = home.join(".claude").join("projects");
         collect_recent_jsonl_files(&projects, now, &mut files, &mut 0);
         let projection = Arc::new(CwdProjection::default());
-        let (harvested, harvests) = std::sync::mpsc::channel();
         let cycle = {
-            let inputs = projection.inputs();
+            let projection = Arc::clone(&projection);
             std::thread::spawn(move || {
-                context_cycle(&inputs, &mut || {
-                    harvested.send(()).unwrap();
+                // Each harvest records how many workspaces it could see.
+                let mut seen = Vec::new();
+                let delay = context_cycle(&projection.1, &mut || {
+                    seen.push(projection.recent_cwds(SystemTime::now()).len());
                     Ok(ContextHarvestOutcome::default())
-                })
+                });
+                (seen, delay)
             })
         };
 
-        harvests.recv().unwrap();
         project_transcripts(&projection, &files);
-        let delay = cycle.join().unwrap();
 
-        assert_eq!(harvests.try_iter().count(), 1, "one harvest per delivery");
+        let (seen, delay) = cycle.join().unwrap();
+        assert_eq!(seen, [1], "one harvest, after the delivery");
         assert_eq!(delay, CONTEXT_FOOTPRINT_INTERVAL);
-        let inputs = projection.inputs();
         let mut later = 0;
-        let delay = context_cycle(&inputs, &mut || {
+        let delay = context_cycle(&projection.1, &mut || {
             later += 1;
             Ok(ContextHarvestOutcome::default())
         });
