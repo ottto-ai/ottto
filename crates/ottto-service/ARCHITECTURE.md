@@ -99,7 +99,7 @@ raises the refusal alarm. Claude, Codex and Pi share this machinery.
   retried, never via full erasure.
 - **Workspace observations.** Native completion records a resolved repository binding in the
   session's Workspace fact before staging Tail state. The binding survives restart and directory
-  removal; failed lookups remain unknown and can resolve on later ordinary selected work. Git
+  removal; unsuccessful lookups remain unbound and can resolve on later ordinary selected work. Git
   worktrees keep the shared common-directory identity. Explicit non-Git and unknown folders can
   carry a sanitized directory basename under the workspace-label upload policy; labels never
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
