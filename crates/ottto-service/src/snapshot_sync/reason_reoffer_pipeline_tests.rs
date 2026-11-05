@@ -812,8 +812,8 @@ fn unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold() {
     assert_eq!(pipeline.server.offered().len(), 2);
 }
 
-/// R8: a conflict on the daily offer keeps today's unsettled/follow-up
-/// behavior, keeps the refusal and its cooldown, and the conflict's
+/// A conflict on the daily offer finishes with its follow-up still owed,
+/// keeps the refusal and its cooldown, and the conflict's
 /// RetryPending state cannot let the refused body escape the 24 h gate.
 #[test]
 #[serial]
@@ -837,7 +837,10 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
         2,
         "due offer reached the server"
     );
-    assert!(day1.result.is_err(), "a conflict still owes a follow-up");
+    assert!(
+        day1.result.is_ok(),
+        "an isolated conflict keeps its follow-up owed"
+    );
     assert_eq!(
         pipeline.server.last_terminal()["last_error_code"],
         "server_error"
@@ -1512,7 +1515,10 @@ fn refused_then_conflicted_holding(
     pipeline.server.answer(Answer::Conflict);
     let t1 = t0 + DAY + 60;
     let day1 = pipeline.cycle(t1);
-    assert!(day1.result.is_err(), "a conflict still owes a follow-up");
+    assert!(
+        day1.result.is_ok(),
+        "an isolated conflict keeps its follow-up owed"
+    );
     assert_eq!(pipeline.server.offered().len(), 2);
     let deadline = reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"].clone();
     assert!(

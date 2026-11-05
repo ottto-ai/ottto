@@ -33,6 +33,28 @@ impl FinishOutcome {
     }
 }
 
+// Reuse the loopback receiver's witness calculation for offered-body custody checks.
+fn finish_wire_body_witness(item: &serde_json::Value) -> String {
+    assert!(item.get("cache_observations").is_none());
+    assert!(item.get("context_curve").is_none());
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    )
+}
+
 struct FinishServer {
     url: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -143,18 +165,11 @@ impl FinishServer {
                         serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
                     } else if matches!(outcome, FinishOutcome::Accept | FinishOutcome::Witness) {
                         let entities = items.iter().map(|item| {
-                            assert!(item.get("cache_observations").is_none());
-                            assert!(item.get("context_curve").is_none());
-                            let mut payload = serde_json::Map::new();
-                            for key in ["session_account_evidence", "tool_usage", "tool_usage_truncated"] {
-                                if let Some(value) = item.get(key) { payload.insert(key.into(), value.clone()); }
-                            }
                             let exclusive = item.get("usage_accounting_contract").and_then(|v| v.as_str())
                                 == Some("session_exclusive_reported_usage:v1");
                             let version = item.get("session_account_evidence").is_some()
                                 .then_some(if exclusive { 8u64 } else { 7u64 });
-                            let digest = format!("{:x}", Sha256::digest(
-                                crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()));
+                            let digest = finish_wire_body_witness(item);
                             serde_json::json!({"source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
                                 "body_witness_version":version,"body_witness_digest":version.map(|_| if matches!(outcome, FinishOutcome::Witness) { "0".repeat(64) } else { digest })})
@@ -406,8 +421,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 );
                 assert!(record.upload_body_witness.is_some());
                 assert_eq!(
-                    record.upload_body_witness,
-                    progress.quarantined_fingerprints[fp].upload_body_witness
+                    record.upload_body_witness.as_ref(),
+                    Some(&finish_wire_body_witness(item))
                 );
                 assert!(!saved.accepted_snapshot_fingerprint_recorded(fp));
             }
