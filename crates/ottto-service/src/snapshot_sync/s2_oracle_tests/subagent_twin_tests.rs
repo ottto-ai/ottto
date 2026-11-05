@@ -43,7 +43,13 @@ fn twins(name: &str, reverse: bool, clock: &str, idless: bool, positive: bool) -
             value["message"].as_object_mut().unwrap().remove("id");
             text += &(value.to_string() + "\n");
         }
+        if positive && agent == 0 {
+            text += &line(ROOT, "old", AT, 6);
+        }
         c.write_at(&member(old, agent), &text, "2026-11-04T07:00:00Z");
+        if positive && agent == 0 {
+            text += &line(ROOT, "copy-own", GROW, 13);
+        }
         c.write_at(&member(new, agent), &text, COPY_BIRTH);
     }
     c.write_at(
@@ -70,6 +76,7 @@ fn twins(name: &str, reverse: bool, clock: &str, idless: bool, positive: bool) -
             ));
         }
         rows.push(api_login(ROOT, "side", 4, '2', Some('8')));
+        rows.push(api_login(ROOT, "copy-own", 13, '2', Some('8')));
         c.evidence(&rows, &[trace("side", "000")]);
     }
     c
@@ -83,6 +90,14 @@ fn cold(c: &Corpus) -> RouteResult {
 /// after a crash before upload against identical final POST bytes/placement.
 fn routes(c: &Corpus) -> RouteResult {
     let expected = cold(c);
+    let main = c
+        .births
+        .iter()
+        .filter(|(path, _)| path.file_name().unwrap() == format!("{ROOT}.jsonl").as_str())
+        .max_by_key(|(_, birth)| *birth)
+        .unwrap()
+        .0;
+    let original = std::fs::read_to_string(main).unwrap();
     for (mode, upgrade) in [
         (Mode::Ram, false),
         (Mode::DiskRestore, false),
@@ -98,20 +113,25 @@ fn routes(c: &Corpus) -> RouteResult {
         let mut first = c.raw(&scanner, index, 100, true, &[]);
         first.enrich(c);
         money_oracle::assert_equivalent(&expected, &result(&first, mode));
-        // Save native inputs without accepting: a restart owes exactly this body.
+        // Save native inputs without accepting; the next real change continues them.
         first.finish();
         let mut prior = session.save_reload(&mut first.index);
         if upgrade {
             prior = fixture::upgrade_from_legacy_store(&prior, &c.base.join("legacy.json"));
         }
+        // Saved undelivered work alone selects no read. A real append drives
+        // the continuation/restart instead of demanding an unchanged re-offer.
+        append(main, &line(ROOT, "restart-growth", GROW, 8));
+        let grown = cold(c);
         let mut again = if mode == Mode::Ram {
             c.raw(&scanner, prior, 100, true, &[])
         } else {
             c.raw(&E2ScanFixture::capturing_identity(), prior, 100, true, &[])
         };
         again.enrich(c);
-        money_oracle::assert_equivalent(&expected, &result(&again, mode));
+        money_oracle::assert_equivalent(&grown, &result(&again, mode));
         let _ = commit(&session, again);
+        std::fs::write(main, &original).unwrap();
     }
     expected
 }
@@ -153,7 +173,8 @@ fn identical_family_and_idless_copies() {
 }
 
 /// [money] The inclusive gate is each duplicated occurrence's timestamp,
-/// including all-copy children, pre-boundary copies and unusable clocks.
+/// including all-copy children. Unusable clocks take the native untimed
+/// count path before a copied skip can reach the timestamp gate.
 #[test]
 fn occurrence_boundary_counts_unusable_and_old_copies() {
     with_e2(|| {
@@ -250,17 +271,13 @@ fn growth_on_either_home_and_main_only() {
                 let path = c.root.join(relative);
                 append(&path, &line(ROOT, &format!("growth-{step}"), GROW, 8));
                 let expected = cold(&c);
-                let mut warm = hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&path));
+                // Save the prior before either scan takes its growth claim.
+                let restored_prior = session.save_reload(&mut prior);
+                let warm = hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&path));
                 assert_eq!(warm.modes.0, 0, "append/forced family use Tail");
                 assert!(warm.modes.1 > 0);
                 money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
-                let restored = hinted(
-                    &c,
-                    session.save_reload(&mut prior),
-                    100,
-                    true,
-                    std::slice::from_ref(&path),
-                );
+                let restored = hinted(&c, restored_prior, 100, true, std::slice::from_ref(&path));
                 money_oracle::assert_equivalent(&expected, &result(&restored, Mode::DiskRestore));
                 additions += 1;
                 let sum = expected
@@ -269,7 +286,6 @@ fn growth_on_either_home_and_main_only() {
                     .map(|s| s["request_count"].as_u64().unwrap())
                     .sum::<u64>();
                 assert_eq!(sum, 5 + additions, "each append adds exactly one request");
-                warm.finish();
                 prior = commit(&session, warm);
             }
         }
@@ -284,9 +300,23 @@ fn positive_placement_matches_one_home() {
         let c = twins("subagent-twin-positive", false, TURN, false, true);
         let actual = routes(&c);
         assert!(accounts(&actual).len() >= 2);
+        assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 5);
+        assert_eq!(
+            actual.snapshots[&child(0)]["removed_usage"]["input_tokens"],
+            77
+        );
+        assert_eq!(
+            actual.snapshots[&child(0)]["cost"]["total_cost_usd"],
+            "0.00067"
+        );
         let mut one = corpus("subagent-twin-positive-one-home");
         for agent in 0..3 {
             let text = std::fs::read_to_string(c.root.join(member("a", agent))).unwrap();
+            let text = if agent == 0 {
+                text + &line(ROOT, "old-copy", AT, 6) + &line(ROOT, "copy-own", GROW, 13)
+            } else {
+                text
+            };
             one.write_at(&member("a", agent), &text, "2026-11-04T07:00:00Z");
         }
         let text = std::fs::read_to_string(c.root.join(format!("z/{ROOT}.jsonl"))).unwrap();
@@ -329,8 +359,16 @@ fn restart_boundaries_and_quiet_settlement() {
         );
         let first = page(&c, index.clone(), 1, true);
         // A crash before upload cannot grant an ACK or lose either member.
-        let replay = page(&c, index, 100, true);
-        money_oracle::assert_equivalent(&expected, &result(&replay, Mode::Restart));
+        let replay = page(&c, ScanIndex::load(session.path()).unwrap(), 100, true);
+        let restarted = result(&replay, Mode::Restart);
+        money_oracle::assert_equivalent(&expected, &restarted);
+        for agent in 0..2 {
+            assert_eq!(restarted.snapshots[&child(agent)]["request_count"], 1);
+            assert_eq!(
+                restarted.snapshots[&child(agent)]["removed_request_count"],
+                3
+            );
+        }
         let mut delivered = result(&first, Mode::Restart).snapshots;
         let mut prior = commit(&session, first);
         for _ in 0..10 {
@@ -397,6 +435,16 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         let prior = commit(&session, first);
         let quiet = page(&c, prior.clone(), 100, true);
         assert!(quiet.scan.snapshots.is_empty());
+        let main = c.root.join(format!("z/{ROOT}.jsonl"));
+        append(&main, &line(ROOT, "main-only", GROW, 8));
+        let pulled = hinted(&c, prior, 100, true, &[main]);
+        let same = body(&pulled, &child(0)).unwrap();
+        assert_eq!(same.request_count, 2);
+        assert_eq!(
+            snapshot_upload_body_witness(same),
+            before.accepted[&child(0)].witness
+        );
+        let prior = commit(&session, pulled);
         for home in ["a", "z"] {
             append(
                 &c.root.join(member(home, 0)),
@@ -412,6 +460,16 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         );
         let expected = cold(&c);
         money_oracle::assert_equivalent(&expected, &result(&grown, Mode::Restart));
-        assert_eq!(before.accepted[&child(0)].body["request_count"], 2);
+        let fingerprint = body(&grown, &child(0))
+            .unwrap()
+            .snapshot_fingerprint
+            .clone();
+        let witness = snapshot_upload_body_witness(body(&grown, &child(0)).unwrap());
+        let (settled, progress) = commit_with_progress(&session, grown);
+        assert!(settled.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&fingerprint),
+            Some(&witness)
+        );
     });
 }

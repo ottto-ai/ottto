@@ -390,6 +390,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         first_own,
         first_own_at: _,
         grandfathered: _,
+        twin_pending: _,
         ambiguous,
         disclosed: _,
         e2_nanos: _,
@@ -907,6 +908,8 @@ pub(crate) struct FileFold {
     first_own_at: Option<i128>,
     /// An accepted copy decided before `COPY_PROOF_FROM` keeps its decision.
     grandfathered: bool,
+    /// Only the native subagent branch leaves these skips for page proof.
+    twin_pending: bool,
     /// Request hashes two responses of this file claim; filled on demand.
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
@@ -923,7 +926,7 @@ pub(crate) struct FileFold {
     /// copy route the page takes: the page's evidence scope reads its pair.
     fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
 
 impl FileFold {
     pub(in crate::snapshots) fn new(
@@ -1018,6 +1021,7 @@ impl FileFold {
             first_own: None,
             first_own_at: None,
             grandfathered: false,
+            twin_pending: false,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
             e2_nanos: FoldNanos::default(),
@@ -1320,9 +1324,13 @@ impl FileFold {
             self.copy = None;
             return;
         }
-        if context.is_some_and(|context| {
-            claude_index_path_member_ref(context.path).is_some_and(|m| m.subagent_stem.is_some())
-        }) {
+        if self.ambiguous.is_empty()
+            && context.is_some_and(|context| {
+                claude_index_path_member_ref(context.path)
+                    .is_some_and(|m| m.subagent_stem.is_some())
+            })
+        {
+            self.twin_pending = true;
             self.copy = None;
             self.finish_identity_start(false, markers);
             return;
@@ -1850,6 +1858,7 @@ pub(crate) fn decide_page_copies(
             unproven_idless: fold.prefix.unproven_idless,
             ..PrefixTally::default()
         };
+        let twin_pending = std::mem::take(&mut fold.twin_pending);
         let proof = fold.proof.clone();
         if !matches!(proof, Some(CopyProof::Holders { .. })) {
             if let Some(Located(file)) = fold.location {
@@ -1861,7 +1870,11 @@ pub(crate) fn decide_page_copies(
         match proof {
             Some(CopyProof::Holders { .. }) => holders.push(at),
             Some(CopyProof::Family(root)) => {
-                decide_subagent_twins(items, at);
+                if twin_pending {
+                    decide_subagent_twins(items, at);
+                    items[at].claude_money.as_deref_mut().unwrap().proof =
+                        Some(CopyProof::Family(root.clone()));
+                }
                 decide_family(items, at, &root, index);
             }
             None => {}
@@ -2122,7 +2135,8 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
                 .timestamp
                 .as_deref()
                 .and_then(rfc3339_unix_nanos)
-                .is_some_and(|at| at >= SUBAGENT_TWIN_FROM);
+                .expect("native skips have usable provider timestamps")
+                >= SUBAGENT_TWIN_FROM;
             let held = eligible && earlier.iter().any(|ids| ids.contains(*id));
             kept += u64::from(held);
             !held
