@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+description = "The ottto command-line interface for developers, support, CI, and AI agents."
+repository.workspace = true
+homepage.workspace = true
 
 [lints]
 workspace = true

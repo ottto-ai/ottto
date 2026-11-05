@@ -12,6 +12,8 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.81"
 authors = ["Ottto Team"]
+repository = "https://github.com/ottto-ai/ottto"
+homepage = "https://ottto.net"
 
 # CI runs clippy with -D warnings, so "warn" fails the build. Every member
 # crate opts in with `[lints] workspace = true`.

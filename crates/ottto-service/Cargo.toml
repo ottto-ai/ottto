@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+description = "Per-user Ottto daemon that owns local state, setup, repair, diagnostics, and updates."
+repository.workspace = true
+homepage.workspace = true
 build = "build.rs"
 
 [lints]
