@@ -238,18 +238,27 @@ mod unix {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// An opened settings directory and its size limit: managed roots keep the
-    /// 1 MiB limit; the user's default root has none.
+    /// How a settings directory is opened. `Managed` and `Read` walk every
+    /// component without following links and keep the 1 MiB limit; `Managed`
+    /// also requires an owner-only root. `User` is the user's default root: it
+    /// follows their directory links, as Claude does, and has no size limit.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Root {
+        Managed,
+        Read,
+        User,
+    }
+
+    /// An opened settings directory and its size limit.
     struct Directory(File, Option<u64>);
     impl Directory {
-        fn open(path: &Path, private: bool) -> io::Result<Self> {
+        fn open(path: &Path, root: Root) -> io::Result<Self> {
             use std::os::unix::ffi::OsStrExt;
             if !path.is_absolute() {
                 return Err(invalid("settings directory must be absolute"));
             }
-            if !private {
-                // The user's own root follows their directory links, as Claude
-                // does; the settings file itself is still opened no-follow.
+            if root == Root::User {
+                // The settings file itself is still opened no-follow.
                 let path = CString::new(path.as_os_str().as_bytes())
                     .map_err(|_| invalid("invalid settings directory"))?;
                 let fd = unsafe {
@@ -280,7 +289,10 @@ mod unix {
                 }
             }
             let metadata = directory.0.metadata()?;
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
+            if root == Root::Managed
+                && (metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o777 != 0o700)
+            {
                 return Err(invalid("managed settings directory must be owner-only"));
             }
             Ok(directory)
@@ -315,8 +327,8 @@ mod unix {
             }
             Ok(Some(body))
         }
-        fn same_root(&self, root: &Path, private: bool) -> io::Result<bool> {
-            let current = Self::open(root, private)?.0.metadata()?;
+        fn same_root(&self, path: &Path, root: Root) -> io::Result<bool> {
+            let current = Self::open(path, root)?.0.metadata()?;
             let original = self.0.metadata()?;
             Ok(current.dev() == original.dev() && current.ino() == original.ino())
         }
@@ -360,7 +372,7 @@ mod unix {
         let parent = path
             .parent()
             .ok_or_else(|| invalid("settings has no parent"))?;
-        let directory = match Directory::open(parent, false) {
+        let directory = match Directory::open(parent, Root::Read) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -428,7 +440,8 @@ mod unix {
         let _thread_guard = WRITE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = match Directory::open(root, private) {
+        let kind = if private { Root::Managed } else { Root::User };
+        let directory = match Directory::open(root, kind) {
             Ok(directory) => directory,
             Err(error) if private && skip_missing && error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Outcome::Unchanged)
@@ -438,7 +451,7 @@ mod unix {
                 let parent = root
                     .parent()
                     .ok_or_else(|| invalid("settings directory has no parent"))?;
-                let parent = Directory::open(parent, false)?;
+                let parent = Directory::open(parent, Root::User)?;
                 let name = CString::new(
                     root.file_name()
                         .ok_or_else(|| invalid("settings directory has no name"))?
@@ -451,7 +464,7 @@ mod unix {
                         return Err(error);
                     }
                 }
-                Directory::open(root, false)?
+                Directory::open(root, Root::User)?
             }
             Err(error) => return Err(error),
         };
@@ -498,7 +511,7 @@ mod unix {
             temporary.write_all(&body)?;
             temporary.sync_all()?;
             before_commit()?;
-            if !directory.same_root(root, private)? || directory.read()? != original {
+            if !directory.same_root(root, kind)? || directory.read()? != original {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "settings changed during provisioning",
