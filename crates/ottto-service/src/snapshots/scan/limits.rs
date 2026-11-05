@@ -1,7 +1,7 @@
 //! Scan limits: the epoch gates that date which usage a rule counts, and the
 //! per-tick listing, backfill and unhealthy-retry budgets.
 
-use crate::snapshots::dated_on_or_after;
+use crate::snapshots::rfc3339_unix_seconds;
 
 /// 2026-11-09T00:00:00Z, a 00:00Z expected on/after install on every machine.
 /// Codex thread-settings tiers and
@@ -17,6 +17,16 @@ pub(in crate::snapshots) const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1
 /// keeps exactly the rows it had. Correcting older repeats is an operator
 /// decision.
 pub(in crate::snapshots) const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
+
+/// `false` for a missing or unparsable timestamp.
+pub(in crate::snapshots) fn dated_on_or_after(
+    timestamp: Option<&str>,
+    from_unix_seconds: u64,
+) -> bool {
+    timestamp
+        .and_then(rfc3339_unix_seconds)
+        .is_some_and(|seconds| seconds >= from_unix_seconds)
+}
 
 pub(in crate::snapshots) fn in_codex_forward_evidence_epoch(timestamp: Option<&str>) -> bool {
     dated_on_or_after(timestamp, CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS)

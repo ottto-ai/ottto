@@ -728,7 +728,7 @@ mod usage;
 use scan::limits::CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS;
 pub(crate) use scan::limits::LISTING_INTERVAL_SECONDS;
 use scan::limits::{
-    in_codex_forward_evidence_epoch, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS,
+    dated_on_or_after, in_codex_forward_evidence_epoch, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS,
     LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
     UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS, UNHEALTHY_SCAN_RETRY_MAX_SECONDS,
 };
@@ -743,13 +743,6 @@ use usage::PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS;
 use usage::{
     provider_price_line, provider_price_line_model_key, ProviderPriceLineKind, PROVIDER_PRICE_LINES,
 };
-
-/// `false` for a missing or unparsable timestamp.
-fn dated_on_or_after(timestamp: Option<&str>, from_unix_seconds: u64) -> bool {
-    timestamp
-        .and_then(rfc3339_unix_seconds)
-        .is_some_and(|seconds| seconds >= from_unix_seconds)
-}
 
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
