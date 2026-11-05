@@ -111,6 +111,10 @@
     "marker_source_file_fingerprint",
     "verified_source_file_fingerprint"
   ],
+  "proof.upload_context": [
+    "body_witness",
+    "context_fingerprint"
+  ],
   "proof.usage": [
     "assigned_request_id_fingerprints",
     "assigned_request_id_fingerprints.*",

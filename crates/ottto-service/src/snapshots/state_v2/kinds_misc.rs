@@ -327,6 +327,13 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         &serde_json::to_vec(&index.schema_version)?,
     )?;
     macro_rules! save {
+        // Stamps go one row per entity; field_mode finds no two-kind entry,
+        // so the stamp-free header stays one Field row.
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
+            let proof = &index.upload_context_proof;
+            write_field(&proof.header(), "upload_context_proof", $head, rows, cx)?;
+            rows.map($stamps, &proof.entity_stamps)?;
+        };
         (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             // Like the v1 serializer: only versioned cursor fences persist.
             let inventory = &index.claude_desktop_store_inventory;
@@ -369,6 +376,15 @@ pub(super) fn hydrate_txn(
     // Retired kinds are never read: hydrate's retired walk names their rows,
     // so the next save removes them.
     macro_rules! load {
+        // A layout-5 header holds every stamp inline; the next save splits it.
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
+            use super::super::upload_context_receipt::{EntityStamp, ProofState};
+            let mut proof: ProofState =
+                read_field($head, tx, Some(&mut cx.digests), Default::default)?;
+            let stamps = mapper::read_map::<EntityStamp>(tx, $stamps, None, Some(&mut cx.digests))?;
+            proof.entity_stamps.extend(stamps);
+            index.upload_context_proof = proof;
+        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };
