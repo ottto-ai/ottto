@@ -344,7 +344,14 @@ fn active_session_from_snapshot(
     let attribution = agent_status.and_then(|status| account_attribution(snapshot, status));
     let compaction_timestamps =
         bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
-    let (latest_model, latest_reasoning_effort) = latest_model_identity(snapshot);
+    let latest_row = latest_model_row(snapshot);
+    let (latest_model, latest_reasoning_effort) = latest_model_identity(latest_row);
+    // Pi has no account to label, so its card names the provider route of the
+    // same newest row instead.
+    let provider_route = latest_row
+        .filter(|_| source == SnapshotSource::Pi)
+        .and_then(|row| row.model_provider.clone())
+        .filter(|provider| non_empty(provider));
     let (current_account, account_history) = session_accounts(source, snapshot);
     let session_kind = active_session_kind(source, snapshot);
     ActiveSession {
@@ -411,6 +418,7 @@ fn active_session_from_snapshot(
         account_attribution_source: attribution.map(|value| value.source),
         latest_model,
         latest_reasoning_effort,
+        provider_route,
         current_account,
         account_history,
     }
@@ -495,8 +503,8 @@ fn active_session_context_points(points: &[LocalContextPoint]) -> Vec<ActiveSess
 /// newest bucket; within that bucket there is no finer ordering, so the row
 /// that did the most work wins. Ties break on model name so two scans of the
 /// same transcript never disagree.
-fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<String>) {
-    let Some(bucket) = snapshot
+fn latest_model_row(snapshot: &SnapshotItem) -> Option<&SnapshotModelUsage> {
+    let bucket = snapshot
         .usage_buckets
         .iter()
         .filter(|bucket| !bucket.model_usage.is_empty())
@@ -511,12 +519,8 @@ fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<Str
                         .unwrap_or(right.bucket_start.as_str()),
                 )
                 .then_with(|| left.bucket_start.cmp(&right.bucket_start))
-        })
-    else {
-        return (None, None);
-    };
-
-    let row = bucket
+        })?;
+    bucket
         .model_usage
         .iter()
         .max_by(|left, right| {
@@ -524,8 +528,10 @@ fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<Str
                 .cmp(&row_tokens(right))
                 .then_with(|| right.model.cmp(&left.model))
         })
-        .filter(|row| non_empty(&row.model));
+        .filter(|row| non_empty(&row.model))
+}
 
+fn latest_model_identity(row: Option<&SnapshotModelUsage>) -> (Option<String>, Option<String>) {
     match row {
         Some(row) => (
             Some(row.model.clone()),
@@ -1138,6 +1144,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pi_session_carries_newest_row_provider_route_and_other_sources_none() {
+        let mut older = usage_row("glm-5", None, 900);
+        older.model_provider = Some("gcp_glm".to_string());
+        let mut newest = usage_row("gemini-3-flash-preview", None, 10);
+        newest.model_provider = Some("google_vertex".to_string());
+        newest.gateway_provider = Some("google_vertex".to_string());
+        let mut snapshot = test_snapshot("s-pi", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![
+            bucket("2026-07-19T10:00:00Z", "2026-07-19T10:30:00Z", vec![older]),
+            bucket("2026-07-19T11:00:00Z", "2026-07-19T11:04:00Z", vec![newest]),
+        ];
+        let route = |snapshot: &SnapshotItem, source| {
+            active_session_from_snapshot(source, snapshot, None).provider_route
+        };
+
+        assert_eq!(
+            route(&snapshot, SnapshotSource::Pi).as_deref(),
+            Some("google_vertex")
+        );
+        assert_eq!(route(&snapshot, SnapshotSource::ClaudeCode), None);
+
+        snapshot.usage_buckets[1].model_usage[0].model_provider = Some(" ".to_string());
+        assert_eq!(route(&snapshot, SnapshotSource::Pi), None);
     }
 
     #[test]
