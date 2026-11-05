@@ -40,10 +40,22 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups: it re-checks the directories and headers of the homes
-  holding them, and the inventory holds an owner seen in two homes. A change in an unrelated
-  home is the next pass's fact. A header owner that changes in a checked home during a pass
-  holds that pass’s Codex publication until revalidation on the next pass.
+  singleton sessions and joined groups across every registered home. New files
+  outside the scan roster and changed headers fail when their old or new owner
+  belongs to this page; unrelated changes defer to the next roster refresh.
+  Refresh and checkpoint share the directory listing helper. A page-local memo
+  shares re-listed directory witnesses and path/stat classifications across
+  pre-upload and post-ACK checks; unchanged facts require no repeat header reads.
+  Neither the roster snapshot nor this memo changes persisted traversal state.
+  New archives use every filename ownership candidate, like held archives;
+  archives beside known, still-present plaintext defer. If unrelated plaintext
+  vanishes and activates its roster archive, that archive uses the same filename
+  fence: a page-owner candidate or missing filename proof fails the page.
+  Unknown or unreadable headers remain conservative failures, including unrelated
+  compressed rereads.
+  A new empty day directory still fails one page (about once per home per day).
+  A symlink entry that refresh cannot certify can block pages across homes.
+  A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.

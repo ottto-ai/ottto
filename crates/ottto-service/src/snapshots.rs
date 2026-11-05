@@ -15940,6 +15940,7 @@ impl OwnedSourceScan {
                             inventory,
                             codex_join_completed,
                             &surviving,
+                            &traversal_snapshot.codex_rollout_paths,
                         )
                     })
                 });
@@ -23833,48 +23834,12 @@ fn refresh_retained_codex_directories(
             }
             _ => continue,
         };
-        let Ok(entries) = fs::read_dir(&directory) else {
+        let Some((present, appeared, new_directories)) =
+            census.listing(&directory, &traversal.codex_rollout_paths)
+        else {
             continue;
         };
-        let entries = entries.collect::<Vec<_>>();
-        let mut present = BTreeSet::new();
-        let mut appeared = Vec::new();
-        let mut new_directories = Vec::new();
-        let mut clean = true;
-        for entry in entries {
-            let Some((path, file_type)) = entry
-                .ok()
-                .and_then(|entry| entry.file_type().ok().map(|kind| (entry.path(), kind)))
-            else {
-                clean = false;
-                break;
-            };
-            if file_type.is_symlink() {
-                clean = false;
-                break;
-            }
-            if file_type.is_dir() {
-                if !census.contains(&path) {
-                    new_directories.push(path);
-                }
-                continue;
-            }
-            if !file_type.is_file() || !transcript_path_admitted(source, &path) {
-                continue;
-            }
-            let key = local_index_key(&path);
-            if !traversal.codex_rollout_paths.contains(&key) {
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => appeared.push((path, metadata)),
-                    _ => {
-                        clean = false;
-                        break;
-                    }
-                }
-            }
-            present.insert(key);
-        }
-        if !clean || !census.refresh(&directory, &before) {
+        if !census.refresh(&directory, &before) {
             continue;
         }
         traversal.codex_rollout_paths.retain(|key| {
