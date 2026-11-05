@@ -4,6 +4,7 @@ set -euo pipefail
 MANIFEST=""
 OUTPUT=""
 BASE_URL=""
+RECORD_SHA256=0
 
 usage() {
   cat <<'USAGE'
@@ -19,6 +20,8 @@ Options:
   --manifest <path>   Stable release manifest to read.
   --output <path>     Installer wrapper output path.
   --base-url <url>    Immutable HTTPS release prefix. Defaults to manifest rollback.immutable_prefix.
+  --record-sha256     Write the generated helper's SHA-256 into the manifest at
+                      install_methods.verified_native_installer.sha256.
   -h, --help          Show help.
 USAGE
 }
@@ -36,6 +39,10 @@ while [[ $# -gt 0 ]]; do
     --base-url)
       BASE_URL="${2:?--base-url requires a value}"
       shift 2
+      ;;
+    --record-sha256)
+      RECORD_SHA256=1
+      shift
       ;;
     -h|--help)
       usage
@@ -67,6 +74,9 @@ require_command() {
 
 require_command jq
 require_command python3
+if [[ "$RECORD_SHA256" -eq 1 ]]; then
+  require_command shasum
+fi
 
 failures=0
 fail() {
@@ -90,6 +100,7 @@ rollback_immutable_prefix="$(jq -r '.rollback.immutable_prefix // empty' "$MANIF
 rollback_latest_manifest_url="$(jq -r '.rollback.latest_manifest_url // empty' "$MANIFEST")"
 app_bundle_supported="$(jq -r '(.supported_install_owners // []) | index("app_bundle") != null' "$MANIFEST")"
 verified_installer_owner="$(jq -r '.install_methods.verified_native_installer.runtime_install_owner // empty' "$MANIFEST")"
+verified_installer_path="$(jq -r '.install_methods.verified_native_installer.path // empty' "$MANIFEST")"
 
 if [[ -z "$BASE_URL" ]]; then
   BASE_URL="$rollback_immutable_prefix"
@@ -112,6 +123,9 @@ if [[ "$app_bundle_supported" != "true" ]]; then
 fi
 if [[ -n "$verified_installer_owner" && "$verified_installer_owner" != "app_bundle" ]]; then
   fail "Verified native installer helper must bind to runtime_install_owner=app_bundle"
+fi
+if [[ "$RECORD_SHA256" -eq 1 && "$verified_installer_path" != "$(basename "$OUTPUT")" ]]; then
+  fail "Recording the helper SHA-256 requires install_methods.verified_native_installer.path to name the output file: $verified_installer_path"
 fi
 if [[ "$rollback_immutable_prefix" != https://* || "$rollback_immutable_prefix" != *"/stable/$version" ]]; then
   fail "Stable rollback immutable_prefix must be the HTTPS stable versioned prefix: $rollback_immutable_prefix"
@@ -458,3 +472,12 @@ PY
 
 chmod 0755 "$OUTPUT"
 echo "Wrote verified native installer helper: $OUTPUT"
+
+if [[ "$RECORD_SHA256" -eq 1 ]]; then
+  installer_sha="$(shasum -a 256 "$OUTPUT" | awk '{print $1}')"
+  jq --arg sha "$installer_sha" \
+    '.install_methods.verified_native_installer.sha256 = $sha' \
+    "$MANIFEST" > "$MANIFEST.next"
+  mv "$MANIFEST.next" "$MANIFEST"
+  echo "Recorded verified native installer helper SHA-256 in manifest: $installer_sha"
+fi

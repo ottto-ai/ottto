@@ -12,7 +12,8 @@ ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
-MAC_APP_ROOT="${OTTTO_MACOS_APP_ROOT:-$ROOT/tools/ottto-macos-app}"
+MAC_APP_ROOT=""
+MAC_APP_SOURCE_PIN=""
 
 VERSION="0.1.0-dev"
 CHANNEL="dev"
@@ -29,6 +30,11 @@ usage() {
 Usage: macos_package.sh [options]
 
 Options:
+  --app-root <path>          Required. The tools/ottto-macos-app Swift package
+                             root inside its clean Git checkout.
+  --app-source-commit <sha>  40-hex commit the app checkout must be at.
+                             Required for stable-candidate and stable;
+                             dev and preview default to the checkout HEAD.
   --version <version>        Release version. Default: 0.1.0-dev
   --channel <channel>        dev, preview, stable-candidate, or stable. Default: dev
   --output-dir <path>        Output directory. Default: tools/ottto-local-platform/dist/macos
@@ -43,6 +49,14 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --app-root)
+      MAC_APP_ROOT="${2:?--app-root requires a value}"
+      shift 2
+      ;;
+    --app-source-commit)
+      MAC_APP_SOURCE_PIN="${2:?--app-source-commit requires a value}"
+      shift 2
+      ;;
     --version)
       VERSION="${2:?--version requires a value}"
       shift 2
@@ -94,6 +108,18 @@ case "$CHANNEL" in
     exit 2
     ;;
 esac
+if [[ -z "$MAC_APP_ROOT" ]]; then
+  echo "--app-root is required: pass the tools/ottto-macos-app Swift package root" >&2
+  exit 2
+fi
+if [[ -n "$MAC_APP_SOURCE_PIN" && ! "$MAC_APP_SOURCE_PIN" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "--app-source-commit must be a 40-hex app source commit" >&2
+  exit 2
+fi
+if [[ ( "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ) && -z "$MAC_APP_SOURCE_PIN" ]]; then
+  echo "--app-source-commit is required for stable-candidate and stable channels" >&2
+  exit 2
+fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -112,7 +138,6 @@ require_command plutil
 require_command codesign
 require_command install_name_tool
 require_command otool
-require_command gh
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "aarch64" ]]; then
@@ -141,7 +166,7 @@ if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and len
 fi
 if [[ ! -d "$MAC_APP_ROOT" ]]; then
   echo "macOS app root does not exist: $MAC_APP_ROOT" >&2
-  echo "Set OTTTO_MACOS_APP_ROOT to the Ottto Swift package root." >&2
+  echo "Pass --app-root the Ottto Swift package root." >&2
   exit 2
 fi
 if [[ ! -f "$MAC_APP_ROOT/Package.swift" ]]; then
@@ -208,32 +233,11 @@ if [[ -n "$(git -C "$MAC_APP_GIT_ROOT" ls-files --others --exclude-standard -- "
 fi
 MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 MAC_APP_SOURCE_COMMIT="$(git -C "$MAC_APP_GIT_ROOT" rev-parse HEAD)"
-# The release workflow pins the app source commit from the release tag. CI
-# builds require that pin; local builds default to the checkout HEAD.
-if [[ "${GITHUB_ACTIONS:-}" == "true" && ! "${OTTTO_MACOS_APP_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "OTTTO_MACOS_APP_SOURCE_COMMIT must be a 40-hex app source commit in CI" >&2
-  exit 2
-fi
-MAC_APP_SOURCE_PIN="${OTTTO_MACOS_APP_SOURCE_COMMIT:-$MAC_APP_SOURCE_COMMIT}"
+# Stable channels pin the app source commit (the release workflow takes it
+# from the release tag); dev and preview builds default to the checkout HEAD.
+MAC_APP_SOURCE_PIN="${MAC_APP_SOURCE_PIN:-$MAC_APP_SOURCE_COMMIT}"
 if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_SOURCE_PIN" ]]; then
-  echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not the pinned commit $MAC_APP_SOURCE_PIN" >&2
-  exit 2
-fi
-if env -u GH_TOKEN -u GITHUB_TOKEN \
-  gh api repos/singular-labs/coding-agents-observability >/dev/null 2>&1; then
-  echo "Singular guard failed while verifying the private app source" >&2
-  exit 2
-fi
-if ! env -u GH_TOKEN -u GITHUB_TOKEN GIT_TERMINAL_PROMPT=0 \
-  git -C "$MAC_APP_GIT_ROOT" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-  fetch -q --no-tags "https://github.com/$MAC_APP_SOURCE_REPOSITORY.git" refs/heads/master; then
-  echo "Could not fetch the private app source master from GitHub" >&2
-  exit 2
-fi
-MAC_APP_REMOTE_MASTER="$(git -C "$MAC_APP_GIT_ROOT" rev-parse FETCH_HEAD)"
-if ! git -C "$MAC_APP_GIT_ROOT" rev-list --first-parent "$MAC_APP_REMOTE_MASTER" |
-  grep -xF "$MAC_APP_SOURCE_PIN" >/dev/null; then
-  echo "macOS app source commit $MAC_APP_SOURCE_PIN is not on the first-parent line of GitHub master" >&2
+  echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not --app-source-commit $MAC_APP_SOURCE_PIN" >&2
   exit 2
 fi
 MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
@@ -272,7 +276,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     OTTTO_RELEASE_VERSION="$VERSION" \
       OTTTO_RELEASE_CHANNEL="$CHANNEL" \
       GIT_COMMIT="$COMMIT" \
-      cargo build --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
+      cargo build --locked --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
   )
   swift build -c release --package-path "$MAC_APP_ROOT" \
     -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \

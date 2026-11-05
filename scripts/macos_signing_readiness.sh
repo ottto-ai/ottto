@@ -149,7 +149,7 @@ cat <<'NEXT'
 macOS signing readiness passed.
 
 Next stable release commands:
-  ./scripts/macos_package.sh --version <version> --channel stable
+  ./scripts/macos_package.sh --app-root <app-root> --app-source-commit <app-commit> --version <version> --channel stable
   ./scripts/macos_notarize.sh --manifest dist/macos/release-manifest.json --keychain-profile "$OTTTO_NOTARY_PROFILE"
   ./scripts/macos_stable_preflight.sh --manifest dist/macos/release-manifest.json --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" --keychain-profile "$OTTTO_NOTARY_PROFILE"
 NEXT

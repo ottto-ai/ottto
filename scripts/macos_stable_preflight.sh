@@ -9,6 +9,7 @@ MANIFEST=""
 SIGN_IDENTITY="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
 KEYCHAIN_PROFILE="${OTTTO_NOTARY_PROFILE:-}"
 DRY_RUN="false"
+REQUIRE_INSTALLER_SHA256="false"
 
 usage() {
   cat <<'USAGE'
@@ -25,6 +26,7 @@ Options:
   --sign-identity <identity>    Developer ID Application signing identity.
   --keychain-profile <profile>  notarytool keychain profile.
   --dry-run                     Skip credential-dependent Apple checks.
+  --require-installer-sha256    Require the helper checksum for a new release.
   -h, --help                    Show help.
 USAGE
 }
@@ -45,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN="true"
+      shift
+      ;;
+    --require-installer-sha256)
+      REQUIRE_INSTALLER_SHA256="true"
       shift
       ;;
     -h|--help)
@@ -129,6 +135,8 @@ verified_installer_path="$(jq -r '.install_methods.verified_native_installer.pat
 verified_installer_url="$(jq -r '.install_methods.verified_native_installer.url // empty' "$MANIFEST")"
 verified_installer_latest_url="$(jq -r '.install_methods.verified_native_installer.latest_url // empty' "$MANIFEST")"
 verified_installer_runtime_owner="$(jq -r '.install_methods.verified_native_installer.runtime_install_owner // empty' "$MANIFEST")"
+verified_installer_sha="$(jq -r '.install_methods.verified_native_installer.sha256 // empty' "$MANIFEST")"
+verified_installer_has_sha="$(jq '.install_methods.verified_native_installer | has("sha256")' "$MANIFEST")"
 
 if [[ "$schema_version" != "1" ]]; then
   fail "Unsupported release manifest schema_version: $schema_version"
@@ -187,6 +195,10 @@ fi
 if [[ "$verified_installer_runtime_owner" != "app_bundle" ]]; then
   fail "Stable manifest verified native installer must bind runtime_install_owner=app_bundle"
 fi
+# Older immutable releases omit this field; present values must always be valid.
+if [[ "$REQUIRE_INSTALLER_SHA256" == "true" || "$verified_installer_has_sha" == "true" ]] && [[ ! "$verified_installer_sha" =~ ^[0-9a-f]{64}$ ]]; then
+  fail "Stable manifest install_methods.verified_native_installer.sha256 must be a lowercase SHA-256"
+fi
 
 manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
 resolve_manifest_file() {
@@ -234,6 +246,9 @@ if [[ -n "$verified_installer_path" ]]; then
     fi
     rm -f "$expected_installer"
     trap - EXIT
+    if [[ "$verified_installer_sha" =~ ^[0-9a-f]{64}$ && "$(sha256_file "$verified_installer_resolved_path")" != "$verified_installer_sha" ]]; then
+      fail "Stable manifest verified native installer helper SHA-256 does not match the manifest: $verified_installer_path"
+    fi
   fi
 fi
 

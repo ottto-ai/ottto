@@ -42,10 +42,15 @@ requires Developer ID signing.
 From this directory's parent:
 
 ```bash
-./scripts/macos_package.sh --version 0.1.0 --channel dev
+./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+  --version 0.1.0 --channel dev
 ./scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
 ./scripts/macos_dev_install.sh --manifest dist/macos/release-manifest.json
 ```
+
+`--app-root` names the `tools/ottto-macos-app` Swift package inside its clean
+Git checkout. Stable-candidate and stable builds also take
+`--app-source-commit`, the 40-hex commit that checkout must be at.
 
 The package manifest uses URL-safe artifact names such as
 `Ottto-macos-arm64.dmg`, `ottto-macos-arm64.zip`, and
@@ -234,7 +239,8 @@ To produce a distribution-signed package, pass a Developer ID identity:
 
 ```bash
 OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Ottto Inc (...)" \
-  ./scripts/macos_package.sh --version 0.1.0 --channel stable
+  ./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+    --app-source-commit <40-hex app commit> --version 0.1.0 --channel stable
 ```
 
 Then submit the exact generated archives to Apple and update the manifest only
@@ -310,13 +316,22 @@ See `../homebrew/README.md` for the tap layout and clean-Mac install, service,
 update, and uninstall QA checklist.
 
 Generate the stable hosted native installer wrapper from the same stable
-manifest only after the stable release gate and stable preflight pass:
+manifest before stable preflight, attestation binding, and manifest signing:
 
 ```bash
 ./scripts/hosted_native_installer.sh \
   --manifest dist/macos/release-manifest.json \
-  --output dist/macos/install-macos.sh
+  --output dist/macos/install-macos.sh \
+  --record-sha256
 ```
+
+`--record-sha256` writes the generated wrapper's SHA-256 into the manifest at
+`install_methods.verified_native_installer.sha256`. Run it before attestation
+binding and manifest signing so the signed manifest publishes the exact digest
+of the served `install-macos.sh`. The release workflow passes
+`--require-installer-sha256` to stable preflight to reject a missing field.
+Without that flag, preflight accepts older manifests without the field for
+rollback verification; a present field must always be valid and match the file.
 
 The wrapper is a terminal convenience around the native signed artifact. It
 downloads the immutable `release-manifest.json`, verifies that the manifest is
@@ -446,21 +461,24 @@ AWS/CDN prerequisites before publish:
    `min_protocol_version: 15`, non-empty `supported_install_owners`, and
    rollback metadata for the immutable versioned prefix plus channel latest
    pointer.
-6. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
-   SHA-256, is uploaded under the immutable prefix, and is attested with
-   predicate `https://cyclonedx.org/bom`.
-7. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
-   Build L2 or better, covers every artifact plus `release-manifest.json` and
-   the SBOM, and has verified GitHub attestation evidence.
-8. Update `quality_gates.stable_candidate_rc` in the stable manifest to point
+6. Update `quality_gates.stable_candidate_rc` in the stable manifest to point
    at the passing stable-candidate RC evidence file and the candidate manifest
    SHA-256 from the same commit.
-9. Run `macos_release_gate.sh` and `macos_stable_preflight.sh` against the exact
+7. Generate `install-macos.sh` from the exact manifest with
+   `hosted_native_installer.sh --record-sha256` and run its dry-run/static QA
+   before attestation generation, attestation binding, and manifest signing.
+8. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
+   SHA-256, is uploaded under the immutable prefix, and is attested with
+   predicate `https://cyclonedx.org/bom`.
+9. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
+   Build L2 or better, covers every artifact plus `release-manifest.json` and
+   the SBOM, and has verified GitHub attestation evidence. Bind that evidence
+   and sign the final manifest with `macos_manifest_signature.sh`.
+10. Run `macos_release_gate.sh` and
+   `macos_stable_preflight.sh --require-installer-sha256` against the exact
    manifest to publish.
-10. Generate the Homebrew tap formula from the exact manifest and run the tap QA
+11. Generate the Homebrew tap formula from the exact manifest and run the tap QA
    checklist.
-11. Generate `install-macos.sh` from the exact manifest with
-   `hosted_native_installer.sh` and run its dry-run/static QA.
 12. Upload the app, CLI, daemon archives, `release-manifest.json`, the
     CycloneDX SBOM, the Homebrew formula output, and `install-macos.sh` to the
     immutable versioned prefix.

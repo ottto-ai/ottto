@@ -14,6 +14,7 @@ require_command() {
 }
 
 require_command jq
+require_command shasum
 
 APP_SHA="3333333333333333333333333333333333333333333333333333333333333333"
 CLI_SHA="1111111111111111111111111111111111111111111111111111111111111111"
@@ -143,8 +144,13 @@ expect_generation_failure() {
 stable_manifest="$TMP_DIR/stable-manifest.json"
 write_manifest "$stable_manifest"
 
+stable_manifest_sha_before="$(shasum -a 256 "$stable_manifest" | awk '{print $1}')"
 installer="$TMP_DIR/install-macos.sh"
 "$GENERATOR" --manifest "$stable_manifest" --output "$installer" >/dev/null
+if [[ "$(shasum -a 256 "$stable_manifest" | awk '{print $1}')" != "$stable_manifest_sha_before" ]]; then
+  echo "Expected generation without --record-sha256 to leave the manifest unchanged" >&2
+  exit 1
+fi
 
 bash -n "$installer"
 assert_contains "$installer" 'Usage: install-macos.sh'
@@ -167,6 +173,49 @@ assert_not_contains "$installer" 'launchctl bootstrap'
 assert_not_contains "$installer" 'bootstrap LaunchAgent'
 assert_not_contains "$installer" 'ottto-locald'
 assert_not_contains "$installer" 'DEFAULT_BASE_URL="https://install.ottto.net/ottto-local-platform/releases/stable/latest'
+
+# --record-sha256 writes exactly the generated helper's SHA-256 into the manifest
+# and changes nothing else, so the signed manifest publishes the served file hash.
+recorded_dir="$TMP_DIR/recorded"
+mkdir -p "$recorded_dir"
+recorded_manifest="$recorded_dir/release-manifest.json"
+cp "$stable_manifest" "$recorded_manifest"
+"$GENERATOR" --manifest "$recorded_manifest" --output "$recorded_dir/install-macos.sh" --record-sha256 >/dev/null
+recorded_sha="$(jq -r '.install_methods.verified_native_installer.sha256 // empty' "$recorded_manifest")"
+served_sha="$(shasum -a 256 "$recorded_dir/install-macos.sh" | awk '{print $1}')"
+if [[ ! "$recorded_sha" =~ ^[0-9a-f]{64}$ || "$recorded_sha" != "$served_sha" ]]; then
+  echo "Expected recorded installer SHA-256 to equal the generated helper digest" >&2
+  exit 1
+fi
+if ! cmp -s "$installer" "$recorded_dir/install-macos.sh"; then
+  echo "Expected --record-sha256 to generate the same helper bytes" >&2
+  exit 1
+fi
+if [[ "$(jq -S 'del(.install_methods.verified_native_installer.sha256)' "$recorded_manifest")" != "$(jq -S . "$stable_manifest")" ]]; then
+  echo "Expected --record-sha256 to change only install_methods.verified_native_installer.sha256" >&2
+  exit 1
+fi
+if [[ -e "$recorded_manifest.next" ]]; then
+  echo "Expected --record-sha256 to leave no temporary manifest behind" >&2
+  exit 1
+fi
+# Regenerating from the recorded manifest yields the same helper, so the hash is stable.
+"$GENERATOR" --manifest "$recorded_manifest" --output "$recorded_dir/install-macos.sh" --record-sha256 >/dev/null
+if [[ "$(jq -r '.install_methods.verified_native_installer.sha256' "$recorded_manifest")" != "$served_sha" ]]; then
+  echo "Expected regenerating the helper to keep the recorded SHA-256 stable" >&2
+  exit 1
+fi
+
+renamed_output_manifest="$TMP_DIR/renamed-output-manifest.json"
+cp "$stable_manifest" "$renamed_output_manifest"
+if "$GENERATOR" --manifest "$renamed_output_manifest" --output "$TMP_DIR/other-name.sh" --record-sha256 >/dev/null 2>&1; then
+  echo "Expected --record-sha256 to refuse an output that the manifest does not name" >&2
+  exit 1
+fi
+if ! cmp -s "$renamed_output_manifest" "$stable_manifest"; then
+  echo "Expected a refused --record-sha256 run to leave the manifest unchanged" >&2
+  exit 1
+fi
 
 pkg_manifest="$TMP_DIR/pkg-manifest.json"
 write_manifest "$pkg_manifest" stable "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/Ottto-macos-arm64.pkg"

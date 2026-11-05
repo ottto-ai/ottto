@@ -824,6 +824,41 @@ impl ApcFixture {
         panic!("the generation ends within {APC_MAX_PAGES} bounded pages");
     }
 
+    /// Stop at a shed correction offer; completion is required after recovery.
+    fn shed_until(
+        &self,
+        hour: u32,
+        first: ApcUpload,
+        target: Option<&str>,
+        owed: &BTreeSet<String>,
+    ) -> Vec<ApcPage> {
+        let mut pages = Vec::new();
+        for number in 0..APC_MAX_PAGES {
+            let mode = if number == 0 { first } else { ApcUpload::Shed };
+            let page = self.page(&format!("2026-08-02T{hour:02}:{number:02}:00Z"), mode);
+            self.assert_durable(&page, hour);
+            if mode != ApcUpload::Crash {
+                assert!(
+                    page.index.scan_traversal_in_progress_for_test()
+                        || (page.index.bounded_sweep_had_unsettled_upload()
+                            && !page.scan.census_complete)
+                );
+            }
+            assert_eq!(&page.record().unwrap().correction.unwrap().1, owed);
+            let offered = page.shed
+                && page.offered_bodies.iter().any(|(member, (fp, _))| {
+                    owed.contains(member)
+                        && target.map_or(true, |target| member == target)
+                        && page.offered.contains(fp)
+                });
+            pages.push(page);
+            if offered {
+                return pages;
+            }
+        }
+        panic!("the targeted correction is offered within {APC_MAX_PAGES} pages");
+    }
+
     /// Every save reloads with the family intact: never a quarantined index.
     fn assert_durable(&self, page: &ApcPage, hour: u32) {
         assert_eq!(
@@ -1419,13 +1454,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-shed", false);
     let (_, grant) = fixture.reach_grant();
-    let pages = fixture.generation(grant.hour + 1, |number| {
-        if number == 0 {
-            ApcUpload::Crash
-        } else {
-            ApcUpload::Shed
-        }
-    });
+    let pages = fixture.shed_until(grant.hour + 1, ApcUpload::Crash, None, &grant.owed);
     assert_eq!(pages[0].upload, ApcUpload::Crash);
     let mut offered_owed = BTreeSet::new();
     let mut noop_drained = BTreeSet::new();
@@ -1544,7 +1573,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
     let (_, grant) = fixture.reach_grant();
-    let shed = fixture.generation(grant.hour + 1, |_| ApcUpload::Shed);
+    let shed = fixture.shed_until(grant.hour + 1, ApcUpload::Shed, None, &grant.owed);
     // The first owed member whose corrected body was offered and shed.
     let (member, stale_page) = shed
         .iter()
@@ -1574,7 +1603,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 
     // The new revision's body is offered and shed too, so neither body is
     // accepted when the late ACK of the old one arrives.
-    let current = fixture.generation(grant.hour + 2, |_| ApcUpload::Shed);
+    let current = fixture.shed_until(grant.hour + 2, ApcUpload::Shed, Some(&member), &grant.owed);
     let reparsed = current
         .iter()
         .find(|page| page.parsed.contains(&member))
