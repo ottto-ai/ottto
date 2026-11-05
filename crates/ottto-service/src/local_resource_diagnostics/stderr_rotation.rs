@@ -6,7 +6,9 @@
 //! directory and a fresh file at the original path takes over fd 2. Archives
 //! of exactly that pattern older than [`KEEP_FOR`] are then deleted, except
 //! the newest [`KEEP_NEWEST`]. A terminal, `/dev/null` or pipe on fd 2 is left
-//! alone, and every failure keeps stderr as it was.
+//! alone. A failure before the rename keeps stderr as it was; if the reopen
+//! fails after the rename, stderr keeps writing to the archive until the next
+//! start and pruning is skipped. Nothing is lost.
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -56,7 +58,7 @@ fn rotate(fd: RawFd, now: OffsetDateTime) {
         _ => return,
     }
     if let Err(error) = rotate_and_prune(fd, &live, &metadata, now) {
-        eprintln!("service log rotation skipped: {error}");
+        eprintln!("service log rotation/prune: {error}");
     }
 }
 
@@ -101,8 +103,14 @@ fn rotate_and_prune(
         })
         .collect();
     let ends: Vec<OffsetDateTime> = archives.iter().map(|(_, end)| *end).collect();
-    for index in archives_to_delete(now, &ends) {
-        std::fs::remove_file(&archives[index].0)?;
+    let failed = archives_to_delete(now, &ends)
+        .into_iter()
+        .filter(|&index| std::fs::remove_file(&archives[index].0).is_err())
+        .count();
+    if failed > 0 {
+        return Err(std::io::Error::other(format!(
+            "{failed} old archives not deleted"
+        )));
     }
     Ok(())
 }
