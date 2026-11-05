@@ -2,22 +2,132 @@
 //! account-deferred sessions), the family authority record checks, the
 //! accepted-body checks and the request-census shadow counts.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use crate::snapshots::claude_context_file_birth::ClaudeFileBirthVerdict;
+use crate::snapshots::scan_index::file_set_digest::update_length_prefixed;
 use crate::snapshots::wire::SnapshotItem;
 use crate::snapshots::{
-    claude_authority_record_contract_is_valid, claude_snapshot_family_root,
-    claude_usage_family_witness_fingerprint, usage_totals_from_item,
-    ClaudeUsageAuthorityDisposition, ClaudeUsageAuthorityQuarantineDisposition,
+    claude_authority_record_contract_is_valid, claude_request_accounts, claude_request_identity,
+    claude_snapshot_family_root, usage_totals_from_item, ClaudeContextFileBirthCounts,
+    ClaudeTranscriptUsageOccurrence, ClaudeUsageAuthorityQuarantineDisposition,
     ClaudeUsageAuthorityQuarantineRecord, ClaudeUsageFamilyWitness, ScanIndex, ScanIndexEntry,
-    CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+    SourceScanResult, CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
     SNAPSHOT_ACCEPTED_LEDGER_VERSION,
 };
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeUsageAuthorityDisposition {
+    /// Local counters for how this fold's Claude scalars were decided.
+    pub(crate) context_file_birth: ClaudeContextFileBirthCounts,
+    pub(in crate::snapshots) quarantined_source_session_ids: BTreeSet<String>,
+    /// The account-deferred subset of `quarantined_source_session_ids`. Upload
+    /// retention still uses the union; this only classifies settlement.
+    pub(in crate::snapshots) account_deferred_source_session_ids: BTreeSet<String>,
+    /// Fixed-label `e2` emission veto counts for this page. Diagnostic only;
+    /// never serialized, persisted, or used to decide upload eligibility.
+    pub(crate) request_owned_hold_reasons: BTreeMap<&'static str, u64>,
+    pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
+    /// Contract-5 only: each rebuilt item's requests, classified and folded
+    /// into bounded row x authority-key groups during the rebuild.
+    pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// Copy-derived rows (#944): the accepted rows this
+    /// pass's bodies treat as never accepted. The sync loop tombstones them
+    /// through `AcceptedBuckets` and saves before any upload.
+    pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,
+    /// Why each folded item kept or lost its Claude posture scalars. Kept for
+    /// tests only: never built in a release fold, never serialized, and never
+    /// an index, account, identity, audit or upload input.
+    #[cfg(test)]
+    pub(crate) posture_admissions: BTreeMap<String, ClaudePostureAdmission>,
+}
+
+pub(in crate::snapshots) fn claude_usage_family_witness_fingerprint(
+    witness: &ClaudeUsageFamilyWitness,
+) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"ottto:claude-usage-family-durable-witness:v1");
+    update_length_prefixed(&mut digest, witness.evidence_fingerprint.as_bytes());
+    update_length_prefixed(&mut digest, b"member_request_id_fingerprints");
+    for (member, fingerprint) in &witness.member_request_id_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"member_occurrence_fingerprints");
+    for (member, fingerprint) in &witness.member_occurrence_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"assigned_request_id_fingerprints");
+    for (member, fingerprint) in &witness.assigned_request_id_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"legacy_excluded_request_id_hashes");
+    for (member, excluded) in &witness.legacy_excluded_request_id_hashes {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        for request_hash in excluded {
+            update_length_prefixed(&mut digest, request_hash.as_bytes());
+        }
+    }
+    update_length_prefixed(&mut digest, b"legacy_exclusion_evidence_fingerprint");
+    update_length_prefixed(
+        &mut digest,
+        witness
+            .legacy_exclusion_evidence_fingerprint
+            .as_deref()
+            .unwrap_or("none")
+            .as_bytes(),
+    );
+    update_length_prefixed(&mut digest, b"legacy_owner_roots");
+    for root in &witness.legacy_owner_roots {
+        update_length_prefixed(&mut digest, root.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::snapshots) struct ClaudeTranscriptUsageOccurrenceWitness {
+    #[serde(default)]
+    pub(in crate::snapshots) sequence: u64,
+    pub(in crate::snapshots) input_tokens: u64,
+    pub(in crate::snapshots) output_tokens: u64,
+    pub(in crate::snapshots) cache_read_tokens: u64,
+    pub(in crate::snapshots) cache_creation_5m_tokens: u64,
+    pub(in crate::snapshots) cache_creation_1h_tokens: u64,
+    pub(in crate::snapshots) reasoning_output_tokens: u64,
+    pub(in crate::snapshots) model: Option<String>,
+    pub(in crate::snapshots) speed_mode: Option<String>,
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+}
+
+impl From<&ClaudeTranscriptUsageOccurrence> for ClaudeTranscriptUsageOccurrenceWitness {
+    fn from(occurrence: &ClaudeTranscriptUsageOccurrence) -> Self {
+        Self {
+            sequence: occurrence.sequence,
+            input_tokens: occurrence.usage.input_tokens,
+            output_tokens: occurrence.usage.output_tokens,
+            cache_read_tokens: occurrence.usage.cache_read_tokens,
+            cache_creation_5m_tokens: occurrence.usage.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: occurrence.usage.cache_creation_1h_tokens,
+            reasoning_output_tokens: occurrence.usage.reasoning_output_tokens,
+            model: occurrence.model.clone(),
+            speed_mode: occurrence.selector.context.get("speed_mode").cloned(),
+            reasoning_effort: occurrence.reasoning_effort.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::snapshots) struct ProvenClaudeUsageFamily {
+    pub(in crate::snapshots) witness: ClaudeUsageFamilyWitness,
+    pub(in crate::snapshots) rows_by_member:
+        BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+}
 
 /// Test-only, content-free copy of one family authority record and its
 /// binding to the retained witness.
@@ -371,3 +481,42 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub json_bytes: usize,
     pub heap_bytes: usize,
 }
+
+impl ScanIndex {
+    pub(crate) fn claude_usage_authority_pending_count(&self) -> usize {
+        self.claude_usage_authority_quarantine
+            .values()
+            .filter(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            })
+            .count()
+    }
+
+    pub(crate) fn claude_usage_authority_terminal_entity_count(&self) -> usize {
+        self.claude_usage_authority_quarantine
+            .values()
+            .filter(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            })
+            .map(|record| record.member_source_file_fingerprints.len())
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    pub(crate) fn account_claude_usage_authority_census_health(
+        &self,
+        scan_result: &mut SourceScanResult,
+    ) -> bool {
+        let terminal_entity_count = self.claude_usage_authority_terminal_entity_count();
+        scan_result.ownership_incomplete_file_count = scan_result
+            .ownership_incomplete_file_count
+            .saturating_add(terminal_entity_count);
+        scan_result.terminal_ownership_incomplete_file_count = scan_result
+            .terminal_ownership_incomplete_file_count
+            .saturating_add(terminal_entity_count);
+        self.claude_usage_authority_pending_count() > 0
+    }
+}
+
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
+crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
