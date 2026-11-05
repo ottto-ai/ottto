@@ -484,9 +484,9 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     );
     assert!(progress.accepted_body_witnesses.is_empty());
     let parts = [
-        json!(&item.session_account_evidence),
-        json!((&item.tool_usage, item.tool_usage_truncated)),
-        json!((&item.cache_observations, &item.cache_observations_state)),
+        serde_json::json!(&item.session_account_evidence),
+        serde_json::json!((&item.tool_usage, item.tool_usage_truncated)),
+        serde_json::json!((&item.cache_observations, &item.cache_observations_state)),
     ]
     .map(|part| {
         use sha2::Digest;
