@@ -77,7 +77,7 @@ new_case() {
 pr_json() {
   jq -n --arg s "$2" --argjson d "$3" --arg h "$4" --arg m "$5" --arg fork "${6:-}" \
     '{id: "PR_node7", state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
-      baseRefName: "main", headRefName: "feature",
+      title: "fix: a change", baseRefName: "main", headRefName: "feature",
       isCrossRepository: ($fork != ""),
       headRepository: {name: "repo"},
       headRepositoryOwner: {login: (if $fork == "" then "example" else $fork end)}}' \
@@ -155,6 +155,7 @@ run_guard() {
   local expected="$1" status=0
   shift
   MERGE_GUARD_TEST_DIR="$case_dir" PATH="$FAKE_BIN:$PATH" \
+    OTTTO_PR_TITLE_DENY_FILE="${DENY_FILE:-$TMP_DIR/no-title-deny-file}" \
     bash "$GUARD" "$@" > "$case_dir/out" 2>&1 || status=$?
   if [ "$status" -ne "$expected" ]; then
     fail "exit $status, expected $expected; output:"
@@ -296,6 +297,29 @@ run_guard 3 7
 expect_output 'no merge queue on main'
 expect_no_log 'gh pr ready'
 expect_no_log 'check-runs'
+
+# A title that matches the local deny list is refused before anything else
+# happens, and the message does not print the list.
+green_case denied-title-refused
+jq '.title = "fix: a change (TAG1)"' "$case_dir/pr" > "$case_dir/pr.next"
+mv "$case_dir/pr.next" "$case_dir/pr"
+DENY_FILE="$case_dir/deny.ere"
+printf '# internal tags\n\n\\(TAG[0-9]\\)\n' > "$DENY_FILE"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+if grep -F -q 'TAG[0-9]' "$case_dir/out"; then
+  fail "output prints the deny pattern"
+fi
+expect_no_log 'gh pr ready'
+expect_no_log 'check-runs'
+expect_no_log 'gh enqueue'
+
+# Comment and blank lines never match: a clean title passes the same list.
+green_case clean-title-with-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+unset DENY_FILE
 
 new_case usage-errors
 run_guard 2

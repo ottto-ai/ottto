@@ -18,7 +18,10 @@ MIN_INTERVAL=60
 # Two hours: a queued PR waits for its PR checks and then a full queue round
 # (Mac slot wait plus the Mac job) inside one shared budget.
 DEFAULT_TIMEOUT=7200
-PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
+PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner,title"
+# Optional local list of extended regexes, one per line, that a PR title must
+# not match (the title becomes the squash subject on the base branch).
+TITLE_DENY_FILE="${OTTTO_PR_TITLE_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ottto/pr-title-deny.ere}"
 
 EXIT_USAGE=2
 EXIT_REFUSED=3
@@ -61,11 +64,17 @@ Options:
   --interval  seconds between polls (default 60, minimum 60)
   --timeout   total seconds to wait before giving up (default 7200)
 
+Environment:
+  OTTTO_PR_TITLE_DENY_FILE  extended regexes, one per line, that the PR title
+                            must not match; default
+                            ${XDG_CONFIG_HOME:-~/.config}/ottto/pr-title-deny.ere.
+                            No file means no title check.
+
 Exit codes:
   0  merged
   2  usage error or missing tool
-  3  refused: PR is not open, has merge conflicts (CONFLICTING), or the base
-     branch has no merge queue
+  3  refused: PR is not open, has merge conflicts (CONFLICTING), its title
+     matches the title deny list, or the base branch has no merge queue
   4  a required check finished without success, or PR removed from merge queue
   5  the PR head changed while waiting; rerun for the new head
   6  timed out waiting for required checks or the merge queue
@@ -157,6 +166,17 @@ refuse_unmergeable() {
   [ "$state" = OPEN ] || die "$EXIT_REFUSED" "PR #$pr is $state, not OPEN"
   if [ "$mergeable" = CONFLICTING ]; then
     die "$EXIT_REFUSED" "PR #$pr has merge conflicts (CONFLICTING); GitHub starts no pull-request run for it. Rebase onto the base branch, regenerate generated files, push, and rerun."
+  fi
+}
+
+# The title is the squash subject: refuse one that matches the local deny list.
+# The message names no pattern, so the list itself is never printed.
+refuse_denied_title() {
+  [ -s "$TITLE_DENY_FILE" ] || return 0
+  # Blank and comment lines are dropped: an empty pattern would match any title.
+  if pr_field title \
+    | grep -Eq -f <(grep -Ev '^[[:space:]]*(#|$)' "$TITLE_DENY_FILE"); then
+    die "$EXIT_REFUSED" "PR #$pr title matches the title deny list ($TITLE_DENY_FILE); edit the title and rerun"
   fi
 }
 
@@ -350,6 +370,7 @@ wait_for_queue() {
 
 read_pr
 refuse_unmergeable
+refuse_denied_title
 base="$(pr_field baseRefName)"
 base_path="$(printf '%s' "$base" | jq -sRr @uri)"
 rules="$(gh api "repos/{owner}/{repo}/rules/branches/$base_path")" \

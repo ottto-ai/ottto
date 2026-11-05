@@ -84,6 +84,10 @@
   exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
   checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
   not evidence, and no Linux job stands in for the macOS `Rust contracts` job.
+- The PR title becomes the squash subject on `main`: keep it a plain
+  conventional title with no internal tracking tags. The guard refuses a title
+  that matches the local deny list in `OTTTO_PR_TITLE_DENY_FILE` (default
+  `~/.config/ottto/pr-title-deny.ere`) when that file exists.
 - `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
 - The author merges its own reviewed, green, mergeable PR; no merge window, slot
   or extra approval is needed. Wait only for a real dependency or conflict, an
