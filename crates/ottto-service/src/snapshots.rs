@@ -3776,10 +3776,11 @@ fn claude_index_path_family_member(path: &Path) -> Option<(String, String)> {
     Some(claude_index_path_member_ref(path)?.into_owned())
 }
 
+#[cfg(test)]
+use sources::claude::account::evidence::claude_account_evidence_covers_snapshot;
 use sources::claude::account::evidence::{
-    apply_claude_account_evidence, claude_account_evidence_covers_snapshot,
-    exact_session_account_hash, set_claude_account_hash, set_session_account_hash,
-    veto_claude_original_identity,
+    apply_claude_account_evidence, exact_session_account_hash, set_claude_account_hash,
+    set_session_account_hash, veto_claude_original_identity,
 };
 
 /// After an account owner retags rows. `e2` (gate on): the fold holds the
