@@ -249,6 +249,7 @@ collection authority.
 Current locked commands:
 
 ```bash
+ottto --version # -V also prints the release version without contacting the daemon
 ottto status --json
 ottto status --json --watch
 ottto receipts --json
