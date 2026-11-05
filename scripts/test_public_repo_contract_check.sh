@@ -2155,5 +2155,34 @@ fi
 grep -q "private backend registry loader must read root connectors/registry.generated.json" /tmp/public-contract-broken-private.out
 grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
 
+# [behaviour] Stable skeleton requirements survive without the export gates.
+for relative in Cargo.lock crates/Cargo.lock release/manifest.schema.json \
+  agent-adapters/codex-skill/agents/openai.yaml; do
+  mv "$output_dir/$relative" "$tmp_dir/required-file"
+  if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/required.out" 2>&1; then
+    echo "Expected missing stable public file to fail contracts" >&2
+    exit 1
+  fi
+  grep -Fq "required file is missing: $relative" "$tmp_dir/required.out"
+  mv "$tmp_dir/required-file" "$output_dir/$relative"
+done
+for manifest in Cargo.toml crates/Cargo.toml; do
+  cp "$output_dir/$manifest" "$tmp_dir/workspace.toml"
+  sed '/^\[workspace\]$/d' "$tmp_dir/workspace.toml" > "$output_dir/$manifest"
+  if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/workspace.out" 2>&1; then
+    echo "Expected missing workspace declaration to fail contracts" >&2
+    exit 1
+  fi
+  grep -q 'Rust workspace: pattern not found' "$tmp_dir/workspace.out"
+  cp "$tmp_dir/workspace.toml" "$output_dir/$manifest"
+done
+chmod -x "$output_dir/scripts/public_repo_manifest.sh"
+if "$CONTRACT_SCRIPT" --staged-output "$output_dir" >"$tmp_dir/executable.out" 2>&1; then
+  echo "Expected missing executable permission to fail contracts" >&2
+  exit 1
+fi
+grep -q 'required executable is not executable: scripts/public_repo_manifest.sh' "$tmp_dir/executable.out"
+chmod +x "$output_dir/scripts/public_repo_manifest.sh"
+
 echo "public_repo_contract_check tests passed"
 script_completed=1
