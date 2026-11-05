@@ -376,7 +376,11 @@ fn positive_placement_matches_one_home() {
         for agent in 0..3 {
             let text = std::fs::read_to_string(c.root.join(member("a", agent))).unwrap();
             let text = if agent == 0 {
-                text + &line(ROOT, "old-copy", AT, 6) + &line(ROOT, "copy-own", GROW, 13)
+                // A kept pre-boundary copy has no own login row before it, so it
+                // takes the session's starting account, as z's kept "old" does.
+                let (fork, rest) = text.split_once('\n').unwrap();
+                format!("{fork}\n{}{rest}", line(ROOT, "old-copy", AT, 6))
+                    + &line(ROOT, "copy-own", GROW, 13)
             } else {
                 text
             };
