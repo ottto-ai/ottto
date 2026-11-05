@@ -4,4 +4,5 @@
 
 pub(super) mod json_fields;
 pub(super) mod limits;
+pub(super) mod lines;
 pub(super) mod source_session_id;

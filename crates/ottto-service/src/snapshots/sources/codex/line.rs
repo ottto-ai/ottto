@@ -4,9 +4,13 @@
 
 use serde_json::Value;
 
+use crate::snapshots::cache_observations::{self, OwnedRequest};
 use crate::snapshots::scan::json_fields::{string_at, u64_at};
 use crate::snapshots::scan_index::file_set_digest::sha256_hex;
-use crate::snapshots::{raw_value_at, usage_object_has_numeric_field, UsageCosts, UsageTotals};
+use crate::snapshots::{
+    raw_value_at, timestamp_is_after, usage_object_has_numeric_field, SnapshotAccumulator,
+    UsageCosts, UsageTotals,
+};
 
 pub(in crate::snapshots) fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
     let root = value
@@ -159,4 +163,36 @@ pub(in crate::snapshots) fn codex_total_usage_has_request_count(value: &Value) -
     u64_at(root, &["request_count"])
         .or_else(|| u64_at(root, &["requests"]))
         .is_some()
+}
+
+pub(in crate::snapshots) fn codex_cache_request(
+    value: &Value,
+    accumulator: &SnapshotAccumulator,
+) -> Option<OwnedRequest> {
+    let slot = cache_observations::codex_slot(
+        value,
+        accumulator.latest_model.clone(),
+        accumulator.latest_reasoning_effort.clone(),
+    )?;
+    let compaction_before = accumulator
+        .compaction_timestamps
+        .last()
+        .is_some_and(|timestamp| {
+            accumulator.cache_requests.last().map_or(true, |prior| {
+                timestamp_is_after(timestamp, &prior.slot.occurred_at)
+            })
+        });
+    Some(OwnedRequest {
+        slot,
+        ordering: if accumulator.cache_active_turns.len() > 1 {
+            "ambiguous"
+        } else {
+            "sequential"
+        }
+        .into(),
+        compaction_before,
+        configuration_changed: false,
+        configuration_witness: accumulator.cache_configuration_witness.clone(),
+        idle_seconds: accumulator.cache_pending_idle,
+    })
 }

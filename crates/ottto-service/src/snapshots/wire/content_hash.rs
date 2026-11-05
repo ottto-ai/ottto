@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::{SnapshotItem, SnapshotSemanticEnvelope, SnapshotSource};
+use crate::snapshots::usage::cache_observations::cache_state_from_patch;
 use crate::snapshots::{
     claude_request_identity, semantic_attribution, semantic_model_usage, semantic_usage_buckets,
-    sha256_hex, snapshot_upload_body_witness_payload, SnapshotUploadPolicy,
-    POLICY_NEUTRAL_COMPONENTS, SNAPSHOT_CONTENT_HASH_EPOCH, SNAPSHOT_REVISION_CONTRACT_VERSION,
-    SNAPSHOT_REVISION_V2_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    sha256_hex, SnapshotUploadPolicy, POLICY_NEUTRAL_COMPONENTS, SNAPSHOT_CONTENT_HASH_EPOCH,
+    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
+    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 
 pub(crate) fn snapshot_semantic_component_hashes(
@@ -204,6 +205,48 @@ pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Optio
         });
     }
     None
+}
+
+pub(in crate::snapshots) fn snapshot_upload_body_witness_payload(
+    item: &SnapshotItem,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    if let Some(evidence) = &item.session_account_evidence {
+        payload.insert("session_account_evidence".to_string(), json!(evidence));
+    }
+    if let Some(observations) = &item.cache_observations {
+        payload.insert(
+            "cache_observations_state".into(),
+            item.cache_observations_state.clone().unwrap_or_else(|| {
+                cache_state_from_patch(None, observations).expect("no accepted rows to parse")
+            }),
+        );
+    }
+    // Legacy tool witnesses include both defaults whenever either tool leaf
+    // is declared. Creator/cache domains retain wire presence.
+    if payload.is_empty() && (item.tool_usage.is_some() || item.tool_usage_truncated) {
+        payload.insert(
+            "tool_usage".into(),
+            json!(item.tool_usage.as_deref().unwrap_or(&[])),
+        );
+        payload.insert(
+            "tool_usage_truncated".into(),
+            json!(item.tool_usage_truncated),
+        );
+        return Value::Object(payload);
+    }
+    // Mirror wire declaration exactly. Serde omits `None` and false; backend
+    // witnesses include only fields actually declared in the accepted item.
+    if let Some(tool_usage) = &item.tool_usage {
+        payload.insert("tool_usage".to_string(), json!(tool_usage));
+    }
+    if item.tool_usage_truncated {
+        payload.insert(
+            "tool_usage_truncated".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    serde_json::Value::Object(payload)
 }
 
 /// RFC 8785 SHA-256 digest of additive snapshot-body evidence.
@@ -401,5 +444,21 @@ pub(crate) fn snapshot_semantic_envelope(
         rescan_from_revision_hash,
         forced_full_rescan,
         component_hashes,
+    }
+}
+
+impl SnapshotItem {
+    /// Envelope head-CAS fields: (base, challenge, refused revision, forced).
+    /// The backend refuses a base token combined with a challenge; the answer
+    /// replaces the stale base rather than adding to it.
+    pub(in crate::snapshots) fn cache_handshake(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>, bool) {
+        match &self.cache_conflict_answer {
+            Some((challenge, revision)) => {
+                (None, Some(challenge.clone()), Some(revision.clone()), true)
+            }
+            None => (self.cache_base_head_etag.clone(), None, None, false),
+        }
     }
 }

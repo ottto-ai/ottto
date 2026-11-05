@@ -1,7 +1,6 @@
 //! Session display titles: normalization of explicit and first-prompt titles,
 //! and the filters that keep identifiers, commands and setup text out of them.
 
-use crate::snapshots::first_prompt_title;
 use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped;
 use crate::snapshots::wire::SnapshotSource;
 
@@ -31,6 +30,44 @@ pub(crate) fn claude_registration_display_title(value: String) -> Option<String>
 /// shared first-prompt rule without the full-prompt role rewrite and size gate.
 pub(crate) fn prompt_prefix_display_title(value: String) -> Option<String> {
     first_prompt_title(SnapshotSource::Codex, &value, false)
+}
+
+pub(in crate::snapshots) fn first_prompt_display_title(
+    source: SnapshotSource,
+    value: String,
+) -> Option<String> {
+    first_prompt_title(source, &value, true)
+}
+
+/// The one first-prompt title rule. `full_prompt` adds the Codex role rewrite
+/// and the 80-char / 12-word gate that only a whole first message needs.
+fn first_prompt_title(source: SnapshotSource, value: &str, full_prompt: bool) -> Option<String> {
+    let raw = value.trim();
+    if raw.is_empty()
+        || contains_blocked_prompt_fragment(raw)
+        || looks_like_resume_boilerplate(&raw.to_ascii_lowercase())
+    {
+        return None;
+    }
+    if full_prompt && source == SnapshotSource::Codex {
+        if let Some(role_title) = agent_role_prompt_display_title(raw) {
+            return Some(role_title);
+        }
+    }
+    let first_line = raw.lines().find_map(|line| {
+        let trimmed = line
+            .trim()
+            .trim_start_matches(['#', '-', '*', '>', ' '])
+            .trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })?;
+    let normalized = normalize_title(first_line.to_string())?;
+    if full_prompt
+        && (normalized.chars().count() > 80 || normalized.split_whitespace().count() > 12)
+    {
+        return None;
+    }
+    normalize_display_title(normalized, "first_prompt")
 }
 
 pub(in crate::snapshots) fn agent_role_prompt_display_title(raw: &str) -> Option<String> {
