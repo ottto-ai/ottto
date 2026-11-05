@@ -331,19 +331,41 @@ fn publication_pending_pause_does_not_touch_v1() {
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
 
-/// [behaviour] a load naming its support dir imports v1 and publishes custody.
+/// [behaviour] a support-dir load imports v1 or a missing root and publishes custody.
 #[test]
 fn support_dir_load_imports_and_publishes() {
+    use crate::snapshots::{ScanIndexLoadOrigin, SnapshotSource};
+    let source = SnapshotSource::ClaudeCode;
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    let index = ScanIndex::load_for_snapshot_source(
-        &f.path,
-        crate::snapshots::SnapshotSource::ClaudeCode,
-        &f.support,
-    )
-    .unwrap();
+    let index = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(published(&f.path).unwrap());
+    assert_eq!(
+        index.generation, 1,
+        "present originals still advance on import"
+    );
+
+    let f = Fixture::new();
+    let (index, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Missing);
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
+    let (mut reopened, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&reopened));
+    assert_eq!(reopened.generation, index.generation);
+    assert_eq!(
+        reopened.accepted_snapshot_fingerprints,
+        index.accepted_snapshot_fingerprints
+    );
+    assert!(save_with(&f.path, &mut reopened).unwrap());
+    let (saved, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert!(saved.files.is_empty() && saved.generation >= 1);
+    assert!(!origin.is_fresh(&saved));
 }
 
 /// [format] absent parent containment guard never promotes a database.

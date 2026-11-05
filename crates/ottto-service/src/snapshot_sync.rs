@@ -20426,8 +20426,9 @@ mod tests {
         let requests = captured.lock().expect("captured requests").clone();
         assert!(!requests[1].contains("\"manifest\""));
 
+        let scratch = crate::test_scratch::ScratchDir::new("scan-manifest-index");
         let mut index =
-            ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
+            ScanIndex::load(&scratch.join("scan-index.json")).expect("empty scan index");
         index.file_snapshot_fingerprints.insert(
             "/tmp/rollout-session-1.jsonl".to_string(),
             BTreeSet::from(["a".repeat(64)]),

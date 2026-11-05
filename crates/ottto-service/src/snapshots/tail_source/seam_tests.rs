@@ -99,7 +99,7 @@ pub(in crate::snapshots::tail_source) fn load<S: TailSource>(
 
 /// A state database route in a fresh directory.
 pub(in crate::snapshots::tail_source) struct Route {
-    _session: ColdSession,
+    pub(in crate::snapshots::tail_source) _session: Option<ColdSession>,
     pub(in crate::snapshots::tail_source) dir: PathBuf,
     pub(in crate::snapshots::tail_source) path: PathBuf,
     pub(in crate::snapshots::tail_source) index: ScanIndex,
@@ -122,7 +122,7 @@ pub(in crate::snapshots::tail_source) fn route_for(source: Source) -> Route {
     let (session, index) = ColdSession::publish(source, &ScanIndex::default(), &dir);
     Route {
         path: session.path().to_owned(),
-        _session: session,
+        _session: Some(session),
         dir,
         index,
     }
@@ -395,4 +395,12 @@ fn an_append_restates_only_the_open_pages() {
     let stored = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
     Claude::validate_loaded(&acc, &stored).unwrap();
     assert_eq!(acc.claude_responses.values().len(), 301);
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        if self._session.is_none() {
+            state_v2::money_test_support::erase_published(&self.path);
+        }
+    }
 }

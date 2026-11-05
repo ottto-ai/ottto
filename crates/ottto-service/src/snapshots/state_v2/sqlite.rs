@@ -1605,10 +1605,13 @@ impl Txn<'_> {
             ensure!(
                 self.write
                     && !self.failed
-                    && next
-                        == expected
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?,
+                    // Only an unpublished empty import may initialize G=0.
+                    // Every commit to a published store must advance its CAS.
+                    && ((self.store.import && expected == 0 && next == 0)
+                        || next
+                            == expected
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?),
                 "state_v2_generation_order"
             );
             let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
