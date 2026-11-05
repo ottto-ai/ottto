@@ -11564,6 +11564,11 @@ pub(crate) fn source_marker(support_dir: &Path, source: SnapshotSource) -> Optio
     }
 }
 
+/// This source alone is paused: a marker that is not already resuming.
+pub(crate) fn source_paused(support_dir: &Path, source: SnapshotSource) -> bool {
+    source_marker(support_dir, source).is_some_and(|marker| marker != "reconnect")
+}
+
 fn write_source_marker(path: &Path, state: &str) -> Result<()> {
     ottto_core::write_owner_only_file_atomic(path, state.as_bytes())?;
     sync_progress_parent(path)

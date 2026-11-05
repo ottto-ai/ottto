@@ -2288,6 +2288,8 @@ fn status_from_state_with_relay_finding(
         let source = snapshot_sync::snapshot_source_of_kind(&health.source);
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
+        // Read here only; row builders leave it false, so no row goes stale.
+        health.source_paused = snapshot_sync::source_paused(&default_support_dir(), source);
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
@@ -3865,6 +3867,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         connected_at: state.first_seen(&source),
         telemetry_configured: telemetry_configured_for_source(&source),
         reconciliation_enabled: state.reconciliation_enabled(&source),
+        source_paused: false,
     }
 }
 
@@ -4273,6 +4276,7 @@ fn source_health_from_verification(
         connected_at: state.first_seen(&result.source),
         telemetry_configured: telemetry_configured_for_source(&result.source),
         reconciliation_enabled: state.reconciliation_enabled(&result.source),
+        source_paused: false,
     }
 }
 
@@ -4774,6 +4778,7 @@ fn source_health_from_agent_status(
         connected_at: state.first_seen(&snapshot.source),
         telemetry_configured: telemetry_configured_for_source(&snapshot.source),
         reconciliation_enabled: state.reconciliation_enabled(&snapshot.source),
+        source_paused: false,
     }
 }
 
@@ -9011,6 +9016,7 @@ mod tests {
             connected_at: Some("2026-05-05T09:00:00Z".to_string()),
             telemetry_configured: Some(true),
             reconciliation_enabled: Some(true),
+            source_paused: false,
         }
     }
 

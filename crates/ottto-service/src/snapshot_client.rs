@@ -3110,6 +3110,12 @@ impl SnapshotApiClient {
         self.upload_local_health(relay_token, "projection", request)
     }
 
+    /// Saves one source's pause/resume; replies with the heartbeat's
+    /// `source_control` block.
+    pub fn upload_source_control(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        self.upload_local_health(relay_token, "source-control", request)
+    }
+
     /// POST to `/api/v1/apps/health/{kind}` with the relay token.
     fn upload_local_health(
         &self,

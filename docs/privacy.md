@@ -367,6 +367,9 @@ durable state in `snapshots`, caches, context composition state, backfill state 
 upload receipts all stay. Turning a source back on resumes from that kept state and
 continues forward: data uploaded before the source was turned off stays on the
 server, so nothing already sent is sent again.
+Pause in the Ottto app stops that source on this Mac before it saves the pause to
+your account, so a pause that cannot be saved still stops collection; Resume
+collects again only after your account saves it.
 
 **Forget installation** clears the installation identity and credentials only; all
 collected local data stays.

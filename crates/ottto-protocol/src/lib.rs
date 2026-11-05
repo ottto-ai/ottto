@@ -754,6 +754,11 @@ pub struct SourceHealth {
     /// "managed by workspace" state) and for daemons that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_enabled: Option<bool>,
+    /// This source alone is paused on this Mac (Pause, or the web's per-source
+    /// off), as opposed to the machine-wide collection switch. Always sent;
+    /// absent only from daemons that predate per-source pause.
+    #[serde(default)]
+    pub source_paused: bool,
 }
 
 /// Bounded machine-local status from the latest completed incremental
@@ -4404,6 +4409,13 @@ pub enum LocalControlCommand {
         action_type: String,
         api_base_url: Option<String>,
     },
+    /// Pause (`enabled: false`) or resume one source's collection on this
+    /// Mac and save it to the account. Replies
+    /// `{source, source_paused, server_saved}`.
+    SourceCollection {
+        source: SourceKind,
+        enabled: bool,
+    },
     TelemetryControl {
         action: TelemetryControlAction,
         source: SourceKind,
@@ -5327,6 +5339,25 @@ mod tests {
                 action_type: "install_source".to_string(),
                 api_base_url: None,
             }
+        );
+    }
+
+    /// [format] The Companion's Pause/Resume command: exact wire JSON.
+    #[test]
+    fn source_collection_command_wire_shape() {
+        let command = LocalControlCommand::SourceCollection {
+            source: SourceKind::ClaudeCode,
+            enabled: false,
+        };
+        let wire = serde_json::json!({
+            "command": "source_collection",
+            "source": "claude_code",
+            "enabled": false
+        });
+        assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
         );
     }
 
