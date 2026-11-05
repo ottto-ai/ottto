@@ -145,86 +145,47 @@ release-verification, agent-adapter, troubleshooting, and JSON automation exampl
 [`docs/`](docs/README.md). These docs are written to stand alone in a public
 repository or release package without private repo links.
 
-## Public Export Gate
+## Public Surface Gate
 
-The future public `ottto` repository must be populated from the approved export
-surface under this local-platform tree, not by copying arbitrary private
-monorepo paths. The export manifest and checks live in
-[`public-export/`](public-export/README.md). Run
-`scripts/public_repo_export_check.sh --require-no-rewrites` before any public
-repo bootstrap or runtime move; it verifies export roots, fails private paths
-and secret-like content, and fails private repo references that would need to be
-rewritten to the public repository name. Current release attestation defaults already name
-`ottto-ai/ottto`, so the expected pre-bootstrap bundle output is
-`rewrite-required references: 0`; any new rewrite-required release/runtime
-reference is a regression to fix before cutover.
-`scripts/public_repo_export_bundle.sh --force`
-materializes the root-shaped public staging tree, including connector
-SDK/testkit crates, first-party source packages, the generated connector
-registry, public manifest schemas, public GitHub Actions and Dependabot
-configuration, and root Apache-2.0 license, NOTICE, security, contribution,
-conduct, support, and trademark policy files. The bundle refuses rewrite-required
-source by default; `--allow-rewrites` is reserved for legacy/test fixtures. The generated manifest records
-every staged non-manifest file with SHA-256, size, mode, and executable-bit
-metadata plus a deterministic `content_sha256`; run
-`scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto`
-to verify that inventory before bootstrap. This repository does not commit
-`PUBLIC_EXPORT_MANIFEST.json`: `scripts/public_repo_manifest.sh --digest` (or
-`--facts`) derives the same digest and counts from a commit's git tree, and the
-public-surface gate requires the self-exported bundle's manifest to equal the
-one derived from `HEAD`. The generated tree must also pass
-`scripts/public_repo_skeleton_check.sh`, which verifies the public repo shape
-for runtime crates, connectors, docs, release tooling, policies, CI, and agent
-adapters before bootstrap, and
-`scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto`,
-which verifies the generated root-shaped tree still carries the public CLI
-JSON/NDJSON fixtures, local-control protocol fixtures, generated connector
-registry, manifest schemas, setup claim fixtures, diagnostics redaction
-fixture, release manifest schema, and private backend/frontend consumer
-assumptions. When `--private-repo-root` is supplied, the same gate also checks
-the private runtime pin at
-`backend/app/domain/local_platform/public_runtime_pin.json`, so private
-consumers only validate against the pinned public manifest digest. Once the
-public repo is the runtime authority, run the same contract gate with
-`--require-public-authority`; it requires the private pin to name a
+Public files must stand alone: no secrets, customer data, private repository
+references, or operator paths. `scripts/public_repo_secret_scan.sh` scans every
+committed `HEAD` blob using the committed deny policy in
+`public-export/deny-patterns.tsv`, without reading history or working files.
+It refuses symlinks, gitlinks, unsafe paths, private/build paths, environment
+files, bytecode, and tracked derived manifests before scanning content. Findings
+contain only categories and escaped file locations.
+
+This repository does not commit `PUBLIC_EXPORT_MANIFEST.json`:
+`scripts/public_repo_manifest.sh --digest` (or `--facts`) derives the manifest
+digest and counts from a commit's git tree, recording every tracked file with
+SHA-256, size, mode, and executable-bit metadata, and `--guard` fails when the
+commit or the index still tracks the file.
+
+`scripts/public_repo_contract_check.sh` verifies that the root carries the
+public repo shape (runtime and connector workspaces, docs including
+`docs/support.md`, release tooling, policies, CI, and agent adapters) plus the
+public CLI JSON/NDJSON fixtures, local-control protocol fixtures, generated
+connector registry, manifest schemas, setup claim fixtures, diagnostics
+redaction fixture, release manifest schema, and private backend/frontend
+consumer assumptions. When `--private-repo-root` is supplied, the same gate also
+checks the private runtime pin at
+`backend/app/domain/local_platform/public_runtime_pin.json` against the manifest
+digest and counts derived from the checked root's `HEAD`, so private consumers
+only validate against the pinned public manifest digest. With
+`--require-public-authority` it also requires the private pin to name a
 `public_repo_commit` and verifies that the checked public root is a clean git
-checkout at that commit. Without `--staged-output`, the gate derives the public
-manifest digest and counts from the checked root's `HEAD`. Before any public
-commit or runtime move, run
-`scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto`
-to scan current export candidates, candidate path history, and the generated
-bundle for private paths and secret-like content.
-Run `scripts/public_repo_surface_ci.sh --staged-output dist/public-export/ottto`
-to copy the generated root-shaped bundle into a temporary git checkout and run
-the same public-surface gate that the exported GitHub Actions workflow uses:
-schema/registry validation, shellcheck, export tests, manifest/skeleton,
-secret-scan, contract checks, release/installer dry-run tests, and a
-self-exported bundle verification. This includes release manifest,
-stable-candidate RC, stable preflight, stable closeout, stable QA template,
-Homebrew, hosted installer, and CycloneDX SBOM generator tests.
+checkout at that commit.
+
+`scripts/public_repo_surface_ci.sh` runs the public-surface gate that GitHub
+Actions runs: schema/registry validation, shellcheck, the derived-manifest
+guard, the committed-tree secret scan, the root contract check, and
+release/installer dry-run tests (release manifest, stable-candidate RC, stable
+preflight, stable closeout, stable QA template, Homebrew, hosted installer, and
+CycloneDX SBOM generator tests). `--staged-output <dir>` copies a root-shaped
+tree into a temporary git checkout, commits it, and runs the same checks there.
 The default `--scope all` runs every step and needs macOS. GitHub CI splits the
 gate: `--scope portable` runs on Linux, and `--scope macos` runs the steps that
 need real macOS tools or macOS `/bin/bash` 3.2 inside the Rust contracts job.
-The skeleton gate also requires `docs/support.md`, the public support runbook
-covering redacted triage, diagnostics, escalation, data boundaries, and
-public-v1 closeout readiness.
-Use `scripts/public_repo_bootstrap_plan.sh --target-dir <clean-public-checkout> --report public-bootstrap-plan.json`
-to build and verify the bundle, check that the target checkout is a clean git
-root outside the private monorepo with `origin` bound to `ottto-ai/ottto`,
-print a dry-run add/change/delete plan, and write a machine-readable report
-without absolute local filesystem paths. Only pass `--apply` after reviewing
-that plan; apply mode copies the verified bundle into the target checkout and
-reruns the public manifest, skeleton, secret-scan, and contract gates against
-the applied tree.
-After apply, run
-`scripts/public_repo_cutover_closeout.sh --target-dir <public-checkout> --source-repo-root <private-monorepo> --bootstrap-report public-bootstrap-apply.json --report public-cutover-closeout.json`
-before committing or enabling branch protection in the public checkout. The
-closeout gate verifies the target manifest, skeleton, secret scan, public/private
-contracts, and public-surface CI smoke against the applied checkout, then writes
-a path-safe JSON report with the target `origin` repository binding, git status,
-manifest digest, bootstrap report branch/head plus remote/digest consistency,
-private source history/consumer-contract scope, per-check results, and
-`ready_to_commit=true`.
 
 ## CLI Contract
 
@@ -249,6 +210,7 @@ collection authority.
 Current locked commands:
 
 ```bash
+ottto --version # -V also prints the release version without contacting the daemon
 ottto status --json
 ottto status --json --watch
 ottto receipts --json
@@ -464,10 +426,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   stable `otm_…` machine identity.
 - `ottto logout --local-only --forget-installation --confirm` is the emergency
   variant for when Ottto cannot be reached. It performs the same local reset
-  without contacting Ottto, so the server registration is not released: this
-  Mac stays registered to the old Ottto account, and a different account can
-  connect it only after the old account removes this Mac on its Apps page
-  (Disconnect).
+  without contacting Ottto, so the server registration is not released. If the
+  old Ottto account was deleted or already disconnected this Mac, a different
+  account signs in and chooses Replace it on the claim page. Otherwise this Mac
+  stays registered to the old account, and a different account can connect it
+  only after the old account removes this Mac on its Apps page (Disconnect).
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).
@@ -517,8 +480,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `net.ottto.Companion` bundle identifier, so dev and preview builds keep
   working unconfigured. `OTTTO_COMPANION_TEAM_ID` and
   `OTTTO_COMPANION_CODE_REQUIREMENT` override both, for running a release daemon
-  against a locally built app (see
-  [`docs/session-2026-09-16-companion-code-requirement.md`](docs/session-2026-09-16-companion-code-requirement.md))
+  against a locally built app.
 - a macOS packaging rehearsal script that builds the SwiftUI app bundle, embeds
   Rust CLI/daemon helpers, ad-hoc seals dev/preview bundles, writes a release
   manifest, and separates those internal builds from stable

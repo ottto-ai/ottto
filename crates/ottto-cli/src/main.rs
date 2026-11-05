@@ -2,7 +2,7 @@ mod launch_check;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
-    client_control_token, default_socket_path, execute_local_uninstall,
+    client_control_token, compiled_release_version, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
     load_or_create_control_token_unless_daemon_owns, local_lifecycle_home_dir,
     request_unix_socket_with_timeout, TokenStoreError, UninstallExecutionOptions,
@@ -19,14 +19,17 @@ use ottto_protocol::{
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static RELEASE_VERSION: LazyLock<String> = LazyLock::new(compiled_release_version);
 
 const DEFAULT_SETUP_TIMEOUT_SECONDS: u64 = 300;
 const SETUP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
-#[command(name = "ottto")]
+#[command(name = "ottto", version = RELEASE_VERSION.as_str())]
 #[command(about = "Ottto local platform CLI for developers, support, CI, and AI agents")]
 struct Cli {
     #[arg(
@@ -1561,6 +1564,10 @@ fn setup_error_should_start_browser_claim(error: &CliError) -> bool {
         .message
         .to_ascii_lowercase()
         .contains("attach an active setup run")
+        || matches!(
+            error.details.get("reason_code"),
+            Some(RedactedValue::String(reason)) if reason == "mac_disconnected"
+        )
 }
 
 fn browser_claim_from_payload(payload: &serde_json::Value) -> Result<BrowserClaimState, CliError> {
@@ -2806,6 +2813,18 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn version_flags_print_shared_release_version_without_daemon() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["ottto", flag]).expect_err("version exits parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("ottto {}\n", compiled_release_version())
+            );
+        }
+    }
+
     fn invocation_from_cli(cli: Cli) -> Invocation {
         let mode = output_mode(command_json(&cli.command), cli.watch).expect("valid output mode");
         build_invocation(cli, mode)
@@ -3726,6 +3745,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Replace it on the browser claim page"));
+    }
+
+    #[test]
+    fn setup_rejected_disconnected_mac_starts_fresh_browser_claim() {
+        let disconnected = CliError {
+            code: CliErrorCode::BackendRejected,
+            message:
+                "This Mac was disconnected from its Ottto account. Sign in to connect it again."
+                    .to_string(),
+            retryable: false,
+            details: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    RedactedValue::String("/api/v1/agent-status/snapshots".to_string()),
+                ),
+                ("status".to_string(), RedactedValue::Number(401)),
+                (
+                    "reason_code".to_string(),
+                    RedactedValue::String("mac_disconnected".to_string()),
+                ),
+            ]),
+        };
+
+        assert!(setup_error_should_start_browser_claim(&disconnected));
     }
 
     #[test]

@@ -35,12 +35,13 @@ The generated registry lives at `connectors/registry.generated.json`.
 
 ## Validate A Change
 
-Run the generator and registry tests from the repository root:
+`connectors/registry.generated.json` is built from the manifests by maintainer
+tooling outside this repository. If your change edits a manifest, say so in the
+pull request; a maintainer regenerates the registry before merge. Validate the
+manifests and fixtures with the testkit from the repository root:
 
 ```bash
-cd backend
-uv run python scripts/generate_connector_registry.py
-uv run python scripts/generate_connector_registry.py --check
+cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test first_party_sources
 ```
 
 Use the public Rust testkit helpers in source-package tests instead of copying

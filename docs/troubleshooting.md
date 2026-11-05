@@ -57,6 +57,15 @@ Claude Code without `CLAUDE_CONFIG_DIR`, type `/login`, complete Claude's
 sign-in, then run Verify again. Do not start a new Ottto setup or Mac claim for
 this source-scoped result.
 
+If Doctor reports `claude_shell_profile_telemetry_override`, Claude Desktop may
+inherit telemetry exports from a shell profile. The report lists variable names
+and destination classes, never their values. An unreadable profile is Unknown.
+Fix reports the warning and preserves user-owned profile lines while keeping
+managed configuration repair available. Remove or comment out the relevant
+unfenced exports, quit and reopen Claude Desktop, start a new session, then run
+Verify again. This check reports literal exports in zsh/bash profiles; it does not
+inspect running process environments or establish a session capture gap.
+
 For Codex:
 
 ```bash

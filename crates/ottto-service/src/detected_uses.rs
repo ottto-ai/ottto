@@ -153,7 +153,10 @@ struct GroupBuilder {
 
 impl GroupBuilder {
     fn into_detected_use(self) -> DetectedUse {
-        let account_label = self.subscription_product.as_deref().map(humanize_plan);
+        let account_label = self
+            .subscription_product
+            .as_deref()
+            .map(|product| humanize_plan(product, &self.gateway_provider));
         DetectedUse {
             gateway_provider: self.gateway_provider,
             plan_fingerprint: self.plan_fingerprint,
@@ -277,8 +280,29 @@ fn row_total_tokens(row: &SnapshotModelUsage) -> u64 {
 
 /// Human-readable label for a plan slug. Known plans get a curated label; any
 /// other value is title-cased so the panel never shows a bare lowercase slug.
-fn humanize_plan(product: &str) -> String {
-    match product.trim().to_ascii_lowercase().as_str() {
+/// A `chatgpt_`/`claude_` prefix is dropped. Plan ids keep their old names:
+/// Claude `max_5x` is Max and `max_20x` is Ultra; ChatGPT `team` is Business
+/// and `prolite`/`pro`/`promax` are Pro 100/200/500.
+fn humanize_plan(product: &str, gateway_provider: &str) -> String {
+    let product = product.trim();
+    let lower = product.to_ascii_lowercase();
+    let chatgpt = lower.starts_with("chatgpt_");
+    let prefix = if chatgpt {
+        "chatgpt_".len()
+    } else if lower.starts_with("claude_") {
+        "claude_".len()
+    } else {
+        0
+    };
+    let openai = chatgpt || gateway_provider.eq_ignore_ascii_case("openai");
+    match &lower[prefix..] {
+        "team" if openai => "Business".to_string(),
+        "pro" if openai => "Pro 200".to_string(),
+        "prolite" => "Pro 100".to_string(),
+        "promax" => "Pro 500".to_string(),
+        "max_5x" => "Max".to_string(),
+        "max_20x" => "Ultra".to_string(),
+        "max" => "Max or Ultra".to_string(),
         "pro" => "Pro".to_string(),
         "team" => "Team".to_string(),
         "team_standard" => "Team Standard".to_string(),
@@ -286,9 +310,8 @@ fn humanize_plan(product: &str) -> String {
         "plus" => "Plus".to_string(),
         "enterprise" => "Enterprise".to_string(),
         "business" => "Business".to_string(),
-        "max" => "Max".to_string(),
         "free" => "Free".to_string(),
-        _ => title_case(product),
+        _ => title_case(&product[prefix..]),
     }
 }
 
@@ -607,7 +630,7 @@ mod tests {
             .expect("personal pro group present");
         assert_eq!(pro.gateway_provider, "openai");
         assert_eq!(pro.plan_fingerprint.as_deref(), Some("pro::20598"));
-        assert_eq!(pro.account_label.as_deref(), Some("Pro"));
+        assert_eq!(pro.account_label.as_deref(), Some("Pro 200"));
         assert_eq!(pro.account_identifier_hash, None);
 
         let team = detected
@@ -616,10 +639,39 @@ mod tests {
             .expect("team group present");
         assert_eq!(team.gateway_provider, "openai");
         assert_eq!(team.plan_fingerprint.as_deref(), Some("team::20607"));
-        assert_eq!(team.account_label.as_deref(), Some("Team"));
+        assert_eq!(team.account_label.as_deref(), Some("Business"));
 
         // Distinct fingerprints prove the dual-destination split holds.
         assert_ne!(pro.plan_fingerprint, team.plan_fingerprint);
+    }
+
+    /// [behaviour] Plan labels use the current Claude and ChatGPT plan names
+    /// while the plan ids keep their old names.
+    #[test]
+    fn humanize_plan_uses_current_plan_names() {
+        for (product, gateway, label) in [
+            ("max_5x", "anthropic", "Max"),
+            ("claude_max_20x", "anthropic", "Ultra"),
+            ("max", "anthropic", "Max or Ultra"),
+            ("team", "anthropic", "Team"),
+            ("team_premium", "anthropic", "Team Premium"),
+            ("pro", "anthropic", "Pro"),
+            ("team", "openai", "Business"),
+            ("chatgpt_team", "", "Business"),
+            ("pro", "openai", "Pro 200"),
+            ("prolite", "openai", "Pro 100"),
+            ("promax", "openai", "Pro 500"),
+            ("chatgpt_plus", "openai", "Plus"),
+            ("go", "openai", "Go"),
+            ("edu", "openai", "Edu"),
+            ("ChatGPT Plus", "openai", "ChatGPT Plus"),
+        ] {
+            assert_eq!(
+                humanize_plan(product, gateway),
+                label,
+                "{product} on {gateway}"
+            );
+        }
     }
 
     #[test]

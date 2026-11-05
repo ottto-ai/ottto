@@ -6,16 +6,12 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
-      semver-major-days: 14
     groups:
       github-actions:
         patterns:
           - "*"
     commit-message:
       prefix: ci(deps)
-    labels:
-      - ci
-      - dependencies
 
   - package-ecosystem: cargo
     directory: /
@@ -30,9 +26,6 @@ updates:
           - "*"
     commit-message:
       prefix: deps(runtime)
-    labels:
-      - rust
-      - dependencies
 
   - package-ecosystem: cargo
     directory: /crates
@@ -47,6 +40,3 @@ updates:
           - "*"
     commit-message:
       prefix: deps(connectors)
-    labels:
-      - rust
-      - dependencies

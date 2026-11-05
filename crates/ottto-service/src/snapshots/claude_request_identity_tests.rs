@@ -1016,6 +1016,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         terminal_unix_seconds: at,
         event_clock_complete: true,
         marker,
+        spanless_first: false,
     }
 }
 
@@ -3950,3 +3951,257 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
+
+/// `lines` parsed by the money fold, the file born an hour before the cutoff
+/// so every record is the file's own whenever the test runs.
+fn parse_spanless(dir: &Path, lines: &[Value]) -> SnapshotItem {
+    let born = (identity::SPANLESS_FIRST_REQUEST_FROM - 3600) * 1_000_000_000;
+    crate::snapshots::claude_request_money::e2::with_fixture_birth(born, || {
+        parse_session(dir, lines).remove(0)
+    })
+}
+
+/// The page's money-fold steps before tagging: reconcile request accounts,
+/// then finish the page.
+fn fold_page(items: &mut Vec<SnapshotItem>, evidence: &ScanEvidence<'_>) {
+    identity::reconcile_request_accounts(items, evidence);
+    crate::snapshots::claude_request_money::e2::finish_page(
+        items,
+        &ScanIndex::default(),
+        crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
+}
+
+/// RFC 3339 `offset` seconds from the span-less first-request cutoff.
+fn spanless_clock(offset: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(
+        i64::try_from(identity::SPANLESS_FIRST_REQUEST_FROM).unwrap() + offset,
+    )
+    .unwrap()
+    .format(&Rfc3339)
+    .unwrap()
+}
+
+/// [money] Request-local login requires an original root's first response,
+/// judged on the prefix up to it: later id-less or multi-iteration responses
+/// never revoke it.
+#[test]
+fn spanless_first_request_own_login_classifier_table() {
+    with_max_gated_claude_revision(3, || {
+        let mut failures = Vec::new();
+        for case in [
+            "file-first",
+            "login-only",
+            "id-less-after",
+            "multi-iteration-after",
+            "progressive-first",
+            "zero-usage-before",
+            "resume-switch",
+            "fork-parent",
+            "inherited-prefix",
+            "subagent-file",
+            "id-less-first",
+            "repeated-response-id",
+            "empty-client-id",
+            "duplicate-rows",
+            "cross-root",
+            "unreadable-owner",
+            "foreign-owner",
+            "bad-clock",
+            "bad-org",
+            "pre-cutoff",
+        ] {
+            let dir = temp_dir(&format!("spanless-own-login-{case}"));
+            let at = &spanless_clock(if case == "pre-cutoff" { -1 } else { 0 });
+            let mut lines = vec![owned_response("first", at, 10, 1)];
+            match case {
+                "id-less-after" => {
+                    let mut later = owned_response("no-id", &spanless_clock(1), 3, 1);
+                    later.as_object_mut().unwrap().remove("requestId");
+                    lines.push(later);
+                }
+                "multi-iteration-after" => {
+                    let mut later = owned_response("later", &spanless_clock(1), 10, 10);
+                    later["message"]["usage"]["iterations"] = json!([
+                        {"input_tokens": 5, "output_tokens": 5},
+                        {"input_tokens": 5, "output_tokens": 5}
+                    ]);
+                    lines.push(later);
+                }
+                // One response written as two progressive records.
+                "progressive-first" => lines.insert(0, owned_response("first", at, 10, 0)),
+                "zero-usage-before" => lines.insert(0, api_error_response(Some("zero"), at)),
+                "resume-switch" => lines.insert(0, owned_response("earlier", at, 3, 1)),
+                "fork-parent" => lines.insert(
+                    0,
+                    json!({"type":"fork-context-ref", "sessionId":ROOT,
+                    "parentSessionId":OTHER_ROOT, "timestamp":at}),
+                ),
+                "inherited-prefix" => lines.insert(
+                    0,
+                    json!({"type":"assistant", "sessionId":ROOT,
+                    "timestamp":at, "forkedFrom":{"sessionId":OTHER_ROOT,"messageUuid":"copied"},
+                    "message":{"id":"copied","model":"claude-haiku-4-5",
+                    "usage":{"input_tokens":3,"output_tokens":1}}}),
+                ),
+                "id-less-first" => {
+                    let mut first = owned_response("no-id", at, 3, 1);
+                    first.as_object_mut().unwrap().remove("requestId");
+                    lines.insert(0, first);
+                }
+                "repeated-response-id" => {
+                    let mut repeated = owned_response("first", at, 3, 1);
+                    repeated["message"]["id"] = json!("distinct-response");
+                    lines.push(repeated);
+                }
+                _ => {}
+            }
+            let mut raw = parse_spanless(&dir, &lines);
+            if case == "subagent-file" {
+                raw.source_session_id = format!("{ROOT}_agent-child");
+            }
+            // The file-wide shape flags fall; the prefix verdict stands.
+            match case {
+                "id-less-after" => assert!(!raw.claude_context_curve_identity_complete),
+                "multi-iteration-after" => {
+                    assert!(!raw.claude_context_curve_request_index_complete);
+                }
+                "progressive-first" => assert_eq!(raw.request_count, 1),
+                _ => {}
+            }
+            if case == "bad-clock" {
+                raw.claude_usage_occurrences
+                    .get_mut("first")
+                    .unwrap()
+                    .event_clock_complete = false;
+            }
+            let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
+            row.observed_at = at.into();
+            if case != "login-only" {
+                row.request_identity = Some(org_identity(D64));
+            }
+            if case == "empty-client-id" {
+                row.client_request_id.clear();
+            }
+            if case == "bad-org" {
+                row.request_identity
+                    .as_mut()
+                    .unwrap()
+                    .organization
+                    .disposition = crate::claude_local_otel::ClaudeIdentityDisposition::Conflict;
+            }
+            let row = signed(row);
+            let (mut api, mut traces) = reports(vec![row.clone()], vec![]);
+            if case == "duplicate-rows" {
+                api.evidence.get_mut(ROOT).unwrap().push(row);
+            }
+            if case == "cross-root" {
+                api.evidence.insert(
+                    OTHER_ROOT.into(),
+                    vec![signed(complete_api_row(OTHER_ROOT, "first", 1, 10, 1, 0))],
+                );
+            }
+            if case == "foreign-owner" {
+                traces
+                    .evidence
+                    .get_mut(ROOT)
+                    .unwrap()
+                    .push(complete_trace_row(ROOT, "first", "foreign"));
+            }
+            // A named owner with an unreadable sidecar is not an absent owner.
+            let roots = if case == "unreadable-owner" {
+                BTreeSet::from([OTHER_ROOT.to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+            let mut items = vec![raw];
+            let parents = if case == "unreadable-owner" {
+                vec![(ROOT.to_owned(), OTHER_ROOT.to_owned())]
+            } else {
+                vec![]
+            };
+            let scope = super::super::claude_cross_root_evidence::EvidenceScope::of_page(
+                &items,
+                &ScanIndex::default(),
+                &root_set(),
+                parents,
+                &api.evidence,
+            );
+            let cross =
+                super::super::claude_cross_root_evidence::CrossRootEvidence::new(&items, scope);
+            let evidence = ScanEvidence::new(&api, &traces, roots).with_scope(&cross);
+            fold_page(&mut items, &evidence);
+            identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+            let tagged = items[0].request_evidence.iter().any(|entry| {
+                entry.account_source.is_none()
+                    && entry.identity_basis
+                        == if case == "login-only" {
+                            identity::TELEMETRY_LOGIN
+                        } else {
+                            identity::TELEMETRY
+                        }
+            });
+            let expected = matches!(
+                case,
+                "file-first"
+                    | "login-only"
+                    | "id-less-after"
+                    | "multi-iteration-after"
+                    | "progressive-first"
+            );
+            if tagged != expected {
+                failures.push(case);
+            }
+            let _ = fs::remove_dir_all(dir);
+        }
+        assert!(
+            failures.is_empty(),
+            "request-local classifier rows: {failures:?}"
+        );
+    });
+}
+
+/// [money] A Desktop span-less first response: the fold and the recent
+/// activity path read one verdict, accepted from the cutoff and refused before.
+#[test]
+fn spanless_first_request_desktop_fold_and_activity_agree() {
+    with_max_gated_claude_revision(3, || {
+        for (offset, accepted) in [(0, true), (-1, false)] {
+            let dir = temp_dir(&format!("spanless-desktop-{accepted}"));
+            let at = spanless_clock(offset);
+            let mut first = owned_response("first", &at, 10, 1);
+            first["entrypoint"] = json!("claude-desktop");
+            let mut raw = parse_spanless(&dir, &[marker(ORG_1), first]);
+            raw.collected_at = spanless_clock(offset + 30);
+            let original = SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: Some(OWNER_A.into()),
+                provider_workspace_hash: Some(org_hash(ORG_1)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("complete"),
+                source_created_at: Some(spanless_clock(offset - 1)),
+            };
+            let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
+            row.observed_at.clone_from(&at);
+            row.request_identity = Some(org_identity(&org_hash(ORG_1)));
+            let (api, traces) = reports(vec![signed(row)], vec![]);
+            let evidence = ScanEvidence::new(&api, &traces, BTreeSet::new());
+            let mut items = vec![raw];
+            assert!(items[0].claude_money.is_some(), "the money fold reads it");
+            fold_page(&mut items, &evidence);
+            // The activity path as the page stages it, before tagging.
+            let activity =
+                identity::collect_request_owned_activity(&items[0], &evidence, Some(&original));
+            identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
+            let fold = items[0].request_evidence.iter().any(|entry| {
+                entry.identity_basis == identity::TELEMETRY && entry.account_source.is_none()
+            });
+            let recent = activity.at(OWNER_A, &org_hash(ORG_1)).is_some();
+            assert_eq!((fold, recent), (accepted, accepted), "{at}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    });
+}

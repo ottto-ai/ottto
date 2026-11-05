@@ -77,7 +77,8 @@ macro_rules! scan_index_fields {
             claude_money_birth_store => Misc (misc check_field Field) ["v1_field.birth_store" => 1] side,
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
-            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2] side,
+            // Its stamps are one row per entity, as accepted.entity (layout 6).
+            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6] side,
             // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
             retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
             retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
@@ -186,6 +187,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (3, "copy-prefix recovery nonce"),
     (4, "tail store"),
     (5, "folder login ledger + tail revision + head envelope"),
+    (6, "upload context proof stamps one row per entity"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
@@ -229,10 +231,12 @@ pub(super) fn introduced(kind: &str) -> Result<u32> {
 /// Before layout controls existed, this authenticated inventory contained every
 /// field known to its writer, including fields absent in the imported v1 JSON.
 pub(super) fn legacy_layout(presence: &BTreeMap<String, bool>) -> u32 {
+    // A field's later kinds (a newer split) say nothing about its writer.
+    let first = |field: &str| LAYOUTS.iter().find(|(_, f, _)| *f == field).map(|e| e.2);
     LAYOUTS
         .iter()
         .filter(|(_, field, _)| presence.contains_key(*field))
-        .map(|(_, _, layout)| *layout)
+        .filter_map(|(_, field, _)| first(field))
         .max()
         .unwrap_or(1)
 }
@@ -354,6 +358,7 @@ mod tests {
         assert_eq!(introduced("tail.head").unwrap(), TAIL_LAYOUT);
         assert_eq!(introduced("tail.revision").unwrap(), 5);
         assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
+        assert_eq!(introduced("proof.upload_context").unwrap(), 6);
         assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
         // An unversioned store's inventory never names a layout-5 field, so its
         // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).

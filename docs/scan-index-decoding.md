@@ -23,8 +23,7 @@ payload allocation. Repairs release the complete charge; output restart admissio
 uses that same charge. Oversized
 keys take the counted budget path without allocating a large key buffer.
 Excess damage uses the existing load quarantine or CAS error. The load diagnostic
-names the prior-history gated rebuild, which requires #712 to land first; the
-existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
+names the prior-history gated rebuild; the existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
 If this same checkpoint has a `.corrupt` sibling timestamped within 24 hours,
 the next over-budget load refuses in place instead of rebuilding again. The
 existing backup name supplies the rename timestamp (mtime survives rename);

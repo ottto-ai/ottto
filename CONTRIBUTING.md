@@ -11,6 +11,8 @@ adapters.
 - Do not include secrets, tokens, cookies, raw credentials, raw prompts, raw
   model output, customer data, private planning docs, or local filesystem paths.
 - Keep public docs standalone; they must not require private repository context.
+- Put lasting design in `docs/` or a crate's `ARCHITECTURE.md`. Dated session,
+  review or rollout notes do not belong in this repository.
 - Update tests and docs when behavior, CLI contracts, schemas, connector
   manifests, release metadata, or support workflows change.
 - A pull request that changes Rust code carries a line starting with `Reuse:`
@@ -54,7 +56,10 @@ enqueueing, run `gh workflow run ci.yml --ref <branch>` once. The script refuses
 merge conflicts: rebase onto `main` and push first. `gh pr checks` exit 0 is not
 evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
 manually started (`workflow_dispatch`) run tests the branch head, not the merge
-with `main`.
+with `main`. The PR title becomes the squash commit subject on `main`, so keep it
+a plain conventional title; the script refuses a title that matches the local
+deny list in `OTTTO_PR_TITLE_DENY_FILE` (default
+`~/.config/ottto/pr-title-deny.ere`) when that file exists.
 
 `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
 

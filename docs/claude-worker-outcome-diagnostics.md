@@ -91,6 +91,3 @@ which registered slot's limits are uploaded follows the same canonical choice.
 A registered slot that is not canonical for its pair can neither upload nor
 become the preferred anchor. The default login still competes on meter
 quality.
-
-Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
-consent, breaker or release changes were performed for this correction.

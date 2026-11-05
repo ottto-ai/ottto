@@ -3328,9 +3328,11 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// email, and is never uploaded. Older clients ignore this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_notice: Option<String>,
-    /// Default home only: the account and organization proven to own the
-    /// stored token, and the ones its `.claude.json` cache names. Hashes and
-    /// a time only; older clients ignore these additive fields.
+    /// The default home, and a registered slot whose `.claude.json` names
+    /// another account than its approved one: the account and organization
+    /// proven to own the stored token, and the ones its `.claude.json` cache
+    /// names. Hashes and a time only; older clients ignore these additive
+    /// fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_owner_account_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

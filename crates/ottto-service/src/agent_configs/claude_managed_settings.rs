@@ -20,15 +20,59 @@ const MANAGED_KEYS: [&str; 13] = [
     "OTEL_RESOURCE_ATTRIBUTES",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Changed,
     Unchanged,
     OptedOut,
     ExternalTelemetry,
+    /// The default settings.json is a link or not a regular file.
+    Linked,
 }
 
-fn merge(settings: &mut Value, approved: &[(&str, String)]) -> io::Result<Option<Outcome>> {
+const ENABLE_FLAGS: [&str; 2] = [
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+];
+
+/// Only an explicit off value opts out. Any other enable-flag value is on and
+/// is written back as "1".
+fn opt_out(key: &str, value: &Value) -> bool {
+    match key {
+        key if ENABLE_FLAGS.contains(&key) => value.as_str().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false"
+            )
+        }),
+        "OTEL_METRICS_EXPORTER" | "OTEL_LOGS_EXPORTER" | "OTEL_TRACES_EXPORTER" => value == "none",
+        _ => false,
+    }
+}
+
+/// Ottto's earlier direct-to-cloud setup: an API-key header and only Ottto
+/// signal endpoints. It is ours, so it moves to the relay.
+fn ottto_direct(env: &Map<String, Value>) -> bool {
+    let mut endpoints = env
+        .iter()
+        .filter(|(key, _)| key.starts_with("OTEL_EXPORTER_OTLP_") && key.ends_with("_ENDPOINT"))
+        .peekable();
+    env.get("OTEL_EXPORTER_OTLP_HEADERS")
+        .and_then(Value::as_str)
+        .is_some_and(|header| header.starts_with("X-API-Key=") && !header.contains(','))
+        && endpoints.peek().is_some()
+        && endpoints.all(|(key, value)| {
+            signal_endpoint_base(key, value).is_some_and(crate::control::is_production_api_base_url)
+        })
+}
+
+/// `clear_opt_out` is the explicit source Enable: it replaces opt-out values
+/// (including the one Disable writes) but still preserves external exporters.
+fn merge(
+    settings: &mut Value,
+    approved: &[(&str, String)],
+    clear_opt_out: bool,
+) -> io::Result<Option<Outcome>> {
     let object = settings
         .as_object_mut()
         .ok_or_else(|| invalid("settings is not an object"))?;
@@ -38,22 +82,21 @@ fn merge(settings: &mut Value, approved: &[(&str, String)]) -> io::Result<Option
     let env = env
         .as_object_mut()
         .ok_or_else(|| invalid("env is not an object"))?;
-    if [
-        "CLAUDE_CODE_ENABLE_TELEMETRY",
-        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
-    ]
-    .iter()
-    .any(|key| env.get(*key).is_some_and(|value| value != "1"))
-        || [
-            "OTEL_METRICS_EXPORTER",
-            "OTEL_LOGS_EXPORTER",
-            "OTEL_TRACES_EXPORTER",
-        ]
-        .iter()
-        .any(|key| env.get(*key).is_some_and(|value| value == "none"))
-    {
+    if clear_opt_out {
+        env.retain(|key, value| !opt_out(key, value));
+    }
+    if env.iter().any(|(key, value)| opt_out(key, value)) {
         return Ok(Some(Outcome::OptedOut));
     }
+    if ottto_direct(env) {
+        env.retain(|key, _| !MANAGED_KEYS.contains(&key.as_str()));
+    }
+    // Enable flags are on here; "1" replaces any other on value.
+    let compared = || {
+        approved
+            .iter()
+            .filter(|(key, _)| !ENABLE_FLAGS.contains(key))
+    };
     let owned = env
         .get("OTEL_EXPORTER_OTLP_HEADERS")
         .is_some_and(|value| value == "X-Ottto-Local-Relay=claude_code");
@@ -68,7 +111,7 @@ fn merge(settings: &mut Value, approved: &[(&str, String)]) -> io::Result<Option
             .is_some_and(|value| owned_signal_endpoint(key, value) == Some(false))
     });
     let customized_owned_value = owned
-        && approved.iter().any(|(key, _)| {
+        && compared().any(|(key, _)| {
             env.get(*key)
                 .is_some_and(|value| !owned_relay_value(key, value))
         });
@@ -76,7 +119,7 @@ fn merge(settings: &mut Value, approved: &[(&str, String)]) -> io::Result<Option
         || external_endpoint
         || customized_owned_value
         || (!owned
-            && approved.iter().any(|(key, value)| {
+            && compared().any(|(key, value)| {
                 env.get(*key)
                     .is_some_and(|current| current != value.as_str())
             }))
@@ -99,12 +142,17 @@ fn owned_signal_endpoint(key: &str, value: &Value) -> Option<bool> {
     Some(signal_endpoint_port(key, value).is_some())
 }
 
-fn signal_endpoint_port(key: &str, value: &Value) -> Option<u16> {
+fn signal_endpoint_base<'a>(key: &str, value: &'a Value) -> Option<&'a str> {
     let signal = key
         .strip_prefix("OTEL_EXPORTER_OTLP_")?
         .strip_suffix("_ENDPOINT")?;
-    let suffix = format!("/v1/{}", signal.to_ascii_lowercase());
-    let base = value.as_str()?.strip_suffix(&suffix)?;
+    value
+        .as_str()?
+        .strip_suffix(&format!("/v1/{}", signal.to_ascii_lowercase()))
+}
+
+fn signal_endpoint_port(key: &str, value: &Value) -> Option<u16> {
+    let base = signal_endpoint_base(key, value)?;
     base.strip_prefix("http://127.0.0.1:")
         .or_else(|| base.strip_prefix("http://localhost:"))?
         .parse::<u16>()
@@ -234,11 +282,36 @@ mod unix {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct Directory(File);
+    /// How a settings directory is opened. `Managed` and `Read` walk every
+    /// component without following links and keep the 1 MiB limit; `Managed`
+    /// also requires an owner-only root. `User` is the user's default root: it
+    /// follows their directory links, as Claude does, and has no size limit.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Root {
+        Managed,
+        Read,
+        User,
+    }
+
+    /// An opened settings directory and its size limit.
+    struct Directory(File, Option<u64>);
     impl Directory {
-        fn open(path: &Path, private: bool) -> io::Result<Self> {
+        fn open(path: &Path, root: Root) -> io::Result<Self> {
+            use std::os::unix::ffi::OsStrExt;
             if !path.is_absolute() {
                 return Err(invalid("settings directory must be absolute"));
+            }
+            if root == Root::User {
+                // The settings file itself is still opened no-follow.
+                let path = CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| invalid("invalid settings directory"))?;
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                return Ok(Self(file(fd)?, None));
             }
             let fd = unsafe {
                 libc::open(
@@ -246,25 +319,21 @@ mod unix {
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
             };
-            let mut directory = Self(file(fd)?);
+            let mut directory = Self(file(fd)?, Some(SETTINGS_LIMIT));
             for component in path.components() {
                 match component {
                     Component::RootDir => {}
                     Component::Normal(name) => {
-                        use std::os::unix::ffi::OsStrExt;
                         let name = CString::new(name.as_bytes())
                             .map_err(|_| invalid("invalid directory component"))?;
-                        directory = Self(directory.open_file(
-                            &name,
-                            libc::O_RDONLY | libc::O_DIRECTORY,
-                            0,
-                        )?);
+                        directory.0 =
+                            directory.open_file(&name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
                     }
                     _ => return Err(invalid("settings directory must be normalized")),
                 }
             }
             let metadata = directory.0.metadata()?;
-            if private
+            if root == Root::Managed
                 && (metadata.uid() != unsafe { libc::geteuid() }
                     || metadata.mode() & 0o777 != 0o700)
             {
@@ -291,18 +360,19 @@ mod unix {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-            check_file(&file)?;
+            check_file(&file, self.1)?;
             let mut body = Vec::new();
-            (&mut file)
-                .take(SETTINGS_LIMIT + 1)
-                .read_to_end(&mut body)?;
-            if body.len() as u64 > SETTINGS_LIMIT {
+            match self.1 {
+                Some(limit) => (&mut file).take(limit + 1).read_to_end(&mut body)?,
+                None => file.read_to_end(&mut body)?,
+            };
+            if self.1.is_some_and(|limit| body.len() as u64 > limit) {
                 return Err(invalid("settings exceeds size limit"));
             }
             Ok(Some(body))
         }
-        fn same_root(&self, root: &Path, private: bool) -> io::Result<bool> {
-            let current = Self::open(root, private)?.0.metadata()?;
+        fn same_root(&self, path: &Path, root: Root) -> io::Result<bool> {
+            let current = Self::open(path, root)?.0.metadata()?;
             let original = self.0.metadata()?;
             Ok(current.dev() == original.dev() && current.ino() == original.ino())
         }
@@ -315,7 +385,7 @@ mod unix {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
     }
-    fn check_file(file: &File) -> io::Result<()> {
+    fn check_file(file: &File, limit: Option<u64>) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata.uid() != unsafe { libc::geteuid() }
@@ -323,7 +393,7 @@ mod unix {
         {
             return Err(invalid("settings must be an owner-controlled regular file"));
         }
-        if metadata.len() > SETTINGS_LIMIT {
+        if limit.is_some_and(|limit| metadata.len() > limit) {
             return Err(invalid("settings exceeds size limit"));
         }
         Ok(())
@@ -346,7 +416,7 @@ mod unix {
         let parent = path
             .parent()
             .ok_or_else(|| invalid("settings has no parent"))?;
-        let directory = match Directory::open(parent, false) {
+        let directory = match Directory::open(parent, Root::Read) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -358,7 +428,38 @@ mod unix {
     }
 
     pub(super) fn reconcile(root: &Path, approved: &[(&str, String)]) -> io::Result<Outcome> {
-        reconcile_before_commit(root, approved, || {})
+        reconcile_before_commit(root, approved, || Ok(()))
+    }
+
+    pub(super) fn reconcile_default(
+        root: &Path,
+        approved: &[(&str, String)],
+        clear_opt_out: bool,
+        edit: impl FnOnce(&mut Value) -> io::Result<()>,
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(Outcome, Option<Outcome>)> {
+        if std::fs::symlink_metadata(root.join("settings.json"))
+            .is_ok_and(|metadata| !metadata.is_file() || metadata.nlink() != 1)
+        {
+            return Ok((Outcome::Unchanged, Some(Outcome::Linked)));
+        }
+        let mut kept = None;
+        let written = update(
+            root,
+            false,
+            false,
+            |settings| {
+                // A kept env stays as it was; the root's own edit still runs.
+                let mut merged = settings.clone();
+                kept = merge(&mut merged, approved, clear_opt_out)?;
+                if kept.is_none() {
+                    *settings = merged;
+                }
+                edit(settings).map(|()| None)
+            },
+            before_commit,
+        )?;
+        Ok((written, kept))
     }
 
     pub(super) fn disable_settings(root: &Path, default_root: bool) -> io::Result<Outcome> {
@@ -367,20 +468,20 @@ mod unix {
             !default_root,
             true,
             |settings| disable(settings, default_root),
-            || {},
+            || Ok(()),
         )
     }
 
     fn reconcile_before_commit(
         root: &Path,
         approved: &[(&str, String)],
-        before_commit: impl FnOnce(),
+        before_commit: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<Outcome> {
         update(
             root,
             true,
             false,
-            |settings| merge(settings, approved),
+            |settings| merge(settings, approved, false),
             before_commit,
         )
     }
@@ -390,12 +491,13 @@ mod unix {
         private: bool,
         skip_missing: bool,
         transform: impl FnOnce(&mut Value) -> io::Result<Option<Outcome>>,
-        before_commit: impl FnOnce(),
+        before_commit: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<Outcome> {
         let _thread_guard = WRITE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = match Directory::open(root, private) {
+        let kind = if private { Root::Managed } else { Root::User };
+        let directory = match Directory::open(root, kind) {
             Ok(directory) => directory,
             Err(error) if private && skip_missing && error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Outcome::Unchanged)
@@ -405,7 +507,7 @@ mod unix {
                 let parent = root
                     .parent()
                     .ok_or_else(|| invalid("settings directory has no parent"))?;
-                let parent = Directory::open(parent, false)?;
+                let parent = Directory::open(parent, Root::User)?;
                 let name = CString::new(
                     root.file_name()
                         .ok_or_else(|| invalid("settings directory has no name"))?
@@ -418,7 +520,7 @@ mod unix {
                         return Err(error);
                     }
                 }
-                Directory::open(root, false)?
+                Directory::open(root, Root::User)?
             }
             Err(error) => return Err(error),
         };
@@ -429,7 +531,7 @@ mod unix {
             libc::O_RDWR | libc::O_CREAT,
             0o600,
         )?;
-        check_file(&lock)?;
+        check_file(&lock, directory.1)?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -450,7 +552,7 @@ mod unix {
         let mut body = serde_json::to_vec_pretty(&settings)
             .map_err(|_| invalid("cannot serialize settings"))?;
         body.push(b'\n');
-        if body.len() as u64 > SETTINGS_LIMIT {
+        if directory.1.is_some_and(|limit| body.len() as u64 > limit) {
             return Err(invalid("updated settings exceeds size limit"));
         }
         let name = CString::new(format!(
@@ -464,8 +566,8 @@ mod unix {
         let result = (|| {
             temporary.write_all(&body)?;
             temporary.sync_all()?;
-            before_commit();
-            if !directory.same_root(root, private)? || directory.read()? != original {
+            before_commit()?;
+            if !directory.same_root(root, kind)? || directory.read()? != original {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "settings changed during provisioning",
@@ -760,8 +862,7 @@ mod unix {
             assert!(reconcile_before_commit(&root, &env(), || fs::write(
                 &path,
                 r#"{"user":"concurrent"}"#
-            )
-            .unwrap())
+            ))
             .is_err());
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
@@ -793,7 +894,7 @@ mod unix {
             assert!(reconcile_before_commit(&child, &env(), || {
                 fs::rename(&child, &previous).unwrap();
                 fs::create_dir(&child).unwrap();
-                fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(&child, fs::Permissions::from_mode(0o700))
             })
             .is_err());
             assert!(!child.join("settings.json").exists());
@@ -861,6 +962,32 @@ pub(crate) fn reconcile(root: &Path, approved: &[(&str, String)]) -> io::Result<
     #[cfg(not(unix))]
     {
         let _ = (root, approved);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed settings require no-follow filesystem support",
+        ))
+    }
+}
+
+/// Write the approved relay env into the user's default Claude root with the
+/// managed classifier and transaction. `edit` applies the root's own changes
+/// (status line) whatever the env outcome; `before_commit` runs once the new
+/// body is staged and the original is about to be replaced (backup). Returns
+/// the write outcome and, when the env was kept, why.
+pub(crate) fn reconcile_default(
+    root: &Path,
+    approved: &[(&str, String)],
+    clear_opt_out: bool,
+    edit: impl FnOnce(&mut Value) -> io::Result<()>,
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<(Outcome, Option<Outcome>)> {
+    #[cfg(unix)]
+    {
+        unix::reconcile_default(root, approved, clear_opt_out, edit, before_commit)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, approved, clear_opt_out, edit, before_commit);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "managed settings require no-follow filesystem support",

@@ -22,13 +22,13 @@ use ottto_core::{
     default_prior_device_path, default_support_dir, execute_local_uninstall,
     generate_control_token, install_owner_for_path, local_lifecycle_home_dir, plan_local_uninstall,
     redact_inline, release_channel_from_str, ClaudeConfigSlotSettingsError,
-    CodexAccountSlotSettingsError, ControlTokenStore, FileAccountStore,
+    CodexAccountSlotSettingsError, ControlTokenStore, DeviceCredentialContinuity, FileAccountStore,
     FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, FileConnectionStore,
     FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
-    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding,
-    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority, TokenStoreError, UninstallExecutionOptions,
-    OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding,
+    LocalDeviceEnvelope, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, SnapshotNamespaceAlias, TokenStoreError,
+    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
@@ -1025,6 +1025,7 @@ fn handle_command(
             if retry_relay_authorization {
                 require_authorized_local_client(daemon, &authorization)?;
                 crate::snapshot_sync::reset_relay_authorization_backoff();
+                daemon.refresh_shell_profile_health()?;
             }
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
@@ -4285,22 +4286,26 @@ fn apply_telemetry_config(
     source: &SourceKind,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     if source_patch_disabled(source) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
             // Explicit, backend-authorized enable also clears the default
-            // JSON opt-out written by disable. Per-root user opt-outs survive.
-            patch.changed |=
-                patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)?.changed;
+            // JSON opt-out written by disable. Per-root user opt-outs and
+            // external exporters survive. Settings go first, so kept settings
+            // never get the shell env either.
+            let settings =
+                patch_claude_code_settings_with_relay_base(&machine, &relay_base_url, true)?;
+            if let Some(kept) = settings.kept {
+                return Err(LocalApiError::LocalOperationFailed(
+                    claude_settings_kept_reason(kept).1.to_string(),
+                ));
+            }
+            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
+            patch.changed |= settings.changed;
             Ok(patch)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
@@ -4378,11 +4383,7 @@ fn repair_source(
 
     let before = source_config_state_for_daemon(daemon, &source)?;
     let patch = if before.drift.is_empty() {
-        ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        }
+        ConfigPatchResult::default()
     } else {
         execute_write_config_repair(daemon, authorization, &source)?
     };
@@ -4409,6 +4410,8 @@ fn repair_source(
                     source_display_name(&source)
                 )
             }
+        } else if let Some(kept) = patch.kept {
+            claude_settings_kept_reason(kept).1.to_string()
         } else {
             format!(
                 "{} telemetry config still has drift after repair.",
@@ -4589,7 +4592,7 @@ fn repair_source_config(
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)
+            patch_claude_code_settings_with_relay_base(&machine, &relay_base_url, false)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "Pi does not support local config repair".to_string(),
@@ -5842,13 +5845,17 @@ fn complete_pending_auth_claim(
                 backfill_policy: completed.backfill_policy.clone(),
                 backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
             };
-            let pending = pending_device_credential_from_preparation(
+            let mut pending = pending_device_credential_from_preparation(
                 &validated_api_base_url(None)?,
                 prepared,
                 false,
                 Some(claim_commit),
                 completion.request_authority.clone(),
             )?;
+            continue_prior_snapshot_namespace(
+                &mut pending,
+                completion.prior_device_credential.as_ref(),
+            );
             stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
             stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
             let staged = FilePendingDeviceCredentialStore::default()
@@ -5976,7 +5983,9 @@ fn complete_pending_auth_claim(
         completed.backfill_cutoff_at.as_deref(),
         &completed.user.id,
         match &relay_credentials {
-            ClaimRelayDeviceCredential::Legacy(device, secret) => Some((device, secret.as_str())),
+            ClaimRelayDeviceCredential::Legacy(device, secret) => Some(
+                crate::snapshot_sync::snapshot_destination_namespace(device, secret, None),
+            ),
             ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
         },
     )?;
@@ -6026,12 +6035,9 @@ fn persist_claim_backfill_policy(
     policy: Option<&str>,
     cutoff_at: Option<&str>,
     user_id: &str,
-    destination: Option<(&LocalDeviceBinding, &str)>,
+    namespace: Option<String>,
 ) -> Result<(), LocalApiError> {
     let support_dir = default_support_dir();
-    let namespace = destination.map(|(device, secret)| {
-        crate::snapshot_sync::snapshot_upload_destination_namespace(device, secret)
-    });
     crate::backfill::apply_claim_backfill_policy_for_destination(
         &support_dir,
         policy,
@@ -6243,7 +6249,10 @@ fn install_staged_account_switch(
         staged
             .relay_device
             .as_ref()
-            .zip(staged.relay_device_secret.as_deref()),
+            .zip(staged.relay_device_secret.as_deref())
+            .map(|(device, secret)| {
+                crate::snapshot_sync::snapshot_destination_namespace(device, secret, None)
+            }),
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
@@ -6674,8 +6683,12 @@ fn stage_pending_setup_run_token_with_store<S: ControlTokenStore + ?Sized>(
     Ok(())
 }
 
-fn secret_sha256(value: &str) -> String {
+pub(crate) fn secret_sha256(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+pub(crate) fn secret_commitment_matches(commitment: &str, secret: &str) -> bool {
+    constant_work_eq(commitment.as_bytes(), secret_sha256(secret).as_bytes())
 }
 
 fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
@@ -6694,13 +6707,9 @@ fn validate_pending_candidate_secret(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
 ) -> Result<(), LocalApiError> {
-    let candidate_commitment = secret_sha256(candidate_secret);
     if candidate_secret.trim().is_empty()
         || !valid_secret_commitment(&pending.secret_commitment_sha256)
-        || !constant_work_eq(
-            pending.secret_commitment_sha256.as_bytes(),
-            candidate_commitment.as_bytes(),
-        )
+        || !secret_commitment_matches(&pending.secret_commitment_sha256, candidate_secret)
     {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6728,6 +6737,14 @@ fn validate_pending_prior_credential_binding(
             .identity_continuity_capability
             .as_deref()
             .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+        || authority
+            .canonical_snapshot_namespace
+            .as_deref()
+            .is_some_and(|namespace| {
+                authority.flow != "setup_claim"
+                    || authority.prior_device_id.is_none()
+                    || !crate::hex::is_sha256_lower(namespace)
+            })
     {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6790,6 +6807,16 @@ fn write_and_verify_active_device_credential(
     let expected_binding = LocalDeviceCredentialBinding {
         device: pending.device.clone(),
         credential_generation: pending.credential_generation,
+        continuity: DeviceCredentialContinuity {
+            owner: pending.claim_commit.as_ref().and_then(|claim| {
+                Some(LocalCredentialOwner {
+                    user_id: claim.target_user_id.clone(),
+                    organization_id: claim.account.organization.as_ref()?.id.clone(),
+                    api_base_url: pending.api_base_url.clone(),
+                })
+            }),
+            snapshot_namespace: pending_snapshot_alias(pending),
+        },
     };
 
     active_secret_store
@@ -6807,6 +6834,21 @@ fn write_and_verify_active_device_credential(
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(())
+}
+
+/// The journaled same-account namespace, bound to the staged candidate secret.
+fn pending_snapshot_alias(
+    pending: &PendingDeviceCredentialPreparation,
+) -> Option<SnapshotNamespaceAlias> {
+    let namespace = pending
+        .request_authority
+        .as_ref()?
+        .canonical_snapshot_namespace
+        .clone()?;
+    Some(SnapshotNamespaceAlias {
+        namespace,
+        secret_commitment_sha256: pending.secret_commitment_sha256.clone(),
+    })
 }
 
 fn clear_pending_device_credential(
@@ -6975,7 +7017,11 @@ fn write_and_verify_pending_claim_commit(
         claim.backfill_policy.as_deref(),
         claim.backfill_cutoff_at.as_deref(),
         &claim.target_user_id,
-        Some((&pending.device, candidate_secret)),
+        Some(crate::snapshot_sync::snapshot_destination_namespace(
+            &pending.device,
+            candidate_secret,
+            pending_snapshot_alias(pending).as_ref(),
+        )),
     )?;
     write_and_verify_active_device_credential(
         pending,
@@ -7356,7 +7402,7 @@ const FORGOTTEN_INSTALLATION: &str = "Installation identity and credentials were
 /// Ottto, and the server's answer for a cloud reset.
 fn auth_reset_message(forget_installation: bool, device_released: Option<bool>) -> StableMessage {
     const NOT_RELEASED: &str = "Ottto did not confirm releasing this Mac's server registration, so it may still be active; the account that owns it can disconnect this Mac on its Apps page (Disconnect).";
-    const STILL_REGISTERED: &str = "This Mac is still registered to the previous Ottto account on the server, so a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
+    const STILL_REGISTERED: &str = "This Mac may still be registered to the previous Ottto account on the server. If that account was deleted or already disconnected this Mac, sign in and choose Replace it on the claim page. Otherwise a different account can connect it only after the previous account disconnects this Mac on its Apps page (Disconnect). The normal path is `ottto logout --forget-installation --confirm` without --local-only, which releases the registration first.";
     const FORGOTTEN: &str = FORGOTTEN_INSTALLATION;
     let (code, text) = match (forget_installation, device_released) {
         (true, None) => (
@@ -8949,6 +8995,11 @@ fn cli_error(error: LocalApiError) -> CliError {
                     "reason_code".to_string(),
                     RedactedValue::String(reason_code.clone()),
                 );
+            } else if backend_error_means_mac_disconnected(&error) {
+                details.insert(
+                    "reason_code".to_string(),
+                    RedactedValue::String(MAC_DISCONNECTED_REASON_CODE.to_string()),
+                );
             }
             match backend.kind {
                 BackendErrorKind::Unreachable => CliErrorCode::BackendUnreachable,
@@ -8995,8 +9046,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if body.contains("revoked_cross_account_predecessor") {
-                return "This Mac belonged to another Ottto account whose device is revoked. The new signed-in owner must choose Replace it on the browser claim page; Ottto will start local history at the prior revocation cutoff."
-                    .to_string();
+                return MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE.to_string();
             }
             if body.contains("cross-account takeover requires the exact active predecessor") {
                 return "This Mac still has a live registration for another Ottto account. Complete the takeover from that live installation with its exact saved device credential, or have the prior owner revoke it before the new owner approves Replace it."
@@ -9042,15 +9092,15 @@ fn cli_error_message(error: &LocalApiError) -> String {
             {
                 return "Setup run expired. Run `ottto login` to reconnect this Mac.".to_string();
             }
-            if terminal_refresh_rejection(error) == Some(TerminalRefreshRejection::DeviceRejected) {
-                return "Ottto no longer accepts this Mac's device credential. Run `ottto login` to reconnect this Mac.".to_string();
-            }
             if backend.status == Some(401) || backend.status == Some(403) {
                 if diagnostics_upload {
                     return "Ottto rejected the diagnostics upload. Sign in again or use a fresh support claim.".to_string();
                 }
                 if logout_disconnect {
                     return "Ottto rejected the cloud logout for this Mac. Sign in from the Ottto app or use `ottto logout --local-only` only to clear local state.".to_string();
+                }
+                if backend_error_means_mac_disconnected(error) {
+                    return MAC_DISCONNECTED_MESSAGE.to_string();
                 }
                 return "Ottto rejected the local setup request. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
@@ -9092,6 +9142,51 @@ fn backend_error_detail(backend: &BackendErrorDetails) -> Option<String> {
         .get("detail")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// Plain guidance when Ottto refuses this Mac because its device was revoked
+/// or its account was deleted. The generic "rejected the local setup request"
+/// line told the user neither what happened nor what to do.
+const MAC_DISCONNECTED_MESSAGE: &str =
+    "This Mac was disconnected from its Ottto account. Sign in to connect it again.";
+
+/// The new owner's sign-in found this Mac's revoked device from another Ottto
+/// account (`revoked_cross_account_predecessor`). Replace it on the browser
+/// claim page is still the step that binds it to the new account.
+const MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE: &str = "This Mac was disconnected from its earlier Ottto account. To connect it to your account, choose Replace it on the sign-in page in your browser.";
+
+/// Typed signal for the same case in the error details, so the app and the CLI
+/// act on it without matching message text.
+const MAC_DISCONNECTED_REASON_CODE: &str = "mac_disconnected";
+
+/// Exact backend `detail` strings that mean Ottto no longer accepts this Mac's
+/// device or account. A compatibility path until the backend types them.
+const MAC_DISCONNECTED_DETAILS: [&str; 7] = [
+    "Telemetry device is not active",
+    "Telemetry device is revoked",
+    "Telemetry device not found",
+    "Telemetry device secret is invalid",
+    "Telemetry device was revoked during registration",
+    "Setup run owner not found",
+    "Setup run organization not found",
+];
+
+/// Ottto refused this Mac (401/403) because its device was revoked or its
+/// account no longer exists. Diagnostics uploads and cloud logout keep their
+/// own guidance.
+fn backend_error_means_mac_disconnected(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(backend) = error else {
+        return false;
+    };
+    if !matches!(backend.status, Some(401 | 403))
+        || backend.endpoint.contains("/diagnostics/")
+        || backend.endpoint.contains("/local-client/disconnect")
+    {
+        return false;
+    }
+    backend_error_indicates_account_gone(error)
+        || backend_error_detail(backend)
+            .is_some_and(|detail| MAC_DISCONNECTED_DETAILS.contains(&detail.as_str()))
 }
 
 const SETUP_RUN_EXPIRED_DETAIL: &str = "Setup run expired";
@@ -9201,17 +9296,17 @@ fn reattach_required_state(error: &LocalApiError) -> Option<ReattachRequiredStat
         .and_then(|object| object.get("can_reconnect"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    let action = if can_reconnect {
-        "Reconnect it with the saved credential, or approve Replace it in the browser."
+    let text = if can_reconnect {
+        format!(
+            "This Mac is already registered as {device_name}{last_seen_text}. Reconnect it with the saved credential, or approve Replace it in the browser."
+        )
     } else {
-        "The predecessor was revoked. Approve Replace it in the browser to bind the new owner without importing pre-revocation history."
+        MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE.to_string()
     };
     Some(ReattachRequiredState {
         message: StableMessage {
             code: format!("reattach_required:{reason}"),
-            text: format!(
-                "This Mac is already registered as {device_name}{last_seen_text}. {action}"
-            ),
+            text,
         },
         can_reconnect,
     })
@@ -11049,11 +11144,14 @@ fn run_install_source_action(
     let patch = match source_kind {
         SourceKind::Codex => reconcile_codex_source_off()?,
         SourceKind::ClaudeCode => {
-            patch_claude_code_settings_with_relay_base(machine, &relay_base_url)?
+            patch_claude_code_settings_with_relay_base(machine, &relay_base_url, false)?
         }
         SourceKind::Pi => unreachable!("Pi install actions do not patch OTLP config"),
     };
-    let config_event_message = if patch.changed {
+    let kept = patch.kept.map(claude_settings_kept_reason);
+    let config_event_message = if let Some((_, text)) = kept {
+        text.to_string()
+    } else if patch.changed {
         format!(
             "Patched {} telemetry settings",
             source_display_name(&source_kind)
@@ -11064,31 +11162,37 @@ fn run_install_source_action(
             source_display_name(&source_kind)
         )
     };
+    let mut metadata = json!({
+        "source": source,
+        "settings": match source_kind {
+            SourceKind::Codex => "codex_config",
+            SourceKind::ClaudeCode => "claude_settings",
+            SourceKind::Pi => "none",
+        },
+        "changed": patch.changed,
+        "created": patch.created,
+        "backup_created": patch.backup_created,
+        "backup_scope": "source_config",
+        "restore_operation": "uninstall_restore",
+    });
+    if let Some((reason, _)) = kept {
+        metadata["reason"] = json!(reason);
+    }
     record_install_session_event(
         api_base_url,
         &install_session.install_session_id,
         &install_session.install_session_token,
         InstallSessionEvent {
-            event_type: if patch.changed {
+            event_type: if kept.is_some() {
+                "config.patch.skipped"
+            } else if patch.changed {
                 "config.patched"
             } else {
                 "config.unchanged"
             },
             status: "succeeded",
             message: &config_event_message,
-            metadata: Some(json!({
-                "source": source,
-                "settings": match source_kind {
-                    SourceKind::Codex => "codex_config",
-                    SourceKind::ClaudeCode => "claude_settings",
-                    SourceKind::Pi => "none",
-                },
-                "changed": patch.changed,
-                "created": patch.created,
-                "backup_created": patch.backup_created,
-                "backup_scope": "source_config",
-                "restore_operation": "uninstall_restore",
-            })),
+            metadata: Some(metadata),
             device_id: Some(&device_id),
         },
     )?;
@@ -11116,7 +11220,13 @@ fn run_install_source_action(
     }
 
     let status = if relay_running { "succeeded" } else { "failed" }.to_string();
-    let message = if relay_running {
+    let message = if let Some((_, text)) = kept {
+        if relay_running {
+            text.to_string()
+        } else {
+            format!("{text} The local OTLP relay is not listening.")
+        }
+    } else if relay_running {
         format!(
             "{} telemetry setup installed",
             source_display_name(&source_kind)
@@ -11699,6 +11809,36 @@ fn device_credential_request_authority(
         prior_device_id: prior.map(|value| value.device_id.clone()),
         prior_device_sources: prior.map(|value| value.device_sources.clone()),
         prior_secret_commitment_sha256: prior.map(|value| secret_sha256(&value.device_secret)),
+        canonical_snapshot_namespace: None,
+    }
+}
+
+/// Journal the prior device's snapshot namespace when this setup claim is the
+/// prior owner's user and organization on the same API and machine. Any other
+/// claim (or the register route) starts its own namespace, as before.
+fn continue_prior_snapshot_namespace(
+    pending: &mut PendingDeviceCredentialPreparation,
+    prior: Option<&PriorDeviceCredential>,
+) {
+    let (Some(prior), Some(claim), Some(authority)) = (
+        prior,
+        pending.claim_commit.as_ref(),
+        pending.request_authority.as_mut(),
+    ) else {
+        return;
+    };
+    let Some(owner) = prior.owner.as_ref() else {
+        return;
+    };
+    if authority.flow == "setup_claim"
+        && authority.prior_device_id.as_deref() == Some(prior.device_id.as_str())
+        && pending.device.machine_id.as_deref() == Some(authority.machine_id.as_str())
+        && claim.account.user.as_ref().map(|user| &user.id) == Some(&owner.user_id)
+        && claim.account.organization.as_ref().map(|org| &org.id) == Some(&owner.organization_id)
+        && claim.connection.api_base_url.trim_end_matches('/')
+            == owner.api_base_url.trim_end_matches('/')
+    {
+        authority.canonical_snapshot_namespace = Some(prior.snapshot_namespace.clone());
     }
 }
 
@@ -11713,6 +11853,8 @@ fn same_prior_device_authority(
             let actual_secret_commitment = secret_sha256(&actual.device_secret);
             expected.device_id == actual.device_id
                 && expected.device_sources == actual.device_sources
+                && expected.owner == actual.owner
+                && expected.snapshot_namespace == actual.snapshot_namespace
                 && constant_work_eq(
                     expected_secret_commitment.as_bytes(),
                     actual_secret_commitment.as_bytes(),
@@ -11859,6 +12001,10 @@ struct PriorDeviceCredential {
     device_id: String,
     device_sources: Vec<String>,
     device_secret: String,
+    /// Account the credential was installed for, if known.
+    owner: Option<LocalCredentialOwner>,
+    /// The namespace its local snapshot history lives under.
+    snapshot_namespace: String,
 }
 
 fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
@@ -11868,12 +12014,30 @@ fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCreden
         return prior_device_credential_with_stores(
             &active_store,
             &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            connected_account_owner(),
         );
     }
+    // A retained prior carries the owner recorded before logout reset the account.
     prior_device_credential_with_stores(
         &FileDeviceStore::new(default_prior_device_path()),
         &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
+        None,
     )
+}
+
+/// Owner of a legacy active binding written before credentials recorded one:
+/// the bound account, only while it is connected.
+fn connected_account_owner() -> Option<LocalCredentialOwner> {
+    let account = FileAccountStore::default().load().ok()?;
+    let connection = FileConnectionStore::default().load().ok()??;
+    if account.state != LocalAccountState::Connected {
+        return None;
+    }
+    Some(LocalCredentialOwner {
+        user_id: account.user?.id,
+        organization_id: account.organization?.id,
+        api_base_url: connection.api_base_url,
+    })
 }
 
 fn retain_prior_device_credential_for_logout() -> Result<(), LocalApiError> {
@@ -11882,6 +12046,7 @@ fn retain_prior_device_credential_for_logout() -> Result<(), LocalApiError> {
         &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
         &FileDeviceStore::new(default_prior_device_path()),
         &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
+        connected_account_owner(),
     )
 }
 
@@ -11890,8 +12055,9 @@ fn retain_prior_device_credential_with_stores(
     active_secret_store: &impl ControlTokenStore,
     prior_device_store: &FileDeviceStore,
     prior_secret_store: &impl ControlTokenStore,
+    legacy_owner: Option<LocalCredentialOwner>,
 ) -> Result<(), LocalApiError> {
-    let Some(device) = active_device_store.load().or_state_poisoned()? else {
+    let Some(mut envelope) = active_device_store.load_envelope().or_state_poisoned()? else {
         return Ok(());
     };
     let secret = match active_secret_store.load() {
@@ -11909,11 +12075,14 @@ fn retain_prior_device_credential_with_stores(
         }
         Err(_) => return Err(LocalApiError::StatePoisoned),
     };
-    if device.device_id.trim().is_empty() || secret.trim().is_empty() {
+    if envelope.device.device_id.trim().is_empty() || secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
     prior_secret_store.save(&secret).or_state_poisoned()?;
-    prior_device_store.save(&device).or_state_poisoned()
+    envelope.continuity.owner = envelope.continuity.owner.take().or(legacy_owner);
+    prior_device_store
+        .save_envelope(&envelope)
+        .or_state_poisoned()
 }
 
 fn clear_prior_device_credential() -> Result<(), LocalApiError> {
@@ -11933,18 +12102,28 @@ fn clear_prior_device_selector() -> Result<(), LocalApiError> {
 fn prior_device_credential_with_stores(
     device_store: &FileDeviceStore,
     secret_store: &impl ControlTokenStore,
+    legacy_owner: Option<LocalCredentialOwner>,
 ) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
-    let Some(device) = device_store.load().or_state_poisoned()? else {
+    let Some(LocalDeviceEnvelope { device, continuity }) =
+        device_store.load_envelope().or_state_poisoned()?
+    else {
         return Ok(None);
     };
     let device_secret = secret_store.load().or_state_poisoned()?;
     if device.device_id.trim().is_empty() || device_secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
+    let snapshot_namespace = crate::snapshot_sync::snapshot_destination_namespace(
+        &device,
+        &device_secret,
+        continuity.snapshot_namespace.as_ref(),
+    );
     Ok(Some(PriorDeviceCredential {
         device_id: device.device_id,
         device_sources: device.sources,
         device_secret,
+        owner: continuity.owner.or(legacy_owner),
+        snapshot_namespace,
     }))
 }
 
@@ -12006,11 +12185,14 @@ fn record_install_session_event(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ConfigPatchResult {
     changed: bool,
     created: bool,
     backup_created: bool,
+    /// Claude settings left untouched because the user opted out or exports
+    /// telemetry elsewhere.
+    kept: Option<crate::agent_configs::claude_managed_settings::Outcome>,
 }
 
 fn local_relay_base_url_for_daemon(daemon: &LocalDaemon) -> String {
@@ -12045,11 +12227,7 @@ pub fn reconcile_codex_source_off_at_startup() -> Result<bool, LocalApiError> {
 
 fn reconcile_codex_source_off() -> Result<ConfigPatchResult, LocalApiError> {
     if source_patch_disabled(&SourceKind::Codex) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     reconcile_codex_source_off_at(&home_path(".codex/config.toml"), &default_support_dir())
 }
@@ -12065,21 +12243,13 @@ fn reconcile_codex_source_off_at(
     let existing = match fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConfigPatchResult {
-                changed: false,
-                created: false,
-                backup_created: false,
-            })
+            return Ok(ConfigPatchResult::default())
         }
         Err(_) => return Err(LocalApiError::StatePoisoned),
     };
     let next = codex_source_off_body(&existing)?;
     if next == existing {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
     if fs::read_to_string(path).or_state_poisoned()? != existing {
@@ -12093,6 +12263,7 @@ fn reconcile_codex_source_off_at(
         changed: true,
         created: false,
         backup_created,
+        kept: None,
     })
 }
 
@@ -12229,6 +12400,7 @@ fn patch_codex_config_at_with_relay_base(
         changed: write.changed,
         created: write.created,
         backup_created,
+        kept: None,
     })
 }
 
@@ -12253,9 +12425,12 @@ fn render_codex_relay_toml_block_for_base(relay_base_url: &str) -> String {
     .join("\n")
 }
 
+/// `clear_opt_out` only for the explicit source Enable; every other caller
+/// leaves an opt-out or external exporter in place and reports it.
 fn patch_claude_code_settings_with_relay_base(
     machine: &MachineIdentity,
     relay_base_url: &str,
+    clear_opt_out: bool,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let _settings_guard = lock_managed_claude_settings();
     let backup_root = default_support_dir();
@@ -12264,6 +12439,7 @@ fn patch_claude_code_settings_with_relay_base(
         machine,
         &backup_root,
         relay_base_url,
+        clear_opt_out,
     )?;
     patch.changed |= repair_registered_managed_claude_relay_settings_locked()?;
     Ok(patch)
@@ -12276,13 +12452,9 @@ fn repair_claude_statusline_for_refresh_at(
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     if !claude_statusline_refresh_repair_needed(path, support_dir) {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
-    patch_claude_code_settings_at_with_relay_base(path, machine, support_dir, relay_base_url)
+    patch_claude_code_settings_at_with_relay_base(path, machine, support_dir, relay_base_url, false)
 }
 
 fn claude_statusline_refresh_repair_needed(path: &Path, support_dir: &Path) -> bool {
@@ -12391,11 +12563,7 @@ fn patch_claude_code_env_at(
     let shell_would_change =
         claude_env::upsert_would_change(shell_rc_path, shell_body).map_err(agent_config_error)?;
     if !env_would_change && !shell_would_change {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
+        return Ok(ConfigPatchResult::default());
     }
     let env_backup_created = if env_would_change {
         backup_existing_config(SourceKind::ClaudeCode, env_path, backup_root)?.is_some()
@@ -12423,6 +12591,7 @@ fn patch_claude_code_env_at(
         changed: env_write.changed || shell_write.changed,
         created: env_write.created || shell_write.created,
         backup_created: env_backup_created || shell_backup_created,
+        kept: None,
     })
 }
 
@@ -12453,6 +12622,7 @@ fn remove_claude_code_env_at(
         changed: env_write.changed || shell_write.changed || removed_empty_env,
         created: false,
         backup_created: false,
+        kept: None,
     })
 }
 
@@ -12474,6 +12644,7 @@ fn patch_claude_code_settings_at(
         machine,
         backup_root,
         &crate::otlp_relay::default_local_relay_base_url(),
+        false,
     )
 }
 
@@ -12482,19 +12653,49 @@ fn patch_claude_code_settings_at_with_relay_base(
     machine: &MachineIdentity,
     backup_root: &Path,
     relay_base_url: &str,
+    clear_opt_out: bool,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    use crate::agent_configs::claude_managed_settings::{reconcile_default, Outcome};
     let created = !path.exists();
-    let existing_settings = if created {
-        json!({})
-    } else {
-        let body = fs::read_to_string(path).or_state_poisoned()?;
-        serde_json::from_str::<serde_json::Value>(&body).or_state_poisoned()?
-    };
-    let mut settings = existing_settings.clone();
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    let delegated_statusline = match existing_claude_statusline_command(&settings) {
+    let root = path.parent().ok_or(LocalApiError::StatePoisoned)?;
+    let (mut wrapper_changed, mut backup_created) = (false, false);
+    let (written, kept) = reconcile_default(
+        root,
+        &claude_code_relay_env_with_base(machine, relay_base_url),
+        clear_opt_out,
+        |settings| {
+            wrapper_changed = point_claude_statusline_at_wrapper(settings, backup_root)
+                .map_err(io::Error::other)?;
+            Ok(())
+        },
+        || {
+            backup_created = backup_existing_config(SourceKind::ClaudeCode, path, backup_root)
+                .map_err(io::Error::other)?
+                .is_some();
+            Ok(())
+        },
+    )
+    .map_err(|error| {
+        LocalApiError::LocalOperationFailed(format!(
+            "Claude Code settings could not be safely updated: {error}"
+        ))
+    })?;
+    let written = written == Outcome::Changed;
+    Ok(ConfigPatchResult {
+        changed: written || wrapper_changed,
+        created: created && written,
+        backup_created,
+        kept,
+    })
+}
+
+/// Route the settings status line through Ottto's wrapper, delegating to the
+/// user's own command, and refresh the wrapper. Returns whether it changed.
+fn point_claude_statusline_at_wrapper(
+    settings: &mut serde_json::Value,
+    backup_root: &Path,
+) -> Result<bool, LocalApiError> {
+    let delegated_statusline = match existing_claude_statusline_command(settings) {
         Some(command) => Some(command),
         None => existing_claude_statusline_wrapper_delegated_command(backup_root)?,
     };
@@ -12517,45 +12718,30 @@ fn patch_claude_code_settings_at_with_relay_base(
         "command".to_string(),
         serde_json::Value::String(shell_quote_path(&statusline_script)),
     );
-
-    let env_value = object.entry("env").or_insert_with(|| json!({}));
-    if !env_value.is_object() {
-        *env_value = json!({});
-    }
-    let env = env_value
-        .as_object_mut()
-        .ok_or(LocalApiError::StatePoisoned)?;
-    for (key, value) in claude_code_relay_env_with_base(machine, relay_base_url) {
-        env.insert(key.to_string(), serde_json::Value::String(value));
-    }
-
-    let settings_changed = settings != existing_settings;
-    let backup_created = if settings_changed {
-        backup_existing_config(SourceKind::ClaudeCode, path, backup_root)?.is_some()
-    } else {
-        false
-    };
     let (_statusline_script, wrapper_changed) =
         write_claude_statusline_wrapper(backup_root, delegated_statusline.as_deref())?;
-    if !settings_changed {
-        return Ok(ConfigPatchResult {
-            changed: wrapper_changed,
-            created: false,
-            backup_created: false,
-        });
+    Ok(wrapper_changed)
+}
+
+/// Stable reason code and user text for Claude settings Ottto left untouched.
+fn claude_settings_kept_reason(
+    kept: crate::agent_configs::claude_managed_settings::Outcome,
+) -> (&'static str, &'static str) {
+    use crate::agent_configs::claude_managed_settings::Outcome;
+    match kept {
+        Outcome::OptedOut => (
+            "opted_out",
+            "Claude Code settings turn telemetry off, so Ottto left their telemetry settings unchanged.",
+        ),
+        Outcome::Linked => (
+            "linked_settings",
+            "Claude Code settings.json is a link or not a regular file, so Ottto left it unchanged.",
+        ),
+        _ => (
+            "external_telemetry",
+            "Claude Code settings send telemetry to another collector, so Ottto left their telemetry settings unchanged.",
+        ),
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).or_state_poisoned()?;
-    }
-    let body = serde_json::to_vec_pretty(&settings).or_state_poisoned()?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, body).or_state_poisoned()?;
-    fs::rename(tmp_path, path).or_state_poisoned()?;
-    Ok(ConfigPatchResult {
-        changed: true,
-        created,
-        backup_created,
-    })
 }
 
 fn existing_claude_statusline_command(settings: &serde_json::Value) -> Option<String> {
@@ -15049,7 +15235,7 @@ fn control_token_validation_base_url(requested: Option<&str>) -> Result<String, 
 /// optionally with a sub-path). Unlike [`is_trusted_api_base_url`] this excludes
 /// the loopback dev allowance, so it is safe to honor even from an untrusted
 /// request body when deciding where to validate a control token.
-fn is_production_api_base_url(value: &str) -> bool {
+pub(crate) fn is_production_api_base_url(value: &str) -> bool {
     if value.contains('@') || value.contains('?') || value.contains('#') {
         return false;
     }
@@ -18740,6 +18926,8 @@ for line in sys.stdin:
             device_id: "device-prior".to_string(),
             device_sources: vec!["codex".to_string(), "pi".to_string()],
             device_secret: prior_secret.to_string(),
+            owner: None,
+            snapshot_namespace: "a".repeat(64),
         };
         device_credential_request_authority(
             "setup_claim",
@@ -19240,6 +19428,8 @@ for line in sys.stdin:
                 device_id: old_device.device_id.clone(),
                 device_sources: old_device.sources.clone(),
                 device_secret: old_secret.clone(),
+                owner: None,
+                snapshot_namespace: "a".repeat(64),
             }),
             Some(IDENTITY_CONTINUITY_CAPABILITY),
         ));
@@ -22294,6 +22484,8 @@ for line in sys.stdin:
             device_id: "device_prior".to_string(),
             device_sources: vec!["codex".to_string()],
             device_secret: "secret_prior".to_string(),
+            owner: None,
+            snapshot_namespace: "a".repeat(64),
         };
         let repeat =
             telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
@@ -22643,7 +22835,7 @@ for line in sys.stdin:
         let missing_secret = MemoryTokenStore::new();
 
         assert!(matches!(
-            prior_device_credential_with_stores(&device_store, &missing_secret),
+            prior_device_credential_with_stores(&device_store, &missing_secret, None),
             Err(LocalApiError::StatePoisoned)
         ));
         assert!(device_store
@@ -28365,7 +28557,7 @@ X-API-Key = "otel_redacted"
         assert_eq!(fs::read(&default).unwrap(), default_body);
         assert!(!disable_managed_claude_relay_settings().unwrap());
         // Explicit source enable restores approval; root-specific off remains.
-        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123", true)
             .unwrap();
         assert!(!repair_registered_managed_claude_relay_settings().unwrap());
         let mut settings: serde_json::Value =
@@ -28373,7 +28565,7 @@ X-API-Key = "otel_redacted"
         settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] = json!("0");
         fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
         disable_managed_claude_relay_settings().unwrap();
-        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123", true)
             .unwrap();
         assert!(!repair_registered_managed_claude_relay_settings().unwrap());
         let settings: serde_json::Value =
@@ -28478,8 +28670,7 @@ X-API-Key = "otel_redacted"
 
     #[test]
     fn patch_claude_code_settings_writes_loopback_relay_without_dropping_env() {
-        let root =
-            std::env::temp_dir().join(format!("ottto-claude-settings-test-{}", std::process::id()));
+        let root = control_test_root("claude-settings-loopback");
         let path = root.join("settings.json");
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(
@@ -28870,6 +29061,7 @@ X-API-Key = "otel_redacted"
             &test_machine(),
             &support_dir,
             &default_base,
+            false,
         )
         .expect("seed clean settings");
         let clean_body = fs::read_to_string(&clean).expect("read clean settings");
@@ -28909,6 +29101,7 @@ X-API-Key = "otel_redacted"
             &test_machine(),
             &support_dir,
             &default_base,
+            false,
         )
         .expect("restore clean wrapper");
 
@@ -29700,6 +29893,113 @@ X-API-Key = "otel_redacted"
         );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
+    }
+
+    fn backend_rejection(endpoint: &str, status: u16, body: &str) -> LocalApiError {
+        LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: endpoint.to_string(),
+            status: Some(status),
+            body_excerpt: Some(body.to_string()),
+            reason_code: None,
+        })
+    }
+
+    #[test]
+    fn revoked_or_deleted_mac_gets_plain_sign_in_guidance() {
+        // Observed 2026-11-04: a Mac whose account was deleted showed "Ottto
+        // rejected the local setup request. Open the Ottto app from Ottto to
+        // attach an active setup run. (HTTP 401)".
+        for (endpoint, body) in [
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":"Telemetry device is not active"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/refresh",
+                r#"{"detail":"Telemetry device not found"}"#,
+            ),
+            (
+                "/api/v1/agent-status/snapshots",
+                r#"{"detail":"Telemetry device is revoked"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":"Setup run owner not found"}"#,
+            ),
+            (
+                "/api/v1/setup-runs/[id]/local-client/scan-result",
+                r#"{"detail":{"code":"account_not_found"}}"#,
+            ),
+        ] {
+            let error = cli_error(backend_rejection(endpoint, 401, body));
+            assert_eq!(error.message, MAC_DISCONNECTED_MESSAGE, "{endpoint} {body}");
+            assert_eq!(
+                error.details.get("reason_code"),
+                Some(&RedactedValue::String("mac_disconnected".to_string())),
+                "{endpoint} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_rejections_keep_their_guidance_and_no_disconnected_reason() {
+        let expired = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/scan-result",
+            401,
+            r#"{"detail":"Setup run expired"}"#,
+        ));
+        assert_eq!(
+            expired.message,
+            "Setup run expired. Run `ottto login` to reconnect this Mac."
+        );
+        assert!(!expired.details.contains_key("reason_code"));
+
+        let unknown = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/scan-result",
+            401,
+            r#"{"detail":"Setup run companion token expired"}"#,
+        ));
+        assert!(unknown.message.contains("attach an active setup run"));
+        assert!(!unknown.details.contains_key("reason_code"));
+
+        let diagnostics = cli_error(backend_rejection(
+            "/api/v1/diagnostics/bundles",
+            401,
+            r#"{"detail":"Telemetry device is not active"}"#,
+        ));
+        assert!(diagnostics.message.contains("diagnostics upload"));
+        assert!(!diagnostics.details.contains_key("reason_code"));
+
+        let logout = cli_error(backend_rejection(
+            "/api/v1/setup-runs/[id]/local-client/disconnect",
+            401,
+            r#"{"detail":"Telemetry device is not active"}"#,
+        ));
+        assert!(logout.message.contains("cloud logout"));
+        assert!(!logout.details.contains_key("reason_code"));
+    }
+
+    #[test]
+    fn revoked_cross_account_predecessor_gets_plain_replace_it_guidance() {
+        let body = r#"{"detail":{"code":"reattach_required","reason":"revoked_cross_account_predecessor","device_name":"Test Mac","can_reconnect":false}}"#;
+        let endpoint = "/api/v1/setup-claims/[claim]/local-client/complete";
+        let message = cli_error(backend_rejection(endpoint, 409, body)).message;
+        assert_eq!(message, MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE);
+        assert!(message.contains("Replace it"));
+        assert!(!message.contains("predecessor"));
+
+        let state = reattach_required_state(&backend_rejection(endpoint, 409, body))
+            .expect("reattach state");
+        assert_eq!(
+            state.message.code,
+            "reattach_required:revoked_cross_account_predecessor"
+        );
+        assert_eq!(
+            state.message.text,
+            MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE
+        );
+        assert!(!state.can_reconnect);
     }
 
     #[test]
@@ -32086,6 +32386,416 @@ X-API-Key = "otel_redacted"
         )
     }
 
+    const RELOGIN_CUTOFF: &str = "2026-10-01T00:00:00Z";
+
+    fn relogin_env(name: &str) -> [EnvVarGuard; 2] {
+        let secrets = telemetry_key_store_root(&format!("{name}-secret"));
+        fs::create_dir_all(&secrets).expect("secret root");
+        [
+            EnvVarGuard::set_path(
+                "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                &telemetry_key_store_root(name),
+            ),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+        ]
+    }
+
+    fn relogin_device(device_id: &str, sources: &[&str]) -> LocalDeviceBinding {
+        LocalDeviceBinding {
+            device_id: device_id.to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+        }
+    }
+
+    fn relogin_account(user: &str, org: &str) -> (LocalAccountBinding, LocalConnectionBinding) {
+        let mut account = connected_account();
+        account.user.as_mut().unwrap().id = user.to_string();
+        account.organization.as_mut().unwrap().id = org.to_string();
+        let connection = LocalConnectionBinding {
+            setup_run_id: format!("setup-{user}"),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some(format!("claim-{user}")),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        (account, connection)
+    }
+
+    /// A legacy (owner-less) active device of connected `user`; its first claim
+    /// set a dated cutoff and completed Codex backfill on the returned namespace.
+    fn install_legacy_active(device_id: &str, sources: &[&str], user: &str) -> String {
+        let (account, connection) = relogin_account(user, "org_test");
+        FileAccountStore::default().save(&account).unwrap();
+        FileConnectionStore::default().save(&connection).unwrap();
+        let device = relogin_device(device_id, sources);
+        FileDeviceStore::default().save(&device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("secret-0")
+            .unwrap();
+        let namespace = raw_namespace(device_id, "secret-0");
+        let support = default_support_dir();
+        crate::backfill::apply_claim_backfill_policy_for_destination(
+            &support,
+            Some("from"),
+            Some(RELOGIN_CUTOFF),
+            user,
+            Some(&namespace),
+        )
+        .unwrap();
+        let codex = crate::snapshots::SnapshotSource::Codex;
+        crate::backfill::update_backfill_state(&support, |state| {
+            crate::backfill::mark_backfill_complete_for_destination(state, codex, &namespace)
+        })
+        .unwrap();
+        namespace
+    }
+
+    /// The local-only logout steps that matter here: retain, then reset.
+    fn relogin_local_logout() {
+        retain_prior_device_credential_for_logout().unwrap();
+        FileAccountStore::default().reset().unwrap();
+        FileConnectionStore::default().reset().unwrap();
+        FileDeviceStore::default().reset().unwrap();
+        let secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        secret.delete().unwrap();
+    }
+
+    /// A setup claim by `user`/`org` rotating `prior` to `next` (dated
+    /// backfill at the first cutoff), decided as at stage time.
+    fn relogin_claim(
+        prior: &PriorDeviceCredential,
+        user: &str,
+        org: &str,
+        next: LocalDeviceBinding,
+    ) -> (PendingDeviceCredentialPreparation, String, String) {
+        let candidate = format!("candidate-{}-{}", next.device_id, "secret".repeat(3));
+        let setup_token = format!("setup-{}-{}", next.device_id, "token".repeat(3));
+        let (account, connection) = relogin_account(user, org);
+        let mut pending = test_pending_device_credential(&next.device_id, true);
+        pending.request_authority = Some(device_credential_request_authority(
+            "setup_claim",
+            &next.device_id,
+            &test_machine(),
+            Some(prior),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        pending.device = next;
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            target_user_id: user.to_string(),
+            account,
+            connection,
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: Some("from".to_string()),
+            backfill_cutoff_at: Some(RELOGIN_CUTOFF.to_string()),
+        });
+        continue_prior_snapshot_namespace(&mut pending, Some(prior));
+        (pending, candidate, setup_token)
+    }
+
+    fn journaled_namespace(pending: &PendingDeviceCredentialPreparation) -> Option<String> {
+        let authority = pending.request_authority.as_ref()?;
+        authority.canonical_snapshot_namespace.clone()
+    }
+
+    fn stored_journal_namespace() -> Option<String> {
+        let pending = FilePendingDeviceCredentialStore::default().load().unwrap();
+        journaled_namespace(&pending?)
+    }
+
+    /// Stage, confirm and promote through startup recovery.
+    fn promote_relogin(pending: &PendingDeviceCredentialPreparation, candidate: &str, token: &str) {
+        stage_pending_device_credential(pending, candidate).unwrap();
+        stage_pending_setup_run_token(pending, token).unwrap();
+        let store = FilePendingDeviceCredentialStore::default();
+        mark_pending_device_credential_confirmed(pending, "2026-11-05T00:00:00Z", &store).unwrap();
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+    }
+
+    /// What the snapshot loader and resolver use for the active credential.
+    fn active_namespace() -> String {
+        let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+        crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &secret)
+    }
+
+    fn raw_namespace(device_id: &str, secret: &str) -> String {
+        let device = relogin_device(device_id, &[]);
+        crate::snapshot_sync::snapshot_destination_namespace(&device, secret, None)
+    }
+
+    fn cutoff_destination() -> Option<String> {
+        let state = crate::backfill::load_backfill_state(&default_support_dir());
+        assert_eq!(state.backfill_cutoff_at.as_deref(), Some(RELOGIN_CUTOFF));
+        state.backfill_cutoff_destination_namespace
+    }
+
+    #[test]
+    #[serial]
+    /// [regress] R1/R4: a same-account claim re-login keeps the local
+    /// namespace for each source, re-claimed while bound or after a local
+    /// logout of a legacy (owner-less) device, along A→B and A→B→C. A grant
+    /// added by the successor, or dropped by the next, changes nothing; the
+    /// first claim's dated cutoff stays bound to the namespace.
+    fn same_account_relogin_keeps_snapshot_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for source in ["claude_code", "codex", "pi"] {
+            let grants: [&[&str]; 2] = [&["claude_code", "codex", "pi"], &[source]];
+            for (logout, links) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+                let row = format!("{source}, logout={logout}, links={links}");
+                let _env = relogin_env(&format!("relogin-keep-{source}-{logout}-{links}"));
+                let id = |link: usize| format!("device-{source}-{link}");
+                let canonical = install_legacy_active(&id(0), &[source], "user_test");
+                for link in 1..=links {
+                    if logout {
+                        relogin_local_logout();
+                    }
+                    let prior = prior_device_credential_for_registration().unwrap().unwrap();
+                    assert_eq!(prior.snapshot_namespace, canonical, "{row}");
+                    let next = relogin_device(&id(link), grants[link - 1]);
+                    let (pending, candidate, token) =
+                        relogin_claim(&prior, "user_test", "org_test", next);
+                    assert_eq!(journaled_namespace(&pending), Some(canonical.clone()));
+                    promote_relogin(&pending, &candidate, &token);
+                    assert_eq!(active_namespace(), canonical, "{row}");
+                    assert_ne!(raw_namespace(&id(link), &candidate), canonical);
+                    let binding = FileDeviceStore::default().load_envelope().unwrap().unwrap();
+                    let owner = binding.continuity.owner.unwrap();
+                    assert_eq!(
+                        [owner.user_id, owner.organization_id],
+                        ["user_test", "org_test"]
+                    );
+                    let alias = binding.continuity.snapshot_namespace.unwrap();
+                    assert_eq!(alias.namespace, canonical, "{row}: copied, never chained");
+                    assert_eq!(cutoff_destination(), Some(canonical.clone()), "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    /// R5: a claim that does not prove the same account on the same API and
+    /// machine journals no namespace; the promoted credential resolves raw
+    /// and inherits none of the predecessor's backfill completion. "0-case"
+    /// rows are defensive checks no current caller reaches.
+    fn relogin_refusals_start_a_fresh_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        type Pending = PendingDeviceCredentialPreparation;
+        fn claim(pending: &mut Pending) -> &mut PendingClaimCredentialCommit {
+            pending.claim_commit.as_mut().unwrap()
+        }
+        fn authority(pending: &mut Pending) -> &mut PendingDeviceCredentialRequestAuthority {
+            pending.request_authority.as_mut().unwrap()
+        }
+        let promoted = |row: &str, edit: &dyn Fn(&mut Pending, &mut PriorDeviceCredential)| {
+            let _env = relogin_env(&format!("relogin-refuse-{row}"));
+            let canonical = install_legacy_active("device-refuse-a", &["codex"], "user_test");
+            let mut prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let next = relogin_device("device-refuse-b", &["codex"]);
+            let (mut pending, candidate, token) =
+                relogin_claim(&prior, "user_test", "org_test", next);
+            let original = pending.claim_commit.clone().unwrap();
+            authority(&mut pending).canonical_snapshot_namespace = None;
+            edit(&mut pending, &mut prior);
+            let prior = Some(&prior).filter(|_| row != "no prior");
+            continue_prior_snapshot_namespace(&mut pending, prior);
+            // A claim the commit validator refuses cannot promote at all.
+            let commit = pending.claim_commit.get_or_insert_with(|| original.clone());
+            if commit.account.user.is_none() {
+                commit.account.user = original.account.user;
+            }
+            promote_relogin(&pending, &candidate, &token);
+            let namespace = active_namespace();
+            let owed = |namespace: &str| {
+                let state = crate::backfill::load_backfill_state(&default_support_dir());
+                crate::backfill::pending_backfill_sources_for_destination(&state, namespace)
+            };
+            let codex = crate::snapshots::SnapshotSource::Codex;
+            assert!(!owed(&canonical).contains(&codex), "{row}");
+            let inherited = !owed(&namespace).contains(&codex);
+            (pending, namespace, candidate, inherited)
+        };
+        let fresh = |row: &str, edit: &dyn Fn(&mut Pending, &mut PriorDeviceCredential)| {
+            let (pending, namespace, candidate, inherited) = promoted(row, edit);
+            assert_eq!(journaled_namespace(&pending), None, "{row}");
+            assert!(!inherited, "{row}: no predecessor completion");
+            let raw = raw_namespace("device-refuse-b", &candidate);
+            assert_eq!(namespace, raw, "{row}");
+        };
+        let (control, namespace, _, inherited) = promoted("control", &|_, _| {});
+        assert!(inherited, "control keeps its completion");
+        assert_eq!(journaled_namespace(&control), Some(namespace), "kept");
+        fresh("different user", &|p, _| {
+            claim(p).target_user_id += "x";
+            claim(p).account.user.as_mut().unwrap().id += "x";
+        });
+        fresh("other org", &|p, _| {
+            claim(p).account.organization.as_mut().unwrap().id += "x"
+        });
+        fresh("None user", &|p, _| claim(p).account.user = None);
+        fresh("None org", &|p, _| claim(p).account.organization = None);
+        fresh("None machine", &|p, _| p.device.machine_id = None);
+        fresh("other machine", &|p, _| {
+            p.device.machine_id = Some("other".into())
+        });
+        fresh("no prior", &|_, _| {});
+        fresh("no owner", &|_, prior| prior.owner = None);
+        fresh("api differs", &|_, prior| {
+            prior.owner.as_mut().unwrap().api_base_url = "https://api.other.example".into()
+        });
+        fresh("register route", &|p, _| {
+            authority(p).flow = "register".into()
+        });
+        fresh("0-case: foreign prior", &|_, prior| prior.device_id += "x");
+        fresh("0-case: no claim commit", &|p, _| p.claim_commit = None);
+
+        // No journal carries a namespace on the register route or malformed.
+        for (flow, namespace) in [("register", "a".repeat(64)), ("setup_claim", "zz".into())] {
+            let mut pending = control.clone();
+            authority(&mut pending).flow = flow.into();
+            authority(&mut pending).canonical_snapshot_namespace = Some(namespace);
+            let refused = validate_pending_prior_credential_binding(&pending);
+            assert_eq!(refused, Err(LocalApiError::StatePoisoned), "{flow}");
+        }
+
+        // The loader takes an alias only with this secret's commitment, even
+        // when its namespace is another credential's raw hash, and a reload
+        // after a legacy save stripped it resolves raw in the same process.
+        let _env = relogin_env("relogin-carry");
+        let device = relogin_device("device-carry", &["codex"]);
+        let install = |namespace: String, commitment: &str| {
+            let snapshot_namespace = Some(SnapshotNamespaceAlias {
+                namespace,
+                secret_commitment_sha256: secret_sha256(commitment),
+            });
+            let continuity = DeviceCredentialContinuity {
+                owner: None,
+                snapshot_namespace,
+            };
+            let envelope = LocalDeviceEnvelope {
+                device: device.clone(),
+                continuity,
+            };
+            FileDeviceStore::default().save_envelope(&envelope).unwrap();
+        };
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("secret-1")
+            .unwrap();
+        let s1_raw = raw_namespace("device-carry", "secret-1");
+        install(s1_raw.clone(), "secret-2");
+        assert_eq!(active_namespace(), s1_raw);
+        let s2 = crate::snapshot_sync::snapshot_upload_destination_namespace(&device, "secret-2");
+        assert_eq!(s2, raw_namespace("device-carry", "secret-2"), "foreign");
+        install("Z".repeat(64), "secret-1");
+        assert_eq!(active_namespace(), s1_raw, "malformed alias");
+        install("c".repeat(64), "secret-1");
+        assert_eq!(active_namespace(), "c".repeat(64));
+        FileDeviceStore::default().save(&device).unwrap();
+        assert_eq!(active_namespace(), s1_raw, "legacy save, then reload");
+        drop(_env);
+
+        // Different user, owner retained after a local logout of user A.
+        let _env = relogin_env("relogin-cross-account");
+        install_legacy_active("device-cross-a", &["codex"], "user_a");
+        relogin_local_logout();
+        let prior = prior_device_credential_for_registration().unwrap().unwrap();
+        let next = relogin_device("device-cross-b", &["codex"]);
+        let (pending, candidate, token) = relogin_claim(&prior, "user_b", "org_test", next);
+        assert_eq!(journaled_namespace(&pending), None);
+        promote_relogin(&pending, &candidate, &token);
+        let fresh = raw_namespace("device-cross-b", &candidate);
+        assert_eq!(active_namespace(), fresh, "owner retained, different user");
+        assert_eq!(
+            cutoff_destination(),
+            Some(fresh),
+            "the new account's cutoff"
+        );
+    }
+
+    #[test]
+    #[serial]
+    /// R2: a crash at each journal step keeps the namespace decided before
+    /// staging; it comes only from the immutable journal, never from hashing
+    /// the old device with the new secret. Unconfirmed cuts recover through
+    /// the server (the existing recovery tests), so they assert the journal.
+    fn relogin_crash_cuts_keep_the_journaled_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let restart = recover_pending_device_credential_at_startup;
+        let fenced = || crate::snapshot_client::load_snapshot_device_credentials().is_err();
+        for (cut, row) in [
+            "staged",
+            "guards passed",
+            "confirmed",
+            "candidate secret written",
+            "envelope written and read back",
+            "claim commit blocked",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _env = relogin_env(&format!("relogin-cut-{cut}"));
+            let canonical = install_legacy_active("device-cut-a", &["codex"], "user_test");
+            let prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let next = relogin_device("device-cut-b", &["codex"]);
+            let (mut pending, candidate, token) =
+                relogin_claim(&prior, "user_test", "org_test", next);
+            pending.preconfirm_guards_passed = false;
+            stage_pending_device_credential(&pending, &candidate).unwrap();
+            stage_pending_setup_run_token(&pending, &token).unwrap();
+            assert_eq!(stored_journal_namespace(), Some(canonical.clone()), "{row}");
+            if cut == 0 {
+                assert_eq!(
+                    active_namespace(),
+                    canonical,
+                    "{row}: old credential usable"
+                );
+                continue;
+            }
+            let store = FilePendingDeviceCredentialStore::default();
+            let pending = mark_pending_device_credential_guards_passed(&pending, &store).unwrap();
+            let confirmed = (cut >= 2).then(|| {
+                let at = "2026-11-05T00:00:00Z";
+                mark_pending_device_credential_confirmed(&pending, at, &store).unwrap()
+            });
+            let active_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+            if cut >= 3 {
+                active_secret.save(&candidate).unwrap();
+            }
+            if let Some(confirmed) = confirmed.as_ref().filter(|_| cut >= 4) {
+                let devices = FileDeviceStore::default();
+                write_and_verify_active_device_credential(
+                    confirmed,
+                    &candidate,
+                    &devices,
+                    &active_secret,
+                )
+                .unwrap();
+            }
+            if cut == 5 {
+                let connection = ottto_core::default_connection_path();
+                fs::remove_file(&connection).unwrap();
+                fs::create_dir(&connection).unwrap();
+                assert_eq!(restart(), Err(LocalApiError::StatePoisoned), "{row}");
+                fs::remove_dir(&connection).unwrap();
+            }
+            assert!(fenced(), "{row}");
+            assert_eq!(stored_journal_namespace(), Some(canonical.clone()), "{row}");
+            if cut >= 2 {
+                assert_eq!(restart(), Ok(true), "{row}");
+                assert_eq!(active_namespace(), canonical, "{row}: restart");
+                assert_eq!(restart(), Ok(false), "{row}");
+                assert_eq!(active_namespace(), canonical, "{row}: second restart");
+            }
+        }
+    }
+
     fn connected_account() -> LocalAccountBinding {
         LocalAccountBinding {
             state: LocalAccountState::Connected,
@@ -32118,4 +32828,6 @@ X-API-Key = "otel_redacted"
             account_scope: Some(TEST_ACCOUNT_SCOPE.to_string()),
         }
     }
+
+    mod claude_settings;
 }

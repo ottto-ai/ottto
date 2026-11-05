@@ -9,6 +9,7 @@
 //! cause the caller counts, never a default-empty success.
 use super::state_v2::{Collection, CollectionMeta, Shape as PageShape};
 use super::*;
+use crate::context_footprint::RepositoryIdentity;
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
@@ -793,9 +794,10 @@ fn read_shared_page(
 
 /// The session facts (D168-1): content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
-/// rewritten when its fact changes. A kind or version this build does not
-/// know is incompatible: new ones come with a reduction revision. Kinds are
-/// shared by every codec; a kind its source never sets is never stored (the
+/// rewritten when its fact changes. An unknown kind or version holds its file
+/// as future state. Workspace accepts path-only v1 and bound v2 independently
+/// of the other v1 facts; the head reduction revision stays unchanged. Kinds
+/// are shared by every codec; a kind its source never sets is never stored (the
 /// Codex agent label and prelude on Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact {
@@ -817,6 +819,15 @@ const FACTS: [Fact; 6] = [
     Fact::CodexPrelude,
 ];
 const FACT_VERSION: u64 = 1;
+const WORKSPACE_BINDING_VERSION: u64 = 2;
+
+crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
+    U repository_hash: Option<String>,
+    U repository_identity_source: Option<String>,
+    U workspace_kind: Option<String>,
+    U repository_label: Option<String>,
+    U repository_label_source: Option<String>,
+});
 
 impl Fact {
     fn present(self, acc: &SnapshotAccumulator) -> bool {
@@ -834,7 +845,12 @@ impl Fact {
 
     fn put(self, acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
         e.varint(self as u64)?;
-        e.varint(FACT_VERSION)?;
+        let bound_workspace = self == Self::Workspace && acc.repository_binding.is_some();
+        e.varint(if bound_workspace {
+            WORKSPACE_BINDING_VERSION
+        } else {
+            FACT_VERSION
+        })?;
         match self {
             Self::Title => acc.title.put(e),
             Self::FirstPrompt => {
@@ -843,16 +859,21 @@ impl Fact {
             }
             // A path never enters a record body (`PathBuf` refuses outside
             // hashing); the workspace path is a parsed JSON string, stored so.
-            Self::Workspace => acc
-                .workspace_path
-                .as_ref()
-                .map(|path| {
-                    path.to_str()
-                        .map(str::to_owned)
-                        .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
-                })
-                .transpose()?
-                .put(e),
+            Self::Workspace => {
+                acc.workspace_path
+                    .as_ref()
+                    .map(|path| {
+                        path.to_str()
+                            .map(str::to_owned)
+                            .ok_or(Refuse::NonEmpty("SnapshotAccumulator.workspace_path"))
+                    })
+                    .transpose()?
+                    .put(e)?;
+                if let Some(binding) = &acc.repository_binding {
+                    binding.put(e)?;
+                }
+                Ok(())
+            }
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
             Self::AgentLabel => acc.codex_agent_label.put(e),
             Self::CodexPrelude => acc.session_start.put_codex_prelude_fact(e),
@@ -873,7 +894,10 @@ impl Fact {
         if d.varint()? != page {
             return Err(ReconstructCause::Corrupt);
         }
-        if d.varint()? != FACT_VERSION {
+        let version = d.varint()?;
+        if version != FACT_VERSION
+            && !(fact == Self::Workspace && version == WORKSPACE_BINDING_VERSION)
+        {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
@@ -883,7 +907,12 @@ impl Fact {
                 into.first_prompt_title = <Option<String> as Durable>::take(&mut d)?;
             }
             Self::Workspace => {
-                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from)
+                into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from);
+                into.repository_binding = if version == WORKSPACE_BINDING_VERSION {
+                    Some(RepositoryIdentity::take(&mut d)?)
+                } else {
+                    None
+                };
             }
             Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
             Self::AgentLabel => into.codex_agent_label = <Option<String> as Durable>::take(&mut d)?,
@@ -1001,6 +1030,8 @@ head_fields! {
         N last_activity_at: Option<String>,
         U workspace_hash: Option<String>,
         X workspace_path: Option<PathBuf>,
+        // No head bytes: the optional binding belongs only to Workspace v2.
+        I repository_binding: Option<crate::context_footprint::RepositoryIdentity>,
         U latest_model: Option<String>,
         U latest_reasoning_effort: Option<String>,
         L latest_turn_id: Option<String>,
@@ -1196,3 +1227,7 @@ mod retired_slot_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tail_source/repository_binding_tests.rs"]
+mod repository_binding_tests;

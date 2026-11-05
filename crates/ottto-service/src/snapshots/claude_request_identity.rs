@@ -2836,6 +2836,37 @@ pub(crate) fn from_account_rule(unix_seconds: Option<u64>) -> bool {
         .is_some_and(|at| at.saturating_mul(1_000) >= ACCOUNT_RULE_FROM)
 }
 
+/// 2026-11-09T00:00:00Z (UTC s). A root file's first response with its own
+/// telemetry row but no trace owner takes that row's login when its own
+/// provider time is at or after it; an earlier request keeps its refusal.
+pub(crate) const SPANLESS_FIRST_REQUEST_FROM: u64 = 1_794_182_400;
+
+/// The sequence of `item`'s first response when it may take its own row's
+/// login without a trace owner: an original root file (no fork parent or
+/// inherited prefix) whose sequence-0 response has a request id (so no id-less
+/// or unresolved response precedes it), counts, is not a copy, and shares its
+/// id with no other response. Read before the occurrence map drains.
+fn spanless_first_sequence(
+    item: &SnapshotItem,
+    fold: &super::claude_request_money::e2::FileFold,
+) -> Option<u64> {
+    if fold.fork_parent().is_some()
+        || item.claude_context_curve_owned_start_proven
+        || owner_root(item) != Some(item.source_session_id.as_str())
+    {
+        return None;
+    }
+    let (request, first) = item
+        .claude_usage_occurrences
+        .iter()
+        .find(|(_, occurrence)| occurrence.sequence == 0)?;
+    (!first.usage.is_zero()
+        && !fold.is_skipped(first.sequence)
+        && !fold.unproven_copy(first)
+        && !fold.is_ambiguous(request))
+    .then_some(first.sequence)
+}
+
 /// One `credential_org` marker, positioned by the response sequence at its line:
 /// a response with sequence `s` follows it iff `s >= position`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3694,6 +3725,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                         .try_fold(0_u64, u64::checked_add)
                         .is_some_and(|requests| requests <= item.request_count)),
         );
+        let spanless_first = spanless_first_sequence(item, &fold);
         let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
         let mut requests = occurrences.iter_mut().collect::<Vec<_>>();
         requests.sort_unstable_by_key(|(_, occurrence)| occurrence.sequence);
@@ -3720,7 +3752,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 .requests
                 .get(&(root, request.as_str()))
                 .and_then(|row| *row);
-            let identity = request_occurrence_facts(item, request, occurrence)
+            let identity = request_occurrence_facts(item, request, occurrence, spanless_first)
                 .map(|facts| classify_ref(evidence, &facts));
             let copy = carry.on && fold.unproven_copy(occurrence);
             // A gap has no telemetry row and no other stream's owner.
@@ -4467,6 +4499,8 @@ pub(crate) struct RequestFacts<'a> {
     pub(crate) terminal_unix_seconds: Option<u64>,
     pub(crate) event_clock_complete: bool,
     pub(crate) marker: MarkerVerdict<'a>,
+    /// `spanless_first_sequence` named this request.
+    pub(crate) spanless_first: bool,
 }
 
 /// A borrowed authority key: classification builds no strings; a `Grouping`
@@ -4603,6 +4637,16 @@ pub(crate) fn classify_ref<'k>(
     };
     match evidence.owners.get(&(facts.root, facts.request_id)) {
         Some(None) => return Refused(Refusal::ConflictingDuplicate),
+        // No trace owner: only the original root's first response from the
+        // cutoff, claimed by no other root or unreadable owner, keeps its row.
+        None if facts.spanless_first
+            && facts.root == facts.source_session_id
+            && !row.client_request_id.is_empty()
+            && facts
+                .terminal_unix_seconds
+                .is_some_and(|at| at >= SPANLESS_FIRST_REQUEST_FROM)
+            && !evidence.owner_unreadable(facts.root, facts.request_id)
+            && !matches!(evidence.request_root(facts.request_id), Some(None)) => {}
         None => return Refused(Refusal::IncompleteEvidence),
         Some(Some(owner)) => {
             if owner_is_foreign(owner, facts.root, facts.source_session_id)
@@ -4799,6 +4843,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 ),
                 _ => MarkerVerdict::None,
             },
+            spanless_first: false,
         };
         let identity = classify_ref(self.evidence, &facts);
         // Activity never overrides stronger request identity. A later Desktop
@@ -5166,6 +5211,7 @@ fn request_occurrence_facts<'a>(
     item: &'a SnapshotItem,
     request_id: &'a str,
     occurrence: &'a super::ClaudeTranscriptUsageOccurrence,
+    spanless_first: Option<u64>,
 ) -> Option<RequestFacts<'a>> {
     let root = owner_root(item)?;
     let timestamp = occurrence.timestamp.as_deref()?;
@@ -5190,10 +5236,11 @@ fn request_occurrence_facts<'a>(
                     desktop || from_account_rule(terminal_unix_seconds),
                 )
             }),
+        spanless_first: spanless_first == Some(occurrence.sequence),
     })
 }
 
-fn collect_request_owned_activity(
+pub(crate) fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
     original: Option<&super::SessionAccountEvidence>,
@@ -5201,6 +5248,7 @@ fn collect_request_owned_activity(
     let Some(fold) = item.claude_money.as_deref() else {
         return Default::default();
     };
+    let spanless_first = spanless_first_sequence(item, fold);
     let mut activity = crate::desktop_recent::RecentActivity::default();
     for (request_id, occurrence) in &item.claude_usage_occurrences {
         if !occurrence.desktop_request
@@ -5212,7 +5260,8 @@ fn collect_request_owned_activity(
         let Some(timestamp) = occurrence.timestamp.as_deref() else {
             continue;
         };
-        let Some(facts) = request_occurrence_facts(item, request_id, occurrence) else {
+        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, spanless_first)
+        else {
             continue;
         };
         let identity = classify_ref(evidence, &facts);

@@ -210,6 +210,11 @@ pub fn run_snapshot_audit<W: Write>(
     crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
     let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::load(&index_path)?;
+    // As a sync cycle does before scanning: the active body revision is not
+    // persisted, and below it the history veto drops every request-owned body.
+    index.activate_effective_upload_body_witness_revision(
+        crate::snapshot_sync::effective_upload_body_witness_revision(options.source),
+    );
     let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
         options.source,
         &options.roots,
@@ -999,6 +1004,164 @@ mod tests {
         assert_eq!(evidence_stats.candidate_root_count, 1);
         assert_eq!(evidence_stats.paired_sidecar_root_count, 0);
         assert_eq!(evidence_stats.complete_sidecar_root_count, 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn sidecar_fingerprint<T: Serialize>(row: &T) -> String {
+        use sha2::Digest as _;
+        let bytes = serde_json::to_vec(row).expect("serialize sidecar row");
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    fn write_sidecar<T: Serialize>(support: &Path, dir: &str, root: &str, rows: &[T]) {
+        use sha2::Digest as _;
+        let path = support
+            .join(dir)
+            .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+        fs::create_dir_all(path.parent().expect("sidecar dir")).expect("create sidecar dir");
+        let encoded = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("serialize sidecar row") + "\n")
+            .collect::<String>();
+        fs::write(path, encoded).expect("write sidecar");
+    }
+
+    /// A Claude page whose bodies are all request-owned (`e2`) is reported:
+    /// the audit activates the compiled upload-body revision before scanning,
+    /// as a sync cycle does, so the history veto keeps those bodies.
+    #[test]
+    fn claude_audit_reports_request_owned_sessions_from_support_evidence() {
+        let home = crate::test_scratch::private_dir("snapshot-audit-request-owned");
+        let sessions = home.join(".claude").join("projects").join("fixture");
+        let root = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let agent = "a4d1585d310070d0f";
+        let agent_dir = sessions.join(root).join("subagents");
+        fs::create_dir_all(&agent_dir).expect("create sessions");
+        fs::write(
+            sessions.join(format!("{root}.jsonl")),
+            include_str!("../../../fixtures/snapshot-audit/claude-request-owned-root.jsonl"),
+        )
+        .expect("write root transcript");
+        fs::write(
+            agent_dir.join(format!("agent-{agent}.jsonl")),
+            include_str!("../../../fixtures/snapshot-audit/claude-request-owned-agent.jsonl"),
+        )
+        .expect("write agent transcript");
+        // Complete API and trace rows for every request; req_5 is the agent's.
+        let support = home.join("support");
+        let api = (1..=5_u64)
+            .map(|i| {
+                let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                    capture_revision: "claude_api_request:v2".to_string(),
+                    session_id: root.to_string(),
+                    request_id: format!("req_{i}"),
+                    client_request_id: format!("client-req_{i}"),
+                    observed_at: format!("2026-08-02T07:00:{i:02}Z"),
+                    model: "claude-haiku-4-5".to_string(),
+                    effort: "high".to_string(),
+                    query_source: "user".to_string(),
+                    speed: "fast".to_string(),
+                    cost_usd_micros: Some(100),
+                    event_sequence: Some(i),
+                    app_version: "2.1.226".to_string(),
+                    input_tokens: 10,
+                    output_tokens: if i == 5 { 1 } else { 10 },
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some("a".repeat(64)),
+                    ..Default::default()
+                };
+                row.fingerprint = sidecar_fingerprint(&row);
+                row
+            })
+            .collect::<Vec<_>>();
+        let trace = (1..=5_u64)
+            .map(|i| {
+                let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+                    capture_revision: "claude_llm_request_ownership:v1".to_string(),
+                    session_id: root.to_string(),
+                    request_id: format!("req_{i}"),
+                    client_request_id: format!("client-req_{i}"),
+                    agent_id: if i == 5 { agent } else { "" }.to_string(),
+                    observed_at: "2026-08-02T07:00:30Z".to_string(),
+                    ..Default::default()
+                };
+                row.fingerprint = sidecar_fingerprint(&row);
+                row
+            })
+            .collect::<Vec<_>>();
+        write_sidecar(&support, crate::claude_local_otel::STORE_DIR, root, &api);
+        write_sidecar(
+            &support,
+            "local-otel/claude-code-trace-ownership",
+            root,
+            &trace,
+        );
+        let audit_key_path = home.join("audit.key");
+        fs::write(&audit_key_path, [7_u8; MIN_AUDIT_KEY_BYTES]).expect("write audit key");
+        let collected_at = "2026-08-02T07:10:00Z";
+
+        let report = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::ClaudeCode,
+                roots: vec![sessions.clone()],
+                audit_state_dir: home.join("audit-state"),
+                audit_key_path,
+                session_attribution_hmac_key_path: attribution_key_file(&home),
+                attribution_home: Some(home.clone()),
+                claude_support_dir: Some(support.clone()),
+                machine_id: "fixture-machine".to_string(),
+                collected_at: collected_at.to_string(),
+                backfill_window_days: BACKFILL_WINDOW_DAYS,
+                private_upload_payload_out: None,
+            },
+            &mut Vec::new(),
+        )
+        .expect("audit");
+        let stats = report
+            .claude_local_evidence
+            .as_ref()
+            .expect("Claude evidence stats");
+        assert_eq!(stats.complete_sidecar_root_count, 1);
+
+        // The same evidence stage on a fresh index yields only request-owned
+        // bodies, so without the active revision the veto would drop them all.
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&sessions),
+            &mut index,
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            None,
+            Some(support.as_path()),
+            &[],
+            false,
+        )
+        .expect("scan");
+        crate::snapshots::claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            &index,
+            "fixture-machine",
+        );
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+        assert_eq!(scan.snapshots.len(), 2);
+        assert!(scan.snapshots.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("claude_request_owned_usage:v1")
+        }));
+
+        assert_eq!(report.emitted_session_count, 2);
+        let mut request_counts = report
+            .sessions
+            .iter()
+            .map(|session| session.request_count)
+            .collect::<Vec<_>>();
+        request_counts.sort_unstable();
+        assert_eq!(
+            request_counts,
+            vec![1, 4],
+            "each body keeps its own requests"
+        );
         let _ = fs::remove_dir_all(home);
     }
 

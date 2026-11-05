@@ -4,6 +4,9 @@
   runtime/CLI/protocol; `crates/Cargo.toml` owns connector SDK/testkit. Check both
   only when the change affects both.
 - Daemon (`crates/ottto-service`) work: read [its ARCHITECTURE.md](crates/ottto-service/ARCHITECTURE.md) first.
+- Record lasting design in `docs/` or a crate's `ARCHITECTURE.md`, written for
+  readers of the current code. Dated session, review or rollout notes do not
+  belong in this repository.
 - Make small, cohesive changes. Read callers and state ownership first; separate
   mechanical refactoring from behavior changes. Use private modules and narrow
   interfaces; preserve public paths. File length alone does not justify a split.
@@ -19,6 +22,13 @@
 
 # Checks and tools
 
+- Keep public files standalone and free of secrets, customer data, private repo
+  references, and operator paths; `scripts/public_repo_secret_scan.sh` enforces
+  the committed `public-export/deny-patterns.tsv` policy.
+- `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
+  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
+  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run the relevant
+  surface/contract checks when their inputs change.
 - Use existing Cargo tooling and CI. Establish an affected baseline once, run
   compile/focused tests per code patch, then existing formatting, Clippy, and
   changed-crate tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
@@ -84,6 +94,10 @@
   exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
   checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
   not evidence, and no Linux job stands in for the macOS `Rust contracts` job.
+- The PR title becomes the squash subject on `main`: keep it a plain
+  conventional title with no internal tracking tags. The guard refuses a title
+  that matches the local deny list in `OTTTO_PR_TITLE_DENY_FILE` (default
+  `~/.config/ottto/pr-title-deny.ere`) when that file exists.
 - `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
 - The author merges its own reviewed, green, mergeable PR; no merge window, slot
   or extra approval is needed. Wait only for a real dependency or conflict, an
@@ -97,14 +111,3 @@
   tests. Use one stable PR/task identity, standard review for ordinary behavior and
   strict for sensitive invariants. Cosmetic or purely mechanical changes may skip
   with a concrete reason; report skipped/unavailable review honestly.
-
-# Public export
-
-- Keep public files standalone and free of secrets, customer data, private repo
-  references, and operator paths. Follow the contribution/export tooling already
-  in this repo.
-- New root export files need `public-export/roots.txt` and `public-export/path-map.tsv`
-  entries. `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
-  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
-  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run relevant
-  export/contract checks when their inputs change.

@@ -162,6 +162,12 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
+impl RepositoryIdentity {
+    pub(crate) fn is_repository(&self) -> bool {
+        self.repository_hash.is_some()
+    }
+}
+
 impl SpawnEnv {
     fn claude_command(&self) -> Result<Command> {
         let Some(program) = crate::command_env::executable_path("claude") else {
@@ -233,32 +239,60 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
     let codex_preludes = Arc::clone(&daemon.codex_preludes);
+    let inputs = daemon.footprint_cwds.inputs();
+    let mut harvest = move || {
+        let claude = harvest_all_once(&home, &support_dir, &projection);
+        // Codex session starts share this thread: no extra background job.
+        if let Err(error) =
+            crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+        {
+            eprintln!(
+                "codex session start harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+        }
+        claude
+    };
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
-            let refused = match harvest_all_once(&home, &support_dir, &projection) {
-                Ok(outcome) => outcome.refused > 0,
-                Err(error) => {
-                    eprintln!(
-                        "context footprint harvest skipped: {}",
-                        crate::snapshot_sync::safe_error(&error)
-                    );
-                    false
-                }
-            };
-            // Codex session starts share this thread: no extra background job.
-            if let Err(error) =
-                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
-            {
-                eprintln!(
-                    "codex session start harvest skipped: {}",
-                    crate::snapshot_sync::safe_error(&error)
-                );
-            }
-            std::thread::sleep(next_context_cycle_delay(refused));
+            std::thread::sleep(context_cycle(&inputs, &mut harvest));
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
+}
+
+/// Waits for snapshot sync's first usable delivery (returns at once after it;
+/// the flag never resets), harvests, and answers the delay before the next.
+fn context_cycle(
+    inputs: &FootprintInputs,
+    harvest: &mut impl FnMut() -> Result<ContextHarvestOutcome>,
+) -> Duration {
+    let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
+    let refused = match harvest() {
+        Ok(outcome) => outcome.refused > 0,
+        Err(error) => {
+            eprintln!(
+                "context footprint harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+            false
+        }
+    };
+    next_context_cycle_delay(refused)
+}
+
+/// Set by the first snapshot-sync delivery a harvest can use, from the Claude
+/// or Codex observer; one per daemon, shared by both feeds, RAM only.
+#[derive(Debug, Default)]
+pub(crate) struct FootprintInputs(Mutex<bool>, std::sync::Condvar);
+
+impl FootprintInputs {
+    pub(crate) fn deliver(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.1.notify_all();
+    }
 }
 
 fn harvest_all_once(
@@ -723,35 +757,38 @@ pub(crate) fn resolve_repository_identity(
     workspace: &Path,
     labels_enabled: bool,
 ) -> RepositoryIdentity {
-    let Some(toplevel) = git_toplevel(workspace) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: None,
-            repository_label_source: None,
-            repository_identity_source: None,
-            workspace_kind: Some("non_git".to_string()),
-        };
+    if fs::read_dir(workspace).is_err() {
+        return unresolved_repository_identity("unknown");
+    }
+    let toplevel = git_stdout_capped(
+        workspace,
+        &["rev-parse", "--show-toplevel"],
+        GIT_STDOUT_MAX_BYTES,
+    );
+    let toplevel = match toplevel {
+        Ok(bytes) => match String::from_utf8(bytes)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => absolutize_git_path(workspace, raw.trim()),
+            None => return unresolved_repository_identity("unknown"),
+        },
+        Err(GitOutputError::Failed) => return unresolved_repository_identity("non_git"),
+        Err(_) => return unresolved_repository_identity("unknown"),
     };
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: labels_enabled
-                .then(|| toplevel.file_name()?.to_str())
-                .flatten()
-                .and_then(|name| safe_text(name, 255)),
-            repository_label_source: labels_enabled.then(|| "git_root".to_string()),
-            repository_identity_source: None,
-            workspace_kind: Some("unknown".to_string()),
-        };
+        return unresolved_repository_identity("unknown");
     };
-    let common_dir = absolutize_git_path(workspace, &common_dir_raw);
-    let git_dir = git_stdout(workspace, &["rev-parse", "--git-dir"])
-        .map(|raw| absolutize_git_path(workspace, &raw));
+    let Ok(common_dir) = absolutize_git_path(workspace, &common_dir_raw).canonicalize() else {
+        return unresolved_repository_identity("unknown");
+    };
+    let Some(git_dir) = git_stdout(workspace, &["rev-parse", "--git-dir"])
+        .and_then(|raw| absolutize_git_path(workspace, &raw).canonicalize().ok())
+    else {
+        return unresolved_repository_identity("unknown");
+    };
     let common_text = common_dir.to_string_lossy();
-    let linked_worktree = git_dir
-        .as_ref()
-        .map(|git_dir| canonical_or_self(git_dir) != canonical_or_self(&common_dir))
-        .unwrap_or(false);
+    let linked_worktree = git_dir != common_dir;
     let workspace_kind = if linked_worktree {
         "linked_worktree"
     } else if same_path(workspace, &toplevel) {
@@ -785,6 +822,16 @@ pub(crate) fn resolve_repository_identity(
             .to_string(),
         ),
         workspace_kind: Some(workspace_kind.to_string()),
+    }
+}
+
+fn unresolved_repository_identity(kind: &str) -> RepositoryIdentity {
+    RepositoryIdentity {
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: Some(kind.to_string()),
     }
 }
 
@@ -836,14 +883,14 @@ pub(crate) fn git_stdout_capped(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Vec<u8>, GitOutputError> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| GitOutputError::Failed)?;
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| GitOutputError::Failed)?;
     let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
     fn stop(
         mut child: std::process::Child,
@@ -1300,7 +1347,7 @@ const PROJECTED_FILE_BYTES: usize = 256;
 /// then are known, and nothing is known while snapshot sync does not read
 /// Claude.
 #[derive(Debug, Default)]
-pub(crate) struct CwdProjection(Mutex<Projection>);
+pub(crate) struct CwdProjection(Mutex<Projection>, Arc<FootprintInputs>);
 
 /// Counters are since daemon start, for the cycle metrics line.
 #[derive(Debug, Default)]
@@ -1354,6 +1401,11 @@ impl CwdProjection {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The wake shared with the Codex feed.
+    pub(crate) fn inputs(&self) -> Arc<FootprintInputs> {
+        Arc::clone(&self.1)
+    }
+
     /// One snapshot-sync pass's observer.
     pub(crate) fn observer(self: &Arc<Self>) -> Box<CwdObserver> {
         self.lock().passes += 1;
@@ -1386,6 +1438,9 @@ impl CwdProjection {
             remember_cwd(&mut known, cwd);
         }
         if let Some(mtime) = file.mtime {
+            if !known.is_empty() && mtime.elapsed().unwrap_or_default() <= RECENT_WORKSPACE_WINDOW {
+                self.1.deliver();
+            }
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
             projection.files.insert(file.object, entry);
@@ -1737,7 +1792,16 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| safe_text(name, 255))
-        .or_else(|| Some("workspace".to_string()))
+        .or_else(|| {
+            workspace
+                .file_name()
+                .is_none()
+                .then(|| "workspace".to_string())
+        })
+        .filter(|label| {
+            let lower = label.to_ascii_lowercase();
+            !lower.contains(".claude") && !lower.contains(".codex") && !label.contains('\\')
+        })
 }
 
 #[cfg(test)]
@@ -2210,6 +2274,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    /// [regress] An existing folder with a failed Git lookup is distinct from a missing cwd.
     #[test]
     fn repository_identity_marks_non_git_without_repository_hash() {
         let dir = temp_dir("repo-identity-non-git");
@@ -2221,6 +2286,11 @@ mod tests {
         assert!(identity.repository_label_source.is_none());
         assert!(identity.repository_identity_source.is_none());
         assert_eq!(identity.workspace_kind.as_deref(), Some("non_git"));
+        let missing = resolve_repository_identity(&dir.join("missing"), true);
+        assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
+        fs::write(dir.join(".git"), "gitdir: missing-metadata\n").unwrap();
+        let broken = resolve_repository_identity(&dir, true);
+        assert_eq!(broken.workspace_kind.as_deref(), Some("non_git"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2399,6 +2469,47 @@ mod tests {
         let mut found = discover_workspaces(cwds, &mut path_scopes, repository_scope);
         found.truncate(MAX_WORKSPACES_PER_CYCLE);
         (found, path_scopes)
+    }
+
+    /// Regression: at daemon start no snapshot pass has delivered a
+    /// transcript yet, so the thread must wait for the first delivery instead
+    /// of harvesting nothing and sleeping six hours.
+    #[test]
+    fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
+        let home = temp_dir("startup-wake");
+        let now = SystemTime::now();
+        let dir = home.join("work").join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        write_discovery_transcripts(&home, now, &[(60, vec![dir.as_path()])]);
+        let mut files = Vec::new();
+        let projects = home.join(".claude").join("projects");
+        collect_recent_jsonl_files(&projects, now, &mut files, &mut 0);
+        let projection = Arc::new(CwdProjection::default());
+        let cycle = {
+            let projection = Arc::clone(&projection);
+            std::thread::spawn(move || {
+                // Each harvest records how many workspaces it could see.
+                let mut seen = Vec::new();
+                let delay = context_cycle(&projection.1, &mut || {
+                    seen.push(projection.recent_cwds(SystemTime::now()).len());
+                    Ok(ContextHarvestOutcome::default())
+                });
+                (seen, delay)
+            })
+        };
+
+        project_transcripts(&projection, &files);
+
+        let (seen, delay) = cycle.join().unwrap();
+        assert_eq!(seen, [1], "one harvest, after the delivery");
+        assert_eq!(delay, CONTEXT_FOOTPRINT_INTERVAL);
+        let mut later = 0;
+        let delay = context_cycle(&projection.1, &mut || {
+            later += 1;
+            Ok(ContextHarvestOutcome::default())
+        });
+        assert_eq!((later, delay), (1, CONTEXT_FOOTPRINT_INTERVAL));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

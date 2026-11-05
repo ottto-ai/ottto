@@ -607,6 +607,11 @@ pub(crate) mod reason_reoffer_pipeline_tests {
     include!("reason_reoffer_pipeline_tests.rs");
 }
 
+// Same real prepare/finish pipeline across a same-account re-login.
+pub(crate) mod relogin_pipeline_tests {
+    include!("relogin_pipeline_tests.rs");
+}
+
 thread_local! {
     static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -994,7 +999,7 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
         });
         let (preparation, index, scan) = home.prepare(arm);
         let index_path = preparation.index_path.clone();
-        crate::snapshots::money_freshness::set_roster_for_test(
+        crate::snapshots::money_freshness::walk_ended_for_test(
             SnapshotSource::ClaudeCode,
             Some((u64::MAX / 2, BTreeMap::new())),
         );

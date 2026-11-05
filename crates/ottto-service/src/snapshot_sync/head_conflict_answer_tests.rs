@@ -141,6 +141,26 @@ pub(super) fn cycle_with_transport(
     now: u64,
     class: impl Fn(&SnapshotItem) -> u8,
     enforce: impl Fn(&[SnapshotItem]) -> bool,
+    server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Vec<Value>) {
+    for item in items {
+        progress
+            .active_quarantine_retries
+            .insert(item.snapshot_fingerprint.clone());
+    }
+    let page = selected_page(progress, items, now, class, enforce, server);
+    progress.active_quarantine_retries.clear();
+    page
+}
+
+/// `cycle_with_transport` under only the retry leases already in `progress`,
+/// as the real quarantine retry selection left them.
+fn selected_page(
+    progress: &mut SnapshotUploadProgress,
+    items: &[SnapshotItem],
+    now: u64,
+    class: impl Fn(&SnapshotItem) -> u8,
+    enforce: impl Fn(&[SnapshotItem]) -> bool,
     mut server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
@@ -156,9 +176,6 @@ pub(super) fn cycle_with_transport(
             .accepted_cache_heads
             .get(&cache_session_key(&item.source_session_id))
             .cloned();
-        progress
-            .active_quarantine_retries
-            .insert(item.snapshot_fingerprint.clone());
     }
     attach_head_conflict_answers(&mut items, progress, now);
     let mut wires = Vec::new();
@@ -206,7 +223,6 @@ pub(super) fn cycle_with_transport(
             progress.accepted_body_witnesses
         );
     }
-    progress.active_quarantine_retries.clear();
     (result, wires)
 }
 
@@ -400,10 +416,21 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
         ack
     });
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 },
         "mismatched witness echo is not a settlement"
     );
+    // The named body is set aside under its bounded retry, never accepted.
+    assert!(progress.contains_body(
+        &item.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&item)
+    ));
+    assert!(
+        progress.quarantined_fingerprints[&item.snapshot_fingerprint].retry_after_unix_seconds
+            > current_unix_seconds()
+    );
+    assert!(progress.accepted_body_witnesses.is_empty());
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
     assert!(progress.head_conflict_challenges.is_empty());
     let refusals = || {
@@ -439,7 +466,11 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
         ack
     });
-    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert!(progress.accepted_body_witnesses.is_empty());
     assert_eq!(
         refusals(),
         [format!(
@@ -489,6 +520,171 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xd));
     assert_eq!(progress.accepted_cache_heads[&key], "3".repeat(64));
     assert!(progress.head_conflict_challenges.is_empty());
+}
+
+/// [regress] One request carries a due owed answer beside a body whose ACK
+/// ref echoes another witness. The invalid ACK used to pace every active
+/// retry in it 6-12 h and end the pass, so the owed body stayed held. Now
+/// only the named body is set aside; the owed body is re-sent in the same
+/// pass with its answer and settles only from its own exact ACK. An invalid
+/// ACK that names no ref keeps the whole-request path.
+#[test]
+fn a_named_witness_refusal_sets_aside_only_its_body_and_resends_the_owed_answer() {
+    let owed = item();
+    let mut named = item();
+    named.source_session_id = "synthetic-named-sibling".into();
+    named.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &named);
+    let owed_key = cache_session_key(&owed.source_session_id);
+    let mut seeded = progress_with_stale_head(&owed);
+    seeded
+        .accepted_cache_heads
+        .insert(cache_session_key(&named.source_session_id), stale_head());
+    let (result, _) = cycle(&mut seeded, &owed, 1_000, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    let held = |progress: &SnapshotUploadProgress, item: &SnapshotItem| {
+        progress.contains_body(
+            &item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(item),
+        ) && progress.quarantined_fingerprints[&item.snapshot_fingerprint].retry_after_unix_seconds
+            > current_unix_seconds()
+    };
+    for case in ["unnamed", "inexact", "exact"] {
+        let mut progress = seeded.clone();
+        // The real selection leases only the due owed body; the named
+        // sibling is fresh work with no retry record.
+        progress.prepare_quarantine_retries(&BTreeMap::new());
+        assert_eq!(
+            progress.active_quarantine_retries,
+            BTreeSet::from([owed.snapshot_fingerprint.clone()])
+        );
+        let mut sends = 0;
+        let (result, wires) = selected_page(
+            &mut progress,
+            &[named.clone(), owed.clone()],
+            1_001,
+            |_| 0,
+            |_| true,
+            |request, _| {
+                sends += 1;
+                let mut ack = empty_ack();
+                for item in &request.snapshots {
+                    let mut one = accepted(item, &"2".repeat(64));
+                    let entity = &mut one.accepted_entities[0];
+                    if item.source_session_id == named.source_session_id
+                        || (case == "inexact" && sends > 1)
+                    {
+                        entity.body_witness_digest = Some("0".repeat(64));
+                    }
+                    if case == "unnamed" {
+                        entity.head_etag = None;
+                    }
+                    ack.accepted += 1;
+                    ack.accepted_entities.append(&mut one.accepted_entities);
+                }
+                Ok(ack)
+            },
+        );
+        progress.active_quarantine_retries.clear();
+        let carried = |wire: &Value| {
+            wire["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|body| {
+                    (
+                        body["source_session_id"].as_str().unwrap().to_owned(),
+                        body["semantic_envelope"]["conflict_head_challenge"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let answered = (owed.source_session_id.clone(), Value::from(challenge(0xc)));
+        assert_eq!(wires.len(), if case == "unnamed" { 1 } else { 2 }, "{case}");
+        assert_eq!(
+            carried(&wires[0]).len(),
+            2,
+            "{case}: one request, both bodies"
+        );
+        assert!(carried(&wires[0]).contains_key(&named.source_session_id));
+        assert_eq!(
+            carried(&wires[0]).get_key_value(&answered.0),
+            Some((&answered.0, &answered.1))
+        );
+        // Nothing settles from an invalid ACK, named or not.
+        assert!(!progress
+            .accepted_body_witnesses
+            .contains_key(&named.snapshot_fingerprint));
+        let deferred = match result {
+            Ok(ResumableUploadResult::Deferred { count }) => Some(count),
+            Ok(other) => panic!("{case}: {other:?}"),
+            Err(error) => {
+                assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
+                assert!(error.downcast_ref::<RefusedSnapshotIndexes>().is_none());
+                None
+            }
+        };
+        let expected = match case {
+            "unnamed" => None,
+            "inexact" => Some(2),
+            _ => Some(1),
+        };
+        assert_eq!(deferred, expected, "{case}");
+        if case == "unnamed" {
+            // Today's whole-request path: the active retry is paced, and the
+            // fresh body gains no custody.
+            assert!(held(&progress, &owed));
+            assert!(!progress
+                .quarantined_fingerprints
+                .contains_key(&named.snapshot_fingerprint));
+        } else {
+            assert_eq!(
+                carried(&wires[1]),
+                BTreeMap::from([answered.clone()]),
+                "{case}: the owed body alone, re-sent in this pass with its answer"
+            );
+            assert!(
+                held(&progress, &named),
+                "{case}: the named body is set aside"
+            );
+            let record = &progress.quarantined_fingerprints[&named.snapshot_fingerprint];
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+        }
+        if case == "exact" {
+            assert_eq!(progress.accepted_cache_heads[&owed_key], "2".repeat(64));
+            assert!(progress.head_conflict_challenges.is_empty());
+            assert_eq!(
+                progress.accepted_body_witnesses[&owed.snapshot_fingerprint],
+                snapshot_upload_body_witness(&owed)
+            );
+            assert!(!progress
+                .quarantined_fingerprints
+                .contains_key(&owed.snapshot_fingerprint));
+            // The next selection does not lease the set-aside body early.
+            progress.prepare_quarantine_retries(&BTreeMap::new());
+            assert!(!progress
+                .active_quarantine_retries
+                .contains(&named.snapshot_fingerprint));
+        } else {
+            // The owed body settles only from an exact ACK of its own.
+            assert_eq!(progress.accepted_cache_heads[&owed_key], stale_head());
+            let record = &progress.head_conflict_challenges[&owed_key];
+            assert_eq!(record.challenge, challenge(0xc));
+            assert_eq!(record.last_answer_unix, 0);
+            assert!(!progress
+                .accepted_body_witnesses
+                .contains_key(&owed.snapshot_fingerprint));
+            assert!(held(&progress, &owed), "{case}");
+        }
+    }
 }
 
 /// [regress] A refused answer holds only its identical re-send, and for at
@@ -1069,7 +1265,10 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
 /// the persisted ledger, and the first activation after it mirrors the
 /// session again; the scan index itself never stores it. A challenge whose
 /// session holds no saved base can never carry an answer: it is not
-/// mirrored before or after the restart, so its files may re-fold.
+/// mirrored before or after the restart, so its files may re-fold. A
+/// same-account re-login (A→B→C) before the restart changes nothing: the
+/// conflict is still owed, its answer rides the one counted native Full and
+/// settles it.
 #[test]
 fn a_restart_mirrors_the_persisted_challenge_again() {
     let item = item();
@@ -1105,9 +1304,10 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
     index.save(&index_path).unwrap();
 
+    let namespace = crate::snapshot_sync::relogin_namespace(&"a".repeat(64), 2);
     let mut restarted = SnapshotUploadProgress::load(
         &progress_path,
-        &"a".repeat(64),
+        &namespace,
         snapshot_quarantine_witness(SnapshotSource::Codex),
     )
     .unwrap();
@@ -1122,4 +1322,18 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     assert!(index.head_conflict_owed(&key));
     assert!(restarted.head_conflict_challenges.contains_key(&baseless));
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
+    let mut answers = 0;
+    for (at, head) in [(1_001, "2"), (1_002, "3"), (1_003, "4")] {
+        let owed = mirrored(&restarted, &key);
+        let server = |item: &SnapshotItem| accepted(item, &head.repeat(64));
+        let (result, wire) = cycle(&mut restarted, &item, at, server);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let answered = envelope(&wire)["conflict_head_challenge"] == challenge(0xc);
+        assert_rescan_claim(&wire, answered);
+        assert!(!answered || owed, "an answer rides only a mirrored Full");
+        answers += usize::from(answered);
+    }
+    assert_eq!(answers, 1);
+    assert!(!mirrored(&restarted, &key), "settled");
+    assert_eq!(restarted.accepted_cache_heads[&key], "4".repeat(64));
 }
