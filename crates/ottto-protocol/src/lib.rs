@@ -890,6 +890,13 @@ pub struct ActiveSession {
     /// configured default standing in for observed evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_reasoning_effort: Option<String>,
+    /// Pi only: the provider route of the same newest usage row as
+    /// `latest_model`, as the transcript names it (normalized, for example
+    /// `google_vertex`). A display label for a source with no account; it
+    /// never names an account or an auth kind. Absent for other sources and
+    /// when the row records no provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<String>,
     /// The account handling this session NOW: the identity of the session's
     /// newest own request, never the current login or a lifetime payer.
     /// Absent when the daemon could not compute it (older daemon, source
@@ -8576,6 +8583,7 @@ mod tests {
                 account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
+                provider_route: None,
                 current_account: None,
                 account_history: Vec::new(),
             }],
@@ -8617,9 +8625,21 @@ mod tests {
         assert!(value["sessions"][0]
             .as_object()
             .is_some_and(|session| !session.contains_key("account_withheld_reason")));
+        // Absent, not null, outside Pi.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("provider_route")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut pi = reconciliation.clone();
+        pi.sessions[0].provider_route = Some("google_vertex".to_string());
+        let value = serde_json::to_value(&pi).expect("serialize pi reconciliation");
+        assert_eq!(value["sessions"][0]["provider_route"], "google_vertex");
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize pi reconciliation");
+        assert_eq!(round_tripped, pi);
 
         let mut withheld = reconciliation.clone();
         withheld.sessions[0].account_identifier_hash = None;
