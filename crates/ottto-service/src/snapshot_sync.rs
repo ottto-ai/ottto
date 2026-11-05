@@ -14850,6 +14850,15 @@ mod tests {
         )
     }
 
+    /// The real due-retry selection, with a held body's deadline reached.
+    fn lease_due_retry(progress: &mut SnapshotUploadProgress, fingerprint: &str) {
+        if let Some(record) = progress.quarantined_fingerprints.get_mut(fingerprint) {
+            record.retry_after_unix_seconds = 0;
+            progress.prepare_quarantine_retries(&BTreeMap::new());
+            assert!(progress.active_quarantine_retries.contains(fingerprint));
+        }
+    }
+
     /// [money] A lost ACK response leaves no checkpoint; only the exact
     /// creator-domain proof (public v7) settles the retry, after which the
     /// settled body is a no-op.
@@ -14959,22 +14968,40 @@ mod tests {
                 // The cache-declared neighbour domain cannot settle it.
                 (Some(13), Some(digest.clone())),
             ] {
-                upload_resumable_batches_with_body_witness(
+                lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
+                let mut calls = 0;
+                let outcome = upload_resumable_batches_with_body_witness(
                     &items,
                     &unique_poison_scope(),
                     &mut progress,
                     &mut accepted,
                     |snapshot| snapshot.snapshot_fingerprint.as_str(),
                     snapshot_upload_body_witness,
-                    |batch| checked_response(batch, version, proof.clone(), unchanged),
+                    |batch| {
+                        calls += 1;
+                        checked_response(batch, version, proof.clone(), unchanged)
+                    },
                     |_| Ok(()),
                 )
-                .expect_err("missing/wrong proof or capability domain cannot settle retry");
+                .unwrap();
+                // The refusal names the body: it is set aside, never settled.
+                assert_eq!(
+                    (outcome, calls),
+                    (ResumableUploadResult::Deferred { count: 1 }, 1),
+                    "missing/wrong proof or capability domain cannot settle retry"
+                );
                 assert_eq!(accepted, 0);
                 assert!(progress.accepted_fingerprints.is_empty());
-                assert!(!progress.contains_body(&items[0].snapshot_fingerprint, &digest));
+                assert!(!progress
+                    .accepted_body_witnesses
+                    .contains_key(&items[0].snapshot_fingerprint));
+                assert_eq!(
+                    progress.quarantined_fingerprints[&items[0].snapshot_fingerprint].disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
             }
         }
+        lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
         let mut retry_calls = 0;
         upload_resumable_batches_with_body_witness(
             &items,

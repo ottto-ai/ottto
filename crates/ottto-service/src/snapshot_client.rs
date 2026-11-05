@@ -4824,6 +4824,8 @@ mod tests {
         let (request, mut ack) = witnessed_ack();
         ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
         ack.unchanged_entities[0].body_witness_version = None;
+        // A well-formed missing proof: version and digest both absent.
+        ack.unchanged_entities[0].body_witness_digest = None;
         let error = ack.validate_entity_ack(&request).unwrap_err();
         assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
         assert_eq!(

@@ -1579,7 +1579,8 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
     let mut ledger = progress();
     let saves = std::cell::Cell::new(0usize);
     let saves_before_cas = std::cell::Cell::new(None);
-    let error = bootstrap_cache_heads(
+    let mut refusals = Vec::new();
+    let deferred = bootstrap_cache_heads(
         &probes,
         "h360-witness",
         &mut ledger,
@@ -1597,26 +1598,35 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
                     reference.body_witness_digest = Some("0".repeat(64));
                 }
             }
-            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
-            Ok(ack)
+            let checked = ack.validate_entity_ack_with_head_cas(&request(batch), cas);
+            if let Err(error) = &checked {
+                assert_eq!(
+                    snapshot_upload_error_class(error),
+                    Some(SnapshotUploadErrorClass::BackendResponse)
+                );
+                refusals.push(upload_failure_diagnostic(error));
+            }
+            checked.map(|()| ack)
         },
         |_| {
             saves.set(saves.get() + 1);
             Ok(())
         },
     )
-    .unwrap_err();
+    .unwrap();
     assert_eq!(
-        snapshot_upload_error_class(&error),
-        Some(SnapshotUploadErrorClass::BackendResponse)
+        refusals,
+        ["kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"]
     );
+    // The refused probe names its own ref: it is set aside under its bounded
+    // retry with one save, and no head is minted.
+    assert_eq!(deferred, 1);
     assert_eq!(
-        upload_failure_diagnostic(&error),
-        "kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"
+        saves_before_cas.get().map(|saved| saved + 1),
+        Some(saves.get())
     );
-    assert_eq!(saves_before_cas.get(), Some(saves.get()));
     assert!(ledger.accepted_cache_heads.is_empty());
-    assert!(!cache_head_probe_held(&ledger, &probes[0]));
+    assert!(cache_head_probe_held(&ledger, &probes[0]));
 }
 
 #[test]
