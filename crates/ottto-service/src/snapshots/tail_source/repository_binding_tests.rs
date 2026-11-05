@@ -102,8 +102,36 @@ fn capture_restore<S: TailSource>(
     .unwrap();
     assert_eq!(workspace_version, Some(2));
     assert_eq!(restored.repository_binding, Some(expected.clone()));
+    let bound = restored.repository_binding.as_ref().unwrap();
+    let heap = [
+        &bound.repository_hash,
+        &bound.repository_identity_source,
+        &bound.workspace_kind,
+        &bound.repository_label,
+        &bound.repository_label_source,
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::capacity)
+    .sum::<usize>();
+    eprintln!(
+        "repository_binding_metrics inline_bytes={} heap_bytes={} fact_bytes={}",
+        std::mem::size_of_val(&restored.repository_binding),
+        heap,
+        fact_pages(&restored)
+            .unwrap()
+            .into_iter()
+            .find(|(page, _)| *page == 2)
+            .unwrap()
+            .1
+            .len()
+    );
     let missing = resolve_repository_identity(&cwd, true);
     assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
+    // The stored reduction is PRE, as in the normal native finish.
+    if S::SOURCE == SnapshotSource::ClaudeCode {
+        restored.finalize_claude_responses_e2(None);
+    }
     // Neither stale path-cache state nor a later failed measurement wins.
     let items = restored.into_items_with_repository_identity(
         &path,

@@ -10261,7 +10261,7 @@ impl SnapshotAccumulator {
                     Some("non_git" | "unknown")
                 )
             })
-            .and_then(|_| self.workspace_path.as_deref())
+            .and(self.workspace_path.as_deref())
             .and_then(crate::context_footprint::workspace_label);
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
