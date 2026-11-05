@@ -241,7 +241,7 @@ removing and re-adding it.
 Running `CLAUDE_CONFIG_DIR=<that directory> claude` and `/login` with another
 account replaces the Claude login inside that connection. Ottto then reports
 `identity_mismatch` for it, with a local message that names both plans (for
-example a Claude Max 20x login in a Claude Team Premium connection). Until the
+example a Claude Ultra login in a Claude Team Premium connection). Until the
 approved account signs in again, Ottto starts no Claude command, credential
 refresh or usage request for that connection and uploads nothing for the other
 account; the approved account keeps its own profile and its last full reading,

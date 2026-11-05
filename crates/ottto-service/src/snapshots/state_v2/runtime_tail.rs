@@ -53,6 +53,16 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
+/// Files a save does not keep: their staged heads go, the committed ones stay.
+pub(in crate::snapshots) fn unstage_tail(
+    path: &Path,
+    keys: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.unstage(keys);
+        Ok(())
+    })
+}
 /// This file's completion could not encode: its predecessor stays.
 pub(in crate::snapshots) fn set_aside_tail(
     path: &Path,

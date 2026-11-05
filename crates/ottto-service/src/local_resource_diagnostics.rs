@@ -195,6 +195,8 @@ mod footprint;
 pub(crate) mod rearm_cause;
 #[cfg(unix)]
 mod shutdown;
+#[cfg(unix)]
+mod stderr_rotation;
 
 process_static!(fn with_claude_identity_over_cap: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]);
 
@@ -340,9 +342,54 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     });
 }
 
+/// One decoder close's counts, in `codex_zst_input` key order.
+pub(crate) const CODEX_ZST_INPUT_KEYS: [&str; 6] = [
+    "codex_zst_compressed_bytes",
+    "codex_zst_compressed_consumed_bytes",
+    "codex_zst_decoded_bytes",
+    "codex_zst_cpu_micros",
+    "codex_zst_decoder_native_peak_bytes",
+    "codex_zst_decoder_allocation_refusals",
+];
+/// The native peak is a maximum across header decoders; the rest are sums.
+const CODEX_ZST_PEAK: usize = 4;
+// Header-only decoder closes since the last flush: the decoder count (retries
+// included), then the `CODEX_ZST_INPUT_KEYS` totals.
+process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
+
+/// Counts only: inventory header reads decode every `.zst` once per walk, so
+/// `codex_zst_refused_flush` reports them as one per-walk row.
+pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
+    with_codex_zst_headers(|headers| {
+        let _ = headers[0].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        for (index, (total, count)) in headers[1..].iter().zip(counts).enumerate() {
+            if index == CODEX_ZST_PEAK {
+                total.fetch_max(count, Relaxed);
+            } else {
+                let _ = total.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_header_decoders() -> u64 {
+    with_codex_zst_headers(|headers| headers[0].load(Relaxed))
+}
+
 /// One sparse line of the non-zero cumulative counters, only when their sum
-/// moved since the last flush.
+/// moved since the last flush. Header decoder totals since the last flush go
+/// on their own `codex_zst_input_headers` row, then reset.
 pub(crate) fn codex_zst_refused_flush() {
+    let headers: [u64; 7] =
+        with_codex_zst_headers(|headers| std::array::from_fn(|i| headers[i].swap(0, Relaxed)));
+    if headers[0] != 0 {
+        let counts: BTreeMap<&str, u64> = std::iter::once("codex_zst_header_decoders")
+            .chain(CODEX_ZST_INPUT_KEYS)
+            .zip(headers)
+            .collect();
+        traversal_point("codex_zst_input_headers", "codex", &counts);
+    }
     let counts = with_codex_zst_refused(|refused| {
         let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
             .into_iter()
@@ -405,7 +452,8 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
 /// Repeated reads count again; missing/refused files add nothing. No identities.
 /// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
 /// Retention: pairs deleted (and their bytes), pairs kept by a protection,
-/// copy or write fence, and pairs kept by a read or unlink fault.
+/// copy or write fence (of them, by the copy rule), pairs kept by a read or
+/// unlink fault, and held pairs (and their bytes) with no listed transcript.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
     #[serde(skip_serializing_if = "is_zero")]
@@ -419,11 +467,17 @@ struct ClaudeSidecarReparse {
     #[serde(skip_serializing_if = "is_zero")]
     claude_telemetry_held_roots: u64,
     #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_copied: u64,
+    #[serde(skip_serializing_if = "is_zero")]
     claude_telemetry_read_fault: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_bytes: u64,
 }
-process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6]);
+process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9]);
 pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
-    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0]);
+    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0, 0, 0, 0]);
 }
 /// One Claude telemetry retention run.
 #[derive(Default, PartialEq, Eq)]
@@ -431,7 +485,10 @@ pub(crate) struct ClaudeTelemetryRetention {
     pub(crate) retired_roots: u64,
     pub(crate) retired_bytes: u64,
     pub(crate) held_roots: u64,
+    pub(crate) held_copied: u64,
     pub(crate) read_fault: u64,
+    pub(crate) held_no_transcript_roots: u64,
+    pub(crate) held_no_transcript_bytes: u64,
 }
 pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
     add_claude_sidecar_counts([
@@ -440,10 +497,13 @@ pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
         run.retired_roots,
         run.retired_bytes,
         run.held_roots,
+        run.held_copied,
         run.read_fault,
+        run.held_no_transcript_roots,
+        run.held_no_transcript_bytes,
     ]);
 }
-fn add_claude_sidecar_counts(deltas: [u64; 6]) {
+fn add_claude_sidecar_counts(deltas: [u64; 9]) {
     with_claude_sidecar_reparse(|counts| {
         for (counter, delta) in counts.iter().zip(deltas) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
@@ -457,8 +517,17 @@ fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
         claude_telemetry_retired_roots: counts[2].swap(0, Relaxed),
         claude_telemetry_retired_bytes: counts[3].swap(0, Relaxed),
         claude_telemetry_held_roots: counts[4].swap(0, Relaxed),
-        claude_telemetry_read_fault: counts[5].swap(0, Relaxed),
+        claude_telemetry_held_copied: counts[5].swap(0, Relaxed),
+        claude_telemetry_read_fault: counts[6].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_roots: counts[7].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_bytes: counts[8].swap(0, Relaxed),
     })
+}
+
+/// Test seam: drain this thread's Claude page counters as their logged keys.
+#[cfg(test)]
+pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
+    serde_json::to_value(take_claude_sidecar_reparse()).unwrap()
 }
 
 /// Nonzero-only counters on the existing native_collection_page line. They
@@ -1624,6 +1693,12 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
     let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
     traversal_point("codex_continuation_mint", "codex", &counts);
 }
+/// Rotates a large service log once at startup, while the state lock is held.
+pub fn rotate_service_log_at_startup() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_at_startup();
+}
+
 /// Content-free allocator launch configuration, called once before serving.
 pub fn log_startup_resources() {
     let value = std::env::var_os("MallocLargeCache");
@@ -2203,6 +2278,21 @@ mod tests {
         .unwrap();
         assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
         assert_eq!(maximum["claude_sidecar_reparse_bytes"], u64::MAX);
+        let (_, rows) = capture(|| {
+            claude_telemetry_retention(ClaudeTelemetryRetention {
+                held_roots: 3,
+                held_copied: 1,
+                held_no_transcript_roots: 2,
+                held_no_transcript_bytes: 7,
+                ..Default::default()
+            });
+            Probe::start().collection("claude_code", collection());
+        });
+        let counts = &rows[0]["counts"];
+        assert_eq!(counts["claude_telemetry_held_roots"], 3);
+        assert_eq!(counts["claude_telemetry_held_copied"], 1);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_roots"], 2);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_bytes"], 7);
     }
 
     #[test]

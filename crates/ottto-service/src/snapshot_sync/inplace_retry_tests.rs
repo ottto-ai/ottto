@@ -286,7 +286,10 @@ fn never_retried_in_place() {
     });
     assert_eq!(
         driven.result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(driven.posts.len(), 1);
     assert!(driven.waits.is_empty());

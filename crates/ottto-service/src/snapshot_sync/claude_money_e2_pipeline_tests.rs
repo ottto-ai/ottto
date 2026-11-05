@@ -245,7 +245,7 @@ impl Page {
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
-                apply_claude_local_evidence_to_scan_with_retained(
+                apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
@@ -2231,7 +2231,10 @@ fn retry_case(conflict: bool) {
         });
         assert_eq!(
             result.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
         );
         assert_eq!(
             first, resent,

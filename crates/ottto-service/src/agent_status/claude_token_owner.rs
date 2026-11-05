@@ -1,16 +1,19 @@
-//! Which account owns the default Claude home's token.
+//! Which account owns a Claude home's stored token.
 //!
-//! The default `~/.claude` has more than one writer: a Claude Desktop Code
-//! session writes `.claude.json` `oauthAccount` for Desktop's account, while
-//! a terminal `claude` keeps its own login in the default keychain item. The
+//! A Claude folder has more than one writer: a Claude Desktop Code session
+//! writes `.claude.json` `oauthAccount` for Desktop's account, while a
+//! terminal `claude` keeps its own login in the folder's keychain item. The
 //! token's owner is the account that is billed, so it is proven with that
 //! token (`GET /api/oauth/profile`) and `.claude.json` is only a display cache.
+//! The default home and registered slots use the same check.
 //!
 //! Only the account and organization uuids are read; they are hashed with the
 //! existing identity scheme and the body is dropped. The verdict lives in
-//! memory, keyed by a fingerprint of the token itself: one call per token,
-//! with back-off after a failure.
+//! memory, one token per home (`"default"` or the slot id), keyed by a
+//! fingerprint of the token itself: one call per token, with back-off after a
+//! failure.
 
+use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,15 +38,19 @@ enum Verdict {
     Failed { retry_at: Instant, failures: u32 },
 }
 
-/// The latest default-home token and its verdict. One entry: the default home
-/// holds one token at a time. Tests keep one per test thread.
-#[cfg(not(test))]
-static LAST: Mutex<Option<(String, Verdict)>> = Mutex::new(None);
+/// Each home's latest token and its verdict, keyed by home: one entry for
+/// the default home and one per registered slot. A new token replaces its
+/// home's entry and never reuses an old verdict. Tests keep one map per test
+/// thread.
+type Owners = BTreeMap<String, (String, Verdict)>;
 
 #[cfg(not(test))]
-fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
-    use_last(
-        &mut LAST
+static OWNERS: Mutex<Owners> = Mutex::new(BTreeMap::new());
+
+#[cfg(not(test))]
+fn with_owners<R>(use_owners: impl FnOnce(&mut Owners) -> R) -> R {
+    use_owners(
+        &mut OWNERS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     )
@@ -51,13 +58,12 @@ fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R
 
 #[cfg(test)]
 thread_local! {
-    static LAST: std::cell::RefCell<Option<(String, Verdict)>> =
-        const { std::cell::RefCell::new(None) };
+    static OWNERS: std::cell::RefCell<Owners> = const { std::cell::RefCell::new(BTreeMap::new()) };
 }
 
 #[cfg(test)]
-fn with_last<R>(use_last: impl FnOnce(&mut Option<(String, Verdict)>) -> R) -> R {
-    LAST.with(|last| use_last(&mut last.borrow_mut()))
+fn with_owners<R>(use_owners: impl FnOnce(&mut Owners) -> R) -> R {
+    OWNERS.with(|owners| use_owners(&mut owners.borrow_mut()))
 }
 
 /// A content fingerprint of the stored token (never a file time).
@@ -68,13 +74,13 @@ fn credential_fingerprint(access_token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// The proven owner of `access_token`, or `None` while unproven. The provider
-/// is asked at most once per token, and again after a failure only once its
-/// back-off has passed; `may_call` false serves the remembered verdict only.
-/// No lock is held during the call.
-pub(super) fn proven_owner(access_token: &str, may_call: bool) -> Option<ProvenOwner> {
+/// The proven owner of `access_token`, the token `home` stores, or `None`
+/// while unproven. The provider is asked at most once per token, and again
+/// after a failure only once its back-off has passed; `may_call` false serves
+/// the remembered verdict only. No lock is held during the call.
+pub(super) fn proven_owner(home: &str, access_token: &str, may_call: bool) -> Option<ProvenOwner> {
     let fingerprint = credential_fingerprint(access_token);
-    let failures = with_last(|last| match last.as_ref() {
+    let failures = with_owners(|owners| match owners.get(home) {
         Some((known, verdict)) if *known == fingerprint => match verdict {
             Verdict::Proven(owner) => Err(Some(owner.clone())),
             Verdict::Failed { retry_at, .. } if Instant::now() < *retry_at => Err(None),
@@ -87,7 +93,11 @@ pub(super) fn proven_owner(access_token: &str, may_call: bool) -> Option<ProvenO
         Ok(_) => return None,
         Err(remembered) => return remembered,
     };
-    let verdict = match fetch_owner(access_token) {
+    #[cfg(test)]
+    let injected = Some(test_profile_response(home, access_token));
+    #[cfg(not(test))]
+    let injected = None;
+    let verdict = match fetch_owner(access_token, injected) {
         Some(owner) => Verdict::Proven(owner),
         None => {
             let failures = failures.saturating_add(1);
@@ -104,17 +114,14 @@ pub(super) fn proven_owner(access_token: &str, may_call: bool) -> Option<ProvenO
         Verdict::Proven(owner) => Some(owner.clone()),
         Verdict::Failed { .. } => None,
     };
-    with_last(|last| *last = Some((fingerprint, verdict)));
+    with_owners(|owners| {
+        owners.insert(home.to_string(), (fingerprint, verdict));
+    });
     owner
 }
 
-fn fetch_owner(access_token: &str) -> Option<ProvenOwner> {
-    #[cfg(test)]
-    let injected = Some(PROFILE_TEST_RESPONSE
-        .with(std::cell::Cell::get)
-        .unwrap_or(default_home_profile)());
-    #[cfg(not(test))]
-    let injected: Option<Result<Value, u16>> = None;
+/// `injected` stands in for the endpoint in tests: a 200 body or a status.
+fn fetch_owner(access_token: &str, injected: Option<Result<Value, u16>>) -> Option<ProvenOwner> {
     let started = Instant::now();
     let response = match injected {
         Some(Ok(body)) => Ok(body),
@@ -171,10 +178,10 @@ fn owner_from_profile(body: &Value) -> Option<ProvenOwner> {
     })
 }
 
-/// Test-only stand-in for the profile endpoint: a 200 body (`Ok`) or an HTTP
-/// status (`Err`).
+/// Test-only stand-in for the profile endpoint, given the token sent: a 200
+/// body (`Ok`) or an HTTP status (`Err`).
 #[cfg(test)]
-pub(super) type ProfileResponder = fn() -> Result<Value, u16>;
+pub(super) type ProfileResponder = fn(&str) -> Result<Value, u16>;
 
 #[cfg(test)]
 thread_local! {
@@ -183,14 +190,60 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Tests without a responder: the token belongs to the account the test
-/// home's default `.claude.json` names.
+/// The responder's answer; without one, the token belongs to the account its
+/// own home's `.claude.json` names (the default home's, or the registered
+/// slot's), as a sign-in there leaves it.
 #[cfg(test)]
-fn default_home_profile() -> Result<Value, u16> {
-    let path = ottto_core::ClaudeConfigDirSlot::Default.identity_path(&super::home_dir());
-    let account = super::read_claude_cli_oauth_account(&path).ok_or(404_u16)?;
+fn test_profile_response(home: &str, access_token: &str) -> Result<Value, u16> {
+    if let Some(respond) = PROFILE_TEST_RESPONSE.with(std::cell::Cell::get) {
+        return respond(access_token);
+    }
+    let slot = if home == "default" {
+        ottto_core::ClaudeConfigDirSlot::Default
+    } else {
+        let settings = super::FileClaudeConfigSlotSettingsStore::default()
+            .load()
+            .map_err(|_| 404_u16)?;
+        let descriptor = settings
+            .managed_slots
+            .iter()
+            .chain(&settings.external_slots)
+            .find(|descriptor| descriptor.slot_id == home)
+            .ok_or(404_u16)?;
+        super::claude_config_slot_for_descriptor(descriptor).ok_or(404_u16)?
+    };
+    let account = super::read_claude_cli_oauth_account(&slot.identity_path(&super::home_dir()))
+        .ok_or(404_u16)?;
     Ok(serde_json::json!({
         "account": {"uuid": account.account_uuid},
         "organization": {"uuid": account.organization_uuid},
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [behaviour] Each home keeps its own verdict: the default home and a
+    /// slot proving in turn over two passes make one call each, never
+    /// evicting each other.
+    #[test]
+    fn each_home_keeps_its_own_verdict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn respond(token: &str) -> Result<Value, u16> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({
+                "account": {"uuid": format!("account-{token}")},
+                "organization": {"uuid": format!("organization-{token}")},
+            }))
+        }
+        PROFILE_TEST_RESPONSE.with(|cell| cell.set(Some(respond)));
+        for _ in 0..2 {
+            assert!(proven_owner("default", "default-token", true).is_some());
+            assert!(proven_owner("claude_slot_owner", "slot-token", true).is_some());
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "one call per home's token");
+        PROFILE_TEST_RESPONSE.with(|cell| cell.set(None));
+    }
 }

@@ -1,7 +1,8 @@
-// Claude telemetry retention on the real e2 pipeline fixture: a session's
-// API + trace pair is deleted only when no transcript, index or census entry,
-// named session, held state or copied request reads it; every surviving body
-// is unchanged.
+// Claude telemetry retention on the real e2 pipeline fixture. Deletion waits
+// for proof that a pair was delivered, so no pair is deleted or read today.
+// Once proven (a test seam until then), a session's API + trace pair is
+// deleted only when no transcript, index or census entry, named session, held
+// state or copied request reads it; every surviving body is unchanged.
 use super::state_v2_money_tests::{routed, tagged_api};
 use super::*;
 use crate::snapshots::e2_pipeline_scan_fixture::{
@@ -70,9 +71,10 @@ fn listing(c: &Corpus) -> BTreeMap<String, Option<u64>> {
     listed
 }
 
-/// A new process whose complete walk, begun at `started_at_ms`, listed `listed`.
+/// A complete walk, begun at `started_at_ms`, listed `listed` and ended (no
+/// restart).
 fn roster(started_at_ms: u64, listed: BTreeMap<String, Option<u64>>) {
-    crate::snapshots::money_freshness::set_roster_for_test(
+    crate::snapshots::money_freshness::walk_ended_for_test(
         SnapshotSource::ClaudeCode,
         Some((started_at_ms, listed)),
     );
@@ -94,6 +96,18 @@ fn retire_with(c: &Corpus, index: &ScanIndex, removed: &BTreeSet<String>, named:
 
 fn retire(c: &Corpus, index: &ScanIndex) {
     retire_with(c, index, &BTreeSet::new(), &[NAMED.to_string()]);
+}
+
+/// Treat every candidate as delivered (or none, as today) on this thread.
+fn proven(proven: bool) {
+    crate::snapshots::claude_telemetry_retention::prove_delivery_for_test(proven);
+}
+
+/// One retention run's page counters (reads and retention counts), alone.
+fn counted(run: impl FnOnce()) -> serde_json::Value {
+    crate::local_resource_diagnostics::take_claude_sidecar_reparse_for_test();
+    run();
+    crate::local_resource_diagnostics::take_claude_sidecar_reparse_for_test()
 }
 
 /// ROOT and COPY have transcripts; COPY copied request g1 of COPIED. GONE,
@@ -137,12 +151,14 @@ fn cold(c: &Corpus) -> Page {
     page
 }
 
-/// [money] Retention deletes exactly the unread pairs (one a half pair) and
-/// keeps the transcript's, the copied and the named ones; a cold read of every
-/// surviving session then equals the arm without retention (money oracle).
+/// [money] Once delivery is proven, retention deletes exactly the unread pairs
+/// (one a half pair) and keeps the transcript's, the copied and the named ones;
+/// a cold read of every surviving session then equals the arm without
+/// retention (money oracle).
 #[test]
 fn telemetry_retention_equality_oracle() {
     with_e2(|| {
+        proven(true);
         let (c, warm) = corpus("telemetry-retention-oracle");
         let before = cold(&c);
         walked(&c, now_ms() + 60_000);
@@ -167,12 +183,13 @@ fn telemetry_retention_equality_oracle() {
 
 /// [money] Positive control: one session on two accounts (a switch mid
 /// session, then back) with identity-tagged rows, and an unread pair. After
-/// retention deletes the unread pair, a cold read and a restart from the
-/// saved index equal the reads with the pair present, and so does a reread
-/// after the survivor grows.
+/// retention deletes the unread pair, a cold read and a restart from the saved
+/// index equal the reads with the pair present, and so does a reread after the
+/// survivor grows.
 #[test]
 fn telemetry_retention_positive_control_cold_restart_and_append() {
     with_e2(|| {
+        proven(true);
         let mut c = Corpus::new("telemetry-retention-positive");
         let marker = serde_json::json!({"type":"attachment", "sessionId":ROOT,
             "attachment":{"type":"credential_org",
@@ -341,11 +358,12 @@ enum Dependency {
     ExcludedFileOnly,
 }
 
-/// [money] Every dependency keeps the candidate's pair, except an excluded
-/// journal, which reads nothing; the uncopied gone control retires in every
-/// row.
+/// [money] With delivery proven, every dependency keeps the candidate's pair,
+/// except an excluded journal, which reads nothing; the uncopied gone control
+/// retires in every row.
 #[test]
 fn telemetry_retention_keeps_every_dependency() {
+    proven(true);
     for (row, keeps) in [
         (Dependency::SubagentCopy, true),
         (Dependency::ResumeCopy, true),
@@ -501,17 +519,20 @@ fn telemetry_retention_keeps_every_dependency() {
     }
 }
 
-/// [money] Fail closed: a member that changes after it was read is kept under
-/// the lock; no current walk, a pair written after the walk began, a listed
-/// transcript with no census record (it may hold a copy), one without an
-/// mtime, and a malformed member all keep the pair. A transcript that grew
+/// [money] Fail closed, with delivery proven: a member that changes after it
+/// was read is kept under the lock; no current walk, a pair written after the
+/// walk began, a listed transcript with no census record (it may hold a copy),
+/// one without an mtime, and a malformed member all keep the pair. A transcript that grew
 /// since its loss-free read is known through that read's ids.
 #[test]
 fn telemetry_retention_fails_closed() {
     with_e2(|| {
+        proven(true);
         let (c, warm) = corpus("telemetry-retention-closed");
         let stem = format!("{:x}", Sha256::digest(HALF.as_bytes()));
-        let read = crate::claude_local_otel::read_telemetry_pair(&c.support, &stem).unwrap();
+        let read = crate::claude_local_otel::read_telemetry_pair(&c.support, &stem)
+            .unwrap()
+            .unwrap();
         append(
             &member(&c, "claude-code-effort", HALF),
             &(serde_json::to_string(&api_for(HALF, "g5", 17, 1700)).unwrap() + "\n"),
@@ -526,7 +547,7 @@ fn telemetry_retention_fails_closed() {
         );
 
         let gone = || members(&c, GONE);
-        crate::snapshots::money_freshness::set_roster_for_test(SnapshotSource::ClaudeCode, None);
+        crate::snapshots::money_freshness::walk_ended_for_test(SnapshotSource::ClaudeCode, None);
         retire(&c, &warm.index);
         assert_eq!(gone(), (true, true), "no complete walk in this process");
         walked(&c, 0);
@@ -572,12 +593,14 @@ fn telemetry_retention_fails_closed() {
     });
 }
 
-/// [money] The hint path: a key this pass removed keeps its root's pair while
-/// the same relative path still exists (the walk did not list it), and the
-/// next run, with no backlog, retires the pair only after a real NotFound.
+/// [money] The hint path, with delivery proven: a key this pass removed keeps
+/// its root's pair while the same relative path still exists (the walk did not
+/// list it), and the next run of the same walk, with no backlog, retires the
+/// pair only after a real NotFound.
 #[test]
 fn telemetry_retention_hint_path_retires_only_after_not_found() {
     with_e2(|| {
+        proven(true);
         let (c, warm) = corpus("telemetry-retention-hint");
         let path = c.root.join(format!("{GONE}.jsonl"));
         std::fs::write(&path, line(GONE, "g9", AT, 1)).unwrap();
@@ -594,13 +617,14 @@ fn telemetry_retention_hint_path_retires_only_after_not_found() {
     });
 }
 
-/// [format] A crash between a pair's two unlinks leaves one member; the next
-/// process's first complete walk deletes it. A restart's cold read of every
-/// survivor equals the read before retention, both after the crash and after
-/// the finishing run (money and placement oracle).
+/// [format] With delivery proven, a crash between a pair's two unlinks leaves
+/// one member; the next complete walk, in the same process, deletes it. A
+/// restart's cold read of every survivor equals the read before retention, both
+/// after the crash and after the finishing run (money and placement oracle).
 #[test]
 fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
     with_e2(|| {
+        proven(true);
         let (c, warm) = corpus("telemetry-retention-crash");
         // GONE is then the only unread pair; its second unlink fails.
         std::fs::remove_file(member(&c, "claude-code-effort", HALF)).unwrap();
@@ -618,5 +642,79 @@ fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
         assert_eq!(members(&c, ROOT), (true, true));
         let finished = cold(&c);
         assert_equivalent(&before, &routed(&finished, finished.upload_policy));
+    });
+}
+
+/// [regress] With delivery proven, each complete walk rechecks every stored
+/// pair: a pair held at one walk's end is retired after the next walk ends,
+/// with no restart.
+#[test]
+fn telemetry_retention_rechecks_held_pairs_after_each_complete_walk() {
+    with_e2(|| {
+        proven(true);
+        let (c, warm) = corpus("telemetry-retention-per-walk");
+        walked(&c, 0);
+        retire(&c, &warm.index);
+        assert_eq!(
+            members(&c, GONE),
+            (true, true),
+            "written after walk 1 began"
+        );
+        walked(&c, now_ms() + 60_000);
+        retire(&c, &warm.index);
+        assert_eq!(members(&c, GONE), (false, false), "walk 2 rechecks it");
+        assert_eq!(members(&c, ROOT), (true, true));
+    });
+}
+
+/// [regress] Until delivery is proven, retention deletes and reads no pair of
+/// any kind across two complete walks and a restart, and counts each held
+/// pair (those without a listed transcript, with their metadata bytes).
+#[test]
+fn telemetry_retention_holds_and_reads_no_pair_until_delivery_is_proven() {
+    with_e2(|| {
+        proven(false);
+        let (c, mut warm) = corpus("telemetry-retention-hold");
+        // (session, members, has a listed transcript)
+        let kinds = [
+            (ROOT, (true, true), true),
+            (GONE, (true, true), false),
+            (HALF, (true, false), false),
+            (COPIED, (true, true), false),
+            (NAMED, (true, true), false),
+        ];
+        let no_transcript_bytes = kinds
+            .iter()
+            .filter(|(_, _, listed)| !listed)
+            .flat_map(|(session, _, _)| {
+                ["claude-code-effort", "claude-code-trace-ownership"]
+                    .map(|dir| member(&c, dir, session))
+            })
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        let expected = serde_json::json!({
+            "claude_telemetry_held_roots": kinds.len(),
+            "claude_telemetry_held_no_transcript_roots": 4,
+            "claude_telemetry_held_no_transcript_bytes": no_transcript_bytes,
+        });
+        let mut index = warm.index.clone();
+        for run in ["walk 1", "walk 2", "restart"] {
+            if run == "restart" {
+                crate::snapshots::money_freshness::walk_ended_for_test(
+                    SnapshotSource::ClaudeCode,
+                    None,
+                );
+                let counts = counted(|| retire(&c, &index));
+                assert_eq!(counts, serde_json::json!({}), "no walk since start");
+                index = c.reload(&mut warm.index);
+            }
+            walked(&c, now_ms() + 60_000);
+            // Zero body reads: no side-file read and no read fault.
+            assert_eq!(counted(|| retire(&c, &index)), expected, "{run}");
+            for (session, members_before, _) in kinds {
+                assert_eq!(members(&c, session), members_before, "{run}: {session}");
+            }
+        }
     });
 }

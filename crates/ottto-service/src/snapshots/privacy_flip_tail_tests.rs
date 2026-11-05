@@ -53,7 +53,8 @@ fn growth(source: SnapshotSource) -> Vec<Value> {
 /// both directions, a Tail under B after a parse under A equals a Full under
 /// B: money, placement, everything the scan retains, and the bodies POSTed.
 /// Attribution is under the key at send: the whole session re-keys, as a cold
-/// Full under B.
+/// Full under B. A same-account re-login (A→B, A→B→C) between the two sends
+/// changes nothing.
 #[test]
 fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
@@ -70,6 +71,7 @@ fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
                 let parsed = f.flip_walk(before.policy, f.attribution_for(before).as_ref());
                 f.send_all(&committed, &parsed.scan);
                 assert!(!f.debt(), "{label}: parsed and acknowledged under A");
+                f.uploader.relogin(1 + usize::from(start));
                 f.flip_to(after);
                 f.append(&growth(source));
                 f.route();

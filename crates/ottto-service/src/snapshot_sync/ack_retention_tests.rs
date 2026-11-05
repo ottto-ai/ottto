@@ -212,7 +212,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
     .unwrap();
     assert!(matches!(
         outcome,
-        SnapshotPageOutcome::Settled { conflicted: 1 }
+        SnapshotPageOutcome::Settled { conflicted: 1, .. }
     ));
 
     let (_, reloaded) = f.load();
@@ -993,8 +993,9 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
         "carried",
         "unknown",
         "held",
+        "relogin",
     ] {
-        let f = AckFixture::new(true);
+        let mut f = AckFixture::new(true);
         let (committed, mut progress) = f.load();
         let mut selected = committed.clone();
         selected.files.clear();
@@ -1046,6 +1047,10 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
             }
             std::fs::write(&f.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
         }
+        if mode == "relogin" {
+            // Crash after the handoff; restart after a re-login A→B→C.
+            f.namespace = crate::snapshot_sync::relogin_namespace(&f.namespace, 2);
+        }
         let (mut saved, mut progress) = f.load();
         progress
             .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
@@ -1055,7 +1060,7 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
                 .1
                 .accepted_fingerprints
                 .contains(&f.item.snapshot_fingerprint),
-            mode != "retire",
+            !matches!(mode, "retire" | "relogin"),
             "{mode}"
         );
     }

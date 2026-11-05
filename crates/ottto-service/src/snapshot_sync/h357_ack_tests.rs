@@ -200,14 +200,7 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for case in [
-        "missing",
-        "malformed",
-        "unknown",
-        "wrong_body",
-        "count",
-        "overlap",
-    ] {
+    for case in ["missing", "malformed", "unknown", "count", "overlap"] {
         let items = items(3);
         let mut ledger = progress();
         let mut accepted = 0;
@@ -229,9 +222,6 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
                     }
                     "unknown" => {
                         ack.entity_ack_contract = Some("future:v9".into());
-                    }
-                    "wrong_body" => {
-                        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
                     }
                     "count" => {
                         ack.accepted = 3;
@@ -256,6 +246,58 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         assert_eq!(accepted, 0);
         assert!(ledger.accepted_body_witnesses.is_empty());
         assert!(ledger.quarantined_fingerprints.is_empty());
+    }
+    // A wrong body witness names its own ref: only that body is set aside,
+    // never certified, and its siblings settle from their own exact ACK.
+    let items = items(3);
+    let mut ledger = progress();
+    let mut accepted = 0;
+    let mut sends = 0;
+    let mut refused = None;
+    let outcome = upload_resumable_batches_with_body_witness(
+        &items,
+        "codex",
+        &mut ledger,
+        &mut accepted,
+        |i| i.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            sends += 1;
+            let mut ack = response(&batch, 0);
+            if sends == 1 {
+                // `response` reverses order: accepted_entities[0] is batch[1].
+                ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+                refused = Some(batch[1].clone());
+            }
+            ack.validate_entity_ack(&request(batch))?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
+    );
+    assert_eq!(sends, 2);
+    assert_eq!(accepted, 2);
+    let refused = refused.unwrap().snapshot_fingerprint;
+    assert!(!ledger.accepted_body_witnesses.contains_key(&refused));
+    assert_eq!(
+        ledger.quarantined_fingerprints[&refused].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert_eq!(ledger.quarantined_fingerprints.len(), 1);
+    for item in items.iter().filter(|i| i.snapshot_fingerprint != refused) {
+        assert_eq!(
+            ledger
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint),
+            Some(&snapshot_upload_body_witness(item))
+        );
     }
 }
 
@@ -1331,16 +1373,45 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
     assert_eq!(accepted, 1);
     assert_eq!(
         with_bootstrap_deferred(outcome, deferred),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     // Deferred dominates refusal as in the partitioned uploader.
     assert_eq!(
         with_bootstrap_deferred(ResumableUploadResult::Rejected { count: 2 }, 1),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(
-        with_bootstrap_deferred(ResumableUploadResult::Deferred { count: 2 }, 1),
-        ResumableUploadResult::Deferred { count: 3 }
+        with_bootstrap_deferred(
+            ResumableUploadResult::Deferred {
+                count: 2,
+                isolated: 0
+            },
+            1
+        ),
+        ResumableUploadResult::Deferred {
+            count: 3,
+            isolated: 0
+        }
+    );
+    // A true deferral beside an isolated refusal still defers the pass.
+    assert_eq!(
+        with_bootstrap_deferred(
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 1
+            },
+            1
+        ),
+        ResumableUploadResult::Deferred {
+            count: 2,
+            isolated: 1
+        }
     );
     assert_eq!(
         with_bootstrap_deferred(ResumableUploadResult::Rejected { count: 2 }, 0),
@@ -1365,6 +1436,50 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         with_bootstrap_deferred(ResumableUploadResult::Disabled(None), 1),
         ResumableUploadResult::Disabled(None)
     );
+    // A probe refused as ordinary mixed usage is held alone and does not
+    // defer the pass; the main upload carries its exact quarantined body.
+    let mut mixed = progress();
+    let deferred = bootstrap_cache_heads(
+        &probes,
+        "h360-mixed",
+        &mut mixed,
+        true,
+        |batch, cas| {
+            let mut ack = response(&batch, 0);
+            if cas {
+                for reference in ack
+                    .accepted_entities
+                    .iter_mut()
+                    .chain(&mut ack.unchanged_entities)
+                {
+                    reference.head_etag = Some("e".repeat(64));
+                }
+                ack.accepted_entities
+                    .retain(|reference| reference.snapshot_fingerprint != conflict_fp);
+                ack.unchanged_entities
+                    .retain(|reference| reference.snapshot_fingerprint != conflict_fp);
+                ack.accepted -= 1;
+                ack.rejected_entities.push(SnapshotEntityRejection {
+                    source_session_id: probes[0].source_session_id.clone(),
+                    snapshot_fingerprint: conflict_fp.clone(),
+                    reason: "accepted_log_stale_older_mixed".into(),
+                    detail: "not logged".into(),
+                    permanent: false,
+                    occurrence_count: 1,
+                });
+            }
+            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(deferred, 0);
+    assert_eq!(
+        mixed.quarantined_fingerprints[&conflict_fp].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(cache_head_probe_held(&mixed, &probes[0]));
     // A shed or disabled probe stage still aborts before any main upload.
     crate::client_report::reset_for_test();
     for case in ["shed", "disabled"] {
@@ -1543,7 +1658,8 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
     let mut ledger = progress();
     let saves = std::cell::Cell::new(0usize);
     let saves_before_cas = std::cell::Cell::new(None);
-    let error = bootstrap_cache_heads(
+    let mut refusals = Vec::new();
+    let deferred = bootstrap_cache_heads(
         &probes,
         "h360-witness",
         &mut ledger,
@@ -1561,26 +1677,35 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
                     reference.body_witness_digest = Some("0".repeat(64));
                 }
             }
-            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
-            Ok(ack)
+            let checked = ack.validate_entity_ack_with_head_cas(&request(batch), cas);
+            if let Err(error) = &checked {
+                assert_eq!(
+                    snapshot_upload_error_class(error),
+                    Some(SnapshotUploadErrorClass::BackendResponse)
+                );
+                refusals.push(upload_failure_diagnostic(error));
+            }
+            checked.map(|()| ack)
         },
         |_| {
             saves.set(saves.get() + 1);
             Ok(())
         },
     )
-    .unwrap_err();
+    .unwrap();
     assert_eq!(
-        snapshot_upload_error_class(&error),
-        Some(SnapshotUploadErrorClass::BackendResponse)
+        refusals,
+        ["kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"]
     );
+    // The refused probe names its own ref: it is set aside under its bounded
+    // retry with one save, and no head is minted.
+    assert_eq!(deferred, 1);
     assert_eq!(
-        upload_failure_diagnostic(&error),
-        "kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"
+        saves_before_cas.get().map(|saved| saved + 1),
+        Some(saves.get())
     );
-    assert_eq!(saves_before_cas.get(), Some(saves.get()));
     assert!(ledger.accepted_cache_heads.is_empty());
-    assert!(!cache_head_probe_held(&ledger, &probes[0]));
+    assert!(cache_head_probe_held(&ledger, &probes[0]));
 }
 
 #[test]

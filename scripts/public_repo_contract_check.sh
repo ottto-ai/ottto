@@ -7,25 +7,23 @@ PUBLIC_ROOT="${PUBLIC_CONTRACT_REPO_ROOT:-$DEFAULT_PUBLIC_ROOT}"
 PRIVATE_REPO_ROOT="${PUBLIC_CONTRACT_PRIVATE_REPO_ROOT:-}"
 PRIVATE_RUNTIME_PIN="${PUBLIC_CONTRACT_PRIVATE_RUNTIME_PIN:-}"
 REQUIRE_PUBLIC_AUTHORITY="${PUBLIC_CONTRACT_REQUIRE_PUBLIC_AUTHORITY:-false}"
-STAGED_OUTPUT=0
 
 usage() {
   cat <<'USAGE'
-Usage: public_repo_contract_check.sh [--staged-output <dir>] [--private-repo-root <dir>] [--private-runtime-pin <path>] [--require-public-authority]
+Usage: public_repo_contract_check.sh [--private-repo-root <dir>] [--private-runtime-pin <path>] [--require-public-authority]
 
 Checks that a root-shaped public ottto repository checkout carries the JSON,
 schema, registry, setup, and redaction contracts consumed by the private Ottto
 backend/frontend. By default the script checks the repository root containing
-scripts/. Use --staged-output to check a generated public export bundle. When
---private-repo-root is supplied, the private repository must also carry a
-public-runtime pin whose manifest digest matches the checked public root.
-Use --require-public-authority after public repo cutover: it requires the
-private pin to name a public repo commit and verifies that the checked public
-root is a clean git checkout at that commit.
+scripts/ (override with PUBLIC_CONTRACT_REPO_ROOT). When --private-repo-root is
+supplied, the private repository must also carry a public-runtime pin whose
+manifest digest matches the checked public root. Use
+--require-public-authority to require the private pin to name a public repo
+commit and verify that the checked public root is a clean git checkout at that
+commit.
 
-The pin is compared with public manifest facts. With --staged-output they come
-from the bundle's PUBLIC_EXPORT_MANIFEST.json. Otherwise the checked root is a
-git checkout and they are derived from its HEAD commit tree with
+The pin is compared with public manifest facts. The checked root is then a git
+checkout and the facts are derived from its HEAD commit tree with
 scripts/public_repo_manifest.sh; a commit that still tracks the manifest file
 must match the derived manifest.
 
@@ -39,15 +37,6 @@ USAGE
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --staged-output)
-      [[ "$#" -ge 2 ]] || {
-        echo "public-contract: --staged-output requires a value" >&2
-        exit 2
-      }
-      PUBLIC_ROOT="$2"
-      STAGED_OUTPUT=1
-      shift 2
-      ;;
     --private-repo-root)
       [[ "$#" -ge 2 ]] || {
         echo "public-contract: --private-repo-root requires a value" >&2
@@ -80,10 +69,11 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 python3 - "$PUBLIC_ROOT" "$PRIVATE_REPO_ROOT" "$PRIVATE_RUNTIME_PIN" "$REQUIRE_PUBLIC_AUTHORITY" \
-  "$STAGED_OUTPUT" "$SCRIPT_DIR/public_repo_manifest.sh" <<'PY'
+  "$SCRIPT_DIR/public_repo_manifest.sh" <<'PY'
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -96,8 +86,7 @@ PUBLIC_ROOT = Path(sys.argv[1]).resolve()
 PRIVATE_REPO_ROOT = Path(sys.argv[2]).resolve() if sys.argv[2] else None
 PRIVATE_RUNTIME_PIN_ARG = sys.argv[3]
 REQUIRE_PUBLIC_AUTHORITY = sys.argv[4].lower() in {"1", "true", "yes"}
-STAGED_OUTPUT = sys.argv[5] == "1"
-MANIFEST_SCRIPT = sys.argv[6]
+MANIFEST_SCRIPT = sys.argv[5]
 REQUIRED_CONNECTOR_REDACTION_CLASSES = {
     "prompt",
     "response",
@@ -237,16 +226,6 @@ def git_output(args: list[str]) -> str | None:
 
 
 def public_manifest_facts() -> dict[str, Any]:
-    # Decide by mode, not by looking for .git: a staged bundle such as
-    # dist/public-export/ottto sits inside the outer git checkout.
-    if STAGED_OUTPUT:
-        manifest = require_dict(load_json("PUBLIC_EXPORT_MANIFEST.json"), "public export manifest")
-        files = manifest.get("files")
-        return {
-            "content_sha256": manifest.get("content_sha256"),
-            "output_file_count": manifest.get("output_file_count"),
-            "file_record_count": len(files) if isinstance(files, list) else None,
-        }
     try:
         result = subprocess.run(
             ["bash", MANIFEST_SCRIPT, "--repo", str(PUBLIC_ROOT), "--facts"],
@@ -391,8 +370,8 @@ def check_connector_docs_contracts() -> None:
                 "connector docs must document the collector manifest contract helper",
             ),
             (
-                "uv run python scripts/generate_connector_registry.py --check",
-                "connector docs must preserve registry generator check command",
+                "a maintainer regenerates the registry before merge",
+                "connector docs must say who regenerates the registry",
             ),
             (
                 "Official first-party fixtures must not expose raw prompts, responses, tool\n  output, command output, local paths, credentials, cookies, API keys,\n  passwords, or secrets.",
@@ -907,6 +886,143 @@ def check_diagnostics_values_are_redacted(value: Any, context: str) -> None:
         for pattern, label in DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS:
             if pattern.search(raw):
                 fail(f"{path} exposes unredacted {label}: {raw!r}")
+
+
+def check_public_skeleton_contracts() -> None:
+    # Stable root shape: workspaces, docs, release tooling, policies and CI.
+    required_dirs = (
+        ".github",
+        ".github/workflows",
+        "agent-adapters",
+        "agent-adapters/codex-skill",
+        "agent-adapters/codex-skill/agents",
+        "agent-adapters/claude-code-skill",
+        "connectors",
+        "connectors/sources",
+        "crates",
+        "crates/ottto-cli",
+        "crates/ottto-connector-sdk",
+        "crates/ottto-connector-testkit",
+        "crates/ottto-core",
+        "crates/ottto-protocol",
+        "crates/ottto-service",
+        "docs",
+        "fixtures",
+        "homebrew",
+        "public-export",
+        "release",
+        "schemas",
+        "scripts",
+    )
+    for relative in required_dirs:
+        expect((PUBLIC_ROOT / relative).is_dir(), f"required directory is missing: {relative}")
+    required_files = (
+        ".github/dependabot.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/macos-stable-release.yml",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+        "SECURITY.md",
+        "SUPPORT.md",
+        "TRADEMARKS.md",
+        "agent-adapters/codex-skill/SKILL.md",
+        "agent-adapters/codex-skill/agents/openai.yaml",
+        "agent-adapters/claude-code-skill/SKILL.md",
+        "connectors/README.md",
+        "connectors/registry.generated.json",
+        "connectors/sources/codex/source.toml",
+        "crates/Cargo.lock",
+        "crates/Cargo.toml",
+        "crates/ottto-cli/Cargo.toml",
+        "crates/ottto-connector-sdk/Cargo.toml",
+        "crates/ottto-connector-testkit/Cargo.toml",
+        "crates/ottto-core/Cargo.toml",
+        "crates/ottto-protocol/Cargo.toml",
+        "crates/ottto-service/Cargo.toml",
+        "docs/README.md",
+        "docs/agent-adapters.md",
+        "docs/support.md",
+        "fixtures/cli/help-contract.txt",
+        "homebrew/README.md",
+        "release/README.md",
+        "release/manifest.schema.json",
+        "schemas/collector-fixture.schema.json",
+        "schemas/collector-manifest.schema.json",
+        "schemas/connector-registry.schema.json",
+        "schemas/source-manifest.schema.json",
+    )
+    for relative in required_files:
+        require_file(relative)
+    required_executables = (
+        "scripts/homebrew_formula.sh",
+        "scripts/hosted_native_installer.sh",
+        "scripts/macos_attestation_bind.sh",
+        "scripts/macos_manifest_signature.sh",
+        "scripts/macos_release_gate.sh",
+        "scripts/macos_release_source_check.sh",
+        "scripts/macos_public_rc_evidence_template.sh",
+        "scripts/macos_public_rc_gate.sh",
+        "scripts/macos_stable_preflight.sh",
+        "scripts/macos_stable_qa_evidence_template.sh",
+        "scripts/public_repo_contract_check.sh",
+        "scripts/public_repo_secret_scan.sh",
+        "scripts/public_repo_surface_ci.sh",
+        "scripts/test_public_repo_contract_check.sh",
+        "scripts/test_public_repo_secret_scan.sh",
+        "scripts/test_public_repo_surface_ci.sh",
+        "scripts/test_macos_public_rc_gate.sh",
+        "scripts/test_macos_attestation_bind.sh",
+        "scripts/test_macos_release_source_check.sh",
+        "scripts/test_macos_manifest_signature.sh",
+        "scripts/test_macos_stable_release_workflow.sh",
+        "scripts/test_macos_stable_qa_evidence_template.sh",
+        "scripts/public_repo_manifest.sh",
+    )
+    for relative in required_executables:
+        path = require_file(relative)
+        if path is not None:
+            expect(os.access(path, os.X_OK), f"required executable is not executable: {relative}")
+    patterns = (
+        ('^\\[workspace\\]$', 'Cargo.toml', 'root Rust workspace'),
+        ('"crates/ottto-cli"', 'Cargo.toml', 'runtime crate workspace membership'),
+        ('"crates/ottto-service"', 'Cargo.toml', 'service crate workspace membership'),
+        ('^\\[workspace\\]$', 'crates/Cargo.toml', 'connector Rust workspace'),
+        ('"ottto-connector-sdk"', 'crates/Cargo.toml', 'connector SDK workspace membership'),
+        ('"ottto-connector-testkit"', 'crates/Cargo.toml', 'connector testkit workspace membership'),
+        ('^# Ottto( Local Platform)?$', 'README.md', 'root README title'),
+        ('^# Ottto Local Platform Public Docs$', 'docs/README.md', 'public docs index'),
+        ('^# Agent Adapters$', 'docs/agent-adapters.md', 'agent adapter docs'),
+        ('MCP adapter is intentionally deferred', 'docs/agent-adapters.md', 'MCP adapter deferral'),
+        ('^# Ottto Local Platform Support Runbook$', 'docs/support.md', 'support runbook title'),
+        ('^## Triage$', 'docs/support.md', 'support runbook triage'),
+        ('^## Diagnostics$', 'docs/support.md', 'support runbook diagnostics'),
+        ('^## Escalation$', 'docs/support.md', 'support runbook escalation'),
+        ('^## Do Not Collect$', 'docs/support.md', 'support runbook data boundaries'),
+        ('docs/support\\.md', 'SUPPORT.md', 'root support runbook link'),
+        ('github-actions', '.github/dependabot.yml', 'GitHub Actions dependency hygiene'),
+        ('package-ecosystem: cargo', '.github/dependabot.yml', 'Cargo dependency hygiene'),
+        ('cargo clippy', '.github/workflows/ci.yml', 'Rust clippy CI'),
+        ('public_repo_surface_ci\\.sh', '.github/workflows/ci.yml', 'public surface CI gate'),
+        ('public_repo_surface_ci\\.sh --scope portable', '.github/workflows/ci.yml', 'portable (Linux) public surface CI gate'),
+        ('public_repo_surface_ci\\.sh --scope macos', '.github/workflows/ci.yml', 'macOS-native public surface CI gate'),
+        ('workflow_dispatch', '.github/workflows/macos-stable-release.yml', 'stable release manual dispatch'),
+        ('macos-stable-release', '.github/workflows/macos-stable-release.yml', 'stable release protected environment'),
+        ('macos_attestation_bind\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release attestation binding'),
+        ('macos_release_source_check\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release source verification'),
+        ('macos_manifest_signature\\.sh', '.github/workflows/macos-stable-release.yml', 'stable release manifest signature'),
+        ('public_repo_contract_check\\.sh', 'scripts/public_repo_surface_ci.sh', 'public contract CI gate'),
+        ('public_repo_secret_scan\\.sh', 'scripts/public_repo_surface_ci.sh', 'secret scan CI gate'),
+    )
+    for pattern, relative, description in patterns:
+        path = require_file(relative)
+        if path is not None:
+            expect(re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE) is not None,
+                   f"{description}: pattern not found in {relative}")
 
 
 def check_schema_contracts() -> None:
@@ -2551,6 +2667,7 @@ def check_private_consumers() -> int:
 if not PUBLIC_ROOT.is_dir():
     die(f"public repository root is not a directory: {PUBLIC_ROOT}")
 
+check_public_skeleton_contracts()
 check_schema_contracts()
 check_registry_contract()
 check_cli_contracts()

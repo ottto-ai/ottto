@@ -756,6 +756,7 @@ mod http_tests {
                 .save_with_credential_generation(&ottto_core::LocalDeviceCredentialBinding {
                     device: device.clone(),
                     credential_generation,
+                    continuity: Default::default(),
                 })
                 .unwrap();
             let result = client.issue_relay_token(&device, "same-secret", SnapshotSource::Codex);

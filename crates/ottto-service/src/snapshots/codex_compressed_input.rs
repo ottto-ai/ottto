@@ -90,6 +90,8 @@ pub(super) struct BoundedDecoder<R: Read> {
     compressed_bytes: u64,
     decoded_bytes: u64,
     cpu_micros: u64,
+    /// Set by `OpenedInput::header_only`: an inventory header read.
+    header: bool,
 }
 
 impl<R: Read> BoundedDecoder<R> {
@@ -115,6 +117,7 @@ impl<R: Read> BoundedDecoder<R> {
             compressed_bytes: 0,
             decoded_bytes: 0,
             cpu_micros: 0,
+            header: false,
         })
     }
 
@@ -213,18 +216,25 @@ impl<R: Read> Read for BoundedDecoder<R> {
 
 impl<R: Read> Drop for BoundedDecoder<R> {
     fn drop(&mut self) {
-        crate::local_resource_diagnostics::traversal_point(
-            "codex_zst_input",
-            "codex",
-            &serde_json::json!({
-                "codex_zst_compressed_bytes": self.physical_limit - self.input.get_ref().limit(),
-                "codex_zst_compressed_consumed_bytes": self.compressed_bytes,
-                "codex_zst_decoded_bytes": self.decoded_bytes,
-                "codex_zst_cpu_micros": self.cpu_micros,
-                "codex_zst_decoder_native_peak_bytes": self.context.peak_bytes() as u64,
-                "codex_zst_decoder_allocation_refusals": self.context.allocation_refusals(),
-            }),
-        );
+        use crate::local_resource_diagnostics as diagnostics;
+        let counts = [
+            self.physical_limit - self.input.get_ref().limit(),
+            self.compressed_bytes,
+            self.decoded_bytes,
+            self.cpu_micros,
+            self.context.peak_bytes() as u64,
+            self.context.allocation_refusals(),
+        ];
+        // Header reads fold into one per-walk row; every body decode keeps its own.
+        if self.header {
+            diagnostics::codex_zst_input_header(counts);
+            return;
+        }
+        let counts: std::collections::BTreeMap<&str, u64> = diagnostics::CODEX_ZST_INPUT_KEYS
+            .into_iter()
+            .zip(counts)
+            .collect();
+        diagnostics::traversal_point("codex_zst_input", "codex", &counts);
     }
 }
 
@@ -308,6 +318,7 @@ impl OpenedInput {
             decoder.remaining = super::codex_file_join::MAX_HEADER_BYTES as u64;
             decoder.physical_limit = 2 * super::codex_file_join::MAX_HEADER_BYTES as u64;
             decoder.input.get_mut().set_limit(decoder.physical_limit);
+            decoder.header = true;
         }
         self
     }
@@ -498,6 +509,65 @@ pub(in crate::snapshots) mod tests {
             .unwrap();
         assert!(peak > 0 && peak <= compressed_input_credit().unwrap() as u64);
         assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
+    }
+
+    /// [behaviour] A header-only decoder prints no row of its own: header
+    /// closes add to one row the pass flush prints (sums, peak as maximum),
+    /// then reset. A body decoder keeps its own `codex_zst_input` row.
+    #[test]
+    fn header_decoders_fold_into_one_flushed_row() {
+        use crate::local_resource_diagnostics::{
+            capture, codex_zst_header_decoders, codex_zst_input_header, codex_zst_refused_flush,
+        };
+        let f = fixture(
+            &zstd::stream::encode_all(&b"synthetic\n"[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let open = || {
+            OpenedInput::compressed(
+                File::open(&f.0).unwrap(),
+                64,
+                compressed_input_credit().unwrap(),
+            )
+            .unwrap()
+        };
+        let stage = |rows: &[Value], name: &str| {
+            rows.iter()
+                .filter(|r| r["stage"] == name)
+                .map(|r| r["counts"].clone())
+                .collect::<Vec<_>>()
+        };
+        for header in [true, false] {
+            let before = codex_zst_header_decoders();
+            let (_, rows) = capture(|| {
+                let mut input = if header { open().header_only() } else { open() };
+                assert_eq!(std::io::copy(&mut input, &mut std::io::sink()).unwrap(), 10);
+                input.close();
+            });
+            assert_eq!(stage(&rows, "codex_zst_input").len(), usize::from(!header));
+            assert_eq!(codex_zst_header_decoders() - before, u64::from(header));
+        }
+        // The real header's totals flush once; then fold known values.
+        let (_, rows) = capture(codex_zst_refused_flush);
+        assert_eq!(stage(&rows, "codex_zst_input_headers").len(), 1);
+        let (_, rows) = capture(|| {
+            codex_zst_input_header([1, 2, 3, 4, 10, 0]);
+            codex_zst_input_header([5, 6, 7, 8, 4, 1]);
+            codex_zst_refused_flush();
+            codex_zst_refused_flush();
+        });
+        assert_eq!(
+            stage(&rows, "codex_zst_input_headers"),
+            [json!({
+                "codex_zst_header_decoders": 2,
+                "codex_zst_compressed_bytes": 6,
+                "codex_zst_compressed_consumed_bytes": 8,
+                "codex_zst_decoded_bytes": 10,
+                "codex_zst_cpu_micros": 12,
+                "codex_zst_decoder_native_peak_bytes": 10,
+                "codex_zst_decoder_allocation_refusals": 1,
+            })]
+        );
     }
 
     /// [behaviour]
@@ -1064,6 +1134,15 @@ pub(in crate::snapshots) mod tests {
             .filter(|r| r["stage"] == "codex_zst_input")
             .count()
     }
+    /// Header decoders closed since `before`: flushed rows plus the unflushed rest.
+    fn header_decodes(rows: &[Value], before: u64) -> u64 {
+        rows.iter()
+            .filter(|r| r["stage"] == "codex_zst_input_headers")
+            .filter_map(|r| r["counts"]["codex_zst_header_decoders"].as_u64())
+            .sum::<u64>()
+            + crate::local_resource_diagnostics::codex_zst_header_decoders()
+            - before
+    }
     fn saved(index: &ScanIndex) -> ScanIndex {
         serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
     }
@@ -1129,12 +1208,14 @@ pub(in crate::snapshots) mod tests {
                 }}, "work": {"header": rows[0], "attempts": 1}
             }});
             old = serde_json::from_value(legacy).unwrap();
+            let before = crate::local_resource_diagnostics::codex_zst_header_decoders();
             let (index, result, logs) = run_archive(
                 &f,
                 saved(&old),
                 Arc::new(sampled_scan::SharedCache::default()),
             );
-            assert_eq!(full_decodes(&logs), 2, "ordinary header and body: {kind}");
+            assert_eq!(full_decodes(&logs), 1, "ordinary body: {kind}");
+            assert_eq!(header_decodes(&logs, before), 1, "ordinary header: {kind}");
             assert_eq!(result.snapshots.len(), 1, "{kind}");
             assert_eq!(
                 result.snapshots[0].input_tokens,
@@ -1845,12 +1926,19 @@ pub(in crate::snapshots) mod tests {
                 index.historical_replay_generation.as_deref(),
                 Some("unchanged")
             );
+            let headers = crate::local_resource_diagnostics::codex_zst_header_decoders();
             let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
                 index.activate_file_upload_context(SnapshotSource::Codex, "changed".into())
             });
             assert!(!alarms.iter().any(|l| l["stage"] == "durable_tail_alarm"
                 || l["stage"] == "codex_zst_input"
+                || l["stage"] == "codex_zst_input_headers"
                 || l["stage"] == "codex_zst_inventory"));
+            assert_eq!(
+                header_decodes(&alarms, headers),
+                0,
+                "a context change decodes no header"
+            );
             let first_key = local_index_key(&f.0);
             assert!(index.files[&first_key].last_upload_body_witness.is_some());
             if phase == "changed" {

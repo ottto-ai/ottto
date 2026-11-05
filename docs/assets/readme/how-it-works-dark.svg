@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="330" viewBox="0 0 860 330" role="img" aria-labelledby="t d">
+  <title id="t">How Ottto works</title>
+  <desc id="d">On your Mac, coding agents such as Claude Code, Codex and Pi write session files. The Ottto service on the Mac turns them into usage records. Transcripts, full conversations, code, file contents, tool output, sign-in tokens and API keys never leave the Mac. Once the Mac is connected, usage metadata, plus readable labels unless you turn them off, goes to your Ottto account, which prices it and powers the dashboard, findings and the Claude and ChatGPT connector.</desc>
+  <style>
+    .t{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#f3ece3}
+    .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#c9bba8}
+    .m{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;fill:#f3ece3}
+  </style>
+  <rect x="0" y="0" width="860" height="330" rx="16" fill="#1d1a17"/>
+  <rect x="20" y="20" width="470" height="290" rx="14" fill="#24201c" stroke="#3a332c" stroke-width="1.5"/>
+  <text x="40" y="48" class="s" font-size="13" font-weight="600" letter-spacing="1.2">YOUR MAC</text>
+  <rect x="40" y="66" width="190" height="118" rx="12" fill="#2b2620" stroke="#3a332c"/>
+  <text x="58" y="94" class="t" font-size="16" font-weight="600">Coding agents</text>
+  <text x="58" y="120" class="s" font-size="14">Claude Code, Codex</text>
+  <text x="58" y="142" class="s" font-size="14">and Pi</text>
+  <text x="58" y="168" class="s" font-size="12">write session files</text>
+  <line x1="234" y1="125" x2="266" y2="125" stroke="#8a7560" stroke-width="2"/>
+  <path d="M266 119 L276 125 L266 131 Z" fill="#8a7560"/>
+  <rect x="280" y="66" width="190" height="118" rx="12" fill="#2b2620" stroke="#ffb088" stroke-width="2"/>
+  <text x="296" y="94" class="m" font-size="15" font-weight="600">ottto-service</text>
+  <text x="296" y="120" class="s" font-size="14">reads usage locally</text>
+  <text x="296" y="142" class="s" font-size="14">builds usage records</text>
+  <text x="296" y="168" class="s" font-size="12">Ottto.app · ottto CLI</text>
+  <rect x="40" y="206" width="430" height="84" rx="12" fill="#2e251d" stroke="#4a3b2d" stroke-dasharray="5 4"/>
+  <text x="58" y="234" class="t" font-size="14" font-weight="600">Never leaves your Mac</text>
+  <text x="58" y="258" class="s" font-size="13">transcripts and full conversations · code and file contents</text>
+  <text x="58" y="278" class="s" font-size="13">tool and command output · sign-in tokens and API keys</text>
+  <line x1="474" y1="125" x2="520" y2="125" stroke="#ffb088" stroke-width="2"/>
+  <path d="M520 119 L530 125 L520 131 Z" fill="#ffb088"/>
+  <text x="478" y="112" class="s" font-size="11">usage</text>
+  <text x="478" y="146" class="s" font-size="11">metadata</text>
+  <rect x="540" y="20" width="300" height="290" rx="14" fill="#24201c" stroke="#3a332c" stroke-width="1.5"/>
+  <text x="560" y="48" class="s" font-size="13" font-weight="600" letter-spacing="1.2">YOUR OTTTO ACCOUNT</text>
+  <text x="560" y="84" class="t" font-size="16" font-weight="600">Prices your usage</text>
+  <text x="560" y="118" class="s" font-size="14">● Dashboard and sessions</text>
+  <text x="560" y="144" class="s" font-size="14">● Plans and limits</text>
+  <text x="560" y="170" class="s" font-size="14">● Where to save</text>
+  <text x="560" y="196" class="s" font-size="14">● Claude and ChatGPT connector</text>
+  <text x="560" y="250" class="s" font-size="12">only once this Mac is connected</text>
+</svg>

@@ -12,6 +12,7 @@ mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
+mod claude_shell_telemetry;
 pub(crate) mod claude_spawn_gate;
 pub mod claude_upkeep;
 pub mod client_report;
@@ -76,7 +77,7 @@ mod upload_policy;
 pub mod upload_receipts;
 pub mod xpc_mach;
 
-pub use local_resource_diagnostics::log_startup_resources;
+pub use local_resource_diagnostics::{log_startup_resources, rotate_service_log_at_startup};
 
 #[cfg(unix)]
 pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
@@ -783,6 +784,7 @@ impl LocalDaemon {
             api_base_url: default_connection_api_base_url(),
         });
         clear_setup_run_read_rejection(&mut state);
+        clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -926,6 +928,7 @@ impl LocalDaemon {
             api_base_url: default_connection_api_base_url(),
         });
         clear_setup_run_read_rejection(&mut state);
+        clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -1150,6 +1153,25 @@ impl LocalDaemon {
         Ok(true)
     }
 
+    fn shell_profile_finding(
+        &self,
+        source: &SourceKind,
+    ) -> Result<Option<HealthProblem>, LocalApiError> {
+        let relay = self.state()?.relay.clone();
+        Ok(claude_shell_telemetry::problem(source, &relay))
+    }
+
+    /// Doctor's existing pass, independent of account/SDK refresh.
+    pub(crate) fn refresh_shell_profile_health(&self) -> Result<(), LocalApiError> {
+        let finding = self.shell_profile_finding(&SourceKind::ClaudeCode)?;
+        let mut state = self.state()?;
+        for health in &mut state.sources {
+            claude_shell_telemetry::apply(health, finding.clone());
+        }
+        state.persist_source_state(&SourceKind::ClaudeCode);
+        Ok(())
+    }
+
     pub fn record_verification_result(
         &self,
         result: &SourceVerificationResult,
@@ -1157,6 +1179,7 @@ impl LocalDaemon {
         if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
+        let shell_finding = self.shell_profile_finding(&result.source)?;
         let mut state = self.state()?;
         let observed_at = current_rfc3339_timestamp();
         state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
@@ -1202,6 +1225,7 @@ impl LocalDaemon {
                 }
             }
         }
+        claude_shell_telemetry::apply(&mut health, shell_finding);
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -1294,6 +1318,7 @@ impl LocalDaemon {
         source: &SourceKind,
         config: SourceConfigState,
     ) -> Result<(), LocalApiError> {
+        let shell_finding = self.shell_profile_finding(source)?;
         let mut state = self.state()?;
         let Some(existing) = state
             .sources
@@ -1314,11 +1339,17 @@ impl LocalDaemon {
             existing
                 .recommended_actions
                 .retain(|action| action.action != RepairActionKind::WriteConfig);
-            if existing.state == SourceState::NeedsRepair && existing.problems.is_empty() {
+            if existing.state == SourceState::NeedsRepair
+                && existing
+                    .problems
+                    .iter()
+                    .all(claude_shell_telemetry::is_problem)
+            {
                 existing.state = SourceState::Healthy;
                 existing.grade = HealthGrade::Ok;
             }
         }
+        claude_shell_telemetry::apply(existing, shell_finding);
         state.persist_source_state(source);
         Ok(())
     }
@@ -1376,9 +1407,21 @@ impl LocalDaemon {
                 snapshots
             })
             .collect::<Vec<_>>();
+        let shell_finding = if sources.contains(&SourceKind::ClaudeCode) {
+            self.shell_profile_finding(&SourceKind::ClaudeCode)?
+        } else {
+            None
+        };
         let mut state = self.state()?;
         for collection in collections {
             upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot.clone());
+            if let Some(health) = state
+                .sources
+                .iter_mut()
+                .find(|h| h.source == collection.source_health_snapshot.source)
+            {
+                claude_shell_telemetry::apply(health, shell_finding.clone());
+            }
         }
         Ok(snapshots)
     }
@@ -1387,6 +1430,8 @@ impl LocalDaemon {
         &self,
         snapshot: AgentStatusSnapshot,
     ) -> Result<(), LocalApiError> {
+        let source = snapshot.source.clone();
+        let shell_finding = self.shell_profile_finding(&source)?;
         let mut state = self.state()?;
         if !state.running {
             return Ok(());
@@ -1396,6 +1441,9 @@ impl LocalDaemon {
         });
         if !seeded || snapshot.status == AgentStatusState::Available {
             upsert_agent_status_snapshot(&mut state, snapshot);
+            if let Some(health) = state.sources.iter_mut().find(|h| h.source == source) {
+                claude_shell_telemetry::apply(health, shell_finding);
+            }
         }
         Ok(())
     }
@@ -1446,8 +1494,21 @@ impl LocalDaemon {
             .into_iter()
             .map(|collection| collection.source_health_snapshot.clone())
             .collect();
+        let shell_finding = if verifying.contains(&SourceKind::ClaudeCode) {
+            self.shell_profile_finding(&SourceKind::ClaudeCode)?
+        } else {
+            None
+        };
         let mut state = self.state()?;
-        Ok(apply_verifying_reconfirm(&mut state, snapshots))
+        let remaining = apply_verifying_reconfirm(&mut state, snapshots);
+        for health in state
+            .sources
+            .iter_mut()
+            .filter(|h| verifying.contains(&h.source))
+        {
+            claude_shell_telemetry::apply(health, shell_finding.clone());
+        }
+        Ok(remaining)
     }
 
     pub fn set_relay_state(&self, token: &str, relay: RelayState) -> Result<(), LocalApiError> {
@@ -1730,8 +1791,13 @@ impl LocalDaemon {
         if should_load_connection {
             let _ = self.connection_for_authorized_client()?;
         }
+        let shell_finding = self.shell_profile_finding(&source)?;
         let state = self.state()?;
-        let authority = repair_authority_for_state(&state);
+        let mut authority = repair_authority_for_state(&state);
+        if let Some(problem) = shell_finding {
+            authority.message.text.push(' ');
+            authority.message.text.push_str(&problem.detail);
+        }
         Ok(RepairPlan {
             plan_id: format!("repair_{}", source_slug(&source)),
             machine_id: state.machine.machine_id.clone(),
@@ -2553,11 +2619,13 @@ fn runtime_identity_for_status_with_installed_app_version(
     observed_at: &str,
     installed_app_version: &str,
 ) -> RuntimeIdentityV1 {
-    let executable_path = std::env::current_exe().ok();
+    // The executable path is read only to classify the install; it contains
+    // the macOS user name, so it never leaves the Mac in this identity.
     let install_owner = if status.service_owner.daemon_owner != InstallOwner::Unknown {
         status.service_owner.daemon_owner
     } else {
-        executable_path
+        std::env::current_exe()
+            .ok()
             .as_deref()
             .map(ottto_core::install_owner_for_path)
             .unwrap_or(InstallOwner::Unknown)
@@ -2571,7 +2639,7 @@ fn runtime_identity_for_status_with_installed_app_version(
         app_bundle_version: app_bundle_version.clone(),
         cli_version: Some(installed_app_version.to_string()),
         service_version: Some(daemon_version.clone()),
-        service_pid: Some(std::process::id()),
+        service_pid: None,
         service_executable_path_class: match install_owner {
             InstallOwner::AppBundle => "app_bundle_helper",
             InstallOwner::Homebrew => "homebrew",
@@ -2580,7 +2648,7 @@ fn runtime_identity_for_status_with_installed_app_version(
             InstallOwner::Unknown => "unknown",
         }
         .to_string(),
-        service_executable_path: executable_path.map(|path| path.display().to_string()),
+        service_executable_path: None,
         service_executable_hash: None,
         launchd_label: Some(ottto_core::MACOS_LAUNCH_AGENT_LABEL.to_string()),
         launchd_loaded_program_hash: None,
@@ -2637,10 +2705,9 @@ fn runtime_heartbeat_for_status(
         app_bundle_version: runtime.app_bundle_version.clone(),
         protocol_version: format!("local_control.v{}", status.protocol_version),
         health_schema_version: "local_machine_health.v1".to_string(),
-        executable_path: runtime
-            .service_executable_path
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
+        // The backend contract still requires this key. Send the coarse
+        // install class, never the absolute path.
+        executable_path: runtime.service_executable_path_class.clone(),
         install_owner: runtime.install_owner,
         launchd_label: runtime
             .launchd_label
@@ -2673,11 +2740,15 @@ fn latest_local_health_upload_in(events: &[LocalHealthEventV1]) -> Option<Latest
         .filter(|event| {
             event.event_type == "LocalHealthUploadFailed"
                 || event.event_type == "LocalHealthUploadSucceeded"
+                || event.event_type == LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED
         })
         .max_by_key(|event| event.sequence)
         .and_then(|event| {
             if event.event_type == "LocalHealthUploadSucceeded" {
                 return Some(LatestLocalHealthUpload::Succeeded);
+            }
+            if event.event_type == LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED {
+                return None;
             }
             let kind = event
                 .payload
@@ -2756,6 +2827,34 @@ fn clear_setup_run_read_rejection(state: &mut DaemonState) {
         serde_json::json!({
             "kind": "setup_run_binding_replaced",
             "message": "the rejected setup-run binding was replaced or removed",
+            "current": true
+        }),
+    );
+}
+
+/// A completed sign-in claim installs credentials Ottto has just accepted, so
+/// a local-health upload rejected under the previous credentials no longer
+/// describes this Mac. Without this, status kept answering
+/// `reconnect_required` after a successful `ottto login` until the next
+/// local-health upload, which can be minutes away. The next upload re-checks
+/// the new credentials and records a fresh rejection if Ottto refuses them.
+const LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED: &str = "LocalHealthUploadRejectionCleared";
+
+fn clear_local_health_upload_auth_rejection(state: &mut DaemonState) {
+    if !matches!(
+        latest_local_health_upload_in(&state.local_health_events),
+        Some(LatestLocalHealthUpload::AuthRejected { .. })
+    ) {
+        return;
+    }
+    push_local_health_event(
+        state,
+        LOCAL_HEALTH_UPLOAD_REJECTION_CLEARED,
+        "local_health_upload_rejection_cleared",
+        LocalHealthAuthority::Setup,
+        serde_json::json!({
+            "kind": "sign_in_completed",
+            "message": "a completed sign-in replaced the rejected credentials; the next upload checks them again",
             "current": true
         }),
     );
@@ -3045,6 +3144,9 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
 }
 
 fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
+    if claude_shell_telemetry::is_problem(problem) {
+        return claude_shell_telemetry::CODE;
+    }
     if problem.code == StableProblemCode::TelemetryNotVerified
         && problem_detail_is_usage_limited(&problem.detail)
     {
@@ -3222,6 +3324,22 @@ fn local_health_blockers_for_status(
             &status.generated_at,
             "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions",
         ));
+    }
+    for source in &status.sources {
+        if let Some(problem) = source
+            .problems
+            .iter()
+            .find(|p| claude_shell_telemetry::is_problem(p))
+        {
+            blockers.push(blocker(
+                claude_shell_telemetry::CODE,
+                LocalHealthSeverity::Warning,
+                "source",
+                LocalHealthAuthority::Runtime,
+                &status.generated_at,
+                &problem.detail,
+            ));
+        }
     }
     if account.state == LocalHealthAccountState::Connected {
         if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
@@ -4317,6 +4435,13 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
         preserve_blocking_verification_state(&mut refreshed, &existing);
+        if let Some(problem) = existing
+            .problems
+            .iter()
+            .find(|p| claude_shell_telemetry::is_problem(p))
+        {
+            claude_shell_telemetry::apply(&mut refreshed, Some(problem.clone()));
+        }
         state.sources[index] = refreshed;
         return;
     }
@@ -6266,6 +6391,45 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_runtime_identity_and_heartbeat_carry_no_executable_path_or_pid() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T07:00:00Z",
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+        let heartbeat = runtime_heartbeat_for_status(&status, &runtime, 7);
+
+        assert_eq!(runtime.service_executable_path, None);
+        assert_eq!(runtime.service_pid, None);
+        assert_eq!(runtime.service_executable_path_class, "app_bundle_helper");
+        assert_eq!(heartbeat.executable_path, "app_bundle_helper");
+
+        let runtime_json = serde_json::to_value(&runtime).expect("runtime json");
+        assert!(runtime_json.get("service_executable_path").is_none());
+        assert!(runtime_json.get("service_pid").is_none());
+        let exe = std::env::current_exe().expect("test executable");
+        let exe = exe.display().to_string();
+        for json in [
+            runtime_json.to_string(),
+            serde_json::to_string(&heartbeat).expect("heartbeat json"),
+        ] {
+            assert!(
+                !json.contains(&exe),
+                "uploaded JSON carries the executable path"
+            );
+            assert!(
+                !json.contains("\"/Users/"),
+                "uploaded JSON carries a home path"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_identity_still_blocks_old_app_bundle_service() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut status = daemon.status(TOKEN).expect("status");
@@ -6378,6 +6542,95 @@ mod tests {
         let effective = effective_account_binding(&status);
         assert_eq!(effective.state, LocalAccountState::ClaimPending);
         assert_eq!(effective, status.account);
+    }
+
+    #[test]
+    fn completed_sign_in_supersedes_an_older_upload_auth_rejection() {
+        // Observed 2026-11-04: the Mac's account was deleted, its local-health
+        // uploads were rejected, then `ottto login` bound a new account. Status
+        // kept answering reconnect_required (and the app kept "Reconnect this
+        // Mac") until the next local-health upload, minutes later.
+        let daemon = daemon().with_account(account("user_1", "old@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon.mark_account_not_found().expect("account gone");
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_new", "nonce_new"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_new",
+                "nonce_new",
+                account("user_2", "new@example.com"),
+                "setup_new".to_string(),
+                "2026-11-04T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete auth");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status.canonical_health.as_ref().expect("canonical health");
+        assert_eq!(health.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(health.account.device_state, LocalDeviceState::Active);
+        assert_eq!(health.account.setup_run_state, LocalSetupRunState::Complete);
+        assert_eq!(
+            health.account.setup_token_state,
+            LocalSetupTokenState::Valid
+        );
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "auth_missing"));
+        assert_eq!(
+            effective_account_binding(&status).state,
+            LocalAccountState::Connected
+        );
+        assert!(!daemon
+            .connected_setup_run_needs_reconnect()
+            .expect("needs reconnect"));
+
+        // The new credentials are checked again by the next upload: a fresh
+        // rejection still trips the reconnect.
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record second upload failure");
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+    }
+
+    #[test]
+    fn confirmed_account_switch_supersedes_an_older_upload_auth_rejection() {
+        let daemon = daemon().with_account(account("user_1", "old@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon
+            .install_switched_account(
+                account("user_2", "new@example.com"),
+                "setup_new".to_string(),
+                "2026-11-04T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+                "claim_new",
+            )
+            .expect("install switched account");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .state,
+            LocalHealthAccountState::Connected
+        );
     }
 
     #[test]

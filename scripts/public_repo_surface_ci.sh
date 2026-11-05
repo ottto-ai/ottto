@@ -19,13 +19,12 @@ Usage: public_repo_surface_ci.sh [--root <dir>] [--staged-output <dir>] [--keep-
                                 [--scope all|portable|macos]
 
 Runs the public repository surface checks that GitHub Actions runs before a
-public commit: schema/registry JSON validation, shellcheck, export gate tests,
-release/installer dry-run tests, manifest/skeleton/secret/contract checks, and
-a self-exported staged bundle verification.
+public commit: schema/registry JSON validation, shellcheck, release/installer
+dry-run tests, and the derived-manifest guard, committed-tree secret scan, and
+root contract checks.
 
-Use --staged-output to copy a generated root-shaped bundle into a temporary git
-checkout before running the same checks. This is the local substitute for public
-GitHub CI while the separate ottto repository is not reachable.
+Use --staged-output to copy a root-shaped tree into a temporary git checkout,
+commit it, and run the same checks against that commit.
 
 --scope picks which steps run. Each step is portable (P), needed on both Linux
 and macOS (B: the scripts under test run on Macs under /bin/bash 3.2 and BSD
@@ -169,10 +168,10 @@ fi
 
 required_public_files=(
   "connectors/registry.generated.json"
-  "public-export/roots.txt"
-  "scripts/public_repo_export_bundle.sh"
-  "scripts/public_repo_manifest_check.sh"
-  "scripts/public_repo_skeleton_check.sh"
+  "public-export/deny-patterns.tsv"
+  "scripts/public_repo_contract_check.sh"
+  "scripts/public_repo_manifest.sh"
+  "scripts/public_repo_secret_scan.sh"
   "schemas/source-manifest.schema.json"
 )
 for path in "${required_public_files[@]}"; do
@@ -205,30 +204,6 @@ run_step() {
   echo "public-surface-ci: $label"
   (cd "$REPO_ROOT" && "$@")
   steps_run=$((steps_run + 1))
-}
-
-# PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
-# (scripts/public_repo_manifest.sh) and must not be committed. A staged bundle
-# carries its generated copy at the root; it must still match its files and the
-# derived manifest.
-check_root_manifest() {
-  if [[ -n "$STAGED_OUTPUT_DIR" ]]; then
-    if [[ -f PUBLIC_EXPORT_MANIFEST.json ]]; then
-      bash scripts/public_repo_manifest_check.sh
-      bash scripts/public_repo_manifest.sh --compare PUBLIC_EXPORT_MANIFEST.json
-    else
-      echo "public-surface-ci: staged output has no root manifest; the self-export check covers it"
-    fi
-    return
-  fi
-  bash scripts/public_repo_manifest.sh --guard
-}
-
-check_self_export_matches_tree() {
-  if ! git diff --quiet HEAD --; then
-    fail "tracked files differ from HEAD; commit or stash them before comparing the self-exported manifest"
-  fi
-  bash scripts/public_repo_manifest.sh --compare dist/public-export/ottto/PUBLIC_EXPORT_MANIFEST.json
 }
 
 # The move checks compare the change with its base: the first parent of the
@@ -286,15 +261,13 @@ run_step P "check that a move-only change only moves items" move_check scripts/c
 run_step P "check test IDs and never-retry decisions" move_check scripts/check_test_id_map.py
 run_step P "report the snapshots source layout" source_layout_report
 
-run_step P "test public export check" bash scripts/test_public_repo_export_check.sh
-run_step P "run public export check" bash scripts/public_repo_export_check.sh
-run_step P "test public export bundle" bash scripts/test_public_repo_export_bundle.sh
-run_step P "test public bootstrap plan" bash scripts/test_public_repo_bootstrap_plan.sh
-run_step P "test public cutover closeout" bash scripts/test_public_repo_cutover_closeout.sh
-run_step P "test public manifest check" bash scripts/test_public_repo_manifest_check.sh
 run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
-run_step P "check root manifest is derived from the commit tree" check_root_manifest
-run_step P "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
+# PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
+# (scripts/public_repo_manifest.sh --facts) and must not be committed.
+run_step P "check root manifest is derived from the commit tree" \
+  bash scripts/public_repo_manifest.sh --guard
+run_step P "scan committed public tree" bash scripts/public_repo_secret_scan.sh
+run_step P "verify root public contracts" bash scripts/public_repo_contract_check.sh
 run_step P "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
 run_step B "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
 run_step P "test public contract check" bash scripts/test_public_repo_contract_check.sh
@@ -321,17 +294,6 @@ run_step B "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
 # shellcheck disable=SC2016
 run_step M "parse public scripts with macOS /bin/bash" \
   /bin/bash -c 'for f in scripts/*.sh; do /bin/bash -n "$f" || exit 1; done'
-
-run_step P "generate self-exported public bundle" bash scripts/public_repo_export_bundle.sh --force
-run_step P "verify self-exported manifest" \
-  bash scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto
-run_step P "verify self-exported manifest matches commit tree" check_self_export_matches_tree
-run_step P "verify public skeleton" \
-  bash -c 'PUBLIC_SKELETON_REPO_ROOT=dist/public-export/ottto scripts/public_repo_skeleton_check.sh'
-run_step P "scan self-exported public bundle" \
-  bash scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto
-run_step P "verify self-exported public contracts" \
-  bash scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto
 
 echo "public-surface-ci: ran $steps_run steps (scope=$SCOPE)"
 echo "public-surface-ci: completed public surface checks at $REPO_ROOT"

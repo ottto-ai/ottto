@@ -64,11 +64,31 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         THREAD_EVENTS.with(|events| events.borrow_mut().insert(name, value));
     }
     if let Ok(mut stats) = stats().lock() {
-        if let Ok(value) = serde_json::to_value(value) {
-            stats.latest.insert(name, value);
+        let value = serde_json::to_value(value);
+        if let Ok(value) = &value {
+            stats.latest.insert(name, value.clone());
         }
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        // In a pass, each event still prints, but only its own value.
+        if in_pass() {
+            if let Ok(value) = value {
+                crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
+                    "latest": { name: value }
+                }));
+            }
+        } else {
+            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        }
     }
+}
+/// Window, memory, heap and save-work samples taken in this thread's pass fold
+/// into the one full row `plateau` prints; outside a pass they print at once.
+fn publish(stats: &Stats) {
+    if !in_pass() {
+        crate::local_resource_diagnostics::claude_state_v2(stats);
+    }
+}
+fn in_pass() -> bool {
+    PASS.with(|pass| pass.borrow().active)
 }
 /// Test evidence only: the latest value of a content-free event.
 #[cfg(test)]
@@ -143,7 +163,7 @@ impl Stage {
                     },
                 );
             }
-            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+            publish(&stats);
         }
     }
 }
@@ -285,7 +305,7 @@ pub(in super::super) fn phase(name: &'static str) {
 fn record_memory(name: &'static str, window: MemoryWindow) {
     if let Ok(mut stats) = stats().lock() {
         stats.stage_memory.insert(name, window);
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        publish(&stats);
     }
 }
 
@@ -373,7 +393,7 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     let observation = retained_heap(index);
     if let Ok(mut stats) = stats().lock() {
         stats.retained_heap_bytes.insert(owner, observation);
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        publish(&stats);
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
@@ -452,7 +472,7 @@ impl Drop for Window {
                     ..Default::default()
                 },
             );
-            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+            publish(&stats);
         }
     }
 }
@@ -480,7 +500,7 @@ pub(super) fn save_work(rows: u64, bytes: u64) {
     if let Ok(mut stats) = stats().lock() {
         stats.save_dirty_rows.observe(rows);
         stats.save_dirty_bytes.observe(bytes);
-        crate::local_resource_diagnostics::claude_state_v2(&*stats);
+        publish(&stats);
     }
     row_cap_save();
 }
@@ -616,7 +636,62 @@ mod ops_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// [regress] The outer save window preserves CPU/wall in later records.
+    /// [behaviour] In a pass, an event prints a row with only its own value
+    /// and stage, memory and save-work samples print nothing until the one
+    /// full pass-end row; outside a pass every change prints the full row.
+    #[test]
+    fn pass_samples_fold_into_the_pass_end_row() {
+        let previous = PASS.with(|pass| {
+            std::mem::replace(
+                &mut *pass.borrow_mut(),
+                Pass {
+                    active: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (_, pass_rows) = crate::local_resource_diagnostics::capture(|| {
+            event("hold", &"synthetic_hold");
+            drop(Window::begin("save"));
+            phase("prepare");
+            save_work(1, 1);
+            decoded(5, 0, 0);
+            event("hold", &"none");
+            plateau();
+        });
+        let (_, outside) = crate::local_resource_diagnostics::capture(|| {
+            event("hold", &"none");
+            save_work(1, 1);
+        });
+        PASS.with(|pass| *pass.borrow_mut() = previous);
+        let rows = |records: Vec<serde_json::Value>| {
+            records
+                .into_iter()
+                .filter(|record| record["stage"] == "claude_state_v2")
+                .map(|record| record["counts"].clone())
+                .collect::<Vec<_>>()
+        };
+        let pass_rows = rows(pass_rows);
+        assert_eq!(pass_rows.len(), 3, "{pass_rows:?}");
+        assert_eq!(
+            pass_rows[..2],
+            [
+                serde_json::json!({"latest": {"hold": "synthetic_hold"}}),
+                serde_json::json!({"latest": {"hold": "none"}}),
+            ]
+        );
+        let full = &pass_rows[2];
+        assert_eq!(full["decoded_per_pass"]["rows"], 5);
+        assert!(full["stage_memory"].is_object() && full["latest"].is_object());
+        assert!(full["save_dirty_rows"]["max"].is_u64());
+        let outside = rows(outside);
+        assert_eq!(outside.len(), 2, "{outside:?}");
+        assert!(outside
+            .iter()
+            .all(|row| row["stage_memory"].is_object() && row["save_dirty_rows"]["max"].is_u64()));
+    }
+
+    /// [regress] The outer save window preserves CPU/wall in the pass-end record.
     #[test]
     fn stage_windows_carry_cpu_and_wall() {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
@@ -634,6 +709,7 @@ mod ops_tests {
                 drop(Stage::new(Kind::Save));
             }
             save_work(1, 1);
+            plateau();
             PASS.with(|pass| *pass.borrow_mut() = previous);
             let mut window = crate::local_resource_diagnostics::StageSum::begin(
                 "claude_code",
