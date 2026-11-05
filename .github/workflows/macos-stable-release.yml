@@ -77,6 +77,7 @@ jobs:
       OTTTO_NOTARY_PROFILE: ${{ secrets.OTTTO_NOTARY_PROFILE }}
       OTTTO_NOTARY_WAIT_TIMEOUT: ${{ vars.OTTTO_NOTARY_WAIT_TIMEOUT || '30m' }}
       OTTTO_RELEASE_REPOSITORY: ${{ github.repository }}
+      OTTTO_MACOS_APP_SOURCE_REPOSITORY: ${{ secrets.OTTTO_MACOS_APP_SOURCE_REPOSITORY }}
       OTTTO_RELEASE_SIGNER_WORKFLOW: .github/workflows/macos-stable-release.yml
       OTTTO_RELEASE_SOURCE_REF: ${{ github.ref }}
       OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
@@ -102,6 +103,10 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
             echo "macOS stable releases are workflow_dispatch only." >&2
+            exit 1
+          fi
+          if [[ ! "$OTTTO_MACOS_APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY must be configured in owner/name form." >&2
             exit 1
           fi
           # Releases build only from a v<X.Y.Z> release tag; any other ref fails.
