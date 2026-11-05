@@ -170,14 +170,26 @@ refuse_unmergeable() {
 }
 
 # The title is the squash subject: refuse one that matches the local deny list.
-# The message names no pattern, so the list itself is never printed.
+# Messages name no pattern, so the list itself is never printed. A list that
+# cannot be read or evaluated refuses rather than letting the title through.
 refuse_denied_title() {
   [ -s "$TITLE_DENY_FILE" ] || return 0
+  local patterns pattern title status=0
   # Blank and comment lines are dropped: an empty pattern would match any title.
-  if pr_field title \
-    | grep -Eq -f <(grep -Ev '^[[:space:]]*(#|$)' "$TITLE_DENY_FILE"); then
-    die "$EXIT_REFUSED" "PR #$pr title matches the title deny list ($TITLE_DENY_FILE); edit the title and rerun"
-  fi
+  patterns="$(grep -Ev '^[[:space:]]*(#|$)' "$TITLE_DENY_FILE")" || status=$?
+  [ "$status" -le 1 ] \
+    || die "$EXIT_REFUSED" "the title deny list ($TITLE_DENY_FILE) could not be read; fix it and rerun"
+  title="$(pr_field title)"
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    status=0
+    grep -Eq -e "$pattern" <<<"$title" 2>/dev/null || status=$?
+    case "$status" in
+      0) die "$EXIT_REFUSED" "PR #$pr title matches the title deny list ($TITLE_DENY_FILE); edit the title and rerun" ;;
+      1) ;;
+      *) die "$EXIT_REFUSED" "the title deny list ($TITLE_DENY_FILE) could not be evaluated; fix it and rerun" ;;
+    esac
+  done <<<"$patterns"
 }
 
 # Prints "<verdict>|<detail>" for the required checks on $1, judging for each
@@ -393,6 +405,7 @@ started_at=$SECONDS
 while :; do
   read_pr
   refuse_unmergeable
+  refuse_denied_title
   current_sha="$(pr_field headRefOid)"
   if [ "$current_sha" != "$head_sha" ]; then
     die "$EXIT_HEAD_MOVED" "PR #$pr head moved from $head_sha to $current_sha; rerun to wait for the new head"
