@@ -272,6 +272,7 @@ fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem
 }
 
 fn apply_bootstrapped_cache_heads(
+    source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
 ) -> Result<usize> {
@@ -289,6 +290,13 @@ fn apply_bootstrapped_cache_heads(
                 // No cache patch or accepted head is invented. The normal
                 // uploader sees the exact held probe and keeps its quarantine;
                 // healthy siblings retain their own independent settlement.
+                crate::local_resource_diagnostics::traversal_point(
+                    "held_cache_head_probe",
+                    source,
+                    &serde_json::json!({"fingerprint_hash8": SessionHash::of(&probe.snapshot_fingerprint).to_string(),
+                        "body_witness_hash8": &snapshot_upload_body_witness(&probe)[..8],
+                        "saved_head_present": progress.accepted_cache_heads.contains_key(&cache_session_key(&probe.source_session_id))}),
+                );
                 *snapshot = probe;
                 held = held.saturating_add(1);
                 continue;
@@ -7844,15 +7852,19 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-                .inspect_err(log_bootstrap_failure("apply"))
-                .inspect_err(|_| {
-                    upload_progress.finish_reason_reoffers(
-                        &attempted_reason_reoffers,
-                        false,
-                        source.api_slug(),
-                    );
-                })?;
+            let held = apply_bootstrapped_cache_heads(
+                source.api_slug(),
+                &mut scan_result.snapshots,
+                &upload_progress,
+            )
+            .inspect_err(log_bootstrap_failure("apply"))
+            .inspect_err(|_| {
+                upload_progress.finish_reason_reoffers(
+                    &attempted_reason_reoffers,
+                    false,
+                    source.api_slug(),
+                );
+            })?;
             if held > 0 {
                 eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -10154,6 +10166,13 @@ where
                     &body_witness(item),
                     retry_after,
                 );
+                crate::local_resource_diagnostics::traversal_point(
+                    "quarantine_retry_body",
+                    poison_scope,
+                    &serde_json::json!({"origin": "conflict",
+                        "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
+                        "body_witness_hash8": body_witness(item).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+                );
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
@@ -10182,7 +10201,8 @@ where
             .rejected_entities
             .iter()
             .filter(|entity| !entity.permanent && entity.ordinary_retryable())
-            .count();
+            .count()
+            .saturating_add(response.conflict_entities.len());
         progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     } else {
         for index in indices {
@@ -10701,6 +10721,13 @@ where
                         identity_retry_at
                             .unwrap_or_else(|| quarantine_retry_after(item_fingerprint)),
                     );
+                    crate::local_resource_diagnostics::traversal_point(
+                        "quarantine_retry_body",
+                        poison_scope,
+                        &serde_json::json!({"origin": if identity_retry_at.is_some() { "identity_retry" } else { reason },
+                            "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
+                            "body_witness_hash8": body_witness(&items[*index]).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+                    );
                 }
                 if persist(progress).is_err() {
                     *progress = before;
@@ -10713,6 +10740,9 @@ where
                     }));
                 }
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
+                if identity_retry_at.is_some() {
+                    isolated_entities = isolated_entities.saturating_add(held.len());
+                }
                 crate::local_resource_diagnostics::traversal_point(
                     "quarantine_retry",
                     poison_scope,
@@ -12880,7 +12910,7 @@ mod tests {
             outcome,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
@@ -15248,7 +15278,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(accepted, 0);
@@ -15789,7 +15819,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
@@ -15893,7 +15923,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 3,
-                isolated: 0
+                isolated: 3
             }
         );
         assert_eq!(accepted, 0);
@@ -17690,7 +17720,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(observed_classes, vec![false, true]);
@@ -22825,7 +22855,7 @@ mod tests {
                 }
                 page[1].cache_base_head_etag = Some("d".repeat(64));
                 assert_eq!(
-                    apply_bootstrapped_cache_heads(&mut page, &f.progress).unwrap(),
+                    apply_bootstrapped_cache_heads("codex", &mut page, &f.progress).unwrap(),
                     0
                 );
                 assert_eq!(page[0].cache_base_head_etag, Some("e".repeat(64)));

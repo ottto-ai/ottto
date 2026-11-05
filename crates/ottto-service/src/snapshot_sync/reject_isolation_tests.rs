@@ -203,10 +203,11 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 (source, "identity"),
                 (source, "witness"),
                 (source, "mixed"),
+                (source, "conflict"),
             ]
         }) {
             let identity = named == "identity";
-            let isolated = usize::from(named == "mixed");
+            let isolated = usize::from(matches!(named, "mixed" | "conflict" | "identity"));
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -331,24 +332,39 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                         .validate_entity_ack(&wire(&batch))
                                         .map(|()| response);
                                 }
-                                if named == "mixed" {
+                                if matches!(named, "mixed" | "conflict") {
                                     // A valid entity ACK refusing this item
-                                    // alone as non-permanent mixed usage.
+                                    // alone as a conflict or non-permanent mixed usage.
                                     let mut response = ack(&batch)?;
+                                    let mut conflict = response
+                                        .accepted_entities
+                                        .iter()
+                                        .find(|entity| entity.snapshot_fingerprint == fp)
+                                        .unwrap()
+                                        .clone();
                                     response
                                         .accepted_entities
                                         .retain(|entity| entity.snapshot_fingerprint != fp);
                                     response.accepted -= 1;
-                                    response.rejected_entities.push(
-                                        crate::snapshot_client::SnapshotEntityRejection {
-                                            source_session_id: entity.clone(),
-                                            snapshot_fingerprint: fp.clone(),
-                                            reason: "accepted_log_stale_older_mixed".into(),
-                                            detail: String::new(),
-                                            permanent: false,
-                                            occurrence_count: 1,
-                                        },
-                                    );
+                                    if named == "conflict" {
+                                        conflict.head_etag = None;
+                                        conflict.head_challenge = batch
+                                            .iter()
+                                            .any(|i| i.cache_observations.is_some())
+                                            .then(|| "c".repeat(64));
+                                        response.conflict_entities.push(conflict);
+                                    } else {
+                                        response.rejected_entities.push(
+                                            crate::snapshot_client::SnapshotEntityRejection {
+                                                source_session_id: entity.clone(),
+                                                snapshot_fingerprint: fp.clone(),
+                                                reason: "accepted_log_stale_older_mixed".into(),
+                                                detail: String::new(),
+                                                permanent: false,
+                                                occurrence_count: 1,
+                                            },
+                                        );
+                                    }
                                     response.validate_entity_ack(&wire(&batch))?;
                                     for item in batch
                                         .into_iter()
@@ -406,7 +422,29 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             assert_eq!(accepted, 1, "one ACK for the distinct prior revision");
             let prior = route(Mode::Ram, vec![], &backend, &progress);
             let sent_at = current_unix_seconds();
-            let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
+            let ((result, accepted, emitted), records) =
+                crate::local_resource_diagnostics::capture(|| {
+                    send(&items, &mut progress, &mut backend, true)
+                });
+            let origin = match named {
+                "conflict" => Some("conflict"),
+                "identity" => Some("identity_retry"),
+                _ => None,
+            };
+            if let Some(origin) = origin {
+                let rows = records
+                    .iter()
+                    .filter(|r| r["stage"] == "quarantine_retry_body")
+                    .collect::<Vec<_>>();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["source"], source.api_slug());
+                assert_eq!(
+                    rows[0]["counts"],
+                    json!({"origin":origin,
+                    "fingerprint_hash8":format!("{:x}",Sha256::digest(fp.as_bytes()))[..8],
+                    "body_witness_hash8":snapshot_upload_body_witness(&poison)[..8]})
+                );
+            }
             // Deferred, never Shed: the caller sets no source backoff.
             assert_eq!(
                 result,
@@ -420,6 +458,10 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 SnapshotQuarantineDisposition::RetryPending
             );
             assert_eq!(record.failed_reconstruction_count, 1);
+            assert_eq!(
+                record.upload_body_witness.as_deref(),
+                Some(snapshot_upload_body_witness(&poison).as_str())
+            );
             if identity {
                 assert!(
                     (sent_at + 60..=current_unix_seconds() + 72)

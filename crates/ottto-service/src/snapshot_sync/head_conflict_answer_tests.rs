@@ -256,7 +256,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(envelope(&refused_wire)["base_head_etag"], stale_head());
@@ -456,7 +456,7 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(
@@ -559,7 +559,7 @@ fn a_named_witness_refusal_sets_aside_only_its_body_and_resends_the_owed_answer(
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     let held = |progress: &SnapshotUploadProgress, item: &SnapshotItem| {
@@ -725,7 +725,7 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xa));
@@ -750,7 +750,7 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
@@ -788,7 +788,7 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
             result.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(envelope(&wire)["base_head_etag"], stale_head());
@@ -807,7 +807,7 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
@@ -841,7 +841,7 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(progress.head_conflict_challenges.len(), cap);
@@ -953,7 +953,7 @@ fn plain_conflict_is_probed_within_an_hour() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert!(progress.head_conflict_challenges.is_empty());
@@ -1266,7 +1266,7 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(envelope(&stale)["conflict_head_challenge"], challenge(0xa));

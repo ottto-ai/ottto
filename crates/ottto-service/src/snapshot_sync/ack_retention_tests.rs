@@ -642,7 +642,7 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
             |state| state.save(&progress_path),
         )
         .unwrap();
-        apply_bootstrapped_cache_heads(&mut items, &progress).unwrap();
+        apply_bootstrapped_cache_heads("codex", &mut items, &progress).unwrap();
         upload_resumable_batches_with_body_witness(
             &items,
             &unique_poison_scope(),

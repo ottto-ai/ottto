@@ -85,7 +85,15 @@ entity only. A body witness is not a stored body: missing body custody never
 triggers transcript reconstruction, and legacy owed entities never ride
 quarantine, re-offer, audit or revision-triggered reconstruction. Diagnostics add
 scalar owed/held counts to the existing refusal records; only a rising owed count
-raises the refusal alarm. Claude, Codex and Pi share this machinery.
+raises the refusal alarm. Claude, Codex and Pi share this machinery. A pass whose
+only holds are validated ordinary retryable refusals, validated ACK conflicts or
+named identity deferrals with a server retry deadline finishes successfully while
+each exact body remains owed in RetryPending custody. Validation, body-witness and
+usage-decrease review holds still defer the pass, including beside an isolated
+hold. Uploads, acknowledgements, custody, retry clocks, totals and placement are
+unchanged. Held cache-head probes and quarantine origins use structured diagnostics
+with fingerprint and body-witness hash8 values only, plus source and saved-head
+presence for probes.
 
 ## Stores
 
