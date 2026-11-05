@@ -3346,18 +3346,6 @@ struct PendingIndexFinalization {
     effective_upload_body_witness_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SnapshotUploadPolicy {
-    pub session_titles_enabled: bool,
-    pub workspace_labels_enabled: bool,
-    pub session_artifacts_enabled: bool,
-    pub session_attribution_enabled: bool,
-    /// Backend capability derived from the existing session-title privacy
-    /// choice. It is not a separate user setting and defaults off for older
-    /// backends that do not advertise the additive private-label contract.
-    pub session_attribution_labels_enabled: bool,
-}
-
 pub(crate) fn snapshot_source_from_api_slug(value: &str) -> Option<SnapshotSource> {
     match value {
         "codex" => Some(SnapshotSource::Codex),
@@ -3367,23 +3355,8 @@ pub(crate) fn snapshot_source_from_api_slug(value: &str) -> Option<SnapshotSourc
     }
 }
 
-impl Default for SnapshotUploadPolicy {
-    fn default() -> Self {
-        Self {
-            session_titles_enabled: true,
-            workspace_labels_enabled: true,
-            // Opt-in: artifacts are stripped before upload unless the backend
-            // activity hint explicitly enables them for the org.
-            session_artifacts_enabled: false,
-            // Opt-in: compact facts stay local unless the backend explicitly
-            // enables the additive attribution contract.
-            session_attribution_enabled: false,
-            session_attribution_labels_enabled: false,
-        }
-    }
-}
-
 pub use crate::upload_policy::apply_upload_policy;
+pub use crate::upload_policy::SnapshotUploadPolicy;
 
 #[cfg(test)]
 pub(crate) fn snapshot_item_wire_size(
