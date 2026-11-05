@@ -6598,10 +6598,16 @@ mod tests {
             "2026-10-03T20:00:00Z".to_string(),
             "2026-10-03T20:15:00Z".to_string(),
         );
+        // This fixture stores no Claude login, so the other account's
+        // `.claude.json` has no token whose owner can be proven: owner
+        // unproven, never a mismatch for an unknown owner.
         assert_eq!(
             mismatched.state,
-            ottto_protocol::ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+            ottto_protocol::ClaudeConfigSlotCollectionStateV1::IdentityUnknown
         );
+        assert!(mismatched.diagnostics[0]
+            .message
+            .contains("could not yet confirm"));
         assert_eq!(mismatched.account_identifier_hash, Some(account.clone()));
         assert_eq!(
             mismatched.organization_identifier_hash,

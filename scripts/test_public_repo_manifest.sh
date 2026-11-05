@@ -38,8 +38,8 @@ clone_repo() {
   configure_repo "$2"
 }
 
-# Writes the manifest public_repo_export_bundle.sh would write for these files:
-# the file-system view, with modes from stat().
+# Independent oracle: the manifest of these files from the file-system view,
+# with modes from stat().
 write_fs_manifest() {
   python3 - "$1" "$2" <<'PY'
 import hashlib
@@ -69,7 +69,7 @@ for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_p
     )
 manifest = {
     "schema_version": 1,
-    "generated_by": "public_repo_export_bundle.sh",
+    "generated_by": "test_public_repo_manifest.sh",
     "generated_at": "2026-10-24T00:00:00+00:00",
     "source_commit": "0123456789abcdef0123456789abcdef01234567",
     "candidate_file_count": len(records),
@@ -104,7 +104,7 @@ expect_status() {
 }
 
 # Fixture: a 0644 file, a 0755 file, a nested file named like the root
-# manifest (not excluded), and export roots with a comment.
+# manifest (not excluded), and legacy export roots with a comment.
 fixture="$tmp_dir/fixture"
 mkdir -p "$fixture/scripts" "$fixture/docs" "$fixture/public-export"
 git -C "$fixture" init -q
@@ -121,6 +121,11 @@ first_commit="$(git -C "$fixture" rev-parse HEAD)"
 oracle="$tmp_dir/oracle.json"
 write_fs_manifest "$fixture" "$oracle"
 expected_digest="$(json_field "$oracle" content_sha256)"
+# Pinned serialization: compact sorted JSON records; consumers persist this value.
+if [[ "$expected_digest" != "be73704352cf37aa7c49adee4d0f8106ffa5180678c619dcfa8039f6a41e398f" ]]; then
+  echo "Expected the pinned fixture digest, got $expected_digest" >&2
+  exit 1
+fi
 
 digest="$("$SCRIPT" --repo "$fixture" --digest)"
 if [[ "$digest" != "$expected_digest" ]]; then
@@ -251,7 +256,7 @@ expect_status 1 "$tmp_dir/compare-digest.out" \
 grep -q "content_sha256 0000000000000000000000000000000000000000000000000000000000000000 != derived" \
   "$tmp_dir/compare-digest.out"
 
-# Symlinks and submodules are refused, as the export bundle refuses them.
+# Symlinks and submodules are refused.
 symlinked="$tmp_dir/symlinked"
 clone_repo "$fixture" "$symlinked"
 ln -s README.md "$symlinked/link.md"
@@ -267,26 +272,29 @@ git -C "$submodule" commit -qm gitlink
 expect_status 2 "$tmp_dir/submodule.out" "$SCRIPT" --repo "$submodule" --digest
 grep -q "public manifest does not support commit entries (mode 160000): vendor/sub" "$tmp_dir/submodule.out"
 
-# --repo must be a checkout's top level, not a directory inside one (such as
-# dist/public-export/ottto inside the repository).
-mkdir -p "$fixture/dist/public-export/ottto"
-expect_status 2 "$tmp_dir/nested.out" "$SCRIPT" --repo "$fixture/dist/public-export/ottto" --digest
+# --repo must be a checkout's top level, not a directory inside one.
+mkdir -p "$fixture/nested/checkout"
+expect_status 2 "$tmp_dir/nested.out" "$SCRIPT" --repo "$fixture/nested/checkout" --digest
 grep -q "\-\-repo must be the top level of a git checkout" "$tmp_dir/nested.out"
 expect_status 2 "$tmp_dir/no-action.out" "$SCRIPT" --repo "$fixture"
 expect_status 2 "$tmp_dir/two-actions.out" "$SCRIPT" --repo "$fixture" --digest --facts
 
-# The real repository: a bundle exported from a clean checkout of HEAD equals
-# the manifest derived from HEAD, even when checkout and export run under
-# umask 002 (the bundle writes 0644/0755 like the derivation).
+# The real repository: the manifest derived from HEAD in a umask 002 checkout
+# equals the independent file-system oracle over a umask 022 copy of HEAD.
 real_clone="$tmp_dir/real-clone"
-(umask 002 && git clone -q "$ROOT" "$real_clone")
+mkdir -p "$real_clone"
+(umask 002 && git -C "$ROOT" archive HEAD | tar -x -C "$real_clone")
+git -C "$real_clone" init -q
 configure_repo "$real_clone"
-real_bundle="$tmp_dir/real-bundle"
-(umask 002 && "$real_clone/scripts/public_repo_export_bundle.sh" --output-dir "$real_bundle" --force) \
-  >"$tmp_dir/real-bundle.out"
-"$SCRIPT" --repo "$real_clone" --compare "$real_bundle/PUBLIC_EXPORT_MANIFEST.json" \
-  >"$tmp_dir/real-compare.out"
-grep -q "derived == $real_bundle/PUBLIC_EXPORT_MANIFEST.json" "$tmp_dir/real-compare.out"
+git -C "$real_clone" add .
+git -C "$real_clone" commit -qm "real tree"
+real_tree="$tmp_dir/real-tree"
+mkdir -p "$real_tree"
+# tar.umask 0022 archives 0644/0755 entries, whoever extracts them.
+git -C "$ROOT" -c tar.umask=0022 archive HEAD | tar -x -C "$real_tree"
+write_fs_manifest "$real_tree" "$tmp_dir/real-oracle.json"
+"$SCRIPT" --repo "$real_clone" --compare "$tmp_dir/real-oracle.json" >"$tmp_dir/real-compare.out"
+grep -q "derived == $tmp_dir/real-oracle.json" "$tmp_dir/real-compare.out"
 
 echo "public_repo_manifest tests passed"
 script_completed=1

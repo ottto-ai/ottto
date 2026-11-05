@@ -6,6 +6,9 @@ rust-version = "1.95"
 license = "Apache-2.0"
 authors = ["Ottto Team"]
 description = "Shared manifest constants and validation helpers for Ottto source and collector packages."
+repository = "https://github.com/ottto-ai/ottto"
+homepage = "https://ottto.net"
+publish = false
 
 [lints]
 workspace = true

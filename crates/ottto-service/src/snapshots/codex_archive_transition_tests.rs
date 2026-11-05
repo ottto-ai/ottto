@@ -1510,3 +1510,108 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
     );
     drop(session);
 }
+
+/// [regress] A shed partial save commits no Tail head for a file whose entry
+/// it does not keep, so the next page reads that file: a new rollout Full, an
+/// appended one by Tail from its kept head. [money] Two accounts, a side call,
+/// an evidence gap and (appended) a mid-session switch: the owed page's bodies
+/// and placement equal a cold Full's. The Claude rows are
+/// `shed_save_keeps_held_custody_and_drops_unkept_heads` and
+/// `shed_save_keeps_an_appended_turn_owed_once`.
+#[test]
+fn shed_save_commits_heads_only_for_kept_entries() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for appended in [false, true] {
+        let c = Corpus::new();
+        let ids = [MAIN, OTHER, SIDE, GAP];
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        // A native spawned side session under B, and an evidence gap.
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let keys = ids.map(|id| local_index_key(&c.path(id)));
+        let (_session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let page_on =
+            |index: ScanIndex| page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+        // A metadata-only head (an inventory observation) is not a read's
+        // continuation and stays by design, as `codex_physical_matches` skips it.
+        let heads = |index: &ScanIndex| {
+            keys.iter()
+                .map(|key| {
+                    state_v2::load_head(index, key, REVISION)
+                        .unwrap()
+                        .filter(|head| !head.metadata_only)
+                        .map(|head| head.body)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut before = prior;
+        // How the owed page must read each file: a new one Full from 0, an
+        // appended one by Tail from its committed end.
+        let mut reads = vec![(DeliveryMode::Full, 0); ids.len()];
+        if appended {
+            let (working, first, ..) = page_on(before.clone());
+            before = working
+                .checkpoint_with_captured_posts(&first, &before, "accept")
+                .0;
+            for (read, id) in reads.iter_mut().zip(ids) {
+                *read = (DeliveryMode::Tail, fs::metadata(c.path(id)).unwrap().len());
+                append(&c.path(id), &turn(3));
+            }
+            // A mid-session switch: a contradicting creator.
+            append(&c.path(MAIN), &header(MAIN, Some("switched")));
+            e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
+        }
+        let kept = heads(&before);
+        assert!(kept.iter().all(|head| head.is_some() == appended));
+        let (working, shed, ..) = page_on(before.clone());
+        assert_eq!(shed.snapshots.len(), ids.len());
+        let (mut index, _) = working.checkpoint_with_captured_posts(&shed, &before, "shed");
+        assert_eq!(
+            heads(&index),
+            kept,
+            "the shed save keeps each committed head"
+        );
+        e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let before = index.clone();
+        let (working, owed, delivery, ..) = page_on(index);
+        assert_eq!(
+            owed.snapshots.len(),
+            ids.len(),
+            "the next page reads every file"
+        );
+        // The read mode: a Full re-read of an appended file fails here.
+        let mut delivered = delivery.0.lock().unwrap().clone();
+        for read in reads {
+            let at = delivered
+                .iter()
+                .position(|got| *got == read)
+                .unwrap_or_else(|| panic!("missing read {read:?} in {delivered:?}"));
+            delivered.remove(at);
+        }
+        assert!(delivered.is_empty(), "extra reads: {delivered:?}");
+        let (index, posts) = working.checkpoint_with_captured_posts(&owed, &before, "accept");
+        let (_, cold, ..) = page_on(ScanIndex::default());
+        let cold = emitted(&index, &cold);
+        assert_ne!(
+            cold.snapshots[MAIN]["session_account_evidence"],
+            cold.snapshots[OTHER]["session_account_evidence"],
+            "two placements"
+        );
+        assert!(
+            cold.snapshots[OTHER]["session_account_evidence"].is_object(),
+            "tagged positive control"
+        );
+        assert!(
+            cold.snapshots[GAP]["session_account_evidence"].is_null(),
+            "evidence gap"
+        );
+        money_oracle::assert_equivalent(&cold, &route(&index, &owed, posts));
+    }
+}

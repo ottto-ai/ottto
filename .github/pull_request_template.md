@@ -6,13 +6,17 @@
 
 <!-- Commands you ran and their result, for example `cargo fmt --check`,
 `cargo test -p <crate>`, `jq empty` on changed JSON, or the script test for the
-file you changed. See CONTRIBUTING.md for the full list. -->
+file you changed. See docs/development.md for the full list. -->
 
 ## Compatibility
 
 <!-- Does this change CLI help or JSON output, exit codes, the local-control
 protocol, schemas, connector manifests, or release metadata? If yes, list the
 fixtures and docs you updated. Otherwise write "None". -->
+
+## AI assistance
+
+<!-- "None", or the tool and what it wrote. Small completions need no note. -->
 
 ## Checklist
 

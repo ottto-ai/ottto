@@ -40,10 +40,22 @@ file-system hint / periodic listing → select file → read new bytes from save
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
   a wildcard over every potentially colliding owner. Any missing header/listing proof still
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
-  singleton sessions and joined groups: it re-checks the directories and headers of the homes
-  holding them, and the inventory holds an owner seen in two homes. A change in an unrelated
-  home is the next pass's fact. A header owner that changes in a checked home during a pass
-  holds that pass’s Codex publication until revalidation on the next pass.
+  singleton sessions and joined groups across every registered home. A new file
+  naming a page owner fails; unrelated new files defer to the next roster refresh.
+  Every header ownership change and vanished census directory fails closed.
+  Refresh and checkpoint share the stable `DirectoryCensus::relist` helper.
+  Each boundary re-lists changed directories and re-reads new or changed headers.
+  The page roster moves from the traversal snapshot into validation; clones share
+  it in memory, and no additional traversal state is persisted.
+  New archives use every filename ownership candidate, like held archives;
+  archives beside known, still-present plaintext defer. If unrelated plaintext
+  vanishes and activates its roster archive, that archive uses the same filename
+  fence: a page-owner candidate or missing filename proof fails the page.
+  Unknown or unreadable headers remain conservative failures, including unrelated
+  compressed rereads.
+  A new empty day directory still fails one page (about once per home per day).
+  A symlink entry that refresh cannot certify can block pages across homes.
+  A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.
@@ -97,6 +109,14 @@ raises the refusal alarm. Claude, Codex and Pi share this machinery.
   totals and fork state on the same Tail seam. Each pass removes the
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
   retried, never via full erasure.
+- **Workspace observations.** Native completion records a resolved repository binding in the
+  session's Workspace fact before staging Tail state. The binding survives restart and directory
+  removal; unsuccessful lookups remain unbound and can resolve on later ordinary selected work. Git
+  worktrees keep the shared common-directory identity. Explicit non-Git and unknown folders can
+  carry a sanitized directory basename under the workspace-label upload policy; labels never
+  determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
+  write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
+  reconstructing them. No historical sessions are selected just to enrich metadata.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression
@@ -149,6 +169,11 @@ counters, the Tail store, saving, erasure, upload, acknowledgement, status, coun
 switches. Per-source code is limited to the root layout, the file reader and reducer, and money
 rules that really differ: copied-prefix deduplication for Claude, cumulative deltas for Codex and
 forks for Pi. Source capabilities are table fields, not `== Source::Claude` checks in shared code.
+
+Claude subagent path twins retain a native copied-request skip only when an earlier
+same-member page fold holds that id and the occurrence's usable provider timestamp is at
+or after 2026-11-05T00:00:00Z. Other requests and idless copies count through the existing
+restoration path; the parent-repeat rule and listed-family behavior remain unchanged.
 
 ## Module map: snapshots/ (target; migration in progress)
 

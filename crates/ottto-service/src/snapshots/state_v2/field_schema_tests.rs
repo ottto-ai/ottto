@@ -28,6 +28,9 @@ const RELEASES: [(&str, u32); 2] = [
     ("tests/fixtures/state_v2/release-0.1.216.json", 5),
     ("tests/fixtures/state_v2/release-0.1.218.json", 5),
 ];
+/// Paths a later layout stores as another kind's rows; the frozen releases
+/// still load them inline.
+const MOVED: [(&str, &str); 1] = [("v1_field.upload_context_proof", "entity_stamps")];
 /// Controls the frozen release stored beside its rows.
 const RELEASE_META: [&str; 3] = ["schema_version", "catalogue_layout", "field_presence"];
 /// A collection stops growing here even if an enum inside it has not cycled.
@@ -781,7 +784,9 @@ fn stored_field_paths_check() {
             continue;
         };
         for path in paths.difference(now) {
-            if parent(path).is_some_and(|p| !now.contains(p)) {
+            if parent(path).is_some_and(|p| !now.contains(p))
+                || MOVED.contains(&(kind.as_str(), path.as_str()))
+            {
                 continue;
             }
             retired_path_loads(&index, kind, path);
@@ -832,3 +837,6 @@ fn previous_release_check(path: &str, layout: u32) {
         panic!("{path}: release refused: {e:#}");
     }
 }
+
+#[path = "proof_split_tests.rs"]
+mod proof_split_tests;

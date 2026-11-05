@@ -249,7 +249,13 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
         ack(batch, &[(at(batch, &held), HELD, false)])
     })
     .unwrap();
-    assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(
+        outcome,
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
+    );
     // Siblings are checkpointed; the held body is not.
     assert_eq!(accepted, 2);
     for sibling in &items[1..] {
@@ -433,7 +439,12 @@ fn unknown_non_permanent_rejection_settles_accepted_siblings() {
             if permanent {
                 ResumableUploadResult::Rejected { count: 1 }
             } else {
-                ResumableUploadResult::Deferred { count: 1 }
+                // Unknown vocabulary is `other`: an ordinary retryable refusal,
+                // held alone.
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated: 1,
+                }
             }
         );
         assert_eq!(accepted, 2);

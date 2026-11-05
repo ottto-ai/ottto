@@ -64,6 +64,14 @@ The state-v2 store, Claude's scan-index store, uses stage `claude_state_v2` in
 this same local sink. Only Claude's daemon loads and already active Claude custody
 enable the resource probes; Codex and Pi keep their existing measurements.
 
+While a Claude pass runs on the scanning thread, each event below (`save_span`,
+`hold`, `growth_claim_refused`, ...) prints its own row with only the changed
+field, `{"latest": {"<name>": <value>}}`, so every save and hold stays countable.
+Stage windows, memory checkpoints, retained heap and save-work samples print
+nothing mid-pass; the pass-end row (after `post_pass_plateau`) carries the full
+snapshot with every field below. A same-name window repeated in one pass shows
+its last instance. Outside a pass, each change prints the full snapshot at once.
+
 | Field | Measurement |
 | --- | --- |
 | `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
@@ -179,12 +187,20 @@ bytes since the previous Claude page. Repeated reads count again; absent keys
 mean zero. Nonzero values remain exact, with no separate diagnostic record.
 On the same line, `claude_telemetry_retired_roots` and
 `claude_telemetry_retired_bytes` count Claude telemetry pairs deleted because
-every transcript of their session is gone, `claude_telemetry_held_roots` the
-candidate pairs kept (a live reader, a copy of their requests, a listed
-transcript with no loss-free census read, a write after the walk began, or a
-change while deleting),
+every transcript of their session is gone and their delivery is proven,
+`claude_telemetry_held_roots` the candidate pairs kept (delivery not yet
+proven, a live reader, a copy of their requests, a listed transcript with no
+loss-free census read, a write after the walk began, or a change while
+deleting), of which `claude_telemetry_held_copied` were kept by the copy rule,
 and `claude_telemetry_read_fault` the pairs kept because a member could not be
-read cleanly or unlinked.
+read cleanly or unlinked. `claude_telemetry_held_no_transcript_roots` and
+`claude_telemetry_held_no_transcript_bytes` count the held pairs whose session
+has no transcript the last walk listed, and their member bytes from metadata.
+Deletion is paused until a
+pair's delivery can be proven, so every candidate is held today and none is
+read. A session with neither telemetry member is skipped. Every complete root
+walk makes the full recheck of stored pairs due again, so held counts repeat
+on each complete walk.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -1002,6 +1018,19 @@ placeholders such as `[machine_id]` in diagnostics output. Account, user,
 organization, device, and installation identifiers must follow the same
 redacted-placeholder rule.
 
+## Service Log Rotation
+
+Each time the service starts, before it serves, it checks the file its stderr
+writes to. When that file is at least 64 MiB, it is renamed in place to
+`<stem>.<YYYYMMDDTHHMMSSZ>.log` (UTC rotation time), for example
+`ottto-service.err.20261105T142358Z.log`, and a new empty file takes the
+original name. Archives matching exactly that pattern are deleted once older
+than 7 days, but the newest 2 are always kept; the live file and any other
+name are never touched. Rotation happens only at startup, so a long-running
+service keeps appending to its live file until the next start. To read the
+full history, read the archives in name order, then the live file. A terminal,
+`/dev/null` or pipe on stderr is left alone.
+
 ## What To Share
 
 Share:
@@ -1749,9 +1778,15 @@ scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo o
 header attempt per archive; no money effect. Whether an older binary decodes carried
 state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
-On close, `codex_zst_input` on the #799 carrier reports consumed
-`codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
-`codex_zst_cpu_micros`, including failures. There is no content or path in these
+On close, each body decoder prints `codex_zst_input` on the #799 carrier with
+consumed `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder
+thread `codex_zst_cpu_micros`, including failures. Inventory header reads decode
+every `.zst` once per walk, so their closes print no row of their own: the Codex
+pass flush that prints `codex_zst_refused` also prints one `codex_zst_input_headers`
+row, when any header decoder closed since the last flush, with
+`codex_zst_header_decoders` (retries included) and the same `codex_zst_*` fields
+summed (`codex_zst_decoder_native_peak_bytes` is the maximum). Unlike the refusal
+counters, these totals reset at each flush. There is no content or path in these
 counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and

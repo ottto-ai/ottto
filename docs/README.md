@@ -34,6 +34,11 @@ CLI and `ottto-service` daemon, not private development scripts.
 - [Troubleshooting](troubleshooting.md): common exit codes and recovery steps.
 - [Examples](examples.md): copy-ready JSON workflows for agents and support.
 
+## Contributing
+
+- [Development Guide](development.md): build prerequisites, workspaces, and local
+  checks.
+
 ## Design Notes
 
 Technical notes for contributors about local runtime behavior and contracts.

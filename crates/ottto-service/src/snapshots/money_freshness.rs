@@ -47,6 +47,7 @@ impl WalkFold {
             let roster = self.debt.complete_roster().map(std::sync::Arc::new);
             with_walks(|walks| {
                 walks.last[source as usize] = debt;
+                walks.backlog_ran[source as usize] = false;
                 walks.roster[source as usize] = roster;
             });
             emit(source, &self, "walk", debt.as_ref());
@@ -57,8 +58,8 @@ impl WalkFold {
 }
 
 /// Each source's walk in progress, its last walk's aggregate, the roster of
-/// its last walk when that walk was complete (RAM only), and whether this
-/// process already ran its one backlog retirement on a roster.
+/// its last walk when that walk was complete (RAM only), and whether the
+/// backlog retirement already ran on that roster (once per complete walk).
 struct Walks {
     folds: [WalkFold; 3],
     last: [Option<Report>; 3],
@@ -74,7 +75,7 @@ const NO_WALKS: Walks = Walks {
 
 /// The one gate for deleting by absence: the source's last root walk began
 /// in this process and listed every root with no walk issue. Its roster, and
-/// whether the process's one backlog run is still due (claimed by this call).
+/// whether that walk's one backlog run is still due (claimed by this call).
 pub(super) fn index_current_since_start(
     source: SnapshotSource,
 ) -> Option<(std::sync::Arc<Roster>, bool)> {
@@ -108,24 +109,8 @@ fn with_walks<T>(body: impl FnOnce(&mut Walks) -> T) -> T {
     WALKS_FOR_TEST.with(|walks| body(&mut walks.borrow_mut()))
 }
 
-/// A new process whose first root walk ended with this roster (`None`: not
-/// complete).
 #[cfg(test)]
-pub(crate) fn set_roster_for_test(
-    source: SnapshotSource,
-    roster: Option<(u64, std::collections::BTreeMap<String, Option<u64>>)>,
-) {
-    let roster = roster.map(|(started_at_ms, listed)| {
-        std::sync::Arc::new(Roster {
-            started_at_ms,
-            listed,
-        })
-    });
-    with_walks(|walks| {
-        walks.roster[source as usize] = roster;
-        walks.backlog_ran[source as usize] = false;
-    });
-}
+pub(crate) use super::g7_debt::walk_ended_for_test;
 
 /// A restart forgets every walk in progress and every aggregate.
 #[cfg(test)]

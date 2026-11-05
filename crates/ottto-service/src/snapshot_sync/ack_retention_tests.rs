@@ -212,7 +212,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
     .unwrap();
     assert!(matches!(
         outcome,
-        SnapshotPageOutcome::Settled { conflicted: 1 }
+        SnapshotPageOutcome::Settled { conflicted: 1, .. }
     ));
 
     let (_, reloaded) = f.load();

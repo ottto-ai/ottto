@@ -336,7 +336,7 @@ impl LineObserver for Observer {
             }
             if p.is_owned_fresh_start() && file.mtime.and_then(|m| m.elapsed().ok()) <= Some(STALE)
             {
-                self.feed.2.deliver();
+                self.feed.2.deliver(FootprintInputs::CODEX);
             }
             State::Done(Box::new(p), o.capped)
         } else if *end == DeliveryEnd::Complete {

@@ -262,7 +262,10 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
     assert!(wires[0]["head_cas_contract"].is_string());
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(before
         .head_conflict_challenges
@@ -699,7 +702,10 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(wires[0]["head_cas_contract"].is_string());
     assert_eq!(
@@ -783,9 +789,13 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
             "{outcome}"
         );
         if retryable {
-            assert!(
-                matches!(result, ResumableUploadResult::Deferred { .. }),
-                "{outcome}: {result:?}"
+            assert_eq!(
+                result,
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated: 1
+                },
+                "{outcome}"
             );
             assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 0);
         }

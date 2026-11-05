@@ -244,7 +244,10 @@ fn paused_e2_ack_loss_restart_exact_receipt() {
         });
         assert_eq!(
             status.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
         );
         assert_eq!(
             progress.accepted_fingerprints.len(),

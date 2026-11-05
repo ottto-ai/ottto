@@ -20,7 +20,7 @@ use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
-    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
+    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected, RefusedSnapshotIndexes,
     RelayTokenAuthorizationRejected, ShedSnapshotIndexes, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
@@ -223,9 +223,10 @@ fn bootstrap_cache_heads_with_budget(
                 ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
                 // The partitioned uploader persisted each conflicting probe's exact
                 // body quarantine. Carry that hold into the normal upload rather
-                // than discarding every unrelated file's progress.
-                ResumableUploadResult::Deferred { count } => {
-                    deferred = deferred.saturating_add(count);
+                // than discarding every unrelated file's progress. An isolated
+                // refusal is held alone and does not defer the pass.
+                ResumableUploadResult::Deferred { count, isolated } => {
+                    deferred = deferred.saturating_add(count.saturating_sub(isolated));
                 }
                 outcome => {
                     shed = matches!(outcome, ResumableUploadResult::Shed { .. });
@@ -315,10 +316,14 @@ fn with_bootstrap_deferred(
     }
     match result {
         ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
-            ResumableUploadResult::Deferred { count: deferred }
+            ResumableUploadResult::Deferred {
+                count: deferred,
+                isolated: 0,
+            }
         }
-        ResumableUploadResult::Deferred { count } => ResumableUploadResult::Deferred {
+        ResumableUploadResult::Deferred { count, isolated } => ResumableUploadResult::Deferred {
             count: count.saturating_add(deferred),
+            isolated,
         },
         other => other,
     }
@@ -992,16 +997,19 @@ pub(crate) fn checkpoint_account_release_for_test(
 }
 
 /// The page items a server answer names: an indexed validation rejection
-/// (422) or an identity-deferral shed (503). `None` when nothing is named or
-/// a location falls outside this page; that failure keeps its own path (a
-/// shed stays a whole-pass shed).
+/// (422), an identity-deferral shed (503) or ACK refs that echoed another
+/// body witness. `None` when nothing is named or a location falls outside
+/// this page; that failure keeps its own path (a shed stays a whole-pass shed).
 fn server_named_items(error: &anyhow::Error, indices: &[usize]) -> Option<BTreeSet<usize>> {
-    let named = match error.downcast_ref::<ShedSnapshotIndexes>() {
-        Some(named) => &named.0,
-        None => error
+    let named = if let Some(named) = error.downcast_ref::<ShedSnapshotIndexes>() {
+        &named.0
+    } else if let Some(named) = error.downcast_ref::<RefusedSnapshotIndexes>() {
+        &named.0
+    } else {
+        error
             .downcast_ref::<BatchRejected>()?
             .snapshot_indexes
-            .as_ref()?,
+            .as_ref()?
     };
     named
         .iter()
@@ -7353,7 +7361,7 @@ fn finish_sync_source(
             }
         };
         let (mut disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_retained(
+            apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                 support_dir,
                 &mut scan_result,
                 &mut index,
@@ -8003,6 +8011,7 @@ fn finish_sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
+    let mut isolated_only = false;
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
     // obligations this full scan references before any selection (#794 F1).
@@ -8080,7 +8089,10 @@ fn finish_sync_source(
                     resolved_permanent_rejections = true;
                     count
                 }
-                ResumableUploadResult::Deferred { count } => count,
+                ResumableUploadResult::Deferred { count, isolated } => {
+                    isolated_only = count == isolated;
+                    count
+                }
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
@@ -8604,7 +8616,14 @@ fn finish_sync_source(
                 state,
             },
         );
-        if !resolved_permanent_rejections {
+        if isolated_only {
+            // Each refused body keeps its own exact retry custody; the sweep
+            // stays unsettled, but the refusal no longer fails the pass.
+            eprintln!(
+                "local snapshot upload completed with {count} refused entity(ies) held for retry for {}",
+                source.api_slug()
+            );
+        } else if !resolved_permanent_rejections {
             return Err(snapshot_entity_deferred(count));
         }
         // Permanent refusals remain disclosed after the durable save; a
@@ -8838,7 +8857,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
 }
 
-/// The ordinary evidence stage without retained cache or identity ledger inputs.
+/// The ordinary evidence stage without identity ledger or wire budget inputs.
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -8848,7 +8867,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_retained(
+    apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         support_dir,
         scan_result,
         index,
@@ -8869,7 +8888,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_retained(
+    apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         support_dir,
         scan_result,
         index,
@@ -8910,7 +8929,7 @@ fn whole_corpus_evidence() -> bool {
     false
 }
 
-fn apply_claude_local_evidence_to_scan_with_retained(
+fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
@@ -9432,8 +9451,12 @@ enum ResumableUploadResult {
     },
     /// Accepted siblings are durably checkpointed; backend conflicts remain
     /// held for bounded retry and paced context offers wait for a later pass.
+    /// `isolated` (included in `count`) are validated ordinary retryable
+    /// entity refusals, each held alone; when they are all of `count`, the
+    /// pass finishes with them still owed.
     Deferred {
         count: usize,
+        isolated: usize,
     },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
@@ -9789,7 +9812,7 @@ where
 
 #[derive(Debug)]
 enum SnapshotPageOutcome {
-    Settled { conflicted: usize },
+    Settled { conflicted: usize, isolated: usize },
     Disabled(Option<String>),
 }
 
@@ -9912,6 +9935,7 @@ where
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
     let mut conflicted_entities = 0usize;
+    let mut isolated_entities = 0usize;
     let mut head_conflicts_recovered = Vec::new();
     let mut head_conflicts_recorded = Vec::new();
     let entity_ack = match response.entity_ack_contract.as_deref() {
@@ -10154,6 +10178,11 @@ where
                 .filter(|entity| !entity.permanent)
                 .count(),
         );
+        isolated_entities = response
+            .rejected_entities
+            .iter()
+            .filter(|entity| !entity.permanent && entity.ordinary_retryable())
+            .count();
         progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     } else {
         for index in indices {
@@ -10201,6 +10230,7 @@ where
 
     Ok(SnapshotPageOutcome::Settled {
         conflicted: conflicted_entities,
+        isolated: isolated_entities,
     })
 }
 
@@ -10548,6 +10578,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut isolated_entities = 0usize;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -10595,8 +10626,12 @@ where
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
-            Ok(SnapshotPageOutcome::Settled { conflicted }) => {
+            Ok(SnapshotPageOutcome::Settled {
+                conflicted,
+                isolated,
+            }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
+                isolated_entities = isolated_entities.saturating_add(isolated);
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -10637,28 +10672,26 @@ where
             }
             Err(error) if server_named_items(&error, &indices).is_some() => {
                 let held = server_named_items(&error, &indices).expect("named items");
-                // The server named these items: a validation rejection, or an
-                // identity deferral that waits for its identity only. Hold
-                // them; their siblings and later batches continue this pass.
-                let (status, reason, identity_retry_at) =
-                    match error.downcast_ref::<UploadShed>().copied() {
-                        Some(shed) => (
-                            shed.status,
-                            "identity_deferred",
-                            Some(
-                                current_unix_seconds()
-                                    .saturating_add(shed_backoff(shed.retry_after).as_secs()),
-                            ),
+                // The server named these items: a validation rejection, an
+                // identity deferral that waits for its identity only, or ACK
+                // refs that echoed another body witness. Hold them; their
+                // siblings settle only from their own exact ACK, re-sent in
+                // this pass, and later batches continue.
+                let (status, reason, identity_retry_at) = match (
+                    error.downcast_ref::<UploadShed>().copied(),
+                    error.downcast_ref::<BatchRejected>(),
+                ) {
+                    (Some(shed), _) => (
+                        Some(shed.status),
+                        "identity_deferred",
+                        Some(
+                            current_unix_seconds()
+                                .saturating_add(shed_backoff(shed.retry_after).as_secs()),
                         ),
-                        None => (
-                            error
-                                .downcast_ref::<BatchRejected>()
-                                .expect("typed rejection")
-                                .status,
-                            "validation_reject",
-                            None,
-                        ),
-                    };
+                    ),
+                    (None, Some(rejected)) => (Some(rejected.status), "validation_reject", None),
+                    (None, None) => (None, "body_witness_refused", None),
+                };
                 let before = progress.clone();
                 for index in &held {
                     let item_fingerprint = fingerprint(&items[*index]);
@@ -10787,6 +10820,7 @@ where
     if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
+            isolated: isolated_entities,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {
@@ -12842,7 +12876,13 @@ mod tests {
             |progress| progress.save(&progress_path),
         )
         .unwrap();
-        assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            outcome,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         index.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
@@ -14849,6 +14889,15 @@ mod tests {
         )
     }
 
+    /// The real due-retry selection, with a held body's deadline reached.
+    fn lease_due_retry(progress: &mut SnapshotUploadProgress, fingerprint: &str) {
+        if let Some(record) = progress.quarantined_fingerprints.get_mut(fingerprint) {
+            record.retry_after_unix_seconds = 0;
+            progress.prepare_quarantine_retries(&BTreeMap::new());
+            assert!(progress.active_quarantine_retries.contains(fingerprint));
+        }
+    }
+
     /// [money] A lost ACK response leaves no checkpoint; only the exact
     /// creator-domain proof (public v7) settles the retry, after which the
     /// settled body is a no-op.
@@ -14958,22 +15007,46 @@ mod tests {
                 // The cache-declared neighbour domain cannot settle it.
                 (Some(13), Some(digest.clone())),
             ] {
-                upload_resumable_batches_with_body_witness(
+                lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
+                let mut calls = 0;
+                let outcome = upload_resumable_batches_with_body_witness(
                     &items,
                     &unique_poison_scope(),
                     &mut progress,
                     &mut accepted,
                     |snapshot| snapshot.snapshot_fingerprint.as_str(),
                     snapshot_upload_body_witness,
-                    |batch| checked_response(batch, version, proof.clone(), unchanged),
+                    |batch| {
+                        calls += 1;
+                        checked_response(batch, version, proof.clone(), unchanged)
+                    },
                     |_| Ok(()),
                 )
-                .expect_err("missing/wrong proof or capability domain cannot settle retry");
+                .unwrap();
+                // The refusal names the body: it is set aside, never settled.
+                assert_eq!(
+                    (outcome, calls),
+                    (
+                        ResumableUploadResult::Deferred {
+                            count: 1,
+                            isolated: 0
+                        },
+                        1
+                    ),
+                    "missing/wrong proof or capability domain cannot settle retry"
+                );
                 assert_eq!(accepted, 0);
                 assert!(progress.accepted_fingerprints.is_empty());
-                assert!(!progress.contains_body(&items[0].snapshot_fingerprint, &digest));
+                assert!(!progress
+                    .accepted_body_witnesses
+                    .contains_key(&items[0].snapshot_fingerprint));
+                assert_eq!(
+                    progress.quarantined_fingerprints[&items[0].snapshot_fingerprint].disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
             }
         }
+        lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
         let mut retry_calls = 0;
         upload_resumable_batches_with_body_witness(
             &items,
@@ -15171,7 +15244,13 @@ mod tests {
             |state| state.save(&progress_path),
         )
         .expect("conflict remains retryable");
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 0);
 
         index.mark_bounded_sweep_unsettled();
@@ -15706,7 +15785,13 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         assert_eq!(persisted.len(), 2);
@@ -15804,7 +15889,13 @@ mod tests {
         )
         .expect("an all-conflict page remains retryable");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 3,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 0);
         assert!(progress.accepted_fingerprints.is_empty());
         assert_eq!(
@@ -16778,7 +16869,13 @@ mod tests {
                 Ok(accepted_batch(batch.len()))
             }, |_| Ok(()),
         ).expect("indexed rejection holds only the refused entity");
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 24);
         assert_eq!(progress.accepted_fingerprints.len(), 24);
         // A retryable rejection now has durable custody rather than retrying every cycle.
@@ -16879,7 +16976,10 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 result,
-                ResumableUploadResult::Deferred { count: 1 } | ResumableUploadResult::Completed
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated: 0
+                } | ResumableUploadResult::Completed
             ));
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
             assert_eq!(accepted, 1);
@@ -17586,7 +17686,13 @@ mod tests {
         )
         .expect("a normal entity conflict is a closed-machine result");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(observed_classes, vec![false, true]);
         assert_eq!(accepted, 1);
         assert!(progress.accepted_fingerprints.contains(&ordinary));
@@ -21588,6 +21694,10 @@ mod tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
         }
         #[cfg(unix)]
+        mod claude_first_request_login_tests {
+            include!("snapshot_sync/claude_first_request_login_tests.rs");
+        }
+        #[cfg(unix)]
         mod claude_login_only_org_tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }
@@ -22318,7 +22428,10 @@ mod tests {
                 &item.snapshot_fingerprint,
                 &snapshot_upload_body_witness(item),
             ) {
-                return Ok(SnapshotPageOutcome::Settled { conflicted: 0 });
+                return Ok(SnapshotPageOutcome::Settled {
+                    conflicted: 0,
+                    isolated: 0,
+                });
             }
             attempt_snapshot_page(
                 &self.items,

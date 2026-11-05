@@ -162,6 +162,12 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
+impl RepositoryIdentity {
+    pub(crate) fn is_repository(&self) -> bool {
+        self.repository_hash.is_some()
+    }
+}
+
 impl SpawnEnv {
     fn claude_command(&self) -> Result<Command> {
         let Some(program) = crate::command_env::executable_path("claude") else {
@@ -234,37 +240,61 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let projection = Arc::clone(&daemon.footprint_cwds);
     let codex_preludes = Arc::clone(&daemon.codex_preludes);
     let inputs = daemon.footprint_cwds.inputs();
-    let mut harvest = move || {
-        let claude = harvest_all_once(&home, &support_dir, &projection);
+    let mut harvest = move |[claude, codex]: [bool; 2]| {
+        let claude = claude.then(|| harvest_all_once(&home, &support_dir, &projection));
         // Codex session starts share this thread: no extra background job.
-        if let Err(error) =
+        if let Some(Err(error)) = codex.then(|| {
             crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
-        {
+        }) {
             eprintln!(
                 "codex session start harvest skipped: {}",
                 crate::snapshot_sync::safe_error(&error)
             );
         }
-        claude
+        claude.unwrap_or(Ok(ContextHarvestOutcome::default()))
     };
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(context_cycle(&inputs, &mut harvest));
+        .spawn(move || {
+            let mut schedule = ContextSchedule::default();
+            loop {
+                context_cycle(&inputs, &mut schedule, &mut harvest);
+            }
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
 }
 
-/// Waits for snapshot sync's first usable delivery (returns at once after it;
-/// the flag never resets), harvests, and answers the delay before the next.
+/// Sources harvested so far, and when their next cadence harvest is due.
+#[derive(Debug, Default)]
+struct ContextSchedule {
+    harvested: [bool; 2],
+    due: Option<Instant>,
+}
+
+/// Sleeps until the cadence harvests every source seen so far, or a new source's
+/// first inputs arrive: that one is harvested alone. Either way the next
+/// cadence is due one delay after this harvest.
 fn context_cycle(
     inputs: &FootprintInputs,
-    harvest: &mut impl FnMut() -> Result<ContextHarvestOutcome>,
-) -> Duration {
+    schedule: &mut ContextSchedule,
+    harvest: &mut impl FnMut([bool; 2]) -> Result<ContextHarvestOutcome>,
+) {
+    let new = |arrived: &[bool; 2]| -> [bool; 2] {
+        std::array::from_fn(|i| arrived[i] && !schedule.harvested[i])
+    };
+    let wait = schedule.due.map_or(Duration::MAX, |due| {
+        due.saturating_duration_since(Instant::now())
+    });
     let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
-    drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
-    let refused = match harvest() {
+    let first = new(&inputs
+        .1
+        .wait_timeout_while(arrived, wait, |arrived| new(arrived) == [false; 2])
+        .unwrap_or_else(PoisonError::into_inner)
+        .0);
+    let first = (first != [false; 2]).then_some(first);
+    let sources = first.unwrap_or(schedule.harvested);
+    let refused = match harvest(sources) {
         Ok(outcome) => outcome.refused > 0,
         Err(error) => {
             eprintln!(
@@ -274,18 +304,23 @@ fn context_cycle(
             false
         }
     };
-    next_context_cycle_delay(refused)
+    schedule.due = Some(Instant::now() + next_context_cycle_delay(refused));
+    schedule.harvested = std::array::from_fn(|i| schedule.harvested[i] || sources[i]);
 }
 
-/// Set by the first snapshot-sync delivery a harvest can use, from the Claude
-/// or Codex observer; one per daemon, shared by both feeds, RAM only.
+/// Set per source (Claude, Codex) by its first snapshot-sync delivery a harvest
+/// can use, which alone wakes the thread; one per daemon, never reset, RAM only.
 #[derive(Debug, Default)]
-pub(crate) struct FootprintInputs(Mutex<bool>, std::sync::Condvar);
+pub(crate) struct FootprintInputs(Mutex<[bool; 2]>, std::sync::Condvar);
 
 impl FootprintInputs {
-    pub(crate) fn deliver(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        self.1.notify_all();
+    pub(crate) const CLAUDE: usize = 0;
+    pub(crate) const CODEX: usize = 1;
+    pub(crate) fn deliver(&self, source: usize) {
+        let mut arrived = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !std::mem::replace(&mut arrived[source], true) {
+            self.1.notify_all();
+        }
     }
 }
 
@@ -751,35 +786,38 @@ pub(crate) fn resolve_repository_identity(
     workspace: &Path,
     labels_enabled: bool,
 ) -> RepositoryIdentity {
-    let Some(toplevel) = git_toplevel(workspace) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: None,
-            repository_label_source: None,
-            repository_identity_source: None,
-            workspace_kind: Some("non_git".to_string()),
-        };
+    if fs::read_dir(workspace).is_err() {
+        return unresolved_repository_identity("unknown");
+    }
+    let toplevel = git_stdout_capped(
+        workspace,
+        &["rev-parse", "--show-toplevel"],
+        GIT_STDOUT_MAX_BYTES,
+    );
+    let toplevel = match toplevel {
+        Ok(bytes) => match String::from_utf8(bytes)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => absolutize_git_path(workspace, raw.trim()),
+            None => return unresolved_repository_identity("unknown"),
+        },
+        Err(GitOutputError::Failed) => return unresolved_repository_identity("non_git"),
+        Err(_) => return unresolved_repository_identity("unknown"),
     };
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
-        return RepositoryIdentity {
-            repository_hash: None,
-            repository_label: labels_enabled
-                .then(|| toplevel.file_name()?.to_str())
-                .flatten()
-                .and_then(|name| safe_text(name, 255)),
-            repository_label_source: labels_enabled.then(|| "git_root".to_string()),
-            repository_identity_source: None,
-            workspace_kind: Some("unknown".to_string()),
-        };
+        return unresolved_repository_identity("unknown");
     };
-    let common_dir = absolutize_git_path(workspace, &common_dir_raw);
-    let git_dir = git_stdout(workspace, &["rev-parse", "--git-dir"])
-        .map(|raw| absolutize_git_path(workspace, &raw));
+    let Ok(common_dir) = absolutize_git_path(workspace, &common_dir_raw).canonicalize() else {
+        return unresolved_repository_identity("unknown");
+    };
+    let Some(git_dir) = git_stdout(workspace, &["rev-parse", "--git-dir"])
+        .and_then(|raw| absolutize_git_path(workspace, &raw).canonicalize().ok())
+    else {
+        return unresolved_repository_identity("unknown");
+    };
     let common_text = common_dir.to_string_lossy();
-    let linked_worktree = git_dir
-        .as_ref()
-        .map(|git_dir| canonical_or_self(git_dir) != canonical_or_self(&common_dir))
-        .unwrap_or(false);
+    let linked_worktree = git_dir != common_dir;
     let workspace_kind = if linked_worktree {
         "linked_worktree"
     } else if same_path(workspace, &toplevel) {
@@ -813,6 +851,16 @@ pub(crate) fn resolve_repository_identity(
             .to_string(),
         ),
         workspace_kind: Some(workspace_kind.to_string()),
+    }
+}
+
+fn unresolved_repository_identity(kind: &str) -> RepositoryIdentity {
+    RepositoryIdentity {
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: Some(kind.to_string()),
     }
 }
 
@@ -864,14 +912,14 @@ pub(crate) fn git_stdout_capped(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Vec<u8>, GitOutputError> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| GitOutputError::Failed)?;
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| GitOutputError::Failed)?;
     let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
     fn stop(
         mut child: std::process::Child,
@@ -1420,7 +1468,7 @@ impl CwdProjection {
         }
         if let Some(mtime) = file.mtime {
             if !known.is_empty() && mtime.elapsed().unwrap_or_default() <= RECENT_WORKSPACE_WINDOW {
-                self.1.deliver();
+                self.1.deliver(FootprintInputs::CLAUDE);
             }
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
@@ -1773,7 +1821,16 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| safe_text(name, 255))
-        .or_else(|| Some("workspace".to_string()))
+        .or_else(|| {
+            workspace
+                .file_name()
+                .is_none()
+                .then(|| "workspace".to_string())
+        })
+        .filter(|label| {
+            let lower = label.to_ascii_lowercase();
+            !lower.contains(".claude") && !lower.contains(".codex") && !label.contains('\\')
+        })
 }
 
 #[cfg(test)]
@@ -2246,6 +2303,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
+    /// [regress] An existing folder with a failed Git lookup is distinct from a missing cwd.
     #[test]
     fn repository_identity_marks_non_git_without_repository_hash() {
         let dir = temp_dir("repo-identity-non-git");
@@ -2257,6 +2315,11 @@ mod tests {
         assert!(identity.repository_label_source.is_none());
         assert!(identity.repository_identity_source.is_none());
         assert_eq!(identity.workspace_kind.as_deref(), Some("non_git"));
+        let missing = resolve_repository_identity(&dir.join("missing"), true);
+        assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
+        fs::write(dir.join(".git"), "gitdir: missing-metadata\n").unwrap();
+        let broken = resolve_repository_identity(&dir, true);
+        assert_eq!(broken.workspace_kind.as_deref(), Some("non_git"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2437,44 +2500,75 @@ mod tests {
         (found, path_scopes)
     }
 
-    /// Regression: at daemon start no snapshot pass has delivered a
-    /// transcript yet, so the thread must wait for the first delivery instead
-    /// of harvesting nothing and sleeping six hours.
+    /// Regression: each source's first harvest waits for its own first
+    /// delivery. A Codex start that arrives first is harvested alone and keeps
+    /// its cadence while Claude is pending; Claude's later delivery is harvested
+    /// alone, once, then both follow the 6 h cadence.
     #[test]
     fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
         let home = temp_dir("startup-wake");
         let now = SystemTime::now();
         let dir = home.join("work").join("repo");
+        let codex_dir = home.join("codex");
         fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&codex_dir).unwrap();
         write_discovery_transcripts(&home, now, &[(60, vec![dir.as_path()])]);
         let mut files = Vec::new();
         let projects = home.join(".claude").join("projects");
         collect_recent_jsonl_files(&projects, now, &mut files, &mut 0);
         let projection = Arc::new(CwdProjection::default());
-        let cycle = {
-            let projection = Arc::clone(&projection);
+        let codex = crate::codex_prelude_footprint::CodexPreludeFeed::new(projection.inputs());
+        let codex = Arc::new(codex);
+        // Each harvest records, per harvested source, how much it could see.
+        let cycle = |mut schedule: ContextSchedule| {
+            let (projection, codex) = (Arc::clone(&projection), Arc::clone(&codex));
             std::thread::spawn(move || {
-                // Each harvest records how many workspaces it could see.
                 let mut seen = Vec::new();
-                let delay = context_cycle(&projection.1, &mut || {
-                    seen.push(projection.recent_cwds(SystemTime::now()).len());
-                    Ok(ContextHarvestOutcome::default())
-                });
-                (seen, delay)
+                context_cycle(
+                    &projection.1,
+                    &mut schedule,
+                    &mut |[claude_on, codex_on]: [bool; 2]| {
+                        seen.push([
+                            claude_on.then(|| projection.recent_cwds(SystemTime::now()).len()),
+                            codex_on.then(|| codex.done_for_test().len()),
+                        ]);
+                        Ok(ContextHarvestOutcome::default())
+                    },
+                );
+                (seen, schedule)
             })
         };
+        let six_hours = |schedule: &ContextSchedule| {
+            let due = schedule.due.unwrap();
+            let left = due.saturating_duration_since(Instant::now());
+            left > CONTEXT_FOOTPRINT_INTERVAL - Duration::from_secs(60)
+                && left <= CONTEXT_FOOTPRINT_INTERVAL
+        };
 
+        // Codex delivers first: only Codex is harvested.
+        let waiting = cycle(ContextSchedule::default());
+        crate::codex_prelude_footprint::tests::deliver_fresh_start(&codex, &codex_dir);
+        let (seen, mut schedule) = waiting.join().unwrap();
+        assert_eq!(seen, [[None, Some(1)]]);
+        assert_eq!(schedule.harvested, [false, true]);
+        assert!(six_hours(&schedule));
+        // A pending Claude does not hold Codex's cadence.
+        schedule.due = Some(Instant::now());
+        let (seen, schedule) = cycle(schedule).join().unwrap();
+        assert_eq!(seen, [[None, Some(1)]]);
+        assert!(six_hours(&schedule));
+        // Claude's first delivery: Claude alone, once; the next cadence is 6 h out.
+        let waiting = cycle(schedule);
         project_transcripts(&projection, &files);
-
-        let (seen, delay) = cycle.join().unwrap();
-        assert_eq!(seen, [1], "one harvest, after the delivery");
-        assert_eq!(delay, CONTEXT_FOOTPRINT_INTERVAL);
-        let mut later = 0;
-        let delay = context_cycle(&projection.1, &mut || {
-            later += 1;
-            Ok(ContextHarvestOutcome::default())
-        });
-        assert_eq!((later, delay), (1, CONTEXT_FOOTPRINT_INTERVAL));
+        let (seen, mut schedule) = waiting.join().unwrap();
+        assert_eq!(seen, [[Some(1), None]]);
+        assert_eq!(schedule.harvested, [true, true]);
+        assert!(six_hours(&schedule));
+        // Then the 6 h cadence harvests both.
+        schedule.due = Some(Instant::now());
+        let (seen, schedule) = cycle(schedule).join().unwrap();
+        assert_eq!(seen, [[Some(1), Some(1)]]);
+        assert!(six_hours(&schedule));
         fs::remove_dir_all(home).unwrap();
     }
 

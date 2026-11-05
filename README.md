@@ -1,892 +1,198 @@
-# Ottto Local Platform
+# Ottto
 
-This is the clean-slate local runtime for customer machines. It is the target
-production path for the daemon, CLI, macOS app, agent skill, and `/apps`
-integration. The retired Python companion implementation has been removed from
-the production repository path.
+Ottto is one tool to see what is right and what is wrong with your coding agents. It works with
+several coding agents on your Mac, such as Claude Code, Codex and Pi.
 
-## Public V1 Promise
+- **Everyday work:** usage, plan limits and cost across your agents, logins and Macs, at a glance.
+- **What should you optimize:** where your cost goes and which setup problems may hold your agents
+  back, based on your own sessions and setup, so you fix what matters first.
 
-The public `ottto` repository is intended to be enough for an external
-developer, support engineer, CI job, or coding agent to install, set up, verify,
-repair, diagnose, update, and uninstall Ottto without private repository
-knowledge.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/overview-dark.png">
+    <img alt="The Ottto dashboard Overview page for a demo account, last 7 days: cards for API usage, subscriptions, cloud providers and daily run-rate; pay-as-you-go cost drivers by agent for Claude Code, Codex and Pi; and token, session and hourly activity summaries." src="docs/assets/readme/overview-light.png" width="860">
+  </picture><br>
+  <sub>The Overview page of the Ottto dashboard, showing a demo account's data.</sub>
+</p>
 
-Stable releases are distributed through the install owners advertised by the
-release manifest:
+## Get started
 
-- Homebrew tap: installs `ottto`, installs `ottto-service`, and owns
-  `brew services start ottto`.
-- Hosted native installer: downloads and verifies a signed, notarized DMG or
-  PKG without installing mutable shell-managed payloads.
-- GitHub Releases and release notes: publish immutable manifest-backed
-  artifacts, checksums, SBOM/provenance metadata, and rollback instructions.
-- Signed `Ottto.app`: provides the native app path while staying aligned with
-  the same `ottto-service` runtime and release manifest.
+1. **Install Ottto.app.**
+   [**Download Ottto for Mac**](https://install.ottto.net/ottto-local-platform/releases/stable/latest/Ottto-macos-arm64.dmg)
+   (Apple silicon, macOS 14 or later; signed and notarized).
 
-`net.ottto.service` is a single-owner user LaunchAgent. A normal install,
-launch, upgrade, or restart may repair only the LaunchAgent it already owns:
-Homebrew through `brew services`, the native app through its bundled helper,
-and the hosted installer through its installed helper. Replacing a different
-owner requires an explicit migration command; ordinary app launch must use a
-Homebrew-owned service without rewriting it, and ordinary Homebrew service
-start must not silently take over an app-bundle-owned job.
+   Prefer the command line? Homebrew installs the `ottto` CLI and the background service (not the
+   app). Use one or the other:
 
-Final public-v1 closeout verifies that the public repository resolves as
-`ottto-ai/ottto`, uses `main` as its default branch, and has that public `main`
-branch head bound to the launch runtime commit. It also verifies that the exact
-stable GitHub Release is non-draft, non-prerelease, has `targetCommitish`
-bound to either `main` or the launch runtime commit, and contains only
-canonical tag-scoped download assets for `release-manifest.json`, every stable
-manifest artifact, and the CycloneDX SBOM before
-`stable_release_published` can pass.
-The same closeout requires a redacted public `Public CI` report, preferably
-from the `merge_group` run of the exact public runtime commit (the queue
-fast-forwards `main` to that tested SHA). A successful `push` run on `main`
-remains accepted during the transition. The report must have a public run URL
-matching its run ID, a unique workflow job inventory, canonical public GitHub
-job URLs for that run, and green runtime, public-surface, and advisory jobs.
-The public repo, release, CI, and final closeout `checked_at` fields plus
-GitHub release/CI timestamps must be parseable ISO-8601 UTC timestamps, so
-reviewed evidence cannot carry ambiguous local time strings. Release and CI
-access reports also require `checked_at` to be at or after the reported GitHub
-event, and final closeout requires its `checked_at` to be at or after each
-component access report.
+   ```bash
+   brew install ottto-ai/tap/ottto
+   brew services start ottto
+   ```
 
-Stable preflight also requires a passing, redacted internal stable-candidate RC
-evidence record from a `stable-candidate` manifest built from the same commit,
-so stable publication cannot skip candidate artifact trust, installer, setup,
-diagnostics, update, rollback, and static install-owner checks. The
-stable-candidate RC gate rejects candidate macOS artifacts that are not marked
-signed, notarized, and Gatekeeper-assessed, and its evidence skeleton requires
-explicit signature, notarization, Gatekeeper, and local-runtime pass/fail facts
-bound to `ottto-service`, `net.ottto.service`, protocol v15, the
-stable-candidate version/channel, and candidate release-manifest SHA-256.
-Stable closeout then requires clean-machine evidence for each advertised install
-owner, including setup, app detection, Codex verify/fix, diagnostics, logout,
-update/upgrade, uninstall, reinstall, post-reinstall status, re-onboard after a
-local Keychain wipe, and owner-specific trust checks before `latest` can be
-treated as externally ready. Each owner entry must also bind the installed local
-runtime to `ottto-service`,
-`net.ottto.service`, protocol v15, the exact stable version/channel, install
-owner, and release-manifest SHA-256. The closeout gate rejects extra required
-install owners and unknown per-owner check names so the matrix cannot pass with
-unreviewed launch evidence.
+   More options, updates and uninstall: [docs/install.md](docs/install.md).
 
-Setup is browser-claim-first. The CLI never collects an Ottto password in the
-terminal. Agents and headless sessions use `--json --no-browser --no-wait`,
-show the returned claim URL or claim code to the user, and resume through the
-same daemon-owned setup flow.
+2. **Sign in to your Ottto account** in the app, or run `ottto setup`. This connects your Mac and
+   unlocks everything below: the full dashboard, the findings, and Ottto for Claude and ChatGPT.
 
-The first public smoke commands are:
+## With and without an account
 
-```bash
-ottto status --json
-ottto receipts --json --limit 20
-ottto context --json
-ottto setup --json
-ottto apps detect --json
-ottto verify --app codex --json
-ottto verify --repair --app codex --json
-ottto doctor --json
-ottto fix --app codex --json
-ottto diagnostics collect --json
-ottto update check --json
-```
+**Ottto for Claude and ChatGPT:** ask about your usage, cost, data sources and recommendations from
+the chat you already use. Ottto's connector is read-only and cannot change anything in your account.
 
-Privacy defaults are part of the product contract. Local usage sync starts only
-after claim approval, uses a six-month default backfill capped at 1000 files per
-app/source, and must not upload raw prompts, raw output, absolute local paths,
-cookies, credentials, or secret material. Live telemetry is source-level
-opt-in, diagnostics upload is explicit-approval-only, and risky collectors are
-excluded from default v1. Codex Cloud Sessions additionally requires the
-user's versioned grant for the exact local device/user/organization scope plus
-server policy approval; without both, its supervisor remains inert.
-`OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` always wins.
+| | Without an account | With an Ottto account |
+| --- | :---: | :---: |
+| Find the coding agents on your Mac | ✓ | ✓ |
+| Check that Ottto's service is healthy | ✓ | ✓ |
+| Collect diagnostics for support | ✓ | ✓ |
+| Update and uninstall | ✓ | ✓ |
+| Dashboard: usage, cost and sessions | | ✓ |
+| Plans and limits for each login | | ✓ |
+| Findings on cost and setup | | ✓ |
+| Recommendations | | ✓ |
+| Every Mac and login in one place | | ✓ |
+| Ottto for Claude and ChatGPT | | ✓ |
 
-This public repository owns the local runtime, installer/release tooling,
-public docs, tests, redaction, diagnostics, agent adapters, connector
-SDK/testkit, manifest schemas, and safe first-party source packages. The cloud
-application, backend, frontend, billing, auth, analytics, infrastructure,
-private operations, and planning docs remain private.
+## Everyday work
 
-## Crates
-
-- `ottto-protocol`: stable JSON models shared by the daemon, CLI, app, agent
-  skill, backend event ingestion, and web setup flows.
-- `ottto-core`: platform-neutral local logic such as source health summaries,
-  repair planning primitives, diagnostics redaction, and stable CLI errors.
-- `ottto-service`: the per-user daemon and future local authenticated control
-  API owner.
-- `ottto-cli`: the `ottto` developer, support, CI, and AI-agent interface.
-
-## Contract First
-
-Every customer-facing local action should cross the typed protocol boundary:
-
-- status
-- receipts
-- setup
-- doctor
-- fix
-- verify
-- diagnostics collect
-- update check
-- uninstall
-
-The SwiftUI app and agent skill should talk to `ottto-service` through this
-protocol. The app must not shell out to the CLI for normal behavior, and the web
-app must not duplicate local setup logic.
-
-## Public Docs
-
-External install, setup, privacy, diagnostics, support, connector,
-release-verification, agent-adapter, troubleshooting, and JSON automation examples live in
-[`docs/`](docs/README.md). These docs are written to stand alone in a public
-repository or release package without private repo links.
-
-## Public Export Gate
-
-The future public `ottto` repository must be populated from the approved export
-surface under this local-platform tree, not by copying arbitrary private
-monorepo paths. The export manifest and checks live in
-[`public-export/`](public-export/README.md). Run
-`scripts/public_repo_export_check.sh --require-no-rewrites` before any public
-repo bootstrap or runtime move; it verifies export roots, fails private paths
-and secret-like content, and fails private repo references that would need to be
-rewritten to the public repository name. Current release attestation defaults already name
-`ottto-ai/ottto`, so the expected pre-bootstrap bundle output is
-`rewrite-required references: 0`; any new rewrite-required release/runtime
-reference is a regression to fix before cutover.
-`scripts/public_repo_export_bundle.sh --force`
-materializes the root-shaped public staging tree, including connector
-SDK/testkit crates, first-party source packages, the generated connector
-registry, public manifest schemas, public GitHub Actions and Dependabot
-configuration, and root Apache-2.0 license, NOTICE, security, contribution,
-conduct, support, and trademark policy files. The bundle refuses rewrite-required
-source by default; `--allow-rewrites` is reserved for legacy/test fixtures. The generated manifest records
-every staged non-manifest file with SHA-256, size, mode, and executable-bit
-metadata plus a deterministic `content_sha256`; run
-`scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto`
-to verify that inventory before bootstrap. This repository does not commit
-`PUBLIC_EXPORT_MANIFEST.json`: `scripts/public_repo_manifest.sh --digest` (or
-`--facts`) derives the same digest and counts from a commit's git tree, and the
-public-surface gate requires the self-exported bundle's manifest to equal the
-one derived from `HEAD`. The generated tree must also pass
-`scripts/public_repo_skeleton_check.sh`, which verifies the public repo shape
-for runtime crates, connectors, docs, release tooling, policies, CI, and agent
-adapters before bootstrap, and
-`scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto`,
-which verifies the generated root-shaped tree still carries the public CLI
-JSON/NDJSON fixtures, local-control protocol fixtures, generated connector
-registry, manifest schemas, setup claim fixtures, diagnostics redaction
-fixture, release manifest schema, and private backend/frontend consumer
-assumptions. When `--private-repo-root` is supplied, the same gate also checks
-the private runtime pin at
-`backend/app/domain/local_platform/public_runtime_pin.json`, so private
-consumers only validate against the pinned public manifest digest. Once the
-public repo is the runtime authority, run the same contract gate with
-`--require-public-authority`; it requires the private pin to name a
-`public_repo_commit` and verifies that the checked public root is a clean git
-checkout at that commit. Without `--staged-output`, the gate derives the public
-manifest digest and counts from the checked root's `HEAD`. Before any public
-commit or runtime move, run
-`scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto`
-to scan current export candidates, candidate path history, and the generated
-bundle for private paths and secret-like content.
-Run `scripts/public_repo_surface_ci.sh --staged-output dist/public-export/ottto`
-to copy the generated root-shaped bundle into a temporary git checkout and run
-the same public-surface gate that the exported GitHub Actions workflow uses:
-schema/registry validation, shellcheck, export tests, manifest/skeleton,
-secret-scan, contract checks, release/installer dry-run tests, and a
-self-exported bundle verification. This includes release manifest,
-stable-candidate RC, stable preflight, stable closeout, stable QA template,
-Homebrew, hosted installer, and CycloneDX SBOM generator tests.
-The default `--scope all` runs every step and needs macOS. GitHub CI splits the
-gate: `--scope portable` runs on Linux, and `--scope macos` runs the steps that
-need real macOS tools or macOS `/bin/bash` 3.2 inside the Rust contracts job.
-The skeleton gate also requires `docs/support.md`, the public support runbook
-covering redacted triage, diagnostics, escalation, data boundaries, and
-public-v1 closeout readiness.
-Use `scripts/public_repo_bootstrap_plan.sh --target-dir <clean-public-checkout> --report public-bootstrap-plan.json`
-to build and verify the bundle, check that the target checkout is a clean git
-root outside the private monorepo with `origin` bound to `ottto-ai/ottto`,
-print a dry-run add/change/delete plan, and write a machine-readable report
-without absolute local filesystem paths. Only pass `--apply` after reviewing
-that plan; apply mode copies the verified bundle into the target checkout and
-reruns the public manifest, skeleton, secret-scan, and contract gates against
-the applied tree.
-After apply, run
-`scripts/public_repo_cutover_closeout.sh --target-dir <public-checkout> --source-repo-root <private-monorepo> --bootstrap-report public-bootstrap-apply.json --report public-cutover-closeout.json`
-before committing or enabling branch protection in the public checkout. The
-closeout gate verifies the target manifest, skeleton, secret scan, public/private
-contracts, and public-surface CI smoke against the applied checkout, then writes
-a path-safe JSON report with the target `origin` repository binding, git status,
-manifest digest, bootstrap report branch/head plus remote/digest consistency,
-private source history/consumer-contract scope, per-check results, and
-`ready_to_commit=true`.
-
-## CLI Contract
-
-The public CLI is the developer, support, CI, and AI-agent surface over
-`ottto-service`. Help text for visible commands and options is frozen by
-`fixtures/cli/help-contract.txt` and the `ottto-cli` unit test
-`cli_help_matches_frozen_contract`; update both intentionally when changing the
-public command surface.
-
-Codex lifecycle automation uses `.agents/skills/ottto/SKILL.md`, which stays
-thin over this contract: it calls `ottto --json`, uses public `--app` commands,
-and does not duplicate setup, repair, diagnostics, or install-owner logic.
-Claude Code lifecycle automation uses `.claude/skills/ottto/SKILL.md`, the
-project skill equivalent, with no hooks, status-line monitor ownership, or
-preapproved tool grants in v1.
-
-MCP is deliberately not a public-v1 adapter. `docs/agent-adapters.md` records
-the deferral: any future MCP server must wrap the stable CLI/local protocol and
-must not own setup, repair, diagnostics upload, update, credential, or source
-collection authority.
-
-Current locked commands:
-
-```bash
-ottto status --json
-ottto status --json --watch
-ottto receipts --json
-ottto receipts --json --limit 20 --since 2026-09-10T00:00:00Z --source codex
-ottto provider-requests --json
-ottto provider-requests --json --since 24h
-ottto status --refresh-agent-status --json
-ottto context --json
-ottto context --json --range today --source codex
-ottto context --json --all-machines --max-tokens 4000
-ottto costs --json
-ottto costs --json --range today --source codex
-ottto costs --json --all-machines --bucket day
-ottto cloud materials --source vertex --json
-ottto cloud plan --source vertex --config-file connector.json --json
-ottto cloud register --source vertex --config-file connector.json --approve --json
-ottto cloud test --source vertex --config-file connector.json --json
-ottto cloud status --source vertex --json
-ottto cloud sync --source vertex --days 30 --approve --json
-ottto sessions --json
-ottto sessions --json --limit 20 --source codex
-ottto sessions --json --all-machines --sort-by cost --sort-dir desc
-ottto recommendations --json
-ottto provider-impact --json
-ottto provider-impact --json --provider openai --app codex --kind quota --limit 25
-ottto apps --json
-ottto apps detect --json
-ottto apps status --app codex --json
-ottto setup --json
-ottto setup --json --no-browser --no-wait
-ottto setup --json --timeout 300
-ottto setup --claim-code <code> --json
-ottto login --json
-ottto login --json --no-browser --no-wait
-ottto account --json
-ottto logout --json
-ottto logout --local-only --json
-ottto logout --forget-installation --confirm --json
-ottto logout --local-only --forget-installation --confirm --json
-ottto doctor --json
-ottto fix --app codex --json
-ottto verify --app codex --json
-ottto verify --repair --app codex --json
-ottto diagnostics collect --json
-ottto diagnostics collect --upload --approve-upload --accept-retention-disclosure --support-claim <claim> --json
-ottto update --json
-ottto update check --json
-ottto uninstall --backup-state ./ottto-state-backup --confirm --json
-```
-
-Automation should pass `--json`; JSON mode prints one final JSON object and no
-human summary text. `--json --watch` prints newline-delimited JSON progress
-events followed by one final event with `ok`, `exit_code`, and either `payload`
-or `error`; setup can return a payload with a nonzero `exit_code` when it needs
-user action or times out. Setup opens a browser claim by default when no local
-setup-run binding exists, prints the URL/code fallback in human mode, and waits
-up to `--timeout` seconds for browser approval and setup progress before
-returning exit code `61`. Agents and headless flows can pass `--no-browser` to
-skip auto-open and `--no-wait` to return the fallback claim payload immediately
-with exit code `60`. `--watch` without `--json` exits as `invalid_request`.
-Human mode prints short summaries only and is not a parsing contract. `context`,
-`costs`, `sessions`, `recommendations`, and `provider-impact` are agent-only
-JSON commands; omitting `--json` exits as `invalid_request`.
-All commands call `ottto-service` through the local-control protocol except
-local uninstall cleanup and the hidden Claude Code status-line helper.
-
-Stable CLI exit codes are:
-
-| Code | Meaning |
+| | What you get |
 | --- | --- |
-| `0` | Success or setup complete |
-| `2` | Invalid request or arguments |
-| `10` | `ottto-service` unavailable |
-| `14` | Backend unreachable |
-| `16` | Backend unavailable |
-| `50` | Permission denied |
-| `60` | Setup needs user or browser action |
-| `61` | Setup timed out |
-| `70` | Internal error |
+| **Every agent in one view** | Claude Code, Codex and Pi, side by side · subscription or API key · Bedrock and Vertex AI billing (org admins) |
+| **Plans and limits** | Several subscriptions and accounts: up to 10 Claude Code and 10 Codex logins per Mac · 5-hour and weekly windows |
+| **Cost breakdowns** | By agent, model, repository, machine, subscription and token type · day, week or month · CSV export |
+| **Sessions and sub-agents** | Timeline, tokens and models per run · which agent spawned which sub-agent, and what each one cost |
+| **Many Macs, one account** | Every Mac you connect adds up in one account · logins stay separate |
 
-Public command nouns use `apps` and `--app` for local app lifecycle work. The
-lower-level `agent-status --source <source>` selector remains available for
-existing automation while protocol payloads continue to use `SourceKind`.
-`context --source <source>` intentionally accepts backend source slugs, not only
-local app values, because cloud context can include API and cloud-provider
-sources in addition to Codex, Claude Code, and Pi.
+<details>
+<summary>More about everyday work</summary>
 
-## Current Phase
+- **Agents** are counted from what they record on your Mac, whether they run on a subscription or
+  an API key. Org admins can connect Bedrock and Vertex AI billing, read-only.
+- **Limits** include per-model limits, credits and reset times where the provider shows them. They
+  appear only when Ottto can match a reading to the right login. For automatic Codex limit
+  updates, turn on **Keep limits up to date** on each Mac.
+- **Cost** shows estimated actual cost next to the pay-as-you-go value of the same usage, so you
+  can see what a plan is worth to you. Subscription fees are prorated; unknown payers and unpriced
+  usage can make the estimate partial.
+- **Sessions** show context measurements and compactions where the agent records them. The
+  Families view gives each agent's own cost where priced, and a total for the family.
+- **Logins** are never pooled or rotated to get around limits.
 
-This workspace contains the Phase 1 protocol/core foundation and the first Phase
-2 daemon control primitives:
+</details>
 
-- authenticated local daemon status access
-- daemon-owned relay and source state
-- daemon-owned repair locks
-- read-only Codex and Claude Code config drift verification with
-  `sha256:` fingerprints plus `verify --repair` WriteConfig repair
-- repair-plan proposal skeletons with required approval-boundary metadata:
-  setup-safe config repairs may use terminal approval only when tied to an
-  active setup-run binding, credential/auth-adjacent actions require browser
-  approval, disconnected or stale local account state is browser-only, and old
-  repair payloads without authority/approval metadata fail deserialization
-- typed diagnostics bundles with explicit redaction reports
-- typed local control request/response envelopes
-- authenticated `claude_accounts_status`, `claude_account_prepare`,
-  `claude_account_reconnect`, `claude_account_check`,
-  `claude_account_stop_waiting`,
-  `claude_account_set_upkeep_consent`, `claude_account_register_path`, and
-  `claude_account_remove` operations for one bounded, versioned machine-local
-  registry. The true default `CLAUDE_CONFIG_DIR`-unset slot is always present;
-  up to nine absolute config-dir strings are stored exactly as registered with
-  stable opaque ids and explicit `managed` / `external` ownership, and one
-  explicit consent bit governs future background upkeep for the whole registry.
-  Advanced path registration is external ownership. Managed prepare creates a
-  private `0700` directory and returns an exact Claude Code launch command;
-  customer-owned `/login` remains entirely inside official Claude Code.
-  `claude_account_prepare` remains the managed first-connect operation; exact
-  reconnect reuses one already-registered custom slot and its exact launch
-  command without creating a directory or duplicate registration. Exact checks
-  are single-flight, stop is durable until explicit prepare/reconnect replay,
-  and these protocol-v18 operations perform no login automation, token refresh,
-  inference, credential write, or Keychain write. Authenticated local status
-  includes each exact slot's already-collected session, weekly, scoped-limit,
-  and usage-credit values with captured/provider observation times plus typed
-  fresh, stale, or partial state; this additive machine-local view does not
-  change the backend snapshot wire.
-- consented background freshness upkeep for registered custom Claude slots.
-  On daemon startup, macOS wake/network restoration, and normal quota
-  collection opportunities, an expired access credential with a still-valid
-  absolute refresh deadline may run only the resolved installed `claude`
-  binary with argv `doctor`, exact `CLAUDE_CONFIG_DIR`, a shared cleared
-  minimal environment, closed stdin, discarded output, and a bounded timeout.
-  Success requires read-only proof that `expiresAt` advanced; durable
-  per-expiry claims and exponential backoff suppress restart/wake/process
-  storms. The default slot is never probed. The existing subscription-usage
-  off-switch pauses both reads and upkeep without clearing registrations,
-  consent, or caches, while an absent-by-default operational sentinel stops
-  only new upkeep commands. Ottto still performs no raw OAuth refresh, login,
-  inference, credential write, second scheduling service, or Keychain mutation.
-- persistent Unix-socket serving with `--once` smoke mode
-- CLI-to-daemon Unix-socket requests for status, setup, login, account, logout,
-  setup claim codes, doctor, repair, verify, diagnostics, and uninstall
-- CLI autostart recovery that kickstarts the standard per-user LaunchAgent when
-  the default socket is unavailable, while leaving custom sockets deterministic
-- macOS LaunchAgent plist generation and launchctl install-plan construction
-- 0600 file-backed local control-token storage for CLI/agent access, avoiding
-  macOS Keychain prompts on normal local-control calls
-- daemon-owned account binding with non-secret account metadata persisted to
-  `~/Library/Application Support/Ottto/account.json`
-- daemon-owned setup-run binding metadata persisted to
-  `~/Library/Application Support/Ottto/connection.json`, allowing source
-  verification to survive daemon restarts without exposing setup-run secrets to
-  the app. The binding now persists the validated `api_base_url` from the
-  `/apps` deep link so standalone Companion verify and setup-run polling keep
-  talking to the same local or production backend that created the run; legacy
-  binding files without the field default to the configured API base until the
-  next setup deep link rewrites them.
-- daemon-owned persistent machine identity in
-  `~/Library/Application Support/Ottto/machine.json`, using a hashed macOS
-  hardware UUID when available plus a generated installation id. Placeholder
-  development ids are replaced on the next daemon startup.
-- daemon-owned setup-run and relay-device secret storage in the
-  `net.ottto.service` Keychain service, without exposing those secrets to the
-  app. macOS Keychain operations are bounded by a timeout and mirrored to
-  owner-only files under the Ottto support directory so dev/preview signature
-  churn, unavailable Keychain access, or blocking Keychain calls do not strand
-  verification after restart.
-- local-only logout moves the relay-device id and secret into a dormant,
-  owner-only prior-credential slot. A later browser claim presents that exact
-  predecessor proof, so emergency local cleanup does not strand an otherwise
-  valid installation. The slot is never printed or logged and is deleted after
-  a successful reattach, cloud logout, installation reset, or uninstall.
-- native app auth commands: `auth_status`, `auth_start`, `auth_complete`, and
-  `auth_reset`. Reset/logout is cloud-first by default: the daemon records a
-  `local-client/disconnect` in Ottto before clearing local account, connection,
-  and setup-run token state. That request also presents this Mac's relay-device
-  id and secret, read before any local deletion, so Ottto can release the Mac's
-  server registration; the response reports `device_released`, and `false`
-  (or an older server that omits it) means the registration may still be
-  active until its account disconnects the Mac on the Apps page (Disconnect). An
-  account switch sends the same release for the previous device unless the new
-  binding reuses that device id. When Ottto has already ended this Mac's setup
-  run, an expired connection no longer blocks the release: the daemon presents
-  the same id and secret to `POST /api/v1/telemetry/devices/{device_id}/release`
-  and, once Ottto confirms, finishes the logout like a cloud logout
-  (`cloud_disconnected: false`, `device_released: true`).
-  `local_only=true` is reserved for emergency local
-  cleanup when the backend cannot be reached or the website state is stale.
-  Neither mode clears account/device identity while Cloud sessions still needs
-  an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
-  confirmation, then retry logout. Browser claim completion and setup-driven
-  relay-device registration use the same guard before any backend identity
-  rotation. While one accepted identity update is in flight, competing setup,
-  logout, device writes, and Cloud-session mutations fail with
-  `identity_mutation_in_progress` and are safe to retry. Setup and login are
-  idempotent no-ops while a bound user is already connected; they cannot create
-  a pending-claim overlay over a healthy binding. Once Verify or an agent read
-  records that Ottto ended the setup run or refused the device credential, or
-  no setup-run binding is left, login starts a reconnect claim instead; the
-  bound user is kept and completing the claim replaces the binding. Rejected or unauthorized
-  setup-run polling is terminal locally instead of retrying a stale run.
-- `ottto logout --forget-installation --confirm` is the explicit destructive
-  reset path. It first disconnects this Mac in Ottto and releases its server
-  registration, exactly like an ordinary logout, then clears installation id,
-  active and prior credentials and setup bindings, while keeping collected local
-  state (scan indexes, receipts and first-sweep progress) and leaving Codex,
-  Claude Code, and Pi source data untouched. It requires an active Ottto connection. The account
-  scope is derived from the Mac and its macOS user, so it is not cleared and
-  is the same after the reset. Restart the daemon before pairing so it creates
-  a fresh installation identity. Because replacement credentials use a new destination
-  namespace, ordinary replacement never reuses the old destination's receipts;
-  it creates new receipt state for the new destination while preserving the
-  stable `otm_…` machine identity.
-- `ottto logout --local-only --forget-installation --confirm` is the emergency
-  variant for when Ottto cannot be reached. It performs the same local reset
-  without contacting Ottto, so the server registration is not released: this
-  Mac stays registered to the old Ottto account, and a different account can
-  connect it only after the old account removes this Mac on its Apps page
-  (Disconnect).
-- `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
-  loss, and accepts `--backup-state <directory>` to export only those receipts
-  and first-sweep state first (never relay credentials or account secrets).
-  Uninstall also inventories and unregisters every Launch Services record for
-  the production Companion bundle identifier before removal. Only stable
-  packages declare the production `ottto://` URL scheme; development, preview,
-  stable-candidate, QA, and runner bundles cannot become stale setup-link
-  handlers.
-- native app account-state UX now treats browser login and local app binding as
-  separate states: Verify returns a sign-in-specific message when no local
-  account is bound, and the SwiftUI app keeps polling a pending browser claim so
-  successful browser approval updates the local UI even if the deep link handoff
-  is missed.
-- real setup-run attach/resume for web-created `/apps` runs, including local
-  Codex/Claude/Pi scan publication, setup-action polling, bounded smoke
-  verification commands, and redacted setup JSON shared by Companion and the
-  CLI fallback. A fresh deep link with `claim_code` reattaches the local
-  binding to that run, while a mismatched `setup_run_id` without a claim code
-  fails clearly instead of silently replacing the existing binding.
-- setup-run answers from trusted native clients, currently used by Companion to
-  skip or disable a failed source through the setup-run token without exposing
-  browser credentials or setup secrets to the app.
-- setup-run actions from trusted native clients, currently used by Companion to
-  continue `ready_to_install` sources by queueing and executing local-client
-  `install_source`/`verify_source` work through the daemon-owned setup-run token.
-- setup-run install completion payloads use backend-safe metadata keys, so
-  successful Codex or Claude setup completion is not rejected by the setup-run
-  secret/header guard.
-- backend setup calls are routed through typed local-control backend errors
-  (`backend_unreachable`, `backend_rejected`, `backend_unavailable`, and
-  `backend_response_unexpected`) with safe status/body excerpts, so CLI and
-  Companion can distinguish network, rejection, service, and protocol failures.
-- setup-run polling sends backend heartbeats before asking for work, refreshing
-  the short setup-run token and clearing disconnected state while the daemon is
-  alive.
-- SMAppService-oriented LaunchAgent packaging metadata with the
-  `net.ottto.service.xpc` Mach service name
-- a real launchd-backed XPC listener for `ottto-service serve-xpc`; it also
-  serves the default per-user CLI/agent Unix socket for app-bundled launches,
-  and a supplied debug socket overrides that fallback path
-- trusted native-app authorization that inspects the local peer process,
-  requires it to run as the daemon's own uid, validates the Companion executable
-  path, and always enforces a code requirement against its signature. A
-  Developer ID signed daemon demands a Companion signed by the same Apple team,
-  baked in at build time, so a customer install enforces it with nothing
-  configured; an ad-hoc sealed internal daemon demands only the
-  `net.ottto.Companion` bundle identifier, so dev and preview builds keep
-  working unconfigured. `OTTTO_COMPANION_TEAM_ID` and
-  `OTTTO_COMPANION_CODE_REQUIREMENT` override both, for running a release daemon
-  against a locally built app.
-- a macOS packaging rehearsal script that builds the SwiftUI app bundle, embeds
-  Rust CLI/daemon helpers, ad-hoc seals dev/preview bundles, writes a release
-  manifest, and separates those internal builds from stable
-  signed/notarized requirements
-- a release gate that validates artifact presence, SHA-256 integrity, manifest
-  shape, rollback metadata, macOS app bundle sealing, and stable-channel
-  signing/notarization/Gatekeeper state
-- a stable macOS preflight wrapper that blocks publish readiness unless the
-  manifest is stable-only, artifact URLs and hashes match the rollback
-  immutable prefix, Developer ID signing uses hardened runtime and timestamps,
-  notarization profile access works, stapling validates, and Gatekeeper accepts
-  the app/CLI/daemon artifacts. Dry-run mode validates non-secret manifest,
-  rollback, and hash checks without requiring Apple credentials.
-- a Homebrew formula generator that writes `Formula/ottto.rb` from the stable
-  release manifest only after Homebrew is listed as a supported install owner
-  and the CLI/daemon artifacts are immutable-prefix pinned, signed, notarized,
-  Gatekeeper-assessed, and SHA-256 pinned. The generated formula installs the
-  public CLI as `ottto`, installs the service executable as `ottto-service`,
-  owns Homebrew launchd label `net.ottto.service`, starts with
-  `brew services start ottto`, updates with
-  `brew update && brew upgrade ottto`, and uninstalls with
-  `brew services stop ottto && brew uninstall ottto`. The Homebrew service
-  remains the LaunchAgent owner when `Ottto.app` is also present; the app talks
-  to the running service instead of replacing the Homebrew plist.
-- a stable hosted native installer wrapper generator that writes
-  `install-macos.sh` only from a stable manifest whose native macOS app artifact
-  is HTTPS, immutable-prefix pinned, SHA-256 pinned, signed, notarized,
-  Gatekeeper-assessed, and advertised for the `hosted_installer` owner. The
-  wrapper verifies and opens the DMG or PKG; it does not install mutable shell
-  payloads, clear quarantine, or bootstrap launchd jobs.
-- a stable release closeout gate that validates redacted clean-machine QA
-  evidence before stable `latest` promotion. The evidence must match the exact
-  manifest version, commit, and SHA-256 and prove every advertised install owner
-  passed its install, service, status, update, uninstall, and trust checks while
-  binding that owner to the `ottto-service` runtime, `net.ottto.service`,
-  protocol v15, stable channel/version, and release-manifest SHA-256.
-- a CycloneDX SBOM generator plus release-manifest `supply_chain` contract for
-  SLSA v1.2 Build Track provenance. Stable release gates require the SBOM URL
-  and SHA-256 under the immutable prefix, verified SBOM attestation with
-  predicate `https://cyclonedx.org/bom`, SLSA provenance predicate
-  `https://slsa.dev/provenance/v1`, Build L2 or better, and subject coverage for
-  every artifact plus `release-manifest.json` and the SBOM.
-- a dispatch-only protected macOS stable release workflow that builds, signs,
-  notarizes, attests, binds supply-chain metadata, CMS-signs the final manifest,
-  and uploads artifacts without CDN write permissions or stable-channel
-  promotion.
-- a notarization helper that submits the generated macOS archives and updates
-  manifest notarization flags only after Apple validation and local Gatekeeper
-  assessment pass
-- local and hosted preview installers that verify dev/preview artifacts,
-  install the app and Rust helpers to user-scoped locations, clear quarantine
-  for the explicit tester install path, and delegate LaunchAgent plist writing
-  to `ottto-service`. Bootstrap refreshes only same-owner LaunchAgents by
-  default and refuses cross-owner rewrites unless the operator supplies the
-  explicit migration flag, so stale app-bundle helpers can be repaired without
-  stealing Homebrew-owned or hosted-installer-owned jobs. Hosted installer
-  readiness checks wait for the daemon without invoking CLI autostart, and the
-  native app skips bundled SMAppService registration while the installer-owned
-  user LaunchAgent exists.
-- an installed dev/preview E2E smoke that validates the app bundle, LaunchAgent,
-  CLI-to-daemon protocol, real setup claim handoff when a claim is supplied,
-  actionable Codex verification JSON, and diagnostics redaction
-- a SwiftUI app flow that calls the daemon as a trusted local app client for
-  account login, source verify/repair, and diagnostics collection without
-  reading the daemon control token from Keychain. The native Companion keeps
-  source rows compact and daemon-owned: brand marks, setup readiness, primary
-  setup/verify/repair/skip actions, and disclosure details all render from the
-  typed local-control status/setup/verify payloads instead of shelling out or
-  scanning local files in SwiftUI.
-- source verification that runs a bounded local smoke prompt, waits for fresh
-  backend verification evidence, uses the daemon-owned setup-run token to call
-  the backend local-client verification endpoint, updates local source health,
-  and reports
-  verified/no-fresh-telemetry/reconnect-required/local-smoke-failure states
-  instead of a placeholder pending result. Pi verification runs a real
-  non-interactive `pi --print` prompt for every configured provider/model route
-  from `~/.pi/agent/settings.json` plus the default route, falling back to
-  `pi --list-models` when settings are unavailable. A Pi source is `verified`
-  when every route passes, `warning` when at least one route passes and at least
-  one route fails, and failed only when no route passes. Smoke diagnostics read
-  both stderr and stdout through the same redaction/truncation path so CLIs that
-  print authentication failures on stdout still produce actionable safe setup
-  errors.
-- built-in local OTLP relay support in `ottto-service` on `127.0.0.1:43119` for
-  Claude Code and Codex, with deterministic per-user fallback ports when
-  another macOS user account or stale Ottto service already owns the default
-  loopback listener: approved setup-run `install_source` actions register a
-  telemetry device, store the relay secret locally, patch
-  `~/.claude/settings.json` or `~/.codex/config.toml` with logs, metrics, and
-  traces endpoints for the active relay endpoint, expose `/healthz` for local
-  readiness, and expose a narrow browser CORS `/control` endpoint for M3
-  `telemetry_control` enable/disable/status requests from the Apps page. The
-  control endpoint returns the private-network
-  CORS header required by Chromium for production `https://ottto.net` to reach
-  the loopback daemon, while the frontend marks the request target as
-  `loopback`. The companion `/local-health` endpoint returns the current
-  relay-device id inside its canonical health payload only for an allowlisted
-  browser origin. This lets the Apps page distinguish separate macOS-user
-  installations on one physical Mac without exposing the relay secret,
-  account identifiers, or hardware UUID. The origin gate is a browser CORS
-  boundary, not native-client authentication, so the returned device id is a
-  non-secret pseudonymous binding label and origin-less probes remain redacted.
-  Claude Code setup also installs a local
-  `statusLine` wrapper that preserves an existing status line command while
-  feeding documented `rate_limits` fields into the local quota cache. The relay
-  reduces OTLP payloads locally and answers the exporter itself; it forwards
-  nothing upstream, because Ottto's server retired OTLP ingest. Manual edits
-  to the managed Ottto fence are rejected with `manual_fence_review_required`, leaving local keys in place
-  until the user reviews the file instead of guessing at cleanup. Pi setup
-  actions also register or merge the local telemetry device source grant, but
-  they skip Codex/Claude OTLP config patching because Pi telemetry is imported
-  from local session files. Pi route Verify no longer uploads smoke transcripts
-  to the retired direct Pi import endpoint. The local scan
-  reports Pi as requiring install when the Pi CLI/session files are present but
-  the device grant does not yet include `pi`.
-- local Claude Code reasoning-effort reduction at that loopback boundary:
-  Claude's documented `claude_code.api_request` logs use OTLP/HTTP JSON while
-  metrics and traces remain protobuf. The relay accepts both fixed-length and
-  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction, and
-  rejects ambiguous or unsupported transfer framing. It stores only session id, request
-  timestamp, model, applied effort, and token counters in owner-only hashed
-  sidecars; prompts, responses, commands, paths, account identity, email, and
-  raw OTLP are discarded. Snapshot sync partitions matching transcript
-  model/hour rows by this evidence, leaves uncovered residual usage as unknown,
-  and preserves exact transcript totals. The relay returns the OTLP success
-  response after the local reduction, and a non-retryable error when the body
-  cannot be decoded or its evidence cannot be stored.
-- source-local snapshot parsing and background sync in `ottto-service` for Codex
-  `~/.codex/sessions/**/*.jsonl`, Claude Code
-  `~/.claude/projects/**/*.jsonl`, and Pi
-  `~/.pi/agent/sessions/**/*.jsonl`, streamed line-by-line and reduced to safe
-  usage/title/model/timestamp/selector hashes instead of response, tool output,
-  command output, or raw local paths. The Codex parser version
-  `codex_jsonl:v11` reads current `event_msg` title updates,
-  `payload.info.total_token_usage` totals, and selector fields such as
-  `service_tier`, `actual_service_tier`, `fast_mode`, `batch_mode`,
-  `inference_geo`, `context_bucket`, and cache TTL aliases from direct or
-  nested `selector_context` rows. Mutable `~/.codex/config.toml` defaults are
-  available to live status display but are not backdated onto cumulative
-  historical usage rows; only session-native selector evidence enters snapshot
-  semantics. During the semantic-sync cutover, a legacy Codex index that had a
-  config file in scope receives one conservative corrective reconciliation:
-  the old stat-only index cannot prove which rows inherited config guesses.
-  This correction cannot recur after the index advances. The parser then fills
-  missing titles from local Codex sidecars in this order:
-  `~/.codex/session_index.jsonl` `thread_name`,
-  `~/.codex/state_5.sqlite` `threads.title`, and finally a short, filtered
-  first-user-prompt fallback. The fallback rejects setup/system text, AGENTS and
-  environment blocks, pasted plans, command-looking text, raw ids, generic
-  labels, and tool/function names such as `exec_command` or `write_stdin`.
-  Claude Code parser version `claude_code_jsonl:v4` carries
-  `message.usage.speed`, service tier, residency, batch, and context aliases
-  into selector context. The Pi parser accepts both the current native
-  `session.id` plus nested `type: "message"` records and the historical
-  `session_id` plus `message_end` records. It carries `ottto-selector` /
-  `ottto.selector` custom entries and per-message selector aliases into
-  subsequent assistant-message usage rows. Provider response time is the
-  canonical usage clock even when a later envelope timestamp crosses an hour.
-  An exact response id deduplicates every matching `message` / `message_end`
-  compatibility occurrence; repeated same-shape or id-less responses remain
-  distinct, while unmatched divergent cross-shape reuse makes the file
-  retryable. All three parsers emit
-  content-free hourly activity buckets from persisted request/usage event
-  timestamps; polling cadence affects freshness only and no wall-clock activity
-  is inferred. Parser build versions are provenance and do not trigger scans or
-  historical replay. Incremental scan identity uses transcript size,
-  nanosecond mtime, a frozen scan-derivation version, and only that session's
-  title/state sidecar digest. A pre-cutover entry migrates without parsing only
-  when transcript stats and the reconstructed legacy sidecar identity both
-  match; uncertainty forces a one-time correctness parse. Parsed snapshots are compared by
-  semantic component hashes (usage, lifecycle, latency, context, display,
-  attribution, and artifacts); collection time, parser build, file identity,
-  and evidence-lineage metadata cannot manufacture a new snapshot. Semantic
-  no-ops are retained in the local index but omitted from upload. A fully read,
-  valid file that truthfully parses to no snapshot joins the v2 index's explicit
-  confirmed-empty set, so unchanged empty transcripts cost no repeated parse
-  work and any file/scan-identity change reparses them. Positive allowlisted
-  consumption/request/cost evidence that produces no snapshot, or a positive
-  usage record with no valid activity bucket, instead increments content-free
-  traversal diagnostics and keeps that file retryable. The current frozen
-  generation retains those counters across bounded backoff; it never records
-  the lossy file as empty or advances its manifest contribution. Healthy files
-  continue through quarantine-not-fence. Snapshot audit and status requests
-  expose confirmed-empty, positive-usage-evidence, and dropped-usage counts.
-  Versions, limits, budgets, quotas, and unknown positive metadata do not
-  qualify as usage evidence.
-  Historical
-  walks occur only for first bootstrap or an explicit reviewed replay revision.
-  The daemon starts the
-  snapshot sync loop beside the local OTLP relay,
-  uses source-scoped relay tokens and backend activity hints, scans the last
-  six months by default with stricter backend windows allowed, caps each
-  app/source at 10,000 recent files, strips filtered session titles or path-free
-  workspace labels before upload when the effective backend org/user activity
-  hint disables them, uploads changed snapshots in schema-v5 batches, and
-  reports collector status and cap-hit metadata without exposing local paths.
-  Every collector-status receipt declares its own kind — `checkin` for a
-  liveness beat (the independent heartbeat and the cycle-start in-progress
-  marker) or `scan_status` for a scan result (completed traversal, error,
-  changed loss census, cap-hit change, enabled/disabled transition) — so the
-  meaning of a receipt is stated rather than inferred from its shape. A
-  liveness beat never discloses scan evidence: it is built without access to
-  any scan outcome, and a receipt whose declared kind its own payload
-  contradicts is refused before it reaches the network.
-  Every scan result also discloses, beside each public loss counter, the share
-  the daemon settled as non-progressing (`last_terminal_*`) and the residue
-  witness as counts only, so a backend can prove class by class that the loss
-  a census discloses is loss no retry can change. A census that completed with
-  only such settled residue is reported as a success — `last_success_at` set,
-  zero consecutive failures — under the named code `census_residue`, but only
-  once the backend's activity hint advertises
-  `census_residue_status_contract: census_residue_status:v1`; until then the
-  receipt keeps the legacy `parse_error` shape and still carries the additive
-  counters.
-  Schema-v5 activity buckets are generated from timestamped local usage events:
-  Codex cumulative usage rows without explicit request totals count as one
-  observed activity event, and top-level snapshot `request_count` matches the
-  uploaded bucket total when buckets are present.
-  Policy-disabled metadata uses a policy-scoped scan index so later re-enabling
-  titles or labels can re-upload unchanged local files with the newly allowed
-  display metadata. Per-model usage is grouped by `(model, selector_hash)`, so
-  mixed fast and standard usage for one model is emitted as separate model-usage
-  rows without duplicating canonical model records.
-- adaptive per-source local snapshot cadence primitives: debounced file watches
-  through `notify`, hot/warm/idle/cold/failing/disabled scheduler states,
-  backend activity-hint polling, and a persisted scan index under
-  `~/Library/Application Support/Ottto` whose backend-visible fields are hashes.
-  Multi-page scans also keep an atomic, policy- and relay-device-scoped upload
-  checkpoint made only of accepted semantic snapshot fingerprints plus a
-  one-way destination namespace hash. A timeout, restart, or one invalid
-  snapshot therefore resumes at the unaccepted work instead of replaying every
-  earlier page. Scan indexes and historical-bootstrap completion are also bound
-  to that destination so an account switch cannot reuse another account's
-  delivery cursor; the checkpoint is removed only after the final markers are
-  durable.
-- source-scoped relay snapshot client helpers for relay-token exchange, batch
-  upload, collector status, and backend activity-hints, with missing relay
-  device credentials logged as a safe local skip instead of leaking paths or
-  secrets
-- local protocol version 12 and local snapshot schema version 5 as clean
-  cutovers. Local control requests must include `protocol_version: 12`, and
-  backend local snapshot batch/status endpoints reject stale internal schema
-  versions instead of compatibility-mapping them. Protocol v11 adds
-  owner-aware update gates, manifest minimum-version/protocol metadata, and
-  required repair-plan authority fields that distinguish server-backed
-  setup-safe terminal approval from browser-required account, stale binding,
-  and credential-rotation cases; old repair payloads without these fields are
-  rejected at Rust and macOS app protocol boundaries.
-  Protocol v10 adds explicit diagnostics
-  upload approval fields, local-only default upload reports, support-claim
-  authorization, and retention disclosure acceptance before any diagnostics
-  upload attempt. Protocol v9 adds typed diagnostics bundles and explicit
-  redaction reports for
-  local/support/agent/setup/command output surfaces. Protocol v8
-  added registry-backed source descriptor review tiers, maturity badges, and
-  collector descriptors for Codex, Claude Code, and Pi
-  without adding static `supported_platforms`; runtime availability remains
-  represented by source operation state. Protocol v7 added display-safe billing
-  identity hashes/evidence for accounts, model routes, plan observations, and
-  Pi route verification results; protocol v6 added Pi route classifications,
-  per-route smoke results, and source-level verification warnings while
-  preserving protocol-v5 uninstall planning/execution and lifecycle
-  diagnostics. `SourceHealth` carries daemon-owned source descriptors and
-  repair backup metadata, `AgentStatusSnapshot` emits protocol-v4
-  `quota_windows` instead of legacy `limits`.
-  Each quota window carries `scope`, `freshness`, optional
-  model/account label, reset time, percentage, and remaining/quota fields;
-  `rate_limited` is an explicit state. Local snapshots can include optional
-  user-approved `workspace_display_label` text while keeping the hashed
-  workspace identity as the only default project key; org and user telemetry
-  settings can independently disable title and workspace-label upload. The
-  same title/privacy choice gates optional attribution display labels: a
-  sanitized prompt prefix (96 bytes maximum) or allowlisted skill name may
-  accompany an opaque template/skill fact only when a compatible backend
-  advertises support. Older backends keep that capability off, and no new
-  polling, process inspection, local permission, full transcript, or path is
-  introduced.
-- display-safe agent status snapshots attached to `SourceHealth` for Codex,
-  Claude Code, and Pi, including account, subscription, model, context,
-  quota-window, credit-balance, capability-gap, and diagnostic fields where each
-  local CLI exposes safe metadata. Codex quota collection asks the local Codex
-  app-server inside `ottto-service`, converts the returned primary and secondary
-  windows into session/weekly quota windows with `started_at` and `resets_at`,
-  and converts provider credits into display-safe balances without serializing
-  access tokens. `SourceHealth` and
-  `AgentStatusSnapshot` also carry
-  `plan_observations` with last-seen, current marker, evidence method, optional
-  session id, and normalized billing/model attribution so the backend can keep
-  multiple known plans for one source/computer. When a resumed Claude Desktop
-  session remains in more than one account bucket, the uniquely newest bucket
-  owns the live session observation; equal or missing timestamps fail closed.
-  Pi `--list-models` output is
-  parsed as a provider table and exposed through structured
-  `available_model_details` so OpenAI Codex, OpenAI API-key, Google Vertex
-  Gemini, Google Gemini API-key, AWS Bedrock, Azure OpenAI, gateway, and unknown
-  Pi model routes keep their provider, model provider, billing provider,
-  billing channel, auth mode, source category, context/output size, thinking,
-  image-support metadata, and optional local billing identity evidence instead
-  of flattening to one unknown model list. Locald now prefers
-  `$PI_CODING_AGENT_DIR/settings.json` or `~/.pi/agent/settings.json` for
-  `defaultProvider`, `defaultModel`, `defaultThinkingLevel`, and
-  `enabledModels`, reads `$PI_CODING_AGENT_DIR/auth.json` or
-  `~/.pi/agent/auth.json` for display-safe account/project/credential
-  fingerprints, and falls back to `pi --list-models` only when settings are
-  unavailable.
-- cached agent status in `ottto status --json`, explicit refresh through
-  `ottto status --refresh-agent-status --json` or
-  `ottto apps detect --json`, source-specific refresh through
-  `ottto agent-status --source <source> --json` or
-  `ottto apps status --app <app> --json`, and locald collectors that redact raw
-  command output, secrets, and absolute local paths before backend publication.
-  Background source snapshot sync is source-isolated: a scan or upload failure
-  for one local app logs that source and continues with the remaining granted
-  sources, so a broken Codex session scan cannot prevent Claude Code agent
-  status from reaching the backend. Sync logs report phase-level safe causes
-  such as agent-status upload, activity-hint request, local scan, or snapshot
-  upload failure without exposing raw response bodies or local paths.
-  Public CLI affordances use `apps` and `--app`; typed daemon protocol payloads
-  keep `SourceHealth`, `SourceKind`, and `source` fields.
-  Codex keeps `codex login status` as the local diagnostic source and can carry
-  pasted or future structured `/status` evidence when available; Claude uses
-  `claude auth status --json` as high-confidence account/plan evidence.
-- diagnostics collection returns a protocol-owned `DiagnosticsBundle` with
-  sectioned runtime/version/install/repair/security facts plus a
-  `RedactionReport` and `DiagnosticsUploadReport`. Collection is local-only by
-  default; `ottto diagnostics collect --upload` requires `--approve-upload`,
-  `--accept-retention-disclosure`, and either an active Ottto login or
-  `--support-claim <claim>`. The redaction report names covered surfaces
-  (`diagnostics`, `support_output`, `agent_output`, `setup_error`, and
-  `command_output`), protected categories (local paths, secret tokens, account
-  identifiers, machine identifiers, raw prompts, and command output), redacted
-  fields, and intentionally preserved fields.
-- setup scan publication uses protocol-owned agent-status redaction: safe
-  provider, auth, plan, billing, confidence, and model-route metadata is kept,
-  together with the raw provider account id and selected organization/workspace
-  id (plain ids only) beside their hashes. Account emails, account and
-  organization labels, path-like diagnostics, and secret-shaped values are
-  nulled before leaving the machine. Provider account hashes remain the stable
-  grouping key.
-- bounded local command execution resolves agent CLIs from launchd-safe macOS
-  candidate paths including `~/.local/bin`, Homebrew, `/usr/local/bin`, and
-  system directories in addition to the inherited `PATH`; daemon-launched
-  status and smoke commands also receive that augmented `PATH` so
-  `/usr/bin/env` shebangs can find interpreters such as `node` under launchd.
-- setup and standalone verification use the persisted setup-run API base URL,
-  run Pi smoke prompts for every configured provider/model route, record
-  whether a local Pi session file was created for each route, filter backend
-  verification by model/model-provider/billing-provider, and report route-level
-  no-telemetry failures as command failure, no local session, local session not
-  uploaded, or verification service unavailable.
-- native update checks read the release manifest and report `current`,
-  `update_available`, or `unknown` plus a separate gate of `current`,
-  `soft_warn`, `hard_block`, or `unknown`. Ordinary stale versions are soft
-  warnings; only below-min-supported versions or protocol-incompatible
-  manifests hard block. The parser requires public-v1 update metadata and
-  rollback metadata before trusting a manifest. Update instructions route
-  through the detected install owner (Homebrew, hosted installer, app bundle,
-  or unknown) so Ottto does not self-overwrite owner-managed files. The default
-  manifest URL follows the local release channel, while
-  `OTTTO_RELEASE_MANIFEST_URL` remains available for explicit operator tests.
+## What should you optimize
 
-The remaining production hardening work is live macOS lifecycle and release
-execution: SMAppService packaging, reboot/startup validation, sleep/wake and
-network-interruption soak, Developer ID signing, notarization, Gatekeeper
-assessment, rollback, and support-runbook rehearsal.
+Sign in, and Ottto imports recent sessions from your Mac in the background, so findings start from
+history you already have. It points you to the biggest costs and setup problems first; the fix is
+yours to choose.
 
-Preview builds currently register the app-bundled LaunchAgent and use the typed
-JSON command envelope over XPC. Native app requests are accepted only from a
-trusted Companion process, using peer PID plus macOS code-signing/path
-validation; CLI and agent requests still require the control token. Stable
-customer distribution remains blocked until Developer ID signing, notarization,
-and Gatekeeper assessment pass.
+| | What you get |
+| --- | --- |
+| **Where to save** | Findings from your own sessions and setup, with evidence · a prompt you can paste into your agent |
+| **Recommendations** | A Recommendations page with prioritized suggestions for your account |
+| **Setup that holds agents back** | Nested AGENTS.md Claude Code does not load on its own · a CLAUDE.md too large to load · a MEMORY.md near its limit |
+| **What fills the context window** | Instruction and memory files, skills and MCP tools at start · files read, search and tool output while working |
+| **Setting changes and their cost** | Cost per request before and after you change the default model, reasoning effort or fast mode |
+| **Repeated and scheduled runs** | What repeated work and automations cost |
+
+<details>
+<summary>More about what to optimize</summary>
+
+- **Findings** include MCP tools whose definitions load up front in your latest setup, Claude Code
+  sessions with very large contexts, the extra cost of Claude Code fast mode, and sessions on an
+  older Claude Code version without idle compaction. Each finding is labeled, for example
+  **Measured** or **Estimate**. Dollar figures on findings cover only the stated period, appear
+  only when pricing is complete, and are not projected. The prompt asks your agent to investigate
+  first and change nothing yet.
+- **Context** start sizes are measured where the agent records them; what enters while working is
+  estimated.
+- **Setting changes** use the saved settings Ottto sees, not every temporary switch. They compare
+  the same agent and Mac before and after; results say when the evidence is thin, and a
+  before-and-after comparison is not proof of cause.
+- **Repeated runs** are grouped by scheduled task, repeated prompt template or repeated title.
+
+</details>
+
+## How it works
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/how-it-works-dark.svg">
+    <img alt="On your Mac, coding agents write session files and the Ottto service turns them into usage records. Transcripts, full conversations and code never leave the Mac. Once the Mac is connected, usage metadata, plus readable labels unless you turn them off, goes to your Ottto account, which prices it and powers the dashboard, findings and the Claude and ChatGPT connector." src="docs/assets/readme/how-it-works-light.svg" width="860">
+  </picture>
+</p>
+
+Ottto is not a proxy or an AI gateway. It does not reroute your agents' model requests and does
+not change their API key or base URL. It reads the session files your agents already write.
+
+## The `ottto` CLI
+
+Use the app for the graphical interface. Use the CLI when you want to:
+
+- script Ottto or read your data as JSON: every documented command takes `--json` and returns
+  documented exit codes
+- run Ottto on a Mac you reach over SSH
+- let Claude Code or Codex check their own Ottto setup, with the [skills](docs/agent-adapters.md)
+
+Install it with Homebrew, as in [Get started](#get-started). Ottto.app does not add `ottto` to
+your PATH.
+
+```bash
+ottto setup                   # connect this Mac to your Ottto account, in your browser
+ottto apps detect --json      # find supported agents on this Mac
+ottto doctor                  # show current service and agent health
+ottto fix --app claude-code   # repair Ottto's setup for an agent (or codex, pi)
+ottto costs --json --days 7   # the last 7 days of cost across your account, as JSON
+```
+
+## Privacy
+
+**Ottto never uploads your transcripts or full conversations.**
+
+**What never leaves your Mac**
+
+- Your transcripts and full conversations, including your agents' responses
+- Code, file contents, and tool and command output
+- Your agents' sign-in tokens, API keys, cookies and passwords
+- Instruction, memory and skill text, and absolute file paths
+
+To show your Claude plan limits, Ottto uses your Claude Code sign-in only to ask Anthropic for your
+usage, and never sends it to Ottto. Turn this off in Ottto.app settings: **Read subscription usage**.
+
+**What is sent, only once you connect this Mac to an Ottto account (setup)**
+
+Usage metadata, so Ottto can price your usage and find savings: token counts, session timing and
+activity counts, plan limit usage, metadata about your accounts and workspaces (such as login
+emails, plans and ids), agent settings, one-way hashes of paths and of repeated prompts to group
+sessions, and basic details about the Mac. Setup sends the Mac's basic details when it starts.
+Diagnostics are a separate upload, sent only when you approve it.
+
+Two settings in the web dashboard (app.ottto.net → **Settings → Data & privacy**) add more:
+
+- **Readable labels** (on by default; a workspace admin can turn it off for everyone). With it on,
+  Ottto also sends each session's title, or the first 80 characters of its first prompt when the
+  session has no title, and, for prompts you repeat, a short start of that prompt (96 bytes at
+  most, with paths removed), so you can recognize sessions. It also sends project
+  folder and repository names, the names of skills, custom agents, MCP servers and MCP tools, and
+  the repository paths of files in a session's context. Turning it off stops those. Built-in tool
+  names, counts and account metadata are still sent.
+- **Session links** (off by default; a workspace admin setting). With it on, Ottto also sends pull
+  request, issue and commit links found in a session. They name their repository even with
+  Readable labels off.
+
+If you add Ottto to Claude or ChatGPT, the answers you ask for go into that chat.
+
+More: [privacy policy](https://app.ottto.net/privacy) for the hosted service and
+[docs/privacy.md](docs/privacy.md) for this runtime.
+
+## Open source
+
+This repository holds Ottto's local runtime, written in Rust: the `ottto` CLI, the `ottto-service`
+background service, the connector SDK and the readers for Claude Code, Codex and Pi. Ottto.app and
+the hosted dashboard are not in this repository. Build and test: [CONTRIBUTING.md](CONTRIBUTING.md).
+To add an agent, start with [connectors/README.md](connectors/README.md).
+
+[Docs](docs/README.md) · [Install](docs/install.md) · [Troubleshooting](docs/troubleshooting.md) ·
+[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Code of conduct](CODE_OF_CONDUCT.md) ·
+Apache-2.0 [license](LICENSE)
+
+<p align="center"><sub><i>Three t's: one for every agent you forgot was still running.</i></sub></p>

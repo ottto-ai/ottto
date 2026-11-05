@@ -560,7 +560,9 @@ fn measured_first_own_request_at(item: &SnapshotItem) -> Option<String> {
 }
 
 /// Why an item without a provider-proven start kept or lost its scalars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialized (snake_case) only as `context_posture_withheld`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ClaudeFileBirthVerdict {
     Admitted,
     UnknownBirth,
@@ -574,6 +576,17 @@ pub(crate) enum ClaudeFileBirthVerdict {
 }
 
 crate::heap_layout_bound::no_heap!(true; ClaudeFileBirthVerdict);
+
+impl ClaudeFileBirthVerdict {
+    /// Ownership unknown: the cleared posture is withheld, not a proven empty
+    /// value. Admitted owns it; AllCopied and Tripwire disprove it.
+    pub(crate) fn posture_not_withheld(verdict: &Option<Self>) -> bool {
+        !matches!(
+            verdict,
+            Some(Self::UnknownBirth | Self::UntimedRecord | Self::MultiFile | Self::EvidenceBound)
+        )
+    }
+}
 
 impl SnapshotItem {
     /// Local design E decision for this fold, independent of strict ownership.
@@ -1202,10 +1215,11 @@ pub(super) fn admit_claude_file_birth_posture(
         {
             ClaudeFileBirthVerdict::UntimedRecord
         }
+        // Before AllCopied: one copy cannot speak for an id with two files.
+        _ if multi_file => ClaudeFileBirthVerdict::MultiFile,
         _ if birth.tagged_responses > 0 && birth.own_responses == 0 => {
             ClaudeFileBirthVerdict::AllCopied
         }
-        _ if multi_file => ClaudeFileBirthVerdict::MultiFile,
         _ if tripwire.over_bound_roots.contains(root_session_id) => {
             ClaudeFileBirthVerdict::EvidenceBound
         }
