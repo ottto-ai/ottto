@@ -802,9 +802,7 @@ impl HeaderInventory {
                     // Losing unrelated plaintext can activate its roster archive.
                     // Reuse the new-archive filename fence; never decode here.
                     let archive = header.candidate.path.with_extension("jsonl.zst");
-                    if !codex_archive_path(&header.candidate.path)
-                        && paths.contains(&local_index_key(&archive))
-                    {
+                    if !codex_archive_path(&header.candidate.path) {
                         match fs::symlink_metadata(&archive) {
                             Ok(stat) => {
                                 anyhow::ensure!(
@@ -2496,6 +2494,33 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn owner_scoped_new_subdirectory_mid_page_fails() {
+        let (root, inventory) = fixture();
+        let validation = validator(inventory);
+        fs::create_dir(root.join("sessions/new-day")).unwrap();
+        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_scoped_vanished_directory_mid_page_fails() {
+        let (root, mut inventory) = fixture();
+        let sessions = root.join("sessions");
+        let directory = sessions.join("old-day");
+        fs::create_dir(&directory).unwrap();
+        inventory.directories = DirectoryCensus::new();
+        for path in [&sessions, &directory] {
+            inventory
+                .directories
+                .observe(path, &fs::metadata(path).unwrap());
+        }
+        let validation = validator(inventory);
+        fs::remove_dir(directory).unwrap();
+        assert_eq!(validation_error(&validation), DIRECTORY_MEMBERSHIP_CHANGED);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn owner_scoped_known_roster_entries_need_no_header_proof() {
         let (root, original) = fixture();
         let owner = original.headers[0].owner.clone();
@@ -2595,9 +2620,6 @@ pub(super) mod tests {
             } else {
                 assert!(validation.validate(&selected).is_ok());
                 assert!(validation.validate_all().is_ok());
-                let mut index = ScanIndex::default();
-                index.save(&root.join("index.json")).unwrap();
-                assert!(archive.is_file(), "unrelated archive defers in place");
             }
             fs::remove_dir_all(root).unwrap();
         }
