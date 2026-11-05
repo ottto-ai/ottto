@@ -209,11 +209,15 @@ fn checkpoint(
     .unwrap()
 }
 
-fn commit_native(
+fn commit_native(source: SnapshotSource, session: &StateV2ColdSession, page: Page) -> ScanIndex {
+    commit_native_with_progress(source, session, page).0
+}
+
+fn commit_native_with_progress(
     source: SnapshotSource,
     session: &StateV2ColdSession,
     mut page: Page,
-) -> ScanIndex {
+) -> (ScanIndex, SnapshotUploadProgress) {
     let mut progress = progress(source);
     assert_eq!(
         send(source, &page, &mut progress, ack).0.unwrap(),
@@ -226,7 +230,7 @@ fn commit_native(
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    session.save_reload(&mut page.index)
+    (session.save_reload(&mut page.index), progress)
 }
 
 /// [regress] New and updated files stay queued on a retained traversal after
@@ -382,6 +386,7 @@ fn retained_unkept_revisions_requeue_for_every_source_and_failure() {
                         if restart {
                             owed = ScanIndex::load(session.path()).unwrap();
                         }
+                        crate::snapshots::state_v2::release_collection_page_limit_for_test(&owed);
                         let (retry, consumed) =
                             fixture::observe_consumed(|| native_page(source, &c, owed, 100, true));
                         assert_eq!(
@@ -437,6 +442,23 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
     with_e2(|| {
         for grows in [false, true] {
             let (mut c, path) = placement_corpus("unkept-lost-ack");
+            crate::snapshots::write_claude_reemission_list_for_test(&c.support, &[ROOT]);
+            c.evidence(
+                &[
+                    api_login(ROOT, "a", 10, '1', Some('7')),
+                    api_login(ROOT, "b", 20, '2', Some('8')),
+                    super::super::state_v2_money_tests::tagged_api("gap", 12, None),
+                    api_login(ROOT, "agent", 5, '2', Some('8')),
+                    api_login(ROOT, "side", 4, '2', Some('8')),
+                ],
+                &[
+                    trace("a", ""),
+                    trace("b", ""),
+                    trace("gap", ""),
+                    trace("agent", "agent-000"),
+                    trace("side", ""),
+                ],
+            );
             // Independent pending roots keep the walk alive after root + agent.
             c.root(COPY, &line(COPY, "sibling", AT, 9));
             let (session, prior) = StateV2ColdSession::publish(
@@ -495,6 +517,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     &[
                         api_login(ROOT, "a", 10, '1', Some('7')),
                         api_login(ROOT, "b", 20, '2', Some('8')),
+                        super::super::state_v2_money_tests::tagged_api("gap", 12, None),
                         api_login(ROOT, "agent", 5, '2', Some('8')),
                         api_login(ROOT, "side", 4, '2', Some('8')),
                         api_login(ROOT, "after-switch", 6, '3', Some('9')),
@@ -502,6 +525,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     &[
                         trace("a", ""),
                         trace("b", ""),
+                        trace("gap", ""),
                         trace("agent", "agent-000"),
                         trace("side", ""),
                         trace("after-switch", ""),
@@ -513,6 +537,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     assert_eq!(loaded.generation, owed.generation);
                 })
                 .unwrap();
+            crate::snapshots::state_v2::release_collection_page_limit_for_test(&owed);
             let mut retry = page(&c, owed, 100, true);
             assert!(retry.finish().held_fingerprints.is_empty());
             let cold_page = page(&c, ScanIndex::default(), 100, false);
@@ -627,6 +652,7 @@ fn watcher_only_append_requeues_after_a_partial_checkpoint() {
             session.path(),
             Some(crate::snapshots::UnsettledUploadCause::Shed),
         );
+        crate::snapshots::state_v2::release_collection_page_limit_for_test(&owed);
         let mut retry = page(&c, owed, 100, true);
         assert!(retry.finish().held_fingerprints.is_empty());
         assert!(retry
@@ -673,7 +699,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 .cloned()
                 .map(|item| (item.source_session_id.clone(), item))
                 .collect::<BTreeMap<_, _>>();
-            let (prior, mut sender) = commit_with_progress(&session, initial);
+            let (prior, mut sender) = commit_native_with_progress(SOURCE, &session, initial);
             append(
                 &root,
                 &line(ROOT, "boundary-root", "2026-08-02T07:04:00Z", 6),
@@ -801,6 +827,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 }
                 continue;
             }
+            crate::snapshots::state_v2::release_collection_page_limit_for_test(&loaded);
             let mut retry = page(&c, loaded, 100, true);
             assert!(retry.finish().held_fingerprints.is_empty());
             let already_acked = sender.accepted_fingerprints.clone();

@@ -3536,6 +3536,15 @@ pub(crate) fn checkpoint_page_for_test(
     )?;
     if accept {
         use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+        let mut index = index.clone();
+        let mut scan = scan.clone();
+        let holds = LocalHoldSettlement::classify(
+            scan.source,
+            &mut index,
+            &mut scan,
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        assert!(!holds.any(), "the completed fixture page has no holds");
         let (result, _, _) = upload_source_under(
             scan.source,
             SnapshotUploadPolicy::default(),
@@ -3547,6 +3556,15 @@ pub(crate) fn checkpoint_page_for_test(
             result? == ResumableUploadResult::Completed,
             "fixture exact ACK"
         );
+        progress.save(progress_path)?;
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        index.save(index_path)?;
+        return Ok(index);
     }
     progress.save(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(

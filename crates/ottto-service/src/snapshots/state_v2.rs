@@ -17,6 +17,8 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
+#[cfg(test)]
+pub(crate) use runtime::release_collection_page_limit_for_test;
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
 #[cfg(any(test, target_os = "macos"))]

@@ -950,6 +950,20 @@ pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf
     ))
 }
 
+/// Release a synthetic small-page request without discarding staged Tail state.
+#[cfg(test)]
+pub(crate) fn release_collection_page_limit_for_test(index: &ScanIndex) {
+    let path = runtime_path(index)
+        .unwrap()
+        .expect("a routed fixture index");
+    with_state(&path, |state| {
+        state.page_limit = 250;
+        state.requested_page = 250;
+        Ok(())
+    })
+    .unwrap();
+}
+
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
     let Some(_) = &index.v2().persistence_v2 else {
         return requested;
