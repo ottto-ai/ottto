@@ -28286,7 +28286,7 @@ mod tests {
             .is_none());
 
         let mut conflicting_rows = with_prompt_suggestion["claude-request-id-1"].clone();
-        conflicting_rows[2].account_identifier_hash = Some("b".repeat(64));
+        conflicting_rows[2].account_identifier_hash = Some("b".repeat(64).into());
         let conflicting = BTreeMap::from([("claude-request-id-1".to_string(), conflicting_rows)]);
         let mut conflicting_items = parsed.clone();
         apply_claude_effort_evidence(&mut conflicting_items, &conflicting);
@@ -28299,7 +28299,7 @@ mod tests {
         assert_eq!(conflicting_items[0].claude_account_withheld_reason, None);
 
         let mut owned_mix_rows = with_prompt_suggestion["claude-request-id-1"].clone();
-        owned_mix_rows[1].account_identifier_hash = Some("b".repeat(64));
+        owned_mix_rows[1].account_identifier_hash = Some("b".repeat(64).into());
         let owned_mix = BTreeMap::from([("claude-request-id-1".to_string(), owned_mix_rows)]);
         let mut owned_mix_items = parsed;
         apply_claude_effort_evidence(&mut owned_mix_items, &owned_mix);
@@ -28470,7 +28470,7 @@ mod tests {
         let mut row = complete_api_row(parent, "req_cache_split", 1, 10, 10, 2014);
         if split {
             row.cache_creation_5m_tokens = 2014;
-            row.app_version = "2.1.300".to_string();
+            row.app_version = "2.1.300".into();
         }
         row.fingerprint.clear();
         row.fingerprint = format!(
@@ -28816,7 +28816,7 @@ mod tests {
             let child = items[1].clone();
             let make_api = |request: &str, seq: u64, account: &str| {
                 let mut row = complete_api_row(&root, request, seq, 10, 1, 0);
-                row.account_identifier_hash = Some(account.to_string());
+                row.account_identifier_hash = Some(account.into());
                 row.fingerprint.clear();
                 row.fingerprint = format!(
                     "sha256:{:x}",
@@ -29027,7 +29027,7 @@ mod tests {
                 "missing request organization does not invent or veto an account"
             );
             let mut mixed = api.clone();
-            mixed[1].account_identifier_hash = Some("b".repeat(64));
+            mixed[1].account_identifier_hash = Some("b".repeat(64).into());
             rehash(&mut mixed[1]);
             assert!(!d1_subagent_account_specimen(
                 &mut child.clone(),

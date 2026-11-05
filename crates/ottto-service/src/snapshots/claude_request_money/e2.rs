@@ -3862,8 +3862,8 @@ fn trace_owners<'a>(
         }) else {
             continue;
         };
-        if *row.capture_revision == *"claude_llm_request_ownership:v1"
-            && *row.session_id == *root
+        if &*row.capture_revision == "claude_llm_request_ownership:v1"
+            && &*row.session_id == root
             && timed("side.trace_fingerprint", || {
                 claude_trace_evidence_fingerprint_is_valid(row)
             })

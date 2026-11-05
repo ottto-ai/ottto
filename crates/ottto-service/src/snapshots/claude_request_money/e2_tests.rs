@@ -1241,8 +1241,8 @@ fn e2_reported_selector_inputs_keep_model_speed_effort_and_hour() {
                             let mut occurrence = item.claude_usage_occurrences["r"].clone();
                             occurrence.reasoning_effort = native_effort.map(str::to_owned);
                             let mut api = row("r", 1, 10);
-                            api.speed = speed.to_owned();
-                            api.effort = effort.to_owned();
+                            api.speed = speed.into();
+                            api.effort = effort.into();
                             api.observed_at = at(3601); // fallback clock is another hour
                             for occurrence in [Some(&occurrence), None] {
                                 let mut e2 =
@@ -2106,7 +2106,7 @@ fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting
             ],
         )];
         let mut own = row("b", 2, 20);
-        own.account_identifier_hash = Some("b".repeat(64));
+        own.account_identifier_hash = Some("b".repeat(64).into());
         let read = sidecar(&[refingerprint(own)]);
         attach_page(&mut items, &read);
         let api = api_report(&read);

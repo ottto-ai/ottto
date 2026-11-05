@@ -408,8 +408,8 @@ fn baseline_identity_upgrade_replay(
     previous: &ClaudeLocalOtelEvidence,
     incoming: &ClaudeLocalOtelEvidence,
 ) -> bool {
-    if *previous.capture_revision != *API_REQUEST_CAPTURE_REVISION
-        || *incoming.capture_revision != *API_REQUEST_CAPTURE_REVISION
+    if &*previous.capture_revision != API_REQUEST_CAPTURE_REVISION
+        || &*incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
         || previous.request_identity.is_none() == incoming.request_identity.is_none()
     {
         return false;
@@ -473,7 +473,7 @@ fn baseline_decode_api_line(
             return;
         }
     };
-    if *item.session_id != *session_id {
+    if &*item.session_id != session_id {
         health.invalid_session_rows += 1;
         return;
     }
@@ -501,7 +501,7 @@ fn baseline_decode_trace_line(
             return;
         }
     };
-    if *item.session_id != *session_id {
+    if &*item.session_id != session_id {
         report.invalid_session_rows += 1;
         return;
     }

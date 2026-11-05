@@ -528,7 +528,7 @@ fn api_login(
     let login = login.to_string().repeat(64);
     let mut row = api_for(session, request, tokens, tokens * 10);
     row.account_identity_checked = true;
-    row.account_identifier_hash = Some(login.clone());
+    row.account_identifier_hash = Some(login.clone().into());
     row.request_identity = Some(std::sync::Arc::new(
         crate::claude_local_otel::ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),

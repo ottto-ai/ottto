@@ -340,7 +340,7 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
             .map(|line| {
                 let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
                     serde_json::from_str(line).unwrap();
-                row.account_identifier_hash = Some("a".repeat(64));
+                row.account_identifier_hash = Some("a".repeat(64).into());
                 use crate::claude_local_otel::{
                     ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
                     ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
@@ -352,7 +352,7 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
                     account: ClaudeIdentityAttributeEvidence {
                         disposition: ClaudeIdentityDisposition::Complete,
                         origin: ClaudeIdentityAttributeOrigin::LogRecord,
-                        log_record_hash: row.account_identifier_hash.clone(),
+                        log_record_hash: row.account_identifier_hash.as_deref().map(str::to_owned),
                         resource_hash: None,
                     },
                     organization: ClaudeIdentityAttributeEvidence {

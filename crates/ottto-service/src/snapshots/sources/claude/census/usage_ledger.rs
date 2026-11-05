@@ -311,8 +311,8 @@ pub(crate) fn validate_claude_api_row(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     root_session_id: &str,
 ) -> bool {
-    *row.capture_revision == *"claude_api_request:v2"
-        && *row.session_id == *root_session_id
+    &*row.capture_revision == "claude_api_request:v2"
+        && &*row.session_id == root_session_id
         && !row.request_id.is_empty()
         && !row.model.is_empty()
         && row.request_count == 1
@@ -355,8 +355,8 @@ fn classify_claude_usage_ledger_with_rows<'a, R>(
     }
     let mut trace_by_request = BTreeMap::new();
     for row in trace_rows {
-        if *row.capture_revision != *"claude_llm_request_ownership:v1"
-            || *row.session_id != *root_session_id
+        if &*row.capture_revision != "claude_llm_request_ownership:v1"
+            || &*row.session_id != root_session_id
             || row.request_id.is_empty()
             || !claude_trace_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
@@ -646,7 +646,7 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
             occurrence.reasoning_output_tokens,
         )
         && Some(api_cache_creation) == transcript_cache_creation
-        && occurrence.model.map_or(true, |model| model == row.model)
+        && occurrence.model.map_or(true, |model| model == &*row.model)
         && speed_matches
         && effort_matches
 }
@@ -891,7 +891,7 @@ fn prepare_claude_reported_usage<
                 || occurrence
                     .model
                     .as_deref()
-                    .is_some_and(|model| model != row.model)
+                    .is_some_and(|model| model != &*row.model)
             {
                 return None;
             }

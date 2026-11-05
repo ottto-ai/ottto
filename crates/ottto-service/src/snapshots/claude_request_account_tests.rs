@@ -303,7 +303,7 @@ pub(crate) fn claude_request_account_mixed_fixture(
     let rows = (1..=count)
         .map(|i| {
             let mut row = complete_api_row(&root, &format!("req_{i}"), i as u64, 10, 10, 0);
-            row.account_identifier_hash = Some(if i <= 2 { a.clone() } else { b.clone() });
+            row.account_identifier_hash = Some(if i <= 2 { a.clone() } else { b.clone() }.into());
             row.request_identity = Some(std::sync::Arc::new(
                 crate::claude_local_otel::ClaudeRequestIdentityEvidence {
                     identity_hash_scheme: "provider-sha256:v1".into(),
@@ -311,7 +311,7 @@ pub(crate) fn claude_request_account_mixed_fixture(
                         origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
                         disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
                         resource_hash: None,
-                        log_record_hash: row.account_identifier_hash.clone(),
+                        log_record_hash: row.account_identifier_hash.as_deref().map(str::to_owned),
                     },
                     organization: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
                         origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
@@ -496,7 +496,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
             }
             "single_account" => {
                 for row in a.evidence.values_mut().flatten() {
-                    row.account_identifier_hash = Some("a".repeat(64));
+                    row.account_identifier_hash = Some("a".repeat(64).into());
                     row.fingerprint.clear();
                     row.fingerprint = format!(
                         "sha256:{:x}",
@@ -944,7 +944,7 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
             .unwrap()
             .last_mut()
             .unwrap();
-        child_row.account_identifier_hash = Some("b".repeat(64));
+        child_row.account_identifier_hash = Some("b".repeat(64).into());
         child_row.fingerprint.clear();
         child_row.fingerprint = format!(
             "sha256:{:x}",

@@ -651,8 +651,8 @@ fn identity_upgrade_replay(
     previous: &ClaudeLocalOtelEvidence,
     incoming: &ClaudeLocalOtelEvidence,
 ) -> bool {
-    if *previous.capture_revision != *API_REQUEST_CAPTURE_REVISION
-        || *incoming.capture_revision != *API_REQUEST_CAPTURE_REVISION
+    if &*previous.capture_revision != API_REQUEST_CAPTURE_REVISION
+        || &*incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
         || previous.request_identity.is_none() == incoming.request_identity.is_none()
     {
         return false;
@@ -1097,7 +1097,7 @@ impl ApiSidecarDecoder<'_> {
                 return;
             }
         };
-        if *item.session_id != *self.session_id {
+        if &*item.session_id != self.session_id {
             self.health.invalid_session_rows += 1;
             return;
         }
@@ -1290,7 +1290,7 @@ impl<'a> TraceSidecarDecoder<'a> {
                 return;
             }
         };
-        if *item.session_id != *self.session_id {
+        if &*item.session_id != self.session_id {
             self.report.invalid_session_rows += 1;
             return;
         }
@@ -1387,7 +1387,7 @@ pub fn load_claude_effort_by_request(
             let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
-            if *item.session_id != *session_id
+            if &*item.session_id != session_id
                 || item.request_id.is_empty()
                 || !VALID_EFFORTS.contains(&item.effort.as_ref())
             {

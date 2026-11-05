@@ -105,10 +105,10 @@ impl ProofChain {
         side.client_request_id = "side-client".into();
         side.observed_at = "2026-06-01T07:00:30Z".into();
         side.app_version = "2.1.229".into();
-        side.effort.clear();
-        side.speed.clear();
+        side.effort = "".into();
+        side.speed = "".into();
         side.cost_usd_micros = Some(1);
-        side.account_identifier_hash = Some("b".repeat(64));
+        side.account_identifier_hash = Some("b".repeat(64).into());
         let mut api = vec![side.clone()];
         for request in 0..2 {
             let mut row = side.clone();
@@ -118,7 +118,8 @@ impl ProofChain {
             row.input_tokens = 10 + request;
             row.output_tokens = 1;
             row.event_sequence = Some(request + 2);
-            row.account_identifier_hash = Some(if request == 0 { "a" } else { "b" }.repeat(64));
+            row.account_identifier_hash =
+                Some(if request == 0 { "a" } else { "b" }.repeat(64).into());
             api.push(row);
         }
         let mut traces = Vec::new();

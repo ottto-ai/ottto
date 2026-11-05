@@ -1018,7 +1018,7 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
             let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
                 serde_json::from_str(line).unwrap();
             row.account_identity_checked = true;
-            row.account_identifier_hash = Some(login.to_string());
+            row.account_identifier_hash = Some(login.into());
             row.request_identity = Some(std::sync::Arc::new(
                 serde_json::from_value(serde_json::json!({
                     "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
