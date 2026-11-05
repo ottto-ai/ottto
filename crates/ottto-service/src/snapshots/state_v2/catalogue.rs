@@ -236,7 +236,7 @@ pub(super) fn legacy_layout(presence: &BTreeMap<String, bool>) -> u32 {
     LAYOUTS
         .iter()
         .filter(|(_, field, _)| presence.contains_key(*field))
-        .filter_map(|(_, field, _)| first(*field))
+        .filter_map(|(_, field, _)| first(field))
         .max()
         .unwrap_or(1)
 }
