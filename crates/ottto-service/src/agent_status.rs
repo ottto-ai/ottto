@@ -6022,7 +6022,9 @@ fn collect_registered_claude_slot_step(
     let local = read_registered_claude_slot_locally(descriptor);
     // Another account signed in to this slot, or one that cannot be shown to
     // be the approved account: no upkeep, CLI, usage call, candidate or
-    // refresh for it until the approved account is back.
+    // refresh for it until the approved account is back. The one exception:
+    // an unproven lapsed token may refresh itself, so its fresh token can be
+    // proven.
     let mut owner = None;
     if let Some(expected) = &expected_binding {
         let calls_allowed = claude_owner_call_allowed();
@@ -6039,13 +6041,35 @@ fn collect_registered_claude_slot_step(
                 previous,
                 captured_at,
             )),
-            ClaudeSlotOwnerRule::Unproven => Some(claude_slot_approval_blocked_status(
-                expected,
-                ClaudeSlotProbeFailure::OwnerUnproven,
-                claude_slot_owner_unproven_message,
-                previous,
-                captured_at,
-            )),
+            ClaudeSlotOwnerRule::Unproven => {
+                // A lapsed token is never sent for proof, and its verdict is
+                // not remembered (as after a restart): start the slot's own
+                // background refresh, when due, so the pass its completion
+                // wakes proves the fresh token. Nothing is collected here.
+                if let Some(local) = local.as_ref().filter(|local| {
+                    let strong = |oauth: &Option<ClaudeCliOauthAccount>| {
+                        oauth.as_ref().and_then(claude_strong_oauth_identity_hashes)
+                    };
+                    calls_allowed
+                        && local.state == ClaudeLocalLoginState::RefreshPending
+                        && strong(&local.initial_oauth_account)
+                            == strong(&local.final_oauth_account)
+                }) {
+                    registered_slot_refresh(
+                        descriptor,
+                        &local.live_login(),
+                        upkeep_consent,
+                        network_enabled,
+                    );
+                }
+                Some(claude_slot_approval_blocked_status(
+                    expected,
+                    ClaudeSlotProbeFailure::OwnerUnproven,
+                    claude_slot_owner_unproven_message,
+                    previous,
+                    captured_at,
+                ))
+            }
             ClaudeSlotOwnerRule::Unknown => Some(claude_slot_approval_blocked_status(
                 expected,
                 ClaudeSlotProbeFailure::IdentityUnknown,
@@ -8166,7 +8190,7 @@ fn claude_slot_owner_unproven_message(approved_plan: Option<&str>) -> String {
         .map(|label| format!("the {label} account"))
         .unwrap_or_else(|| "the account it was set up with".to_string());
     format!(
-        "Claude Code's account file for this connection names a different account, and Ottto could not yet confirm that its saved sign-in is still {approved}. Ottto paused limit reading, uploads and token refresh here until it can; reconnect if this does not clear."
+        "Claude Code's account file for this connection names a different account, and Ottto could not yet confirm that its saved sign-in is still {approved}. Ottto paused limit reading and uploads here until it can; reconnect if this does not clear."
     )
 }
 
@@ -37122,11 +37146,13 @@ exit 44
     /// [regress] T6, the observed case: another app rewrites an approved
     /// slot's `.claude.json` to another account; the slot's stored token stays
     /// the approved login and decides. Lapsed with no verdict (as after a
-    /// restart): owner unproven, last reading kept, no request. Valid: one
-    /// profile call with that token, then collection on the approved pair
-    /// with no other login's label; the usage call gets that token.
-    /// Reconnect's identity check and the upkeep fence agree. Lapsed again:
-    /// its background refresh runs, binding kept.
+    /// restart): owner unproven, last reading kept, no request; with "Keep my
+    /// Claude accounts signed in" on, exactly one background refresh of the
+    /// slot's own login starts, and a failed one leaves the slot as it was.
+    /// Refreshed (valid): one profile call with the fresh token, then
+    /// collection on the approved pair with no other login's label; the
+    /// usage call gets that token. Reconnect's identity check and the upkeep
+    /// fence agree. Lapsed again: its background refresh runs, binding kept.
     #[test]
     #[serial]
     fn slot_with_another_accounts_cached_login_collects_on_its_proven_token() {
@@ -37143,23 +37169,41 @@ exit 44
         assert_eq!(profile_calls(), 0, "a matching account file needs no proof");
 
         fixture.write_identity(&dir, OTHER_ACCOUNT);
-        fixture.item_token(&slot, -TimeDuration::hours(1), "token-slot-a");
-        fixture.collect();
-        let unproven = fixture.slot_collection(0);
-        assert_eq!(
-            unproven.state,
-            ClaudeConfigSlotCollectionStateV1::IdentityUnknown
-        );
-        assert!(unproven.diagnostics[0]
-            .message
-            .contains("could not yet confirm"));
-        assert_eq!(
-            unproven.account_identifier_hash.as_deref(),
-            approved_account
-        );
-        assert!(unproven.quota_snapshot.is_some(), "last reading kept");
-        assert_eq!(profile_calls(), 0, "a lapsed token is never sent");
+        fixture.item_token(&slot, -TimeDuration::hours(1), "token-slot-a-lapsed");
+        fixture.clear_logs();
+        let unproven = |context: &str| {
+            fixture.collect();
+            crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+            let unproven = fixture.slot_collection(0);
+            assert_eq!(
+                unproven.state,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                "{context}"
+            );
+            assert!(unproven.diagnostics[0]
+                .message
+                .contains("could not yet confirm"));
+            assert_eq!(
+                unproven.account_identifier_hash.as_deref(),
+                approved_account
+            );
+            assert!(unproven.quota_snapshot.is_some(), "{context}: reading kept");
+            assert_eq!(
+                profile_calls(),
+                0,
+                "{context}: a lapsed token is never sent"
+            );
+        };
+        unproven("consent off");
+        assert_eq!(fixture.slot_dir_spawns(0), 0, "consent off: no refresh");
+        fixture.grant_upkeep();
+        unproven("refreshing");
+        assert_eq!(fixture.slot_dir_spawns(0), 1, "the slot's own refresh");
+        // The stand-in CLI leaves the expiry as it was: a failed refresh.
+        unproven("refresh failed");
+        assert_eq!(fixture.slot_dir_spawns(0), 1, "its retry waits");
 
+        // Claude Code stored the refreshed login.
         fixture.item_token(&slot, TimeDuration::hours(8), "token-slot-a");
         let usage_calls = provider_calls();
         let collection = fixture.collect();
@@ -37235,7 +37279,6 @@ exit 44
         );
         assert!(!claude_slot_login_unapproved(&fixture.descriptor(0)));
 
-        fixture.grant_upkeep();
         fixture.clear_logs();
         fixture.item_token(&slot, -TimeDuration::minutes(2), "token-slot-a");
         fixture.collect();
@@ -37727,7 +37770,9 @@ exit 44
     /// [behaviour] No proof for a slot whose `.claude.json` names another
     /// account: with the network off (no request) or a failed check the slot
     /// is owner unproven, never a mismatch, and keeps its approved account
-    /// and last reading.
+    /// and last reading. Once lapsed, with "Keep my Claude accounts signed
+    /// in" on, it starts no refresh while the network is off or the pass
+    /// serves saved readings only.
     #[test]
     #[serial]
     fn unprovable_slot_owner_keeps_the_approved_reading_without_a_mismatch() {
@@ -37761,6 +37806,26 @@ exit 44
             assert_eq!(status.account_identifier_hash.as_ref(), Some(&approved));
             assert!(status.quota_snapshot.is_some(), "{context}: reading kept");
             assert_eq!(profile_calls(), calls, "{context}");
+        }
+
+        fixture.grant_upkeep();
+        fixture.item(&fixture.slot(0), -TimeDuration::hours(1));
+        fixture.clear_logs();
+        for context in ["network off", "saved readings only"] {
+            if context == "network off" {
+                fs::write(&network_off, b"disabled\n").expect("network off");
+                fixture.collect();
+                fs::remove_file(&network_off).expect("network on");
+            } else {
+                with_claude_pass(true, current_unix_seconds(), || fixture.collect());
+            }
+            crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+            assert_eq!(
+                fixture.slot_collection(0).state,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                "{context}"
+            );
+            assert_eq!(fixture.slot_dir_spawns(0), 0, "{context}: no refresh");
         }
     }
 }
