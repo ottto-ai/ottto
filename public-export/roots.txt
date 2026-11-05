@@ -36,5 +36,6 @@ fixtures/
 homebrew/
 public-export/
 release/
+rust-toolchain.toml
 schemas/
 scripts/

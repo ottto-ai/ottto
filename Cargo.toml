@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.81"
+rust-version = "1.95"
 authors = ["Ottto Team"]
 
 # CI runs clippy with -D warnings, so "warn" fails the build. Every member

@@ -36,5 +36,6 @@ fixtures/	fixtures/	Public repository root is already in export shape.
 homebrew/	homebrew/	Public repository root is already in export shape.
 public-export/	public-export/	Public repository root is already in export shape.
 release/	release/	Public repository root is already in export shape.
+rust-toolchain.toml	.	Public repository root file is already in export shape.
 schemas/	schemas/	Public repository root is already in export shape.
 scripts/	scripts/	Public repository root is already in export shape.
