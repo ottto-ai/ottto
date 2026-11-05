@@ -63,7 +63,8 @@ and destination classes, never their values. An unreadable profile is Unknown.
 Fix reports the warning and preserves user-owned profile lines while keeping
 managed configuration repair available. Remove or comment out the relevant
 unfenced exports, quit and reopen Claude Desktop, start a new session, then run
-Verify again. Dynamic fish snippet filenames are represented by numbered labels.
+Verify again. This check reports literal exports in zsh/bash profiles; it does not
+inspect running process environments or establish a session capture gap.
 
 For Codex:
 

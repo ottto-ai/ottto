@@ -4200,58 +4200,6 @@ fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
     claude_snapshot_family_root_ref(item).to_owned()
 }
 
-/// Diagnostics only; reuse the page's exact Desktop occurrences and strict
-/// effort read. No registry, extra file read, account inference or money mutation.
-pub(crate) fn note_desktop_capture(
-    items: &[SnapshotItem],
-    api: &crate::claude_local_otel::ClaudeApiEvidenceRead,
-    failed: bool,
-) {
-    let mut requests = 0;
-    let mut missing = false;
-    let mut unknown = failed;
-    for item in items {
-        if !item
-            .claude_usage_occurrences
-            .values()
-            .any(|o| o.desktop_request)
-        {
-            // A Desktop response omitted from the request index cannot prove
-            // clean capture (for example an id-less or limited fold).
-            if item.request_count > 0
-                && item
-                    .origin
-                    .as_ref()
-                    .is_some_and(|o| o.entrypoint.as_deref() == Some("claude-desktop"))
-            {
-                requests += 1;
-                unknown = true;
-            }
-            continue;
-        }
-        let report = api.capture_report(claude_snapshot_family_root_ref(item));
-        let rows = report
-            .as_ref()
-            .map(|r| {
-                r.rows
-                    .iter()
-                    .map(|r| r.request_id.as_str())
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        unknown |= !item.claude_context_curve_request_index_complete
-            || !item.claude_context_curve_identity_complete
-            || !report.is_some_and(|r| r.complete);
-        for (request, occurrence) in &item.claude_usage_occurrences {
-            if occurrence.desktop_request {
-                requests += 1;
-                missing |= !rows.contains(request.as_str());
-            }
-        }
-    }
-    crate::claude_shell_telemetry::note_capture(requests, missing, unknown);
-}
-
 fn claude_snapshot_family_root_ref(item: &SnapshotItem) -> &str {
     item.attribution_facts
         .iter()
