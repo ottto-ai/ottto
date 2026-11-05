@@ -77,7 +77,7 @@ new_case() {
 pr_json() {
   jq -n --arg s "$2" --argjson d "$3" --arg h "$4" --arg m "$5" --arg fork "${6:-}" \
     '{id: "PR_node7", state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
-      baseRefName: "main", headRefName: "feature",
+      title: "fix: a change", baseRefName: "main", headRefName: "feature",
       isCrossRepository: ($fork != ""),
       headRepository: {name: "repo"},
       headRepositoryOwner: {login: (if $fork == "" then "example" else $fork end)}}' \
@@ -155,6 +155,7 @@ run_guard() {
   local expected="$1" status=0
   shift
   MERGE_GUARD_TEST_DIR="$case_dir" PATH="$FAKE_BIN:$PATH" \
+    OTTTO_PR_TITLE_DENY_FILE="${DENY_FILE:-$TMP_DIR/no-title-deny-file}" \
     bash "$GUARD" "$@" > "$case_dir/out" 2>&1 || status=$?
   if [ "$status" -ne "$expected" ]; then
     fail "exit $status, expected $expected; output:"
@@ -296,6 +297,64 @@ run_guard 3 7
 expect_output 'no merge queue on main'
 expect_no_log 'gh pr ready'
 expect_no_log 'check-runs'
+
+# set_title <file> <title>
+set_title() {
+  jq --arg t "$2" '.title = $t' "$case_dir/$1" > "$case_dir/$1.next"
+  mv "$case_dir/$1.next" "$case_dir/$1"
+}
+
+DENY_FILE="$TMP_DIR/deny.ere"
+printf '# internal tags\n\nnever-matches-anything\n\\(TAG[0-9]\\)\n' > "$DENY_FILE"
+
+# A draft whose title matches the list is refused before it is marked ready or
+# any check is read, and the message does not print the list.
+green_case denied-title-refused
+pr_json pr OPEN true "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG1)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+if grep -F -q 'TAG[0-9]' "$case_dir/out"; then
+  fail "output prints the deny pattern"
+fi
+expect_no_log 'gh pr ready'
+expect_no_log 'check-runs'
+expect_no_log 'gh enqueue'
+
+# A title edited to a denied one while checks are pending is refused at the
+# next PR read, before enqueue.
+green_case title-denied-while-waiting
+pr_json pr.1 OPEN false "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG2)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+expect_no_log 'gh enqueue'
+
+# Comment and blank lines never match: a clean title passes the same list.
+green_case clean-title-with-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A list with only comments and blank lines, or an empty file, checks nothing.
+printf '# nothing yet\n\n   \n' > "$DENY_FILE"
+green_case comment-only-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+: > "$DENY_FILE"
+green_case empty-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A pattern grep cannot evaluate refuses instead of letting the title through.
+printf 'fix: [unclosed\n' > "$DENY_FILE"
+green_case invalid-deny-pattern-refused
+run_guard 3 7
+expect_output 'could not be evaluated'
+expect_no_log 'gh enqueue'
+unset DENY_FILE
 
 new_case usage-errors
 run_guard 2
