@@ -828,12 +828,14 @@ fn head_shape(index: &ScanIndex, key: &str) -> Option<(bool, state_v2::Represent
         .map(|head| (head.metadata_only, head.common.representation))
 }
 
-/// One ordinary pass under `context`, then its accepting checkpoint.
+/// One ordinary pass under `context` on the process's `cache`, then its
+/// accepting checkpoint.
 fn observed_pass(
     c: &Corpus,
     path: &Path,
     mut index: ScanIndex,
     context: &str,
+    cache: &Arc<sampled_scan::SharedCache>,
 ) -> (ScanIndex, RouteResult, PassFacts) {
     index.activate_file_upload_context(SnapshotSource::Codex, context.into());
     e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
@@ -846,8 +848,7 @@ fn observed_pass(
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
     let activity = codex_zst_refusal_tests::activity();
     let previous = index.clone();
-    let (working, scan, delivery, consumed, logs) =
-        page(c, index, Arc::new(sampled_scan::SharedCache::default()));
+    let (working, scan, delivery, consumed, logs) = page(c, index, cache.clone());
     let samples_after = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
     let activity_after = codex_zst_refusal_tests::activity();
     let zst = logs
@@ -894,9 +895,14 @@ fn observed_pass(
 /// [regress] 0.1.219 left a never-read archived rollout as a metadata-only
 /// head owing the whole archive, unread. Its ordinary counted Full and exact
 /// ACK settle that debt: the file leaves the outstanding set, counts once
-/// (equivalent to a cold run), keeps no metadata-only head, and the next two
-/// passes read nothing. The control is the same archive never seeded: no
-/// 0.1.219 head and no prior debt. Both arms' facts print before any assert.
+/// (equivalent to a cold run) and keeps no metadata-only head. Later passes
+/// in the same process (one process-lifetime cache, as the daemon keeps) read
+/// nothing. After a restart (a fresh cache and a reloaded index) the archive
+/// has its header decoded at most once, within the header bound, with no
+/// identity sample, Full or POST; the next same-process pass reads nothing.
+/// The control is the same archive never seeded: no 0.1.219 head and no
+/// prior debt. Facts are collected under the decoder lock and asserted after
+/// it is released, so a failure here cannot poison other decoder rows.
 #[test]
 fn archive_whole_unread_debt_settles_after_one_counted_full() {
     use crate::snapshots::g7_debt::tests as g7;
@@ -907,101 +913,116 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         read: RouteResult,
         seeded_head: Option<(bool, state_v2::Representation)>,
         owed: Value,
-        passes: [PassFacts; 3],
+        passes: [PassFacts; 5],
         settled: Value,
         head: Option<(bool, state_v2::Representation, state_v2::DebtSummary)>,
         revisions: usize,
         after: Value,
         facts: String,
     }
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut arms = Vec::new();
-    for seeded in [false, true] {
-        // A fresh process per arm: no walk or aggregate carries over.
-        crate::snapshots::money_freshness::restart_for_test();
-        let c = Corpus::new();
-        let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
-        let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
-        fs::write(&compressed, &encoded).unwrap();
-        File::options()
-            .write(true)
-            .open(&compressed)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600))
-            .unwrap();
-        let (cold_index, cold, _, _, _) = page(
-            &c,
-            ScanIndex::default(),
-            Arc::new(sampled_scan::SharedCache::default()),
-        );
-        let expected = emitted(&cold_index, &cold);
-        let (session, mut prior) = StateV2ColdSession::publish(
-            Source::Codex,
-            &ScanIndex::default(),
-            &c.scratch.join("state"),
-        );
-        let key = local_index_key(&compressed);
-        let mut owed = Value::Null;
-        if seeded {
-            g7::seed_archive_whole_unread(&prior, &compressed);
-            prior.save(session.path()).unwrap();
-            prior = ScanIndex::load(session.path()).unwrap();
-            prior.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-            owed = g7::walk(SnapshotSource::Codex, &c.roots(), &mut prior)["debt"].clone();
-            prior.traversal = None;
+    let arms = {
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut arms = Vec::new();
+        for seeded in [false, true] {
+            // A fresh process per arm: no walk or aggregate carries over.
+            crate::snapshots::money_freshness::restart_for_test();
+            let c = Corpus::new();
+            let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
+            let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
+            fs::write(&compressed, &encoded).unwrap();
+            File::options()
+                .write(true)
+                .open(&compressed)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600),
+                )
+                .unwrap();
+            let (cold_index, cold, _, _, _) = page(
+                &c,
+                ScanIndex::default(),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            let expected = emitted(&cold_index, &cold);
+            let (session, mut prior) = StateV2ColdSession::publish(
+                Source::Codex,
+                &ScanIndex::default(),
+                &c.scratch.join("state"),
+            );
+            let key = local_index_key(&compressed);
+            let mut owed = Value::Null;
+            if seeded {
+                g7::seed_archive_whole_unread(&prior, &compressed);
+                prior.save(session.path()).unwrap();
+                prior = ScanIndex::load(session.path()).unwrap();
+                prior.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+                owed = g7::walk(SnapshotSource::Codex, &c.roots(), &mut prior)["debt"].clone();
+                prior.traversal = None;
+            }
+            let seeded_head = head_shape(&prior, &key);
+            // One daemon process: its process-lifetime cache (lib.rs).
+            let process = Arc::new(sampled_scan::SharedCache::default());
+            let (index, read, first) = observed_pass(&c, &compressed, prior, CONTEXT, &process);
+            let (index, _, second) = observed_pass(&c, &compressed, index, CONTEXT, &process);
+            let (index, _, third) = observed_pass(&c, &compressed, index, CONTEXT, &process);
+            // A restart: the committed index, a fresh cache and no walk state.
+            index.save(session.path()).unwrap();
+            crate::snapshots::money_freshness::restart_for_test();
+            let restarted = Arc::new(sampled_scan::SharedCache::default());
+            let index = ScanIndex::load(session.path()).unwrap();
+            let (index, _, fourth) = observed_pass(&c, &compressed, index, CONTEXT, &restarted);
+            let (mut index, _, fifth) = observed_pass(&c, &compressed, index, CONTEXT, &restarted);
+            index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+            let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+            index.save(session.path()).unwrap();
+            let mut index = ScanIndex::load(session.path()).unwrap();
+            let loaded = state_v2::load_head(&index, &key, u32::MAX).unwrap();
+            let mut revisions = 0;
+            if let Some(head) = &loaded {
+                state_v2::load_revisions(&index, &key, head, |_, _| {
+                    revisions += 1;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let head = loaded.as_ref().map(|head| {
+                (
+                    head.metadata_only,
+                    head.common.representation,
+                    head.common.debt,
+                )
+            });
+            index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+            let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
+            let facts = format!(
+                "{} arm: compressed={} decoded={}\nseeded head: {seeded_head:?} owed: {owed}\n\
+                 pass 1: {first}\npass 2: {second}\npass 3: {third}\n\
+                 restart pass 4: {fourth}\npass 5: {fifth}\nsettled: {settled}\n\
+                 head: {head:?} revisions={revisions}\nafter: {after}",
+                if seeded { "seeded" } else { "control" },
+                encoded.len(),
+                rollout(MAIN, Some("a")).len(),
+            );
+            eprintln!("{facts}");
+            arms.push(Arm {
+                seeded,
+                expected,
+                read,
+                seeded_head,
+                owed,
+                passes: [first, second, third, fourth, fifth],
+                settled,
+                head,
+                revisions,
+                after,
+                facts,
+            });
+            drop(session);
         }
-        let seeded_head = head_shape(&prior, &key);
-        let (index, read, first) = observed_pass(&c, &compressed, prior, CONTEXT);
-        let (index, _, second) = observed_pass(&c, &compressed, index, CONTEXT);
-        let (mut index, _, third) = observed_pass(&c, &compressed, index, CONTEXT);
-        index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-        let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
-        index.save(session.path()).unwrap();
-        let mut index = ScanIndex::load(session.path()).unwrap();
-        let loaded = state_v2::load_head(&index, &key, u32::MAX).unwrap();
-        let mut revisions = 0;
-        if let Some(head) = &loaded {
-            state_v2::load_revisions(&index, &key, head, |_, _| {
-                revisions += 1;
-                Ok(())
-            })
-            .unwrap();
-        }
-        let head = loaded.as_ref().map(|head| {
-            (
-                head.metadata_only,
-                head.common.representation,
-                head.common.debt,
-            )
-        });
-        index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
-        let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
-        let facts = format!(
-            "{} arm: compressed={} decoded={}\nseeded head: {seeded_head:?} owed: {owed}\n\
-             pass 1: {first}\npass 2: {second}\npass 3: {third}\nsettled: {settled}\n\
-             head: {head:?} revisions={revisions}\nafter: {after}",
-            if seeded { "seeded" } else { "control" },
-            encoded.len(),
-            rollout(MAIN, Some("a")).len(),
-        );
-        eprintln!("{facts}");
-        arms.push(Arm {
-            seeded,
-            expected,
-            read,
-            seeded_head,
-            owed,
-            passes: [first, second, third],
-            settled,
-            head,
-            revisions,
-            after,
-            facts,
-        });
-        drop(session);
-    }
+        arms
+    };
     let all = arms
         .iter()
         .map(|arm| arm.facts.as_str())
@@ -1022,13 +1043,30 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
             arm.passes[0].zst_decoded_bytes > 0 && arm.passes[0].posts == 1,
             "{label}: pass 1 is the one counted Full\n{all}"
         );
-        for (n, pass) in arm.passes.iter().enumerate().skip(1) {
+        // Same process (passes 2, 3) and after the restart's pass (5).
+        for n in [1, 2, 4] {
             assert!(
-                pass.read_nothing(),
+                arm.passes[n].read_nothing(),
                 "{label}: pass {} reads nothing\n{all}",
                 n + 1
             );
         }
+        // The restart's first pass: at most one bounded header decode.
+        let restart = &arm.passes[3];
+        assert!(
+            restart.identity_samples == 0
+                && restart.decoders <= 1
+                && restart.parses <= 1
+                && restart.zst_input_rows <= 1
+                && restart.zst_decoded_bytes
+                    <= crate::snapshots::codex_file_join::MAX_HEADER_BYTES as u64
+                && restart.consumed == 0
+                && restart.counted_fulls == 0
+                && restart.delivered.is_empty()
+                && restart.snapshots == 0
+                && restart.posts == 0,
+            "{label}: the restart decodes at most one header\n{all}"
+        );
         assert_eq!(arm.settled["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["over_6h_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["unread_bytes"], 0, "{label}\n{all}");
@@ -1046,54 +1084,67 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
 
 /// [regress] Fail toward reading: an archive replaced after its read by a
 /// grown object (another stamp and size) is identified and read again, and
-/// its new money posts once, equal to a cold run.
+/// its new money posts once, equal to a cold run. Asserted after the decoder
+/// lock is released.
 #[test]
 fn replaced_archive_after_its_read_is_identified_and_read() {
     const CONTEXT: &str = "archive-replaced-context";
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::snapshots::money_freshness::restart_for_test();
-    let c = Corpus::new();
-    let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
-    let first_body = rollout(MAIN, Some("a"));
-    fs::write(
-        &compressed,
-        zstd::stream::encode_all(&first_body[..], 1).unwrap(),
-    )
-    .unwrap();
-    let (session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &c.scratch.join("state"),
-    );
-    let (index, _, first) = observed_pass(&c, &compressed, prior, CONTEXT);
-    let grown = [first_body, turn(3).into_bytes()].concat();
-    let replacement = c.scratch.join("replacement.jsonl.zst");
-    fs::write(
-        &replacement,
-        zstd::stream::encode_all(&grown[..], 1).unwrap(),
-    )
-    .unwrap();
-    fs::rename(&replacement, &compressed).unwrap();
-    let (_, replaced_route, replaced) = observed_pass(&c, &compressed, index, CONTEXT);
-    let (cold_index, cold, _, _, _) = page(
-        &c,
-        ScanIndex::default(),
-        Arc::new(sampled_scan::SharedCache::default()),
-    );
+    let (first, replaced, grown_len, cold_route, replaced_route) = {
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::snapshots::money_freshness::restart_for_test();
+        let c = Corpus::new();
+        let compressed = c.archived.join(format!("rollout-{MAIN}.jsonl.zst"));
+        let first_body = rollout(MAIN, Some("a"));
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(&first_body[..], 1).unwrap(),
+        )
+        .unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let process = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, first) = observed_pass(&c, &compressed, prior, CONTEXT, &process);
+        let grown = [first_body, turn(3).into_bytes()].concat();
+        let replacement = c.scratch.join("replacement.jsonl.zst");
+        fs::write(
+            &replacement,
+            zstd::stream::encode_all(&grown[..], 1).unwrap(),
+        )
+        .unwrap();
+        fs::rename(&replacement, &compressed).unwrap();
+        let (_, replaced_route, replaced) =
+            observed_pass(&c, &compressed, index, CONTEXT, &process);
+        let (cold_index, cold, _, _, _) = page(
+            &c,
+            ScanIndex::default(),
+            Arc::new(sampled_scan::SharedCache::default()),
+        );
+        let cold_route = emitted(&cold_index, &cold);
+        drop(session);
+        (
+            first,
+            replaced,
+            grown.len() as u64,
+            cold_route,
+            replaced_route,
+        )
+    };
     let facts = format!("first: {first}\nreplaced: {replaced}");
     assert!(first.zst_decoded_bytes > 0 && first.posts == 1, "{facts}");
     assert!(!replaced.stamp_matches, "{facts}");
     assert!(replaced.identity_samples > 0, "re-identified\n{facts}");
     assert!(
-        replaced.zst_decoded_bytes >= grown.len() as u64 && replaced.consumed > 0,
+        replaced.zst_decoded_bytes >= grown_len && replaced.consumed > 0,
         "read again\n{facts}"
     );
     assert_eq!(replaced.snapshots, 1, "{facts}");
     assert_eq!(replaced.posts, 1, "{facts}");
-    money_oracle::assert_equivalent(&emitted(&cold_index, &cold), &replaced_route);
-    drop(session);
+    money_oracle::assert_equivalent(&cold_route, &replaced_route);
 }
 
 /// [regress] The ordinary first-seen predicate excludes never-seen old input
