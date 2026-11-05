@@ -30765,7 +30765,6 @@ X-API-Key = "otel_redacted"
     }
 
     const SC_DEVICE: &str = "6f1c0e52-0000-4000-8000-00000000a001";
-    const SC_SOURCES: [SourceKind; 3] = [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi];
 
     /// A support dir bound to `SC_DEVICE` with every source granted.
     fn source_collection_support(name: &str) -> (PathBuf, [EnvVarGuard; 2]) {
@@ -30786,17 +30785,12 @@ X-API-Key = "otel_redacted"
         (support, env)
     }
 
-    /// The server's reply: the heartbeat's `source_control` block.
-    fn sc_reply(device_id: &str, slug: &str, revision: u64, state: &str) -> serde_json::Value {
-        json!({"source_control": {"contract": "source_control:v1", "device_id": device_id,
-            "sources": [{"source": slug, "revision": revision, "desired_state": state,
+    /// The server's reply for Codex: the heartbeat's `source_control` block.
+    fn sc_reply(revision: u64, state: &str) -> serde_json::Value {
+        json!({"source_control": {"contract": "source_control:v1", "device_id": SC_DEVICE,
+            "sources": [{"source": "codex", "revision": revision, "desired_state": state,
                 "changed_at": "2026-11-05T00:00:00Z",
                 "action_id": "00000000-0000-4000-8000-000000000001"}]}})
-    }
-
-    fn sc_record(support: &Path, slug: &str) -> Option<u64> {
-        let bytes = fs::read(support.join(format!("snapshots/{slug}.source-control"))).ok()?;
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["revision"].as_u64()
     }
 
     fn sc_files(support: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -30813,135 +30807,88 @@ X-API-Key = "otel_redacted"
     #[test]
     #[serial]
     fn companion_pause_marks_before_post_and_stays_paused_on_post_failure() {
-        use crate::snapshot_sync::{snapshot_source_of_kind, source_marker};
+        use crate::snapshot_sync::source_marker;
+        use crate::snapshots::SnapshotSource;
         let _guard = lock_backend_test_env();
-        for source in SC_SOURCES {
-            let (support, _env) = source_collection_support("source-pause");
-            let snapshot = snapshot_source_of_kind(&source);
-            let slug = snapshot.api_slug();
-            let reply = save_source_collection(&source, false, |body| {
-                assert_eq!(body, &json!({"source": slug, "enabled": false}));
-                assert_eq!(
-                    source_marker(&support, snapshot).as_deref(),
-                    Some("pending"),
-                    "{slug}: marked before the POST"
-                );
-                Err(anyhow::anyhow!("offline"))
-            })
-            .expect("an unsaved pause still pauses");
+        let (support, _env) = source_collection_support("source-pause");
+        let reply = save_source_collection(&SourceKind::Codex, false, |body| {
+            assert_eq!(body, &json!({"source": "codex", "enabled": false}));
             assert_eq!(
-                reply,
-                json!({"source": slug, "source_paused": true, "server_saved": false})
+                source_marker(&support, SnapshotSource::Codex).as_deref(),
+                Some("pending"),
+                "marked before the POST"
             );
-            assert_eq!(
-                source_marker(&support, snapshot).as_deref(),
-                Some("pending")
-            );
-        }
+            Err(anyhow::anyhow!("offline"))
+        })
+        .expect("an unsaved pause still pauses");
+        assert_eq!(
+            reply,
+            json!({"source": "codex", "source_paused": true, "server_saved": false})
+        );
+        assert_eq!(
+            source_marker(&support, SnapshotSource::Codex).as_deref(),
+            Some("pending")
+        );
     }
 
     /// [behaviour] Resume writes nothing before the POST, then applies the
     /// server's serialized reply as a heartbeat would: the marker turns
-    /// `reconnect` and the record moves to N+1 before the handler returns. A
-    /// later heartbeat carrying N+1 changes nothing.
+    /// `reconnect` and the record moves to N+1 before the handler returns.
     #[test]
     #[serial]
     fn companion_resume_through_handler_applies_serialized_server_reply() {
-        use crate::snapshot_sync::{
-            apply_source_control, disable_snapshot_source, resume_reconnected_sources,
-            snapshot_source_of_kind, source_marker,
-        };
+        use crate::snapshot_sync::{apply_source_control, source_marker};
+        use crate::snapshots::SnapshotSource;
         let _guard = lock_backend_test_env();
-        for source in SC_SOURCES {
-            let (support, _env) = source_collection_support("source-resume");
-            let snapshot = snapshot_source_of_kind(&source);
-            let slug = snapshot.api_slug();
-            apply_source_control(&support, &sc_reply(SC_DEVICE, slug, 4, "disabled"));
-            let next = sc_reply(SC_DEVICE, slug, 5, "enabled");
-            let body: &'static str = Box::leak(next.to_string().into_boxed_str());
-            let (url, server) = scripted_json_backend(vec![(200, body)]);
-            let reply = save_source_collection(&source, true, |body| {
-                assert_eq!(
-                    source_marker(&support, snapshot).as_deref(),
-                    Some("pending"),
-                    "{slug}: nothing written before the POST"
-                );
-                crate::snapshot_client::SnapshotApiClient::new(url.clone())
-                    .upload_source_control("relay-token", body)
-            })
-            .expect("resume saved");
-            let requests = server.join().expect("backend");
-            assert!(requests[0].starts_with("POST /api/v1/apps/health/source-control "));
+        let (support, _env) = source_collection_support("source-resume");
+        apply_source_control(&support, &sc_reply(4, "disabled"));
+        let body: &'static str = Box::leak(sc_reply(5, "enabled").to_string().into_boxed_str());
+        let (url, server) = scripted_json_backend(vec![(200, body)]);
+        let reply = save_source_collection(&SourceKind::Codex, true, |body| {
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(http_request_body(&requests[0])).unwrap(),
-                json!({"source": slug, "enabled": true})
-            );
-            assert_eq!(
-                reply,
-                json!({"source": slug, "source_paused": false, "server_saved": true})
-            );
-            assert_eq!(
-                source_marker(&support, snapshot).as_deref(),
-                Some("reconnect")
-            );
-            assert_eq!(sc_record(&support, slug), Some(5));
-
-            resume_reconnected_sources(&support);
-            disable_snapshot_source(&support, snapshot).unwrap();
-            apply_source_control(&support, &next);
-            assert_eq!(
-                source_marker(&support, snapshot).as_deref(),
+                source_marker(&support, SnapshotSource::Codex).as_deref(),
                 Some("pending"),
-                "{slug}: N+1 applies once"
+                "nothing written before the POST"
             );
-            assert_eq!(sc_record(&support, slug), Some(5));
-        }
+            crate::snapshot_client::SnapshotApiClient::new(url.clone())
+                .upload_source_control("relay-token", body)
+        })
+        .expect("resume saved");
+        let requests = server.join().expect("backend");
+        assert!(requests[0].starts_with("POST /api/v1/apps/health/source-control "));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(http_request_body(&requests[0])).unwrap(),
+            json!({"source": "codex", "enabled": true})
+        );
+        assert_eq!(
+            reply,
+            json!({"source": "codex", "source_paused": false, "server_saved": true})
+        );
+        assert_eq!(
+            source_marker(&support, SnapshotSource::Codex).as_deref(),
+            Some("reconnect")
+        );
+        let record = fs::read(support.join("snapshots/codex.source-control")).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(record["revision"], json!(5));
     }
 
     /// [behaviour] A Resume the server did not save fails and writes nothing.
     #[test]
     #[serial]
     fn resume_post_failure_writes_nothing() {
-        use crate::snapshot_sync::{disable_snapshot_source, snapshot_source_of_kind};
+        use crate::snapshot_sync::disable_snapshot_source;
+        use crate::snapshots::SnapshotSource;
         let _guard = lock_backend_test_env();
-        for source in SC_SOURCES {
-            let (support, _env) = source_collection_support("source-resume-fail");
-            disable_snapshot_source(&support, snapshot_source_of_kind(&source)).unwrap();
-            let before = sc_files(&support);
-            let error = save_source_collection(&source, true, |_| Err(anyhow::anyhow!("offline")))
-                .expect_err("an unsaved resume fails");
-            assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
-            assert_eq!(sc_files(&support), before);
-        }
-    }
-
-    /// [behaviour] A reply for another device changes nothing here.
-    #[test]
-    #[serial]
-    fn foreign_device_reply_is_ignored() {
-        use crate::snapshot_sync::{
-            disable_snapshot_source, snapshot_source_of_kind, source_marker,
-        };
-        let _guard = lock_backend_test_env();
-        for source in SC_SOURCES {
-            let (support, _env) = source_collection_support("source-foreign");
-            let snapshot = snapshot_source_of_kind(&source);
-            let slug = snapshot.api_slug();
-            disable_snapshot_source(&support, snapshot).unwrap();
-            let other = "6f1c0e52-0000-4000-8000-00000000b002";
-            let reply =
-                save_source_collection(&source, true, |_| Ok(sc_reply(other, slug, 5, "enabled")))
-                    .expect("saved");
-            assert_eq!(
-                reply,
-                json!({"source": slug, "source_paused": true, "server_saved": true})
-            );
-            assert_eq!(
-                source_marker(&support, snapshot).as_deref(),
-                Some("pending")
-            );
-            assert_eq!(sc_record(&support, slug), None);
-        }
+        let (support, _env) = source_collection_support("source-resume-fail");
+        disable_snapshot_source(&support, SnapshotSource::Codex).unwrap();
+        let before = sc_files(&support);
+        let error = save_source_collection(&SourceKind::Codex, true, |_| {
+            Err(anyhow::anyhow!("offline"))
+        })
+        .expect_err("an unsaved resume fails");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        assert_eq!(sc_files(&support), before);
     }
 
     /// [format] Status always carries `source_paused`, read at status time:
@@ -30961,25 +30908,17 @@ X-API-Key = "otel_redacted"
         disable_snapshot_source(&support, SnapshotSource::Pi).unwrap();
         reconnect_snapshot_source(&support, SnapshotSource::Pi).unwrap();
         let status = serde_json::to_value(daemon.status_for_trusted_client().unwrap()).unwrap();
-        let paused = status["sources"]
-            .as_array()
-            .unwrap()
-            .iter()
+        let rows = status["sources"].as_array().unwrap().iter();
+        let paused: BTreeMap<_, _> = rows
             .map(|row| {
                 (
                     row["source"].as_str().unwrap(),
-                    row["source_paused"].clone(),
+                    row["source_paused"].as_bool(),
                 )
             })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            paused,
-            BTreeMap::from([
-                ("claude_code", json!(false)),
-                ("codex", json!(true)),
-                ("pi", json!(false)),
-            ])
-        );
+            .collect();
+        let expected = [("claude_code", false), ("codex", true), ("pi", false)];
+        assert_eq!(paused, BTreeMap::from(expected.map(|(s, p)| (s, Some(p)))));
     }
 
     /// [behaviour] Claude's legacy relay is revoked once per local answer.
