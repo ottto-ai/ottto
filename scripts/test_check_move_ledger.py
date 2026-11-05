@@ -512,10 +512,24 @@ class LedgerTests(unittest.TestCase):
     ''')
 
     def test_struct_fields_wrapped_after_a_visibility_token_are_a_reflowed_move(self):
-        status, out = self.move_long(self.WRAPPED_FIELDS, self.FIELDS)
-        self.assertEqual(status, 0, out)
-        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
-        self.assertIn('reflowed struct Index (crates/demo/src/snapshots.rs:', out)
+        table = 'pub(crate) struct Table {\n    map: HashMap<K, Vec<(A, B)>>,\n    call: Box<dyn Fn(A, B) -> C>,\n}\n'
+        wrapped = ('pub(crate) struct Table {\n    {a} map:\n        HashMap<K, Vec<(A, B)>>,\n'
+                   '    {b} call:\n        Box<dyn Fn(A, B) -> C>,\n}\n')
+        for name, before, after, label in (
+            ('long fields', self.FIELDS, self.WRAPPED_FIELDS, 'struct Index'),
+            ('nested generic and closure type', table,
+             wrapped.replace('{a}', 'pub(super)').replace('{b}', 'pub(super)'), 'struct Table'),
+            ('pub(in original module)', table,
+             wrapped.replace('{a}', 'pub(in crate::snapshots)').replace('{b}', 'pub(in crate::snapshots)'),
+             'struct Table'),
+            ('mixed scopes', table,
+             wrapped.replace('{a}', 'pub(super)').replace('{b}', 'pub(in crate::snapshots)'), 'struct Table'),
+        ):
+            with self.subTest(name):
+                status, out = self.move_long(after, before)
+                self.assertEqual(status, 0, out)
+                self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+                self.assertIn(f'reflowed {label} (crates/demo/src/snapshots.rs:', out)
 
     def test_struct_field_reflow_rejects_any_other_change(self):
         wrapped, fields = self.WRAPPED_FIELDS, self.FIELDS
@@ -533,6 +547,10 @@ class LedgerTests(unittest.TestCase):
              wrapped.replace('#[serde(default)]', '#[cfg_attr(any(), dummy())]')),
             ('tuple', 'pub(crate) struct Pair(u32, u64);\n',
              'pub(crate) struct Pair(\n    pub(super) u32,\n    pub(super) u64,\n);\n'),
+            ('doc comment', fields, wrapped.replace('/// Entries by path.', '/// Entries by name.')),
+            ('serde string', fields.replace('#[serde(default)]', '#[serde(rename = "a")]'),
+             wrapped.replace('#[serde(default)]', '#[serde(rename = "b")]')),
+            ('unit struct', 'pub(crate) struct Marker;\n', 'pub(crate) struct\n    Marker;\n'),
         ):
             with self.subTest(name):
                 status, out = self.move_long(after, before)
@@ -557,6 +575,24 @@ class LedgerTests(unittest.TestCase):
         status, out = run(self.repo, head, self.repo.commit({other: test.replace('true', '!false')}))
         self.assertEqual(status, 1, out)
         self.assertIn('changed: fn anchors', out)
+
+        def symlink():
+            # Git stores a link's target as its blob; a Rust target lets the run reach the item comparison.
+            (self.repo.root / listed).unlink()
+            os.symlink('fn anchors() {}', self.repo.root / listed)
+            return self.repo.commit({})
+
+        # Only an in-place edit of a regular file is a validator edit; the rest is checked as usual.
+        for name, change in (
+            ('deleted', lambda: self.repo.commit({listed: None})),
+            ('added', lambda: self.repo.commit({listed: test})),
+            ('symlink', symlink),
+        ):
+            with self.subTest(name):
+                before = self.repo.git('rev-parse', 'HEAD')
+                status, out = run(self.repo, before, change())
+                self.assertEqual(status, 1, out)
+                self.assertNotIn('validator edits', out)
 
     def test_report_mode_exits_zero_and_no_rust_change_is_a_pass(self):
         status, out = self.move(ROOT.replace('fn second() {}', 'fn second() { todo!() }'), None, '--report')

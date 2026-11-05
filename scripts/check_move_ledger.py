@@ -38,7 +38,8 @@ punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
 item must match byte for byte. An item must sit under the same module
 attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
 literal must resolve, from its new file, to a target with the same bytes.
-Edits to the files in VALIDATOR_EDITS are listed and not checked.
+In-place edits of the regular files in VALIDATOR_EDITS are listed and not
+checked; adding, deleting or retyping one of them is checked as usual.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -674,6 +675,18 @@ def side(repo: Path, rev: str, changed: list[str], other: rst.GitSource | None =
     return source, tree, files, units
 
 
+def validator_edits(repo: Path, base: str, head: str) -> list[str]:
+    """Listed validator paths changed in place: a regular file at both revisions (status M, mode 100644
+    on both sides). An added, deleted or type-changed listed path is checked like any other path."""
+    fields = rst.git(repo, "diff", "--raw", "--no-renames", "-z", base, head).split("\0")
+    edits = []
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        old_mode, new_mode, _, _, status = meta.lstrip(":").split()
+        if path in VALIDATOR_EDITS and status == "M" and old_mode == new_mode == "100644":
+            edits.append(path)
+    return sorted(edits)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="base commit (default: merge-base of origin/main and HEAD)")
@@ -689,10 +702,10 @@ def main(argv: list[str] | None = None) -> int:
         base = args.base or rst.default_base(repo)
         base_sha = rst.git(repo, "rev-parse", "--verify", f"{base}^{{commit}}").strip()
         head_sha = rst.git(repo, "rev-parse", "--verify", f"{args.head}^{{commit}}").strip()
-        every = rst.changed_files(repo, base_sha, head_sha)
-        changed = [path for path in every if path.endswith(".rs") and path not in VALIDATOR_EDITS]
+        validators = validator_edits(repo, base_sha, head_sha)
+        changed = [path for path in rst.changed_files(repo, base_sha, head_sha)
+                   if path.endswith(".rs") and path not in validators]
         print(f"move-ledger: base {base_sha[:12]} head {head_sha[:12]}: {len(changed)} changed .rs files")
-        validators = [path for path in every if path in VALIDATOR_EDITS]
         if validators:
             print(f"move-ledger: validator edits: {', '.join(validators)}")
         if not changed:
