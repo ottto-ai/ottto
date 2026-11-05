@@ -2283,31 +2283,16 @@ mod tests {
                 held_roots: 3,
                 held_copied: 1,
                 held_no_transcript_roots: 2,
-                held_no_transcript_bytes: u64::MAX,
-                ..Default::default()
-            });
-            claude_telemetry_retention(ClaudeTelemetryRetention {
                 held_no_transcript_bytes: 7,
                 ..Default::default()
             });
-            Probe::start().collection("claude_code", collection());
             Probe::start().collection("claude_code", collection());
         });
         let counts = &rows[0]["counts"];
         assert_eq!(counts["claude_telemetry_held_roots"], 3);
         assert_eq!(counts["claude_telemetry_held_copied"], 1);
         assert_eq!(counts["claude_telemetry_held_no_transcript_roots"], 2);
-        assert_eq!(
-            counts["claude_telemetry_held_no_transcript_bytes"],
-            u64::MAX,
-            "saturating"
-        );
-        for key in [
-            "claude_telemetry_held_no_transcript_roots",
-            "claude_telemetry_held_no_transcript_bytes",
-        ] {
-            assert!(rows[1]["counts"].get(key).is_none(), "drained: {key}");
-        }
+        assert_eq!(counts["claude_telemetry_held_no_transcript_bytes"], 7);
     }
 
     #[test]

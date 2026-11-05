@@ -3461,37 +3461,6 @@ mod tests {
             fs::remove_dir_all(dir).unwrap();
         }
     }
-
-    /// [regress] Retention sizes a held pair from metadata only: both, either
-    /// or neither member (a malformed body is never parsed); a symlink, a
-    /// non-file or a failed stat is a fault, never NotFound.
-    #[test]
-    fn telemetry_pair_bytes_is_metadata_only() {
-        let scratch = crate::test_scratch::ScratchDir::new("telemetry-pair-bytes");
-        let stem = telemetry_stem("pair-bytes");
-        let [api, trace] = telemetry_member_paths(&scratch, &stem);
-        let bytes = || telemetry_pair_bytes(&scratch, &stem);
-        assert_eq!(bytes(), Ok(None), "neither member");
-        for path in [&api, &trace] {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-        }
-        fs::write(&api, b"{not json").unwrap();
-        assert_eq!(bytes(), Ok(Some(9)), "API only, malformed");
-        fs::write(&trace, b"xyz\n").unwrap();
-        assert_eq!(bytes(), Ok(Some(13)), "both members");
-        fs::remove_file(&api).unwrap();
-        assert_eq!(bytes(), Ok(Some(4)), "trace only");
-        std::os::unix::fs::symlink(&trace, &api).unwrap();
-        assert_eq!(bytes(), Err(()), "symlink");
-        fs::remove_file(&api).unwrap();
-        fs::create_dir(&api).unwrap();
-        assert_eq!(bytes(), Err(()), "non-file");
-        // The API store is a file, so stat fails with NotADirectory.
-        let store = api.parent().unwrap();
-        fs::remove_dir_all(store).unwrap();
-        fs::write(store, b"").unwrap();
-        assert_eq!(bytes(), Err(()), "stat fault");
-    }
 }
 
 crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);

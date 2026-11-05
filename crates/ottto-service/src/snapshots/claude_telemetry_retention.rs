@@ -36,6 +36,14 @@ fn root_of(key: &str) -> Option<&str> {
     claude_index_path_member_ref(Path::new(key)).map(|member| member.root)
 }
 
+/// The keys the roster's walk listed, less this pass's removed keys.
+fn listed_keys<'a>(
+    roster: &'a g7_debt::Roster,
+    removed: &'a BTreeSet<String>,
+) -> impl Iterator<Item = &'a String> {
+    roster.listed.keys().filter(|key| !removed.contains(*key))
+}
+
 /// `removed`: this pass's removed keys; `named`: sessions this pass's
 /// snapshots name as parent or root.
 pub(crate) fn retire_claude_telemetry(
@@ -65,22 +73,29 @@ pub(crate) fn retire_claude_telemetry(
     let release = delivery_proven(&stems);
     let mut held = Counts::default();
     // Classification only: a listed family member proves a current transcript.
-    let listed = roster.listed.keys().filter(|key| !removed.contains(*key));
-    let listed = listed.filter_map(|key| root_of(key)).map(telemetry_stem);
-    let listed = listed.collect::<BTreeSet<_>>();
+    let listed = listed_keys(&roster, removed)
+        .filter_map(|key| root_of(key))
+        .map(telemetry_stem)
+        .collect::<BTreeSet<_>>();
     for stem in stems.difference(&release) {
         let no_transcript = !listed.contains(stem);
         match crate::claude_local_otel::telemetry_pair_bytes(support_dir, stem) {
             Ok(None) => continue,
             Ok(Some(bytes)) if no_transcript => held.held_no_transcript_bytes += bytes,
             Ok(Some(_)) => {}
-            Err(()) => held.read_fault += 1,
+            Err(()) => {
+                held.read_fault += 1;
+                continue;
+            }
         }
         held.held_roots += 1;
         held.held_no_transcript_roots += u64::from(no_transcript);
     }
+    if held != Counts::default() {
+        crate::local_resource_diagnostics::claude_telemetry_retention(held);
+    }
     let mut run = if release.is_empty() {
-        held
+        Counts::default()
     } else {
         retire(
             support_dir,
@@ -90,7 +105,6 @@ pub(crate) fn retire_claude_telemetry(
             named,
             &roster,
             release,
-            held,
         )
     };
     run.read_fault += listing_fault;
@@ -134,14 +148,13 @@ thread_local! {
 
 /// Test seam: on this thread, treat every candidate as delivered (`true`) or
 /// none, as today (`false`), to exercise the pipeline a proof releases into.
+/// Delete when the delivery proof lands.
 #[cfg(test)]
 pub(crate) fn prove_delivery_for_test(proven: bool) {
     PROVEN.with(|cell| cell.set(proven));
 }
 
-/// One run over `stems`, added to `run`: every stem with a member is retired,
-/// held or a fault.
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
+/// One run over `stems`: every stem with a member is retired, held or a fault.
 fn retire(
     support_dir: &Path,
     index: &ScanIndex,
@@ -150,10 +163,10 @@ fn retire(
     named: &[String],
     roster: &g7_debt::Roster,
     stems: BTreeSet<String>,
-    mut run: Counts,
 ) -> Counts {
+    let mut run = Counts::default();
     let Some(protected) = protected_stems(index, scan_roots, removed, named, roster) else {
-        run.held_roots += stems.len() as u64;
+        run.held_roots = stems.len() as u64;
         return run;
     };
     // A pair written after the roster's walk began is kept.
@@ -215,10 +228,7 @@ fn protected_stems(
             .flat_map(|witness| witness.legacy_owner_roots.iter()),
     );
     let mut roots = BTreeSet::<&str>::new();
-    let keys = roster
-        .listed
-        .keys()
-        .filter(|key| !removed.contains(*key))
+    let keys = listed_keys(roster, removed)
         .chain(index.files.keys())
         .chain(index.claude_request_census.records().map(|(key, _)| key))
         .chain(index.claude_account_deferred_holds.keys())

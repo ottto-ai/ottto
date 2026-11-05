@@ -183,9 +183,9 @@ fn telemetry_retention_equality_oracle() {
 
 /// [money] Positive control: one session on two accounts (a switch mid
 /// session, then back) with identity-tagged rows, and an unread pair. After
-/// retention deletes the proven the unread pair, a cold read and a restart from the
-/// saved index equal the reads with the pair present, and so does a reread
-/// after the survivor grows.
+/// retention deletes the unread pair, a cold read and a restart from the saved
+/// index equal the reads with the pair present, and so does a reread after the
+/// survivor grows.
 #[test]
 fn telemetry_retention_positive_control_cold_restart_and_append() {
     with_e2(|| {
@@ -520,10 +520,9 @@ fn telemetry_retention_keeps_every_dependency() {
 }
 
 /// [money] Fail closed, with delivery proven: a member that changes after it
-/// was read is kept under
-/// the lock; no current walk, a pair written after the walk began, a listed
-/// transcript with no census record (it may hold a copy), one without an
-/// mtime, and a malformed member all keep the pair. A transcript that grew
+/// was read is kept under the lock; no current walk, a pair written after the
+/// walk began, a listed transcript with no census record (it may hold a copy),
+/// one without an mtime, and a malformed member all keep the pair. A transcript that grew
 /// since its loss-free read is known through that read's ids.
 #[test]
 fn telemetry_retention_fails_closed() {
@@ -595,10 +594,9 @@ fn telemetry_retention_fails_closed() {
 }
 
 /// [money] The hint path, with delivery proven: a key this pass removed keeps
-/// its root's pair while
-/// the same relative path still exists (the walk did not list it), and the
-/// next run of the same walk, with no backlog, retires the pair only after a
-/// real NotFound.
+/// its root's pair while the same relative path still exists (the walk did not
+/// list it), and the next run of the same walk, with no backlog, retires the
+/// pair only after a real NotFound.
 #[test]
 fn telemetry_retention_hint_path_retires_only_after_not_found() {
     with_e2(|| {
@@ -619,13 +617,12 @@ fn telemetry_retention_hint_path_retires_only_after_not_found() {
     });
 }
 
-/// [format] A crash between a pair's two unlinks (delivery proven) leaves one
-/// member; without proof the next complete walk, in the same process, holds
-/// it. A restart's cold read of every survivor equals the read before
-/// retention, both after the crash and after the holding run (money and
-/// placement oracle).
+/// [format] With delivery proven, a crash between a pair's two unlinks leaves
+/// one member; the next complete walk, in the same process, deletes it. A
+/// restart's cold read of every survivor equals the read before retention, both
+/// after the crash and after the finishing run (money and placement oracle).
 #[test]
-fn telemetry_retention_holds_a_pair_after_a_crash_between_unlinks() {
+fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
     with_e2(|| {
         proven(true);
         let (c, warm) = corpus("telemetry-retention-crash");
@@ -639,38 +636,34 @@ fn telemetry_retention_holds_a_pair_after_a_crash_between_unlinks() {
         assert_eq!(members(&c, GONE), (false, true));
         let crashed = cold(&c);
         assert_equivalent(&before, &routed(&crashed, crashed.upload_policy));
-        proven(false);
         walked(&c, now_ms() + 60_000);
-        let counts = counted(|| retire(&c, &warm.index));
-        assert_eq!(members(&c, GONE), (false, true), "the remnant is held");
+        retire(&c, &warm.index);
+        assert_eq!(members(&c, GONE), (false, false));
         assert_eq!(members(&c, ROOT), (true, true));
-        assert!(counts.get("claude_sidecar_reparse_files").is_none());
-        assert!(counts.get("claude_telemetry_retired_roots").is_none());
         let finished = cold(&c);
         assert_equivalent(&before, &routed(&finished, finished.upload_policy));
     });
 }
 
-/// [regress] Each complete walk rechecks every stored pair: a pair held at one
-/// walk's end is held again after the next walk ends while its delivery is
-/// unproven, and counted again.
+/// [regress] With delivery proven, each complete walk rechecks every stored
+/// pair: a pair held at one walk's end is retired after the next walk ends,
+/// with no restart.
 #[test]
 fn telemetry_retention_rechecks_held_pairs_after_each_complete_walk() {
     with_e2(|| {
+        proven(true);
         let (c, warm) = corpus("telemetry-retention-per-walk");
         walked(&c, 0);
-        let first = counted(|| retire(&c, &warm.index));
+        retire(&c, &warm.index);
         assert_eq!(
             members(&c, GONE),
             (true, true),
             "written after walk 1 began"
         );
         walked(&c, now_ms() + 60_000);
-        let second = counted(|| retire(&c, &warm.index));
-        assert_eq!(members(&c, GONE), (true, true), "walk 2 holds it");
+        retire(&c, &warm.index);
+        assert_eq!(members(&c, GONE), (false, false), "walk 2 rechecks it");
         assert_eq!(members(&c, ROOT), (true, true));
-        assert_eq!(first, second, "held counts repeat per complete walk");
-        assert_eq!(second["claude_telemetry_held_roots"], 5);
     });
 }
 

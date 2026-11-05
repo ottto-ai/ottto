@@ -195,8 +195,8 @@ deleting), of which `claude_telemetry_held_copied` were kept by the copy rule,
 and `claude_telemetry_read_fault` the pairs kept because a member could not be
 read cleanly or unlinked. `claude_telemetry_held_no_transcript_roots` and
 `claude_telemetry_held_no_transcript_bytes` count the held pairs whose session
-has no transcript the last walk listed, and their member bytes from metadata
-(a member that cannot be statted adds no bytes). Deletion is paused until a
+has no transcript the last walk listed, and their member bytes from metadata.
+Deletion is paused until a
 pair's delivery can be proven, so every candidate is held today and none is
 read. A session with neither telemetry member is skipped. Every complete root
 walk makes the full recheck of stored pairs due again, so held counts repeat
