@@ -411,7 +411,7 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 main.clone(),
                 c.root.join(member(home, 1)),
                 main.clone(),
-                c.root.join(member(if reverse { "z" } else { "a" }, 2)),
+                c.root.join(member(if reverse { "z" } else { "a" }, 1)),
             ]
             .iter()
             .enumerate()
