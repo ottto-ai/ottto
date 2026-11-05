@@ -33,6 +33,7 @@ Options:
       --no-autostart     Do not kickstart the standard per-user ottto-service
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
+  -V, --version          Print version
 ### ottto status --help
 Show daemon, account, relay, update, and app health
 
