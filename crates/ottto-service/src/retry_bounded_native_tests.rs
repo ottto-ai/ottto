@@ -10,6 +10,7 @@ fn bounded_native_capture(f: &SameSourceAckFixture, now: Instant) -> PreparedRet
         std::slice::from_ref(&f.items[0]),
         &f.working,
         &f.baseline,
+        Default::default(),
         &f.progress,
         &f.index_path,
         &f.progress_path,

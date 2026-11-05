@@ -139,6 +139,8 @@ struct RouteState {
     pass_written_start: Option<u64>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
+    // Heads a partial save left out, kept for this pass's live retry.
+    unstaged: Vec<(String, tail::StagedFile)>,
 }
 impl RouteState {
     fn report_hold(&self) {
@@ -195,6 +197,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_hold: None,
                     pass_written_start: None,
                     tail: Default::default(),
+                    unstaged: Vec::new(),
                 }))
             })
             .clone()

@@ -2415,6 +2415,116 @@ fn pi_downgrade_then_reupgrade() {
 }
 
 #[cfg(unix)]
+/// [regress] A Pi page sheds, so its partial save keeps neither the new
+/// session's entry nor its head. The live retry's exact ACK and its own save
+/// stage that head again (`UnstagedTails`, as the retry turn does), so the
+/// save keeps the entry with its head. The next growth then reads only the
+/// suffix, with no `no_head` Full, and emits a cold Full's body.
+#[test]
+fn pi_live_retry_commits_the_shed_head() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        continuation_for_test, route_for_test, tail_counter_for_test,
+    };
+    let c = corpus("pi_live_retry_commits_the_shed_head");
+    let path = c.root.join("session.jsonl");
+    std::fs::write(&path, pi_seed()).unwrap();
+    input_clock(&path);
+    let key = path.to_str().unwrap();
+    let mut disk = Disk::with_route(&c, SnapshotSource::Pi);
+    let scanner = disk.owner(SnapshotSource::Pi);
+    let committed = route_for_test(
+        SnapshotSource::Pi,
+        Some(scanner.cache.as_ref()),
+        ScanIndex::default(),
+    );
+    // The page's own baseline, as the daemon's pass keeps it.
+    let (mut working, shed, modes) =
+        other_page(&c, &scanner, SnapshotSource::Pi, committed.clone());
+    assert_eq!(modes, (1, 0, 0), "a new Pi session reads Full");
+    let progress_path = snapshot_upload_progress_path(&disk.route);
+    // The route's own progress when it has one, as the daemon's checkpoint.
+    let durable = || {
+        std::fs::read(&progress_path).map_or_else(
+            |_| {
+                SnapshotUploadProgress::new(
+                    format!("{:064x}", 99),
+                    snapshot_quarantine_witness(SnapshotSource::Pi),
+                )
+            },
+            |bytes| serde_json::from_slice::<SnapshotUploadProgress>(&bytes).unwrap(),
+        )
+    };
+    let checkpoint = |working: &ScanIndex,
+                      committed: &ScanIndex,
+                      progress: &SnapshotUploadProgress,
+                      scan: Option<&SourceScanResult>| {
+        checkpoint_partial_snapshot_index(
+            working,
+            committed,
+            progress,
+            &shed.snapshots,
+            scan,
+            &BTreeSet::new(),
+            &disk.route,
+            &progress_path,
+            || Ok(()),
+        )
+    };
+    // The shed: no ACK, so the save keeps no entry and no head.
+    let saved = checkpoint(&working, &committed, &durable(), Some(&shed)).unwrap();
+    assert!(
+        !saved.files.contains_key(key),
+        "the shed save keeps no entry"
+    );
+    let mut unstaged = crate::snapshots::UnstagedTails::take(&working);
+    // The live retry: its exact ACK, then its save on the shed baseline.
+    let mut progress = durable();
+    let (status, _, _) = upload_source_under(
+        SnapshotSource::Pi,
+        SnapshotUploadPolicy::default(),
+        &shed.snapshots,
+        &mut progress,
+        ack,
+    );
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    progress.save(&progress_path).unwrap();
+    working.generation = saved.generation;
+    unstaged
+        .around(&working, || checkpoint(&working, &saved, &progress, None))
+        .unwrap();
+    let prior = ScanIndex::load(&disk.route).unwrap();
+    assert!(prior.files.contains_key(key), "the retry keeps the entry");
+    assert!(
+        continuation_for_test(SnapshotSource::Pi, &scanner.cache, &prior, key).is_some(),
+        "with its head"
+    );
+    pi_grow(
+        &path,
+        pi_turn(
+            "message",
+            Some("later-response"),
+            20,
+            "2026-10-27T06:02:00Z",
+        ),
+    );
+    let no_head = || tail_counter_for_test("tail_bootstrap_full", "no_head");
+    let before = no_head();
+    let restart = disk.owner(SnapshotSource::Pi);
+    let (_, grown, modes) = other_page(&c, &restart, SnapshotSource::Pi, prior.clone());
+    assert_eq!(modes, (0, 1, 0), "the growth reads only the suffix");
+    assert_eq!(no_head(), before, "no no_head Full");
+    let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Pi, prior);
+    assert_eq!(modes.1 + modes.2, 0, "the cold arm reads Full");
+    assert_eq!(
+        other_wire(SnapshotSource::Pi, &grown),
+        other_wire(SnapshotSource::Pi, &full),
+        "Pi retried Tail != Full"
+    );
+}
+
 /// [money] A mode-only change reads nothing, an mtime-only change reads Full,
 /// and later growth restores and Tails, each equal to cold Full.
 #[test]

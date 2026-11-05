@@ -90,6 +90,8 @@ pub(super) struct PreparedRetry {
     proof: Vec<BodyProof>,
     working: ScanIndex,
     baseline: ScanIndex,
+    /// Heads the shed save left out, staged again for this page's save.
+    unstaged: crate::snapshots::UnstagedTails,
     progress: SnapshotUploadProgress,
     index_path: PathBuf,
     progress_path: PathBuf,
@@ -100,7 +102,7 @@ pub(super) struct PreparedRetry {
 impl PreparedRetry {
     /// Admission precedes every deep copy. All native ledger/index/context
     /// storage shares the cap; no unaccounted 128KiB context is implied.
-    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "14 args; no options struct yet")]
     pub(super) fn capture(
         source: SnapshotSource,
         machine_id: &str,
@@ -109,6 +111,7 @@ impl PreparedRetry {
         items: &[SnapshotItem],
         working: &ScanIndex,
         baseline: &ScanIndex,
+        unstaged: crate::snapshots::UnstagedTails,
         progress: &SnapshotUploadProgress,
         index_path: &Path,
         progress_path: &Path,
@@ -144,6 +147,7 @@ impl PreparedRetry {
         counter.add(std::mem::size_of::<Self>())?;
         working.heap_bound(&mut counter)?;
         baseline.heap_bound(&mut counter)?;
+        unstaged.heap_bound(&mut counter)?;
         progress.heap_bound(&mut counter)?;
         counter.add(index_path.as_os_str().len())?;
         counter.add(progress_path.as_os_str().len())?;
@@ -177,6 +181,7 @@ impl PreparedRetry {
             proof,
             working: working.clone(),
             baseline: baseline.clone(),
+            unstaged,
             progress: progress.clone(),
             index_path: index_path.to_owned(),
             progress_path: progress_path.to_owned(),
@@ -418,23 +423,27 @@ impl PreparedRetry {
         // evidence back or adopts a competitor's disk generation.
         budget.remaining(Instant::now())?;
         validate()?;
-        let checkpoint = checkpoint_partial_snapshot_index_with_audit_release(
-            &self.working,
-            &self.baseline,
-            &self.progress,
-            &self.items,
-            // Retained-body retries carry correction debt unchanged; no new
-            // scan facts can qualify an empty-member completion here.
-            None,
-            &BTreeSet::new(),
-            &self.index_path,
-            &self.progress_path,
-            validate,
-            Some(crate::snapshot_retry::RESPONSE_BYTES),
-            None,
-            None,
-            Default::default(),
-        )?;
+        // The shed save's left-out heads stage again: this save keeps each
+        // with its entry, or leaves it out again by the same rule.
+        let checkpoint = self.unstaged.around(&self.working, || {
+            checkpoint_partial_snapshot_index_with_audit_release(
+                &self.working,
+                &self.baseline,
+                &self.progress,
+                &self.items,
+                // Retained-body retries carry correction debt unchanged; no new
+                // scan facts can qualify an empty-member completion here.
+                None,
+                &BTreeSet::new(),
+                &self.index_path,
+                &self.progress_path,
+                validate,
+                Some(crate::snapshot_retry::RESPONSE_BYTES),
+                None,
+                None,
+                Default::default(),
+            )
+        })?;
         self.working.generation = checkpoint.generation;
         self.working.mark_bounded_sweep_unsettled();
         self.baseline = checkpoint;
