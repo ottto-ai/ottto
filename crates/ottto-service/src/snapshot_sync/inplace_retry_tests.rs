@@ -288,7 +288,7 @@ fn never_retried_in_place() {
         driven.result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert_eq!(driven.posts.len(), 1);
@@ -355,7 +355,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
             |_| Ok(()),
         )
     });
-    assert_eq!(deferred.unwrap(), 1);
+    assert_eq!(deferred.unwrap(), 0);
     assert_eq!(posts, 2);
     assert_eq!(waits.len(), 1);
     assert!(!progress

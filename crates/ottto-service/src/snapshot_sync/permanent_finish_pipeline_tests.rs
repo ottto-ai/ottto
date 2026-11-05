@@ -133,13 +133,14 @@ impl FinishServer {
                     if matches!(outcome, FinishOutcome::Identity) {
                         status = "503 Service Unavailable";
                         serde_json::json!({"code":"snapshot_original_identity_unavailable", "errors":(0..items.len()).map(|i| serde_json::json!({"loc":["body","snapshots",i]})).collect::<Vec<_>>()})
-                    } else if matches!(
-                        outcome,
-                        FinishOutcome::Validation | FinishOutcome::ConflictValidation
-                    ) && validation_index.is_some()
-                    {
+                    } else if let Some(index) = validation_index.filter(|_| {
+                        matches!(
+                            outcome,
+                            FinishOutcome::Validation | FinishOutcome::ConflictValidation
+                        )
+                    }) {
                         status = "422 Unprocessable Entity";
-                        serde_json::json!({"errors":[{"loc":["body","snapshots",validation_index.unwrap(),"field"]}]})
+                        serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
                     } else if matches!(outcome, FinishOutcome::Accept | FinishOutcome::Witness) {
                         let entities = items.iter().map(|item| {
                             assert!(item.get("cache_observations").is_none());
@@ -394,6 +395,22 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         )
         .unwrap();
         assert!(!progress.accepted_fingerprints.contains(fingerprint));
+        if matches!(outcome, FinishOutcome::ConflictValidation) {
+            assert_eq!(saved.quarantined_snapshot_fingerprints.len(), 2);
+            for item in offered.iter() {
+                let fp = item["snapshot_fingerprint"].as_str().unwrap();
+                let record = &saved.quarantined_snapshot_fingerprints[fp];
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert_eq!(
+                    record.upload_body_witness.as_ref(),
+                    offered_witnesses.get(fp)
+                );
+                assert!(!saved.accepted_snapshot_fingerprint_recorded(fp));
+            }
+        }
         if let FinishOutcome::Dominated {
             reason: "accepted_log_stale_older_upload",
             ..
