@@ -78,8 +78,9 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// A late-evidence re-fold needs complete stored state: a set-aside file
 /// reads natively instead. A body waiting on a server retry re-folds: it is
 /// the same body a native read sends. Whatever the selection, a file whose
-/// session owes a head-CAS answer never continues from stored state; the
-/// load refuses it ([`conflict_owed`]) once the head names the session.
+/// session owes a head-CAS answer that can ride an upload never continues
+/// from stored state; the load refuses it ([`conflict_owed`]) once the head
+/// names the session. A challenge without a saved base follows these rules.
 pub(in crate::snapshots) fn reuses_stored(
     index: &ScanIndex,
     key: &str,
@@ -115,10 +116,11 @@ pub(in crate::snapshots) fn held_new(index: &ScanIndex, key: &str) -> bool {
     !index.files.contains_key(key) && index.claude_request_census.get(key).is_some()
 }
 
-/// The stored head's session owes a head-CAS answer: the upload ledger holds
-/// an open challenge for it. The answer attaches to any outgoing body of the
-/// session and claims a full rescan, so it rides only a real native Full: the
-/// file reads Full whatever its selection, a grown file included.
+/// The stored head's session owes a head-CAS answer that can ride an upload:
+/// the upload ledger holds an open challenge and a saved base for it. The
+/// answer attaches to an outgoing body of the session and claims a full
+/// rescan, so it rides only a real native Full: the file reads Full whatever
+/// its selection, a grown file included.
 pub(in crate::snapshots) fn conflict_owed(
     index: &ScanIndex,
     path: &Path,

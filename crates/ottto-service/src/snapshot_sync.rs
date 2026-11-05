@@ -9265,9 +9265,16 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
-    // A session that owes a head-CAS answer reads natively, never from Tail.
+    // A session whose upload can carry a head-CAS answer reads natively, never
+    // from Tail. The answer replaces a saved base (`attach_head_conflict_answers`);
+    // a challenge without one never answers, and an ordinary accept clears it.
     index.activate_head_conflict_sessions(
-        progress.head_conflict_challenges.keys().cloned().collect(),
+        progress
+            .head_conflict_challenges
+            .keys()
+            .filter(|key| progress.accepted_cache_heads.contains_key(*key))
+            .cloned()
+            .collect(),
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();

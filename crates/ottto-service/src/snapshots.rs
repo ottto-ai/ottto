@@ -32717,7 +32717,8 @@ impl ScanIndex {
             .collect()
     }
 
-    /// Mirror the upload ledger's open head-CAS challenge sessions.
+    /// Mirror the upload ledger's open head-CAS challenge sessions that hold a
+    /// saved base, the only ones whose upload can carry the answer.
     pub(crate) fn activate_head_conflict_sessions(&mut self, sessions: BTreeSet<String>) {
         self.head_conflict_sessions = sessions;
     }
