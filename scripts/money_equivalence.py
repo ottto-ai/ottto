@@ -36,7 +36,9 @@ NATIVE_FIXTURES = frozenset({
 # yet. A name the base does not emit is UNCOMPARED (the head's VERIFIED receipt
 # only, never a match or a diff). Once the base emits it, it is compared like
 # any other fixture and can be removed here.
-HEAD_ONLY_FIXTURES = ()
+HEAD_ONLY_FIXTURES = (
+    "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
+)
 
 
 # Base and head bodies must match exactly. The only accepted difference is a

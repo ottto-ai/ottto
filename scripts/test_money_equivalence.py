@@ -908,8 +908,8 @@ class HeadOnlyFixtureTests(unittest.TestCase):
                     "head": native_coverage("head", arm_log("head", head))}
         return receipt_names(*self.receipts(base, head), expected["head"], expected["base"])
 
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", ())
     def test_empty_head_only_set_is_todays_gate(self):
-        self.assertEqual(money_equivalence.HEAD_ONLY_FIXTURES, ())
         self.assertEqual(len(NATIVE_FIXTURES), 10)
         names = sorted(NATIVE_FIXTURES)
         self.assertEqual(self.coverage_and_receipts(names, names),
