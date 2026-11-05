@@ -1334,7 +1334,12 @@ impl LocalDaemon {
             existing
                 .recommended_actions
                 .retain(|action| action.action != RepairActionKind::WriteConfig);
-            if existing.state == SourceState::NeedsRepair && existing.problems.is_empty() {
+            if existing.state == SourceState::NeedsRepair
+                && existing
+                    .problems
+                    .iter()
+                    .all(claude_shell_telemetry::is_problem)
+            {
                 existing.state = SourceState::Healthy;
                 existing.grade = HealthGrade::Ok;
             }
@@ -9040,11 +9045,24 @@ mod tests {
         let mut verified = verified_codex("2026-05-05T10:20:00Z");
         verified.source = SourceKind::ClaudeCode;
         daemon.record_verification_result(&verified).unwrap();
+        {
+            let mut state = daemon.state().unwrap();
+            let health = &mut state.sources[0];
+            health.state = SourceState::NeedsRepair;
+            health.problems.push(HealthProblem {
+                code: StableProblemCode::ConfigDrift,
+                title: "Config drift".into(),
+                detail: "Synthetic drift".into(),
+                retryable: true,
+            });
+        }
         daemon
             .record_config_repair_result(&SourceKind::ClaudeCode, verified.config.clone())
             .unwrap();
         let assert_finding = || {
             let state = daemon.state().unwrap();
+            assert_eq!(state.sources[0].state, SourceState::Healthy);
+            assert_eq!(state.sources[0].grade, HealthGrade::Warning);
             assert_eq!(
                 state.sources[0]
                     .problems
