@@ -31,8 +31,12 @@ fn response_line(source: SnapshotSource, session: &str, turn: u64) -> String {
 }
 
 fn native_corpus(source: SnapshotSource) -> (Corpus, Vec<PathBuf>) {
+    native_corpus_of(source, &SESSIONS)
+}
+
+fn native_corpus_of(source: SnapshotSource, sessions: &[&str]) -> (Corpus, Vec<PathBuf>) {
     let mut c = corpus("unkept-native-oracle");
-    let paths = SESSIONS
+    let paths = sessions
         .iter()
         .map(|session| {
             let header = match source {
@@ -439,6 +443,77 @@ fn retained_unkept_revisions_requeue_for_every_source_and_failure() {
     });
 }
 
+/// [regress] At page limit 1 a failed, non-audit, re-queued key joins the
+/// back of the census queue: the other pending key is read first, then it.
+#[test]
+#[serial]
+fn unkept_non_audit_key_rotates_at_page_limit_one() {
+    with_e2(|| {
+        let (c, paths) = native_corpus_of(SOURCE, &SESSIONS[..2]);
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let selected = |page: &Page| {
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    let slot = SESSIONS
+                        .iter()
+                        .position(|session| *session == item.source_session_id)
+                        .unwrap();
+                    paths[slot].to_str().unwrap().to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = native_page(SOURCE, &c, prior, 1, true);
+        assert_eq!(first.scan.scanned_file_count, 1);
+        assert!(!first.scan.census_complete, "retained traversal");
+        let [failed] = <[String; 1]>::try_from(selected(&first)).unwrap();
+        let other = paths
+            .iter()
+            .map(|path| path.to_str().unwrap().to_string())
+            .find(|key| *key != failed)
+            .unwrap();
+        let mut progress = progress(SOURCE);
+        let (status, _) = send(SOURCE, &first, &mut progress, |_| {
+            Err(anyhow!("synthetic upload error"))
+        });
+        assert!(status.is_err());
+        let mut owed = checkpoint(
+            &first,
+            &mut progress,
+            session.path(),
+            Some(crate::snapshots::UnsettledUploadCause::UploadError),
+        );
+        assert_eq!(
+            crate::snapshots::e2_pipeline_scan_fixture::pending_keys_for_test(&owed),
+            BTreeSet::from([failed.clone(), other.clone()]),
+            "the failed key is re-queued beside the other pending key"
+        );
+        let mut order = Vec::new();
+        for remaining in [BTreeSet::from([failed.clone()]), BTreeSet::new()] {
+            let page = native_page(SOURCE, &c, owed, 1, true);
+            let [key] = <[String; 1]>::try_from(selected(&page)).unwrap();
+            order.push(key);
+            owed = commit_native(SOURCE, &session, page);
+            if !remaining.is_empty() {
+                assert_eq!(
+                    crate::snapshots::e2_pipeline_scan_fixture::pending_keys_for_test(&owed),
+                    remaining
+                );
+            }
+        }
+        assert_eq!(
+            order,
+            [other, failed],
+            "the other key is selected first; the failed key comes back after it"
+        );
+    });
+}
+
 /// [money] A receiver-stored body with a lost ACK is an idempotent replacement;
 /// growth before retry follows ordinary update rules and preserves accepted buckets.
 #[test]
@@ -711,7 +786,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 &line(ROOT, "boundary-agent", "2026-08-02T07:04:00Z", 3),
             );
             let scanner = E2ScanFixture::capturing_identity();
-            let mut current = c.raw(&scanner, prior, 3, true, &[root.clone(), agent]);
+            let mut current = c.raw(&scanner, prior, 3, true, &[root.clone(), agent.clone()]);
             current.enrich_with(&c, Some(&mut sender.accepted_identity_buckets));
             assert!(current.finish().held_fingerprints.is_empty());
             assert_eq!(current.scan.snapshots.len(), 2);
@@ -722,6 +797,8 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 .iter()
                 .map(|item| item.snapshot_fingerprint.clone())
                 .collect::<BTreeSet<_>>();
+            let mut faulted: Option<String> = None;
+            let sent_at = current_unix_seconds();
             // The shared ACK fixture's mixed-incidence seam: both real native
             // entity bodies belong to ONE file's checkpoint, so one ACK cannot
             // publish that file's revision.
@@ -747,7 +824,13 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     let mut response = ack(items)?;
                     match fault {
                         "malformed_ack" => {
-                            response.accepted_entities[0].body_witness_digest = Some("0".repeat(64))
+                            // One ref echoes another body witness, once; the
+                            // re-sent siblings get their own exact ACK.
+                            if faulted.is_none() {
+                                let entity = &mut response.accepted_entities[0];
+                                faulted = Some(entity.snapshot_fingerprint.clone());
+                                entity.body_witness_digest = Some("0".repeat(64));
+                            }
                         }
                         "partial_ack" => {
                             response.accepted_entities.pop();
@@ -768,7 +851,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     }
                     Ok(response)
                 });
-                if matches!(fault, "malformed_ack" | "partial_ack") {
+                if fault == "partial_ack" {
                     assert!(status.is_err());
                 } else {
                     assert!(status.is_ok());
@@ -779,10 +862,51 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 current_credit,
                 match fault {
                     "durable_ack" => 2,
-                    "mixed_file" => 1,
+                    "mixed_file" | "malformed_ack" => 1,
                     _ => 0,
                 }
             );
+            if fault == "malformed_ack" {
+                // A named body-witness refusal (neither shed nor a validation
+                // reject): the ref is held RetryPending on the bounded refusal
+                // clock and gets zero credit; siblings settle on their own ACK.
+                let faulted = faulted.as_deref().expect("one ref refused");
+                let item = current
+                    .scan
+                    .snapshots
+                    .iter()
+                    .find(|item| item.snapshot_fingerprint == faulted)
+                    .unwrap();
+                let record = &sender.quarantined_fingerprints[faulted];
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert_eq!(
+                    record.upload_body_witness.as_deref(),
+                    Some(snapshot_upload_body_witness(item).as_str())
+                );
+                let base = SNAPSHOT_QUARANTINE_RETRY_SECONDS;
+                assert!(
+                    (jittered_retry_after(faulted, sent_at, base)
+                        ..=jittered_retry_after(faulted, current_unix_seconds(), base))
+                        .contains(&record.retry_after_unix_seconds),
+                    "body_witness_refused retry clock, not an identity deferral"
+                );
+                assert!(!sender.accepted_fingerprints.contains(faulted));
+                assert!(!sender.accepted_body_witnesses.contains_key(faulted));
+                for sibling in current
+                    .scan
+                    .snapshots
+                    .iter()
+                    .filter(|item| item.snapshot_fingerprint != faulted)
+                {
+                    assert!(sender.contains_body(
+                        &sibling.snapshot_fingerprint,
+                        &snapshot_upload_body_witness(sibling)
+                    ));
+                }
+            }
             let owed = checkpoint(
                 &current,
                 &mut sender,
@@ -797,6 +921,35 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     current.index.files[root.to_str().unwrap()].source_file_fingerprint,
                     "one unaccepted sibling prevents file settlement"
                 );
+            }
+            if let Some(faulted) = faulted.as_deref() {
+                // The refused ref keeps its file debt: no settlement.
+                let members = serde_json::to_value(&current.index).unwrap();
+                let owing = [root.to_str().unwrap(), agent.to_str().unwrap()]
+                    .into_iter()
+                    .filter(|key| {
+                        members["file_snapshot_fingerprints"][*key]
+                            .as_array()
+                            .is_some_and(|set| set.iter().any(|fp| fp == faulted))
+                    })
+                    .collect::<Vec<_>>();
+                for key in [root.to_str().unwrap(), agent.to_str().unwrap()] {
+                    let kept = loaded.files[key].source_file_fingerprint
+                        != current.index.files[key].source_file_fingerprint;
+                    assert!(
+                        kept || !owing.contains(&key),
+                        "refused ref keeps its file debt"
+                    );
+                }
+                assert!(
+                    [root.to_str().unwrap(), agent.to_str().unwrap()]
+                        .into_iter()
+                        .any(|key| loaded.files[key].source_file_fingerprint
+                            != current.index.files[key].source_file_fingerprint),
+                    "no settlement for the refused file"
+                );
+                // The named-refusal retry owns its next offer; this helper adds no release.
+                continue;
             }
             if fault == "not_stored" {
                 // Receiver head dominance is custody, never stored-body credit.
