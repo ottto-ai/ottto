@@ -37,7 +37,7 @@ fn grandfathered_twin_keeps_accepted_body_on_reread() {
         let copy = parse_undecided(&z, Some(t0() + 100_000_000_000), index, &lines);
         assert!(fold(&copy).grandfathered);
         assert!(!fold(&copy).twin_pending);
-        publish(vec![original, copy], None, TelemetryRead::NotRead, index)
+        publish(vec![original, copy], None, TelemetryRead::Loaded, index)
     };
     let accepted = read(&index);
     assert_eq!(
@@ -138,7 +138,7 @@ fn eligible_copy_without_a_holder_counts() {
             ),
             (1, 0, 0)
         );
-        let body = publish(items, None, TelemetryRead::NotRead, &index);
+        let body = publish(items, None, TelemetryRead::Loaded, &index);
         assert_eq!(body[0].request_count, if state == "lacks" { 2 } else { 1 });
         fs::remove_dir_all(a.ancestors().nth(4).unwrap()).unwrap();
     }
