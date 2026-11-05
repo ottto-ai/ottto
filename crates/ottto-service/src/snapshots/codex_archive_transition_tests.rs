@@ -1514,7 +1514,8 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
 /// [regress] A shed partial save commits no Tail head for a file whose entry
 /// it does not keep, so the next page reads that file: a new rollout Full, an
 /// appended one from its kept head. The appended row is the [money] row: the
-/// owed turn posts as a cold Full does, never a Skip.
+/// owed turn posts as a cold Full does, never a Skip. The Claude row with a
+/// held file is `shed_save_keeps_held_custody_and_drops_unkept_heads`.
 #[test]
 fn shed_save_commits_heads_only_for_kept_entries() {
     let _lock = DECODER_TEST_LOCK
@@ -1531,9 +1532,12 @@ fn shed_save_commits_heads_only_for_kept_entries() {
         );
         let page_on =
             |index: ScanIndex| page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+        // A metadata-only head (an inventory observation) is not a read's
+        // continuation and stays by design, as `codex_physical_matches` skips it.
         let head = |index: &ScanIndex| {
             state_v2::load_head(index, &key, REVISION)
                 .unwrap()
+                .filter(|head| !head.metadata_only)
                 .map(|head| head.body)
         };
         let mut before = prior;
