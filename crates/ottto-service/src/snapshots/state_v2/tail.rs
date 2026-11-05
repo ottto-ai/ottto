@@ -385,6 +385,14 @@ impl TailStage {
             self.retire.insert(key);
         }
     }
+    /// Drops the heads staged for `keys`; set-asides and debt stay.
+    pub(super) fn unstage(&mut self, keys: impl IntoIterator<Item = String>) {
+        for key in keys.into_iter().map(String::into_bytes) {
+            if matches!(self.files.get(&key), Some(Entry::File(_))) {
+                self.files.remove(&key);
+            }
+        }
+    }
     /// Files staged with their complete new state.
     pub(super) fn staged(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.files

@@ -26592,22 +26592,7 @@ impl ScanIndex {
             .files
             .iter()
             .filter(|(key, entry)| {
-                !self.files.contains_key(*key)
-                    && !working.decode_holds_file(key)
-                    && !entry
-                        .last_snapshot_fingerprint
-                        .iter()
-                        .chain(
-                            working
-                                .file_snapshot_fingerprints
-                                .get(*key)
-                                .into_iter()
-                                .flatten(),
-                        )
-                        .any(|fingerprint| {
-                            locally_held.contains(fingerprint)
-                                || working.decode_holds_entity(fingerprint)
-                        })
+                !self.files.contains_key(*key) && !working.file_is_held(key, entry, locally_held)
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
@@ -26619,6 +26604,29 @@ impl ScanIndex {
                 "unacknowledged",
             );
         }
+    }
+
+    /// One hold test for every source: the file is decode-held, or one of its
+    /// entities is locally held or decode-held.
+    fn file_is_held(
+        &self,
+        key: &str,
+        entry: &ScanIndexEntry,
+        locally_held: &BTreeSet<String>,
+    ) -> bool {
+        self.decode_holds_file(key)
+            || entry
+                .last_snapshot_fingerprint
+                .iter()
+                .chain(
+                    self.file_snapshot_fingerprints
+                        .get(key)
+                        .into_iter()
+                        .flatten(),
+                )
+                .any(|fingerprint| {
+                    locally_held.contains(fingerprint) || self.decode_holds_entity(fingerprint)
+                })
     }
 
     #[cfg(test)]
@@ -26726,14 +26734,7 @@ impl ScanIndex {
                 if !entry.source_file_fingerprint.is_empty()
                     && crate::local_resource_diagnostics::claude_reread::active()
                 {
-                    let held = self.decode_holds_file(key)
-                        || entry.last_snapshot_fingerprint.as_ref().is_some_and(|fp| {
-                            locally_held.contains(fp) || self.decode_holds_entity(fp)
-                        })
-                        || self.file_snapshot_fingerprints.get(key).is_some_and(|fps| {
-                            !fps.is_disjoint(locally_held)
-                                || fps.iter().any(|fp| self.decode_holds_entity(fp))
-                        });
+                    let held = self.file_is_held(key, entry, locally_held);
                     // Exactly the early exact-incidence branch, and the legacy
                     // head/equality fallback would have admitted this sibling.
                     let exact_only = !held
@@ -26756,6 +26757,18 @@ impl ScanIndex {
                     );
                 }
                 files.insert(key.clone(), committed.clone());
+            }
+        }
+        // A partial save commits a Tail head only for an entry it keeps or a
+        // held file's custody: any other restored or omitted file keeps its
+        // committed head, and its next read starts there. A route error here
+        // also fails the save that would commit.
+        if !every_batch_sent {
+            if let Ok(Some(route)) = state_v2::runtime_path(self) {
+                let unkept = self.files.iter().filter(|(key, entry)| {
+                    !safe_keys.contains(*key) && !self.file_is_held(key, entry, locally_held)
+                });
+                let _ = state_v2::unstage_tail(&route, unkept.map(|(key, _)| key.clone()));
             }
         }
 

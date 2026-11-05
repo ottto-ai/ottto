@@ -623,6 +623,173 @@ fn held_new_file_continues(restart: bool) {
     });
 }
 
+/// [regress] Claude row of `shed_save_commits_heads_only_for_kept_entries`:
+/// a shed partial save keeps a held NEW file's custody head, while a NEW file
+/// it neither keeps nor holds commits no head, so the next page reads it Full.
+#[test]
+fn shed_save_keeps_held_custody_and_drops_unkept_heads() {
+    use crate::snapshots::claude_request_census::with_walk_deadline_for_test as deadline;
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        continuation_for_test, continue_route_for_test, route_of, save_reload_for_test,
+    };
+    const FRESH: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    with_e2(|| {
+        let mut c = corpus("s2-shed-held-and-unkept");
+        c.root(ROOT, &line(ROOT, "root", AT, 10));
+        c.evidence_for(
+            COPY,
+            &[api_login(COPY, "own", 20, '1', Some('7'))],
+            &[trace_for(COPY, "own", "")],
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        let mut prior = ScanIndex::default();
+        for _ in 0..2 {
+            let settled = ready(&c, &scanner, prior.clone(), 100, true);
+            prior = settle_captured_holds(&c, &prior, settled, &mut progress);
+        }
+        let held = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "root", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        // Born before its line, so no census decides it: it is not held.
+        let fresh = c.root(FRESH, &line(FRESH, "fresh", AT, 30));
+        let mut shed = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        deadline(|| shed.enrich(&c));
+        assert_withheld(&shed, COPY, "external census unavailable");
+        let holds = shed.finish();
+        assert!(body(&shed, FRESH).is_some(), "the fresh file is not held");
+        // The upload sheds before any ACK: only the partial checkpoint saves.
+        let route = route_of(&shed.committed).unwrap();
+        // The route owns its progress file: the checkpoint compares against it.
+        let progress_path = snapshot_upload_progress_path(&route);
+        let durable: SnapshotUploadProgress =
+            serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
+        let mut saved = checkpoint_partial_snapshot_index(
+            &shed.index,
+            &shed.committed,
+            &durable,
+            &shed.scan.snapshots,
+            Some(&shed.scan),
+            &holds.held_fingerprints,
+            &route,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        let prior = save_reload_for_test(&mut saved, &c.base.join("scan-index.json"));
+        let head = |path: &Path| {
+            continuation_for_test(SOURCE, &scanner.cache, &prior, path.to_str().unwrap())
+        };
+        assert!(!prior.files.contains_key(held.to_str().unwrap()));
+        assert!(!prior.files.contains_key(fresh.to_str().unwrap()));
+        assert!(
+            head(&held).is_some(),
+            "the held file keeps its custody head"
+        );
+        assert!(head(&fresh).is_none(), "the unkept file commits no head");
+        // A restart keeps only the durable state.
+        let restarted = E2ScanFixture::capturing_identity();
+        continue_route_for_test(&restarted.cache, &route);
+        let mut next = c.raw(&restarted, prior, 100, true, &[]);
+        assert_eq!(
+            next.modes,
+            (1, 0, 1),
+            "the unkept file reads Full, the held one continues from its head"
+        );
+        next.enrich(&c);
+        assert!(body(&next, FRESH).is_some(), "the unkept file publishes");
+        next.finish();
+    });
+}
+
+/// [money] Updated-file row of `shed_save_commits_heads_only_for_kept_entries`:
+/// a shed partial save keeps an appended file's committed entry and head, so
+/// its unACKed turn stays owed. The next page reads it by Tail, once: the
+/// body and its placement (two accounts, a switch, a side call and an
+/// evidence gap) equal a cold Full's.
+#[test]
+fn shed_save_keeps_an_appended_turn_owed_once() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        continuation_for_test, route_of, save_reload_for_test,
+    };
+    with_e2(|| {
+        let (c, path) = placement_corpus("s2-shed-appended-owed");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        let prior = commit(&session, seed);
+        let agent = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
+        append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        append(
+            &agent,
+            &line(ROOT, "agent-later", "2026-08-02T07:04:00Z", 3),
+        );
+        let grown = [path.clone(), agent];
+        let head = |index: &ScanIndex| {
+            continuation_for_test(SOURCE, &scanner.cache, index, path.to_str().unwrap())
+                .map(|head| head.sealed_offset())
+        };
+        let kept = head(&prior);
+        assert!(kept.is_some(), "the seed commits a head");
+        // The upload sheds before any ACK: only the partial checkpoint saves.
+        let mut shed = c.raw(&scanner, prior.clone(), 100, true, &grown);
+        shed.enrich(&c);
+        let holds = shed.finish();
+        assert!(shed.modes.1 > 0, "the shed page reads the append");
+        let route = route_of(&shed.committed).unwrap();
+        let progress_path = snapshot_upload_progress_path(&route);
+        let durable = std::fs::read(&progress_path).map_or_else(
+            |_| e2_progress(),
+            |bytes| serde_json::from_slice(&bytes).unwrap(),
+        );
+        let mut saved = checkpoint_partial_snapshot_index(
+            &shed.index,
+            &shed.committed,
+            &durable,
+            &shed.scan.snapshots,
+            Some(&shed.scan),
+            &holds.held_fingerprints,
+            &route,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        let prior = save_reload_for_test(&mut saved, &c.base.join("scan-index.json"));
+        assert_eq!(head(&prior), kept, "the shed save keeps the committed head");
+        let mut owed = hinted(&c, prior, 100, true, &grown);
+        assert_eq!(owed.modes.0, 0, "the kept head continues: no Full");
+        assert!(owed.modes.1 > 0, "the appended turn reads by Tail");
+        assert!(
+            owed.scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == ROOT),
+            "the unACKed turn stays owed"
+        );
+        let mut cold_page = page(&c, ScanIndex::default(), 100, false);
+        cold_page.scan.snapshots.retain(|item| {
+            owed.scan
+                .snapshots
+                .iter()
+                .any(|owed| owed.source_session_id == item.source_session_id)
+        });
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert!(
+            accounts(&cold).len() >= 2,
+            "positive control: two placed accounts"
+        );
+        money_oracle::assert_equivalent(&cold, &result(&owed, Mode::Restart));
+        owed.finish();
+    });
+}
+
 /// [money] Pages use fresh owners and cold graph loads at every boundary.
 /// Accumulated emitted bodies equal the single cold Full upload.
 #[test]
