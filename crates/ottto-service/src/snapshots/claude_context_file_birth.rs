@@ -1226,10 +1226,11 @@ pub(super) fn admit_claude_file_birth_posture(
         {
             ClaudeFileBirthVerdict::UntimedRecord
         }
+        // Before AllCopied: one copy cannot speak for an id with two files.
+        _ if multi_file => ClaudeFileBirthVerdict::MultiFile,
         _ if birth.tagged_responses > 0 && birth.own_responses == 0 => {
             ClaudeFileBirthVerdict::AllCopied
         }
-        _ if multi_file => ClaudeFileBirthVerdict::MultiFile,
         _ if tripwire.over_bound_roots.contains(root_session_id) => {
             ClaudeFileBirthVerdict::EvidenceBound
         }
