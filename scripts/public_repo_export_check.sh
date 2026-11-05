@@ -176,8 +176,9 @@ while IFS=$'\t' read -r scope pattern description; do
       continue
     fi
     if grep -IEn -- "$pattern" "$REPO_ROOT/$candidate" > "$grep_output_file" 2>/dev/null; then
-      while IFS= read -r hit; do
-        fail "$description: $candidate:$hit"
+      # Report the location only; never echo the matched content.
+      while IFS=: read -r line_number _; do
+        fail "$description: $candidate:$line_number"
       done < "$grep_output_file"
       : > "$grep_output_file"
     fi
