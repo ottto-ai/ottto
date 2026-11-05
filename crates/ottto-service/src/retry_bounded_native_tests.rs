@@ -284,7 +284,7 @@ fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recover
         .unwrap();
     assert!(matches!(
         outcome,
-        SnapshotPageOutcome::Settled { conflicted: 0 }
+        SnapshotPageOutcome::Settled { conflicted: 0, .. }
     ));
     assert_eq!(page.budget.posts_left(), 0);
     let trace = server.join().unwrap();

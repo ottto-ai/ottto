@@ -642,32 +642,50 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     .unwrap();
     assert_eq!(
         with_retained_refusal_conflicts(result, &index, &progress, NOW),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(
         with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
-        ResumableUploadResult::Deferred { count: 1 },
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        },
         "an empty frozen delta still owes retry debt"
     );
     assert_eq!(
         with_retained_refusal_conflicts(
-            ResumableUploadResult::Deferred { count: 2 },
+            ResumableUploadResult::Deferred {
+                count: 2,
+                isolated: 0
+            },
             &index,
             &progress,
             NOW,
         ),
-        ResumableUploadResult::Deferred { count: 3 },
+        ResumableUploadResult::Deferred {
+            count: 3,
+            isolated: 0
+        },
         "ordinary and retained conflicts are distinct"
     );
     progress.attempted_reason_reoffers.insert(fp(1));
     assert_eq!(
         with_retained_refusal_conflicts(
-            ResumableUploadResult::Deferred { count: 1 },
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            },
             &index,
             &progress,
             NOW,
         ),
-        ResumableUploadResult::Deferred { count: 1 },
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        },
         "a fresh re-offer conflict was already counted once"
     );
     assert_eq!(progress.quarantined_fingerprints[&fp(1)], retry);
@@ -854,12 +872,18 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
     );
     assert_eq!(
         with_retained_refusal_conflicts(
-            ResumableUploadResult::Deferred { count: 2 },
+            ResumableUploadResult::Deferred {
+                count: 2,
+                isolated: 0
+            },
             &index,
             &progress,
             NOW,
         ),
-        ResumableUploadResult::Deferred { count: 2 },
+        ResumableUploadResult::Deferred {
+            count: 2,
+            isolated: 0
+        },
         "new unrelated conflicts stay blocking"
     );
     assert_eq!(

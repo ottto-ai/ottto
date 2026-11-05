@@ -685,7 +685,10 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
                     );
                     assert_eq!(
                         result.unwrap(),
-                        ResumableUploadResult::Deferred { count: 1 }
+                        ResumableUploadResult::Deferred {
+                            count: 1,
+                            isolated: 0
+                        }
                     );
                     assert_eq!(accepted, 0);
                 }

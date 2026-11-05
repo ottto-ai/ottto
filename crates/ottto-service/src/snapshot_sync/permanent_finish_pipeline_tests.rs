@@ -9,6 +9,8 @@ enum FinishOutcome {
     /// The backend accepts every body.
     Accept,
     Retryable,
+    /// Every body is refused as ordinary non-permanent mixed usage.
+    Mixed,
     PermanentStatusFailure,
     PermanentUncleanCensus,
     /// Every body is refused for a reason the backend already dominates with
@@ -101,8 +103,10 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
+                    let mixed = matches!(outcome, FinishOutcome::Mixed);
                     let reason = match outcome {
                         FinishOutcome::Dominated { reason, .. } => reason,
+                        FinishOutcome::Mixed => "accepted_log_stale_older_mixed",
                         _ => "invalid",
                     };
                     let rejected = items
@@ -112,7 +116,7 @@ impl FinishServer {
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
                                 "reason":reason,"detail":"synthetic finish refusal",
-                                "permanent":true,"occurrence_count":1
+                                "permanent":!mixed,"occurrence_count":1
                             })
                         })
                         .collect::<Vec<_>>();
@@ -347,7 +351,14 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
             );
             assert_eq!(refusals.exposure.owed_entities, 0);
         }
-        if !matches!(outcome, FinishOutcome::Retryable) {
+        if matches!(outcome, FinishOutcome::Mixed) {
+            assert!(!progress.permanent_rejections.contains_key(fingerprint));
+            assert_eq!(
+                saved.quarantined_snapshot_fingerprints[fingerprint].disposition,
+                SnapshotQuarantineDisposition::RetryPending,
+                "the refused body stays owed in the saved index"
+            );
+        } else if !matches!(outcome, FinishOutcome::Retryable) {
             assert!(
                 progress.permanent_rejections.contains_key(fingerprint),
                 "permanent refusal debt survives finish"
@@ -362,7 +373,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         assert_eq!(
             terminal[cycle]["last_error_code"],
             match outcome {
-                FinishOutcome::Retryable => "server_error",
+                // The held body stays disclosed even when the pass finishes.
+                FinishOutcome::Retryable | FinishOutcome::Mixed => "server_error",
                 // The refused body is settled unproven-terminal residue; the
                 // server already owns a better or newer record for it.
                 FinishOutcome::Dominated {
@@ -440,13 +452,17 @@ fn permanent_finish_real_pipeline_preserves_refusal_and_status_failures() {
 
 /// [regress] A cycle whose only offered entity conflicts quarantines that
 /// entity on its own retry clock. It used to count as a source failure and
-/// climb the whole-source 1 min to 1 h ladder.
+/// climb the whole-source 1 min to 1 h ladder. A pass whose only refusal is
+/// an ordinary mixed-usage one, held alone, used to fail as deferred too;
+/// it now finishes with that body still owed and disclosed.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
-    permanent_finish_pipeline(FinishOutcome::Retryable);
+    for outcome in [FinishOutcome::Retryable, FinishOutcome::Mixed] {
+        permanent_finish_pipeline(outcome);
+    }
 }
 
 /// F1: body A is refused as dominated, then a newer body B of the same entity
