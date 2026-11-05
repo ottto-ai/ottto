@@ -2328,7 +2328,8 @@ pub(super) mod tests {
             &[],
             false,
         );
-        for _ in 0..1000 {
+        // A reader step is one line; one fixture member holds ~1,030 lines.
+        for _ in 0..10_000 {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
