@@ -22,14 +22,14 @@ exception covers a fn signature rustfmt re-wraps (say once a visibility token
 makes it too long): a `fn` item whose text before `fn` and whose body, from its
 opening `{`, are byte for byte equal, whose only visibility token is the
 item-level one before `fn` (not inside an attribute) and whose signature holds
-no macro call still matches, listed as `reflowed`, when its signature tokens
-are equal with whitespace dropped. Literals and comments stay exact, whitespace
-between two punctuation tokens that could join (`& &` vs `&&`) still counts,
-and only a trailing `,` closing the fn's own generic list or outer parameter
-list may be added or dropped. Every other item must match byte for byte. An
-item must sit under the same module attributes (`#[cfg(..)]` and the like), may
-only lose nesting, and every path literal must resolve, from its new file, to a
-target with the same bytes.
+no `!` (so no macro call) still matches, listed as `reflowed`, when its
+signature tokens are equal with whitespace dropped. Literals and comments stay
+exact, whitespace between two punctuation tokens that could join (`& &` vs
+`&&`) still counts, and only a trailing `,` closing the fn's own generic list or
+outer parameter list may be added or dropped. Every other item must match byte
+for byte. An item must sit under the same module attributes (`#[cfg(..)]` and
+the like), may only lose nesting, and every path literal must resolve, from its
+new file, to a target with the same bytes.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -99,7 +99,7 @@ JOINLESS = set("()[]{},;")
 def reflow_key(unit: Unit) -> tuple | None:
     """What a rustfmt re-wrap of a fn signature keeps (see the module docs), or None when `unit` gets no
     reflow pass: not a fn, no body, an unexpected signature shape, a visibility token other than one at
-    item level before `fn` (outside attributes), or a macro call in the signature (a macro can see token
+    item level before `fn` (outside attributes), or any `!` in the signature (a macro call can see token
     boundaries this lexer does not keep)."""
     if unit.kind != "fn" or len(unit.vis) > 1:
         return None
@@ -122,8 +122,7 @@ def reflow_key(unit: Unit) -> tuple | None:
             depth += (piece in "([{") - (piece in ")]}")
     if fn_at is None or body_at is None or (vis_at is not None and (vis_at > code[fn_at][3] or vis_depth != 0)):
         return None
-    if any(code[index][0] == "ident" and code[index + 1][:2] == ("punct", "!")
-           and code[index + 2][1] in ("(", "[", "{") for index in range(fn_at, body_at - 1)):
+    if any(code[index][:2] == ("punct", "!") for index in range(fn_at, body_at)):
         return None
     drop = set()
     at = fn_at + 2  # after `fn name`

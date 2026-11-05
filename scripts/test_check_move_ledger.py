@@ -475,6 +475,8 @@ class LedgerTests(unittest.TestCase):
             # A macro in the signature can see token boundaries the lexer does not keep.
             ('fn f(x: ty!("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty!("s" tag),\n) {}\n'),
             ('fn f(x: ty!(1.0)) {}\n', 'pub(super) fn f(\n    x: ty!(1 . 0),\n) {}\n'),
+            ('fn f(x: ty! /*c*/ ("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty! /*c*/ ("s" tag),\n) {}\n'),
+            ('fn f(x: ty /*c*/ !("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty /*c*/ !("s" tag),\n) {}\n'),
             # A struct whose field visibilities trade places at the same text offsets.
             ('pub(crate) struct S {\n    pub(crate) a: u8,\n    b: u8,\n}\n',
              'pub(crate) struct S {a:u8,pub(crate) b:u8,}\n'),
