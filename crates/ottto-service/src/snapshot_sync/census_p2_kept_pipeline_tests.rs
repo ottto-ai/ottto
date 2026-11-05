@@ -30,6 +30,8 @@ pub(super) fn pipeline_transcript_line(session: &str, request: &str, second: u32
 pub(super) enum PipelineUpload {
     Accept,
     ServerDeferred,
+    Shed,
+    UploadError,
     /// Real entity ACK; settlement follows the uploader result, not a forced outcome.
     EntityAckRejected {
         session: &'static str,
@@ -187,6 +189,7 @@ impl PipelineFixture {
         crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
             self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
         })
+        .expect("in-process pipeline page")
     }
 
     fn page_with_reoffers_born(
@@ -196,7 +199,7 @@ impl PipelineFixture {
         upload: PipelineUpload,
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
-    ) -> PipelinePage {
+    ) -> Result<PipelinePage> {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
         // Production order (`finish_sync_source`): the upload ledger loads
@@ -366,6 +369,17 @@ impl PipelineFixture {
             snapshot_upload_body_witness,
             |items| {
                 uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                match upload {
+                    PipelineUpload::Shed => {
+                        return Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: None,
+                            code: None,
+                        }))
+                    }
+                    PipelineUpload::UploadError => return Err(anyhow!("synthetic upload error")),
+                    _ => {}
+                }
                 if let PipelineUpload::EntityAckRejected { session, reason } = upload {
                     let mut response = accepted_batch(0);
                     response.entity_ack_contract =
@@ -400,8 +414,29 @@ impl PipelineFixture {
                 }
                 Ok(())
             },
-        )
-        .expect("in-process upload");
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                assert_eq!(upload, PipelineUpload::UploadError);
+                checkpoint_partial_snapshot_index_with_audit_release(
+                    &index,
+                    &committed_index,
+                    &progress,
+                    &scan.snapshots,
+                    Some(&scan),
+                    &holds.held_fingerprints,
+                    &self.index_path,
+                    &progress_path,
+                    || Ok(()),
+                    None,
+                    Some(crate::snapshots::UnsettledUploadCause::UploadError),
+                    None,
+                    Default::default(),
+                )?;
+                return Err(error);
+            }
+        };
         if reoffers {
             progress.finish_reason_reoffers(
                 &leased_reoffers,
@@ -409,7 +444,10 @@ impl PipelineFixture {
                 SnapshotSource::ClaudeCode.api_slug(),
             );
         }
-        if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
+        if matches!(
+            upload,
+            PipelineUpload::Accept | PipelineUpload::ServerDeferred
+        ) {
             assert_eq!(result, ResumableUploadResult::Completed);
         }
         // Completed/restorable holds are the sole changed production route.
@@ -441,6 +479,29 @@ impl PipelineFixture {
             PipelineUpload::ServerDeferred => {
                 settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
             }
+            PipelineUpload::Shed => {
+                assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+                let index = checkpoint_partial_snapshot_index_with_audit_release(
+                    &index,
+                    &committed_index,
+                    &progress,
+                    &scan.snapshots,
+                    Some(&scan),
+                    &holds.held_fingerprints,
+                    &self.index_path,
+                    &progress_path,
+                    || Ok(()),
+                    None,
+                    Some(crate::snapshots::UnsettledUploadCause::Shed),
+                    None,
+                    Default::default(),
+                )?;
+                UploadIndexSettlement {
+                    index,
+                    fully_settled: false,
+                }
+            }
+            PipelineUpload::UploadError => unreachable!("upload error returned above"),
             PipelineUpload::EntityAckRejected { .. } => match &result {
                 ResumableUploadResult::Rejected { .. } => {
                     settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
@@ -496,7 +557,7 @@ impl PipelineFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
-        PipelinePage {
+        Ok(PipelinePage {
             parsed,
             scan,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
@@ -508,7 +569,7 @@ impl PipelineFixture {
             uploaded,
             result,
             progress,
-        }
+        })
     }
 
     /// Pages of one traversal, until its census completes or the page bound.
@@ -1445,4 +1506,53 @@ fn listed_family_without_witness_uploads_transcript_only() {
             > prior.accepted[PIPELINE_HELD_SESSION].body["request_count"].as_u64(),
         "the grown body carries more than the accepted one"
     );
+}
+
+/// [behaviour] Both synthetic transport failures run the real partial-checkpoint
+/// path. Terminal pages retain no file credit and a fresh traversal catches up.
+#[test]
+#[serial(source_manifests)]
+fn failed_pipeline_outcomes_checkpoint_without_acceptance() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    for outcome in [PipelineUpload::Shed, PipelineUpload::UploadError] {
+        let mut fixture = PipelineFixture::new("partial-checkpoint-outcomes");
+        fixture.page_files = 100;
+        fixture.durable_progress = true;
+        let failed = crate::snapshots::claude_request_money::e2::with_fixture_birth(
+            PIPELINE_FILE_BIRTH,
+            || {
+                fixture.page_with_reoffers_born(
+                    "2026-08-02T08:00:00Z",
+                    &PIPELINE_BASELINE_CYCLE,
+                    outcome,
+                    |_| {},
+                    false,
+                )
+            },
+        );
+        match outcome {
+            PipelineUpload::Shed => assert!(matches!(
+                failed.unwrap().result,
+                ResumableUploadResult::Shed { .. }
+            )),
+            PipelineUpload::UploadError => assert!(failed.is_err()),
+            _ => unreachable!(),
+        }
+        let saved = ScanIndex::load(&fixture.index_path).unwrap();
+        assert!(saved.files.is_empty());
+        // The persistence serializer omits an empty accepted ledger.
+        assert!(serde_json::to_value(&saved)
+            .unwrap()
+            .get("accepted_snapshot_fingerprints")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)));
+        assert!(!saved.scan_traversal_in_progress_for_test());
+        let recovered = fixture.page(
+            "2026-08-02T08:01:00Z",
+            &PIPELINE_BASELINE_CYCLE,
+            PipelineUpload::Accept,
+        );
+        assert_eq!(recovered.scan.scanned_file_count, 3);
+        assert_eq!(recovered.progress.accepted_fingerprints.len(), 3);
+        assert!(recovered.fully_settled);
+    }
 }

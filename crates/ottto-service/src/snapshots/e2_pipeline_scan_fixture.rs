@@ -482,8 +482,23 @@ impl E2ScanFixture {
         source: SnapshotSource,
         roots: &[PathBuf],
         support: &Path,
+        index: ScanIndex,
+        sampled: bool,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        self.scan_other_page(source, roots, support, index, sampled, 100, &[])
+    }
+
+    /// The same native acquisition with a bounded page and watcher hints.
+    #[expect(clippy::too_many_arguments, reason = "test helper, 8 scan inputs")]
+    pub(crate) fn scan_other_page(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        support: &Path,
         mut index: ScanIndex,
         sampled: bool,
+        limit: usize,
+        hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         index.activate_effective_upload_body_witness_revision(
             crate::snapshot_sync::effective_upload_body_witness_revision(source),
@@ -494,9 +509,9 @@ impl E2ScanFixture {
             index,
             "2026-10-27T08:00:00Z",
             183,
-            100,
+            limit,
             Some(support),
-            &[],
+            hints,
             false,
         );
         if sampled {
