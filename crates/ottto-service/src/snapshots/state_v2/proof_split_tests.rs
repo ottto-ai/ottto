@@ -75,4 +75,24 @@ fn proof_split_check(path: &str, layout: u32) {
         writes.push(db.save_row_attempts().0 - before);
     }
     assert_eq!(writes[1], writes[0] + 1, "{path}: one changed stamp row");
+    let stamps = &mut reopened.upload_context_proof.entity_stamps; // [edge] add, remove, clear
+    let stamp = stamps.values().next().cloned().unwrap();
+    stamps.insert("~".into(), stamp);
+    for left in [count + 1, count, 0] {
+        let stamps = &mut reopened.upload_context_proof.entity_stamps;
+        stamps.retain(|key, _| left > count || left > 0 && key != "~");
+        save_graph(&mut db, &identity, previous, &mut reopened, &mut cx).unwrap();
+        let want = serde_json::to_vec(&reopened).unwrap();
+        drop(db);
+        db = reopen();
+        (reopened, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(serde_json::to_vec(&reopened).unwrap(), want, "{path}");
+        previous = baseline(&reopened, &mut cx).unwrap();
+        let mut rows = dump(&mut db).unwrap().rows;
+        assert!(header(&rows).is_object(), "{path}: header kept");
+        rows.retain(|row| row.0 == "proof.upload_context");
+        assert_eq!(rows[0].3.get(), left.to_string(), "{path}: manifest");
+        assert_eq!(rows.len(), left + 1, "{path}: manifest and members");
+        assert_eq!(rows.iter().any(|row| row.1 == "~"), left > count);
+    }
 }
