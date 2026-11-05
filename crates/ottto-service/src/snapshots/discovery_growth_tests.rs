@@ -191,6 +191,7 @@ impl Fixture {
                 list_all,
                 true,
                 &[],
+                None,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -1420,7 +1421,7 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
     assert_eq!(item.cache_read_tokens, 4);
     assert_eq!(item.output_tokens, 6);
     assert_eq!(item.request_count, 2);
-    f.cache.clear();
+    f.cache.with_cursor(|cursor| cursor.headers.clear());
     let (cold_index, cold, _, _) = f.page_at(
         SnapshotSource::Codex,
         ScanIndex::default(),
@@ -1512,7 +1513,9 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
 /// on the retiring page with the resident copy's requests and tokens. Claude's
 /// copy folds its responses only at finish, so its totals are unknown. The
 /// same file deleted after its ACK counts nothing.
-/// Count only: the entry retires exactly as before.
+/// Count only: the entry retires exactly as before, whether a remove hint or
+/// the re-listing's complete directory read proves it absent; the retirement
+/// adds no accepted fingerprint.
 #[test]
 fn deleted_before_ack_counts_unacked_usage_lost() {
     for source in [
@@ -1520,16 +1523,25 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
         SnapshotSource::Codex,
         SnapshotSource::Pi,
     ] {
-        for unacked in [true, false] {
+        for (unacked, hinted) in [(true, true), (false, true), (true, false), (false, false)] {
             let mut f = Fixture::new();
             f.unacked = unacked;
-            let index = kept_generation(&f, source, false);
+            let index = kept_generation(&f, source, !hinted);
             let grown = f.root.join(format!("{GROWN}.jsonl"));
             let key = local_index_key(&grown);
             assert!(index.files[&key].last_upload_body_witness.is_some());
+            let accepted = index.accepted_snapshot_fingerprints.clone();
             fs::remove_file(&grown).unwrap();
-            let (index, _, _, rows) = f.page_hinted(source, index, &[grown]);
+            let (index, _, _, rows) = if hinted {
+                f.page_hinted(source, index, &[grown])
+            } else {
+                f.page(source, index)
+            };
             assert!(!index.files.contains_key(&key), "{source:?}: retired");
+            assert!(
+                index.accepted_snapshot_fingerprints.is_subset(&accepted),
+                "{source:?} hinted {hinted}: retirement grants no ACK"
+            );
             let page = rows
                 .iter()
                 .find(|row| row["stage"] == "native_collection_page")
@@ -1544,10 +1556,75 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             };
             assert_eq!(
                 page["counts"]["unacked_usage_lost_to_deletion"], expected,
-                "{source:?} unacked {unacked}"
+                "{source:?} unacked {unacked} hinted {hinted}"
             );
         }
     }
 }
 
 mod codex_archive_tests;
+
+/// [regress] A positive remove hint in a retained Codex generation retires
+/// this listing's absent key even if an earlier page observed it.
+#[test]
+fn codex_current_listing_removal_retires_an_earlier_generation_observation() {
+    let f = Fixture::new();
+    let index = f.retained_codex();
+    let key = local_index_key(&f.path);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&key));
+    assert!(index.files.contains_key(&key));
+    fs::remove_file(&f.path).unwrap();
+    let (index, _, _, _) =
+        f.page_hinted(SnapshotSource::Codex, index, std::slice::from_ref(&f.path));
+    assert!(!index.files.contains_key(&key));
+}
+
+/// [money] A directory wider than a tiny per-tick budget is listed in full on
+/// a fresh tick for every source: the census completes and the scan emits the
+/// same snapshots and file count as under the default budget.
+#[test]
+fn wide_directory_over_budget_completes_census_with_default_budget_money() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let root = crate::test_scratch::unique_path("wide-directory-money");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        for session in [UNCHANGED, GROWN, CREATED, REARMED] {
+            append_records(
+                &root.join(format!("{session}.jsonl")),
+                &usage_records(source, session, 1, true),
+            );
+        }
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let scan = || {
+            let mut index = ScanIndex::default();
+            scan_source_roots(source, std::slice::from_ref(&root), &mut index, &now, 7).unwrap()
+        };
+        let default = scan();
+        let tiny = with_test_directory_entries(3, scan);
+
+        assert!(tiny.census_complete, "{source:?}");
+        assert_eq!(tiny.directory_entry_cap_exceeded_count, 0, "{source:?}");
+        assert_eq!(tiny.scanned_file_count, 4, "{source:?}");
+        assert_eq!(tiny.snapshots.len(), 4, "{source:?}");
+        assert_eq!(
+            tiny.scanned_file_count, default.scanned_file_count,
+            "{source:?}"
+        );
+        assert_eq!(census(&tiny), census(&default), "{source:?}");
+        assert_eq!(
+            serde_json::to_value(&tiny.snapshots).unwrap(),
+            serde_json::to_value(&default.snapshots).unwrap(),
+            "{source:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}

@@ -13,11 +13,14 @@ use crate::local_resource_diagnostics::claude_reread;
 /// #825's `STAMPED_WITHOUT_PERMIT`, retired: decoded, never acted on.
 const RETIRED_PERMIT_MARK: u8 = 64;
 
-// The contract-5 caps stay exactly as they were.
+// The contract-5 caps: 32 accounts per item; the parts bound at the default
+// item cap stays exactly as it was.
 const _: () = assert!(
-    claude_request_identity::MAX_AUTHORITY_KEYS == 16
-        && claude_request_identity::MAX_PARTS_PER_ROW == 17
-        && claude_request_identity::MAX_PARTS_PER_ITEM == 2_048
+    claude_request_identity::MAX_AUTHORITY_KEYS == 32
+        && claude_request_identity::MAX_EVIDENCE_ENTRIES == 32
+        && claude_request_identity::MAX_PARTS_PER_ROW == 33
+        && claude_request_identity::max_parts_per_item(claude_request_identity::MAX_ITEM_BYTES)
+            == 2_048
         && claude_request_identity::MAX_ITEM_BYTES == 640 * 1024
 );
 

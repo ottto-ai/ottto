@@ -12,16 +12,16 @@
         "evidence_source": "claude_desktop_original:v1",
         "identity_disposition": "missing"
       },
-      "source_session_id": "w0-cap-evidence",
-      "snapshot_fingerprint": "855578700586c5673a31c61e47c2c5e420fdf539722b034502db021211c58d9d",
+      "source_session_id": "w0-cap-identities",
+      "snapshot_fingerprint": "41e8483e37b2a1f8fd24c8641bb5f0a54af732b4df5838bb8c3403615f6ec73f",
       "status": "final",
-      "input_tokens": 1700,
-      "output_tokens": 170,
+      "input_tokens": 3300,
+      "output_tokens": 330,
       "cache_read_tokens": 0,
       "cache_creation_5m_tokens": 0,
       "cache_creation_1h_tokens": 0,
       "reasoning_output_tokens": 0,
-      "request_count": 17,
+      "request_count": 33,
       "peak_context_fill_tokens": 100,
       "first_turn_context_tokens": 100,
       "last_turn_context_tokens": 100,
@@ -56,13 +56,13 @@
       "model_usage": [
         {
           "model": "claude-haiku-4-5",
-          "input_tokens": 1700,
-          "output_tokens": 170,
+          "input_tokens": 3300,
+          "output_tokens": 330,
           "cache_read_tokens": 0,
           "cache_creation_5m_tokens": 0,
           "cache_creation_1h_tokens": 0,
           "reasoning_output_tokens": 0,
-          "request_count": 17,
+          "request_count": 33,
           "selector_context": {
             "context_bucket": "short"
           },
@@ -71,7 +71,7 @@
           },
           "gateway_provider": "anthropic",
           "model_provider": "anthropic",
-          "cost_usd": "17.00"
+          "cost_usd": "33.00"
         }
       ],
       "usage_buckets": [
@@ -80,13 +80,13 @@
           "model_usage": [
             {
               "model": "claude-haiku-4-5",
-              "input_tokens": 900,
-              "output_tokens": 90,
+              "input_tokens": 3300,
+              "output_tokens": 330,
               "cache_read_tokens": 0,
               "cache_creation_5m_tokens": 0,
               "cache_creation_1h_tokens": 0,
               "reasoning_output_tokens": 0,
-              "request_count": 9,
+              "request_count": 33,
               "selector_context": {
                 "context_bucket": "short"
               },
@@ -95,51 +95,25 @@
               },
               "gateway_provider": "anthropic",
               "model_provider": "anthropic",
-              "cost_usd": "9.00"
+              "cost_usd": "33.00"
             }
           ],
           "first_activity_at": "2026-09-01T10:00:04Z",
           "last_activity_at": "2026-09-01T10:00:50Z"
-        },
-        {
-          "bucket_start": "2026-09-01T11:00:00Z",
-          "model_usage": [
-            {
-              "model": "claude-haiku-4-5",
-              "input_tokens": 800,
-              "output_tokens": 80,
-              "cache_read_tokens": 0,
-              "cache_creation_5m_tokens": 0,
-              "cache_creation_1h_tokens": 0,
-              "reasoning_output_tokens": 0,
-              "request_count": 8,
-              "selector_context": {
-                "context_bucket": "short"
-              },
-              "selector_sources": {
-                "context_bucket": "derived_from_effective_input_volume"
-              },
-              "gateway_provider": "anthropic",
-              "model_provider": "anthropic",
-              "cost_usd": "8.00"
-            }
-          ],
-          "first_activity_at": "2026-09-01T11:00:04Z",
-          "last_activity_at": "2026-09-01T11:00:50Z"
         }
       ],
       "cost": {
-        "total_cost_usd": "17.00",
+        "total_cost_usd": "33.00",
         "evidence_source": "synthetic_reported"
       },
       "session_display_name": null,
       "session_display_name_source": null,
       "source_started_at": "2026-09-01T10:00:04Z",
       "source_ended_at": null,
-      "source_last_activity_at": "2026-09-01T11:00:50Z",
-      "collected_at": "2026-09-01T11:05:50Z",
+      "source_last_activity_at": "2026-09-01T10:00:50Z",
+      "collected_at": "2026-09-01T10:05:50Z",
       "workspace_hash": null,
-      "source_file_fingerprint": "3d0bf372e8190bc73aebf7f01116118464e83bc55d4050be658477e3c9711dae",
+      "source_file_fingerprint": "098ee5d1e66e28be5d420c020162c2e960fe932b85536e138a55ed6ee513dfd3",
       "provenance": {
         "collector": "claude_code_jsonl:own_request_identity_rows:v1",
         "source_file_count": 1,
@@ -151,7 +125,7 @@
         "used_workflow_orchestration": false
       },
       "attribution_facts": [],
-      "request_identity_refusals": 2,
+      "request_identity_refusals": 1,
       "semantic_envelope": {
         "component_contract_version": "snapshot_semantic:v1",
         "revision_contract_version": "snapshot_revision:v1",
@@ -169,11 +143,11 @@
           "context_posture": "0753cf7f13925f184d21bc9a005629d1fee4db3b556470a388706623afd0db0b",
           "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
           "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
-          "lifecycle_activity": "71edcf57ad4baaa88d06fd0a7cc972c518c54c950ad452be26a18ac77c160f3d",
-          "usage_accounting": "01305142f80bc7fe63257d62f3b732cec4f13378a52d2ac3172f03a8d69d357e"
+          "lifecycle_activity": "7c256960e95aa64afce7fdf0ab1ac9017a9445b597f7b35e4a744b287e170e7f",
+          "usage_accounting": "b16e3a92e869cb0f9d60f6d9a16bb484eaf1f66361cf6ba258ec68464fbe0057"
         },
-        "revision_hash": "8ca46907feff11b8b8aca04982957348f7384fa51e2d5d9292d2edfb14cc9417",
-        "content_hash": "8c80a07a8e100f971504cca4aef0ef22521224bf27666f63bb675899833c301e",
+        "revision_hash": "81f96bd6902cab5a3392b2f279ba47268031e99ba73376f644eeee147f5c9f3c",
+        "content_hash": "e7469cafe43079ea9f01936a7236c39ca719e4ae4f091f9f99ce2f3a75a82539",
         "hash_epoch": 1
       }
     }

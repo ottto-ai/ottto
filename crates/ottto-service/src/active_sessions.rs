@@ -26,7 +26,7 @@ use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
+    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS, CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -676,7 +676,10 @@ fn account_attribution(
     }
     // The session's own requests already name several accounts: a parent's or
     // the current login's single account must never stand in for them.
-    if account_withheld_reason(snapshot) == Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS) {
+    if matches!(
+        account_withheld_reason(snapshot),
+        Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS | CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+    ) {
         return None;
     }
     match lineage_account_attribution(snapshot, status) {
@@ -725,6 +728,13 @@ fn account_withheld_reason(snapshot: &SnapshotItem) -> Option<&'static str> {
     match exact_snapshot_account_hash(snapshot) {
         EvidenceResolution::Missing => snapshot.claude_account_withheld_reason,
         EvidenceResolution::Resolved(_) => None,
+        // Held over the account limit: the hold, not the mix, is the news.
+        EvidenceResolution::Conflict
+            if snapshot.claude_account_withheld_reason
+                == Some(CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS) =>
+        {
+            snapshot.claude_account_withheld_reason
+        }
         EvidenceResolution::Conflict if request_identity_rows => {
             // Stops at the second account; nothing is collected.
             let mut first = None;

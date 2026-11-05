@@ -2,7 +2,7 @@
 //! No fixture content comes from a provider account.
 use super::*;
 use crate::transcript_acquisition::{ReadMode, Scope};
-use crate::transcript_cache::{Retained, TranscriptCache};
+use crate::transcript_cache::Retained;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -156,7 +156,9 @@ fn acquire_items_with(
 ) {
     let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
-    let mode = parser.prepare_acquisition(old, scope, debt, now).unwrap();
+    let mode = parser
+        .prepare_acquisition(old.map(Box::new), scope, debt, now)
+        .unwrap();
     let guards = parser
         .reader
         .acquisition
@@ -164,27 +166,11 @@ fn acquire_items_with(
         .unwrap()
         .guard_bytes_read();
     while !parser.step().unwrap() {}
-    let budget = crate::transcript_cache::ENTRY_BYTES;
-    let predicted = parser.retention_bound(budget);
-    if predicted.is_none() {
-        let mut counter = crate::heap_layout_bound::Counter::new(usize::MAX);
-        let accepted = crate::heap_layout_bound::HeapLayoutBound::heap_bound(&parser, &mut counter);
-        eprintln!(
-            "SAMPLED_NATIVE_BYPASS source={source:?} charge_before_refusal={} complete_charge={}",
-            counter.bytes,
-            accepted.is_some()
-        );
-    }
-    let acquisition = parser
-        .retain_reduction(
-            scope,
-            now,
-            sampled_scan::RetainBudget::granted_unclassified(budget),
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(acquisition.reduction.is_some(), predicted.is_some());
-    let retained = acquisition.reduction.map(|state| Retained {
+    // The reduction a stored Tail head continues: the completed parse
+    // without this cycle's live inputs, through a sealed checkpoint only.
+    let state = parser.durable_test_reduction_copy();
+    let acquisition = parser.retain_reduction(scope, now).unwrap().unwrap();
+    let retained = (!acquisition.unsealed).then_some(Retained {
         checkpoint: acquisition.checkpoint,
         state,
     });
@@ -390,50 +376,6 @@ fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
         retained = next;
     }
 }
-#[test]
-fn sampled_native_cache_eviction_and_active_state_accounting() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let fixture = Fixture::new(source);
-        fixture.append(&usage(
-            source,
-            100,
-            0,
-            if source == SnapshotSource::Codex {
-                "gpt-5.6"
-            } else {
-                "claude-opus-4-8"
-            },
-        ));
-        let (retained, _, _, _) = acquire(&fixture, source, None, 100);
-        let mut cache = TranscriptCache::default();
-        let supported = crate::heap_layout_bound::layout_supported();
-        let retained = retained.unwrap();
-        let measured = cache.bound_with(&retained);
-        assert_eq!(measured.is_some(), supported);
-        assert_eq!(cache.insert("fixture".into(), retained), supported);
-        if supported {
-            assert!(cache.resident_bound().unwrap() >= measured.unwrap());
-            let retained = cache.take("fixture").unwrap().retained;
-            let native_copy = retained.state.clone();
-            let clone_bound = cache.bound_with(&native_copy).unwrap();
-            let combined_bound = cache.bound_with(&(retained, native_copy)).unwrap();
-            assert!(combined_bound >= clone_bound);
-            eprintln!("SAMPLED_NATIVE_MEMORY source={source:?} retained_with_cache={measured:?} clone_with_cache={clone_bound} combined={combined_bound}");
-            let (retained, _, _, _) = acquire(&fixture, source, None, 100);
-
-            assert!(cache.take("fixture").is_none());
-            assert!(cache.bound_with(&retained).is_some());
-            // Eviction cannot create a reused state after the original moves.
-            cache.remove("fixture");
-            let (_, mode, _, body) = acquire(&fixture, source, None, 101);
-            assert!(matches!(mode, ReadMode::Full(_)));
-            assert_eq!(body, oracle(&fixture, source));
-        }
-    }
-}
 
 /// [behaviour] A hidden same-width edit can leave a sampled Tail prefix stale.
 #[test]
@@ -487,7 +429,6 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
 }
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -498,12 +439,9 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
         0,
         "claude-opus-4-8",
     ));
-    let ((old, mode, _, body), full) =
-        observe(|| acquire(&fixture, SnapshotSource::ClaudeCode, None, 100));
+    let (old, mode, _, body) = acquire(&fixture, SnapshotSource::ClaudeCode, None, 100);
     assert!(matches!(mode, ReadMode::Full(_)));
     assert_eq!(body, oracle(&fixture, SnapshotSource::ClaudeCode));
-    assert_eq!(full.retention_produced, 1);
-    assert_eq!(full.retention_bound_refused, 0);
     fixture.append(&usage(
         SnapshotSource::ClaudeCode,
         140,
@@ -512,21 +450,13 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     ));
     let (mut parser, expected, scope) = native_parser(&fixture, SnapshotSource::ClaudeCode);
     assert_eq!(
-        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
         ReadMode::Tail
     );
     while !parser.step().unwrap() {}
-    let (certificate, refused) = observe(|| {
-        parser
-            .retain_reduction(
-                &scope,
-                101,
-                sampled_scan::RetainBudget::granted_unclassified(0),
-            )
-            .unwrap()
-            .unwrap()
-    });
-    assert!(certificate.reduction.is_none());
+    let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
     assert_eq!(
         certificate
             .checkpoint
@@ -535,8 +465,6 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
             .due_unix_seconds,
         3700
     );
-    assert_eq!(refused.retention_bound_refused, 1);
-    assert_eq!(refused.retention_produced, 0);
     let parsed = parser
         .finish(
             &expected,
@@ -586,7 +514,9 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
             }
             let (mut parser, expected, scope) = native_parser(&fixture, source);
             assert_eq!(
-                parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+                parser
+                    .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+                    .unwrap(),
                 ReadMode::Tail
             );
             assert_eq!(
@@ -601,19 +531,9 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
                 3700
             );
             while !parser.step().unwrap() {}
-            let certificate = parser
-                .retain_reduction(
-                    &scope,
-                    101,
-                    sampled_scan::RetainBudget::granted_unclassified(if partial {
-                        crate::transcript_cache::ENTRY_BYTES
-                    } else {
-                        0
-                    }),
-                )
-                .unwrap()
-                .unwrap();
-            assert!(certificate.reduction.is_none());
+            let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
+            // A partial final row stays past the sealed checkpoint.
+            assert_eq!(certificate.unsealed, partial);
             assert_eq!(
                 certificate
                     .checkpoint
@@ -654,7 +574,9 @@ fn sampled_native_wrong_provider_cache_refuses_reuse() {
     let (mut parser, _, _) = native_parser(&fixture, SnapshotSource::Codex);
     let scope = Scope("synthetic-native-ClaudeCode".into());
     assert!(matches!(
-        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
         ReadMode::Full(_)
     ));
 }
@@ -779,7 +701,6 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
         assert!(retained.is_some(), "{case}: an in-file fork is retained");
         {
             let accumulator = lineage_state(&fixture, &CodexTitleMetadata::default());
-            assert!(sampled_scan::compatible_reduction(&accumulator), "{case}");
             assert!(accumulator.codex_is_fork, "{case}");
             assert!(
                 matches!(
@@ -813,7 +734,7 @@ fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
     }
 }
 #[test]
-fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
+fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -821,8 +742,7 @@ fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retain
     let metadata = CodexTitleMetadata::default();
     let scope = Scope(format!("synthetic-native-{source:?}"));
     // After a retained `Ordinal` copy, a gap or a backward step breaks the
-    // ordinal stream: the tail is held exactly as a full parse holds it, no
-    // copy is retained, and the next change is a full read.
+    // ordinal stream: the tail is held exactly as a full parse holds it.
     for (case, broken) in [("gap", 4), ("backward", 1)] {
         let fixture = lineage_fixture(&[
             json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-break","forked_from_id":"019fa111-2222-7333-8444-0000000000b1","thread_source":"subagent","subagent_history_start_ordinal":2}}),
@@ -833,23 +753,11 @@ fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retain
         assert!(retained.is_some(), "{case}: the fork is retained first");
         let (total, last) = LINEAGE_APPENDS[0];
         fixture.append(&lineage_tokens(10, Some(broken), total, last));
-        let (next, mode, _, body) =
+        let (_, mode, _, body) =
             acquire_with(&fixture, source, &metadata, &scope, retained, 101, false);
         assert_eq!(mode, ReadMode::Tail, "{case}");
         assert_eq!(body, oracle(&fixture, source), "{case}: tail parity");
         assert_eq!(body, json!([]), "{case}: held, never partial");
-        assert!(next.is_none(), "{case}: no copy after the break");
-        let (total, last) = LINEAGE_APPENDS[1];
-        fixture.append(&lineage_tokens(11, Some(broken + 1), total, last));
-        let (next, mode, _, body) =
-            acquire_with(&fixture, source, &metadata, &scope, next, 102, false);
-        assert_eq!(
-            mode,
-            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
-            "{case}"
-        );
-        assert_eq!(body, oracle(&fixture, source), "{case}: full parity");
-        assert!(next.is_none(), "{case}");
     }
 }
 #[test]
@@ -898,7 +806,6 @@ fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_chang
     );
     {
         let accumulator = lineage_state(&fixture, &family);
-        assert!(sampled_scan::compatible_reduction(&accumulator));
         assert_eq!(
             accumulator
                 .codex_sidecar_parent
@@ -1229,45 +1136,6 @@ fn finish_production_scan_page(
 }
 
 #[test]
-fn sampled_native_live_inputs_restored_after_charge_and_copy() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = Fixture::new(SnapshotSource::Codex);
-    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
-    let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
-    let traces = Arc::new(CodexTurnTraceMap::default());
-    parser.accumulator.codex_turn_traces = Some(traces.clone());
-    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
-    while !parser.step().unwrap() {}
-    for limit in [0, crate::transcript_cache::ENTRY_BYTES] {
-        assert_eq!(parser.retention_bound(limit).is_some(), limit != 0);
-        assert!(Arc::ptr_eq(
-            parser.accumulator.codex_turn_traces.as_ref().unwrap(),
-            &traces
-        ));
-    }
-    let completed = parser
-        .retain_reduction(
-            &scope,
-            100,
-            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
-        )
-        .unwrap()
-        .unwrap();
-    assert!(
-        crate::transcript_cache::FrozenCacheState::supports_frozen_charge(
-            completed.reduction.as_ref().unwrap()
-        )
-    );
-    assert_eq!(Arc::strong_count(&traces), 2);
-    assert!(Arc::ptr_eq(
-        parser.accumulator.codex_turn_traces.as_ref().unwrap(),
-        &traces
-    ));
-}
-
-#[test]
 fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1375,7 +1243,10 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         let due = index.files[&key].unverified_deadline().unwrap();
         let index_path = fixture.dir.join("index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
-        cache.clear();
+        // RAM loss: a restart keeps only the state database.
+        let restarted = Arc::new(sampled_scan::SharedCache::default());
+        *restarted.test_route.lock().unwrap() = cache.test_route.lock().unwrap().take();
+        let cache = restarted;
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
         // A cold unchanged no-op may wait until its due hour, but RAM loss must
@@ -1515,7 +1386,6 @@ fn codec_page(
 /// continuation beside the database (conformance B2).
 #[test]
 fn an_unrouted_codec_source_keeps_no_ram_copy() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -1523,22 +1393,13 @@ fn an_unrouted_codec_source_keeps_no_ram_copy() {
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
         let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
         let before = unrouted();
-        let ((index, modes), first) =
-            observe(|| codec_page(source, &fixture, &cache, ScanIndex::default()));
+        let (index, modes) = codec_page(source, &fixture, &cache, ScanIndex::default());
         assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
         assert_eq!(modes, (1, 0, 0), "first read {source:?}");
         assert_eq!(unrouted(), before, "a new file is no unrouted growth");
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-        let ((_, modes), next) = observe(|| codec_page(source, &fixture, &cache, index));
+        let _ = codec_page(source, &fixture, &cache, index);
         assert!(unrouted() > before, "the growth Full is counted by why");
-        assert_eq!(
-            first.insert_admitted, 0,
-            "no copy is admitted {source:?} (modes {modes:?})"
-        );
-        assert_eq!(
-            next.take_hit, 0,
-            "no copy is taken {source:?} (modes {modes:?})"
-        );
     }
 }
 
@@ -1548,7 +1409,6 @@ fn an_unrouted_codec_source_keeps_no_ram_copy() {
 /// (conformance B2). The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
@@ -1563,17 +1423,11 @@ fn a_codec_route_error_holds_the_file_without_ram() {
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         crate::snapshots::state_v2::poison_route_for_test(&index);
         assert!(crate::snapshots::state_v2::tail_route_path(&index).is_err());
-        assert!(!super::tail_source::keeps_ram(source));
-        let ((index, modes), lifecycle) = observe(|| codec_page(source, &fixture, &cache, index));
+        let (index, modes) = codec_page(source, &fixture, &cache, index);
         assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");
         assert_eq!(
             index.files[&key].size_bytes, size,
             "the file stays owed {source:?}"
-        );
-        assert_eq!(
-            (lifecycle.take_hit, lifecycle.insert_admitted),
-            (0, 0),
-            "RAM is no fallback {source:?}"
         );
     }
 }
@@ -1722,7 +1576,9 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
         incomplete: false,
     }));
     assert_eq!(
-        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
         ReadMode::Unchanged
     );
     let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
@@ -1733,7 +1589,9 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
         incomplete: false,
     }));
     assert!(matches!(
-        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
         ReadMode::Full(_)
     ));
 }
@@ -1824,8 +1682,6 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let small = ScanFixture::new(source);
         let large = ScanFixture::new(source);
-        let small_key = local_index_key(&small.file.0);
-        let large_key = local_index_key(&large.file.0);
         let cache = Arc::new(sampled_scan::SharedCache::default());
         small.file.append(&usage(source, 100, 0, "fixture-model"));
         let (index, _, _) = production_scan(
@@ -1835,11 +1691,6 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             Some(cache.clone()),
             "mixed-files",
         );
-        assert!(
-            !super::tail_source::keeps_ram(source)
-                || cache.retained_checkpoint(&small_key).is_some(),
-            "precondition: the unrelated reduction is resident {source:?}"
-        );
         append_unretainable_rows(&large, source);
         let (mut parser, _, _) = native_parser(&large.file, source);
         while !parser.step().unwrap() {}
@@ -1847,18 +1698,15 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
             "precondition: the fixture refuses optional copies {source:?}"
         );
-        let ((_, large_scan, large_modes, _), lifecycle) =
-            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                production_scan_at_with_setup(
-                    &large,
-                    source,
-                    ScanIndex::default(),
-                    Some(cache.clone()),
-                    "mixed-files",
-                    NOW,
-                    incomplete_sidecar_census,
-                )
-            });
+        let (_, large_scan, large_modes, _) = production_scan_at_with_setup(
+            &large,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+            NOW,
+            incomplete_sidecar_census,
+        );
         assert_eq!(
             large_modes,
             (0, 0, 0),
@@ -1877,23 +1725,6 @@ fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
             production_body(source, large_scan),
             production_body(source, large_full),
             "precondition: native output {source:?}"
-        );
-        assert_eq!(
-            lifecycle.clear_other_active, 0,
-            "unsampled native copy refusal wiped the cache {source:?}"
-        );
-        assert_eq!(lifecycle.clear_entries_released, 0, "{source:?}");
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0, "{source:?}");
-        assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
-        assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
-        assert!(
-            !super::tail_source::keeps_ram(source)
-                || cache.retained_checkpoint(&small_key).is_some(),
-            "the unrelated reduction survives {source:?}"
-        );
-        assert!(
-            cache.retained_checkpoint(&large_key).is_none(),
-            "the unsampled file inserted nothing {source:?}"
         );
         small.file.append(&usage(source, 140, 1, "fixture-model"));
         let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
@@ -1943,292 +1774,6 @@ fn step_until(
     }
     panic!("the scan did not reach the expected step");
 }
-
-/// L-A1 guard matrix: the copy-refusal release called directly on the real
-/// step-start shape of an unsampled native read, and on a borrowed Tail
-/// (no release unless it borrows more than its reduction).
-#[test]
-fn sampled_unsampled_native_refusal_guard_matrix() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let release = |scan: &OwnedSourceScan, measured: Option<usize>| {
-        observe(|| {
-            sampled_scan::release_cache_for_copy_refusal(
-                scan.sampling.as_ref(),
-                scan.active_file.as_deref(),
-                measured,
-            )
-        })
-        .1
-    };
-    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        let small = ScanFixture::new(source);
-        let large = ScanFixture::new(source);
-        let small_key = local_index_key(&small.file.0);
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        small.file.append(&usage(source, 100, 0, "fixture-model"));
-        production_scan(
-            &small,
-            source,
-            ScanIndex::default(),
-            Some(cache.clone()),
-            "mixed-files",
-        );
-        assert!(
-            !super::tail_source::keeps_ram(source)
-                || cache.retained_checkpoint(&small_key).is_some(),
-            "precondition: the unrelated reduction is resident {source:?}"
-        );
-        append_unretainable_rows(&large, source);
-        let mut measured = None;
-        let mut scan = step_until(
-            cached_scan(
-                &large,
-                source,
-                ScanIndex::default(),
-                &cache,
-                incomplete_sidecar_census,
-            ),
-            |scan| {
-                if scan.active_file.is_none() {
-                    return false;
-                }
-                let (budget, resident) = scan.sampled_copy_parts();
-                measured = resident;
-                budget == 0
-            },
-        );
-        let active = scan.active_file.as_deref().unwrap();
-        assert!(
-            active.sampling.is_none()
-                && active.cursor.is_none()
-                && active.group.is_none()
-                && active.aliases.is_empty()
-                && active.applied_receipts.is_empty()
-                && active.parser.reader.acquisition.is_none(),
-            "precondition: an unsampled native read {source:?}"
-        );
-        assert!(
-            measured.is_some(),
-            "precondition: this step measured the residents {source:?}"
-        );
-        let reserved = cache.cursor_reserved();
-
-        // Exempt and measured: no clear, no new copy budget.
-        let counts = release(&scan, measured);
-        assert_eq!(
-            (
-                counts.clear_other_active,
-                counts.clear_full_resident_bound_unknown,
-                counts.clear_metadata_unsupported,
-                counts.clear_no_active,
-                counts.clear_entries_released,
-            ),
-            (0, 0, 0, 0, 0),
-            "{source:?}"
-        );
-        assert!(
-            !super::tail_source::keeps_ram(source)
-                || cache.retained_checkpoint(&small_key).is_some(),
-            "{source:?}"
-        );
-        assert_eq!(
-            scan.sampled_copy_parts(),
-            (0, measured),
-            "residents stay bounded and the copy budget stays zero {source:?}"
-        );
-        assert_eq!(cache.cursor_reserved(), reserved, "{source:?}");
-
-        // Any structural miss keeps ClearOtherActive, even when measured.
-        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.aliases.push(candidate);
-        let counts = release(&scan, measured);
-        assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
-        // Only a source that keeps a RAM copy has a resident to release.
-        assert_eq!(
-            counts.clear_entries_released,
-            if super::tail_source::keeps_ram(source) {
-                1
-            } else {
-                0
-            },
-            "{source:?}"
-        );
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.aliases.clear();
-        active.applied_receipts.insert(String::new(), None);
-        assert_eq!(
-            release(&scan, measured).clear_other_active,
-            1,
-            "receipt {source:?}"
-        );
-        scan.active_file
-            .as_deref_mut()
-            .unwrap()
-            .applied_receipts
-            .clear();
-        let no_join = |active: &OwnedActiveFile| {
-            active
-                .parser
-                .accumulator
-                .codex_tier_replay
-                .as_ref()
-                .map_or(true, |replay| replay.join.is_none())
-        };
-        let others_absent = |active: &OwnedActiveFile| {
-            active.sampling.is_none()
-                && active.cursor.is_none()
-                && active.group.is_none()
-                && active.aliases.is_empty()
-                && active.applied_receipts.is_empty()
-        };
-        // An acquisition alone, which `sampling` implies today, still clears.
-        let active = scan.active_file.as_deref_mut().unwrap();
-        assert!(
-            others_absent(&*active)
-                && no_join(&*active)
-                && active.parser.reader.acquisition.is_none(),
-            "precondition: only the acquisition conjunct changes {source:?}"
-        );
-        let mut file = OpenOptions::new().read(true).open(&large.file.0).unwrap();
-        let plan = crate::transcript_acquisition::ReadPlan::prepare(
-            &mut file,
-            None,
-            &Scope("guard-matrix".into()),
-            None,
-            100,
-        )
-        .unwrap();
-        active.parser.reader.acquisition = Some(plan);
-        assert_eq!(
-            release(&scan, measured).clear_other_active,
-            1,
-            "acquisition {source:?}"
-        );
-        scan.active_file
-            .as_deref_mut()
-            .unwrap()
-            .parser
-            .reader
-            .acquisition = None;
-        // A Codex group join alone, which `group` implies today, still clears.
-        if source == SnapshotSource::Codex {
-            let active = scan.active_file.as_deref_mut().unwrap();
-            assert!(
-                others_absent(&*active)
-                    && active.parser.reader.acquisition.is_none()
-                    && no_join(&*active),
-                "precondition: only the join conjunct changes"
-            );
-            let replay = active.parser.accumulator.codex_tier_replay.take();
-            let mut joined = replay
-                .clone()
-                .unwrap_or_else(|| codex_file_join::TierReplay::new(None, false, String::new()));
-            joined.join = Some(Box::new(codex_file_join::StreamProof::new(
-                String::new(),
-                false,
-                vec![codex_file_join::MemberPlan::default()],
-            )));
-            active.parser.accumulator.codex_tier_replay = Some(joined);
-            assert_eq!(release(&scan, measured).clear_other_active, 1, "join");
-            scan.active_file
-                .as_deref_mut()
-                .unwrap()
-                .parser
-                .accumulator
-                .codex_tier_replay = replay;
-        }
-
-        // An unknown resident bound keeps the clear, recorded as such.
-        let counts = release(&scan, None);
-        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
-        assert_eq!(counts.clear_other_active, 0, "{source:?}");
-        // The no-argument wrapper supplies no measurement: conservative.
-        let (_, counts) = observe(|| scan.release_sampled_cache_for_copy_refusal());
-        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
-        assert_eq!(counts.clear_other_active, 0, "{source:?}");
-        // Audit metadata cannot clear an otherwise bounded native resident.
-        scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
-        let counts = release(&scan, measured);
-        assert_eq!(counts.clear_metadata_unsupported, 0, "{source:?}");
-        assert_eq!(counts.clear_full_resident_bound_unknown, 0, "{source:?}");
-        assert_eq!(counts.clear_other_active, 0, "{source:?}");
-        drop(scan);
-
-        // A sampled Tail singleton borrows only its taken
-        // reduction, so its step-start refusal releases nothing, measured or
-        // not; its release is decided at completion. Any other borrowed
-        // state keeps ClearOtherActive.
-        let tail = ScanFixture::new(source);
-        let tail_cache = Arc::new(sampled_scan::SharedCache::default());
-        tail.file.append(&usage(source, 100, 0, "fixture-model"));
-        let (tail_index, _, _) = production_scan(
-            &tail,
-            source,
-            ScanIndex::default(),
-            Some(tail_cache.clone()),
-            "mixed-files",
-        );
-        tail.file.append(&usage(source, 140, 1, "fixture-model"));
-        let tail_index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
-            source,
-            Some(tail_cache.as_ref()),
-            tail_index,
-        );
-        let mut scan = step_until(
-            cached_scan(&tail, source, tail_index, &tail_cache, |_| {}),
-            |scan| scan.active_file.is_some(),
-        );
-        assert!(
-            matches!(
-                scan.active_file
-                    .as_deref()
-                    .and_then(|active| active.sampling.as_ref())
-                    .map(|sampling| sampling.mode),
-                Some(ReadMode::Tail)
-            ),
-            "precondition: a Tail active {source:?}"
-        );
-        assert!(
-            sampled_scan::borrows_only_retained_reduction(scan.active_file.as_deref().unwrap()),
-            "precondition: shape F {source:?}"
-        );
-        let (_, measured) = scan.sampled_copy_parts();
-        assert!(measured.is_some(), "{source:?}");
-        for resident in [measured, None] {
-            assert_eq!(
-                release(&scan, resident),
-                crate::local_resource_diagnostics::cache_lifecycle::Counts::default(),
-                "Tail {source:?} measured {}",
-                resident.is_some()
-            );
-        }
-        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.aliases.push(candidate);
-        assert!(!sampled_scan::borrows_only_retained_reduction(active));
-        assert_eq!(
-            release(&scan, measured).clear_other_active,
-            1,
-            "Tail alias {source:?}"
-        );
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.aliases.clear();
-        active.applied_receipts.insert(String::new(), None);
-        assert!(!sampled_scan::borrows_only_retained_reduction(active));
-        assert_eq!(
-            release(&scan, measured).clear_other_active,
-            1,
-            "Tail receipt {source:?}"
-        );
-    }
-}
-
-#[path = "retain_release_tests.rs"]
-mod retain_release_tests;
 
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
@@ -2387,20 +1932,7 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
             .unwrap();
         while !sampled.step().unwrap() {}
         assert!(sampled.accumulator.codex_observed_priority_turns.is_none());
-        assert!(sampled
-            .retention_bound(crate::transcript_cache::ENTRY_BYTES)
-            .is_none());
-        let completed = sampled
-            .retain_reduction(
-                &scope,
-                100,
-                sampled_scan::RetainBudget::granted_unclassified(
-                    crate::transcript_cache::ENTRY_BYTES,
-                ),
-            )
-            .unwrap()
-            .unwrap();
-        assert!(completed.reduction.is_none());
+        let completed = sampled.retain_reduction(&scope, 100).unwrap().unwrap();
         assert!(
             completed.checkpoint.audit_debt().is_none(),
             "completed full read remains verified despite copy refusal"
@@ -2449,8 +1981,6 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         assert_eq!(pages.len(), 1);
         let counts = &pages[0]["counts"]["sampled_acquisition"]["acquisition_admission"];
         assert_eq!(counts["attempts"], 1);
-        assert_eq!(counts["retained_entry"], json!({"assessed":1,"matched":0}));
-        assert_eq!(counts["cache_lookup_miss_unknown_origin"], 1);
         assert_eq!(
             counts["state_census_complete"],
             json!({"assessed":1,"matched":usize::from(!blocked)})
@@ -2691,7 +2221,6 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
 /// `cache_lifecycle` event (U-T64(d)).
 #[test]
 fn side_certificate_reports_unsealed_without_cache_events() {
-    use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
     let fixture = Fixture::new(SnapshotSource::Codex);
     fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
     let certify = |fixture: &Fixture| {
@@ -2701,31 +2230,18 @@ fn side_certificate_reports_unsealed_without_cache_events() {
             ReadMode::Full(_)
         ));
         while !parser.step().unwrap() {}
-        observe(|| parser.certify_without_retention(&scope, 100).unwrap())
+        parser.certify_without_retention(&scope, 100).unwrap()
     };
     let retain = |fixture: &Fixture| {
         let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
         parser.prepare_acquisition(None, &scope, None, 100).unwrap();
         while !parser.step().unwrap() {}
-        observe(|| {
-            parser
-                .retain_reduction(
-                    &scope,
-                    100,
-                    sampled_scan::RetainBudget::granted_unclassified(
-                        crate::transcript_cache::ENTRY_BYTES,
-                    ),
-                )
-                .unwrap()
-                .unwrap()
-        })
+        parser.retain_reduction(&scope, 100).unwrap().unwrap()
     };
     let len = fixture.0.metadata().unwrap().len();
-    let (sealed, sealed_events) = retain(&fixture);
+    let sealed = retain(&fixture);
     assert!(!sealed.unsealed);
-    assert_eq!(sealed_events.retention_unsealed_eof, 0);
-    let (certificate, events) = certify(&fixture);
-    assert_eq!(events, Counts::default());
+    let certificate = certify(&fixture);
     let sampled_jsonl::SideCertificate::Certified {
         completed,
         len: held,
@@ -2735,7 +2251,6 @@ fn side_certificate_reports_unsealed_without_cache_events() {
     };
     assert_eq!(held, len);
     assert!(!completed.unsealed);
-    assert!(completed.reduction.is_none());
     assert_eq!(completed.checkpoint.sealed_offset(), len);
 
     // A valid final row without its newline is applied at native EOF.
@@ -2743,12 +2258,9 @@ fn side_certificate_reports_unsealed_without_cache_events() {
     serde_json::to_writer(&mut file, &usage(SnapshotSource::Codex, 140, 1, "gpt-5.5")).unwrap();
     drop(file);
     let grown = fixture.0.metadata().unwrap().len();
-    let (unsealed, unsealed_events) = retain(&fixture);
+    let unsealed = retain(&fixture);
     assert!(unsealed.unsealed);
-    assert!(unsealed.reduction.is_none());
-    assert_eq!(unsealed_events.retention_unsealed_eof, 1);
-    let (certificate, events) = certify(&fixture);
-    assert_eq!(events, Counts::default());
+    let certificate = certify(&fixture);
     let sampled_jsonl::SideCertificate::Certified {
         completed,
         len: held,

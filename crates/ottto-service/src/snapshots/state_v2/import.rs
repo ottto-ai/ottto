@@ -43,10 +43,12 @@ impl Pace {
 pub(super) fn inventory_context(path: &Path) -> std::result::Result<Option<Original>, Pause> {
     Original::read(path).map(Some)
 }
-pub(super) fn import_generation(index: &ScanIndex) -> Result<u64> {
+pub(super) fn import_generation(index: &ScanIndex, original: &Original) -> Result<u64> {
+    // An absent original has no collection save yet. Keep its generation at
+    // zero so reopening the empty publication preserves fresh-load semantics.
     index
         .generation
-        .checked_add(1)
+        .checked_add(u64::from(original.missing.is_none()))
         .ok_or_else(|| Pause::Oversize.into())
 }
 pub(super) fn import_graph(
@@ -58,7 +60,7 @@ pub(super) fn import_graph(
     original.unchanged()?;
     let mut tx = store.begin(TxnMode::Write)?;
     let identity = identity(&mut tx)?;
-    let generation = import_generation(index)?;
+    let generation = import_generation(index, original)?;
     anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
@@ -68,8 +70,8 @@ pub(super) fn import_graph(
         tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),
         Pause::Mismatch
     );
-    // A COMMIT advanced control.generation; the proof must compare the
-    // normalized G graph against that one deliberate G+1 control change.
+    // Compare the normalized graph at its published import generation; only
+    // an absent original keeps G=0 until its first collection save.
     let mut tx = store.begin(TxnMode::Read)?;
     verify_normalized_at(&mut tx, index, original, identity.binding, generation)
 }
@@ -345,8 +347,8 @@ impl<'de> serde::de::Visitor<'de> for Presence {
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
             if !claude_original_field(&name) {
-                // Codex archive custody records its presence when its rows are
-                // written (kinds_misc::ARCHIVE_KINDS); the original never does.
+                // Retired archive fields do not enter the original-field
+                // inventory or install active archive policy state.
                 map.next_value::<serde::de::IgnoredAny>()?;
                 continue;
             }

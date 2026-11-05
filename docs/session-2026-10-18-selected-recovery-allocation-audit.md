@@ -1,5 +1,7 @@
 # Selected recovery allocation audit scope
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 The test-only selected-recovery peak assertion previously measured allocations
 from every thread while comparing them with this operation's prepaid recovery
 reservation. In a parallel test run, unrelated allocations could inflate that

@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -143,12 +142,6 @@ pub struct BackfillReport {
     pub codex_snapshot_count: u64,
     pub pi_snapshot_count: u64,
     pub completed_at: String,
-}
-
-impl BackfillReport {
-    pub fn total_snapshots(&self) -> u64 {
-        self.claude_code_snapshot_count + self.codex_snapshot_count + self.pi_snapshot_count
-    }
 }
 
 /// Returns the canonical state-file path inside the daemon state directory.
@@ -586,66 +579,6 @@ pub fn run_backfill(
         snapshots.extend(result.snapshots);
     }
     Ok((snapshots, report))
-}
-
-/// Hook the upstream system uses to deliver the post-backfill notification.
-/// Wired by `snapshot_sync` (or main) so test code can install a sink without
-/// pulling in the full daemon orchestration.
-pub trait BackfillNotificationSink: Send + Sync + 'static {
-    fn notify_completed(&self, report: &BackfillReport);
-}
-
-pub struct LoggingBackfillSink;
-
-impl BackfillNotificationSink for LoggingBackfillSink {
-    fn notify_completed(&self, report: &BackfillReport) {
-        eprintln!(
-            "ottto-service: retroactive backfill complete — {} claude_code, {} codex, {} pi snapshots",
-            report.claude_code_snapshot_count,
-            report.codex_snapshot_count,
-            report.pi_snapshot_count,
-        );
-    }
-}
-
-/// Delivery sink for backfill snapshots. Returning `Err` from `deliver`
-/// signals that the upstream pipeline did NOT accept the snapshots; the
-/// backfill thread will then refuse to advance its completion markers
-/// so the next start retries the walk rather than silently losing data.
-pub type SnapshotDeliverer = Arc<dyn Fn(Vec<SnapshotItem>) -> Result<()> + Send + Sync + 'static>;
-
-/// Spawn a background thread that runs `run_backfill` and emits a single
-/// completion notification through the sink. The handle returns the joined
-/// result so callers (e.g. tests) can await it. Production callers detach.
-/// State is only persisted (and the sink notified) when `deliver` returns
-/// `Ok`; a failing deliver leaves the replay bookkeeping untouched
-/// so the next daemon start retries the backfill.
-pub fn spawn_backfill_thread(
-    home_dir: PathBuf,
-    state_dir: PathBuf,
-    collected_at: String,
-    sink: Arc<dyn BackfillNotificationSink>,
-    deliver: SnapshotDeliverer,
-) -> std::thread::JoinHandle<Result<BackfillReport>> {
-    std::thread::spawn(move || {
-        let state = load_backfill_state(&state_dir);
-        let pending = pending_backfill_sources(&state);
-        if pending.is_empty() {
-            return Ok(state.last_report.clone().unwrap_or_default());
-        }
-        let (mut snapshots, report) = run_backfill(&home_dir, &pending, &collected_at, None)?;
-        apply_backfill_cutoff(&mut snapshots, &state);
-        deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
-        update_backfill_state(&state_dir, |state| {
-            for source in &pending {
-                mark_backfill_complete(state, *source);
-            }
-            state.last_completed_at = Some(report.completed_at.clone());
-            state.last_report = Some(report.clone());
-        })?;
-        sink.notify_completed(&report);
-        Ok(report)
-    })
 }
 
 /// RFC3339 timestamp string for "now"; useful when callers want a single

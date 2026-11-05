@@ -26,27 +26,6 @@ fn write_field<T: Serialize + ?Sized>(
     cx.presence.entry(slot.into()).or_insert(true);
     Ok(())
 }
-/// Codex archive custody is written only while held: archives non-empty or a
-/// deferred alarm owed. Stores without it (every Claude store) keep their exact
-/// rows and presence, and an absent root reads empty at any layout.
-pub(super) const ARCHIVE_KINDS: [&str; 2] =
-    ["v1_field.archives", "v1_field.archive_deferred_alarm_count"];
-fn read_archive_kind<T: serde::de::DeserializeOwned + Serialize + Default>(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    mode: mapper::Members,
-    seed: &mut mapper::Digests,
-) -> Result<T> {
-    if tx.get(&mapper::key(kind, "", 0)?)?.is_none() {
-        // Members without their root are still damage.
-        ensure!(
-            tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
-            "state_v2_missing_manifest"
-        );
-        return Ok(T::default());
-    }
-    mapper::field_read(tx, kind, mode, Some(seed), T::default)
-}
 fn read_field<T: serde::de::DeserializeOwned + Serialize>(
     kind: &str,
     tx: &mut dyn Transaction,
@@ -364,18 +343,6 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    if !index.archives.is_empty() || index.archive_deferred_alarm_count != 0 {
-        let [archives, deferred] = ARCHIVE_KINDS;
-        mapper::field_write(rows, archives, &index.archives, mapper::Members::Map)?;
-        cx.presence.entry("archives".into()).or_insert(true);
-        write_field(
-            &index.archive_deferred_alarm_count,
-            "archive_deferred_alarm_count",
-            deferred,
-            rows,
-            cx,
-        )?;
-    }
     write_holds(index, rows)?;
     rows.raw(
         RowKey::Meta("field_presence".into()),
@@ -408,10 +375,6 @@ pub(super) fn hydrate_txn(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    let [archives, deferred] = ARCHIVE_KINDS;
-    index.archives = read_archive_kind(tx, archives, mapper::Members::Map, &mut cx.digests)?;
-    index.archive_deferred_alarm_count =
-        read_archive_kind(tx, deferred, mapper::Members::Field, &mut cx.digests)?;
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

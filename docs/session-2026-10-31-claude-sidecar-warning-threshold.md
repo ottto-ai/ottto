@@ -1,5 +1,7 @@
 # Claude sidecar size is a warning, not an evidence limit
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 API and trace sidecars continue appending and streaming after 64 MiB. The existing
 `oversized_files` counter is pressure information; it no longer makes otherwise
 complete evidence unusable. File fingerprints continue tracking large files.

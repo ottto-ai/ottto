@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Portable synthetic receipt checks. Never builds or executes native binaries."""
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import unittest
 from pathlib import Path
 import tempfile
+from unittest import mock
 
-from money_equivalence import (canonical_declarations, decode_receipt, has_forbidden_diff,
-                               parse_declarations, pr_declarations, receipt_diff,
+import money_equivalence
+from money_equivalence import (NATIVE_FIXTURES, canonical_declarations, decode_receipt,
+                               has_forbidden_diff, native_coverage, parse_declarations,
+                               pr_declarations, receipt_diff, receipt_names,
                                require_base_harness, require_base_scan_fixture,
-                               signed_mismatch, signed_money_lists, value_sha256)
+                               require_disjoint_head_only, signed_mismatch, signed_money_lists,
+                               uncompared_receipts, value_sha256, verified_summary)
 
 
 CONTRACT = "usage_decrease_hold_ack_contract"
@@ -749,6 +755,17 @@ class SignedMoneyTests(unittest.TestCase):
         self.assertIsNone(signed_money_lists(None, FIXTURES))
         self.assertIsNone(signed_money_lists({"snapshot": {NEW_FIELD: []}}, FIXTURES))
 
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", ("new_fixture",))
+    def test_head_only_fixture_on_both_sides_is_compared_and_needs_a_signature(self):
+        names = sorted(NATIVE_FIXTURES) + ["new_fixture"]
+        compared, uncompared = receipt_names(*receipt_dirs(self, names, names), set(names))
+        self.assertIn("new_fixture.json", compared)
+        self.assertEqual(uncompared, [])
+        lists = signed_money_lists(money_block({"new_fixture.json": self.signed}), compared)
+        self.assertFalse(has_forbidden_diff(self.compare(lists["new_fixture.json"])))
+        self.assert_red(self.compare(None))
+        self.assert_red(self.compare([]))
+
     def test_unknown_fixture_name_is_an_error(self):
         with self.assertRaisesRegex(RuntimeError, "unknown fixtures"):
             signed_money_lists(money_block({"no_such_fixture.json": []}), FIXTURES)
@@ -852,6 +869,137 @@ class TransplantTests(unittest.TestCase):
             tests.write_text("mod other_tests {}\n")
             with self.assertRaisesRegex(RuntimeError, "base compat"):
                 require_base_harness(base)
+
+
+NEW_FIXTURE = "new_fixture"
+
+
+def arm_log(arm, names):
+    lines = [f"MONEY_EQUIVALENCE {name} VERIFIED bytes=1 sha256=x cross_build_sha256=y" for name in names]
+    disk = ["restart_between_pages", "upgrade_without_semantic_revision"]
+    disk += ["downgrade_then_reupgrade"] if arm == "base" else []
+    lines += [f"MONEY_EQUIVALENCE_DISK {name} VERIFIED pages=1" for name in disk]
+    return "\n".join(lines) + "\n"
+
+
+def receipt_dirs(testcase, base, head, bodies=None):
+    """Synthetic base/head receipt directories with saved digests."""
+    scratch = tempfile.TemporaryDirectory()
+    testcase.addCleanup(scratch.cleanup)
+    left, right = Path(scratch.name, "base"), Path(scratch.name, "head")
+    for arm, directory, names in (("base", left, base), ("head", right, head)):
+        directory.mkdir()
+        for name in names:
+            data = (bodies or {}).get((arm, name), b"[]")
+            for stem in (name, f"{name}.cross-build"):
+                (directory / f"{stem}.json").write_bytes(data)
+                (directory / f"{stem}.sha256").write_text(hashlib.sha256(data).hexdigest())
+    return left, right
+
+
+class HeadOnlyFixtureTests(unittest.TestCase):
+    """A new native fixture is required on the head, optional and UNCOMPARED on the base."""
+
+    def receipts(self, base, head):
+        return receipt_dirs(self, base, head)
+
+    def coverage_and_receipts(self, base, head):
+        expected = {"base": native_coverage("base", arm_log("base", base)),
+                    "head": native_coverage("head", arm_log("head", head))}
+        return receipt_names(*self.receipts(base, head), expected["head"], expected["base"])
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", ())
+    def test_empty_head_only_set_is_todays_gate(self):
+        self.assertEqual(len(NATIVE_FIXTURES), 10)
+        names = sorted(NATIVE_FIXTURES)
+        self.assertEqual(self.coverage_and_receipts(names, names),
+                         ([f"{name}.json" for name in names], []))
+        for arm in ("base", "head"):
+            with self.subTest(arm=arm), self.assertRaisesRegex(RuntimeError, "incomplete native coverage"):
+                native_coverage(arm, arm_log(arm, names + [NEW_FIXTURE]))
+        with self.assertRaisesRegex(RuntimeError, "^missing or extra fixture receipts$"):
+            receipt_names(*self.receipts(names, names + [NEW_FIXTURE]), NATIVE_FIXTURES)
+        self.assertEqual(
+            verified_summary(names, [], "b", "h", 1.0),
+            "Money equivalence VERIFIED: 10 + 2 disk-restore fixtures, base `b`, head `h`. "
+            "1.0s. Family vector/Pi remain ignored.\n")
+
+    def test_alias_receipt_on_both_arms_is_red(self):
+        # Receipt files must be exactly the VERIFIED names, not just the right count.
+        names = sorted(NATIVE_FIXTURES)
+        aliased = [name for name in names if name != "side_owner"] + ["side_owner_alias"]
+        with self.assertRaisesRegex(RuntimeError, "^missing or extra fixture receipts$"):
+            receipt_names(*self.receipts(aliased, aliased), NATIVE_FIXTURES, NATIVE_FIXTURES)
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
+    def test_head_only_fixture_absent_on_base_is_uncompared(self):
+        names = sorted(NATIVE_FIXTURES)
+        compared, uncompared = self.coverage_and_receipts(names, names + [NEW_FIXTURE])
+        self.assertEqual(compared, [f"{name}.json" for name in names])
+        self.assertEqual(uncompared, [f"{NEW_FIXTURE}.json"])
+        self.assertIn(f"10 compared | 1 new fixtures uncompared (absent on base): {NEW_FIXTURE}.json.",
+                      verified_summary(compared, uncompared, "b", "h", 1.0))
+        _, right = self.receipts(names, names + [NEW_FIXTURE])
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            records, failures = uncompared_receipts(right, uncompared, None)
+        digest = hashlib.sha256(b"[]").hexdigest()
+        self.assertEqual(records, {f"{NEW_FIXTURE}.json": {"head_sha256": digest,
+                                                           "head_cross_build_sha256": digest}})
+        self.assertEqual(failures, [])
+        self.assertIn(f"MONEY_EQUIVALENCE_UNCOMPARED {NEW_FIXTURE}.json absent on base; head VERIFIED",
+                      log.getvalue())
+        # A signed money diff may name it, as it may name any compared fixture.
+        lists = signed_money_lists({"money": {"diff": {f"{NEW_FIXTURE}.json": []}}},
+                                   compared + uncompared)
+        self.assertEqual(lists[f"{NEW_FIXTURE}.json"], [])
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
+    def test_signed_diff_on_an_uncompared_fixture_is_red(self):
+        names = sorted(NATIVE_FIXTURES)
+        _, right = self.receipts(names, names + [NEW_FIXTURE])
+        entry = {"path": "/0/snapshots/0/usage/input_tokens", "class": "changed", "sha256": "0" * 64}
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            _, failures = uncompared_receipts(right, [f"{NEW_FIXTURE}.json"],
+                                              {f"{NEW_FIXTURE}.json": [entry]})
+        self.assertEqual(failures, [f"{NEW_FIXTURE}.json"])
+        self.assertIn(f"MONEY_EQUIVALENCE_SIGNED {NEW_FIXTURE}.json MISMATCH", log.getvalue())
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
+    def test_head_only_fixture_the_base_also_emits_is_compared(self):
+        names = sorted(NATIVE_FIXTURES) + [NEW_FIXTURE]
+        compared, uncompared = self.coverage_and_receipts(names, names)
+        self.assertEqual(compared, sorted(f"{name}.json" for name in names))
+        self.assertEqual(uncompared, [])
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
+    def test_head_missing_a_head_only_fixture_fails(self):
+        names = sorted(NATIVE_FIXTURES)
+        with self.assertRaisesRegex(RuntimeError, "incomplete native coverage"):
+            native_coverage("head", arm_log("head", names))
+        # Both sides omitting it is no different: the head arm fails first.
+        native_coverage("base", arm_log("base", names))
+        with self.assertRaisesRegex(RuntimeError, "missing or extra fixture receipts"):
+            receipt_names(*self.receipts(names, names), NATIVE_FIXTURES | {NEW_FIXTURE})
+
+    @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", (NEW_FIXTURE,))
+    def test_base_missing_a_regular_fixture_still_fails(self):
+        names = sorted(NATIVE_FIXTURES)
+        short = [name for name in names if name != "side_owner"]
+        with self.assertRaisesRegex(RuntimeError, "incomplete native coverage"):
+            native_coverage("base", arm_log("base", short + [NEW_FIXTURE]))
+        # Nor may a regular receipt pass as uncompared.
+        with self.assertRaisesRegex(RuntimeError, "missing or extra fixture receipts"):
+            receipt_names(*self.receipts(short, names + [NEW_FIXTURE]),
+                          NATIVE_FIXTURES | {NEW_FIXTURE})
+
+    def test_head_only_name_overlapping_a_native_fixture_fails(self):
+        for head_only in (("side_owner",), (NEW_FIXTURE, NEW_FIXTURE)):
+            with self.subTest(head_only=head_only), \
+                    mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", head_only):
+                with self.assertRaisesRegex(RuntimeError, "overlap"):
+                    require_disjoint_head_only()
+                with self.assertRaisesRegex(RuntimeError, "overlap"):
+                    native_coverage("head", arm_log("head", sorted(NATIVE_FIXTURES)))
 
 
 if __name__ == "__main__":

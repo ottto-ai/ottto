@@ -267,10 +267,11 @@ fn retained_proof_missing_leaves_the_set_and_the_next_revision_re_tags_when_it_f
     sticky_apply(&mut fourth, &proof, &state).unwrap();
     assert_eq!(retained_marked(&fourth), vec![true, false]);
 
-    // Unfit: newer fresh proof fills the unchanged
-    // 16-key cap first. Counted; the bucket keeps today's untagged/refused
+    // Unfit: newer fresh proof fills the
+    // key cap first. Counted; the bucket keeps today's untagged/refused
     // rule. No hold, no cap increase, no marker without server proof.
-    let (mut wide, wide_proof) = retained_wide_open_hour(&original, &proof, 16);
+    let (mut wide, wide_proof) =
+        retained_wide_open_hour(&original, &proof, identity::MAX_AUTHORITY_KEYS as u64);
     identity::take_identity_counts();
     sticky_apply(&mut wide, &wide_proof, &before_retag).unwrap();
     assert_eq!(retained_marked(&wide), vec![false, false]);
@@ -468,7 +469,8 @@ fn retained_golden_cases() -> Value {
     sticky_apply(&mut second, &two_proof, &two_state).unwrap();
     let hour_zero = second.usage_buckets[0].bucket_start.clone();
     retained_ack(&mut two_state, &second, &[&hour_zero]);
-    let (mut unfit, unfit_proof) = retained_wide_open_hour(&two, &two_proof, 16);
+    let (mut unfit, unfit_proof) =
+        retained_wide_open_hour(&two, &two_proof, identity::MAX_AUTHORITY_KEYS as u64);
     sticky_apply(&mut unfit, &unfit_proof, &two_state).unwrap();
     cases.insert("missing_proof_retag_unfit_proving", sticky_wire(first.clone()));
     cases.insert("missing_proof_retag_fit_proving", sticky_wire(first));

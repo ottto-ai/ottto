@@ -30,11 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     traces: Option<Arc<CodexTurnTraceMap>>,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )?;
     let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
@@ -309,7 +304,7 @@ impl GroupBoot {
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member, None, &mut 0) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -362,6 +357,18 @@ impl GroupBoot {
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
+        // Group plans and the live-prefix certificate still use physical
+        // extents/end_byte_offset. Decoded offsets cannot satisfy those facts.
+        // Refuse before identification/probing can sample compressed bytes.
+        if refuse_compressed_codex(
+            Some(&self.group.members[self.identified].path),
+            None,
+            CodexZstCause::GroupReadUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
         if let Some(events) = launch_events {
@@ -436,7 +443,6 @@ impl GroupBoot {
                         && receipt.as_ref().map_or(true, |receipt| {
                             receipt.version == RECEIPT_VERSION
                                 && receipt.derivation == SnapshotSource::Codex.parser_version()
-                                && receipt.tiers.len() <= MAX_APPLIED_TIERS
                         })
                 })
         })
@@ -626,7 +632,6 @@ impl GroupBoot {
                 first.size_bytes,
                 !index.files.contains_key(&local_index_key(&first.path)),
             ),
-            comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
             previous_upload_body_witness: index.last_upload_body_witness(&last),
@@ -666,7 +671,6 @@ impl GroupBoot {
                 dependencies,
                 memo_digest,
                 scope: cursor::group_scope(),
-                walked: None,
                 consumed_before: 0,
             })),
         }))
@@ -681,12 +685,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     match open_candidate_file(SnapshotSource::Codex, member) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
@@ -705,12 +703,6 @@ fn legacy_tee(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
@@ -757,24 +749,16 @@ pub(in crate::snapshots) struct GroupJob {
     /// `cursor::group_scope` at job start: every resume and the
     /// emission compare it with the current index.
     pub(in crate::snapshots) scope: String,
-    /// The last walked copy-budget charge of a group read without the
-    /// cursor (a cursor job keeps it in its `JobMeta`).
-    pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
-    /// Bytes the completed members' readers consumed: the copy budget measures a group's
-    /// input cumulatively, so a member swap needs no walk (R2-L3).
+    /// Bytes the completed members' readers consumed, plus each member
+    /// swap's charge (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
-    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
+    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
     consumed_before);
 
 impl GroupJob {
-    /// A legacy tee takes every consumed record too.
-    pub(in crate::snapshots) fn has_tee(&self) -> bool {
-        self.tee.is_some()
-    }
-
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
         std::mem::take(&mut self.legacy_baselines)
     }
@@ -1150,7 +1134,8 @@ fn open_member(
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.
-        let (bytes, _, read, _) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
+        let (bytes, _, read, _) =
+            read_header_bytes(&member, None, &mut 0).map_err(|_| GroupEnd::Changed)?;
         group.charge = group.charge.saturating_add(read as u64);
         if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
             return Err(GroupEnd::Changed);

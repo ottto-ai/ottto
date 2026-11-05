@@ -18,6 +18,8 @@ pub(super) struct KindCx {
     /// A full save's staged Tail state; claim-only saves leave this `None` and
     /// publish none. The save's owner takes it back after the attempt.
     pub(super) tail: Option<tail::TailStage>,
+    /// Only the synchronous prepare-time transaction owns this move.
+    pub(super) carry: Option<(String, tail::PathCarry)>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
     /// Rows of retired kinds this hydrate found, by key only: their values are
@@ -135,6 +137,18 @@ pub(super) fn hydrate_txn(
     // because no group happens to scan it. Inventory the closed kind catalogue
     // in bounded pages before installing any semantic state. The same walk
     // names every retired kind's rows, from their headers only.
+    // Only held Codex members carry old first-seen evidence. Empty manifests
+    // and other sources retain main's ordinary retired-kind cleanup.
+    let legacy_archive_members = matches!(
+        binding.source,
+        super::super::scan_index_persistence::Source::Codex
+    ) && !tx
+        .scan_kind(
+            &RecordKind::parse("v1_field.archives")?,
+            Some(&mapper::key("v1_field.archives", "", 0)?),
+            1,
+        )?
+        .is_empty();
     let mut after = None;
     let mut retired = BTreeSet::new();
     loop {
@@ -156,7 +170,15 @@ pub(super) fn hydrate_txn(
                 catalogue::group(kind.name()).is_some(),
                 "state_v2_unmapped_kind"
             );
-            if catalogue::retired(kind.name()) {
+            // Legacy archive member keys retain first-seen evidence. Their
+            // values stay inert; no policy state or baseline digest is loaded.
+            if catalogue::retired(kind.name())
+                && !(legacy_archive_members
+                    && matches!(
+                        kind.name(),
+                        "v1_field.archives" | "v1_field.archive_deferred_alarm_count"
+                    ))
+            {
                 retired.insert(header.key.clone());
             }
         }
@@ -173,6 +195,7 @@ pub(super) fn hydrate_txn(
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
+    super::telemetry::hydrate_checkpoint("hydrate_after_files", 0, None);
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     super::telemetry::hydrate_checkpoint("hydrate_after_accounts", 0, None);
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
@@ -192,7 +215,6 @@ pub(super) fn delta(
         let mut rows = mapper::Rows {
             tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
-            // A staged file's own graph rows commit or roll back with its Tail.
             closures: cx
                 .tail
                 .iter()
@@ -201,7 +223,21 @@ pub(super) fn delta(
                 .collect(),
             ..Default::default()
         };
+        if let Some((to, carry)) = &cx.carry {
+            rows.closures
+                .entry(carry.from.as_bytes().to_vec())
+                .or_default();
+            rows.closures.entry(to.as_bytes().to_vec()).or_default();
+        }
         enumerate(next, &mut rows, cx)?;
+        if let Some((to, carry)) = &cx.carry {
+            // Take BOTH closures before finish: predecessor deletion, destination
+            // graph and all Tail rows share this transaction's COMMIT/rollback.
+            let mut closure = rows.take_closure(carry.from.as_bytes())?;
+            closure.extend(rows.take_closure(to.as_bytes())?);
+            tail::write_closure(rows.tx()?, &closure)?;
+            tail::move_tail(rows.tx()?, to.as_bytes(), carry)?;
+        }
         let retired = tail::removed_files(&rows.old);
         cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
         let digests = rows.finish()?;
@@ -242,6 +278,10 @@ pub(super) fn save_graph(
             Hold::ForeignBinding
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
+        if let Some((to, carry)) = &pending.carry {
+            // CAS-restored custody joins the same map move before encoding.
+            next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+        }
         super::super::lenient_decode::check_held_output(next)?;
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;
@@ -253,6 +293,7 @@ pub(super) fn save_graph(
                 next.generation = generation;
                 // RAM is ahead of a rolled-back file's committed rows: reload
                 // them. The stage is published; the file reselects.
+                pending.carry = None;
                 if pending.tail_rolled_back {
                     pending.tail = None;
                     bail!(Hold::ReloadRequired);

@@ -400,26 +400,10 @@ fn seed_predecessor_from(
     cache: &Arc<SharedCache>,
     input: ScanIndex,
 ) -> ScanIndex {
-    let index = settle(enriched(
+    settle(enriched(
         fixture,
         raw_scan(fixture, input, Some(cache.clone()), |_| {}),
-    ));
-    let bound = cache.inner.lock().unwrap().resident_bound();
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.unwrap() <= state_bytes());
-    } else {
-        assert!(
-            bound.is_none(),
-            "unsupported layout must not acquire a charge"
-        );
-        for key in index.files.keys() {
-            assert!(
-                cache.take(key).is_none(),
-                "unsupported layout must retain no native state"
-            );
-        }
-    }
-    index
+    ))
 }
 // Both branches execute the real scanner. Unsupported CI verifies Full fallback;
 // only the separately compiler-bound supported run verifies actual reuse.
@@ -626,20 +610,14 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
 }
 
 #[test]
-fn restart_and_copy_budget_refusal_keep_full_fallback() {
-    for retained_budget in [false, true] {
+fn restart_and_forgotten_continuation_keep_full_fallback() {
+    for restart in [false, true] {
         let f = Fixture::new(1);
         let cache = Arc::new(SharedCache::default());
         let prior = seed_predecessor(&f, &cache);
-        let cache = if retained_budget {
-            Arc::new(SharedCache {
-                withheld_memo: Default::default(),
-                cap_pace: Default::default(),
-                inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
-                cursor: Default::default(),
-                quiet: Default::default(),
-                test_route: Default::default(),
-            })
+        let cache = if restart {
+            // A new owner on its own route: the prior's heads are not its own.
+            Arc::new(SharedCache::default())
         } else {
             crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
                 &cache, &prior,

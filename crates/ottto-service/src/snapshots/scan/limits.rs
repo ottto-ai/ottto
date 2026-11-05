@@ -25,10 +25,11 @@ pub(in crate::snapshots) fn in_codex_forward_evidence_epoch(timestamp: Option<&s
 // Per-page read budget, not a history bound: discovery queues every file in
 // the window into the durable traversal and the rest continues next page.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
-// Directory discovery has its own hard per-tick budget. Candidate parsing was
-// already capped, but recursively walking an arbitrarily large tree before
-// applying that cap made one tick O(all paths). The durable traversal below
-// consumes at most this many directory entries and then resumes next tick.
+// Directory discovery has its own per-tick pacing budget, never a refusal.
+// Recursively walking an arbitrarily large tree in one tick made it O(all
+// paths); the durable traversal below spends about this many directory entries
+// and resumes next tick. One directory wider than the whole budget is listed
+// in full on a fresh tick, and that overdraw ends the tick.
 pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 /// The gap between metadata-only re-listing passes of one kept generation

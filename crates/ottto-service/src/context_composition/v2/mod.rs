@@ -36,7 +36,6 @@ mod scope;
 mod upload;
 
 pub(crate) use checkpoint::sync_dir;
-pub(crate) use harvest::drop_upload_acks;
 pub use harvest::run_context_composition_worker;
 pub(super) use harvest::spawn_v2_sync;
 

@@ -245,18 +245,13 @@ impl Page {
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
-                try_apply_claude_local_evidence_to_scan_with_comparison(
+                apply_claude_local_evidence_to_scan_with_retained(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    None,
-                    None,
-                    None,
-                    Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
                     wire_budget,
                 )
-                .unwrap()
             });
         if let Some(accepted) = accepted.as_deref_mut() {
             accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
@@ -852,7 +847,9 @@ fn upload_under(
         |s| s.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |s| Some(s.source_session_id.as_str()),
-        |_| false,
+        // The production main-upload class: patched and unpatched bodies
+        // never share a request.
+        |s| snapshot_upload_batch_class(s, false),
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
@@ -2156,7 +2153,6 @@ fn retry_case(conflict: bool) {
             &index_path,
             &progress_path,
             || Ok(()),
-            None,
             None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
             None,
@@ -3554,9 +3550,6 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         }
         if loss == 1 {
             scanner.evict(&prior);
-        } else if loss == 2 {
-            // Actual capacity eviction through the existing victim mechanism.
-            scanner.evict_for_pressure(&prior);
         }
         let scanner = if loss == 3 { &restarted } else { &scanner };
         let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
@@ -3566,8 +3559,8 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
             // On the database route the held-new custody is durable (the
-            // withheld read's census record and committed head): a RAM
-            // clear, eviction or restart still continues it.
+            // withheld read's census record and committed head): an
+            // eviction or restart still continues it.
             assert_eq!(
                 retry.modes,
                 if grow { (0, 1, 0) } else { (0, 0, 1) },
@@ -3646,14 +3639,14 @@ fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
 
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, true, loss);
     }
 }
 
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
 }

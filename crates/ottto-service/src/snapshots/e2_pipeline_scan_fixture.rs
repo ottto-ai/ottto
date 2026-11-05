@@ -103,11 +103,9 @@ pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: 
     });
 }
 
-/// `index`'s files with no continuation, on their own route: RAM is released
-/// and each head retired, so the next read of each is a Full as a first read
-/// is. A released cache alone keeps the heads, as in production.
-pub(crate) fn forget_continuations_for_test(cache: &sampled_scan::SharedCache, index: &ScanIndex) {
-    cache.clear();
+/// `index`'s files with no continuation, on their own route: each head is
+/// retired, so the next read of each is a Full as a first read is.
+pub(crate) fn forget_continuations_for_test(_cache: &sampled_scan::SharedCache, index: &ScanIndex) {
     if let Some(route) = route_of(index) {
         state_v2::retire_tail(&route, index.files.keys().cloned()).unwrap();
     }
@@ -215,28 +213,19 @@ impl Continuation {
     }
 }
 
-/// `key`'s continuation: for a source with a Tail codec its head on
-/// `index`'s route (this pass's staged head, else the committed one), as the
-/// RAM-era fixture read its retained checkpoint; any other source's retained
-/// copy.
+/// `key`'s continuation: its head on `index`'s route (this pass's staged
+/// head, else the committed one), as the RAM-era fixture read its retained
+/// checkpoint.
 pub(crate) fn continuation_for_test(
     source: SnapshotSource,
-    cache: &sampled_scan::SharedCache,
+    _cache: &sampled_scan::SharedCache,
     index: &ScanIndex,
     key: &str,
 ) -> Option<Continuation> {
     let certificate = match source {
         SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
         SnapshotSource::Codex => head_certificate::<tail_source::codex::Codex>(index, key)?,
-        SnapshotSource::Pi => {
-            return cache
-                .retained_checkpoint(key)
-                .map(|checkpoint| Continuation {
-                    audit_debt: checkpoint.audit_debt(),
-                    last_full_verified: checkpoint.last_full_verified(),
-                    sealed_offset: checkpoint.sealed_offset(),
-                })
-        }
+        SnapshotSource::Pi => head_certificate::<tail_source::pi::Pi>(index, key)?,
     };
     Some(Continuation {
         audit_debt: certificate
@@ -443,15 +432,6 @@ impl E2ScanFixture {
 
     /// `index`'s files lose their continuation.
     pub(crate) fn evict(&self, index: &ScanIndex) {
-        forget_continuations_for_test(&self.cache, index);
-    }
-
-    pub(crate) fn evict_for_pressure(&self, index: &ScanIndex) {
-        let mut retained = self.cache.retained().unwrap();
-        let empty = sampled_scan::RetainedCache::default();
-        let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
-        assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
-        drop(retained);
         forget_continuations_for_test(&self.cache, index);
     }
 

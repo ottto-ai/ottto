@@ -1143,3 +1143,74 @@ fn preexisting_v2_ack_does_not_absorb_an_unobserved_legacy_eviction_flip() {
     assert!(loaded.codex_counting_evicted_legacy.is_empty());
     fs::remove_dir_all(acked.root).unwrap();
 }
+
+/// [money] A rollout key that the page's complete directory read did not list
+/// and that is proven absent records its counting evidence before either
+/// page-end exit. With room in the tombstone map, an ordinary and an
+/// audit-debt key retire, each with its Legacy tombstone. A map full of this
+/// generation's Legacy evidence refuses both before the audit exit: each entry
+/// stays and no tombstone is written. A protected key keeps its custody.
+#[test]
+fn directory_proof_tombstones_before_the_audit_exit_or_keeps_custody() {
+    const AT: &str = "2026-10-07T23:00:00Z";
+    for full in [false, true] {
+        let acked = acked_original(false, true);
+        let sessions = acked.root.join("sessions");
+        let [plain, audit, protected] = ["a001", "a002", "a003"].map(|n| {
+            let id = format!("0199f7a0-0000-7000-8000-00000000{n}");
+            let path = sessions.join(format!("rollout-2026-10-01T10-00-00-{id}.jsonl"));
+            (local_index_key(&path), codex_protected_owner(&id))
+        });
+        let mut index = acked.previous.clone();
+        // A fresh generation whose census window is `AT`.
+        index.traversal = None;
+        for (key, owner) in [&plain, &audit, &protected] {
+            index
+                .files
+                .insert(key.clone(), acked_entry(false, Some(owner.clone())));
+        }
+        let entry = index.files.get_mut(&audit.0).unwrap();
+        entry.scan_identity_version =
+            Some(format!("{}:4000000000", sampled_audit::UNVERIFIED_IDENTITY));
+        assert!(entry.has_unverified_source());
+        index
+            .files
+            .get_mut(&protected.0)
+            .unwrap()
+            .codex_protected_owner = Some(protected.1.clone());
+        assert!(index.files[&protected.0].codex_history_is_protected());
+        if full {
+            index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+                .map(|n| {
+                    let tombstone = codex_counting_version::CountingTombstone {
+                        evidence: AckEvidence::LegacyAcked,
+                        retired_in: AT.into(),
+                        created_unix_ms: None,
+                    };
+                    (format!("{n:064x}"), tombstone)
+                })
+                .collect();
+        }
+        {
+            let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+            let _ = scan_at(&acked.root, &mut index, AT);
+        }
+        for (key, owner) in [&plain, &audit] {
+            assert_eq!(index.files.contains_key(key), full, "full {full}: {key}");
+            assert_eq!(
+                index
+                    .codex_counting_tombstones
+                    .get(owner)
+                    .map(|tombstone| tombstone.evidence),
+                (!full).then_some(AckEvidence::LegacyAcked),
+                "full {full}: {key}"
+            );
+        }
+        assert_eq!(
+            index.files[&protected.0].codex_protected_owner.as_deref(),
+            Some(protected.1.as_str()),
+            "full {full}: protection keeps custody"
+        );
+        fs::remove_dir_all(acked.root).unwrap();
+    }
+}

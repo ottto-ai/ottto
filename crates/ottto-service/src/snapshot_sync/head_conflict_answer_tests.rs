@@ -4,17 +4,17 @@ use super::*;
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
 use serde_json::Value;
 
-const SCOPE: &str = "codex-head-conflict-answer-test";
+pub(super) const SCOPE: &str = "codex-head-conflict-answer-test";
 
-fn stale_head() -> String {
+pub(super) fn stale_head() -> String {
     "1".repeat(64)
 }
 
-fn challenge(n: u8) -> String {
+pub(super) fn challenge(n: u8) -> String {
     format!("{n:x}").repeat(64)
 }
 
-fn item() -> SnapshotItem {
+pub(super) fn item() -> SnapshotItem {
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     assert!(
         item.cache_observations.is_some(),
@@ -34,7 +34,7 @@ fn progress_with_stale_head(item: &SnapshotItem) -> SnapshotUploadProgress {
     progress
 }
 
-fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
+pub(super) fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: if items
@@ -54,7 +54,7 @@ fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
     }
 }
 
-fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
+pub(super) fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
     SnapshotEntityRef {
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -68,7 +68,7 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
     }
 }
 
-fn empty_ack() -> SnapshotBatchResponse {
+pub(super) fn empty_ack() -> SnapshotBatchResponse {
     SnapshotBatchResponse {
         conflict_rescans: Default::default(),
         accepted: 0,
@@ -108,25 +108,41 @@ fn conflict(item: &SnapshotItem, challenge: &str) -> SnapshotBatchResponse {
     ack
 }
 
-/// One production-shaped source page: base from the saved head, answer
-/// attached at `now`, the normal ACK validator and conflict binding, and the
-/// normal page settlement. A held conflict body is offered under its bounded
-/// retry lease, as the quarantine retry selection does.
+/// One production-shaped single-body page: see `cycle_with_transport`. Every
+/// request declares head CAS.
 fn cycle(
     progress: &mut SnapshotUploadProgress,
     item: &SnapshotItem,
     now: u64,
     server: impl Fn(&SnapshotItem) -> SnapshotBatchResponse,
 ) -> (Result<ResumableUploadResult>, Value) {
-    cycle_with_transport(progress, item, now, |item| Ok(server(item)))
+    let (result, mut wires) = cycle_with_transport(
+        progress,
+        std::slice::from_ref(item),
+        now,
+        |_| 0,
+        |_| true,
+        |request, _| Ok(server(&request.snapshots[0])),
+    );
+    (result, wires.pop().unwrap_or(Value::Null))
 }
 
-fn cycle_with_transport(
+/// One production-shaped source page: each body's base from its saved head,
+/// owed answers attached at `now`, the batch `class`, the normal ACK validator
+/// and conflict binding, and the normal page settlement saved at each page
+/// boundary. Held conflict bodies are offered under their bounded retry
+/// lease, as the quarantine retry selection does. A request that `enforce`
+/// accepts declares head CAS on the wire (a legacy reconciliation, or the
+/// single-body cycle); any other declares it when a body carries a patch.
+/// Returns the result and each request's wire, in send order.
+pub(super) fn cycle_with_transport(
     progress: &mut SnapshotUploadProgress,
-    item: &SnapshotItem,
+    items: &[SnapshotItem],
     now: u64,
-    server: impl Fn(&SnapshotItem) -> Result<SnapshotBatchResponse>,
-) -> (Result<ResumableUploadResult>, Value) {
+    class: impl Fn(&SnapshotItem) -> u8,
+    enforce: impl Fn(&[SnapshotItem]) -> bool,
+    mut server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
     let path = root.join("progress.json");
     // Each call starts from this view, then saves at the real page boundary.
@@ -134,29 +150,41 @@ fn cycle_with_transport(
     durable.generation = 0;
     durable.save(&path).unwrap();
     progress.generation = durable.generation;
-    let mut items = vec![item.clone()];
-    items[0].cache_base_head_etag = progress
-        .accepted_cache_heads
-        .get(&cache_session_key(&item.source_session_id))
-        .cloned();
+    let mut items = items.to_vec();
+    for item in &mut items {
+        item.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&item.source_session_id))
+            .cloned();
+        progress
+            .active_quarantine_retries
+            .insert(item.snapshot_fingerprint.clone());
+    }
     attach_head_conflict_answers(&mut items, progress, now);
-    progress
-        .active_quarantine_retries
-        .insert(item.snapshot_fingerprint.clone());
-    let mut wire = Value::Null;
+    let mut wires = Vec::new();
     let mut accepted_count = 0;
-    let result = upload_resumable_batches_with_body_witness(
+    let result = upload_resumable_batches_with_literal_families(
         &items,
         SCOPE,
         progress,
         &mut accepted_count,
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
+        |item| Some(item.source_session_id.as_str()),
+        class,
+        |_| None,
+        &mut InplaceRetryBudget::default(),
         |batch| {
             let request = request(batch);
-            wire = serde_json::to_value(request.wire_with_head_cas())?;
-            let mut response = server(&request.snapshots[0])?;
-            response.validate_entity_ack_with_head_cas(&request, true)?;
+            let cas = enforce(request.snapshots.as_slice());
+            let wire = if cas {
+                serde_json::to_value(request.wire_with_head_cas())?
+            } else {
+                serde_json::to_value(&request)?
+            };
+            wires.push(wire.clone());
+            let mut response = server(&request, &wire)?;
+            response.validate_entity_ack_with_head_cas(&request, cas)?;
             response.bind_conflict_rescans(&request);
             Ok(response)
         },
@@ -179,14 +207,14 @@ fn cycle_with_transport(
         );
     }
     progress.active_quarantine_retries.clear();
-    (result, wire)
+    (result, wires)
 }
 
-fn envelope(wire: &Value) -> &Value {
+pub(super) fn envelope(wire: &Value) -> &Value {
     &wire["snapshots"][0]["semantic_envelope"]
 }
 
-fn revision_v2(item: &SnapshotItem) -> String {
+pub(super) fn revision_v2(item: &SnapshotItem) -> String {
     crate::snapshots::snapshot_semantic_envelope(
         SnapshotSource::Codex,
         item,
@@ -431,11 +459,19 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 0);
     assert_eq!(progress.head_conflict_challenges[&key].last_answer_unix, 0);
     let before = progress.clone();
-    let (lost, wire) = cycle_with_transport(&mut progress, &item, 1_003, |_| {
-        Err(anyhow!("synthetic lost reply"))
-    });
+    let (lost, wires) = cycle_with_transport(
+        &mut progress,
+        std::slice::from_ref(&item),
+        1_003,
+        |_| 0,
+        |_| true,
+        |_, _| Err(anyhow!("synthetic lost reply")),
+    );
     assert!(lost.is_err());
-    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xd));
+    assert_eq!(
+        envelope(&wires[0])["conflict_head_challenge"],
+        challenge(0xd)
+    );
     assert_eq!(
         progress.head_conflict_challenges,
         before.head_conflict_challenges
@@ -917,7 +953,7 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
 /// The cycle's upload-context activation, on a copy of the ledger: whether
 /// the scan index then holds the session as owing an answer (its files read
 /// a native Full, never a Tail re-fold).
-fn mirrored(progress: &SnapshotUploadProgress, key: &str) -> bool {
+pub(super) fn mirrored(progress: &SnapshotUploadProgress, key: &str) -> bool {
     let mut index = ScanIndex::default();
     activate_source_upload_context(
         SnapshotSource::Codex,
@@ -1031,7 +1067,9 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
 
 /// The mirror is runtime-only: a restart reloads the open challenge from
 /// the persisted ledger, and the first activation after it mirrors the
-/// session again; the scan index itself never stores it.
+/// session again; the scan index itself never stores it. A challenge whose
+/// session holds no saved base can never carry an answer: it is not
+/// mirrored before or after the restart, so its files may re-fold.
 #[test]
 fn a_restart_mirrors_the_persisted_challenge_again() {
     let item = item();
@@ -1040,6 +1078,17 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     let _ = cycle(&mut progress, &item, 1_000, |item| {
         conflict(item, &challenge(0xc))
     });
+    let baseless = cache_session_key("synthetic-baseless-session");
+    progress.head_conflict_challenges.insert(
+        baseless.clone(),
+        HeadConflictChallenge {
+            challenge: challenge(0xd),
+            stale_revision_v2_hash: "d".repeat(64),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+    assert!(!progress.accepted_cache_heads.contains_key(&baseless));
     let root = crate::test_scratch::ScratchDir::new("head-conflict-mirror-restart");
     let progress_path = root.join("upload-progress.json");
     let index_path = root.join("scan-index.json");
@@ -1053,6 +1102,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
         &mut progress,
     );
     assert!(index.head_conflict_owed(&key));
+    assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
     index.save(&index_path).unwrap();
 
     let mut restarted = SnapshotUploadProgress::load(
@@ -1070,4 +1120,6 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
         &mut restarted,
     );
     assert!(index.head_conflict_owed(&key));
+    assert!(restarted.head_conflict_challenges.contains_key(&baseless));
+    assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
 }

@@ -33,13 +33,13 @@ use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::{self, Hold};
 use crate::snapshots::*;
 use crate::transcript_acquisition::{CertificateRefusal, FullReason, Scope};
-use crate::transcript_cache::{Retained, Taken};
+use crate::transcript_cache::Retained;
 
 /// What a load hands the read.
 pub(in crate::snapshots) enum Load {
     /// Continue from the stored reduction. `base` is `None` for a file set
     /// aside, so its next stage replaces every stored row.
-    Reused(Box<Taken<CachedJsonlReduction>>, Option<TailBase>),
+    Reused(Box<Retained<CachedJsonlReduction>>, Option<TailBase>),
     /// A newer build's head, or a live input not available now: the file
     /// waits, untouched, with its debt.
     Held,
@@ -78,8 +78,9 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// A late-evidence re-fold needs complete stored state: a set-aside file
 /// reads natively instead. A body waiting on a server retry re-folds: it is
 /// the same body a native read sends. Whatever the selection, a file whose
-/// session owes a head-CAS answer never continues from stored state; the
-/// load refuses it ([`conflict_owed`]) once the head names the session.
+/// session owes a head-CAS answer that can ride an upload never continues
+/// from stored state; the load refuses it ([`conflict_owed`]) once the head
+/// names the session. A challenge without a saved base follows these rules.
 pub(in crate::snapshots) fn reuses_stored(
     index: &ScanIndex,
     key: &str,
@@ -115,10 +116,11 @@ pub(in crate::snapshots) fn held_new(index: &ScanIndex, key: &str) -> bool {
     !index.files.contains_key(key) && index.claude_request_census.get(key).is_some()
 }
 
-/// The stored head's session owes a head-CAS answer: the upload ledger holds
-/// an open challenge for it. The answer attaches to any outgoing body of the
-/// session and claims a full rescan, so it rides only a real native Full: the
-/// file reads Full whatever its selection, a grown file included.
+/// The stored head's session owes a head-CAS answer that can ride an upload:
+/// the upload ledger holds an open challenge and a saved base for it. The
+/// answer attaches to an outgoing body of the session and claims a full
+/// rescan, so it rides only a real native Full: the file reads Full whatever
+/// its selection, a grown file included.
 pub(in crate::snapshots) fn conflict_owed(
     index: &ScanIndex,
     path: &Path,
@@ -252,7 +254,7 @@ enum Miss {
 
 /// What a hit loaded: the reduction, its base, and the bytes it read.
 struct Hit {
-    taken: Box<Taken<CachedJsonlReduction>>,
+    retained: Box<Retained<CachedJsonlReduction>>,
     base: TailBase,
     head_bytes: u64,
     page_bytes: u64,
@@ -281,7 +283,7 @@ pub(super) fn load<S: TailSource>(
             counters::bump(source, "tail_db_loads", "hit");
             counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
             counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
-            return Load::Reused(hit.taken, base);
+            return Load::Reused(hit.retained, base);
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
@@ -393,7 +395,7 @@ fn stored<S: TailSource>(
     });
     if pages.is_err() {
         return Err(match failed {
-            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible)) => {
+            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible(_))) => {
                 Miss::FutureFact
             }
             Some((_, cause)) => Miss::Reconstruct(cause),
@@ -417,17 +419,11 @@ fn stored<S: TailSource>(
     if toggled {
         reduction.scrub_context_digest();
     }
-    let taken = Taken {
-        modified_hint: checkpoint.modified_hint(),
-        retained: Retained {
+    Ok(Hit {
+        retained: Box::new(Retained {
             checkpoint,
             state: reduction,
-        },
-        finalization_charge: 0,
-        e2_held_new_file: false,
-    };
-    Ok(Hit {
-        taken: Box::new(taken),
+        }),
         base,
         head_bytes: head.body.len() as u64,
         page_bytes,

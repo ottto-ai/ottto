@@ -13,15 +13,15 @@
         "identity_disposition": "missing"
       },
       "source_session_id": "w0-cap-evidence",
-      "snapshot_fingerprint": "ac81bf76429b0b80deb95879a90ebb0fcd285926ffb04f74fc93a4eb1831a1ce",
+      "snapshot_fingerprint": "47b944c84cdc88cb9cdcdd634e204b8e3d7b06cfb877f91312ad411480a036d5",
       "status": "final",
-      "input_tokens": 1600,
-      "output_tokens": 160,
+      "input_tokens": 3200,
+      "output_tokens": 320,
       "cache_read_tokens": 0,
       "cache_creation_5m_tokens": 0,
       "cache_creation_1h_tokens": 0,
       "reasoning_output_tokens": 0,
-      "request_count": 16,
+      "request_count": 32,
       "peak_context_fill_tokens": 100,
       "first_turn_context_tokens": 100,
       "last_turn_context_tokens": 100,
@@ -56,13 +56,13 @@
       "model_usage": [
         {
           "model": "claude-haiku-4-5",
-          "input_tokens": 1600,
-          "output_tokens": 160,
+          "input_tokens": 3200,
+          "output_tokens": 320,
           "cache_read_tokens": 0,
           "cache_creation_5m_tokens": 0,
           "cache_creation_1h_tokens": 0,
           "reasoning_output_tokens": 0,
-          "request_count": 16,
+          "request_count": 32,
           "selector_context": {
             "context_bucket": "short"
           },
@@ -71,7 +71,7 @@
           },
           "gateway_provider": "anthropic",
           "model_provider": "anthropic",
-          "cost_usd": "16.00",
+          "cost_usd": "32.00",
           "identity_parts": [
             {
               "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
@@ -280,6 +280,214 @@
               "unattributed_total_tokens": 0,
               "request_count": 1,
               "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 16,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 17,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 18,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 19,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 20,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 21,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 22,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 23,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 24,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 25,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 26,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 27,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 28,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 29,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 30,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 31,
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "1.00"
             }
           ]
         }
@@ -335,19 +543,6 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 4,
-                  "input_tokens": 100,
-                  "output_tokens": 10,
-                  "cache_read_tokens": 0,
-                  "cache_creation_5m_tokens": 0,
-                  "cache_creation_1h_tokens": 0,
-                  "reasoning_output_tokens": 0,
-                  "unattributed_total_tokens": 0,
-                  "request_count": 1,
-                  "cost_usd": "1.00"
-                },
-                {
-                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "evidence_ref": 6,
                   "input_tokens": 100,
                   "output_tokens": 10,
@@ -361,7 +556,191 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 11,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 13,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 18,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 20,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 24,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 26,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                }
+              ]
+            }
+          ],
+          "first_activity_at": "2026-09-01T10:00:04Z",
+          "last_activity_at": "2026-09-01T10:00:50Z"
+        },
+        {
+          "bucket_start": "2026-09-01T11:00:00Z",
+          "model_usage": [
+            {
+              "model": "claude-haiku-4-5",
+              "input_tokens": 2300,
+              "output_tokens": 230,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "request_count": 23,
+              "selector_context": {
+                "context_bucket": "short"
+              },
+              "selector_sources": {
+                "context_bucket": "derived_from_effective_input_volume"
+              },
+              "gateway_provider": "anthropic",
+              "model_provider": "anthropic",
+              "cost_usd": "23.00",
+              "identity_parts": [
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 1,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 3,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 4,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 5,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 7,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                   "evidence_ref": 8,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 9,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -423,38 +802,10 @@
                   "unattributed_total_tokens": 0,
                   "request_count": 1,
                   "cost_usd": "1.00"
-                }
-              ]
-            }
-          ],
-          "first_activity_at": "2026-09-01T10:00:04Z",
-          "last_activity_at": "2026-09-01T10:00:50Z"
-        },
-        {
-          "bucket_start": "2026-09-01T11:00:00Z",
-          "model_usage": [
-            {
-              "model": "claude-haiku-4-5",
-              "input_tokens": 700,
-              "output_tokens": 70,
-              "cache_read_tokens": 0,
-              "cache_creation_5m_tokens": 0,
-              "cache_creation_1h_tokens": 0,
-              "reasoning_output_tokens": 0,
-              "request_count": 7,
-              "selector_context": {
-                "context_bucket": "short"
-              },
-              "selector_sources": {
-                "context_bucket": "derived_from_effective_input_volume"
-              },
-              "gateway_provider": "anthropic",
-              "model_provider": "anthropic",
-              "cost_usd": "7.00",
-              "identity_parts": [
+                },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 1,
+                  "evidence_ref": 16,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -467,7 +818,7 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 3,
+                  "evidence_ref": 17,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -480,7 +831,7 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 5,
+                  "evidence_ref": 19,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -493,7 +844,7 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 7,
+                  "evidence_ref": 21,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -506,7 +857,7 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 9,
+                  "evidence_ref": 22,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -519,7 +870,7 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 11,
+                  "evidence_ref": 23,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -532,7 +883,72 @@
                 },
                 {
                   "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-                  "evidence_ref": 13,
+                  "evidence_ref": 25,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 27,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 28,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 29,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 30,
+                  "input_tokens": 100,
+                  "output_tokens": 10,
+                  "cache_read_tokens": 0,
+                  "cache_creation_5m_tokens": 0,
+                  "cache_creation_1h_tokens": 0,
+                  "reasoning_output_tokens": 0,
+                  "unattributed_total_tokens": 0,
+                  "request_count": 1,
+                  "cost_usd": "1.00"
+                },
+                {
+                  "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                  "evidence_ref": 31,
                   "input_tokens": 100,
                   "output_tokens": 10,
                   "cache_read_tokens": 0,
@@ -551,7 +967,7 @@
         }
       ],
       "cost": {
-        "total_cost_usd": "16.00",
+        "total_cost_usd": "32.00",
         "evidence_source": "synthetic_reported"
       },
       "session_display_name": null,
@@ -591,12 +1007,32 @@
           "provider_workspace_hash": "1d9539e8fa321c15c42eca2fa17e2090d0879ca4299cbe39b926bc9a14e8862a"
         },
         {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "1f05649b86ad17a98cddae79fa7637df804823428fe1081f0f227edaa0383044"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "3f245e8fea3e93ef575c29ed93b2f2ac801af123ad7b62e8a29a37e9db3c472f"
+        },
+        {
           "identity_basis": "telemetry",
           "provider_workspace_hash": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
         },
         {
           "identity_basis": "telemetry_login",
           "provider_workspace_hash": "4ad5c840fdcddc2f250e400592bbc82ffe43d008765981980113641a38b51235"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "5309a9639d86fe449a4296d740191f73dff59a38e02b69afd90e5c7c83e95e4b"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "55cbc8a20bdfb3595e33707a04e163190d9cdba729d21a9f747d7e419f011c57"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "64aaf8f5696ff1252c84b50c0e05f8c9f6c04f58c33d5e6c47c7e7fba5aed08e"
         },
         {
           "identity_basis": "telemetry",
@@ -615,6 +1051,18 @@
           "provider_workspace_hash": "7a421713a99881f3a3568b9a4ceae5aa0eb949c26eb66650cb53db682806adcf"
         },
         {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "90f6c1a15e516d4ce796372b7617df0f6f2c56ad17906995c5fff708e1e88cf8"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "9a0251625ec6e2d8d322a1d21d2d89c2bee6859d192b8f3a5bf729de0d5f3b3e"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "9b8081753d85524c0eb74f7450a16112e0bb3a473f854d240eb55018ac8ec4c8"
+        },
+        {
           "identity_basis": "telemetry",
           "provider_workspace_hash": "a1ac7e97250bfe2a622826f5e6c06a51243dab89c33d70a20261886304d438d6"
         },
@@ -629,14 +1077,46 @@
         {
           "identity_basis": "telemetry_login",
           "provider_workspace_hash": "a1b07218e8ade47e1ae6a922dd15a1c365f603ac85611e6644fa0154ee5df8a6"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "a83588e9c607733cadf84cef760a1b29771dcb7a0f9511f65453ab25669115d0"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "b1fa53951b0c9f972e8fc496181ada79076a4c68b906c368b8720f55127304d3"
         },
         {
           "identity_basis": "telemetry",
           "provider_workspace_hash": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36"
         },
         {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "c341b950a78f02e972ce073ff4ed0e1276d070be9e086453d1f2f7ecced49a36"
+        },
+        {
           "identity_basis": "telemetry",
           "provider_workspace_hash": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "c746dea397ad741784427b94b327a6a89b8ef256a17c301825ad9ba0d44c03ee"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "c860b8e9adcd4cf87f0b4f8ad6276273fc5f1c1f69b06470e56c56b27a4eb765"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "e337d58e3c24b87d9da0f830efa0644ec107562b08f88f2429eca647b7781bfb"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "ea76ad59fe848015707e0e100f16e8bf835811885593fe0f2596cf5251b4e8bb"
+        },
+        {
+          "identity_basis": "telemetry_login",
+          "provider_workspace_hash": "ff69af88f62b2d07afb2c6025f543380939c8089c6144d5a3b4abc935143c1cf"
         }
       ],
       "semantic_envelope": {
@@ -657,10 +1137,10 @@
           "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
           "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
           "lifecycle_activity": "71edcf57ad4baaa88d06fd0a7cc972c518c54c950ad452be26a18ac77c160f3d",
-          "usage_accounting": "b60ec1e4b7d2d23bad1050cbb857328da82a8ec1f8e0ac757e1c4babbefcd37f"
+          "usage_accounting": "310ef37178de25c8ea9e371e5523f5477eb30b913e23dc596f669918ea306de5"
         },
-        "revision_hash": "8f5db3e64e36703586161e503adc47da5120af24507bf133c0434446d2c0615f",
-        "content_hash": "80d1a6ddb74f603b9341ff04c8e8853f2287055fe48ac9d535a614c6a37444c8",
+        "revision_hash": "6511cb53f69da486ebf0e33a20917183d82707ae6bc13eb4e0b356b3b4968b5e",
+        "content_hash": "b328266b7e38764367105005d64e76946e9f53386066cf62c8b023efa54cac9f",
         "hash_epoch": 1
       }
     }

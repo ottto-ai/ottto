@@ -146,12 +146,16 @@ impl Drop for PreCutoverEvidenceForTest {
     }
 }
 
-pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
-pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
+pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 32;
+pub(crate) const MAX_AUTHORITY_KEYS: usize = 32;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`).
-/// The byte cap is the real limit; this stops construction early.
-pub(crate) const MAX_PARTS_PER_ITEM: usize = 2_048;
+/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`):
+/// the receiver's dense parts bound, serialized item bytes / 320, at this
+/// pass's item cap (2,048 at the default cap). The byte cap is the real
+/// limit; this stops construction early.
+pub(crate) const fn max_parts_per_item(max_item_bytes: usize) -> usize {
+    max_item_bytes / 320
+}
 pub(crate) const MAX_ROWS: usize = 100;
 /// Receiver `MAX_SNAPSHOT_ITEM_BYTES`, measured on sorted compact JSON.
 pub(crate) const MAX_ITEM_BYTES: usize = super::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
@@ -1099,7 +1103,7 @@ fn apply_grouped_with_accepted(
         }
         top_identities.push(identity);
     }
-    if total_parts > MAX_PARTS_PER_ITEM {
+    if total_parts > max_parts_per_item(max_item_bytes) {
         over_cap.insert(OverCap::PartsPerItem);
     }
     if item.model_usage.len() > MAX_ROWS
@@ -1213,6 +1217,14 @@ fn apply_grouped_with_accepted(
             attempted_bytes,
             components.as_ref(),
         );
+        // Local explanation only: an account-limit hold never uploads, so the
+        // app can say why. Other holds (rows, bytes) keep their reason.
+        if over_cap.contains(&OverCap::AuthorityKeys)
+            || over_cap.contains(&OverCap::EvidenceEntries)
+        {
+            item.claude_account_withheld_reason =
+                Some(super::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS);
+        }
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         return Ok(Tagged::Held);
     }
@@ -2846,12 +2858,9 @@ pub(crate) struct OrgMarkers {
     overflowed: RetiredOverflow,
     context_digest: Option<String>,
     context_changed: bool,
-    /// Response positions of the first non-blank `session_context` email and
-    /// of the first later `session_context` naming a different one. Without a
-    /// key, the second is the first later sentence or the first after a marker:
-    /// it could not be compared, so it counts as different.
+    /// Response position of the first non-blank `session_context` email.
     context_position: Option<u64>,
-    context_flip_position: Option<u64>,
+    context_flip_position: RetiredContextFlipPosition,
 }
 
 /// Retired: the starting marker earlier builds stored beside the entries (it
@@ -2865,6 +2874,12 @@ pub(crate) struct RetiredStartingMarker;
 /// as `false`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetiredOverflow;
+
+/// Retired: the position of the first later `session_context` naming a
+/// different email, which earlier builds stored. Nothing reads it, so it is
+/// decoded and dropped, written as `None`, and a stored head still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetiredContextFlipPosition;
 
 impl crate::durable_tail_codec::Durable for RetiredStartingMarker {
     fn put(
@@ -2913,6 +2928,28 @@ impl crate::durable_tail_codec::Durable for RetiredOverflow {
     }
 }
 
+impl crate::durable_tail_codec::Durable for RetiredContextFlipPosition {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        crate::durable_tail_codec::Durable::put(&None::<u64>, e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::take(d).map(|_| Self)
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        <Option<u64> as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        <Option<u64> as crate::durable_tail_codec::Durable>::shape(s);
+    }
+}
+
 /// The hashed organization of a `credential_org` attachment; `None` when blank
 /// or malformed.
 fn marker_org_hash(attachment: &Value) -> Option<String> {
@@ -2946,23 +2983,13 @@ pub(crate) fn note_marker_line(
             let state = markers.get_or_insert_with(Box::default);
             match accepted::session_context_digest(&text) {
                 // No key, no field: a sentence that cannot be compared explains
-                // no organization change and ends any earlier email.
-                None => {
-                    state.context_digest = None;
-                    if state.context_position.is_some() || !state.entries.is_empty() {
-                        state.context_flip_position.get_or_insert(response_position);
-                    }
-                }
+                // no organization change.
+                None => state.context_digest = None,
                 // An earlier email with no digest (no key then, or scrubbed on a
                 // key change) cannot be compared: this sentence is a fresh
-                // baseline. It explains no organization change and ends that email.
+                // baseline. It explains no organization change.
                 Some(digest) if state.context_digest.as_deref() != Some(digest.as_str()) => {
                     let compared = state.context_digest.is_some();
-                    if (compared || state.context_position.is_some())
-                        && state.context_flip_position.is_none()
-                    {
-                        state.context_flip_position = Some(response_position);
-                    }
                     state.context_changed =
                         compared || (state.context_position.is_none() && !state.entries.is_empty());
                     state.context_digest = Some(digest);
@@ -3018,7 +3045,6 @@ impl OrgMarkers {
             .iter()
             .map(|marker| marker.position)
             .chain(self.context_position)
-            .chain(self.context_flip_position)
     }
     /// Ends comparison across a key change, keeping the markers and their
     /// earlier verdicts. This state exists only once a sentence or marker was
@@ -3029,7 +3055,6 @@ impl OrgMarkers {
         self.context_changed = false;
         if self.context_position.is_none() {
             self.context_position = Some(0);
-            self.context_flip_position = Some(0);
         }
         with_context_digest_scrubs(|counter| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3507,58 +3532,6 @@ impl RequestAccounts {
             .find(|run| run.account.is_some())
             .filter(|run| matches!(run.copied, Some((_, true))))?;
         runs.last().map(|run| run.position)
-    }
-
-    /// X_out's E term for a gate-on fold's accounts: the boxed
-    /// `request_accounts` for `markers` and a bound login of `login` bytes,
-    /// built twice while `finish_native` rebuilds beside the first, with
-    /// each build's scratch (the contradicted positions, the distinct-key
-    /// set, the excluded positions). Each `AccountPartition` is charged per
-    /// reference. Also what one grain key's partition costs, and the marker
-    /// runs (at most one inherited body each).
-    pub(crate) fn finish_heap_bound(
-        markers: Option<&OrgMarkers>,
-        login: usize,
-    ) -> Option<(usize, usize, usize)> {
-        use crate::heap_layout_bound::tree_node_bytes;
-        use std::mem::{align_of, size_of};
-        let (runs, org) = markers.map_or((0, 0), |markers| {
-            let org = markers
-                .entries
-                .iter()
-                .filter_map(|marker| marker.org.as_ref().map(String::capacity))
-                .max()
-                .unwrap_or(0);
-            (markers.entries.len().max(1), org)
-        });
-        // Neither a login nor a marker: every partition is None.
-        let partition = if login == 0 && runs == 0 {
-            0
-        } else {
-            size_of::<AuthorityKey>()
-                .checked_add(align_of::<AuthorityKey>())?
-                .checked_add(2 * size_of::<usize>())?
-                .checked_add(login.max(org))?
-        };
-        // `push` growth from four slots.
-        let slots = if runs == 0 {
-            0
-        } else {
-            runs.checked_mul(2)?.checked_add(4)?
-        };
-        let build = slots
-            .checked_mul(size_of::<AccountRun>())?
-            // starting, fallback, bound, retained_root and every run's account
-            .checked_add(runs.checked_add(4)?.checked_mul(partition)?)?;
-        let scratch = slots.checked_mul(2 * size_of::<u64>())?.checked_add(
-            runs.checked_add(1)?
-                .checked_mul(tree_node_bytes::<&Arc<AuthorityKey>, ()>()?)?,
-        )?;
-        let bytes = size_of::<Self>()
-            .checked_add(align_of::<Self>())?
-            .checked_add(build.checked_mul(2)?)?
-            .checked_add(scratch)?;
-        Some((bytes, partition, runs))
     }
 
     /// Rebuild only after the money owner confirms exclusion. Restored files
@@ -4497,7 +4470,7 @@ pub(crate) struct RequestFacts<'a> {
 }
 
 /// A borrowed authority key: classification builds no strings; a `Grouping`
-/// copies one only when it admits a new key (at most 16 per item).
+/// copies one only when it admits a new key (at most `MAX_AUTHORITY_KEYS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyRef<'k> {
     login: Option<&'k str>,
@@ -5435,10 +5408,10 @@ crate::durable_tail_codec::durable_struct!(OrgMarkers {
     H context_digest: Option<String>,
     N context_changed: bool,
     N context_position: Option<u64>,
-    N context_flip_position: Option<u64>,
+    N context_flip_position: RetiredContextFlipPosition,
 });
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
-crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow);
+crate::heap_layout_bound::no_heap!(true; RetiredStartingMarker, RetiredOverflow, RetiredContextFlipPosition);
 crate::durable_tail_codec::durable_struct!(OrgMarker {
     N position: u64,
     U org: Option<String>,

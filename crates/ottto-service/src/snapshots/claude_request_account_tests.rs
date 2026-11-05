@@ -795,9 +795,8 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    // Session-account qualification and binding; `e2` keeps per-request account partitions.
+    // [money] Production contract-5 placement keeps the root's own requests
+    // separate from its child without manufacturing an original creator.
 
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -861,7 +860,7 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     let (_, withheld, stats) =
         crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
     assert!(!withheld);
-    assert_eq!(stats.own_request_complete_root_count, 1);
+    assert_eq!(stats.own_request_complete_root_count, 0);
     assert_eq!(stats.own_request_unknown_root_count, 0);
     let qualified = scan
         .snapshots
@@ -870,8 +869,18 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
         .unwrap();
     assert_eq!(
         qualified.provenance.collector,
-        claude_request_accounts::COMPLETE
+        claude_request_identity::COLLECTOR
     );
+    assert!(qualified
+        .model_usage
+        .iter()
+        .chain(
+            qualified
+                .usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage)
+        )
+        .all(|row| row.account_identifier_hash.as_deref() == Some("a".repeat(64).as_str())));
     assert_eq!(qualified.request_count, 4);
     assert_eq!(qualified.claude_usage_request_ids.len(), 4);
     assert!(!qualified.claude_usage_request_ids.contains("req_5"));

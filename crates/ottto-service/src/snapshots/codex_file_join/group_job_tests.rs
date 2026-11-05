@@ -2,7 +2,7 @@
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
 use super::super::tests::{
-    counting_v2_unbound_fixture, fixture, legacy_index, member, replay_group, scan, usage,
+    counting_v2_unbound_fixture, fixture, member, replay_group, scan, usage,
 };
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
@@ -1437,250 +1437,6 @@ fn upload_context_change_keeps_paused_group() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn group_with_legacy_tee_is_byte_charged() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (root, inventory) = fixture();
-    let previous = legacy_index(&inventory, None);
-    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
-    loop {
-        match boot.step(None, &previous) {
-            Boot::Pending => {}
-            Boot::Ready => break,
-            _ => panic!("the legacy group boots"),
-        }
-    }
-    let metadata = CodexTitleMetadata::default();
-    let mut job = boot
-        .into_job(JobInputs {
-            metadata: &metadata,
-            traces: None,
-
-            index: &previous,
-        })
-        .unwrap();
-    assert!(job.group.as_ref().unwrap().tee.is_some());
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert!(matches!(
-        step_group(&mut job, &inputs),
-        GroupStep::Read(Ok(false))
-    ));
-    let cache = Arc::new(SharedCache::default());
-    let mut owned = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        &[root.join("sessions")],
-        previous,
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
-    *owned.active_file = Some(job);
-    // The group read without the cursor is charged by bytes
-    // (`completed_bound`, tee inputs taken out), never refused by the
-    // per-line visit walk, so retained singleton copies survive.
-    assert!(owned.sampled_copy_budget() > 0);
-    let walked = owned
-        .active_file
-        .as_ref()
-        .and_then(|active| active.group.as_ref())
-        .and_then(|group| group.walked);
-    assert!(
-        walked.is_some_and(|(charge, _, _)| charge != usize::MAX),
-        "{walked:?}"
-    );
-    assert!(owned.sampled_copy_budget() > 0, "the E3 estimate");
-    // L-A1: a group active owns a proof and tee, so even a measured copy
-    // refusal keeps the conservative release.
-    let (_, measured) = owned.sampled_copy_parts();
-    assert!(measured.is_some(), "precondition: residents measured");
-    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_for_copy_refusal(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            measured,
-        )
-    });
-    assert_eq!(lifecycle.clear_other_active, 1);
-    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-    // Given a Tail acquisition and with every other
-    // borrowed-state conjunct cleared, the group conjunct alone keeps the job
-    // off shape F, so its refusal keeps ClearOtherActive and its completion
-    // never reaches R0's release.
-    let active = owned.active_file.as_deref_mut().unwrap();
-    let mut file = fs::File::open(&active.candidate.path).unwrap();
-    let plan = crate::transcript_acquisition::ReadPlan::prepare(
-        &mut file,
-        None,
-        &Scope("group-fixture".into()),
-        None,
-        100,
-    )
-    .unwrap();
-    let sampling = active.sampling.replace(sampled_scan::Active {
-        key: String::new(),
-        scope: Scope("group-fixture".into()),
-        mode: crate::transcript_acquisition::ReadMode::Tail,
-        audit_due: None,
-        retained_hint: Some((0, 0)),
-        retained_finalization_charge: 0,
-        retained_usage: None,
-        reinsertion: Default::default(),
-        tier_prefix_replay: false,
-    });
-    let acquisition = active.parser.reader.acquisition.replace(plan);
-    let replay = active.parser.accumulator.codex_tier_replay.take();
-    let aliases = std::mem::take(&mut active.aliases);
-    let receipts = std::mem::take(&mut active.applied_receipts);
-    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
-    let cursor = active.cursor.take();
-    assert!(active.group.is_some());
-    assert!(!sampled_scan::borrows_only_retained_reduction(active));
-    let group = active.group.take();
-    assert!(
-        sampled_scan::borrows_only_retained_reduction(active),
-        "precondition: only the group conjunct differs from shape F"
-    );
-    active.group = group;
-    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_for_copy_refusal(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            measured,
-        )
-    });
-    assert_eq!(lifecycle.clear_other_active, 1, "a Tail group job");
-    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-    let active = owned.active_file.as_deref_mut().unwrap();
-    active.sampling = sampling;
-    active.parser.reader.acquisition = acquisition;
-    active.parser.accumulator.codex_tier_replay = replay;
-    active.aliases = aliases;
-    active.applied_receipts = receipts;
-    active.comparison_target = comparison_target;
-    active.cursor = cursor;
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// A byte-charged group job whose real charge overflows the
-/// state budget beside full residents is walked to the whole state budget,
-/// so its refusal evicts to fit on that charge: one entry for an overflow
-/// below one entry's charge, never a wipe-all clear. Its copy-budget record is that
-/// walk, not `usize::MAX`, so the next step's estimate opens the budget and
-/// nothing is released again.
-///
-/// Red at round 1 (66e5315c): the walk stopped at the remaining room,
-/// recorded `usize::MAX` and cleared every filler (`ClearOtherActive`).
-#[test]
-fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests as policy;
-    let (root, inventory) = fixture();
-    let previous = legacy_index(&inventory, None);
-    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
-    loop {
-        match boot.step(None, &previous) {
-            Boot::Pending => {}
-            Boot::Ready => break,
-            _ => panic!("the legacy group boots"),
-        }
-    }
-    let metadata = CodexTitleMetadata::default();
-    let mut job = boot
-        .into_job(JobInputs {
-            metadata: &metadata,
-            traces: None,
-
-            index: &previous,
-        })
-        .unwrap();
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert!(matches!(
-        step_group(&mut job, &inputs),
-        GroupStep::Read(Ok(false))
-    ));
-    // The job's own state grows by bytes past the room the fillers leave.
-    job.parser
-        .accumulator
-        .provider_skills
-        .extend((0..4800).map(|n| format!("group-{n:05}-{}", "x".repeat(1000))));
-    let (cache, filler_charge) = policy::filled_cache();
-    let mut owned = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        &[root.join("sessions")],
-        previous,
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
-    *owned.active_file = Some(job);
-    let (budget, step) = owned.sampled_copy_step();
-    let walked = owned
-        .active_file
-        .as_ref()
-        .and_then(|active| active.group.as_ref())
-        .and_then(|group| group.walked);
-    let receipt =
-        format!("budget={budget} step={step:?} walked={walked:?} filler_charge={filler_charge}");
-    eprintln!("CACHE_POLICY test=M1_group_overflow {receipt}");
-    assert_eq!(
-        budget, 0,
-        "precondition: the group overflows the room; {receipt}"
-    );
-    assert!(
-        step.active.is_some() && walked.map(|(charge, _, _)| charge) == step.active,
-        "F2: the real walk is the refusal's charge and the E3 record; {receipt}"
-    );
-    let overflow = step
-        .resident
-        .zip(step.active)
-        .map(|(resident, active)| (resident + active).saturating_sub(policy::POLICY_STATE_BYTES));
-    assert!(
-        overflow.is_some_and(|overflow| overflow > 0 && overflow < filler_charge),
-        "precondition: an overflow below one entry; {receipt}"
-    );
-    let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_to_fit(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            step,
-        )
-    });
-    assert_eq!(
-        policy::wipe_clears(&counts),
-        0,
-        "F2: a wipe-all clear; {counts:?}"
-    );
-    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{counts:?}");
-    assert_eq!(policy::fillers_resident(&cache), policy::FILLERS - 1);
-    assert!(
-        owned.sampled_copy_budget() > 0,
-        "F2: the next step's E3 estimate keeps the budget shut"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
 /// An append-curable refusal at a paged group's frozen cut
 /// is not memoized while the live member already holds bytes past the cut:
 /// they may cure it, so the next generation reads them and accepts.
@@ -2102,7 +1858,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
         "chmod_sealed",
         "append_sealed",
         "replace_sealed",
-        "poison_replace_sealed",
     ] {
         let root = paged_corpus("wake-content");
         let cache = Arc::new(SharedCache::default());
@@ -2129,7 +1884,7 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 "append_sealed" => {
                     append_rows(&path, &[turn("66666666-aaaa-4aaa-8aaa-666666666666")])
                 }
-                "replace_sealed" | "poison_replace_sealed" => {
+                "replace_sealed" => {
                     let modified = fs::metadata(&path).unwrap().modified().unwrap();
                     let replacement = path.with_extension("replacement");
                     fs::copy(&path, &replacement).unwrap();
@@ -2139,9 +1894,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                         .unwrap()
                         .set_modified(modified)
                         .unwrap();
-                    if change == "poison_replace_sealed" {
-                        cache.poison_retained();
-                    }
                     assert_ne!(
                         fs::metadata(&path).unwrap().ino(),
                         fs::metadata(&replacement).unwrap().ino()
@@ -2170,22 +1922,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
                 assert_eq!(bytes, 0, "{change}: zero wakes");
                 assert_eq!(group_replays(), replay);
-            } else if change == "poison_replace_sealed" {
-                // A poisoned retained-cache lock makes the resumed state
-                // unmeasurable: the one fresh attempt hits the state bound
-                // again instead of remaining paused or completing unpaged.
-                assert_eq!(after.parked_hits, 1, "{change}: must wake");
-                assert_eq!(after.jobs_state_bound, 2, "{change}: one new bound attempt");
-                assert!(
-                    bytes > 0 && bytes <= first_bytes,
-                    "{change}: at most one bounded partial-prefix read: {bytes}/{first_bytes}"
-                );
-                assert!(cache.paused_group_position().is_none());
-                assert_eq!(
-                    group_replays(),
-                    replay,
-                    "the partial attempt never completes"
-                );
             } else {
                 assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
                 assert!(bytes > 0, "{change}: must wake");
@@ -2224,28 +1960,21 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         assert!(matches!(boot.probe(0), Boot::Strict));
         assert_eq!(boot.charge, 0);
     });
+    // The shared boot boundary precedes the parser, member swap and legacy
+    // tee. Those internal helpers receive only members admitted here.
+    for position in 0..group.members.len() {
+        let mut boot = GroupBoot::new(group.clone(), &index);
+        boot.identified = position;
+        boot.group.members[position] = compressed.clone();
+        assert_refused(CodexZstCause::GroupReadUnsupported, || {
+            assert!(matches!(boot.identify(None, &index, None), Boot::Strict));
+            assert_eq!(
+                boot.identified, position,
+                "refused before member acquisition"
+            );
+        });
+    }
     let metadata = CodexTitleMetadata::default();
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(open_member_file(&mut compressed).is_err());
-        assert!(new_group_parser(
-            File::open(&compressed.path).unwrap(),
-            &compressed,
-            &metadata,
-            None,
-            codex_counting_version::AckEvidence::None
-        )
-        .is_err());
-        let expected =
-            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
-        assert!(legacy_tee(
-            &expected,
-            &compressed,
-            &File::open(&compressed.path).unwrap(),
-            &metadata,
-            None,
-        )
-        .is_err());
-    });
     let mut boot = GroupBoot::new(group, &index);
     loop {
         match boot.step(None, &index) {
@@ -2258,40 +1987,9 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-
             index: &index,
         })
         .unwrap();
-    let before = active.parser.reader.consumed_bytes();
-    let group = active.group.as_deref_mut().unwrap();
-    group.current = 1;
-    group.members[1] = compressed;
-    let join = active
-        .parser
-        .accumulator
-        .codex_tier_replay
-        .as_mut()
-        .unwrap()
-        .join
-        .take()
-        .unwrap();
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(matches!(
-            open_member(&mut active, join, &inputs),
-            Err(GroupEnd::Strict)
-        ));
-        assert_eq!(
-            active.parser.reader.consumed_bytes(),
-            before,
-            "swap never reset the reader"
-        );
-    });
     active.candidate.path.set_extension("jsonl.zst");
     let cache = Arc::new(SharedCache::default());
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {

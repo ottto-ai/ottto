@@ -2,8 +2,8 @@
 //! Full (D158), a key rotation is a counted explicit-action reconstruction
 //! while an attribution toggle scrubs and reuses, the legacy record directory
 //! is erased and counted before the first load, the first format round-trips
-//! the lineage clocks and the rule epoch, the shared hour pages carry usage
-//! buckets, and only Claude has a codec.
+//! the lineage clocks and the rule epoch, and the shared hour pages carry usage
+//! buckets.
 use super::super::claude::tests::lines;
 use super::super::claude::Claude;
 use super::super::seam::tests::{route, scope};
@@ -11,7 +11,7 @@ use super::tests::{append, cold, committed, committed_lines, counted, len, loade
 use super::*;
 use crate::local_resource_diagnostics::capture;
 use crate::snapshots::sampled_jsonl::durable::test_finish_items;
-use crate::snapshots::tail_source::{counters, hour_pages, keeps_ram, read_hour_page};
+use crate::snapshots::tail_source::{counters, hour_pages, read_hour_page};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
@@ -96,20 +96,12 @@ fn an_attribution_toggle_scrubs_the_digest_and_reuses_the_head() {
         if current.is_none() {
             // The stored digest is gone: the markers are a no-key cold read's.
             let (fresh, _, _) = read(&route, &path, None);
-            let markers = &taken
-                .retained
-                .state
-                .accumulator_for_test()
-                .claude_org_markers;
+            let markers = &taken.state.accumulator_for_test().claude_org_markers;
             assert!(fresh.accumulator.claude_org_markers.is_some());
             assert_eq!(markers, &fresh.accumulator.claude_org_markers);
             assert_ne!(
                 markers,
-                &unscrubbed
-                    .retained
-                    .state
-                    .accumulator_for_test()
-                    .claude_org_markers
+                &unscrubbed.state.accumulator_for_test().claude_org_markers
             );
         }
         let (parser, mode, _) = read(&route, &path, Some(taken));
@@ -188,7 +180,7 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
     let (Load::Reused(mut taken, _), _) = loaded(&route, &path, &key) else {
         panic!("the committed head is reused");
     };
-    let acc = taken.retained.state.accumulator_for_test();
+    let acc = taken.state.accumulator_for_test();
     assert_eq!(acc.claude_line_clocks, Some(expected));
     assert!(expected.0 < expected.1);
     let epochs: Vec<u8> = acc
@@ -218,17 +210,6 @@ fn codec_list_gives_routes_and_counters_stay_per_source() {
     }
     let ((), claude) = capture(|| counters::emit(SnapshotSource::ClaudeCode));
     assert_eq!(claude.len(), 1);
-}
-
-/// [regress] Retention and the RAM take share one rule, keyed on the codec:
-/// a source without one keeps and takes its RAM copy, a codec source neither,
-/// on a route or off one (a split rule kept a copy it never took and read
-/// Full every time, CX1 S2b run 41569018173).
-#[test]
-fn the_ram_copy_is_kept_and_taken_only_without_a_codec() {
-    assert!(!keeps_ram(SnapshotSource::ClaudeCode));
-    assert!(!keeps_ram(SnapshotSource::Codex));
-    assert!(!keeps_ram(SnapshotSource::Pi));
 }
 
 /// [format] The one hourly page codec carries usage buckets (`UsageHours`,

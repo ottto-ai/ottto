@@ -22,12 +22,6 @@ impl Stamp {
             birth,
         })
     }
-    pub(super) fn matches_acquisition(
-        &self,
-        stamp: &crate::transcript_acquisition::FileStamp,
-    ) -> bool {
-        self.content.matches_acquisition(stamp)
-    }
     fn same_content(&self, other: &Self) -> bool {
         self.birth == other.birth && self.content.same_content(&other.content)
     }

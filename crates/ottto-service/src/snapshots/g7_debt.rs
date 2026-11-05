@@ -6,7 +6,6 @@
 //! settlement. One path for every source; sources differ only by the index
 //! state the existing adapters already keep. The walk's own state rides in
 //! `money_freshness::WalkFold`.
-use super::codex_compressed_input::ArchiveDisposition;
 use super::money_freshness::{WalkFold, ALARM_AFTER};
 use super::state_v2::{DebtSummary, NoUploadRequired, Observation, Representation, TailHead};
 use super::*;
@@ -637,46 +636,25 @@ impl<'a> Page<'a> {
             change: (mtime, true),
             quiet: !listing.in_window,
         };
-        if codex_archive_path(listing.path) {
+        let compressed = codex_archive_path(listing.path);
+        if compressed {
+            // The extent is physical compressed bytes; the reduction-bearing
+            // head retains Tail representation and logical decoded progress.
             live.representation = Representation::Archive;
-            let Some(archive) = index.archives.get(key) else {
-                return live;
-            };
-            live.change.1 = self.bootstrap(mtime);
-            if !archive.matches_metadata(metadata) {
-                live.replaced = true;
-                return live;
-            }
-            match &archive.disposition {
-                ArchiveDisposition::Acquired => {
-                    (live.exact, live.accepted, live.read) = (true, len, len);
-                }
-                ArchiveDisposition::Empty => {
-                    live.evidence = Some(NoUploadRequired::ZeroUsageLines);
-                }
-                // A retained body witness is a whole read; a disposition
-                // alone is not (a refusal may come before any read).
-                ArchiveDisposition::Held { .. }
-                | ArchiveDisposition::HeaderValidated
-                | ArchiveDisposition::Pending => {
-                    if archive
-                        .work
-                        .as_ref()
-                        .is_some_and(|work| work.body_witness.is_some())
-                    {
-                        live.read = len;
-                    }
-                }
-            }
-            return live;
         }
         let Some(entry) = index.files.get(key) else {
             return live;
         };
-        let unchanged = entry.same_listing_stamp_as(metadata);
+        let unchanged = index.listing_stamp_matches(listing.path, metadata);
+        let len = if unchanged { entry.size_bytes } else { len };
+        live.len = len;
+        if unchanged {
+            live.representation = Representation::Tail;
+        }
+
         let birth = metadata.created().ok().and_then(unix_nanos);
         let same_object = entry.opened_birth_nanos == 0 || birth == Some(entry.opened_birth_nanos);
-        let grown = !unchanged && same_object && len > entry.size_bytes;
+        let grown = !compressed && !unchanged && same_object && len > entry.size_bytes;
         live.exact = index.file_upload_context_enabled()
             && !index.file_upload_context_requires_adoption(key)
             && (unchanged || grown);
@@ -763,9 +741,8 @@ impl<'a> Page<'a> {
         debt: FileDebt,
         no_upload_required: bool,
     ) {
-        // The one never-indexed count: owed, no index entry, not an archive.
-        let never_indexed =
-            debt.owed && !codex_archive_path(path) && !index.files.contains_key(&key);
+        // The one never-indexed count, for every ordinary input encoding.
+        let never_indexed = debt.owed && !index.files.contains_key(&key);
         let walk = &mut self.fold.debt;
         walk.sums.never_indexed_files += u64::from(never_indexed);
         walk.sums.add(debt, self.now_ms);

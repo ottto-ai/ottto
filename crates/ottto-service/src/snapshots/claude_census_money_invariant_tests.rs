@@ -474,7 +474,7 @@ fn every_absence_exit_drops_census_marks_and_removals() {
     traversal.observed_index_keys.clear();
     traversal.reconciliation_after = None;
     traversal.reconciliation_upper_bound = Some(key.into());
-    reconcile_missing_index_entries_with_side(&mut index, 10, None, SnapshotSource::ClaudeCode);
+    reconcile_missing_index_entries_with_side(&mut index, 10, SnapshotSource::ClaudeCode);
     assert_eq!(lifetime_kept(&index, key), gone, "main reconciliation");
     holder_kept(&index);
 }
@@ -550,7 +550,7 @@ fn rename_keeps_whole_record() {
         .claude_request_census_mut_for_test()
         .insert_for_test(from, whole.clone());
     let total = index.claude_request_census_for_test().hash_total_for_test();
-    index.rekey_account_custody(from, to);
+    index.rekey_account_custody(from, to, None);
     let census = index.claude_request_census_for_test();
     assert_eq!(census.record_for_test(to), Some(&whole));
     assert!(census.record_for_test(from).is_none());
@@ -564,7 +564,7 @@ fn rename_keeps_whole_record() {
     index
         .claude_request_census_mut_for_test()
         .insert_for_test(to, own.clone());
-    index.rekey_account_custody(from, to);
+    index.rekey_account_custody(from, to, None);
     let census = index.claude_request_census_for_test();
     assert_eq!(census.record_for_test(to), Some(&own));
     assert!(census.record_for_test(from).is_none());

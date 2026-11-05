@@ -1142,6 +1142,7 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
             | LocalControlCommand::Setup { .. }
             | LocalControlCommand::SetupAnswer { .. }
             | LocalControlCommand::SetupAction { .. }
+            | LocalControlCommand::SourceCollection { .. }
             | LocalControlCommand::Verify { .. }
     )
 }
@@ -2539,6 +2540,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::Setup { .. } => "setup",
         LocalControlCommand::SetupAnswer { .. } => "setup_answer",
         LocalControlCommand::SetupAction { .. } => "setup_action",
+        LocalControlCommand::SourceCollection { .. } => "source_collection",
         LocalControlCommand::TelemetryControl { .. } => "telemetry_control",
         LocalControlCommand::CloudSessionsControl { .. } => "cloud_sessions_control",
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {

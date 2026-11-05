@@ -149,10 +149,6 @@ fn assert_prefix_published(
         "{id}: no unreadable; causes={:?}",
         seen.causes
     );
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "{id}: no checkpoint or cache insert"
-    );
     assert!(len(&base.path) > read.frozen, "precondition: grown");
     assert_eq!(
         index.files[&base.key].size_bytes, read.frozen,
@@ -387,7 +383,7 @@ fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
 
 /// SP-2b-c (GREEN): a quiescent unterminated last row in a Claude `Tail`,
 /// not grown. Main's trailing-line rule applies it; H2c must keep this
-/// byte-identical: body == Full parse, `RetentionUnsealedEof`, no copy,
+/// byte-identical: body == Full parse, unsealed, no copy,
 /// nothing unreadable.
 #[test]
 fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
@@ -397,15 +393,9 @@ fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
     let base = baseline(CLAUDE, 4, 2);
     let last = row_bytes(CLAUDE, 6..7);
     append_raw(&base.path, &last[..last.len() - 1]);
-    let ((_, tail, seen), counts) =
-        observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
+    let (_, tail, seen) = plain(&base.fixture, CLAUDE, base.index, &base.cache);
     assert_eq!(seen.modes, (0, 1, 0));
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
-    assert_eq!(counts.retention_unsealed_eof, 1);
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "no copy"
-    );
     assert_eq!(
         production_body(CLAUDE, tail),
         full_body(&base.fixture, CLAUDE)
@@ -475,10 +465,6 @@ fn fe_claude_sp2c_large_prefix_tail_stops_at_frozen_with_relative_limit() {
         "SP-2c-c: reader-relative limit"
     );
     assert_eq!(at_eof.start + at_eof.consumed, read.frozen);
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "SP-2c-c: no copy"
-    );
 }
 
 /// SP-D2c (RED): a Claude `Full` reader reaches EOF exactly at frozen, then
@@ -555,14 +541,7 @@ fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
         is_tail,
         |_| replace(&path, &bytes),
     );
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &tail,
-        &seen,
-        SCOPE_OBJECT,
-        "SP-3a-c",
-    );
+    assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-3a-c");
 }
 
 /// SP-4-c (GREEN): truncated below frozen during a Claude `Tail`, no regrow.
@@ -582,7 +561,7 @@ fn fe_claude_sp4_truncate_during_tail_keeps_main_failure() {
         is_tail,
         |_| truncate(&path, sealed),
     );
-    assert_refused(&base.cache, &base.key, &tail, &seen, SCOPE_OBJECT, "SP-4-c");
+    assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-4-c");
 }
 
 /// SP-5a-c (GREEN): truncated at the open step (a short EOF), then regrown
@@ -618,14 +597,7 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
         "precondition: a short EOF"
     );
     assert!(len(&base.path) > read.frozen, "precondition: regrown");
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &tail,
-        &seen,
-        SCOPE_OBJECT,
-        "SP-5a-c",
-    );
+    assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5a-c");
 }
 
 /// SP-5b-c (GREEN): after the Claude reader passes frozen, the file is
@@ -647,14 +619,7 @@ fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
     );
     let at_eof = at_eof.expect("precondition: the reader reached EOF");
     assert_eq!(at_eof.start + at_eof.consumed, at_eof.frozen);
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &tail,
-        &seen,
-        SCOPE_OBJECT,
-        "SP-5b-c",
-    );
+    assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5b-c");
 }
 
 /// SP-5c-c (GREEN): after the Claude reader passes frozen, the file is
@@ -675,14 +640,7 @@ fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
     );
     let at_eof = at_eof.expect("precondition: the reader reached EOF");
     assert_eq!(len(&base.path), at_eof.frozen, "precondition: not grown");
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &tail,
-        &seen,
-        SCOPE_OBJECT,
-        "SP-5c-c",
-    );
+    assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5c-c");
 }
 
 /// SP-5 residual, Claude (RED; EXPECTED RESIDUAL per FE2, not mutation
@@ -733,10 +691,6 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
         seen.unreadable, 0,
         "SP-5 residual (Claude): accepted; causes={:?}",
         seen.causes
-    );
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "no copy"
     );
     assert_eq!(
         content(production_body(CLAUDE, tail)),
@@ -791,13 +745,10 @@ fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
         return;
     }
     let base = claude_lossy_baseline();
-    let ((index, result, seen), counts) =
-        observe(|| plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache));
+    let (index, result, seen) = plain(&base.fixture, CLAUDE, base.index.clone(), &base.cache);
     assert_eq!(seen.modes, (0, 1, 0));
     assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
-    assert_eq!(counts.retention_incomplete_or_lossy, 0);
     assert_eq!(result.malformed_json_line_count, 1);
-    assert!(base.cache.retained_checkpoint(&base.key).is_none());
     let continuation = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
         CLAUDE,
         &base.cache,
@@ -901,14 +852,7 @@ fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
         |_| append_raw(&path, &appended),
     );
     assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
-    assert_refused(
-        &base.cache,
-        &base.key,
-        &full,
-        &seen,
-        OPEN_READ,
-        "SP-11-c Codex",
-    );
+    assert_refused(&full, &seen, OPEN_READ, "SP-11-c Codex");
 }
 
 /// With s below the last committed size (GREEN): the last page committed
@@ -952,7 +896,6 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
         seen.causes
     );
     assert!(full.snapshots.is_empty(), "SOURCE: never a weaker body");
-    assert!(cache.retained_checkpoint(&key).is_none(), "no copy");
     assert_eq!(
         index.files[&key].size_bytes, committed,
         "the committed entry stands"
@@ -1149,14 +1092,7 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             }
         });
         assert!(read.is_some());
-        assert_refused(
-            &base.cache,
-            &base.key,
-            &result,
-            &seen,
-            SCOPE_OBJECT,
-            "FE capacity",
-        );
+        assert_refused(&result, &seen, SCOPE_OBJECT, "FE capacity");
         // H1c freezes the admitted extent independently of audit capacity.
         // With no H3c audit marker, completion revalidates the selected object.
         assert_eq!(
@@ -1223,7 +1159,6 @@ fn fe_claude_finalizer_response_loss_keeps_valid_grown_prefix() {
         ),
         (800, 80, 5)
     );
-    assert!(base.cache.retained_checkpoint(&base.key).is_none());
     assert_eq!(index.files[&base.key].size_bytes, read.frozen);
 }
 
@@ -1452,176 +1387,4 @@ fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
         .ends_with(":p"));
     assert_eq!(entry.unverified_deadline(), before);
     assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
-}
-
-/// [behaviour] An H3c grown Claude read retains nothing and supplies no
-/// copy budget, so the pre-clone reclamation site does not run.
-#[test]
-fn fe_n4_h3c_grown_read_runs_no_budgeted_reclamation() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // H3c: the grown in-page Full publishes its sealed prefix and passes no
-    // copy budget, so no budgeted reclamation runs.
-    let mut base = baseline(CLAUDE, 4, 2);
-    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
-        &base.cache,
-        &base.index,
-    );
-    sampled_scan::copy_retire_probe();
-    let path = base.path.clone();
-    let index = std::mem::take(&mut base.index);
-    let (index, _, seen, read) = {
-        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
-            append_raw(&path, &row_bytes(CLAUDE, 6..9))
-        })
-    };
-    assert!(is_full(read.mode), "precondition: an in-page Full");
-    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
-    assert!(
-        index.files[&base.key].has_prefix_provenance(),
-        "precondition: H3c published a prefix"
-    );
-    assert!(base.cache.retained_checkpoint(&base.key).is_none());
-    assert!(
-        sampled_scan::copy_retire_probe().is_none(),
-        "no budgeted retire on the H3c route"
-    );
-}
-
-/// #665/#702 second-lander control. The same continued Tail is short of
-/// copy room in both worlds. Without growth it proves and executes a release;
-/// H3c growth keeps every resident, with no copy,
-/// X_out proof, reserved retention peak or deferred release. Pressure uses
-/// R0's existing test-only insert-term seam; all ranks and releases are real.
-#[test]
-fn fe_second_lander_h3c_release_pressure_keeps_victims() {
-    use crate::snapshots::sampled_scan::codex_cursor::bound_for_main;
-    use sampled_scan::test_hooks;
-
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let state_bytes = crate::snapshots::cache_policy_tests::POLICY_STATE_BYTES;
-    let mut base = baseline(CLAUDE, 4, 2);
-    let older = (0..2)
-        .map(|_| {
-            let fixture = ScanFixture::new(CLAUDE);
-            // One victim must cover the real X_out + decode peak as
-            // well as the copy. Two 512-row residents can leave that
-            // proof infeasible or exceed its copy-only victim count.
-            append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..4096));
-            OpenOptions::new()
-                .write(true)
-                .open(&fixture.file.0)
-                .unwrap()
-                .set_modified(SystemTime::now() - std::time::Duration::from_secs(7200))
-                .unwrap();
-            // Seed a real native reduction through ordinary cache
-            // admission, as cache_policy_tests seeds its fillers. A
-            // whole-page Full also reserves its finished output; that
-            // unrelated finalization bound can discard this large copy.
-            let (mut parser, _, scope) = native_parser(&fixture.file, CLAUDE);
-            let now = sampled_scan::now_seconds();
-            assert!(is_full(
-                parser.prepare_acquisition(None, &scope, None, now).unwrap()
-            ));
-            while !parser.step().unwrap() {}
-            let completed = parser
-                .retain_reduction(
-                    &scope,
-                    now,
-                    sampled_scan::RetainBudget::granted_unclassified(
-                        crate::transcript_cache::ENTRY_BYTES,
-                    ),
-                )
-                .unwrap()
-                .unwrap();
-            assert!(!completed.unsealed, "precondition: a complete victim");
-            let retained = Retained {
-                checkpoint: completed.checkpoint,
-                state: completed.reduction.expect("victim fits one cache entry"),
-            };
-            drop(parser);
-            assert!(base
-                .cache
-                .retained()
-                .unwrap()
-                .insert(local_index_key(&fixture.file.0), retained));
-            assert!(base
-                .cache
-                .retained_checkpoint(&local_index_key(&fixture.file.0))
-                .is_some());
-            fixture
-        })
-        .collect::<Vec<_>>();
-    let before = base
-        .cache
-        .retained()
-        .unwrap()
-        .victims()
-        .into_iter()
-        .filter(|(key, _, _)| key != &base.key)
-        .collect::<Vec<_>>();
-    assert_eq!(before.len(), older.len(), "precondition: older residents");
-    sampled_scan::copy_retire_probe();
-    test_hooks::clear();
-    let mut read = None;
-    let index = std::mem::take(&mut base.index);
-    let ((index, result, seen), counts) = observe(|| {
-        page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
-            if read.is_some() {
-                return;
-            }
-            if let Some(opened) = opened(scan) {
-                assert!(is_tail(opened.mode), "precondition: continued Tail");
-                let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
-                    .expect("precondition: measured residents");
-                // Give the insert term exactly the remaining room:
-                // b_ins = 0. Only a completion-time release can fund
-                // retention; this never changes the production limit.
-                test_hooks::set_ins_extra(Some(state_bytes - resident));
-                append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
-                read = Some(opened);
-            }
-        })
-    });
-    let read = read.expect("precondition: opened read");
-    let probe = test_hooks::last_probe();
-    assert_eq!(seen.unreadable, 0, "{:?}", seen.causes);
-    assert_eq!(probe.b_ins, 0, "precondition: no copy room; {probe:?}");
-    assert!(probe.clone.is_some_and(|clone| clone > probe.b_ins));
-    assert!(probe.rank.is_some(), "precondition: release-eligible Tail");
-    assert_prefix_published(
-        "second-lander",
-        &base,
-        &index,
-        result,
-        &seen,
-        &read,
-        read.frozen,
-    );
-    assert!(index.files[&base.key].has_prefix_provenance());
-    assert_eq!(base.cache.retained().unwrap().victims(), before);
-    assert!(sampled_scan::copy_retire_probe().is_none());
-    assert!(
-        test_hooks::decisions().is_empty(),
-        "no retention or deferred release"
-    );
-    assert_eq!(probe.granted_peak, None, "no reserved retention peak");
-    assert_eq!(probe.x_out, None, "no X_out proof");
-    assert_eq!(probe.need_prime, None, "no deferred release proof");
-    assert_eq!(
-        (
-            counts.copy_refusal_admission_evicted,
-            counts.copy_refusal_entries_evicted,
-            counts.clear_entries_released,
-            counts.insert_entries_evicted,
-            counts.retention_produced,
-            counts.insert_admitted,
-        ),
-        (0, 0, 0, 0, 0, 0),
-        "zero victims and no copy: {counts:?}"
-    );
-    test_hooks::clear();
 }
