@@ -12228,6 +12228,11 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         .find(|step| text.contains(step))
     {
         step.to_string()
+    } else if let Some(check) = crate::snapshots::CODEX_JOIN_VALIDATION_FAILURES
+        .into_iter()
+        .find(|check| text.contains(check))
+    {
+        check.to_string()
     } else {
         "sync failed".to_string()
     }

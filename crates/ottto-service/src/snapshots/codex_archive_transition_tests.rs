@@ -101,6 +101,15 @@ fn page_observed(
     c: &Corpus,
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_on(&c.roots(), index, cache, observe)
+}
+/// `page_observed` over explicit scan roots, e.g. a second Codex home.
+fn page_observed_on(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -108,7 +117,7 @@ fn page_observed(
         oracle::observe_consumed(|| {
             let mut scan = OwnedSourceScan::new(
                 SnapshotSource::Codex,
-                &c.roots(),
+                roots,
                 index,
                 NOW,
                 BACKFILL_WINDOW_DAYS,
@@ -496,6 +505,59 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         );
         assert_eq!(cache.cursor_reserved(), 0);
     }
+}
+
+/// [regress] A rollout created in an unrelated Codex home while a page is
+/// open leaves that page's checkpoint valid: the page uploads and saves.
+#[test]
+fn unrelated_home_rollout_mid_page_keeps_the_checkpoint_valid() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    let unrelated = crate::test_scratch::ScratchDir::canonical("codex-unrelated-home");
+    let unrelated_sessions = fs::canonicalize(unrelated.as_ref())
+        .unwrap()
+        .join("sessions");
+    fs::create_dir_all(&unrelated_sessions).unwrap();
+    let (_session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let roots = [
+        c.sessions.clone(),
+        c.archived.clone(),
+        unrelated_sessions.clone(),
+    ];
+    let mut created = false;
+    let (working, scan, _, _, _) = page_observed_on(
+        &roots,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+        |scan| {
+            if scan.codex_join_prepared && !created {
+                fs::write(
+                    unrelated_sessions.join(format!("rollout-{OTHER}.jsonl")),
+                    rollout(OTHER, Some("b")),
+                )
+                .unwrap();
+                created = true;
+            }
+        },
+    );
+    assert!(created, "the unrelated rollout lands inside the page");
+    assert!(scan.snapshots.iter().any(|s| s.source_session_id == MAIN));
+    assert!(scan.snapshots.iter().all(|s| s.source_session_id != OTHER));
+    scan.validate_codex_checkpoint().unwrap();
+    scan.codex_joining_validator()
+        .unwrap()
+        .validate(&scan.snapshots)
+        .unwrap();
+    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &prior, "accept");
+    assert_eq!(posts.len(), 1);
+    assert!(index.files.contains_key(&local_index_key(&c.path(MAIN))));
 }
 
 /// [regress] A reachable body failure after a valid current owner header
