@@ -545,6 +545,10 @@ fn selection_page(
         .map(|candidate| local_index_key(&candidate.path))
         .collect();
     let (mut index, mut scan) = finish(state);
+    let support = fixture._scratch.join("support");
+    fs::create_dir_all(&support).unwrap();
+    let _ =
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
     (selected, index, scan)
 }

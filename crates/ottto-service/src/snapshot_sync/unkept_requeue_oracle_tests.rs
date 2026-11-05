@@ -184,6 +184,12 @@ fn checkpoint(
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
+    if progress.ack_recovery.is_none() {
+        progress.ack_recovery =
+            crate::snapshots::ProgressRecovery::for_index(&page.committed, index_path)
+                .unwrap()
+                .map(Box::new);
+    }
     progress.save(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,
@@ -649,6 +655,8 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
         ] {
             let (mut c, root) = placement_corpus("unkept-ack-boundaries");
             c.root(COPY, &line(COPY, "sibling", AT, 9));
+            let sibling = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+            c.root(sibling, &line(sibling, "second-sibling", AT, 9));
             let agent = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
             let (session, prior) = StateV2ColdSession::publish(
                 Source::Claude,
@@ -675,7 +683,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 &line(ROOT, "boundary-agent", "2026-08-02T07:04:00Z", 3),
             );
             let scanner = E2ScanFixture::capturing_identity();
-            let mut current = c.raw(&scanner, prior, 2, true, &[root.clone(), agent]);
+            let mut current = c.raw(&scanner, prior, 3, true, &[root.clone(), agent]);
             current.enrich_with(&c, Some(&mut sender.accepted_identity_buckets));
             assert!(current.finish().held_fingerprints.is_empty());
             assert_eq!(current.scan.snapshots.len(), 2);
