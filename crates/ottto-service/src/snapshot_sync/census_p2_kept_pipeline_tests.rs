@@ -30,6 +30,8 @@ pub(super) fn pipeline_transcript_line(session: &str, request: &str, second: u32
 pub(super) enum PipelineUpload {
     Accept,
     ServerDeferred,
+    Shed,
+    UploadError,
     /// Real entity ACK; settlement follows the uploader result, not a forced outcome.
     EntityAckRejected {
         session: &'static str,
@@ -121,6 +123,40 @@ impl PipelineFixture {
             .expect("append synthetic Claude response");
     }
 
+    /// Native ordinary-money input with an unresolved occurrence model. The
+    /// saved owner represents a binding from an earlier accepted revision;
+    /// no row account is installed during this scan's evidence stages.
+    pub(super) fn native_account_hold_input(&self) {
+        self.list_held(&[PIPELINE_HELD_SESSION]);
+        let path = self.root.join(format!("{PIPELINE_HELD_SESSION}.jsonl"));
+        let lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["requestId"] == "req_0_2" {
+                    row["message"].as_object_mut().unwrap().remove("model");
+                }
+                row.to_string() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(path, lines).unwrap();
+
+        let index = ScanIndex::load(&self.index_path).unwrap();
+        let mut saved = serde_json::to_value(index).unwrap();
+        let owner_key = crate::context_footprint::sha256_hex(&[
+            "session_owner:v1",
+            PIPELINE_MACHINE_ID,
+            PIPELINE_HELD_SESSION,
+        ]);
+        saved["session_account_bindings"][owner_key] = serde_json::json!({
+            "account_identifier_hash": "a".repeat(64),
+            "workspace_identifier_hash": null
+        });
+        let mut index: ScanIndex = serde_json::from_value(saved).unwrap();
+        index.save(&self.index_path).unwrap();
+    }
+
     pub(super) fn key(index: &ScanIndex, session: &str) -> String {
         let suffix = format!("{session}.jsonl");
         index
@@ -153,6 +189,7 @@ impl PipelineFixture {
         crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
             self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
         })
+        .expect("in-process pipeline page")
     }
 
     fn page_with_reoffers_born(
@@ -162,7 +199,7 @@ impl PipelineFixture {
         upload: PipelineUpload,
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
-    ) -> PipelinePage {
+    ) -> Result<PipelinePage> {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         self.cache.bind_withheld(&mut index);
         // Production order (`finish_sync_source`): the upload ledger loads
@@ -332,6 +369,17 @@ impl PipelineFixture {
             snapshot_upload_body_witness,
             |items| {
                 uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                match upload {
+                    PipelineUpload::Shed => {
+                        return Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: None,
+                            code: None,
+                        }))
+                    }
+                    PipelineUpload::UploadError => return Err(anyhow!("synthetic upload error")),
+                    _ => {}
+                }
                 if let PipelineUpload::EntityAckRejected { session, reason } = upload {
                     let mut response = accepted_batch(0);
                     response.entity_ack_contract =
@@ -366,8 +414,29 @@ impl PipelineFixture {
                 }
                 Ok(())
             },
-        )
-        .expect("in-process upload");
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                assert_eq!(upload, PipelineUpload::UploadError);
+                checkpoint_partial_snapshot_index_with_audit_release(
+                    &index,
+                    &committed_index,
+                    &progress,
+                    &scan.snapshots,
+                    Some(&scan),
+                    &holds.held_fingerprints,
+                    &self.index_path,
+                    &progress_path,
+                    || Ok(()),
+                    None,
+                    Some(crate::snapshots::UnsettledUploadCause::UploadError),
+                    None,
+                    Default::default(),
+                )?;
+                return Err(error);
+            }
+        };
         if reoffers {
             progress.finish_reason_reoffers(
                 &leased_reoffers,
@@ -375,7 +444,10 @@ impl PipelineFixture {
                 SnapshotSource::ClaudeCode.api_slug(),
             );
         }
-        if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
+        if matches!(
+            upload,
+            PipelineUpload::Accept | PipelineUpload::ServerDeferred
+        ) {
             assert_eq!(result, ResumableUploadResult::Completed);
         }
         // Completed/restorable holds are the sole changed production route.
@@ -407,6 +479,29 @@ impl PipelineFixture {
             PipelineUpload::ServerDeferred => {
                 settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
             }
+            PipelineUpload::Shed => {
+                assert!(matches!(result, ResumableUploadResult::Shed { .. }));
+                let index = checkpoint_partial_snapshot_index_with_audit_release(
+                    &index,
+                    &committed_index,
+                    &progress,
+                    &scan.snapshots,
+                    Some(&scan),
+                    &holds.held_fingerprints,
+                    &self.index_path,
+                    &progress_path,
+                    || Ok(()),
+                    None,
+                    Some(crate::snapshots::UnsettledUploadCause::Shed),
+                    None,
+                    Default::default(),
+                )?;
+                UploadIndexSettlement {
+                    index,
+                    fully_settled: false,
+                }
+            }
+            PipelineUpload::UploadError => unreachable!("upload error returned above"),
             PipelineUpload::EntityAckRejected { .. } => match &result {
                 ResumableUploadResult::Rejected { .. } => {
                     settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
@@ -462,7 +557,7 @@ impl PipelineFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
-        PipelinePage {
+        Ok(PipelinePage {
             parsed,
             scan,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
@@ -474,7 +569,7 @@ impl PipelineFixture {
             uploaded,
             result,
             progress,
-        }
+        })
     }
 
     /// Pages of one traversal, until its census completes or the page bound.
@@ -502,7 +597,19 @@ impl PipelineFixture {
 
     /// The baseline: every session committed and accepted, one owner proven.
     pub(super) fn baseline(&self) -> ScanIndex {
-        let pages = self.traversal(8, &PIPELINE_BASELINE_CYCLE);
+        self.baseline_for_cycle(&PIPELINE_BASELINE_CYCLE)
+    }
+
+    /// Save native baseline bodies without synthetic row-account stamping.
+    pub(super) fn native_baseline(&self) -> ScanIndex {
+        self.baseline_for_cycle(&PipelineCycle {
+            proven_owner_session: None,
+            ..PIPELINE_BASELINE_CYCLE
+        })
+    }
+
+    fn baseline_for_cycle(&self, cycle: &PipelineCycle<'_>) -> ScanIndex {
+        let pages = self.traversal(8, cycle);
         let last = pages.last().expect("baseline page");
         assert!(last.scan.census_complete);
         assert!(last.fully_settled);
@@ -598,7 +705,11 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
         pipeline_transcript_line(PIPELINE_LATER_SESSION, "req_3_1", 0),
     )
     .unwrap();
-    let baseline = fixture.baseline();
+    let baseline = if account_hold {
+        fixture.native_baseline()
+    } else {
+        fixture.baseline()
+    };
     if !account_hold {
         fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
@@ -635,10 +746,9 @@ fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accept
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) = mixed_rejected_fixture("h1-real-account-refusal", true);
+    fixture.native_account_hold_input();
     assert_real_rejected_hold(
         &fixture,
         &baseline,
@@ -1126,10 +1236,10 @@ fn same_context_restart_rearms_no_file() {
 }
 
 /// An index written by an older release still carries the retired per-family
-/// pending evidence and per-file owed bits. Decoding drops both and changes no
-/// file entry. With that index on disk, the next traversal after a restart
-/// wakes no root, including a root whose only debt was that pending evidence,
-/// and its save purges both.
+/// pending evidence, account windows and account proofs, and per-file owed
+/// bits. Decoding drops all of them and changes no file entry. With that index
+/// on disk, the next traversal after a restart wakes no root, including a root
+/// whose only debt was that retired state, and its save purges it.
 #[test]
 #[serial(source_manifests)]
 fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
@@ -1137,11 +1247,41 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let mut fixture = PipelineFixture::new("census-p2-upgrade-owed");
     fixture.baseline();
     let index = ScanIndex::load(&fixture.index_path).expect("load the baseline index");
-    let legacy = crate::snapshots::sampled_scan::transition_fixture::legacy_pending_store(&index);
+    let mut legacy =
+        crate::snapshots::sampled_scan::transition_fixture::legacy_pending_store(&index);
     let pending = legacy["claude_usage_family_pending"]
         .as_object()
-        .expect("the legacy store carries pending evidence");
+        .expect("the legacy store carries pending evidence")
+        .clone();
     assert_eq!(pending.len(), PIPELINE_SESSIONS.len());
+    // The same release stored each family's account windows and account
+    // proof under names this build keeps only as decode-and-drop tombstones.
+    const RETIRED: [&str; 3] = [
+        "claude_usage_family_pending",
+        "claude_account_family_pending",
+        "claude_account_family_witnesses",
+    ];
+    let (mut windows, mut proofs) = (serde_json::Map::new(), serde_json::Map::new());
+    for root in pending.keys() {
+        let window = |end: &str, account: &str| {
+            serde_json::json!({"census_window_end": end, "account_identifier_hash": account,
+                "evidence_request_count": 1, "members": {root.as_str(): 1}, "invalid": false})
+        };
+        windows.insert(
+            root.clone(),
+            serde_json::json!({"w": "2026-08-02T08:00:00Z", "a": "a".repeat(64), "e": 1,
+                "i": false, "members": {root.as_str(): 1},
+                "previous_windows": [window("2026-08-01T08:00:00Z", &"b".repeat(64))]}),
+        );
+        proofs.insert(
+            root.clone(),
+            serde_json::json!({"account_identifier_hash": "a".repeat(64),
+                "evidence_request_count": 1, "members": {root.as_str(): 1},
+                "member_request_id_fingerprints": {root.as_str(): "c".repeat(64)}}),
+        );
+    }
+    legacy["claude_account_family_pending"] = windows.into();
+    legacy["claude_account_family_witnesses"] = proofs.into();
     let files = legacy["files"]
         .as_object()
         .expect("the index encodes its file entries");
@@ -1150,13 +1290,12 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let decoded: ScanIndex =
         serde_json::from_value(legacy.clone()).expect("an older release's index decodes");
     let reencoded = serde_json::to_value(&decoded).expect("re-encode the decoded index");
-    assert!(
-        matches!(
-            reencoded.get("claude_usage_family_pending"),
-            None | Some(serde_json::Value::Null)
-        ),
-        "the retired pending evidence is dropped"
-    );
+    for field in RETIRED {
+        assert!(
+            matches!(reencoded.get(field), None | Some(serde_json::Value::Null)),
+            "{field}: the retired state is dropped"
+        );
+    }
     assert_eq!(decoded.files.len(), index.files.len());
     for (key, entry) in index.files.iter() {
         let upgraded = serde_json::to_value(&decoded.files[key]).unwrap();
@@ -1173,13 +1312,12 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read the saved index"))
             .expect("decode the saved index");
-    assert!(
-        matches!(
-            saved.get("claude_usage_family_pending"),
-            None | Some(serde_json::Value::Null)
-        ),
-        "the next save purges the retired pending evidence"
-    );
+    for field in RETIRED {
+        assert!(
+            matches!(saved.get(field), None | Some(serde_json::Value::Null)),
+            "{field}: the next save purges the retired state"
+        );
+    }
     for (key, entry) in saved["files"]
         .as_object()
         .expect("the saved index encodes its file entries")
@@ -1368,4 +1506,53 @@ fn listed_family_without_witness_uploads_transcript_only() {
             > prior.accepted[PIPELINE_HELD_SESSION].body["request_count"].as_u64(),
         "the grown body carries more than the accepted one"
     );
+}
+
+/// [behaviour] Both synthetic transport failures run the real partial-checkpoint
+/// path. Terminal pages retain no file credit and a fresh traversal catches up.
+#[test]
+#[serial(source_manifests)]
+fn failed_pipeline_outcomes_checkpoint_without_acceptance() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    for outcome in [PipelineUpload::Shed, PipelineUpload::UploadError] {
+        let mut fixture = PipelineFixture::new("partial-checkpoint-outcomes");
+        fixture.page_files = 100;
+        fixture.durable_progress = true;
+        let failed = crate::snapshots::claude_request_money::e2::with_fixture_birth(
+            PIPELINE_FILE_BIRTH,
+            || {
+                fixture.page_with_reoffers_born(
+                    "2026-08-02T08:00:00Z",
+                    &PIPELINE_BASELINE_CYCLE,
+                    outcome,
+                    |_| {},
+                    false,
+                )
+            },
+        );
+        match outcome {
+            PipelineUpload::Shed => assert!(matches!(
+                failed.unwrap().result,
+                ResumableUploadResult::Shed { .. }
+            )),
+            PipelineUpload::UploadError => assert!(failed.is_err()),
+            _ => unreachable!(),
+        }
+        let saved = ScanIndex::load(&fixture.index_path).unwrap();
+        assert!(saved.files.is_empty());
+        // The persistence serializer omits an empty accepted ledger.
+        assert!(serde_json::to_value(&saved)
+            .unwrap()
+            .get("accepted_snapshot_fingerprints")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)));
+        assert!(!saved.scan_traversal_in_progress_for_test());
+        let recovered = fixture.page(
+            "2026-08-02T08:01:00Z",
+            &PIPELINE_BASELINE_CYCLE,
+            PipelineUpload::Accept,
+        );
+        assert_eq!(recovered.scan.scanned_file_count, 3);
+        assert_eq!(recovered.progress.accepted_fingerprints.len(), 3);
+        assert!(recovered.fully_settled);
+    }
 }

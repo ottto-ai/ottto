@@ -2,8 +2,8 @@
 //! serde type: every declared field, `Some` options, nonzero numbers, `true`
 //! flags, nonempty collections and each enum variant. Its rows give the field
 //! paths the writer stores, checked against an append-only history; a path the
-//! writer no longer stores must still load. A previous release's rows, frozen
-//! as that release wrote them, must load through the current reader.
+//! writer no longer stores must still load. Each frozen release's rows, as
+//! that release wrote them, must load through the current reader.
 use super::*;
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess,
@@ -23,9 +23,14 @@ type Given = fn(&mut Synth) -> Result<Json, DeError>;
 type Row = (String, String, u64, Box<RawValue>);
 
 const HISTORY: &str = "tests/fixtures/state_v2/serialized-fields.json";
-const RELEASE: &str = "tests/fixtures/state_v2/release-0.1.216.json";
-/// The catalogue layout the frozen release wrote.
-const RELEASE_LAYOUT: u32 = 5;
+/// Frozen releases: each one's rows and the catalogue layout it wrote.
+const RELEASES: [(&str, u32); 2] = [
+    ("tests/fixtures/state_v2/release-0.1.216.json", 5),
+    ("tests/fixtures/state_v2/release-0.1.218.json", 5),
+];
+/// Paths a later layout stores as another kind's rows; the frozen releases
+/// still load them inline.
+const MOVED: [(&str, &str); 1] = [("v1_field.upload_context_proof", "entity_stamps")];
 /// Controls the frozen release stored beside its rows.
 const RELEASE_META: [&str; 3] = ["schema_version", "catalogue_layout", "field_presence"];
 /// A collection stops growing here even if an enum inside it has not cycled.
@@ -661,39 +666,11 @@ fn unwritten(kind: &str) -> bool {
         )
 }
 
-/// Fields whose readers take only their own encoding: the fixture's values,
-/// with the account windows completed by `base`.
-const KEPT: [&str; 3] = [
-    "claude_request_census",
-    "claude_request_census_shadow",
-    "claude_account_family_pending",
-];
-/// The fixture, its account windows complete, with packed member requests
-/// and an absent member.
-fn base() -> ScanIndex {
-    use crate::snapshots::{ArchivedWindows, ClaudeAccountRequestSet};
-    let mut index = fixture();
-    let hashes: BTreeSet<String> = ["1", "2"].iter().map(|n| n.repeat(64)).collect();
-    for pending in index.claude_account_family_pending.values_mut() {
-        let ArchivedWindows::Resident(previous) = &mut pending.previous_windows else {
-            panic!("resident account windows");
-        };
-        for window in previous.iter_mut().chain([&mut pending.current]) {
-            let mut set = ClaudeAccountRequestSet::from_full_hashes(&hashes).unwrap();
-            set.identity_revision = Some("3".repeat(64));
-            window.census_complete = true;
-            window.members.insert("synthetic-file".into(), 2);
-            window.member_requests.insert("synthetic-file".into(), set);
-        }
-        pending
-            .confirmed_absent_members
-            .insert("synthetic-absent".into());
-    }
-    index
-}
+/// Fields whose readers take only their own encoding: the fixture's values.
+const KEPT: [&str; 2] = ["claude_request_census", "claude_request_census_shadow"];
 /// The base index with every other stored field filled from its type.
 fn sample() -> ScanIndex {
-    let mut index = base();
+    let mut index = fixture();
     let mut synth = Synth::new();
     for (name, fill) in fills() {
         if !KEPT.contains(&name) {
@@ -746,14 +723,6 @@ fn given() -> Vec<(&'static str, Vec<Given>)> {
         (
             "files/*/codex_counting_owner",
             vec![g(|s| Ok(s.string().into()))],
-        ),
-        (
-            "claude_retired_family_tombstones",
-            vec![g(|s| {
-                let mut roots = serde_json::Map::new();
-                roots.insert(s.string(), 1.into());
-                Ok(Json::Object(roots))
-            })],
         ),
         (
             "claude_money_birth_store",
@@ -815,7 +784,9 @@ fn stored_field_paths_check() {
             continue;
         };
         for path in paths.difference(now) {
-            if parent(path).is_some_and(|p| !now.contains(p)) {
+            if parent(path).is_some_and(|p| !now.contains(p))
+                || MOVED.contains(&(kind.as_str(), path.as_str()))
+            {
                 continue;
             }
             retired_path_loads(&index, kind, path);
@@ -841,24 +812,31 @@ fn retired_path_loads(index: &ScanIndex, kind: &str, path: &str) {
     }
 }
 
-/// [regress] The previous release's rows, every stored kind with nonempty
+/// [regress] Each frozen release's rows, every stored kind with nonempty
 /// values, load through the current reader.
 #[test]
 fn previous_release_rows_load_through_the_current_reader() {
-    deep_stack(previous_release_check);
+    deep_stack(|| {
+        for (path, layout) in RELEASES {
+            previous_release_check(path, layout);
+        }
+    });
 }
-fn previous_release_check() {
-    let release: Release = serde_json::from_str(&read_fixture(RELEASE)).unwrap();
+fn previous_release_check(path: &str, layout: u32) {
+    let release: Release = serde_json::from_str(&read_fixture(path)).unwrap();
     let kinds: BTreeSet<&str> = release.rows.iter().map(|row| row.0.as_str()).collect();
     for (kind, _) in catalogue::OWNED {
-        let released = catalogue::introduced(kind).unwrap() <= RELEASE_LAYOUT;
+        let released = catalogue::introduced(kind).unwrap() <= layout;
         assert!(
             !released || unwritten(kind) || kinds.contains(kind),
-            "{kind}: no released row"
+            "{path}: {kind}: no released row"
         );
     }
     let (_scratch, mut db) = load(&release).unwrap();
     if let Err(e) = hydrate(&mut db, Scratch::binding()) {
-        panic!("previous release refused: {e:#}");
+        panic!("{path}: release refused: {e:#}");
     }
 }
+
+#[path = "proof_split_tests.rs"]
+mod proof_split_tests;

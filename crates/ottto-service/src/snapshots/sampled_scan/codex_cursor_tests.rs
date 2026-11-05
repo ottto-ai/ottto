@@ -4,7 +4,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -113,16 +113,11 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
     // nothing is read.
     let hit = cache.cursor_parked("key", &file, Some("dependencies"));
     assert_eq!(
-        hit.map(|disclosure| (disclosure.reason, disclosure.state_only_blocked_session_ids)),
-        Some((DebtReason::JoinStateBound, vec![SESSION.to_owned()]))
+        hit.map(|disclosure| disclosure.reason),
+        Some(DebtReason::JoinStateBound)
     );
     // Growth cannot cure a prefix that only grows: still parked (R2-B3).
     temp.append(b"{\"b\":2}\n");
-    assert!(cache
-        .cursor_parked("key", &file, Some("dependencies"))
-        .is_some());
-    // A copy-refusal release keeps parked records (K6).
-    cache.clear();
     assert!(cache
         .cursor_parked("key", &file, Some("dependencies"))
         .is_some());
@@ -151,7 +146,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
         // The least recently used record goes first (L1).
         assert!(!cursor.parked.contains_key("key-000"));
         assert!(cursor.parked.contains_key(&format!("key-{PARKED_KEYS:03}")));
-        assert_eq!(cursor.counters.parked_hits, 3);
+        assert_eq!(cursor.counters.parked_hits, 2);
     });
 }
 
@@ -325,9 +320,8 @@ fn overlong_envelope_row() -> Vec<u8> {
     .into_bytes()
 }
 
-/// A withheld final record applied at a genuine EOF matches a
-/// read without an extent applying its trailing line, for a valid, a
-/// malformed and larger record.
+/// Valid final JSON keeps EOF admission; invalid unterminated bytes stay
+/// pending without loss on both cursor and compatibility routes.
 #[test]
 fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
     for last in [
@@ -348,6 +342,15 @@ fn withheld_record_applied_at_eof_matches_trailing_line_rule() {
                 reader.step(|value| seen.push(value.clone())).unwrap(),
                 JsonlReaderStep::Complete(_)
             ) {}
+            if serde_json::from_slice::<Value>(&last).is_err() {
+                assert!(reader.sealed_fragment());
+                assert!(!reader.apply_sealed_fragment(|value| seen.push(value.clone())));
+                assert!(reader.sealed_fragment());
+                assert_eq!(seen.len(), 2);
+                assert_eq!(reader.report.malformed_json_line_count, 0);
+                assert_eq!(reader.report.invalid_utf8_line_count, 0);
+                return (seen, reader.report);
+            }
             if cursor {
                 assert!(reader.sealed_fragment());
                 assert!(reader.apply_sealed_fragment(|value| seen.push(value.clone())));
@@ -367,7 +370,6 @@ fn disclosure() -> Disclosure {
         cause: ownership::PARSER,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
@@ -380,7 +382,6 @@ fn strict(reason: DebtReason) -> Disclosure {
         cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![SESSION.into()],
         diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
         held: HeldCounts::default(),
@@ -389,8 +390,7 @@ fn strict(reason: DebtReason) -> Disclosure {
 
 /// K2: `JoinStateBound` and `MemberChanged` keep the
 /// strict census gate (a retryable unreadable file, never residue) with the
-/// owner blocked and the prior body kept; only a held terminal refusal is
-/// settleable residue. One writer classifies fresh, memo and parked debt.
+/// prior body kept; only a held terminal refusal is settleable residue. One writer classifies fresh, memo and parked debt.
 #[test]
 fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
     let candidate = CandidateFile {
@@ -414,8 +414,6 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         let mut index = ScanIndex::default();
         let mut census = ScanCensus::default();
         let mut residue = BTreeSet::new();
-        let mut residue_blocked = BTreeSet::new();
-        let mut blocked = BTreeSet::new();
         let mut pending = Vec::new();
         disclose_terminal_codex_debt(
             disclosure,
@@ -425,12 +423,10 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
             DisclosureTargets {
                 census: &mut census,
                 residue_index_keys: &mut residue,
-                residue_blocked_session_ids: &mut residue_blocked,
-                codex_state_only_blocked_session_ids: &mut blocked,
                 pending_finalization: &mut pending,
             },
         );
-        (census, residue, residue_blocked, blocked, pending, index)
+        (census, residue, pending)
     };
     for reason in [
         DebtReason::JoinStateBound,
@@ -438,12 +434,10 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         DebtReason::ProbeBudgetOrder,
     ] {
         assert!(!reason.settleable());
-        let (census, residue, residue_blocked, blocked, pending, index) = disclose(&strict(reason));
-        assert!(residue.is_empty() && residue_blocked.is_empty());
+        let (census, residue, pending) = disclose(&strict(reason));
+        assert!(residue.is_empty());
         assert_eq!(census.ownership_incomplete_file_count, 0);
         assert_eq!(census.unreadable_path_count, 1);
-        assert!(blocked.contains(SESSION));
-        assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].parse_complete);
         assert_eq!(pending[0].diagnostic_reason, FileReason::NotParsedThisCycle);
@@ -453,9 +447,8 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         );
     }
     assert!(DebtReason::HeldTerminal.settleable());
-    let (census, residue, residue_blocked, blocked, pending, _) = disclose(&disclosure());
+    let (census, residue, pending) = disclose(&disclosure());
     assert_eq!(residue.len(), 1);
-    assert!(residue_blocked.contains(SESSION) && blocked.contains(SESSION));
     assert_eq!(census.ownership_incomplete_file_count, 1);
     assert_eq!(census.unreadable_path_count, 0);
     assert_eq!(
@@ -807,8 +800,7 @@ fn fingerprints(scan: &SourceScanResult) -> Vec<String> {
 }
 
 /// `index` on `cache`'s fixture route, saved and reloaded as the daemon does
-/// between passes. Codex has a Tail codec, so it keeps no RAM copy
-/// (`keeps_ram`): a routed page continues from its head on the route.
+/// between passes: a routed page continues from its head on the route.
 fn routed(index: ScanIndex, cache: &SharedCache) -> ScanIndex {
     crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
         SnapshotSource::Codex,
@@ -838,93 +830,9 @@ fn head(index: &ScanIndex, key: &str) -> Option<crate::transcript_acquisition::D
     )
 }
 
-/// A Pi transcript of `messages` usage lines under its own scan root, removed
-/// on drop. All sources now have codecs; cache mechanism tests explicitly
-/// admit its native reduction below instead of relying on a RAM-only source.
-struct PiRoot {
-    _dir: Temp,
-    root: PathBuf,
-}
-impl PiRoot {
-    fn new(messages: usize) -> Self {
-        let dir = Temp::new("pi", b"");
-        fs::remove_file(&dir.0).unwrap();
-        let root = dir.0.join("home/.pi/agent/sessions");
-        fs::create_dir_all(&root).unwrap();
-        let mut body = codex_line(json!({"type": "session", "version": 3,
-            "id": "native-tail-fixture", "timestamp": "2026-10-07T10:00:00Z",
-            "cwd": "/synthetic/pi"}));
-        for id in 0..messages {
-            body.extend(codex_line(
-                crate::snapshots::transcript_acquisition_tests::usage(
-                    SnapshotSource::Pi,
-                    100 + id as u64,
-                    id,
-                    "fixture-model",
-                ),
-            ));
-        }
-        let fixture = Self { _dir: dir, root };
-        fs::write(fixture.file(), body).unwrap();
-        fixture
-    }
-    fn file(&self) -> PathBuf {
-        self.root.join("native-tail-fixture.jsonl")
-    }
-    fn key(&self) -> String {
-        local_index_key(&self.file())
-    }
-}
-
-/// Exercise the existing native copy/admission mechanism directly. Production
-/// scans now persist every source's Tail head and retain no RAM reduction.
-fn retain_fixture_copy(pi: &PiRoot, cache: &Arc<SharedCache>) {
-    use crate::snapshots::sampled_scan::transition_fixture::native_cold;
-    let context = zero_context(cache, "cursor-fixture");
-    let now = super::super::now_seconds();
-    let mut parser = native_cold::parser(
-        SnapshotSource::Pi,
-        &pi.file(),
-        File::open(pi.file()).unwrap(),
-        apply_pi_line,
-    );
-    assert!(matches!(
-        parser
-            .prepare_acquisition(None, &context.namespace, None, now)
-            .unwrap(),
-        crate::transcript_acquisition::ReadMode::Full(_)
-    ));
-    while !parser.step().unwrap() {}
-    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
-    super::super::retire_headers_beside_copy(Some(&context), budget, step);
-    let completed = parser
-        .retain_reduction(
-            &context.namespace,
-            now,
-            super::super::RetainBudget::granted_unclassified(budget),
-        )
-        .unwrap()
-        .expect("a complete native fixture");
-    assert_eq!(
-        completed.checkpoint.sealed_offset(),
-        fs::metadata(pi.file()).unwrap().len()
-    );
-    assert!(completed.reduction.is_some(), "a budgeted native copy");
-    assert!(cache.insert_admitted(pi.key(), completed, 0));
-}
-
-/// Admit `pi`'s native copy through the cache mechanism; returns its key.
-fn pi_retained(pi: &PiRoot, cache: &Arc<SharedCache>) -> String {
-    retain_fixture_copy(pi, cache);
-    let key = pi.key();
-    assert!(cache.retained_checkpoint(&key).is_some());
-    key
-}
-
 /// #641's admission setup: a real Codex cursor job paged to its certified end
-/// (cursor state and optional header facts), beside a real retained copy.
-/// The retained Pi copy is admitted by the cache fixture; returns its key.
-fn certified_beside_a_retained_copy(cache: &Arc<SharedCache>) -> String {
+/// (cursor state and optional header facts).
+fn certified_cursor_job(cache: &Arc<SharedCache>) {
     let fixture = ScanRoot::new(40);
     let mut index = ScanIndex::default();
     for _ in 0..64 {
@@ -940,7 +848,6 @@ fn certified_beside_a_retained_copy(cache: &Arc<SharedCache>) -> String {
         "{}",
         counters(cache)
     );
-    pi_retained(&PiRoot::new(8), cache)
 }
 
 #[test]
@@ -1265,12 +1172,19 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         next_line += 1;
         now += 10;
         clock.set(now);
-        let (next, scan, modes) = page_in(
-            &fixture,
-            routed(index, &cache),
-            Some(Arc::clone(&cache)),
-            "cursor-fixture",
+        let index = routed(index, &cache);
+        // The fresh-first page budget sizes this append as `extent - s`:
+        // the continuation offset is the committed head's sealed offset.
+        assert_eq!(
+            crate::snapshots::tail_source::committed_sealed_offset(
+                SnapshotSource::Codex,
+                &index,
+                &key
+            ),
+            Some(certified.sealed_offset)
         );
+        let (next, scan, modes) =
+            page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
         // (ii) a tail from `s` while the deadline permits.
         assert_eq!(modes, (0, 1));
         assert!(!scan.snapshots.is_empty());
@@ -1402,7 +1316,6 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
     }
     let fixture = ScanRoot::new(40);
     let path = fixture.file(SESSION);
-    let key = local_index_key(&path);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 4096, 64, || {
         let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
@@ -1435,7 +1348,6 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
                     "an invalidated attempt publishes nothing"
                 );
                 assert_eq!(counter(&cache, |c| c.jobs_certified), 0);
-                assert!(cache.retained_checkpoint(&key).is_none());
                 assert!(
                     pending_hint(&index, &path).is_some(),
                     "the path stays pending"
@@ -1665,276 +1577,6 @@ fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
-/// K6 (R2-B1): a copy-refusal release by a Claude scan sharing the process
-/// cache evicts retained copies only. The paused Codex job keeps its charge
-/// and resumes to a certificate without restarting.
-#[test]
-fn claude_copy_refusal_keeps_paused_codex_job_resumable() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 4096, 64, || {
-        let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
-        assert!(scan.snapshots.is_empty());
-        let charge = cache.cursor_charge();
-        assert!(charge > 0, "the job paused: {}", counters(&cache));
-        assert_eq!(cache.cursor_reserved(), 0);
-        let claude_root = Temp::new("claude-root", b"");
-        fs::remove_file(&claude_root.0).unwrap();
-        fs::create_dir_all(claude_root.0.join("projects")).unwrap();
-        let support = claude_root.0.join("support");
-        fs::create_dir_all(&support).unwrap();
-        let claude = OwnedSourceScan::new(
-            SnapshotSource::ClaudeCode,
-            &[claude_root.0.join("projects")],
-            ScanIndex::default(),
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            Some(&support),
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
-        // No active file: the release takes its conservative full path.
-        let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            claude.release_sampled_cache_for_copy_refusal();
-        });
-        assert_eq!(lifecycle.clear_no_active, 1);
-        assert_eq!(lifecycle.clear_metadata_unsupported, 0);
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-        drop(claude);
-        assert_eq!(cache.cursor_charge(), charge, "the paused job survives");
-        assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
-        for _ in 0..32 {
-            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
-        assert_eq!(
-            counter(&cache, |c| c.jobs_certified),
-            1,
-            "{}",
-            counters(&cache)
-        );
-        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
-        assert!(counter(&cache, |c| c.jobs_resumed) > 0);
-    });
-}
-
-/// L-A1: an unsampled Claude read (sidecar census incomplete) beside a
-/// paused Codex job. A measured copy refusal keeps every resident and the
-/// job's charge; the conservative no-argument release still clears retained
-/// copies only (K6).
-#[test]
-fn unsampled_claude_refusal_keeps_residents_and_paused_job_charge() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let fixture = ScanRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 4096, 64, || {
-        let (_, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
-        assert!(scan.snapshots.is_empty());
-        let charge = cache.cursor_charge();
-        assert!(
-            charge > 0,
-            "precondition: the job paused: {}",
-            counters(&cache)
-        );
-        assert_eq!(cache.cursor_reserved(), 0);
-        let claude_root = Temp::new("claude-root", b"");
-        fs::remove_file(&claude_root.0).unwrap();
-        let projects = claude_root.0.join("projects");
-        fs::create_dir_all(&projects).unwrap();
-        let support = claude_root.0.join("support");
-        fs::create_dir_all(&support).unwrap();
-        let mut transcript = Vec::new();
-        for line in [
-            json!({"type":"user", "sessionId":"native-tail-fixture",
-                "timestamp":"2026-10-07T10:00:00Z",
-                "message":{"role":"user","content":"Synthetic test"}}),
-            json!({"type":"assistant", "sessionId":"native-tail-fixture",
-                "timestamp":"2026-10-07T10:00:00Z", "requestId":"req-0",
-                "message":{"id":"response-0", "model":"fixture-model",
-                "usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":10}}}),
-        ] {
-            serde_json::to_writer(&mut transcript, &line).unwrap();
-            transcript.push(b'\n');
-        }
-        fs::write(projects.join("native-tail-fixture.jsonl"), transcript).unwrap();
-        let mut claude = OwnedSourceScan::new(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&projects),
-            ScanIndex::default(),
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-            10,
-            Some(&support),
-            &[],
-            false,
-        )
-        .with_sampled_acquisition(Arc::clone(&cache), Scope("claude-fixture".into()));
-        claude.sidecar_census_complete = false;
-        for _ in 0..10_000 {
-            if claude.active_file.is_some() {
-                break;
-            }
-            match claude.step(None) {
-                OwnedSourceScanStep::Pending(next) => claude = next,
-                OwnedSourceScanStep::Complete { .. } => panic!("the Claude file never opened"),
-            }
-        }
-        let active = claude.active_file.as_deref().unwrap();
-        assert!(
-            active.sampling.is_none()
-                && active.cursor.is_none()
-                && active.group.is_none()
-                && active.parser.reader.acquisition.is_none(),
-            "precondition: an unsampled native read"
-        );
-        let context = claude.sampling.as_ref().unwrap();
-        let measured = crate::heap_layout_bound::bound(context, state_bytes());
-        assert!(measured.is_some(), "precondition: residents measured");
-        let (_, lifecycle) = observe(|| {
-            crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
-                Some(context),
-                Some(active),
-                measured,
-            )
-        });
-        assert_eq!(lifecycle.clear_other_active, 0);
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-        assert_eq!(lifecycle.clear_entries_released, 0);
-        assert!(crate::heap_layout_bound::bound(context, state_bytes()).is_some());
-        assert_eq!(cache.cursor_charge(), charge, "the paused job's charge");
-        assert_eq!(cache.cursor_reserved(), 0, "no reservation");
-        let (_, lifecycle) = observe(|| claude.release_sampled_cache_for_copy_refusal());
-        assert_eq!(
-            lifecycle.clear_full_resident_bound_unknown, 1,
-            "conservative"
-        );
-        assert_eq!(lifecycle.clear_other_active, 0);
-        drop(claude);
-        assert_eq!(cache.cursor_charge(), charge, "K6: the paused job survives");
-        assert_eq!(cache.cursor_reserved(), 0);
-        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
-    });
-}
-
-/// L-A1: a live cursor job reads a fresh `Full` acquisition, so the unchanged
-/// #641 `Full` branch decides its refusal. The cursor conjunct alone still
-/// keeps an otherwise unsampled shape on the conservative release.
-#[test]
-fn cursor_job_copy_refusal_keeps_conservative_release() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 4096, 64, || {
-        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
-            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
-        for _ in 0..10_000 {
-            if scan
-                .active_file
-                .as_ref()
-                .is_some_and(|active| active.cursor.is_some())
-            {
-                break;
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
-            }
-        }
-        assert!(
-            scan.active_file
-                .as_ref()
-                .is_some_and(|active| active.cursor.is_some()),
-            "precondition: a live cursor job"
-        );
-        let release = |scan: &OwnedSourceScan| {
-            let measured =
-                crate::heap_layout_bound::bound(scan.sampling.as_ref().unwrap(), state_bytes());
-            assert!(measured.is_some(), "precondition: residents measured");
-            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-                crate::snapshots::sampled_scan::release_cache_for_copy_refusal(
-                    scan.sampling.as_ref(),
-                    scan.active_file.as_deref(),
-                    measured,
-                )
-            })
-            .1
-        };
-        let active = scan.active_file.as_deref().unwrap();
-        assert!(
-            matches!(
-                active.sampling.as_ref().map(|sampling| sampling.mode),
-                Some(crate::transcript_acquisition::ReadMode::Full(_))
-            ),
-            "precondition: a cursor job reads a fresh Full acquisition"
-        );
-        let lifecycle = release(&scan);
-        assert_eq!(lifecycle.clear_other_active, 0, "the #641 Full branch");
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-        // Isolate the cursor conjunct, then restore the job before its frame
-        // returns it to the slot.
-        let active = scan.active_file.as_deref_mut().unwrap();
-        let sampling = active.sampling.take();
-        let acquisition = active.parser.reader.acquisition.take();
-        assert!(
-            active.cursor.is_some()
-                && active.group.is_none()
-                && active.aliases.is_empty()
-                && active.applied_receipts.is_empty()
-                && active
-                    .parser
-                    .accumulator
-                    .codex_tier_replay
-                    .as_ref()
-                    .map_or(true, |replay| replay.join.is_none()),
-            "precondition: only the cursor conjunct owns state"
-        );
-        let lifecycle = release(&scan);
-        assert_eq!(lifecycle.clear_other_active, 1, "the cursor conjunct");
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.sampling = sampling;
-        active.parser.reader.acquisition = acquisition;
-        // Read as a Tail, with its acquisition, the
-        // cursor conjunct alone still keeps the job off shape F, so its
-        // refusal keeps ClearOtherActive and its completion never reaches
-        // R0's release.
-        let active = scan.active_file.as_deref_mut().unwrap();
-        let sampling = active.sampling.as_mut().unwrap();
-        let mode = sampling.mode;
-        sampling.mode = crate::transcript_acquisition::ReadMode::Tail;
-        assert!(
-            active.parser.reader.acquisition.is_some(),
-            "precondition: the job's acquisition"
-        );
-        assert!(!crate::snapshots::sampled_scan::borrows_only_retained_reduction(active));
-        let cursor = active.cursor.take();
-        assert!(
-            crate::snapshots::sampled_scan::borrows_only_retained_reduction(active),
-            "precondition: only the cursor conjunct differs from shape F"
-        );
-        active.cursor = cursor;
-        let lifecycle = release(&scan);
-        assert_eq!(lifecycle.clear_other_active, 1, "a Tail cursor job");
-        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-        let active = scan.active_file.as_deref_mut().unwrap();
-        active.sampling.as_mut().unwrap().mode = mode;
-    });
-}
-
 /// K12 (R2-H3): dropping a scan frame mid-job returns the intact job to the
 /// slot; the next page resumes it instead of restarting from byte zero.
 #[test]
@@ -2136,7 +1778,6 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
         assert!(counter(&cache, |c| c.jobs_paused) > 0, "it paged");
         assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), 0);
         assert_eq!(published, vec![fingerprints(&unpaged)], "published once");
-        assert!(cache.retained_checkpoint(&key).is_none(), "no copy kept");
         let marker = |index: &ScanIndex| {
             index
                 .files
@@ -2234,6 +1875,30 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
         assert!(cache.cursor_slot_free(), "{}", counters(&cache));
         assert_eq!(pending_hint(&index, &path), None, "dequeued");
     });
+    // Ordinary part of the former archive-gone fixture: a paid, paused
+    // plain Full may not publish after disappearance and refunds every claim.
+    super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+    let gone = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (index, first, modes) = page_in(
+            &gone,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "cursor-fixture",
+        );
+        assert!(first.snapshots.is_empty());
+        assert_eq!(modes.0, 1, "one paid plain Full");
+        assert!(
+            !cache.cursor_slot_free(),
+            "the Full is paused after reading"
+        );
+        fs::remove_file(gone.file(SESSION)).unwrap();
+        let (_, vanished, modes) = page_in(&gone, index, Some(cache.clone()), "cursor-fixture");
+        assert!(vanished.snapshots.is_empty(), "vanished Full emits nothing");
+        assert_eq!(modes.0, 0, "vanish does not regrant Full");
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
 }
 
 /// A quiescent file larger than B whose last record has
@@ -2244,7 +1909,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
 /// read, so later pages skip it, also past the audit interval. No copy is
 /// kept: the applied record lies past the certified prefix `[0, s)`, so
 /// every such job is non-retainable and converges through the index alone.
-/// A malformed record is reported as a line loss.
+/// An invalid unterminated record stays pending with no line loss on either route.
 #[test]
 fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2276,8 +1941,8 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
                 malformed_lines += scan.malformed_json_line_count;
-                // A lossy (malformed) job ends uncertified, like main's
-                // lossy full read.
+                // Complete the certified prefix without applying a pending
+                // invalid suffix, or count the valid EOF record once.
                 if counter(&cache, |c| c.jobs_certified + c.jobs_uncertified) == 1 {
                     completed = Some(scan);
                     break;
@@ -2289,15 +1954,30 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 now += 10;
             }
             let completed = completed.unwrap_or_else(|| panic!("{case}: {}", counters(&cache)));
-            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
-            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
-            assert!(cache.retained_checkpoint(&key).is_none(), "{case}: no copy");
             if case == "malformed" {
-                assert_eq!(counter(&cache, |c| c.jobs_uncertified), 1, "{case}");
-                assert!(unpaged.malformed_json_line_count > 0, "main reports it");
-                assert!(malformed_lines > 0, "{case}: the loss is reported");
+                assert_eq!(counter(&cache, |c| c.eof_record_applied), 0);
+                assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1);
+                assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
+                assert_eq!(
+                    unpaged.malformed_json_line_count, 0,
+                    "compatibility reader also keeps the suffix pending"
+                );
+                assert_eq!(
+                    malformed_lines, 0,
+                    "withheld bytes are not applied or counted"
+                );
+                let totals = |scan: &SourceScanResult| {
+                    scan.snapshots
+                        .iter()
+                        .map(|s| (s.input_tokens, s.output_tokens, s.request_count))
+                        .collect::<Vec<_>>()
+                };
+                assert!(!completed.snapshots.is_empty());
+                assert_eq!(totals(&completed), totals(&unpaged));
                 return;
             }
+            assert_eq!(counter(&cache, |c| c.eof_record_applied), 1, "{case}");
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 0, "{case}");
             assert_eq!(counter(&cache, |c| c.jobs_certified), 1, "{case}");
             assert_eq!(
                 fingerprints(&completed),
@@ -2936,7 +2616,7 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
                 fixture.append(session, &token_line(*line));
                 *line += 1;
             }
-            cache.clear();
+            cache.with_cursor(|cursor| cursor.headers.clear());
         }
         let closed = closed.unwrap_or_else(|| {
             panic!(
@@ -3116,7 +2796,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         .pending_candidates
         .retain(|candidate| candidate.path != fixture.file(SESSION));
     let budget = fixture.len(SESSION) * 4;
-    cache.clear();
+    cache.with_cursor(|cursor| cursor.headers.clear());
     with_test_limits(2048, budget, 64, || {
         let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
         index = next;
@@ -3132,7 +2812,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         body.extend(token_line(1));
         fs::write(fixture.file(NEW), body).unwrap();
         fixture.append(SESSION, &token_line(5));
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         // NEW deliberately has no watcher hint: retained-roster discovery
         // must promote it too, even though refresh runs before hint enqueue.
         let (next, fresh) = published_scan(
@@ -3194,7 +2874,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         // Arm (b): an unhinted new date directory.
         std::thread::sleep(std::time::Duration::from_millis(50));
         write_dated_rollout(&fixture, "2026/10/08", NEW_DAY);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         let mut published = BTreeSet::new();
         for page in 1..=2 {
             let (next, scan) =
@@ -3228,7 +2908,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         hints.push(fixture.file(SESSION));
         index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         let queued = index.traversal.as_ref().unwrap().pending_candidates.len();
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         let selected = selected_page(&fixture, &cache, index, &collected_at(7), &hints);
         assert_eq!(selected.codex_selected_flags[&key], (false, true));
         let (next, ridden) = finish_published(selected);
@@ -3265,7 +2945,6 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
     ignore = "needs validated heap layout"
 )]
 fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
-    use codex_compressed_input::HeaderRead;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -3282,9 +2961,16 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     sessions.push((SESSION, 4));
     sessions.push((REREAD, 4));
     let fixture = ScanRoot::with_sessions(&sessions);
+    let archive = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": ARCHIVE}}));
+    body.extend(token_line(1));
+    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     let cache = Arc::new(SharedCache::default());
     let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
-    assert_eq!(warm.snapshots.len(), MEMBERS + 2);
+    assert_eq!(warm.snapshots.len(), MEMBERS + 3);
     for id in &ids {
         index
             .files
@@ -3293,13 +2979,6 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             .source_file_fingerprint
             .clear();
     }
-    let archive = fixture
-        .root
-        .join(format!("rollout-2026-10-07T10-00-00-{ARCHIVE}.jsonl.zst"));
-    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
-        "type": "session_meta", "payload": {"id": ARCHIVE}}));
-    body.extend(token_line(1));
-    fs::write(&archive, zstd::stream::encode_all(&body[..], 1).unwrap()).unwrap();
     ensure_bounded_traversal(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
@@ -3313,15 +2992,7 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.power = true;
-    let header = archive_header_pass(&mut index, &archive, &cache);
-    assert!(matches!(header, HeaderRead::Validated(_)));
-    // Selection is under test, not the Full. Refuse archive work on every
-    // platform: on a macOS runner with mains power the selected archive's
-    // Full is reserved, and only the collector's reservation save, which
-    // this page loop does not run, releases the next page's inventory.
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(NoArchivePower));
-    index.archive_pass.power = false;
+    assert!(archive_header_pass(&mut index, &archive, &cache).is_ok());
     // Only census members stay queued; SESSION returns through its hint, and
     // the re-read and the archive are queued after the control turns.
     let reread = fixture.file(REREAD);
@@ -3339,7 +3010,7 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     let reread_key = local_index_key(&reread);
     let archive_key = local_index_key(&archive);
     let budget = fixture.len(SESSION) * 4;
-    cache.clear();
+    cache.with_cursor(|cursor| cursor.headers.clear());
     with_test_limits(2048, budget, 64, || {
         // One selecting page with a fresh append to SESSION and its hint.
         let turn = |index: ScanIndex, page: u64| {
@@ -3384,6 +3055,14 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
         index
             .files
             .get_mut(&reread_key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        // This is known ordinary work, like the plaintext reread. A newly
+        // discovered compressed file now legitimately participates as fresh.
+        index
+            .files
+            .get_mut(&archive_key)
             .unwrap()
             .source_file_fingerprint
             .clear();
@@ -3470,18 +3149,6 @@ fn published_scan(
     finish_published(selected_page(fixture, cache, index, collected_at, hints))
 }
 
-/// Platform gates that refuse archive work, as off mains power.
-struct NoArchivePower;
-impl crate::snapshot_sync::continuation::PlatformGates for NoArchivePower {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Refused
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
-}
-
 /// Step `scan` to completion and apply the collector's upload policy.
 fn finish_published(scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     let (index, scan, _) = finish_saving_reservations(scan);
@@ -3514,18 +3181,10 @@ fn finish_saving_reservations_within(
     max_steps: usize,
     phase: impl FnOnce() -> String,
 ) -> (ScanIndex, SourceScanResult, usize) {
-    let mut committed = scan.index.clone();
-    let checkpoint = Temp::new("reservation", b"");
-    fs::remove_file(&checkpoint.0).unwrap();
-    let mut saved = 0;
+    let saved = 0;
     for _ in 0..max_steps {
         match scan.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                saved += usize::from(next.index.archive_pass.dirty);
-                next.persist_archive_reservation(&mut committed, &checkpoint.0)
-                    .unwrap();
-                scan = next;
-            }
+            OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
@@ -3551,18 +3210,6 @@ fn finish_saving_reservations_within(
         "a Codex page did not complete within {max_steps} steps: {}",
         phase()
     );
-}
-
-/// Archive power as on a Mac on AC power; Linux reports it unknown.
-struct PoweredArchiveGates;
-impl crate::snapshot_sync::continuation::PlatformGates for PoweredArchiveGates {
-    fn power(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn enter_background_qos(&mut self) -> crate::snapshot_sync::continuation::PlatformState {
-        crate::snapshot_sync::continuation::PlatformState::Allowed
-    }
-    fn restore_qos(&mut self) {}
 }
 
 /// [regress] 0.1.215 queue: with archive power allowed (macOS), a page whose
@@ -3606,7 +3253,6 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         BACKFILL_WINDOW_DAYS,
         None,
     );
-    index.archive_pass.gates = crate::snapshot_sync::ArchiveGates::new(Some(PoweredArchiveGates));
     fixture.append(SESSION, &token_line(5));
     let page = selected_page(
         &fixture,
@@ -3615,9 +3261,13 @@ fn powered_archive_page_completes_once_its_reservation_is_saved() {
         &collected_at(1),
         &[fixture.file(SESSION)],
     );
-    let (index, _, saved) = finish_saving_reservations(page);
-    assert!(saved > 0, "the archive queued no reservation");
-    assert!(index.archives.contains_key(&local_index_key(&archive)));
+    let (index, scan, saved) = finish_saving_reservations(page);
+    assert_eq!(saved, 0, "ordinary decoding needs no reservation save");
+    assert!(index.files.contains_key(&local_index_key(&archive)));
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|s| s.source_session_id == ARCHIVE));
 }
 
 /// Write a one-turn rollout in a day directory below the fixture root.
@@ -3667,7 +3317,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
                 (
                     candidate.census_member,
                     candidate.watcher_hint,
-                    codex_fresh_data_pending(candidate, &index.files),
+                    codex_fresh_data_pending(candidate, index),
                 )
             })
     };
@@ -3787,7 +3437,7 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         let (index, scan) = hinted_page(
             &fixture,
             index,
@@ -3956,7 +3606,7 @@ fn non_member_job_paused_at_census_close_resumes_in_the_next_generation() {
             fixture.append(L, &token_line(line));
         }
         assert!(fixture.len(L) > singleton);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         let (index, scan) = hinted_page_limited(
             &fixture,
             index,
@@ -4071,7 +3721,7 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
         index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         // An earlier page of this sweep settled only partially.
         index.mark_bounded_sweep_unsettled();
         let (index, scan) = hinted_page(
@@ -4533,7 +4183,6 @@ fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
         "held: {}",
         counters(&cache)
     );
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         1,
@@ -4583,17 +4232,7 @@ fn assert_admitted_once(
         counter(cache, |c| c.memo_hits),
         counter(cache, |c| c.memo_records),
     );
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(CREATED),
-        "admitted: {}",
-        counters(cache)
-    );
-    let (index, again) = home.generation(index, cache, n);
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(CREATED),
-        "no resurrected hold: {}",
-        counters(cache)
-    );
+    let (_, again) = home.generation(index, cache, n);
     let usage = created_usage(&again);
     assert!(
         usage.is_empty()
@@ -4670,7 +4309,6 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
         "held: {}",
         counters(&cache)
     );
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         1,
@@ -4725,7 +4363,6 @@ fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
         "still held: {}",
         counters(&cache)
     );
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         1,
@@ -4745,7 +4382,7 @@ fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
 
 impl CreatedThreadHome {
     /// The same generation `n` scanned cold (fresh index and cache): what a
-    /// full parse of the current files and sidecar publishes and blocks.
+    /// full parse of the current files and sidecar publishes and discloses.
     fn oracle(&self, n: i64) -> (ScanIndex, SourceScanResult) {
         self.generation(ScanIndex::default(), &Arc::new(SharedCache::default()), n)
     }
@@ -4760,13 +4397,9 @@ impl CreatedThreadHome {
 }
 
 /// What a generation discloses about held files: the per-file loss and
-/// residue counts the scan result exposes, and the index's full state-only
-/// blocked set.
-fn census(
-    index: &ScanIndex,
-    scan: &SourceScanResult,
-) -> (Vec<(&'static str, u64)>, BTreeSet<String>) {
-    let counts = vec![
+/// residue counts the scan result exposes.
+fn census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
+    vec![
         (
             "ownership_incomplete",
             scan.ownership_incomplete_file_count as u64,
@@ -4788,45 +4421,24 @@ fn census(
             "residue_index_keys",
             scan.census_residue_index_key_count as u64,
         ),
-        (
-            "residue_blocked_sessions",
-            scan.census_residue_blocked_session_count as u64,
-        ),
-    ];
-    (counts, index.codex_state_only_blocked_session_ids.clone())
+    ]
 }
 
 /// A warm generation, memo hit or miss, discloses exactly what a cold full
 /// parse of the same files and sidecar does, and, with `usage`, publishes
 /// the same created-thread usage. `usage` is false only where the warm scan
 /// legitimately skips an unchanged admitted file that a cold scan publishes.
-///
-/// `sticky` names sessions the warm index still blocks although a cold parse
-/// does not: the index drops a state-only block only when the session
-/// publishes a snapshot, so a usage-free cure leaves it (pre-existing index
-/// rule, not memo state). Each must be warm-only; every other id matches.
 fn assert_oracle(
     home: &CreatedThreadHome,
     cache: &SharedCache,
-    index: &ScanIndex,
     scan: &SourceScanResult,
     n: i64,
     usage: bool,
-    sticky: &[&str],
 ) {
-    let (oracle_index, oracle) = home.oracle(n);
-    let (counts, mut blocked) = census(index, scan);
-    let (oracle_counts, oracle_blocked) = census(&oracle_index, &oracle);
-    for id in sticky {
-        assert!(
-            blocked.remove(*id) && !oracle_blocked.contains(*id),
-            "generation {n}: {id} sticky: {}",
-            counters(cache)
-        );
-    }
+    let (_, oracle) = home.oracle(n);
     assert_eq!(
-        (counts, blocked),
-        (oracle_counts, oracle_blocked),
+        census(scan),
+        census(&oracle),
         "generation {n}: {}",
         counters(cache)
     );
@@ -4861,7 +4473,6 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         "held: {}",
         counters(&cache)
     );
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(held.ownership_incomplete_file_count, 1);
     assert_eq!(
         counter(&cache, |c| c.memo_records),
@@ -4869,7 +4480,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
     // NC1: unchanged, the hold stays quiet: two exact-stamp hits, each
     // disclosing what a cold parse does.
     for n in 1..=2 {
@@ -4880,7 +4491,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
             "{}",
             counters(&cache)
         );
-        assert_oracle(&home, &cache, &next, &quiet, n, true, &[]);
+        assert_oracle(&home, &cache, &quiet, n, true);
         index = next;
     }
     home.flush_from(3);
@@ -4897,7 +4508,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         "admitted: {}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &cured, 3, true, &[]);
+    assert_oracle(&home, &cache, &cured, 3, true);
     assert_admitted_once(&home, &cache, index, &cured, 4);
 }
 
@@ -4934,7 +4545,6 @@ fn copied_created_thread_binds_from_its_header_not_file_birth() {
         let (index, cured) = home.generation(index, &cache, 1);
         if !admitted {
             assert!(created_usage(&cured).is_empty(), "{state_source}");
-            assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
             continue;
         }
         assert_eq!(
@@ -4971,16 +4581,15 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
         counters(&cache)
     );
     assert_eq!(held.ownership_incomplete_file_count, 1);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         1,
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
     home.project(home.bytes(3), 3);
-    let (index, woken) = home.generation(index, &cache, 1);
+    let (_, woken) = home.generation(index, &cache, 1);
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         0,
@@ -5003,7 +4612,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
         "cured, not re-held: {}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
+    assert_oracle(&home, &cache, &woken, 1, true);
 }
 
 /// [money] A state-declared created thread held for an ambiguous fork
@@ -5030,11 +4639,11 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_records_the_fresh_hold() 
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
     assert!(home.memo_entry(&cache).is_some(), "recorded entry");
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+    assert_oracle(&home, &cache, &quiet, 1, true);
     // The turn context flushes past the projection: the bind no longer
     // matches the file.
     let mut file = OpenOptions::new().append(true).open(&home.path).unwrap();
@@ -5047,7 +4656,7 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_records_the_fresh_hold() 
         counters(&cache)
     );
     assert!(created_usage(&grown).is_empty(), "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
+    assert_oracle(&home, &cache, &grown, 2, true);
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         2,
@@ -5055,10 +4664,10 @@ fn bound_created_thread_fork_memo_misses_on_growth_and_records_the_fresh_hold() 
         counters(&cache)
     );
     assert!(home.memo_entry(&cache).is_some(), "re-recorded entry");
-    let (index, unchanged) = home.generation(index, &cache, 3);
+    let (_, unchanged) = home.generation(index, &cache, 3);
     assert!(created_usage(&unchanged).is_empty());
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &unchanged, 3, true, &[]);
+    assert_oracle(&home, &cache, &unchanged, 3, true);
 }
 
 const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
@@ -5114,12 +4723,12 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
     // Unchanged: the orphan hits; the admitted created thread is skipped,
     // which a cold scan republishes, so only the census is compared.
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_oracle(&home, &cache, &index, &quiet, 1, false, &[]);
+    assert_oracle(&home, &cache, &quiet, 1, false);
     // The state census no longer holds any created thread.
     rusqlite::Connection::open(home.codex().join("state_5.sqlite"))
         .unwrap()
@@ -5128,7 +4737,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
             rusqlite::params![CREATED],
         )
         .unwrap();
-    let (index, cured) = home.generation(index, &cache, 2);
+    let (_, cured) = home.generation(index, &cache, 2);
     assert_eq!(
         counter(&cache, |c| c.memo_hits),
         1,
@@ -5157,11 +4766,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
         "{}",
         counters(&cache)
     );
-    // Its usage-free cure publishes nothing, but the re-read
-    // no longer blocks it and no other key holds it, so the warm index
-    // releases it, as a cold parse never sets it.
-    assert!(!index.codex_state_only_blocked_session_ids.contains(ORPHAN));
-    assert_oracle(&home, &cache, &index, &cured, 2, true, &[]);
+    assert_oracle(&home, &cache, &cured, 2, true);
 }
 
 /// Every census count a held file's fresh parse adds and a memo hit replays
@@ -5200,10 +4805,6 @@ fn replayed_census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
             "residue_index_keys",
             scan.census_residue_index_key_count as u64,
         ),
-        (
-            "residue_blocked_sessions",
-            scan.census_residue_blocked_session_count as u64,
-        ),
     ]
 }
 
@@ -5235,7 +4836,6 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     assert_eq!(parsed.borrow().len(), 1, "{}", counters(&cache));
     assert!(created_usage(&held).is_empty(), "{}", counters(&cache));
     assert!(held.recognized_usage_drop_count > 0, "usage-bearing hold");
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
     assert_eq!(
         counter(&cache, |c| c.memo_records),
         1,
@@ -5243,7 +4843,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
         counters(&cache)
     );
     assert_eq!(replayed_census(&held), replayed_census(&home.oracle(0).1));
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
 
     let ((index, quiet), counts) = codex_memo_lifecycle::observe(|| {
         crate::snapshots::with_codex_before_parse(hook.clone(), || {
@@ -5257,7 +4857,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
         fs::metadata(&home.path).unwrap().len()
     );
     assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
-    assert_oracle(&home, &cache, &index, &quiet, 1, true, &[]);
+    assert_oracle(&home, &cache, &quiet, 1, true);
 
     // T18: growth alone.
     let extra = codex_line(json!({
@@ -5272,8 +4872,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
         .unwrap()
         .write_all(&extra)
         .unwrap();
-    let ((index, grown), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
+    let ((_, grown), counts) = codex_memo_lifecycle::observe(|| home.generation(index, &cache, 3));
     assert_eq!(
         (
             counts.memo_miss_exact_stamp,
@@ -5286,15 +4885,13 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
         counters(&cache)
     );
     assert_eq!(replayed_census(&grown), replayed_census(&home.oracle(3).1));
-    assert_oracle(&home, &cache, &index, &grown, 3, true, &[]);
+    assert_oracle(&home, &cache, &grown, 3, true);
 }
 
-/// L-SB site 3 (the one writer): a settleable disclosure replaces the key's
-/// attribution and releases what it no longer blocks; a strict one keeps
-/// the prior attribution and adds its owner. A replayed disclosure
-/// adds the held line and drop totals with unchanged attribution.
+/// The one writer: a replayed settleable disclosure adds the held line and
+/// drop totals; a strict one adds no totals.
 #[test]
-fn one_writer_attributes_and_replays_held_totals() {
+fn one_writer_replays_held_totals() {
     let candidate = CandidateFile {
         physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
@@ -5312,13 +4909,10 @@ fn one_writer_attributes_and_replays_held_totals() {
         fingerprint_birth_nanos: 0,
         withheld_content_stamp: None,
     };
-    let key = local_index_key(&candidate.path);
     let mut index = ScanIndex::default();
     let mut census = ScanCensus::default();
     let mut disclose = |disclosure: &Disclosure, index: &mut ScanIndex| {
         let mut residue = BTreeSet::new();
-        let mut residue_blocked = BTreeSet::new();
-        let mut blocked = BTreeSet::new();
         let mut pending = Vec::new();
         disclose_terminal_codex_debt(
             disclosure,
@@ -5328,51 +4922,33 @@ fn one_writer_attributes_and_replays_held_totals() {
             DisclosureTargets {
                 census: &mut census,
                 residue_index_keys: &mut residue,
-                residue_blocked_session_ids: &mut residue_blocked,
-                codex_state_only_blocked_session_ids: &mut blocked,
                 pending_finalization: &mut pending,
             },
         );
     };
     let mut held = disclosure();
-    held.state_only_blocked_session_ids = vec![SESSION.into(), SESSION_B.into()];
     held.held = HeldCounts {
-        over_line_cap: 2,
-        recognized_usage_drop: 3,
-        dropped_usage_record: 4,
-        terminal_line_loss: 2,
+        loss: Some(TerminalJsonlLoss {
+            malformed_json_line_count: 2,
+            recognized_usage_drop_count: 3,
+            dropped_usage_record_count: 4,
+            ..Default::default()
+        }),
     };
     disclose(&held, &mut index);
-    assert_eq!(
-        index.codex_state_only_blocked_by_file[&key],
-        BTreeSet::from([SESSION.to_owned(), SESSION_B.to_owned()])
-    );
-    // A strict disclosure keeps the prior attribution and adds.
-    let mut owner = strict(DebtReason::JoinStateBound);
-    owner.state_only_blocked_session_ids = vec!["019fa111-2222-7333-8444-888888888888".into()];
-    disclose(&owner, &mut index);
-    assert_eq!(index.codex_state_only_blocked_by_file[&key].len(), 3);
-    // A shrinking settleable replay releases what it no longer blocks.
+    disclose(&strict(DebtReason::JoinStateBound), &mut index);
     disclose(&disclosure(), &mut index);
-    assert_eq!(
-        index.codex_state_only_blocked_by_file[&key],
-        BTreeSet::from([SESSION.to_owned()])
-    );
-    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
-    assert!(!index
-        .codex_state_only_blocked_session_ids
-        .contains(SESSION_B));
     // Only the first (settleable, replayed) disclosure added totals.
     assert_eq!(
         (
-            census.over_line_cap_count,
+            census.malformed_json_line_count,
             census.recognized_usage_drop_count,
             census.dropped_usage_record_count,
             census.terminal_over_line_cap_count,
             census.terminal_recognized_usage_drop_count,
             census.terminal_dropped_usage_record_count,
         ),
-        (2, 3, 4, 2, 2, 2)
+        (2, 3, 4, 0, 3, 4)
     );
 }
 
@@ -5466,14 +5042,14 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
         counters(&cache)
     );
     assert!(home.memo_entry(&cache).is_none());
-    let (index, admitted) = home.generation(index, &cache, 1);
+    let (_, admitted) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&admitted),
         vec![(200, 3)],
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &admitted, 1, true, &[]);
+    assert_oracle(&home, &cache, &admitted, 1, true);
 }
 
 /// T1c: kind (i) with usage (a rollout-declared created thread whose file
@@ -5498,7 +5074,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &held, 0, true, &[]);
+    assert_oracle(&home, &cache, &held, 0, true);
     let (index, quiet) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
@@ -5514,8 +5090,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
         .unwrap()
         .write_all(&extra)
         .unwrap();
-    let ((index, grown), counts) =
-        codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
+    let ((_, grown), counts) = codex_memo_lifecycle::observe(|| home.generation(index, &cache, 2));
     assert_eq!(
         (
             counts.memo_miss_exact_stamp,
@@ -5533,7 +5108,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &grown, 2, true, &[]);
+    assert_oracle(&home, &cache, &grown, 2, true);
 }
 
 /// T3: a non-monotone hold (`AwaitingLegacyTrigger`: a subagent fork with
@@ -5590,12 +5165,7 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     );
     let (index, quiet) = generation(index, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    assert_eq!(
-        census(&index, &quiet).0,
-        census(&index, &held).0,
-        "{}",
-        counters(&cache)
-    );
+    assert_eq!(census(&quiet), census(&held), "{}", counters(&cache));
     fixture.append(SESSION_B, &token_line(3));
     let ((index, grown), counts) = codex_memo_lifecycle::observe(|| generation(index, 2));
     assert_eq!(
@@ -5658,7 +5228,7 @@ fn growth_with_a_sidecar_change_counts_an_other_miss() {
         "{}",
         counters(&cache)
     );
-    assert_oracle(&home, &cache, &index, &woken, 1, true, &[]);
+    assert_oracle(&home, &cache, &woken, 1, true);
     let _ = home.generation(index, &cache, 2);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
 }
@@ -5715,7 +5285,7 @@ fn touched_replaced_or_shrunk_held_file_misses() {
         if name == "shrink" {
             assert_eq!(counts.memo_miss_exact_stamp, 0, "{name}: {counts:?}");
         }
-        assert_oracle(&home, &cache, &next, &scan, n, true, &[]);
+        assert_oracle(&home, &cache, &scan, n, true);
         index = next;
         n += 1;
     }
@@ -5845,361 +5415,17 @@ fn memo_hit_a_week_later_is_the_same_hit() {
     let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
     let (index, day) = home.generation(index, &cache, 1);
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    let blocked = index.codex_state_only_blocked_session_ids.clone();
-    let (index, week) = home.generation(index, &cache, 7 * 86_400);
+    let (_, week) = home.generation(index, &cache, 7 * 86_400);
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
     assert_eq!(replayed_census(&week), replayed_census(&day));
-    assert_eq!(index.codex_state_only_blocked_session_ids, blocked);
     assert!(created_usage(&week).is_empty());
 }
 
-const STATE_ONLY: &str = "01a05eed-49cf-7460-9fd7-f7dbfd2f05e4";
-const LEGACY_ONLY: &str = "01a01e9a-49cf-7460-9fd7-f7dbfd2f05e4";
-
-impl CreatedThreadHome {
-    /// A state row with `tokens` and no rollout: a state-only thread.
-    fn state_row(&self, id: &str, tokens: i64) {
-        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
-            .unwrap()
-            .execute(
-                "INSERT INTO threads VALUES (?1, 'Thread', ?2, 'user', 'Summarize', ?3, NULL)",
-                rusqlite::params![id, tokens, self.base_ms],
-            )
-            .unwrap();
-    }
-
-    fn set_tokens(&self, id: &str, tokens: i64) {
-        rusqlite::Connection::open(self.codex().join("state_5.sqlite"))
-            .unwrap()
-            .execute(
-                "UPDATE threads SET tokens_used = ?2 WHERE id = ?1",
-                rusqlite::params![id, tokens],
-            )
-            .unwrap();
-    }
-
-    /// The full body, its header with or without `forked_from_id`.
-    fn body_with(&self, fork: bool) -> Vec<u8> {
-        let mut header: Value = serde_json::from_slice(&self.body[0]).unwrap();
-        let payload = header["payload"].as_object_mut().unwrap();
-        if fork {
-            payload.insert("forked_from_id".into(), json!(FORK_SOURCE));
-        } else {
-            payload.remove("forked_from_id");
-        }
-        let mut bytes = codex_line(header);
-        bytes.extend(self.body[1..].concat());
-        bytes
-    }
-
-    /// Rewrite the created thread's rollout and project it in full.
-    fn rewrite(&self, fork: bool) {
-        let body = self.body_with(fork);
-        fs::write(&self.path, &body).unwrap();
-        self.project(body.len(), self.body.len());
-    }
-}
-
-/// State-only totals published by a generation: id → tokens.
-fn state_only(scan: &SourceScanResult) -> BTreeMap<String, u64> {
-    scan.snapshots
-        .iter()
-        .filter(|snapshot| {
-            snapshot.request_count == 0
-                && snapshot.input_tokens == 0
-                && snapshot.unattributed_total_tokens > 0
-        })
-        .map(|snapshot| {
-            (
-                snapshot.source_session_id.clone(),
-                snapshot.unattributed_total_tokens,
-            )
-        })
-        .collect()
-}
-
-/// Warm-covers-cold checks after generation `n`, against a cold oracle of the same files:
-/// - SB-T18: every attributed id is blocked;
-/// - warm ⊇ cold on the blocked set outside the ids a published body covers
-///   (cold's set there depends on page order around an acceptance); the
-///   excess outside `legacy ∪ unattributed` is only ids attributed to a key
-///   no longer on disk (class (e));
-/// - warm publishes no state-only total cold does not, and withholds only
-///   ids in that excess, `legacy` or `unattributed`.
-///
-/// Returns the excess and cold's state-only totals.
-fn assert_warm_covers_cold(
-    home: &CreatedThreadHome,
-    cache: &SharedCache,
-    index: &ScanIndex,
-    scan: &SourceScanResult,
-    n: i64,
-) -> (BTreeSet<String>, BTreeMap<String, u64>) {
-    let (oracle_index, oracle) = home.oracle(n);
-    for (key, ids) in &index.codex_state_only_blocked_by_file {
-        for id in ids {
-            assert!(
-                index.codex_state_only_blocked_session_ids.contains(id),
-                "generation {n}: SB-T18 {key} attributes unblocked {id}"
-            );
-        }
-    }
-    let bodies = |scan: &SourceScanResult| {
-        scan.snapshots
-            .iter()
-            .filter(|snapshot| snapshot.request_count > 0)
-            .map(|snapshot| snapshot.source_session_id.clone())
-            .collect::<BTreeSet<_>>()
-    };
-    let mut covered = bodies(scan);
-    covered.extend(bodies(&oracle));
-    for (key, entry) in &index.files {
-        if entry.last_snapshot_fingerprint.is_some() {
-            covered.extend(codex_session_id_candidates_from_path(Path::new(key)));
-        }
-    }
-    let cold = oracle_index
-        .codex_state_only_blocked_session_ids
-        .difference(&covered)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let warm = index
-        .codex_state_only_blocked_session_ids
-        .difference(&covered)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert!(
-        cold.is_subset(&warm),
-        "generation {n}: warm {warm:?} does not cover cold {cold:?}: {}",
-        counters(cache)
-    );
-    let excess = warm
-        .difference(&cold)
-        .filter(|id| {
-            !index.codex_state_only_blocked_legacy.contains(*id)
-                && !index.codex_state_only_blocked_unattributed.contains(*id)
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for id in &excess {
-        assert!(
-            index
-                .codex_state_only_blocked_by_file
-                .iter()
-                .any(|(key, ids)| ids.contains(id) && !Path::new(key).exists()),
-            "generation {n}: {id} over-blocked with no deleted holder: {:?}",
-            index.codex_state_only_blocked_by_file
-        );
-    }
-    let (warm_state, cold_state) = (state_only(scan), state_only(&oracle));
-    for (id, tokens) in &warm_state {
-        assert_eq!(
-            cold_state.get(id),
-            Some(tokens),
-            "generation {n}: warm publishes {id} beyond cold"
-        );
-    }
-    for id in cold_state.keys().filter(|id| !warm_state.contains_key(*id)) {
-        assert!(
-            excess.contains(id)
-                || index.codex_state_only_blocked_legacy.contains(id)
-                || index.codex_state_only_blocked_unattributed.contains(id),
-            "generation {n}: warm withholds {id} outside the disclosed excess: {}",
-            counters(cache)
-        );
-    }
-    (excess, cold_state)
-}
-
-/// Sweep: one home through nine generations; after each, warm covers
-/// cold (see `assert_warm_covers_cold`). Generations: a held fork appears;
-/// a memo hit; a second file blocks the same id; the first is cured and
-/// publishes while the second still claims the id; the second is deleted;
-/// the first is a held fork again; a memo hit; the held fork is deleted
-/// (warm keeps its block, cold publishes the state total: class (e),
-/// asserted); unchanged after that. Not in this sweep: the capture-boundary
-/// revert, two-page, historical-replay and strict/park generations
-/// (method-level `l_sb_*` tests in `snapshots.rs`).
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
-    let home = CreatedThreadHome::new(10, true);
-    home.set_tokens(CREATED, 50);
-    home.state_row(STATE_ONLY, 70);
-    let duplicate = home
-        .fixture
-        .root
-        .join(format!("rollout-2026-10-07T11-00-00-{CREATED}.jsonl"));
-    let cache = Arc::new(SharedCache::default());
-    let run = |index: ScanIndex, n: i64| {
-        let (index, scan) = home.generation(index, &cache, n);
-        let (excess, cold_state) = assert_warm_covers_cold(&home, &cache, &index, &scan, n);
-        (index, scan, excess, cold_state)
-    };
-    // (1) a held fork appears.
-    let (index, scan, _, cold_state) = run(ScanIndex::default(), 0);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
-    assert_eq!(
-        (
-            state_only(&scan).get(STATE_ONLY),
-            cold_state.get(STATE_ONLY)
-        ),
-        (Some(&70), Some(&70)),
-        "positive control: {}",
-        counters(&cache)
-    );
-    // (2) a memo-hit generation.
-    let (index, _, _, _) = run(index, 1);
-    assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
-    // (3) a second file blocks the same id.
-    fs::write(&duplicate, home.body_with(true)).unwrap();
-    let (index, _, _, _) = run(index, 2);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
-    // (4) the first file is cured and publishes; the second still claims it.
-    home.rewrite(false);
-    let (index, _, _, _) = run(index, 3);
-    // (5) the second blocker is deleted.
-    fs::remove_file(&duplicate).unwrap();
-    let (index, _, _, _) = run(index, 4);
-    // (6) the first file is a held fork again.
-    home.rewrite(true);
-    let (index, _, _, _) = run(index, 5);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
-    // (7) a memo-hit generation.
-    let hits = counter(&cache, |c| c.memo_hits);
-    let (index, _, _, _) = run(index, 6);
-    assert_eq!(
-        counter(&cache, |c| c.memo_hits),
-        hits + 1,
-        "{}",
-        counters(&cache)
-    );
-    // (8) the held fork is deleted: no retirement, so warm keeps its block
-    // (class (e)) while cold publishes the state total.
-    fs::remove_file(&home.path).unwrap();
-    let (index, scan, _, cold_state) = run(index, 7);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
-    assert!(!state_only(&scan).contains_key(CREATED));
-    assert_eq!(cold_state.get(CREATED), Some(&50), "{}", counters(&cache));
-    // (9) unchanged: still blocked, still never published.
-    let (index, scan, _, _) = run(index, 8);
-    assert!(index.codex_state_only_blocked_session_ids.contains(CREATED));
-    assert!(!state_only(&scan).contains_key(CREATED));
-}
-
-/// Legacy start: the sweep's home from a pre-upgrade index (no
-/// attribution, plus a legacy-only claim on a thread whose claimant is never
-/// re-parsed). Legacy ids are never released by attribution; `legacy` never
-/// grows; warm never publishes a state-only total cold does not (cold
-/// publishes the legacy-only thread, warm withholds it). Class (h) is not
-/// asserted as an equality.
-#[test]
-fn legacy_blocks_survive_attribution_from_a_pre_upgrade_index() {
-    let home = CreatedThreadHome::new(10, true);
-    home.set_tokens(CREATED, 50);
-    home.state_row(STATE_ONLY, 70);
-    home.state_row(LEGACY_ONLY, 30);
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, _) = home.generation(ScanIndex::default(), &cache, 0);
-    index.codex_state_only_blocked_by_file.clear();
-    index.codex_state_only_blocked_unattributed.clear();
-    index.codex_state_only_blocked_legacy.clear();
-    index.codex_state_only_blocked_attributed = false;
-    index
-        .codex_state_only_blocked_session_ids
-        .insert(LEGACY_ONLY.to_owned());
-    let mut legacy = usize::MAX;
-    for n in 1..=6 {
-        match n {
-            3 => home.rewrite(false),
-            5 => home.rewrite(true),
-            _ => {}
-        }
-        let (next, scan) = home.generation(index, &cache, n);
-        let (_, cold_state) = assert_warm_covers_cold(&home, &cache, &next, &scan, n);
-        assert!(next.codex_state_only_blocked_attributed);
-        assert!(
-            next.codex_state_only_blocked_legacy.contains(LEGACY_ONLY)
-                && next
-                    .codex_state_only_blocked_session_ids
-                    .contains(LEGACY_ONLY),
-            "generation {n}: {}",
-            counters(&cache)
-        );
-        assert!(!state_only(&scan).contains_key(LEGACY_ONLY));
-        assert_eq!(cold_state.get(LEGACY_ONLY), Some(&30), "generation {n}");
-        assert!(
-            next.codex_state_only_blocked_legacy.len() <= legacy,
-            "generation {n}: legacy grew"
-        );
-        legacy = next.codex_state_only_blocked_legacy.len();
-        index = next;
-    }
-}
-
-// #641 join resource (H1-H9): J-T4c, J-T6..J-T11 and credit settlement.
-
-const JOIN_OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-const JOIN_OTHER: &str = "ffffffff-1111-4111-8111-ffffffffffff";
-
-fn join_member(path: PathBuf) -> CandidateFile {
-    CandidateFile {
-        physical_identity: None,
-        scan_root: PathBuf::from("/synthetic/sessions"),
-        path,
-        size_bytes: 0,
-        modified_unix_seconds: 0,
-        modified_unix_nanos: 0,
-        source_file_fingerprint: String::new(),
-        legacy_source_file_fingerprint: String::new(),
-        legacy_config_reconciliation_required: false,
-        opened_object_identity: String::new(),
-        fingerprint_changed_nanos: 0,
-        fingerprint_birth_nanos: 0,
-        withheld_content_stamp: None,
-    }
-}
-
-fn join_members(names: &[&str]) -> Vec<CandidateFile> {
-    names
-        .iter()
-        .map(|name| join_member(PathBuf::from(format!("/synthetic/sessions/{name}"))))
-        .collect()
-}
-
-/// The members' exact `local_index_key`s joined by '\0'.
-fn joined(members: &[CandidateFile]) -> String {
-    members
-        .iter()
-        .map(|member| local_index_key(&member.path))
-        .collect::<Vec<_>>()
-        .join("\0")
-}
-
-fn join_entry(cache: &SharedCache, owner: &str) -> Option<String> {
-    cache
-        .with_cursor(|cursor| cursor.join_owners.get(owner).map(|(_, keys)| keys.clone()))
-        .flatten()
-}
-
-/// The exact accounted size of one new entry (J-T10).
-fn join_charge(owner: &str, members: &[CandidateFile]) -> usize {
-    crate::heap_layout_bound::tree_node_bytes::<String, JoinProvenance>().unwrap()
-        + owner.len()
-        + joined(members).len()
-}
-
-/// The retained cache's own bound: admission keeps it beside the state.
-fn retained_floor(cache: &SharedCache) -> usize {
-    crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
-}
+// #641 cursor resource: claims, admission and credit settlement.
 
 /// Boundary requests must use the least cursor state admission can reach.
 /// Real scan pages also warm optional header facts; those can yield before
-/// provenance or retained copies, and are not a mandatory floor.
+/// provenance, and are not a mandatory floor.
 /// Keep `cursor_resident` whole so no-eviction assertions still include them.
 fn cursor_without_header_facts(cache: &SharedCache) -> usize {
     let headers = cache
@@ -6208,29 +5434,21 @@ fn cursor_without_header_facts(cache: &SharedCache) -> usize {
     cache.cursor_resident().checked_sub(headers).unwrap()
 }
 
-/// Every release `release_join_owners` reports, with its member keys.
-fn released(
-    cache: &SharedCache,
-    census: &BTreeSet<String>,
-    keep: impl Fn(&str) -> bool,
-) -> Vec<(String, Vec<String>)> {
-    let mut released = Vec::new();
-    cache.release_join_owners(census, keep, |owner, members| {
-        released.push((owner.to_owned(), members.map(str::to_owned).collect()));
-    });
-    released
-}
-
-/// [regress] Residue ownership survives a page checkpoint: both absence paths
-/// keep its entries and block inclusive publication; departed join provenance
-/// is retained for that owner while unrelated work completes normally.
+/// [money] R3: the residue no longer vetoes retirement. A vanished file
+/// whose filename owner sits in the residue (a plain ownership refusal,
+/// checkpointed and reloaded) retires exactly like an unrelated vanished
+/// entry, on both absence paths, and nothing is re-emitted for either owner.
+/// The owner's accepted body and witness stay as accepted, and the next
+/// ordinary page equals a cold Full of the same disk, whose file-backed
+/// sibling rollout is the positive control.
 #[test]
-fn plain_codex_residue_keeps_owner_custody_across_reload() {
+fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
     use crate::snapshots::disappearance_diagnostics::tests::finish;
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money, Accepted};
 
     let fixture = ScanRoot::with_sessions(&[]);
     write_account_rollout(&fixture, SESSION, "a", 1);
+    write_account_rollout(&fixture, SESSION_B, "b", 1);
     let (prior_index, prior_scan) = page(&fixture, ScanIndex::default(), None);
     let mut prior = scan_money(SnapshotSource::Codex, &prior_index, &prior_scan);
     prior.accepted = prior_scan
@@ -6247,11 +5465,20 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         })
         .collect();
     assert!(prior.accepted.contains_key(SESSION));
+    assert!(prior.accepted.contains_key(SESSION_B));
     fs::remove_file(fixture.file(SESSION)).unwrap();
+    // Independent cold Full of the disk after the removal: only the sibling
+    // rollout remains, and it emits.
+    let (cold_index, cold_scan) = page(&fixture, ScanIndex::default(), None);
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+    assert!(
+        cold.snapshots.contains_key(SESSION_B),
+        "positive file-backed control"
+    );
+    assert!(!cold.snapshots.contains_key(SESSION));
     let held_key = local_index_key(&fixture.file(SESSION));
     let retired_key = local_index_key(&fixture.root.join("rollout-retired-plain.jsonl"));
     let last = fixture.root.join("last-page.jsonl");
-    fs::write(&last, b"").unwrap();
     let new_scan = |index| {
         OwnedSourceScan::new(
             SnapshotSource::Codex,
@@ -6277,34 +5504,13 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         ..Default::default()
     };
 
-    // Independent cold control: the observed held entry cannot be retired, and
-    // only the healthy state thread exists. No residue guard is needed here.
-    let mut cold = new_scan(seed.clone());
-    cold.codex_join_prepared = true;
-    cold.index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .observed_index_keys
-        .insert(held_key.clone());
-    cold.codex_title_metadata
-        .state_threads
-        .insert(SESSION_B.into(), healthy_thread.clone());
-    let (cold_index, cold_scan) = finish(cold);
-    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
-
     for removal_hint in [false, true] {
+        fs::write(&last, b"").unwrap();
         let mut first = new_scan(seed.clone());
         first.codex_join_prepared = true;
-        // A plain ownership refusal, after its transient read failure clears.
-        // No per-file block or accepted file body may mask the restored block.
         first.census.ownership_incomplete_file_count = 1;
         first.census.causes.add(ownership::GROUP, 1);
         first.residue_index_keys.insert(held_key.clone());
-        first.residue_blocked_session_ids.insert(SESSION.into());
-        first
-            .codex_state_only_blocked_session_ids
-            .insert(SESSION.into());
         first
             .index
             .traversal
@@ -6319,14 +5525,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
             });
         let (mut index, page_one) = finish(first);
         assert!(!page_one.census_complete);
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .residue
-            .blocked_session_ids
-            .contains(SESSION));
-        assert!(index.codex_state_only_blocked_session_ids.is_empty());
         let checkpoint = fixture
             ._dir
             .0
@@ -6337,13 +5535,6 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
         final_page.codex_join_prepared = true;
         final_page.codex_join_inventory = None;
         final_page.identified_candidates.clear();
-        assert!(final_page
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .is_empty());
         for id in [SESSION, SESSION_B] {
             final_page
                 .codex_title_metadata
@@ -6357,202 +5548,50 @@ fn plain_codex_residue_keeps_owner_custody_across_reload() {
                 .extend([held_key.clone(), retired_key.clone()]);
         }
         let (index, result) = finish(final_page);
-        assert!(result.census_complete);
-        assert!(
-            index.files.contains_key(&held_key),
-            "filename owner is retained"
-        );
+        assert!(result.census_complete, "removal_hint {removal_hint}");
         assert!(
             !index.files.contains_key(&retired_key),
             "unrelated entry retires"
         );
-        let mut route = scan_money(SnapshotSource::Codex, &index, &result);
+        assert!(
+            !index.files.contains_key(&held_key),
+            "removal_hint {removal_hint}: the residue owner's file retires too"
+        );
+        for snapshot in &result.snapshots {
+            assert!(
+                ![SESSION, SESSION_B].contains(&snapshot.source_session_id.as_str()),
+                "removal_hint {removal_hint}: re-emitted {snapshot:?}"
+            );
+            assert_ne!(
+                snapshot.provenance.collector.as_str(),
+                "codex_state_sqlite",
+                "removal_hint {removal_hint}"
+            );
+        }
+        // The next ordinary page over the cold control's disk (the page-one
+        // file removed): the retired owner stays held at its accepted body and
+        // every emitted sibling equals cold.
+        fs::remove_file(&last).unwrap();
+        let (route_index, route_scan) = page(&fixture, index, None);
+        let mut route = scan_money(SnapshotSource::Codex, &route_index, &route_scan);
         route.accepted = prior.accepted.clone();
         money_oracle::assert_held(SESSION, &prior, &route, &cold);
         money_oracle::assert_equivalent(&cold, &route);
     }
-
-    // Join release needs a clean completed inventory. Seed only optional RAM
-    // provenance here so this also exercises release on unsupported layouts.
-    let cache = Arc::new(SharedCache::default());
-    let mut departing = new_scan(ScanIndex::default())
-        .with_sampled_acquisition(Arc::clone(&cache), Scope("plain-residue-custody".into()));
-    departing.codex_join_prepared = true;
-    departing.codex_join_inventory = Some(codex_file_join::HeaderInventory::new(
-        &[],
-        &BTreeSet::new(),
-        Some(&codex_file_join::DirectoryCensus::new()),
-    ));
-    assert!(departing.codex_join_inventory.as_ref().unwrap().complete);
-    departing
-        .index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .residue
-        .blocked_session_ids
-        .insert(SESSION.into());
-    for (id, key) in [(SESSION, &held_key), (SESSION_B, &retired_key)] {
-        cache
-            .with_cursor(|cursor| {
-                let used = cursor.tick();
-                cursor.join_owners.insert(id.into(), (used, key.clone()));
-            })
-            .unwrap();
-        departing
-            .index
-            .codex_state_only_blocked_by_file
-            .insert(key.clone(), BTreeSet::from([id.into()]));
-        departing
-            .index
-            .codex_state_only_blocked_session_ids
-            .insert(id.into());
-    }
-    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
-    assert_eq!(join_entry(&cache, SESSION_B), Some(retired_key.clone()));
-    let (index, result) = finish(departing);
-    assert!(result.census_complete);
-    assert_eq!(join_entry(&cache, SESSION), Some(held_key.clone()));
-    assert_eq!(join_entry(&cache, SESSION_B), None);
-    assert_eq!(
-        index.codex_state_only_blocked_by_file.get(&held_key),
-        Some(&BTreeSet::from([SESSION.into()]))
-    );
-    assert!(index.codex_state_only_blocked_session_ids.contains(SESSION));
-    assert!(!index
-        .codex_state_only_blocked_by_file
-        .contains_key(&retired_key));
-    assert!(!index
-        .codex_state_only_blocked_session_ids
-        .contains(SESSION_B));
-}
-
-/// J-T4 (c): `keep` holds a queued or paused owner; without it the owner is
-/// released exactly once with its exact member keys, and only when every
-/// member left the census. Another owner's provenance survives.
-#[test]
-fn join_release_reports_exact_members_once_unless_kept() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let empty = cache.cursor_resident();
-    let members = join_members(&["a.jsonl", "b.jsonl"]);
-    let others = join_members(&["c.jsonl"]);
-    cache.record_join_owner(JOIN_OWNER, &members);
-    cache.record_join_owner(JOIN_OTHER, &others);
-    let keys = members
-        .iter()
-        .map(|member| local_index_key(&member.path))
-        .collect::<Vec<_>>();
-    let census = BTreeSet::from([local_index_key(&others[0].path)]);
-    assert!(released(&cache, &census, |owner| owner == JOIN_OWNER).is_empty());
-    assert!(join_entry(&cache, JOIN_OWNER).is_some());
-    // One member still in the census keeps it.
-    let partial = BTreeSet::from([keys[0].clone(), local_index_key(&others[0].path)]);
-    assert!(released(&cache, &partial, |_| false).is_empty());
-    assert_eq!(
-        released(&cache, &census, |_| false),
-        vec![(JOIN_OWNER.to_owned(), keys)]
-    );
-    assert!(released(&cache, &census, |_| false).is_empty());
-    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-    assert_eq!(join_entry(&cache, JOIN_OTHER), Some(joined(&others)));
-    assert_eq!(
-        cache.cursor_resident(),
-        empty + join_charge(JOIN_OTHER, &others)
-    );
-}
-
-/// J-T11: a non-UTF-8 member key is built, measured and matched exactly as
-/// `local_index_key`; empty, NUL-bearing and empty-list provenance is
-/// refused before anything is reserved, and forgets an older entry.
-#[test]
-fn join_keys_match_local_index_key_and_malformed_ones_are_refused() {
-    use std::os::unix::ffi::OsStrExt;
-    let lossy = [
-        &b"/synthetic/sessions/rollout-\xff.jsonl"[..],
-        &b"/synthetic/sessions/rollout-\xff\xfe-\xe2\x82-x.jsonl"[..],
-        &b"/synthetic/sessions/plain.jsonl"[..],
-    ]
-    .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
-    for path in &lossy {
-        let key = local_index_key(path);
-        let mut built = String::new();
-        push_join_key(&mut built, path);
-        assert_eq!(built, key);
-        assert_eq!(join_key_len(path), Some(key.len()));
-        assert!(join_key_eq(&key, path));
-        assert!(!join_key_eq(&key[..key.len() - 1], path));
-        assert!(!join_key_eq(&format!("{key}x"), path));
-    }
-    let members = lossy.iter().cloned().map(join_member).collect::<Vec<_>>();
-    assert!(same_join_members(&joined(&members), &members));
-    assert!(!same_join_members(&joined(&members[..2]), &members));
-    assert_eq!(join_keys_len(&members), Some(joined(&members).len()));
-    let nul = PathBuf::from(std::ffi::OsStr::from_bytes(
-        b"/synthetic/sessions/a\0b.jsonl",
-    ));
-    assert_eq!(join_key_len(&nul), None);
-    assert_eq!(join_key_len(Path::new("")), None);
-    assert_eq!(join_keys_len(&[]), None);
-    for stored in ["", "a\0", "\0a", "a\0\0b"] {
-        assert!(!join_members_well_formed(stored), "{stored:?}");
-    }
-    assert!(join_members_well_formed("a\0b"));
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let empty = cache.cursor_resident();
-    cache.record_join_owner(JOIN_OWNER, &members);
-    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
-    assert_eq!(
-        cache.cursor_resident() - empty,
-        join_charge(JOIN_OWNER, &members)
-    );
-    let malformed: [Vec<CandidateFile>; 3] = [
-        vec![join_member(nul.clone())],
-        vec![members[0].clone(), join_member(PathBuf::new())],
-        Vec::new(),
-    ];
-    for members in &malformed {
-        cache.record_join_owner(JOIN_OWNER, &members[..]);
-        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-        assert_eq!(cache.cursor_resident(), empty);
-    }
-    cache.record_join_owner("", &members);
-    assert_eq!(join_entry(&cache, ""), None);
-    assert_eq!(cache.cursor_resident(), empty);
-    assert_eq!(cache.cursor_reserved(), 0);
-    // Malformed or partial stored provenance is never released.
-    cache.with_cursor(|cursor| {
-        for (owner, stored) in [(JOIN_OWNER, ""), (JOIN_OTHER, "a\0")] {
-            let used = cursor.tick();
-            cursor
-                .join_owners
-                .insert(owner.to_owned(), (used, stored.to_owned()));
-        }
-    });
-    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
-    assert!(join_entry(&cache, JOIN_OWNER).is_some());
-    assert!(join_entry(&cache, JOIN_OTHER).is_some());
 }
 
 /// J-T7: claim vs claim. An outstanding claim is charged like resident
-/// state, so a second claim and optional provenance cannot spend its room;
-/// settling and refunding each return it exactly once.
+/// state, so a second claim cannot spend its room; settling and refunding
+/// each return it exactly once.
 #[test]
-fn outstanding_claim_blocks_a_second_claim_and_provenance() {
+fn outstanding_claim_blocks_a_second_claim() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
     let state = cache.cursor_resident();
     let claim = 4096;
-    let members = join_members(&["a.jsonl", "b.jsonl"]);
-    with_test_state_budget(state + claim + floor, || {
+    with_test_state_budget(state + claim, || {
         let credit = cache.cursor_reserve(claim).expect("the claim fits");
         assert_eq!(credit.bytes(), claim);
         assert_eq!(cache.cursor_reserved(), claim);
@@ -6560,8 +5599,6 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
         let second = cache.cursor_reserve(claim);
         assert!(second.is_none(), "the claimed room is spent once");
         assert_eq!(cache.cursor_reserved(), claim);
-        cache.record_join_owner(JOIN_OTHER, &members);
-        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
         cache.with_cursor(|cursor| credit.settle(cursor)).unwrap();
         assert_eq!(cache.cursor_reserved(), 0);
         let credit = cache
@@ -6574,144 +5611,39 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
 }
 
 /// An admission that cannot fit even after every eviction it may make
-/// evicts nothing. A hopeless paused reserve (`JoinStateBound`) keeps both
-/// provenance entries and the retained copy; optional provenance inside the
-/// empty-retained floor window is refused and keeps the copy too.
+/// evicts nothing: a hopeless paused reserve (`JoinStateBound`) keeps the
+/// resident state and strands no reservation.
 #[test]
 fn hopeless_admission_evicts_nothing() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    const JOIN_THIRD: &str = "33333333-cccc-4ccc-8ccc-333333333333";
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
         let cache = Arc::new(SharedCache::default());
-        let key = certified_beside_a_retained_copy(&cache);
-        let copy = cache
-            .take(&key)
-            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
-            .retained;
-        // Measured with no retained copy and no provenance: the least an
-        // admission could ever evict down to.
-        let floor = retained_floor(&cache);
+        certified_cursor_job(&cache);
+        // Measured without header facts: the least an admission can reach.
         let empty = cursor_without_header_facts(&cache);
-        cache.insert(
-            key.clone(),
-            sampled_jsonl::CompletedNativeAcquisition {
-                checkpoint: copy.checkpoint,
-                reduction: Some(copy.state),
-                released: None,
-                unsealed: false,
-            },
-            0,
-        );
-        let members = join_members(&["a.jsonl", "b.jsonl"]);
-        cache.record_join_owner(JOIN_OWNER, &members);
-        cache.record_join_owner(JOIN_OTHER, &members);
-        let intact = || {
-            assert!(
-                cache.retained_checkpoint(&key).is_some(),
-                "the copy is kept"
-            );
-            for owner in [JOIN_OWNER, JOIN_OTHER] {
-                assert_eq!(join_entry(&cache, owner), Some(joined(&members)), "{owner}");
-            }
-            assert_eq!(cache.cursor_reserved(), 0);
-        };
-        intact();
         let resident = cache.cursor_resident();
-        // Fits the state with no provenance, never beside an empty retained
-        // cache (before the fix: both entries and the copy were evicted).
-        // Then a charge the state alone cannot hold.
-        for hopeless in [state_bytes() - empty - floor + 1, state_bytes()] {
+        // One byte past the state without header facts, then a charge the
+        // state alone cannot hold.
+        for hopeless in [state_bytes() - empty + 1, state_bytes()] {
             assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
-            intact();
+            assert_eq!(cache.cursor_reserved(), 0);
             assert_eq!(cache.cursor_resident(), resident);
         }
-        // Optional twin: room for the claim, not for the claim and the floor.
-        let claim = join_charge(JOIN_THIRD, &members);
-        with_test_state_budget(
-            cursor_without_header_facts(&cache) + claim + floor - 1,
-            || {
-                cache.record_join_owner(JOIN_THIRD, &members);
-            },
-        );
-        assert_eq!(join_entry(&cache, JOIN_THIRD), None);
-        intact();
-        assert_eq!(cache.cursor_resident(), resident);
-        // Control: a reserve that fits once provenance is forgotten still
-        // goes on (baseline progress), now that it is feasible.
+        // Control: a reserve that fits once header facts yield still goes
+        // on (baseline progress), now that it is feasible.
         let credit = cache
-            .cursor_reserve(state_bytes() - empty - floor)
-            .expect("feasible after forgetting provenance and copies");
-        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
-        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+            .cursor_reserve(state_bytes() - empty)
+            .expect("feasible after reclaiming header facts");
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
 }
 
-/// J-T8: claim vs retained insert. The insert measures outstanding claims
-/// under the retained lock, so a copy that fits only if the claim is
-/// ignored is not kept.
-#[test]
-fn outstanding_claim_is_charged_against_a_retained_insert() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let cache = Arc::new(SharedCache::default());
-        let key = certified_beside_a_retained_copy(&cache);
-        let copy = cache
-            .take(&key)
-            .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
-            .retained;
-        let completed = |copy: crate::transcript_cache::Retained<_>| {
-            sampled_jsonl::CompletedNativeAcquisition {
-                checkpoint: copy.checkpoint,
-                reduction: Some(copy.state),
-                released: None,
-                unsealed: false,
-            }
-        };
-        // Control: without a claim the copy fits.
-        cache.insert(key.clone(), completed(copy), 0);
-        assert!(cache.retained_checkpoint(&key).is_some());
-        // The retained cache's own bound is the admission floor.
-        let with_copy = retained_floor(&cache);
-        let state = cursor_without_header_facts(&cache);
-        assert!(with_copy + state <= state_bytes());
-        let copy = cache.take(&key).expect("retained").retained;
-        // Exact boundary: a claim leaves exactly the copy's room.
-        let exact = state_bytes() - state - with_copy;
-        let credit = cache.cursor_reserve(exact).expect("the claim fits alone");
-        cache.insert(key.clone(), completed(copy), 0);
-        assert!(
-            cache.retained_checkpoint(&key).is_some(),
-            "kept at the boundary"
-        );
-        assert_eq!(
-            retained_floor(&cache) + cache.cursor_resident(),
-            state_bytes()
-        );
-        credit.refund();
-        let copy = cache.take(&key).expect("retained").retained;
-        // A claim that leaves one byte too few for it.
-        let claim = exact + 1;
-        let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
-        cache.insert(key.clone(), completed(copy), 0);
-        assert!(cache.retained_checkpoint(&key).is_none(), "refused");
-        assert!(retained_floor(&cache) + cache.cursor_resident() <= state_bytes());
-        credit.refund();
-        assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// J-T9: one lock order (retained, then cursor) and no recursive cursor
-/// locking, checked in debug builds before any lock is taken.
+/// J-T9: no recursive cursor locking, checked in debug builds before any lock is taken.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "cursor lock taken while this thread holds it")]
@@ -6720,16 +5652,8 @@ fn nested_cursor_lock_is_refused() {
     cache.with_cursor(|_| cache.with_cursor(|_| ()));
 }
 
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "retained lock taken under the cursor lock")]
-fn retained_lock_under_the_cursor_lock_is_refused() {
-    let cache = SharedCache::default();
-    cache.with_cursor(|_| drop(cache.retained()));
-}
-
-/// J-T9 control and settlement: `cursor_reserve` takes retained, then
-/// cursor; a credit unwound outside the lock refunds itself; one unwound
+/// J-T9 control and settlement: `cursor_reserve` takes the cursor lock
+/// alone; a credit unwound outside the lock refunds itself; one unwound
 /// inside a cursor closure does not relock; the held flag resets on every
 /// unwind; a poisoned cursor admits nothing and strands nothing.
 #[test]
@@ -6770,8 +5694,6 @@ fn credits_settle_once_on_every_path() {
     assert_eq!(cache.cursor_resident(), state_bytes());
     assert!(cache.cursor_reserve(1).is_none());
     stranded.refund();
-    cache.record_join_owner(JOIN_OWNER, &join_members(&["a.jsonl"]));
-    assert!(released(&cache, &BTreeSet::new(), |_| false).is_empty());
 }
 
 /// Corrupt credit accounting (a claim that is not outstanding, or one
@@ -6796,286 +5718,6 @@ fn corrupt_credit_accounting_fails_closed() {
     }
 }
 
-struct ProvenanceAdmission {
-    _fixture: ScanRoot,
-    cache: Arc<SharedCache>,
-    floor: usize,
-    empty: usize,
-}
-
-fn provenance_admission() -> ProvenanceAdmission {
-    let fixture = ScanRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    let key = certified_beside_a_retained_copy(&cache);
-    let copy = cache
-        .take(&key)
-        .unwrap_or_else(|| panic!("a retained copy: {}", counters(&cache)))
-        .retained;
-    let floor = retained_floor(&cache);
-    let empty = cursor_without_header_facts(&cache);
-    cache.insert(
-        key.clone(),
-        sampled_jsonl::CompletedNativeAcquisition {
-            checkpoint: copy.checkpoint,
-            reduction: Some(copy.state),
-            released: None,
-            unsealed: false,
-        },
-        0,
-    );
-    let members = join_members(&["a.jsonl", "b.jsonl"]);
-    cache.record_join_owner(JOIN_OWNER, &members);
-    cache.record_join_owner(JOIN_OTHER, &members);
-    ProvenanceAdmission {
-        _fixture: fixture,
-        cache,
-        floor,
-        empty,
-    }
-}
-
-/// [behaviour] A feasible mandatory reserve forgets optional provenance
-/// and succeeds without stranding its reservation.
-#[test]
-fn feasible_reserve_forgets_provenance() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let setup = provenance_admission();
-        let cache = &setup.cache;
-        let credit = cache
-            .cursor_reserve(state_bytes() - setup.empty - setup.floor)
-            .unwrap_or_else(|| panic!("feasible: {}", counters(cache)));
-        assert_eq!(join_entry(cache, JOIN_OWNER), None);
-        assert_eq!(join_entry(cache, JOIN_OTHER), None);
-        credit.refund();
-        assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// R2 optional-header composition uses the existing main copy measure and
-/// production allocation callback, including the shape-F measure's view.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() {
-    let (root, fixture) = codex_file_join::tests::fixture();
-    let paths = fixture
-        .headers
-        .iter()
-        .map(|header| local_index_key(&header.candidate.path))
-        .collect();
-    let cache = Arc::new(SharedCache::default());
-    let credit = cache
-        .cursor_reserve(
-            state_bytes() - retained_floor(&cache) - cache.cursor_resident() - 128 * 1024,
-        )
-        .unwrap();
-    let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-    assert!(first.complete);
-    assert_eq!(first.reuse_misses, 2);
-    let bytes = cache
-        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-        .unwrap();
-    assert!(bytes > 0);
-    cache.retire_headers_over_room(bytes);
-    assert_eq!(
-        cache
-            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-            .unwrap(),
-        bytes
-    );
-    cache.retire_headers_over_room(bytes - 1);
-    assert!(cache
-        .with_cursor(|cursor| cursor.headers.is_empty())
-        .unwrap());
-    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-    assert_eq!((refreshed.reuse_misses, refreshed.reuse_evictions), (2, 2));
-    let context = zero_context(&cache, "ns-main");
-    let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
-    assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
-    let headers = cache
-        .with_cursor(|cursor| std::mem::take(&mut cursor.headers))
-        .unwrap();
-    let (cold_budget, cold_step) = super::super::copy_budget_step(Some(&context), None, true);
-    cache
-        .with_cursor(|cursor| cursor.headers = headers)
-        .unwrap();
-    assert_eq!((budget, step), (cold_budget, cold_step));
-    assert_eq!(
-        cache
-            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-            .unwrap(),
-        bytes,
-        "measurement alone cannot evict"
-    );
-    super::super::retire_headers_beside_copy(Some(&context), budget, step);
-    assert!(cache
-        .with_cursor(|cursor| cursor.headers.is_empty())
-        .unwrap());
-    assert!(super::super::copy_retire_probe().unwrap().fits());
-    let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-    assert_eq!(
-        (next.reuse_hits, next.reuse_misses, next.reuse_evictions),
-        (0, 2, 2)
-    );
-    credit.refund();
-    assert_eq!(cache.cursor_reserved(), 0);
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
-    for path in 0..3 {
-        let (root, fixture) = codex_file_join::tests::fixture();
-        let paths = fixture
-            .headers
-            .iter()
-            .map(|header| local_index_key(&header.candidate.path))
-            .collect();
-        let cache = SharedCache::default();
-        let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-        assert!(first.complete);
-        let before = cache
-            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-            .unwrap();
-        assert!(before > 0);
-        let release = |pinned| match path {
-            0 => cache.release_to_fit(pinned),
-            1 => cache.release_older_to_fit(pinned, (1, 0)),
-            _ => cache.release_older_prefix_to_fit(pinned, (1, 0), 0),
-        };
-        assert!(!release(state_bytes()), "hopeless claims evict nothing");
-        assert_eq!(
-            cache
-                .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-                .unwrap(),
-            before
-        );
-        let pinned = state_bytes() - cache.cursor_resident() + before - retained_floor(&cache);
-        assert!(release(pinned));
-        assert!(cache
-            .with_cursor(|cursor| cursor.headers.is_empty())
-            .unwrap());
-        let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
-        assert_eq!((next.reuse_hits, next.reuse_evictions), (0, 2));
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
-/// A sampled context in `namespace` whose every counter is zero.
-pub(in crate::snapshots) fn zero_context(
-    cache: &Arc<SharedCache>,
-    namespace: &str,
-) -> super::super::Context {
-    super::super::Context {
-        cache: Arc::clone(cache),
-        namespace: Scope(namespace.to_owned()),
-        audit_metadata_supported: true,
-        audit_slots: 0,
-        full_files: 0,
-        tail_files: 0,
-        unchanged_files: 0,
-        native_bytes: 0,
-        full_native_bytes: 0,
-        sample_bytes: 0,
-        full_reasons: [0; 11],
-        priority_replays: 0,
-        audits_started: 0,
-        audits_completed: 0,
-        audit_quiet_retired: 0,
-        audit_cap_full: 0,
-        audit_cap_delay: 0,
-        pace_evicted: 0,
-        start_overdue_seconds: 0,
-        completion_overdue_seconds: 0,
-        admission: Default::default(),
-    }
-}
-
-/// Optional header bytes with a precise measured charge. Uses the real
-/// header decoder; only the cache key's allocation supplies synthetic pressure.
-fn header_pressure(cache: &SharedCache, bytes: usize) -> usize {
-    let (root, fixture) = codex_file_join::tests::fixture();
-    let paths = fixture
-        .headers
-        .iter()
-        .map(|h| local_index_key(&h.candidate.path))
-        .collect();
-    assert!(codex_file_join::header_cache_tests::page(&root, &paths, cache).complete);
-    let facts = cache
-        .with_cursor(|cursor| cursor.headers.get(paths.first().unwrap()))
-        .flatten()
-        .unwrap();
-    let charge = cache
-        .with_cursor(|cursor| {
-            cursor.headers.clear();
-            cursor.headers.refresh("h".repeat(bytes), Some(facts));
-            cursor.headers.optional_bytes().unwrap()
-        })
-        .unwrap();
-    fs::remove_dir_all(root).unwrap();
-    charge
-}
-
-/// [behaviour] Both copy shares fit only after optional headers yield;
-/// zero-budget and unavailable measurements reclaim nothing.
-#[test]
-fn headers_are_reclaimed_only_where_both_copy_shares_are_allocated() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let context = zero_context(&cache, "ns-main");
-    let budget = || super::super::copy_budget_step(Some(&context), None, false);
-    let (without, measured) = budget();
-    let room = measured.room().expect("a measured room");
-    assert_eq!(without, room / 2);
-    let charge = header_pressure(&cache, room - without - 4096);
-    assert!(charge > room - without - without.min(ENTRY_BYTES) && charge < room - without);
-    let (with, step) = budget();
-    assert_eq!(with, without, "the budget is unchanged");
-    assert_eq!(step.room(), Some(room));
-    assert_eq!(
-        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
-        Some(charge)
-    );
-    super::super::retire_headers_beside_copy(Some(&context), 0, step);
-    assert_eq!(
-        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
-        Some(charge)
-    );
-    let busy = {
-        let _held = cache.retained().unwrap();
-        budget()
-    };
-    assert_eq!((busy.0, busy.1.room()), (0, None));
-    super::super::retire_headers_beside_copy(Some(&context), busy.0, busy.1);
-    assert_eq!(
-        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
-        Some(charge)
-    );
-    super::super::copy_retire_probe();
-    super::super::retire_headers_beside_copy(Some(&context), with, step);
-    assert!(cache.with_cursor(|c| c.headers.is_empty()).unwrap());
-    let probe = super::super::copy_retire_probe().expect("probed");
-    assert_eq!(
-        (probe.headers, probe.used, probe.budget),
-        (Some(0), 0, with)
-    );
-    assert!(probe.fits(), "{probe:?}");
-    assert_eq!(budget().1.resident, measured.resident);
-}
-
 /// [behaviour] A completing cursor job stages its head without a RAM copy.
 #[test]
 fn a_completing_cursor_job_on_its_route_stages_its_head_without_a_copy() {
@@ -7088,7 +5730,6 @@ fn a_completing_cursor_job_on_its_route_stages_its_head_without_a_copy() {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let cache = Arc::new(SharedCache::default());
-        super::super::copy_retire_probe();
         let mut index = ScanIndex::default();
         let mut certified = false;
         for _ in 0..64 {
@@ -7109,14 +5750,6 @@ fn a_completing_cursor_job_on_its_route_stages_its_head_without_a_copy() {
         assert!(
             head(&index, &key).is_some(),
             "the certified prefix is staged"
-        );
-        assert!(
-            cache.take(&key).is_none(),
-            "a codec source keeps no RAM copy"
-        );
-        assert!(
-            super::super::copy_retire_probe().is_none(),
-            "no copy budget is reserved for a copy that is never kept"
         );
     });
 }
@@ -7149,10 +5782,6 @@ fn a_small_append_to_a_routed_large_file_is_budgeted_as_the_append() {
         .expect("precondition: the Full's head")
         .sealed_offset;
     assert_eq!(committed, fixture.len(SESSION));
-    assert!(
-        cache.take(&key).is_none(),
-        "precondition: no RAM copy to size from"
-    );
     fixture.append(SESSION, &token_line(41));
     let append = fixture.len(SESSION) - committed;
     // The file is now over the singleton budget; its append is not.
@@ -7176,247 +5805,6 @@ fn a_small_append_to_a_routed_large_file_is_budgeted_as_the_append() {
         let tailed = head(&next, &key).expect("the Tail's head");
         assert_eq!(tailed.sealed_offset, fixture.len(SESSION));
     });
-}
-
-/// [behaviour] The copy share is capped at ENTRY_BYTES. Headers that fit
-/// beside that share and finish/output remain present at the clone.
-#[test]
-fn headers_beside_a_capped_copy_share_are_kept() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let context = zero_context(&cache, "ns-main");
-    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
-    let room = step.room().expect("a measured room");
-    assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
-    let charge = header_pressure(&cache, room - budget - ENTRY_BYTES - 4096);
-    assert!(charge < room - budget - ENTRY_BYTES, "{charge}");
-    assert!(
-        charge > room - 2 * budget,
-        "uncapped shares would reclaim it: {charge}"
-    );
-    super::super::copy_retire_probe();
-    super::super::retire_headers_beside_copy(Some(&context), budget, step);
-    assert_eq!(
-        cache.with_cursor(|c| c.headers.optional_bytes().unwrap()),
-        Some(charge)
-    );
-    let probe = super::super::copy_retire_probe().expect("probed");
-    assert!(
-        probe.headers.is_some_and(|headers| headers >= charge),
-        "{probe:?}"
-    );
-    assert!(probe.fits(), "{probe:?}");
-}
-
-/// [behaviour] An ordinary singleton completion retains its copy using
-/// both budgeted shares; the pre-clone measurement covers optional headers.
-#[test]
-fn an_ordinary_completion_funds_both_copy_shares() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let pi = PiRoot::new(40);
-    let cache = Arc::new(SharedCache::default());
-    super::super::copy_retire_probe();
-    retain_fixture_copy(&pi, &cache);
-    assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
-    assert!(cache.take(&pi.key()).is_some(), "the copy is retained");
-    let probe = super::super::copy_retire_probe().expect("probed");
-    assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
-    assert!(probe.fits(), "{probe:?}");
-}
-
-/// [behaviour] An incomplete sidecar census retains no copy and passes
-/// no budget, so no pre-clone reclamation runs, including on completion.
-#[test]
-fn a_completion_that_retains_no_copy_runs_no_budgeted_reclamation() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
-    with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let key = local_index_key(&fixture.file(SESSION));
-        let cache = Arc::new(SharedCache::default());
-        super::super::copy_retire_probe();
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            let (next, _, _) = page_with(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                NOW,
-                incomplete,
-            );
-            index = next;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
-        assert_eq!(
-            counter(&cache, |c| c.jobs_certified),
-            1,
-            "{}",
-            counters(&cache)
-        );
-        assert!(cache.retained_checkpoint(&key).is_none(), "no copy kept");
-        assert!(
-            super::super::copy_retire_probe().is_none(),
-            "no budgeted retire"
-        );
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Release-to-fit measures main state under the existing lock order.
-
-type CacheCounts = crate::local_resource_diagnostics::cache_lifecycle::Counts;
-
-/// The `FILLERS` filled shared cache and its release measures.
-struct ReleaseScene {
-    cache: Arc<SharedCache>,
-    /// The whole cursor state.
-    main: usize,
-    /// The retained copies' bound.
-    resident: usize,
-    /// One filler's charge.
-    filler: usize,
-}
-impl ReleaseScene {
-    fn new() -> Self {
-        let (cache, filler) = crate::snapshots::cache_policy_tests::filled_cache();
-        let main = cache.cursor_resident();
-        Self {
-            resident: retained_floor(&cache),
-            cache,
-            main,
-            filler,
-        }
-    }
-    /// The `pinned` at which the copies fit exactly beside main's state.
-    fn exact(&self) -> usize {
-        state_bytes() - self.main - self.resident
-    }
-    /// `pinned` at which even an empty retained cache would not fit.
-    fn unreachable(&self) -> usize {
-        let floor =
-            crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), state_bytes())
-                .unwrap();
-        state_bytes() - self.main - floor + 1
-    }
-    /// The release (`release_to_fit`) or Path A (`release_older_to_fit`)
-    /// at `rank`, observing cache lifecycle counters.
-    fn release(&self, pinned: usize, path_a: Option<(i64, i64)>) -> (bool, CacheCounts) {
-        crate::local_resource_diagnostics::cache_lifecycle::observe(|| match path_a {
-            Some(rank) => self.cache.release_older_to_fit(pinned, rank),
-            None => self.cache.release_to_fit(pinned),
-        })
-    }
-    fn fillers(&self) -> usize {
-        crate::snapshots::cache_policy_tests::fillers_resident(&self.cache)
-    }
-    /// What the release charged, all of it: the copies, the whole cursor
-    /// state and `pinned`.
-    fn charged(&self, pinned: usize) -> usize {
-        retained_floor(&self.cache) + self.cache.cursor_resident() + pinned
-    }
-}
-
-fn evicted(counts: &CacheCounts) -> (u64, u64, u64) {
-    (
-        counts.copy_refusal_entries_evicted,
-        counts.copy_refusal_admission_evicted,
-        counts.copy_refusal_bytes_released,
-    )
-}
-
-const NONE_OLDER: (i64, i64) = (0, 0);
-const ALL_OLDER: (i64, i64) = (i64::MAX, 0);
-
-/// [behaviour] Main's release preserves the exact-fit, ranked victim,
-/// unreachable-fit and charge-bound assertions without optional holders.
-#[test]
-fn with_no_proof_the_release_is_m1s() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    use crate::snapshots::cache_policy_tests::FILLERS;
-
-    let scene = ReleaseScene::new();
-    assert_eq!(scene.cache.cursor_resident(), scene.main);
-    let exact = scene.exact();
-    let (credit, counts) = observe(|| scene.cache.cursor_reserve(exact));
-    credit.expect("the cursor admission floor agrees").refund();
-    assert_eq!(counts.cursor_reservation_entries_evicted, 0);
-    for path_a in [Some(NONE_OLDER), None] {
-        for (pinned, fits) in [
-            (exact, true),
-            (scene.unreachable(), false),
-            (usize::MAX, false),
-        ] {
-            let (released, counts) = scene.release(pinned, path_a);
-            assert_eq!(released, fits, "{path_a:?} {pinned}");
-
-            assert_eq!(evicted(&counts), (0, 0, 0));
-            assert_eq!(scene.fillers(), FILLERS);
-        }
-    }
-    let (released, counts) = scene.release(exact + 1, Some(NONE_OLDER));
-    assert!(!released, "nothing older: Path A fits or evicts nothing");
-    assert_eq!(evicted(&counts), (0, 0, 0));
-    let (released, counts) = scene.release(exact + 1, None);
-    assert!(released);
-
-    assert_eq!(counts.copy_refusal_entries_evicted, 1);
-    assert_eq!(scene.fillers(), FILLERS - 1);
-    assert!(scene.charged(exact + 1) <= state_bytes());
-    assert!(!cursor_held());
-    assert!(scene.cache.inner.try_lock().is_ok());
-    assert!(scene.cache.cursor.try_lock().is_ok());
-    assert_eq!(scene.cache.cursor_reserved(), 0);
-}
-
-/// [behaviour] An unavailable measurement keeps the refusal and evicts
-/// no copy: unreachable fit, overflow, or poisoned cursor lock.
-#[test]
-fn a_release_without_a_measure_evicts_nothing() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests::FILLERS;
-    let scene = ReleaseScene::new();
-    let overflow = scene.exact() + scene.filler / 2;
-    let refuses = |pinned: usize, label: &str| {
-        for path_a in [None, Some(ALL_OLDER)] {
-            let (released, counts) = scene.release(pinned, path_a);
-            assert!(!released, "{label} {path_a:?}");
-
-            assert_eq!(evicted(&counts), (0, 0, 0), "{label}");
-            assert_eq!(scene.fillers(), FILLERS, "{label}");
-        }
-    };
-    refuses(scene.unreachable(), "unreachable");
-    refuses(usize::MAX, "past the budget");
-
-    scene
-        .cache
-        .with_cursor(|cursor| cursor.reserved = usize::MAX);
-    refuses(overflow, "unsupported accounting");
-    scene.cache.with_cursor(|cursor| cursor.reserved = 0);
-
-    let unwound = catch_unwind(AssertUnwindSafe(|| {
-        scene.cache.with_cursor(|_| panic!("poison the cursor"));
-    }));
-    assert!(unwound.is_err());
-    assert!(!cursor_held());
-    refuses(overflow, "poisoned cursor");
 }
 
 // Continuation fixtures drive the enabled resume-only scan frame directly.
@@ -7916,7 +6304,6 @@ fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
         census_trusted: true,
         pages: 1,
         unavailable_resumes: 0,
-        charge: None,
         eof_applied: false,
         pace,
     }
@@ -8118,14 +6505,10 @@ fn fill_pace(cache: &SharedCache) {
 ///   carry the table inside `size_of_val(CursorState)` and never walk it;
 /// - the whole-cache bound carries it inside `size_of::<SharedCache>()` (the
 ///   `Arc` payload) and not in the locked parts;
-/// - `context_overhead`, which every release (copy refusal, Path A, and
-///   #665's X_out/peak `prove_release` through `release_room_for_main`) adds
-///   beside `state_for_main`, leaves it out;
 /// - a job's pace facts are inside its own walk (`paused_charge`), with no
 ///   heap, and the table is not reachable from a job.
 #[test]
 fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
-    use crate::heap_layout_bound::bound;
     use std::mem::{align_of, size_of};
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -8164,45 +6547,12 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     let mut whole = Counter::new(usize::MAX);
     cache.heap_bound(&mut whole).unwrap();
     let mut parts = Counter::new(usize::MAX);
-    cache.inner.heap_bound(&mut parts).unwrap();
     cache.cursor.heap_bound(&mut parts).unwrap();
     cache.withheld_memo.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
         shared_root + align_of::<SharedCache>() + 2 * size_of::<usize>() + parts.bytes
     );
-    // The release math: `context_overhead` without the table, beside
-    // `state_for_main` with it.
-    let fixture = ScanRoot::new(4);
-    let scan = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        ScanIndex::default(),
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(&cache), Scope("ns".into()));
-    let context = scan.sampling.as_ref().unwrap();
-    let overhead = crate::snapshots::sampled_scan::context_overhead(context).unwrap();
-    assert_eq!(
-        overhead,
-        size_of::<crate::snapshots::sampled_scan::Context>() + shared_root - size_of::<PaceTable>()
-            + align_of::<SharedCache>()
-            + 2 * size_of::<usize>()
-            + bound(&context.namespace, state_bytes()).unwrap()
-            + bound(&context.admission, state_bytes()).unwrap()
-    );
-    assert!(crate::snapshots::sampled_scan::context_overhead_covers(
-        context
-    ));
-    let retained = cache.retained().unwrap();
-    let room = cache.release_room_for_main(&retained, overhead, |_| true);
-    assert_eq!(room, Some(state_bytes() - state - overhead));
-    drop(retained);
     // A job: its pace facts walk to nothing beyond its own size.
     let temp = Temp::new("pace-job", b"{}\n");
     let meta = pace_meta(&temp, JobPace::new([1; 2], std::time::Instant::now(), true));
@@ -8591,45 +6941,39 @@ fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
     });
 }
 
-/// W9: a continuation worker that panicked while holding the cursor, the
-/// retained lock leaves the process running. The next
+/// W9: a continuation worker that panicked while holding the cursor lock
+/// leaves the process running. The next
 /// ordinary pages neither panic nor deadlock, and fail closed: they publish
 /// nothing the unpaged read would not, and a poisoned cursor admits nothing.
 #[test]
 fn ordinary_pages_after_a_worker_panic_under_any_lock_fail_closed() {
-    use crate::snapshots::sampled_scan::TestLock;
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let fixture = ScanRoot::new(80);
     let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
     let unpaged = fingerprints(&unpaged);
-    for lock in [TestLock::Cursor, TestLock::Retained] {
-        let cache = Arc::new(SharedCache::default());
-        with_test_limits(2048, 1024, 64, || {
-            let (mut index, _) = paused_singleton(&fixture, &cache);
-            let worker = std::thread::scope(|scope| {
-                std::thread::Builder::new()
-                    .name("ottto-codex-continuation".to_string())
-                    .spawn_scoped(scope, || cache.panic_under_lock_for_test(lock))
-                    .unwrap()
-                    .join()
-            });
-            assert!(worker.is_err(), "{lock:?}: the panic stays on the worker");
-            assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
-            for _ in 0..8 {
-                let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
-                index = next;
-                assert!(
-                    fingerprints(&scan).iter().all(|f| unpaged.contains(f)),
-                    "{lock:?}"
-                );
-                if lock == TestLock::Cursor {
-                    assert!(cache.cursor_reserve(1).is_none(), "admits nothing");
-                }
-            }
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, _) = paused_singleton(&fixture, &cache);
+        let worker = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("ottto-codex-continuation".to_string())
+                .spawn_scoped(scope, || {
+                    cache.with_cursor(|_| panic!("W9: panic under the cursor lock (test)"))
+                })
+                .unwrap()
+                .join()
         });
-    }
+        assert!(worker.is_err(), "the panic stays on the worker");
+        assert!(!cursor_held());
+        for _ in 0..8 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            assert!(fingerprints(&scan).iter().all(|f| unpaged.contains(f)));
+            assert!(cache.cursor_reserve(1).is_none(), "admits nothing");
+        }
+    });
 }
 
 /// The cache and held entry are produced by the real sampled pipeline.
@@ -9064,7 +7408,7 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
+fn decoder_floor_preserves_a_real_primary_tail() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9074,8 +7418,7 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
         let primary = ScanRoot::new(40);
         let cache = Arc::new(SharedCache::default());
         let key = local_index_key(&primary.file(SESSION));
-        // The primary continues from its head on its route (a codec source
-        // keeps no RAM copy); the cache fixture admits the other copy.
+        // The primary continues from its head on its route.
         let mut index = ScanIndex::default();
         for _ in 0..64 {
             let (next, _) = page(&primary, routed(index, &cache), Some(Arc::clone(&cache)));
@@ -9085,19 +7428,16 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
             }
         }
         assert!(head(&index, &key).is_some());
-        let peer = PiRoot::new(8);
-        let peer_key = pi_retained(&peer, &cache);
         let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
         let archive = Temp::new("decoder-floor", &bytes);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
         let floor = ENTRY_BYTES;
-        let budget = cache.cursor_resident() + retained_floor(&cache) + credit + floor;
+        let budget = cache.cursor_resident() + credit + floor;
         with_test_state_budget(decoder_least_budget(&cache) - 1, || {
             assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                 .unwrap()
                 .is_none());
             assert_eq!(cache.cursor_reserved(), 0);
-            assert!(cache.retained_checkpoint(&peer_key).is_some());
         });
         with_test_state_budget(budget, || {
             let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
@@ -9115,10 +7455,6 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
                 "a real primary Tail progresses during the decode"
             );
             assert_eq!(scan.snapshots.len(), 1);
-            assert!(
-                cache.retained_checkpoint(&peer_key).is_some(),
-                "decoder causes no extra eviction"
-            );
             assert_eq!(
                 head(&next, &key).map(|head| head.sealed_offset),
                 Some(primary.len(SESSION)),
@@ -9132,25 +7468,19 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
 }
 
 /// The state budget at which a decoder claim just fits once every header fact
-/// and retained copy is gone: the whole cursor state without headers, an empty
-/// retained cache, D, and the primary ENTRY_BYTES floor.
+/// is gone: the whole cursor state without headers, D, and the primary
+/// ENTRY_BYTES floor.
 fn decoder_least_budget(cache: &SharedCache) -> usize {
-    let empty =
-        crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), usize::MAX)
-            .unwrap();
     cursor_without_header_facts(cache)
-        + empty
         + codex_compressed_input::compressed_input_credit().unwrap()
         + ENTRY_BYTES
 }
 
 /// A cache warmed by real pages: optional header facts from a certified
-/// Codex cursor job, beside a native copy admitted by the cache fixture.
-/// Production source scans keep none. Returns the copy's key.
-fn warm_decoder_cache() -> (Arc<SharedCache>, String) {
+/// Codex cursor job.
+fn warm_decoder_cache() -> Arc<SharedCache> {
     let cache = Arc::new(SharedCache::default());
-    let key = certified_beside_a_retained_copy(&cache);
-    assert!(cache.retained_checkpoint(&key).is_some());
+    certified_cursor_job(&cache);
     assert!(
         cache
             .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
@@ -9158,7 +7488,7 @@ fn warm_decoder_cache() -> (Arc<SharedCache>, String) {
             > 0,
         "production inventory warmed header facts"
     );
-    (cache, key)
+    cache
 }
 
 fn synthetic_archive(tag: &str) -> Temp {
@@ -9174,75 +7504,55 @@ fn assert_decoder_refused_evicting_nothing(
     budget: usize,
     archive: &Temp,
 ) {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let resident = cache.cursor_resident();
-    let copies = cache.retained().unwrap().entry_count();
     let reserved = cache.cursor_reserved();
-    let (funded, counts) = observe(|| {
-        with_test_state_budget(budget, || {
-            OpenedInput::funded(File::open(&archive.0).unwrap(), cache).unwrap()
-        })
+    let funded = with_test_state_budget(budget, || {
+        OpenedInput::funded(File::open(&archive.0).unwrap(), cache).unwrap()
     });
     assert!(funded.is_none());
-    assert_eq!(counts.cursor_reservation_entries_evicted, 0);
     assert_eq!(cache.cursor_resident(), resident, "headers kept");
-    assert_eq!(cache.retained().unwrap().entry_count(), copies);
     assert_eq!(cache.cursor_reserved(), reserved);
 }
 
-/// A busy cache admits: free room first, then header facts, then retained
-/// copies through the pause's eviction path and counter. The primary tail
-/// floor stays free after every eviction.
+/// A busy cache admits: free room first, then header facts. The primary
+/// tail floor stays free.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_reclaims_headers_then_retained_copies_only_as_needed() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+fn decoder_reclaims_headers_only_as_needed() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let (cache, key) = warm_decoder_cache();
+        let cache = warm_decoder_cache();
         let resident = cache.cursor_resident();
         let cursor = cursor_without_header_facts(&cache);
         let headers = resident - cursor;
-        let retained = retained_floor(&cache);
         let credit = codex_compressed_input::compressed_input_credit().unwrap();
         // Without facts the free-room bar is T; with them it is T + H.
-        let budget = cursor + retained + credit + ENTRY_BYTES;
+        let budget = cursor + credit + ENTRY_BYTES;
         let archive = synthetic_archive("decoder-reclaim");
         let admit = |limit: usize| {
-            let (input, counts) = observe(|| {
-                with_test_state_budget(limit, || {
-                    OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                        .unwrap()
-                        .expect("a claim that can fit is admitted")
-                })
+            let input = with_test_state_budget(limit, || {
+                OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    .unwrap()
+                    .expect("a claim that can fit is admitted")
             });
             assert_eq!(cache.cursor_reserved(), credit);
-            let used = cache.cursor_resident() + retained_floor(&cache);
+            let used = cache.cursor_resident();
             assert!(limit - used >= ENTRY_BYTES, "the primary floor stays free");
             input.close();
             assert_eq!(cache.cursor_reserved(), 0);
-            counts.cursor_reservation_entries_evicted
         };
         // Free room: nothing is reclaimed.
-        assert_eq!(admit(budget + headers), 0);
+        admit(budget + headers);
         assert_eq!(cache.cursor_resident(), resident);
-        assert!(cache.retained_checkpoint(&key).is_some());
         // Short by the facts: only they go.
-        assert_eq!(admit(budget), 0);
-        assert_eq!(cache.cursor_resident(), cursor);
-        assert!(cache.retained_checkpoint(&key).is_some());
-        // No room for any copy: retained copies go too, and are counted.
-        let copies = cache.retained().unwrap().entry_count() as u64;
-        assert!(copies > 0);
-        assert_eq!(admit(decoder_least_budget(&cache)), copies);
-        assert_eq!(cache.retained().unwrap().entry_count(), 0);
+        admit(budget);
         assert_eq!(cache.cursor_resident(), cursor);
     });
 }
@@ -9262,7 +7572,7 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let (cache, key) = warm_decoder_cache();
+        let cache = warm_decoder_cache();
         let job = cache.cursor_reserve(1024 * 1024).expect("a job's charge");
         let budget = decoder_least_budget(&cache);
         let archive = synthetic_archive("decoder-over-room");
@@ -9271,7 +7581,6 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
             assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
             codex_zst_refused_flush();
         });
-        assert!(cache.retained_checkpoint(&key).is_some());
         assert_eq!(rows.len(), 1, "one line for the whole pass");
         assert_eq!(
             rows[0]["counts"]["codex_zst_refused"],
@@ -9286,26 +7595,20 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
     });
 }
 
-/// [behaviour] Real archive decoder eviction preserves join provenance.
+/// [behaviour] A real archive decoder makes its room from header facts.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_eviction_keeps_join_state() {
+fn decoder_eviction_reclaims_header_facts() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let (cache, key) = warm_decoder_cache();
-        let joined = |cache: &SharedCache| {
-            cache
-                .with_cursor(|cursor| cursor.join_owners.len())
-                .unwrap()
-        };
-        let before = joined(&cache);
+        let cache = warm_decoder_cache();
         let budget = decoder_least_budget(&cache);
         let archive = synthetic_archive("decoder-proof-kept");
         // One byte below the decoder floor: nothing is evicted.
@@ -9313,36 +7616,23 @@ fn decoder_eviction_keeps_join_state() {
         with_test_state_budget(budget, || {
             OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
                 .unwrap()
-                .expect("retained copies make the room")
+                .expect("header facts make the room")
                 .close();
         });
-        assert!(cache.retained_checkpoint(&key).is_none());
-        assert_eq!(joined(&cache), before);
     });
 }
 
-/// One pass's header attempt on an owed archive, through the production read.
+/// The ordinary funded encoding opener, with the existing header recognition bound.
 fn archive_header_pass(
-    index: &mut ScanIndex,
+    _index: &mut ScanIndex,
     path: &Path,
     cache: &Arc<SharedCache>,
-) -> codex_compressed_input::HeaderRead {
-    let archive = index
-        .archives
-        .entry(local_index_key(path))
-        .or_insert_with(|| {
-            codex_compressed_input::ArchiveEvidence::from_metadata(
-                fs::symlink_metadata(path).unwrap(),
-            )
-            .unwrap()
-        });
-    archive.work.get_or_insert_with(Box::default).reservation =
-        codex_compressed_input::ArchiveReservation::HeaderReady;
-    let mut candidate = codex_zst_refusal_tests::candidate(path);
-    candidate.size_bytes = fs::metadata(path).unwrap().len();
-    index
-        .inventory_archive_header(&candidate, Some(cache))
-        .unwrap()
+) -> std::io::Result<String> {
+    let mut input = OpenedInput::encoded(File::open(path)?, path, Some(cache))?.header_only();
+    let mut header = String::new();
+    let result = input.read_line(&mut header).map(|_| header);
+    input.close();
+    result
 }
 
 fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
@@ -9370,142 +7660,27 @@ fn owed_archives(tag: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
     ignore = "needs validated heap layout"
 )]
 fn a_refused_archive_decoder_recovers_on_the_next_pass() {
-    use codex_compressed_input::HeaderRead;
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let clock = TestClock;
     clock.set(1_900_000_000);
     with_test_limits(2048, 8192, 64, || {
-        let (cache, key) = warm_decoder_cache();
+        let cache = warm_decoder_cache();
         let (root, paths) = owed_archives("decoder-next-pass", 1);
-        let archive_key = local_index_key(&paths[0]);
         let mut index = ScanIndex::default();
-        index.archive_pass.power = true;
         let budget = decoder_least_budget(&cache);
         let refused = with_test_state_budget(budget - 1, || {
             archive_header_pass(&mut index, &paths[0], &cache)
         });
-        assert!(matches!(refused, HeaderRead::Deferred));
-        assert_eq!(
-            index.archives[&archive_key].owed_cause(),
-            Some(CodexZstCause::AdmissionRefused)
-        );
-        assert!(index.archives[&archive_key].header().is_none());
-        let spent = |index: &ScanIndex| {
-            index.archives[&archive_key]
-                .work
-                .as_ref()
-                .unwrap()
-                .header_attempts
-        };
-        assert_eq!(spent(&index), 0);
-        assert!(cache.retained_checkpoint(&key).is_some());
-        index.disclose_archive_debt();
+        assert_eq!(refused.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         let recovered = with_test_state_budget(budget, || {
             archive_header_pass(&mut index, &paths[0], &cache)
-        });
-        assert!(matches!(recovered, HeaderRead::Validated(_)));
-        assert!(index.archives[&archive_key].header().is_some());
-        assert_eq!(spent(&index), 1);
+        })
+        .unwrap();
+        assert!(recovered.contains("compressed-fixture"));
         assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
-    });
-}
-
-/// [regress] 0.1.213: every pass refused every owed archive decoder, with no
-/// decode and one log line per archive. Retained copies held the budget near
-/// full and a decoder could only use free room. Now the first decoder makes
-/// the room, every archive reads its header and nothing is refused.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs validated heap layout"
-)]
-fn owed_archives_refused_beside_near_full_retained_copies_are_admitted() {
-    use crate::local_resource_diagnostics::capture;
-    use codex_compressed_input::HeaderRead;
-    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let (cache, _) = warm_decoder_cache();
-        let copies = cache.retained().unwrap().entry_count();
-        let (root, paths) = owed_archives("decoder-near-full", 3);
-        let mut index = ScanIndex::default();
-        index.archive_pass.power = true;
-        // One byte short of the old free-room bar without any header facts:
-        // headers alone cannot make the room, only a retained copy can.
-        let budget = decoder_least_budget(&cache) + retained_floor(&cache)
-            - crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), usize::MAX)
-                .unwrap()
-            - 1;
-        let ((), rows) = capture(|| {
-            with_test_state_budget(budget, || {
-                for path in &paths {
-                    let read = archive_header_pass(&mut index, path, &cache);
-                    assert!(matches!(read, HeaderRead::Validated(_)));
-                    assert_eq!(cache.cursor_reserved(), 0);
-                }
-            });
-            index.disclose_archive_debt();
-        });
-        assert!(cache.retained().unwrap().entry_count() < copies);
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row["stage"] == "codex_zst_inventory")
-                .count(),
-            paths.len()
-        );
-        assert!(!rows.iter().any(|row| row["stage"] == "codex_zst_refused"));
-        fs::remove_dir_all(root).unwrap();
-    });
-}
-
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs validated heap layout"
-)]
-fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
-    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let cache = Arc::new(SharedCache::default());
-        let key = certified_beside_a_retained_copy(&cache);
-        let copy = cache.take(&key).expect("real retained reduction").retained;
-        // Two real reductions with large synthetic keys warm > 8 MiB, while
-        // each entry remains under ENTRY_BYTES. The graph is measured normally.
-        let warm_key = "a".repeat(5 * 1024 * 1024);
-        let peer_key = "b".repeat(5 * 1024 * 1024);
-        for key in [&warm_key, &peer_key] {
-            assert!(cache.retained().unwrap().insert(
-                key.clone(),
-                crate::transcript_cache::Retained {
-                    checkpoint: copy.checkpoint.clone(),
-                    state: copy.state.clone(),
-                }
-            ));
-        }
-        let warm = retained_floor(&cache);
-        assert!(warm > ENTRY_BYTES);
-        let credit = codex_compressed_input::compressed_input_credit().unwrap();
-        let budget = cache.cursor_resident() + warm + credit + ENTRY_BYTES;
-        // An explicit budget isolates the floor rule from zstd version sizing.
-        // The prior retained-sized floor would reject this same warm graph.
-        assert!(cache.cursor_resident() + 2 * warm + credit > budget);
-        with_test_state_budget(budget, || {
-            let owner = DecoderOwner::acquire(&cache, credit).expect("warm cache admits");
-            assert!(cache.retained_checkpoint(&warm_key).is_some());
-            assert!(cache.retained_checkpoint(&peer_key).is_some());
-            owner.release();
-        });
-        assert_eq!(cache.cursor_reserved(), 0);
     });
 }
 
@@ -9559,8 +7734,6 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         let mut census = ScanCensus::default();
         census.causes = census.causes.page(Some(77));
         let mut residue = BTreeSet::new();
-        let mut blocked = BTreeSet::new();
-        let mut residue_blocked = BTreeSet::new();
         let mut pending = Vec::new();
         let mut debt = disclosure();
         debt.cause = cause;
@@ -9573,8 +7746,6 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
                 DisclosureTargets {
                     census: &mut census,
                     residue_index_keys: &mut residue,
-                    residue_blocked_session_ids: &mut residue_blocked,
-                    codex_state_only_blocked_session_ids: &mut blocked,
                     pending_finalization: &mut pending,
                 },
             );
@@ -9587,13 +7758,10 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert_eq!(residue.len(), 1);
         codex_file_join::disclose_strict(
-            "synthetic-owner",
             std::slice::from_ref(&candidate),
             DisclosureTargets {
                 census: &mut census,
                 residue_index_keys: &mut residue,
-                residue_blocked_session_ids: &mut residue_blocked,
-                codex_state_only_blocked_session_ids: &mut blocked,
                 pending_finalization: &mut pending,
             },
         );
@@ -9692,10 +7860,6 @@ fn active_bound_cursor_preserves_scope_resumes_and_publishes() {
                 assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
                 let certificate = head(&index, &key).expect("the certified prefix is staged");
                 assert_eq!(certificate.sealed_offset, fixture.len(SESSION));
-                assert!(
-                    cache.take(&key).is_none(),
-                    "a codec source keeps no RAM copy"
-                );
                 return;
             }
             assert!(scan.snapshots.is_empty());

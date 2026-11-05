@@ -167,7 +167,6 @@ impl Corpus {
             modes,
             disposition: Default::default(),
             released: Default::default(),
-            unhealthy: Default::default(),
             stats: Default::default(),
             delivered: None,
             upload_policy: SnapshotUploadPolicy::default(),
@@ -198,8 +197,6 @@ struct Page {
     modes: (usize, usize, usize),
     disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
     released: e2::pipeline_test_observer::Released,
-    /// #947: requests the last enrichment left Unknown for an unhealthy root.
-    unhealthy: crate::snapshots::ClaudeUnhealthyRootNoFallbackCounts,
     stats: ClaudeLocalEvidenceStats,
     /// Exact ACKs of this page's final bodies, when `ready` delivered them:
     /// `finish` then earns the file receipts as the service finish does.
@@ -248,24 +245,18 @@ impl Page {
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
-                try_apply_claude_local_evidence_to_scan_with_comparison(
+                apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    None,
-                    None,
-                    None,
-                    Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
                     wire_budget,
                 )
-                .unwrap()
             });
         if let Some(accepted) = accepted.as_deref_mut() {
             accepted.invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated));
         }
         self.released = released;
-        self.unhealthy = stats.unhealthy_root_no_fallback_requests;
         self.stats = stats;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
@@ -736,7 +727,6 @@ fn twin(p: &Page) -> Page {
         modes: p.modes,
         disposition: p.disposition.clone(),
         released: p.released,
-        unhealthy: p.unhealthy,
         stats: p.stats.clone(),
         // A twin is an undelivered copy: only `ready`'s original earns receipts.
         delivered: None,
@@ -840,6 +830,25 @@ fn upload_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_source_under(
+        SnapshotSource::ClaudeCode,
+        upload_policy,
+        items,
+        progress,
+        respond,
+    )
+}
+fn upload_source_under(
+    source: SnapshotSource,
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     Result<ResumableUploadResult>,
@@ -857,11 +866,14 @@ fn upload_under(
         |s| s.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |s| Some(s.source_session_id.as_str()),
-        |_| false,
+        // The production main-upload class: patched and unpatched bodies
+        // never share a request.
+        |s| snapshot_upload_batch_class(s, false),
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let wire = request_under(upload_policy, &batch);
+            let mut wire = request_under(upload_policy, &batch);
+            wire.source = source.api_slug().into();
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");
             sent.push(canonical(&wire));
@@ -2161,7 +2173,6 @@ fn retry_case(conflict: bool) {
             &index_path,
             &progress_path,
             || Ok(()),
-            None,
             None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
             None,
@@ -3559,9 +3570,6 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         }
         if loss == 1 {
             scanner.evict(&prior);
-        } else if loss == 2 {
-            // Actual capacity eviction through the existing victim mechanism.
-            scanner.evict_for_pressure(&prior);
         }
         let scanner = if loss == 3 { &restarted } else { &scanner };
         let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
@@ -3571,8 +3579,8 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
             // On the database route the held-new custody is durable (the
-            // withheld read's census record and committed head): a RAM
-            // clear, eviction or restart still continues it.
+            // withheld read's census record and committed head): an
+            // eviction or restart still continues it.
             assert_eq!(
                 retry.modes,
                 if grow { (0, 1, 0) } else { (0, 0, 1) },
@@ -3651,14 +3659,14 @@ fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
 
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, true, loss);
     }
 }
 
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
 }
@@ -4921,9 +4929,10 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert!(
-                page.unhealthy.incomplete > 0,
-                "#947's unhealthy-root branch ran"
+            assert_eq!(
+                body(&page, COPY).and_then(|copy| copy.telemetry_owned_complete),
+                Some(false),
+                "#947: the half pair leaves the root unproven"
             );
             assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
             assert_eq!(
@@ -5252,10 +5261,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert!(
-                page.unhealthy.incomplete > 0,
-                "#947's unhealthy-root branch ran"
-            );
+            // #947: the half pair leaves the root's evidence unavailable.
             assert_eq!(
                 identity_count(&counts, "copy_derived_skipped_evidence_unavailable"),
                 1

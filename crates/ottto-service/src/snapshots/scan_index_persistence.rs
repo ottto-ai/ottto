@@ -50,6 +50,7 @@ pub(crate) enum Source {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Field {
+    /// A retired slot, as `UsagePending`.
     AccountPending,
     /// A slot whose field is retired: an older file's map is still read and
     /// validated, and the decoder drops its records.
@@ -280,14 +281,6 @@ impl LegacyRecovery {
 }
 
 impl LoadedRoot {
-    #[cfg_attr(
-        test,
-        allow(dead_code, reason = "the #[path] contract test crate does not call it")
-    )]
-    pub(crate) fn observed_missing() -> Self {
-        Self(Arc::new(Root::Missing))
-    }
-
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
             Root::Sharded { manifest, .. } => Some(manifest.generation),

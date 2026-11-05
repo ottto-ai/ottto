@@ -116,10 +116,6 @@ pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) sibling_exact_incidence_only: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) account_reproof_calls: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) account_reproof_cleared: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) history_permitted_not_stamped_not_accepted: u64,
@@ -141,8 +137,6 @@ impl Rearm {
             restored_empty_sibling,
             restored_nonempty_sibling,
             sibling_exact_incidence_only,
-            account_reproof_calls,
-            account_reproof_cleared,
             authority_normalization_cleared,
             history_permitted_not_stamped_not_accepted,
             history_permitted_not_stamped_telemetry_unread,
@@ -282,12 +276,6 @@ pub(crate) fn desktop_scoped_acquisition() {
 pub(crate) struct CachePage {
     #[serde(flatten, serialize_with = "sparse_cache")]
     pub(crate) events: cache_lifecycle::Counts,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) insert_count_entries_evicted: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) insert_byte_entries_evicted: u64,
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) reinsert_failed: u64,
 }
 fn sparse_cache<S: serde::Serializer>(
     counts: &cache_lifecycle::Counts,
@@ -298,31 +286,10 @@ fn sparse_cache<S: serde::Serializer>(
 impl CachePage {
     fn is_empty(&self) -> bool {
         self.events.is_empty()
-            && self.insert_count_entries_evicted == 0
-            && self.insert_byte_entries_evicted == 0
-            && self.reinsert_failed == 0
     }
     fn merge(&mut self, other: Self) {
         self.events.merge(other.events);
-        self.insert_count_entries_evicted = self
-            .insert_count_entries_evicted
-            .saturating_add(other.insert_count_entries_evicted);
-        self.insert_byte_entries_evicted = self
-            .insert_byte_entries_evicted
-            .saturating_add(other.insert_byte_entries_evicted);
-        self.reinsert_failed = self.reinsert_failed.saturating_add(other.reinsert_failed);
     }
-}
-pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
-    update(|counts| {
-        let cache = &mut counts.retained_cache_page_events;
-        let n = if count_pressure {
-            &mut cache.insert_count_entries_evicted
-        } else {
-            &mut cache.insert_byte_entries_evicted
-        };
-        *n = n.saturating_add(1);
-    });
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
@@ -372,9 +339,9 @@ impl Scope {
             report_at_finish: false,
         }
     }
-    pub(crate) fn finish_decision(claude: bool, has_lease: bool) -> Self {
+    pub(crate) fn finish_decision(claude: bool) -> Self {
         let mut scope = Self::begin(claude);
-        scope.report_at_finish = claude && !has_lease;
+        scope.report_at_finish = claude;
         scope
     }
     pub(crate) fn finish(mut self) -> Counts {
@@ -397,28 +364,7 @@ impl Drop for Scope {
 }
 pub(crate) fn emit_without_lease(counts: Counts) {
     if counts != Counts::default() {
-        // The disabled-before-lease point has already reported the gate.
-        // Reuse its stage at the end of work only when there are actual events.
-        // Pass a plain decision to avoid merging the active TLS scope twice.
-        #[derive(Serialize)]
-        struct Row {
-            #[serde(flatten)]
-            decision: super::NativeComparisonDecision,
-            #[serde(flatten)]
-            counts: Counts,
-        }
-        super::traversal_point(
-            "native_comparison_decision",
-            "claude_code",
-            &Row {
-                decision: super::NativeComparisonDecision {
-                    layout_supported: crate::heap_layout_bound::layout_supported(),
-                    outcome: super::NativeDecisionOutcome::DisabledBeforeLease,
-                    ..Default::default()
-                },
-                counts,
-            },
-        );
+        super::traversal_point("native_collection_page", "claude_code", &counts);
     }
 }
 pub(crate) fn active() -> bool {
@@ -460,16 +406,6 @@ pub(crate) fn restored(previous_empty: bool, held: bool, exact_only: bool) {
             .saturating_add(u64::from(exact_only));
     });
 }
-/// One account-reproof clear of a family member's source revision.
-pub(crate) fn clear(nonempty: bool) {
-    update(|counts| {
-        let c = &mut counts.claude_reread;
-        c.account_reproof_calls = c.account_reproof_calls.saturating_add(1);
-        c.account_reproof_cleared = c
-            .account_reproof_cleared
-            .saturating_add(u64::from(nonempty));
-    });
-}
 /// Why an upgrade the history gate permitted this page did not stamp.
 pub(crate) enum NotStamped {
     NotAccepted,
@@ -496,60 +432,38 @@ pub(crate) fn authority_normalization(cleared: u64) {
     });
 }
 
-/// Follows a destructive hit through eligibility, parse and retention. Carries
-/// no identity or state; disarmed only after a successful cache admission.
-#[derive(Default)]
-pub(crate) struct Reinsertion(Cell<bool>);
-impl Reinsertion {
-    pub(crate) fn new(hit: bool) -> Self {
-        Self(Cell::new(hit && active()))
-    }
-    pub(crate) fn admitted(&self) {
-        self.0.set(false);
-    }
-}
-impl Drop for Reinsertion {
-    fn drop(&mut self) {
-        if self.0.get() {
-            update(|counts| {
-                let n = &mut counts.retained_cache_page_events.reinsert_failed;
-                *n = n.saturating_add(1);
-            });
-        }
-    }
-}
-crate::heap_layout_bound::no_heap!(false; Reinsertion);
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);
-        clear(true);
+        restored(true, false, false);
         {
             let other = Scope::begin(false);
-            clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            restored(true, false, false);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             assert_eq!(other.finish(), Counts::default());
         }
         let nested = Scope::begin(true);
-        clear(false);
-        assert_eq!(nested.finish().claude_reread.account_reproof_calls, 1);
-        std::thread::spawn(|| clear(true)).join().unwrap();
+        restored(false, false, false);
+        assert_eq!(nested.finish().claude_reread.restored_nonempty_sibling, 1);
+        std::thread::spawn(|| restored(true, false, false))
+            .join()
+            .unwrap();
         let mut page = scope.finish();
-        assert_eq!(page.claude_reread.account_reproof_calls, 1);
-        assert_eq!(page.claude_reread.account_reproof_cleared, 1);
+        assert_eq!(page.claude_reread.restored_empty_sibling, 1);
+        assert_eq!(page.claude_reread.restored_nonempty_sibling, 0);
         assert!(page.retained_cache_page_events.is_empty());
         let resumed = Scope::begin(true);
-        clear(false);
+        restored(false, false, false);
         page.merge(resumed.finish());
-        assert_eq!(page.claude_reread.account_reproof_calls, 2);
-        assert_eq!(page.claude_reread.account_reproof_cleared, 1);
+        assert_eq!(page.claude_reread.restored_empty_sibling, 1);
+        assert_eq!(page.claude_reread.restored_nonempty_sibling, 1);
         assert!(!active());
     }
     #[test]
-    fn sparse_counts_saturate_and_count_failed_reinsertion_once() {
+    fn sparse_counts_saturate_and_page_cache_events_stay_sparse() {
         assert_eq!(
             serde_json::to_value(Counts::default()).unwrap(),
             serde_json::json!({})
@@ -557,16 +471,10 @@ mod tests {
         let scope = Scope::begin(true);
         desktop_inventory_restart();
         desktop_scoped_acquisition();
-        {
-            let _failed = Reinsertion::new(true);
-            let success = Reinsertion::new(true);
-            success.admitted();
-            let _absent = Reinsertion::new(false);
-        }
+        cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
         authority_normalization(u64::MAX);
         authority_normalization(1);
         let counts = scope.finish();
-        assert_eq!(counts.retained_cache_page_events.reinsert_failed, 1);
         assert_eq!(
             counts.claude_reread.authority_normalization_cleared,
             u64::MAX
@@ -574,7 +482,7 @@ mod tests {
         let value = serde_json::to_value(counts).unwrap();
         assert_eq!(
             value["retained_cache_page_events"],
-            serde_json::json!({"reinsert_failed": 1})
+            serde_json::json!({"prefix_excluded_bodies": 1})
         );
         assert_eq!(value["claude_reread"].as_object().unwrap().len(), 1);
     }

@@ -17,7 +17,7 @@ use crate::transcript_acquisition::{ReadMode, Scope};
 use serde_json::Value;
 
 /// What the shared rows need from a source.
-trait FixtureSource: TailSource {
+pub(super) trait FixtureSource: TailSource {
     const INDEX: Source;
     const APPLY: fn(&Value, &mut SnapshotAccumulator);
     fn name() -> String;
@@ -51,7 +51,7 @@ fn rewrite(path: &Path, lines: &[String]) {
     std::fs::rename(&next, path).unwrap();
 }
 
-fn open<S: FixtureSource>(path: &Path) -> OwnedJsonlParser {
+pub(super) fn open<S: FixtureSource>(path: &Path) -> OwnedJsonlParser {
     fixture::parser(S::SOURCE, path, File::open(path).unwrap(), S::APPLY)
 }
 
@@ -61,7 +61,7 @@ fn id<S: FixtureSource>(route: &Route, path: &Path) -> HeadIdentity {
 
 /// `S`'s load of `path`'s committed head, with a fresh parser's accumulator as
 /// this read's live inputs, as the scan prepares them before the load.
-fn load_at<S: FixtureSource>(route: &Route, path: &Path, key: &str) -> Load {
+pub(super) fn load_at<S: FixtureSource>(route: &Route, path: &Path, key: &str) -> Load {
     load_under::<S>(route, path, key, &scope())
 }
 
@@ -83,7 +83,7 @@ fn load_under<S: FixtureSource>(route: &Route, path: &Path, key: &str, scope: &S
 
 /// A read of `path` stepped to its end, to its certified completion and native
 /// finish, encoded at the real PRE seam over `base` (none: every row).
-fn finish<S: FixtureSource>(
+pub(super) fn finish<S: FixtureSource>(
     route: &Route,
     path: &Path,
     parser: OwnedJsonlParser,
@@ -106,21 +106,24 @@ fn finish_under<S: FixtureSource>(
 }
 
 /// One certified Full read of `path` as it stands now.
-fn complete<S: FixtureSource>(
+pub(super) fn complete<S: FixtureSource>(
     route: &Route,
     path: &Path,
     base: Option<TailBase>,
     at_pre: impl FnOnce(&mut SnapshotAccumulator),
 ) -> (PendingTail, Result<ParsedJsonlFile>) {
     let mut parser = open::<S>(path);
-    parser
-        .prepare_acquisition(None, &scope(), None, NOW)
-        .unwrap();
+    assert!(matches!(
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
     while !parser.step().unwrap() {}
     finish::<S>(route, path, parser, base, at_pre)
 }
 
-fn head<S: FixtureSource>(route: &Route, key: &str) -> TailHead {
+pub(super) fn head<S: FixtureSource>(route: &Route, key: &str) -> TailHead {
     state_v2::load_head(&route.index, key, S::REDUCTION_REVISION)
         .unwrap()
         .expect("a committed head")
@@ -298,7 +301,7 @@ fn stored_read_under(
         panic!("the committed head is reused with its base");
     };
     let mut parser = open::<Codex>(path);
-    let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), scope, None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(Some(taken), scope, None, NOW) else {
         panic!("the read prepares");
     };
     if !matches!(mode, ReadMode::Unchanged) {
@@ -521,7 +524,7 @@ fn a_codex_content_rewrite_restages_its_fact_and_drops_the_old_value() {
     let Load::Reused(taken, _) = load_at::<Codex>(&route, &path, &key) else {
         panic!("the committed head is reused");
     };
-    let (acc, _, _) = taken.retained.state.finish_view();
+    let (acc, _, _) = taken.state.finish_view();
     assert_eq!(acc.title.as_deref(), Some("After"));
 }
 
@@ -853,7 +856,8 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     }
     let mut resumed = Vec::new();
     let mut cold = Vec::new();
-    let reconstructions = super::super::counters::total("tail_reconstruct", "incompatible");
+    let reconstructions =
+        super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding");
     for (n, path) in paths.iter().enumerate() {
         let key = local_index_key(path);
         let mut parser = open_with(path, &after);
@@ -881,7 +885,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
             Load::Reused(taken, Some(base)) if n != 0 => {
                 assert!(matches!(
                     parser
-                        .prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
+                        .prepare_acquisition(Some(taken), &scope(), None, NOW)
                         .unwrap_or_else(|_| panic!("unchanged session prepares Tail")),
                     ReadMode::Tail
                 ));
@@ -901,7 +905,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
         cold.extend(native.unwrap().snapshots);
     }
     assert_eq!(
-        super::super::counters::total("tail_reconstruct", "incompatible"),
+        super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding"),
         reconstructions + 1
     );
     assert!(

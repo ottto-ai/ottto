@@ -48,34 +48,19 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Revision 3 keeps a listed family, and
-/// every family while the list pauses adoption, on ordinary (pre-`e2`)
-/// money. With the gate on, `e2` applies to every other family; a family it
-/// does not apply to behaves exactly as gate off (no fold, so no literal).
+/// Revision 3 keeps a listed family on ordinary (pre-`e2`) money. With the
+/// gate on, `e2` applies to every other family, also while the list pauses
+/// adoption: a pause holds adoption only, never emission. A family it does
+/// not apply to behaves exactly as gate off (no fold, so no literal).
 pub(crate) fn family_applies(index: &ScanIndex, root: &str, subagent_stem: Option<&str>) -> bool {
-    applies_unless_listed(
-        index,
-        index
-            .claude_reemission_exclusions
-            .excludes(root, subagent_stem),
-    )
+    !index
+        .claude_reemission_exclusions
+        .excludes(root, subagent_stem)
 }
 
 /// `family_applies` for the family of the file a parse opened.
 pub(in crate::snapshots) fn file_applies(context: &ReadContext<'_>) -> bool {
-    applies_unless_listed(
-        context.index,
-        claude_index_path_member_ref(context.path).is_some_and(|member| {
-            context
-                .index
-                .claude_reemission_exclusions
-                .excludes(member.root, member.subagent_stem)
-        }),
-    )
-}
-
-fn applies_unless_listed(index: &ScanIndex, listed: bool) -> bool {
-    !listed && !index.claude_reemission_exclusions.pauses_adoption()
+    !context.index.claude_family_listed(context.path)
 }
 // Synthetic transcripts are created when a test runs, after their records'
 // fixed timestamps, so `e2` would read every record as copied in. A fixture
@@ -289,7 +274,8 @@ pub(crate) mod money_mark {
 /// acting in the fold gates on the request's own provider timestamp
 /// (`observed_at >= T`, as `provider_context_bucket` does), so a cold read
 /// equals a stored one; anything else goes through the operator command.
-pub(crate) const RULE_EPOCH: u8 = 1;
+/// 2: org lines govern requests from `ACCOUNT_RULE_FROM`.
+pub(crate) const RULE_EPOCH: u8 = 2;
 
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
@@ -413,6 +399,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         telemetry,
         accounts,
         prefix: _,
+        fork_parent,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -431,6 +418,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *ambiguous = BTreeSet::new();
     *telemetry = Default::default();
     *accounts = None;
+    *fork_parent = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -931,133 +919,12 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
+    /// The one session this file's `fork-context-ref` line names, whatever
+    /// copy route the page takes: the page's evidence scope reads its pair.
+    fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
 
-/// What the finish hands a gate-on fold, sized for
-/// [`FileFold::finish_heap_bound`] (X_out's E term).
-#[derive(Debug, Default, Clone, Copy)]
-pub(in crate::snapshots) struct FoldShape {
-    /// Responses the fold observes, each its own grain in the worst case.
-    pub(in crate::snapshots) responses: usize,
-    /// Responses naming no model: each a `model_fallbacks` entry.
-    pub(in crate::snapshots) modelless: usize,
-    /// The largest model a key or fallback copies.
-    pub(in crate::snapshots) model: usize,
-    /// Summed over responses: the text and entries (roots apart) a key's
-    /// context can copy, the base selector's share included.
-    pub(in crate::snapshots) context_strings: usize,
-    pub(in crate::snapshots) context_entries: usize,
-    /// `base_selector`'s completed heap (a clone of the current selector),
-    /// and `bucket_fallback`'s text.
-    pub(in crate::snapshots) base_selector: usize,
-    pub(in crate::snapshots) bucket_fallback: usize,
-    /// One key's `AccountPartition`, and the accounts with their rebuild
-    /// (`RequestAccounts::finish_heap_bound`).
-    pub(in crate::snapshots) partition: usize,
-    pub(in crate::snapshots) accounts: usize,
-    /// Org marker runs: at most one inherited body each.
-    pub(in crate::snapshots) marker_runs: usize,
-    /// The copy proof's text with its scratch.
-    pub(in crate::snapshots) proof: usize,
-}
-
-impl FileFold {
-    /// X_out's E term (gate on): the fold `finalize_claude_responses_e2`
-    /// builds, at its peak, in the `completed_heap` convention. Every
-    /// response is its own grain: the key (bucket, model, context map,
-    /// partition), its slot and its bucket's activity entry. One moment
-    /// holds grains twice: `absorb_grains` clones a held body (pre-birth
-    /// copies, id-less copies, a marker's inherited usage) into the entity
-    /// while the body is alive, and every response can sit in one. The
-    /// accounts' rebuild is in their own term.
-    pub(in crate::snapshots) fn finish_heap_bound(shape: &FoldShape) -> Option<usize> {
-        use super::super::claude_response_records::RFC3339_TEXT_BYTES;
-        use crate::heap_layout_bound::tree_node_bytes;
-        use std::mem::{align_of, size_of};
-        let FoldShape {
-            responses,
-            modelless,
-            model,
-            context_strings,
-            context_entries,
-            base_selector,
-            bucket_fallback,
-            partition,
-            accounts,
-            marker_runs,
-            proof,
-        } = *shape;
-        let grain = tree_node_bytes::<
-            (
-                ClaudeLiveKey,
-                Option<ClaudeRequestUsageOrigin>,
-                AccountPartition,
-            ),
-            ClaudeGrainSide,
-        >()?;
-        let activity = tree_node_bytes::<String, (i128, i128)>()?;
-        let context = tree_node_bytes::<String, String>()?;
-        // A body's two maps keep a root each, even empty.
-        let body = grain.checked_add(activity)?;
-        let per_response = grain
-            .checked_add(activity)?
-            .checked_add(RFC3339_TEXT_BYTES.checked_mul(2)?)? // the key's and activity's bucket
-            .checked_add(model)?
-            .checked_add(partition)?
-            .checked_add(context)?; // the key's context root
-        let grains = responses
-            .checked_mul(per_response)?
-            .checked_add(context_entries.checked_mul(context)?)?
-            .checked_add(context_strings)?;
-        let absorb = grains;
-        // The held copy and id-less copy boxes.
-        let held = size_of::<ClaudeEntityBody>()
-            .checked_add(align_of::<ClaudeEntityBody>())?
-            .checked_add(body)?
-            .checked_mul(2)?;
-        let inherited = if marker_runs == 0 {
-            0
-        } else {
-            size_of::<BTreeMap<u64, ClaudeEntityBody>>()
-                .checked_add(align_of::<BTreeMap<u64, ClaudeEntityBody>>())?
-                .checked_add(marker_runs.checked_add(1)?.checked_mul(
-                    tree_node_bytes::<u64, ClaudeEntityBody>()?.checked_add(body)?,
-                )?)?
-        };
-        let fallbacks = modelless
-            .checked_add(1)?
-            .checked_mul(tree_node_bytes::<u64, String>()?)?
-            .checked_add(modelless.checked_mul(model)?)?;
-        // `push` growth from four slots, and `shrink_to_fit`'s copy.
-        let skipped = responses
-            .checked_mul(3)?
-            .checked_add(4)?
-            .checked_mul(size_of::<(u64, u64)>())?;
-        // A request id is noted on its second claim: at most half the
-        // responses.
-        let ambiguous = (responses / 2 + 1).checked_mul(tree_node_bytes::<u64, ()>()?)?;
-        let mut out = 0usize;
-        for bytes in [
-            size_of::<Self>().checked_add(align_of::<Self>())?, // `claude_money`'s box
-            body,                                               // the entity's roots
-            grains,
-            absorb,
-            held,
-            inherited.checked_mul(2)?,
-            base_selector,
-            bucket_fallback,
-            fallbacks,
-            skipped,
-            ambiguous,
-            accounts,
-            proof,
-        ] {
-            out = out.checked_add(bytes)?;
-        }
-        Some(out)
-    }
-}
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -1160,6 +1027,7 @@ impl FileFold {
             telemetry: Default::default(),
             accounts: None,
             prefix: PrefixTally::default(),
+            fork_parent: None,
         };
         fold.spend(started);
         fold
@@ -1185,6 +1053,7 @@ impl FileFold {
         session: Option<&str>,
         context: Option<&ReadContext<'_>>,
         first_sequence: Option<u64>,
+        trust_from: Option<u64>,
     ) {
         let started = Instant::now();
         let subagent = context
@@ -1197,6 +1066,7 @@ impl FileFold {
             first_sequence,
             subagent,
             &[],
+            trust_from,
         )));
         self.spend(started);
     }
@@ -1234,6 +1104,10 @@ impl FileFold {
                 .contains(&super::super::claude_request_census::claude_request_hash(
                     request_id,
                 ))
+    }
+
+    pub(crate) fn fork_parent(&self) -> Option<&str> {
+        self.fork_parent.as_deref()
     }
 
     pub(crate) fn is_skipped(&self, sequence: u64) -> bool {
@@ -1388,7 +1262,10 @@ impl FileFold {
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
-        self.decide_native(context, markers, fork_parent);
+        self.fork_parent = fork_parent
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned);
+        self.decide_native(context, markers);
         if self.proof.is_none() {
             self.proof = context
                 .and_then(|context| {
@@ -1407,7 +1284,6 @@ impl FileFold {
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
-        fork_parent: Option<&str>,
     ) {
         if self.money_birth.uncertain_root() {
             self.disclose("uncertain_birth", self.responses); // counted, disclosed
@@ -1427,11 +1303,9 @@ impl FileFold {
         }
         if let Some(context) = context.filter(|context| self.cross_session_candidate(context)) {
             // The named original is a sibling file of the same project.
-            let parent = fork_parent
-                .filter(|parent| !parent.is_empty())
-                .map(|parent| {
-                    local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
-                });
+            let parent = self.fork_parent.as_deref().map(|parent| {
+                local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
+            });
             let folder = context
                 .path
                 .parent()
@@ -1993,7 +1867,7 @@ pub(crate) fn decide_page_copies(
             .state
             .get_or_insert_with(|| index.claude_copy_removals.clone());
         for file in resolved_holds {
-            state.clear_hold(file);
+            settle_hold(state, file, false);
         }
     }
 
@@ -2232,7 +2106,7 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
                 .claude_request_census
                 .get(root_key)
                 .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
-            record_counts(Counts::one(27, u64::from(deferred)));
+            record_counts(Counts::one(26, u64::from(deferred)));
             diag("family_copy_deferred", u64::from(deferred));
             false
         }
@@ -2651,9 +2525,9 @@ fn decide_holders(
         let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
         union.dedup();
         let walked = index.claude_request_census.main_transcript_holders(
-            &folder,
+            Some(folder.as_str()),
             &union,
-            deadline,
+            Some(deadline),
             |key, root, record, hits| {
                 // Per holder record, each at most once and only when another
                 // session wants one of its ids: evidence, then (birth, location).
@@ -2724,7 +2598,7 @@ fn decide_holders(
             .collect::<Vec<_>>();
         let twin_removed = wanted.twin_held.iter().filter(|&h| !decided(h)).count() as u64;
         diag("copy_prefix_twin_page_removed", twin_removed);
-        record_counts(Counts::one(28, twin_removed));
+        record_counts(Counts::one(27, twin_removed));
         let reused = wanted
             .stored
             .iter()
@@ -2738,16 +2612,6 @@ fn decide_holders(
         if absent_kept > 0 {
             diag("copy_removal_holder_absent_kept", absent_kept);
             record_counts(Counts::one(23, absent_kept));
-        }
-        // A copy that settled counted loses the prefix: its origin's acceptance counted it twice.
-        if index.claude_money_birth_store.money_marks(wanted.order.1) & money_mark::DISCLOSED != 0 {
-            let late = wanted
-                .covered
-                .keys()
-                .filter(|hash| !wanted.stored.contains(hash))
-                .count() as u64;
-            diag("copy_prefix_late_origin_removed", late);
-            record_counts(Counts::one(24, late));
         }
         if let Some(state) = updates.state.as_mut() {
             let groups = stored_groups(index, &live, wanted.covered, wanted.order.1);
@@ -2787,8 +2651,8 @@ fn decide_holders(
                 .is_some_and(|state| !state.pending(wanted.order.1));
             diag("copy_prefix_origin_unaccepted_copies", u64::from(first));
             diag("copy_prefix_origin_unaccepted_passes", 1);
-            record_counts(Counts::one(25, u64::from(first)));
-            record_counts(Counts::one(26, 1));
+            record_counts(Counts::one(24, u64::from(first)));
+            record_counts(Counts::one(25, 1));
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -2810,7 +2674,7 @@ fn decide_holders(
                 .is_some_and(|parent| parent_proves(index, parent, &wanted.session, wanted.order))
         {
             if let Some(state) = updates.state.as_mut() {
-                state.clear_hold(wanted.order.1);
+                settle_hold(state, wanted.order.1, true);
             }
             diag("copy_parent_ref", uncovered.len() as u64);
             restore_uncovered(&mut items[wanted.at], &[]);
@@ -2838,7 +2702,7 @@ fn decide_holders(
             continue;
         }
         if let Some(state) = updates.state.as_mut() {
-            state.clear_hold(wanted.order.1);
+            settle_hold(state, wanted.order.1, uncovered.is_empty());
         }
         // What no holder proves now (its id list retired, over budget or
         // missing, an origin deleted or in another folder, no stored
@@ -2926,11 +2790,13 @@ fn defer_prefix(
         return;
     };
     if ids.is_empty() {
-        state.clear_hold(file);
+        settle_hold(state, file, uncovered.is_empty());
         restore_uncovered(item, &[]);
         return;
     }
+    let age = state.hold_age(file);
     if !state.advance_hold(file) {
+        record_wait_settled(Settled::Expired, age);
         restore_uncovered(item, &ids);
         if let Some(fold) = item.claude_money.as_deref_mut() {
             fold.prefix.hold_expired = ids
@@ -2940,6 +2806,9 @@ fn defer_prefix(
                 .sum();
         }
         return;
+    }
+    if age == 0 {
+        record_counts(Counts::one(WAIT_AT, 1));
     }
     diag(reason, 1);
     let Some(fold) = item.claude_money.as_deref_mut() else {
@@ -4481,7 +4350,7 @@ fn absent_twins(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; COUNT_LEN] = [
+const COUNT_NAMES: [&str; 28] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4513,8 +4382,7 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // while their holder is no longer indexed.
     "copy_prefix_accepted_session_holds",
     "copy_removal_holder_absent_kept",
-    // A prefix removed after its origin's late acceptance; copies and passes waiting for one.
-    "copy_prefix_late_origin_removed",
+    // Copies and passes waiting for an origin's acceptance.
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
     // A forked subagent's first-line copy counted because its root was not
@@ -4523,7 +4391,11 @@ const COUNT_NAMES: [&str; COUNT_LEN] = [
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
 ];
-const COUNT_LEN: usize = 29;
+// Then `copy_prefix_wait`: proof waits started, and (episodes, decided
+// passes) settled by holder proof, third-pass expiry or counting.
+const WAIT_AT: usize = COUNT_NAMES.len();
+const WAIT_OUTCOMES: [&str; 3] = ["proof", "expired", "counted"];
+const COUNT_LEN: usize = WAIT_AT + 1 + 2 * WAIT_OUTCOMES.len();
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
@@ -4553,6 +4425,8 @@ impl Drop for PageSpent {
     }
 }
 fn record_counts(counts: Counts) {
+    #[cfg(test)]
+    PAGE_COUNTS.with(|page| page.borrow_mut().add(&counts));
     for (counter, value) in COUNTS.iter().zip(counts.0) {
         if value != 0 {
             counter.fetch_add(value, Ordering::Relaxed);
@@ -4562,8 +4436,51 @@ fn record_counts(counts: Counts) {
 pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
-#[derive(Debug, Default)]
+// This thread's share of the shared counters (test builds).
+#[cfg(test)]
+thread_local! {
+    static PAGE_COUNTS: RefCell<Counts> = const { RefCell::new(Counts([0; COUNT_LEN])) };
+}
+#[cfg(test)]
+fn take_thread_counts() -> Counts {
+    PAGE_COUNTS.take()
+}
+/// How a proof wait ended, in `WAIT_OUTCOMES` order.
+#[derive(Clone, Copy)]
+enum Settled {
+    Proof,
+    Expired,
+    Counted,
+}
+/// A proof wait ended after `age` held passes: one episode and its decided
+/// passes, this one included.
+fn record_wait_settled(outcome: Settled, age: u64) {
+    if age > 0 {
+        let at = WAIT_AT + 1 + 2 * outcome as usize;
+        let mut counts = Counts::default();
+        counts.0[at] = 1;
+        counts.0[at + 1] = age + 1;
+        record_counts(counts);
+    }
+}
+/// Clears `file`'s prefix retry debt, counting the wait it ends: proof when
+/// nothing of the prefix is left uncovered.
+fn settle_hold(state: &mut super::copy_removals::CopyRemovals, file: LocationKey, proven: bool) {
+    let outcome = if proven {
+        Settled::Proof
+    } else {
+        Settled::Counted
+    };
+    record_wait_settled(outcome, state.hold_age(file));
+    state.clear_hold(file);
+}
+#[derive(Debug)]
 pub(crate) struct Counts([u64; COUNT_LEN]);
+impl Default for Counts {
+    fn default() -> Self {
+        Self([0; COUNT_LEN])
+    }
+}
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
@@ -4595,7 +4512,7 @@ impl Counts {
         all[12] = added;
         Self(all)
     }
-    /// One enable-readiness counter (index 22..28) by `n`.
+    /// One counter by `n`.
     fn one(at: usize, n: u64) -> Self {
         let mut all = [0; COUNT_LEN];
         all[at] = n;
@@ -4615,6 +4532,21 @@ impl Serialize for Counts {
             if value != 0 {
                 map.serialize_entry(key, &value)?;
             }
+        }
+        let wait = &self.0[WAIT_AT..];
+        if wait.iter().any(|&n| n != 0) {
+            let mut family = serde_json::Map::new();
+            family.insert("version".into(), super::super::collector_version().into());
+            if wait[0] != 0 {
+                family.insert("started".into(), wait[0].into());
+            }
+            for (outcome, pair) in WAIT_OUTCOMES.into_iter().zip(wait[1..].chunks(2)) {
+                if pair[0] != 0 {
+                    let pair = serde_json::json!({"episodes": pair[0], "decisions": pair[1]});
+                    family.insert(outcome.into(), pair);
+                }
+            }
+            map.serialize_entry("copy_prefix_wait", &family)?;
         }
         map.end()
     }

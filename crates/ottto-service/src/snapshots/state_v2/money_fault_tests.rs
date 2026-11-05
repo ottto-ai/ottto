@@ -23,12 +23,6 @@ fn fixture() -> ScanIndex {
         "legacy_excluded_request_id_hashes":
             {"synthetic-file": excluded, "same-member": excluded},
     });
-    raw["claude_account_family_pending"]["synthetic-family"]["v"] =
-        json!("claude_account_request_set:v2");
-    raw["claude_account_family_pending"]["synthetic-family"]["r"] =
-        json!({"synthetic-file":format!(":{}:{}", "b".repeat(64), "c".repeat(64))});
-    raw["claude_retired_family_tombstones"] = json!({"a".repeat(64):u64::MAX});
-    raw["claude_retired_family_tombstones_initialized"] = json!(true);
     // MISC multi-segment scalar alongside FILES, ACCOUNTS and CENSUS owners.
     raw["historical_replay_generation"] = json!("x".repeat(3 * 64 * 1024 + 17));
     serde_json::from_value(raw).unwrap()
@@ -84,9 +78,9 @@ fn assert_refs(db: &mut sqlite::Sqlite) -> BTreeMap<RowKey, u64> {
     actual
 }
 
-/// [money] money presence empty null zero and tombstones survive all kind hydration.
+/// [money] money presence empty null and zero survive all kind hydration.
 #[test]
-fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
+fn money_presence_empty_null_and_zero_survive_all_kind_hydration() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-presence");
     for (n, value) in [None, Some(serde_json::Value::Null), Some(json!(0))]
         .into_iter()
@@ -131,13 +125,11 @@ fn money_presence_empty_null_zero_and_tombstones_survive_all_kind_hydration() {
     }
 }
 
-/// [money] money missing owner tombstone or segment refuses complete hydration.
+/// [money] money missing owner or segment refuses complete hydration.
 #[test]
-fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
+fn money_missing_owner_or_segment_refuses_complete_hydration() {
     for kind in [
         "v1_field.census_shadow",
-        "tombstone.claude_retired_family_tombstones",
-        "account.current",
         "proof.usage",
         "file.census",
         "file.entities",
@@ -169,9 +161,9 @@ fn money_missing_owner_tombstone_or_segment_refuses_complete_hydration() {
     }
 }
 
-/// [money] money ref diffs rollback and commit across accounts, census and usage proof.
+/// [money] money ref diffs rollback and commit across census and usage proof.
 #[test]
-fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_usage_proof() {
+fn money_ref_diffs_rollback_and_commit_across_census_and_usage_proof() {
     let scratch = crate::test_scratch::ScratchDir::canonical("money-ref-diff");
     let mut db = money_test_support::populate(
         Source::Claude,
@@ -194,7 +186,6 @@ fn money_ref_diffs_rollback_and_commit_across_accounts_census_and_usage_proof() 
         .as_object_mut()
         .unwrap()
         .remove("same-member");
-    raw["claude_account_family_pending"] = json!({});
     let mut next: ScanIndex = serde_json::from_value(raw).unwrap();
     next.generation = 2;
     for commit in [false, true] {
@@ -235,8 +226,8 @@ fn money_missing_shared_value_refuses_instead_of_losing_request_membership() {
     );
     let all = assert_refs(&mut db);
     assert!(
-        all.len() >= 3,
-        "independent account, census-prefix and full-hash domains"
+        all.len() >= 2,
+        "independent census-prefix and full-hash domains"
     );
     for key in all.keys() {
         let mut tx = db.begin(TxnMode::Write).unwrap();
@@ -339,15 +330,9 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     use sha2::Digest;
     let scratch = crate::test_scratch::ScratchDir::canonical("money-segmented");
     let mut raw = serde_json::to_value(fixture()).unwrap();
-    let mut members = serde_json::Map::new();
     let hashes = (0_u64..12_000)
-        .map(|n| {
-            let hash = format!("{:x}", sha2::Sha256::digest(n.to_be_bytes()));
-            members.insert(hash.clone(), json!(1));
-            hash
-        })
+        .map(|n| format!("{:x}", sha2::Sha256::digest(n.to_be_bytes())))
         .collect::<Vec<_>>();
-    raw["claude_account_family_pending"]["synthetic-family"]["members"] = members.into();
     raw["claude_usage_family_witnesses"]["synthetic-family"]["legacy_excluded_request_id_hashes"]
         ["synthetic-file"] = json!(hashes);
     raw["file_snapshot_fingerprints"]["synthetic-file"] = json!(hashes);
@@ -369,11 +354,7 @@ fn money_large_memberships_segment_and_preserve_exact_shared_domains() {
     assert_refs(&mut db);
     // Remove a physical chunk from each independent money domain inside a
     // rolled-back transaction, then prove the complete original still opens.
-    for kind in [
-        "account_window",
-        "file.entities",
-        "setting.historical_replay_generation",
-    ] {
+    for kind in ["file.entities", "setting.historical_replay_generation"] {
         let mut tx = db.begin(TxnMode::Write).unwrap();
         let rows = tx
             .scan_kind(&RecordKind::parse(kind).unwrap(), None, 128)

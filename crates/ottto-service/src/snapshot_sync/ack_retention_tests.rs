@@ -752,69 +752,11 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
         &f.progress_path,
         || Ok(()),
         None,
-        None,
         Some(UnsettledUploadCause::Shed),
         None,
         Default::default(),
     )
     .expect("an unsaved ledger rebind does not refuse the partial checkpoint");
-}
-
-#[test]
-fn partial_index_replacement_retires_only_proven_state_only_ack() {
-    let f = AckFixture::new(true);
-    let (index, mut progress) = f.load();
-    let old = "d".repeat(64);
-    let unknown = "e".repeat(64);
-    progress.record_body(&old, &old);
-    progress.record_body(&unknown, &unknown);
-    progress.save(&f.progress_path).unwrap();
-    let mut raw = serde_json::to_value(index).unwrap();
-    raw["codex_state_only_snapshot_fingerprints"] = serde_json::json!({"state-only":old});
-    let mut previous: ScanIndex = serde_json::from_value(raw).unwrap();
-    previous.save(&f.index_path).unwrap();
-    let mut working = serde_json::to_value(&previous).unwrap();
-    working["codex_state_only_snapshot_fingerprints"] =
-        serde_json::json!({"state-only":f.item.snapshot_fingerprint.clone()});
-    let working: ScanIndex = serde_json::from_value(working).unwrap();
-    let saved = checkpoint_partial_snapshot_index(
-        &working,
-        &previous,
-        &progress,
-        std::slice::from_ref(&f.item),
-        None,
-        &BTreeSet::new(),
-        &f.index_path,
-        &f.progress_path,
-        || Ok(()),
-    )
-    .unwrap();
-    let reloaded = ScanIndex::load(&f.index_path).unwrap();
-    assert_eq!(
-        serde_json::to_value(&saved).unwrap(),
-        serde_json::to_value(&reloaded).unwrap()
-    );
-    let saved = reloaded;
-    assert!(!saved.upload_progress_ack_incidence().any(|fp| fp == old));
-    progress
-        .release_acks_after_partial_index_save(
-            &f.progress_path,
-            &previous,
-            &saved,
-            &BTreeSet::new(),
-            true,
-        )
-        .unwrap();
-    let loaded = f.load().1;
-    assert!(!loaded.accepted_fingerprints.contains(&old));
-    assert!(
-        loaded.contains_body(
-            &f.item.snapshot_fingerprint,
-            &snapshot_upload_body_witness(&f.item)
-        ),
-        "adopted sibling remains suppressed during retained retry"
-    );
-    assert_eq!(loaded.accepted_body_witnesses[&unknown], unknown);
 }
 
 #[test]
@@ -895,9 +837,10 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         let mut committed = ScanIndex::default();
         for entity in 0..ENTITIES {
             let fp = format!("{entity:064x}");
-            committed
-                .codex_state_only_snapshot_fingerprints
-                .insert(format!("session-{entity}"), fp.clone());
+            committed.file_snapshot_fingerprints.insert(
+                format!("session-{entity}.jsonl"),
+                BTreeSet::from([fp.clone()]),
+            );
             progress.record_body(&fp, &fp);
         }
         committed.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -908,7 +851,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         progress.configure_ack_capacity(&committed);
         assert_eq!(progress.ack_capacity, ENTITIES + 4096);
         let mut selected = committed.clone();
-        selected.codex_state_only_snapshot_fingerprints.clear();
+        selected.file_snapshot_fingerprints.clear();
         progress
             .stage_ack_retirement_handoff(&committed, &mut selected, &BTreeSet::new())
             .unwrap();
@@ -1050,8 +993,9 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
         "carried",
         "unknown",
         "held",
+        "relogin",
     ] {
-        let f = AckFixture::new(true);
+        let mut f = AckFixture::new(true);
         let (committed, mut progress) = f.load();
         let mut selected = committed.clone();
         selected.files.clear();
@@ -1103,6 +1047,10 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
             }
             std::fs::write(&f.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
         }
+        if mode == "relogin" {
+            // Crash after the handoff; restart after a re-login A→B→C.
+            f.namespace = crate::snapshot_sync::relogin_namespace(&f.namespace, 2);
+        }
         let (mut saved, mut progress) = f.load();
         progress
             .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
@@ -1112,7 +1060,7 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
                 .1
                 .accepted_fingerprints
                 .contains(&f.item.snapshot_fingerprint),
-            mode != "retire",
+            !matches!(mode, "retire" | "relogin"),
             "{mode}"
         );
     }
@@ -1123,9 +1071,10 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
     let f = AckFixture::new(false);
     let (mut index, mut progress) = f.load();
     for entity in 0..5000 {
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert(format!("live-{entity}"), format!("{entity:064x}"));
+        index.file_snapshot_fingerprints.insert(
+            format!("live-{entity}.jsonl"),
+            BTreeSet::from([format!("{entity:064x}")]),
+        );
     }
     for entity in 5000..9095 {
         let fp = format!("{entity:064x}");
@@ -1403,9 +1352,9 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
             let mut item = f.item.clone();
             item.source_session_id = format!("first-install-{entity}");
             item.snapshot_fingerprint = format!("{entity:064x}");
-            scanned.codex_state_only_snapshot_fingerprints.insert(
-                item.source_session_id.clone(),
-                item.snapshot_fingerprint.clone(),
+            scanned.file_snapshot_fingerprints.insert(
+                format!("{}.jsonl", item.source_session_id),
+                BTreeSet::from([item.snapshot_fingerprint.clone()]),
             );
             item
         })
@@ -2316,7 +2265,6 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
             &f.progress_path,
             || Ok(()),
             None,
-            None,
             Some(UnsettledUploadCause::Shed),
             None,
             Default::default(),
@@ -2455,7 +2403,6 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     Ok(())
                 },
                 read_limit,
-                None,
                 None,
                 None,
                 Default::default(),

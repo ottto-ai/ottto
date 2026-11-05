@@ -34,10 +34,6 @@ pub(crate) const MAX_OPENING_FILES: usize = 64;
 /// `start_config_fingerprint`: the first 16 hex digits of
 /// `context_file_counts::salted_content_hash` (64-hex SHA-256), copied exactly.
 const CONFIG_FINGERPRINT_LEN: usize = 16;
-/// An opening file's `path_hash`: `session_attribution::opaque_hmac_id`, i.e.
-/// "<key version>:" + URL-safe unpadded base64 of the 32-byte HMAC-SHA256 (43).
-const PATH_HASH_LEN: usize =
-    crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION.len() + 1 + 43;
 /// Retained capacity of the whole in-window state, charged with the daemon's
 /// heap model (`heap_layout_bound`). Held instruction text (for path matching,
 /// 2x the largest seen) gets half; tracked files, calls, blobs and their keys
@@ -1664,53 +1660,6 @@ impl SessionStartState {
             start.start_config_fingerprint = Some(hash[..CONFIG_FINGERPRINT_LEN].to_string());
         }
         start.into_measured()
-    }
-
-    /// X_out family U2 (#665, c22 amendment 2): an upper bound on the heap the
-    /// boxed `finish` output owns, read from this state without consuming it.
-    /// Moved strings (`client_version`, each file's `tool` and `repo_path`) are
-    /// charged at their resident capacity, `ext` (a <= 8-byte key suffix) at
-    /// its key's suffix, and `path_hash` / the config fingerprint at their
-    /// fixed output length (`PATH_HASH_LEN` at most doubled by `format!`'s
-    /// growth; `CONFIG_FINGERPRINT_LEN` exact). Every tracked file is charged,
-    /// not only the <= 64 `finish` keeps. `None` past `limit`.
-    pub(super) fn finished_heap_bound(
-        &self,
-        attribution: bool,
-        device_salt: bool,
-        limit: usize,
-    ) -> Option<usize> {
-        use std::mem::{align_of, size_of};
-        // The `Box` slot, charged as `heap_layout_bound` charges it.
-        let mut bytes = size_of::<SnapshotSessionStart>()
-            .checked_add(align_of::<SnapshotSessionStart>())?
-            .checked_add(self.client_version.as_ref().map_or(0, String::capacity))?;
-        // `finish` collects the arrived files (amortized growth from 4, so a
-        // power-of-two capacity) and maps them into candidates, which std may
-        // do in that same allocation: charge the larger of the two.
-        let files = self.files.len();
-        let collected = if files == 0 {
-            0
-        } else {
-            files.checked_next_power_of_two()?.max(4)
-        };
-        let in_place = collected.checked_mul(size_of::<(String, usize, OpeningFileState)>())?;
-        let fresh = files
-            .min(MAX_OPENING_FILES)
-            .checked_mul(size_of::<OpeningFileCandidate>())?;
-        bytes = bytes.checked_add(in_place.max(fresh))?;
-        let path_hash = if attribution { 2 * PATH_HASH_LEN } else { 0 };
-        for (key, file) in &self.files {
-            bytes = bytes
-                .checked_add(file.tool.capacity())?
-                .checked_add(file.repo_path.as_ref().map_or(0, String::capacity))?
-                .checked_add(extension(key).map_or(0, str::len))?
-                .checked_add(path_hash)?;
-        }
-        if device_salt && self.config_digest.is_some() {
-            bytes = bytes.checked_add(CONFIG_FINGERPRINT_LEN)?;
-        }
-        (bytes <= limit).then_some(bytes)
     }
 
     /// Path matching saw only part of the injected instruction text (its

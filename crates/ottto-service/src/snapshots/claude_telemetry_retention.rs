@@ -141,7 +141,7 @@ fn retire(
     run
 }
 /// The ONE protection set, as stems: every root the roster lists, the index
-/// keys, the census, pending and witness families (legacy owners included),
+/// keys, the census, witness families (legacy owners included),
 /// account holds, Tail heads and named parents. A removed key is protected
 /// unless a same-name stat proves it absent beneath every configured root.
 /// `None`: the Tail heads could not be read (everything is held).
@@ -153,27 +153,13 @@ fn protected_stems(
     roster: &g7_debt::Roster,
 ) -> Option<BTreeSet<String>> {
     let heads = state_v2::tail_head_keys(index).ok()?;
-    // Account-pending families that still owe identity, and witnessed
-    // families with their legacy owners.
-    let families = index
-        .claude_account_family_pending
-        .iter()
-        .filter(|(_, pending)| {
-            pending.invalid
-                || pending.has_history()
-                || pending
-                    .member_requests
-                    .values()
-                    .any(|requests| requests.identity_revision.is_none())
-        })
-        .map(|(root, _)| root)
-        .chain(index.claude_usage_family_witnesses.keys())
-        .chain(
-            index
-                .claude_usage_family_witnesses
-                .values()
-                .flat_map(|witness| witness.legacy_owner_roots.iter()),
-        );
+    // Witnessed families with their legacy owners.
+    let families = index.claude_usage_family_witnesses.keys().chain(
+        index
+            .claude_usage_family_witnesses
+            .values()
+            .flat_map(|witness| witness.legacy_owner_roots.iter()),
+    );
     let mut roots = BTreeSet::<&str>::new();
     let keys = roster
         .listed

@@ -679,54 +679,6 @@ fn empty_file_proof_is_local_and_never_ack_evidence() {
     assert!(!f.index.copy_prefix_base_context_proven(&f.key()));
 }
 
-/// [format] An old decoder drops the per-entity stamp. Missing means owed, and
-/// the file receipt beside it is untouched. The retired source-wide context
-/// is decoded and dropped, and grants nothing.
-#[test]
-fn entity_stamp_dropped_by_old_decoder_is_owed() {
-    let mut f = Fixture::new(SnapshotSource::Codex);
-    f.adopt();
-    let entity = "b".repeat(64);
-    f.index
-        .codex_state_only_snapshot_fingerprints
-        .insert("state-only".into(), entity.clone());
-    f.index.stamp_entity_upload_context_acks(
-        &"a".repeat(64),
-        &BTreeMap::from([(entity.clone(), "c".repeat(64))]),
-        &BTreeMap::from([(entity.clone(), "d".repeat(64))]),
-    );
-    assert_eq!(
-        f.index
-            .upload_context_owed_counts(f.source)
-            .no_proof_entities,
-        0
-    );
-    let saved_path = f._scratch.join("entity-stamp-index.json");
-    f.index.save(&saved_path).unwrap();
-    let mut encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
-    assert!(encoded["upload_context_proof"]["entity_stamps"]
-        .get(&entity)
-        .is_some());
-    encoded
-        .as_object_mut()
-        .unwrap()
-        .remove("upload_context_proof");
-    // An earlier daemon's source-wide context decodes and is dropped.
-    encoded["upload_context_fingerprint"] = json!("d".repeat(64));
-    fs::write(&saved_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
-    f.index = ScanIndex::load(&saved_path).unwrap();
-    assert!(serde_json::to_value(&f.index).unwrap()["upload_context_fingerprint"].is_null());
-    f.index
-        .activate_file_upload_context(f.source, "d".repeat(64));
-    assert_eq!(
-        f.index
-            .upload_context_owed_counts(f.source)
-            .no_proof_entities,
-        1
-    );
-    assert!(f.entry().upload_context_receipt.is_some());
-}
-
 /// [regress] Local pacing debt is not a backend conflict: the deferred
 /// catch-up stays owed on its own file and the page completes, so it no
 /// longer marks the sweep unsettled (before: Deferred, deferred_conflict).
@@ -2314,7 +2266,7 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
             census_member: true,
             watcher_hint: false,
         },
-        &f.index.files
+        &f.index
     ));
     f.index.traversal = None;
     ensure_bounded_traversal(

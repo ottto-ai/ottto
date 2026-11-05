@@ -11,7 +11,7 @@ use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equ
 use crate::snapshots::AccountSource;
 
 /// (basis, login, org, account source); untagged shares have an empty basis.
-type Placement = (
+pub(super) type Placement = (
     String,
     Option<String>,
     Option<String>,
@@ -19,7 +19,7 @@ type Placement = (
 );
 
 /// Requests per placement over `item`'s bucket rows.
-fn placements(item: &SnapshotItem) -> BTreeMap<Placement, u64> {
+pub(super) fn placements(item: &SnapshotItem) -> BTreeMap<Placement, u64> {
     let mut placed = BTreeMap::new();
     for row in item
         .usage_buckets
@@ -60,7 +60,7 @@ fn placements(item: &SnapshotItem) -> BTreeMap<Placement, u64> {
 }
 
 /// Every identity part sums to its bucket row.
-fn parts_conserve(item: &SnapshotItem) -> bool {
+pub(super) fn parts_conserve(item: &SnapshotItem) -> bool {
     item.usage_buckets
         .iter()
         .flat_map(|bucket| &bucket.model_usage)

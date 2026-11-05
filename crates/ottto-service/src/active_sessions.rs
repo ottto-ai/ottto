@@ -26,7 +26,7 @@ use crate::locked_state_dir::replace_json_cache;
 use crate::snapshots::{
     bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
+    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS, CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -344,7 +344,14 @@ fn active_session_from_snapshot(
     let attribution = agent_status.and_then(|status| account_attribution(snapshot, status));
     let compaction_timestamps =
         bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
-    let (latest_model, latest_reasoning_effort) = latest_model_identity(snapshot);
+    let latest_row = latest_model_row(snapshot);
+    let (latest_model, latest_reasoning_effort) = latest_model_identity(latest_row);
+    // Pi has no account to label, so its card names the provider route of the
+    // same newest row instead.
+    let provider_route = latest_row
+        .filter(|_| source == SnapshotSource::Pi)
+        .and_then(|row| row.model_provider.clone())
+        .filter(|provider| non_empty(provider));
     let (current_account, account_history) = session_accounts(source, snapshot);
     let session_kind = active_session_kind(source, snapshot);
     ActiveSession {
@@ -411,6 +418,7 @@ fn active_session_from_snapshot(
         account_attribution_source: attribution.map(|value| value.source),
         latest_model,
         latest_reasoning_effort,
+        provider_route,
         current_account,
         account_history,
     }
@@ -495,8 +503,8 @@ fn active_session_context_points(points: &[LocalContextPoint]) -> Vec<ActiveSess
 /// newest bucket; within that bucket there is no finer ordering, so the row
 /// that did the most work wins. Ties break on model name so two scans of the
 /// same transcript never disagree.
-fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<String>) {
-    let Some(bucket) = snapshot
+fn latest_model_row(snapshot: &SnapshotItem) -> Option<&SnapshotModelUsage> {
+    let bucket = snapshot
         .usage_buckets
         .iter()
         .filter(|bucket| !bucket.model_usage.is_empty())
@@ -511,12 +519,8 @@ fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<Str
                         .unwrap_or(right.bucket_start.as_str()),
                 )
                 .then_with(|| left.bucket_start.cmp(&right.bucket_start))
-        })
-    else {
-        return (None, None);
-    };
-
-    let row = bucket
+        })?;
+    bucket
         .model_usage
         .iter()
         .max_by(|left, right| {
@@ -524,8 +528,10 @@ fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<Str
                 .cmp(&row_tokens(right))
                 .then_with(|| right.model.cmp(&left.model))
         })
-        .filter(|row| non_empty(&row.model));
+        .filter(|row| non_empty(&row.model))
+}
 
+fn latest_model_identity(row: Option<&SnapshotModelUsage>) -> (Option<String>, Option<String>) {
     match row {
         Some(row) => (
             Some(row.model.clone()),
@@ -670,13 +676,17 @@ fn account_attribution(
     if let Some(account_hash) = snapshot_account_hash {
         return Some(attribution_from_account_hash(
             account_hash,
+            snapshot,
             status,
             "snapshot_account_identity",
         ));
     }
     // The session's own requests already name several accounts: a parent's or
     // the current login's single account must never stand in for them.
-    if account_withheld_reason(snapshot) == Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS) {
+    if matches!(
+        account_withheld_reason(snapshot),
+        Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS | CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+    ) {
         return None;
     }
     match lineage_account_attribution(snapshot, status) {
@@ -725,6 +735,13 @@ fn account_withheld_reason(snapshot: &SnapshotItem) -> Option<&'static str> {
     match exact_snapshot_account_hash(snapshot) {
         EvidenceResolution::Missing => snapshot.claude_account_withheld_reason,
         EvidenceResolution::Resolved(_) => None,
+        // Held over the account limit: the hold, not the mix, is the news.
+        EvidenceResolution::Conflict
+            if snapshot.claude_account_withheld_reason
+                == Some(CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS) =>
+        {
+            snapshot.claude_account_withheld_reason
+        }
         EvidenceResolution::Conflict if request_identity_rows => {
             // Stops at the second account; nothing is collected.
             let mut first = None;
@@ -915,16 +932,24 @@ fn lineage_account_attribution(
 
 fn attribution_from_account_hash(
     account_hash: String,
+    snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
     source: &str,
 ) -> AccountAttribution {
     let matching_observation = status.plan_observations.iter().find(|observation| {
         observation.account_identifier_hash.as_deref() == Some(account_hash.as_str())
     });
+    let organization_identifier_hash = matching_observation
+        .and_then(|observation| observation.organization_identifier_hash.clone())
+        .or_else(|| {
+            // Other Codex logins have no plan observation in the default home's
+            // status. Their own creator pair can complete this local display key.
+            let (creator_account, workspace) = crate::snapshots::codex_creator_pair(snapshot)?;
+            (creator_account == account_hash).then(|| workspace.to_string())
+        });
     AccountAttribution {
         account_identifier_hash: Some(account_hash),
-        organization_identifier_hash: matching_observation
-            .and_then(|observation| observation.organization_identifier_hash.clone()),
+        organization_identifier_hash,
         subscription_product: matching_observation
             .and_then(|observation| observation.subscription_product.clone()),
         source: source.to_string(),
@@ -1128,6 +1153,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pi_session_carries_newest_row_provider_route_and_other_sources_none() {
+        let mut older = usage_row("glm-5", None, 900);
+        older.model_provider = Some("gcp_glm".to_string());
+        let mut newest = usage_row("gemini-3-flash-preview", None, 10);
+        newest.model_provider = Some("google_vertex".to_string());
+        newest.gateway_provider = Some("google_vertex".to_string());
+        let mut snapshot = test_snapshot("s-pi", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![
+            bucket("2026-07-19T10:00:00Z", "2026-07-19T10:30:00Z", vec![older]),
+            bucket("2026-07-19T11:00:00Z", "2026-07-19T11:04:00Z", vec![newest]),
+        ];
+        let route = |snapshot: &SnapshotItem, source| {
+            active_session_from_snapshot(source, snapshot, None).provider_route
+        };
+
+        assert_eq!(
+            route(&snapshot, SnapshotSource::Pi).as_deref(),
+            Some("google_vertex")
+        );
+        assert_eq!(route(&snapshot, SnapshotSource::ClaudeCode), None);
+
+        snapshot.usage_buckets[1].model_usage[0].model_provider = Some(" ".to_string());
+        assert_eq!(route(&snapshot, SnapshotSource::Pi), None);
     }
 
     #[test]
@@ -2309,6 +2360,120 @@ mod tests {
             active.account_attribution_source.as_deref(),
             Some("snapshot_account_identity")
         );
+    }
+
+    #[test]
+    fn codex_bound_sessions_complete_their_local_account_workspace_key() {
+        let account = |id| ottto_core::billing_identity_hash("openai", "account", id).unwrap();
+        let workspace = |id| ottto_core::billing_identity_hash("openai", "workspace", id).unwrap();
+        let default_account = account("default-login");
+        let slot_account = account("slot-login");
+        let default_workspace = workspace("default-workspace");
+        let slot_workspace = workspace("slot-workspace");
+        let mut status = test_status();
+        status.source = ottto_protocol::SourceKind::Codex;
+        let mut observation = test_plan_observation(
+            "default-status",
+            &default_account,
+            AgentStatusConfidence::High,
+        );
+        observation.organization_identifier_hash = Some(default_workspace.clone());
+        status.plan_observations.push(observation);
+
+        for (name, bound_account, creator_account, creator_workspace, disposition, expected_org) in [
+            (
+                "other-slot",
+                &slot_account,
+                &slot_account,
+                Some(&slot_workspace),
+                None,
+                Some(&slot_workspace),
+            ),
+            (
+                "default-observation-wins",
+                &default_account,
+                &default_account,
+                Some(&slot_workspace),
+                None,
+                Some(&default_workspace),
+            ),
+            (
+                "mismatched-creator",
+                &slot_account,
+                &default_account,
+                Some(&default_workspace),
+                None,
+                None,
+            ),
+            (
+                "missing-workspace",
+                &slot_account,
+                &slot_account,
+                None,
+                None,
+                None,
+            ),
+            (
+                "conflicting-creator",
+                &slot_account,
+                &slot_account,
+                Some(&slot_workspace),
+                Some("conflict"),
+                None,
+            ),
+        ] {
+            let dir = temp_dir(name);
+            let mut snapshot = test_snapshot(name, "2026-07-19T10:04:00Z");
+            snapshot.model_usage[0].account_identifier_hash = Some(bound_account.clone());
+            snapshot.usage_buckets[0].model_usage[0].account_identifier_hash =
+                Some(bound_account.clone());
+            snapshot.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "openai",
+                account_identifier_hash: Some(creator_account.clone()),
+                provider_workspace_hash: creator_workspace.cloned(),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "codex_creator_header:v1",
+                identity_disposition: disposition,
+                source_created_at: None,
+            });
+
+            let result = reconcile_active_sessions(
+                &dir,
+                SnapshotSource::Codex,
+                &[snapshot],
+                Some(&status),
+                None,
+                "2026-07-19T10:05:00Z",
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), 1, "{name}");
+            let active = &result.sessions[0];
+            // Companion cards require both account and workspace hashes exactly;
+            // creator workspace hashes already use the card's workspace namespace.
+            assert_eq!(
+                active.account_identifier_hash.as_ref(),
+                Some(bound_account),
+                "{name}"
+            );
+            assert_eq!(
+                active.organization_identifier_hash.as_ref(),
+                expected_org,
+                "{name}"
+            );
+            assert_eq!(
+                active.account_attribution_source.as_deref(),
+                Some("snapshot_account_identity"),
+                "{name}"
+            );
+            assert_eq!(
+                read_active_session_reconciliation(&dir, SnapshotSource::Codex)
+                    .unwrap()
+                    .sessions,
+                result.sessions,
+                "{name}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

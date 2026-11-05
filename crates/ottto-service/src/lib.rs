@@ -256,7 +256,6 @@ pub struct LocalDaemon {
     footprint_cwds: Arc<context_footprint::CwdProjection>,
     codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
-    native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     relay_mismatch: Arc<otlp_relay::RelayMismatchDebounce>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -476,17 +475,17 @@ impl LocalDaemon {
         now: impl Into<String>,
     ) -> Self {
         let now = now.into();
+        let footprint_cwds = Arc::<context_footprint::CwdProjection>::default();
+        let codex_preludes =
+            codex_prelude_footprint::CodexPreludeFeed::new(footprint_cwds.inputs());
         Self {
             session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
-            footprint_cwds: Arc::default(),
-            codex_preludes: Arc::default(),
+            footprint_cwds,
+            codex_preludes: Arc::new(codex_preludes),
             codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
                 snapshot_sync::home_dir().ok().as_deref(),
             )),
-            native_comparison: Arc::new(
-                snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
-            ),
             relay_mismatch: Arc::default(),
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
@@ -649,7 +648,7 @@ impl LocalDaemon {
         // perform settings I/O while holding the daemon state lock.
         let relay = self.state()?.relay.clone();
         let observed = otlp_relay::approved_endpoint_mismatch(&relay);
-        let mut status = {
+        let status = {
             let mut state = self.state()?;
             observe_scan_index_health_changes(&mut state);
             // Pair the relay finding with the same captured state and canonical
@@ -659,9 +658,6 @@ impl LocalDaemon {
             );
             status_from_state_with_relay_finding(&mut state, finding)
         };
-        if snapshots::claude_native_comparison::enabled() {
-            status.native_comparison = Some(self.native_comparison.status());
-        }
         Ok(status)
     }
 
@@ -2297,6 +2293,8 @@ fn status_from_state_with_relay_finding(
         let source = snapshot_sync::snapshot_source_of_kind(&health.source);
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
+        // Read here only; row builders leave it false, so no row goes stale.
+        health.source_paused = snapshot_sync::source_paused(&default_support_dir(), source);
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
@@ -2557,11 +2555,13 @@ fn runtime_identity_for_status_with_installed_app_version(
     observed_at: &str,
     installed_app_version: &str,
 ) -> RuntimeIdentityV1 {
-    let executable_path = std::env::current_exe().ok();
+    // The executable path is read only to classify the install; it contains
+    // the macOS user name, so it never leaves the Mac in this identity.
     let install_owner = if status.service_owner.daemon_owner != InstallOwner::Unknown {
         status.service_owner.daemon_owner
     } else {
-        executable_path
+        std::env::current_exe()
+            .ok()
             .as_deref()
             .map(ottto_core::install_owner_for_path)
             .unwrap_or(InstallOwner::Unknown)
@@ -2575,7 +2575,7 @@ fn runtime_identity_for_status_with_installed_app_version(
         app_bundle_version: app_bundle_version.clone(),
         cli_version: Some(installed_app_version.to_string()),
         service_version: Some(daemon_version.clone()),
-        service_pid: Some(std::process::id()),
+        service_pid: None,
         service_executable_path_class: match install_owner {
             InstallOwner::AppBundle => "app_bundle_helper",
             InstallOwner::Homebrew => "homebrew",
@@ -2584,7 +2584,7 @@ fn runtime_identity_for_status_with_installed_app_version(
             InstallOwner::Unknown => "unknown",
         }
         .to_string(),
-        service_executable_path: executable_path.map(|path| path.display().to_string()),
+        service_executable_path: None,
         service_executable_hash: None,
         launchd_label: Some(ottto_core::MACOS_LAUNCH_AGENT_LABEL.to_string()),
         launchd_loaded_program_hash: None,
@@ -2641,10 +2641,9 @@ fn runtime_heartbeat_for_status(
         app_bundle_version: runtime.app_bundle_version.clone(),
         protocol_version: format!("local_control.v{}", status.protocol_version),
         health_schema_version: "local_machine_health.v1".to_string(),
-        executable_path: runtime
-            .service_executable_path
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
+        // The backend contract still requires this key. Send the coarse
+        // install class, never the absolute path.
+        executable_path: runtime.service_executable_path_class.clone(),
         install_owner: runtime.install_owner,
         launchd_label: runtime
             .launchd_label
@@ -3487,6 +3486,7 @@ fn local_health_capabilities(status: &DaemonStatus) -> Vec<String> {
         "service.reconcile".to_string(),
         "source.remove".to_string(),
         "backfill.v1".to_string(),
+        "source_control:v1".to_string(),
     ];
     for source in &status.sources {
         capabilities.push(format!("verify.{}", source_slug(&source.source)));
@@ -3905,6 +3905,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         connected_at: state.first_seen(&source),
         telemetry_configured: telemetry_configured_for_source(&source),
         reconciliation_enabled: state.reconciliation_enabled(&source),
+        source_paused: false,
     }
 }
 
@@ -4313,6 +4314,7 @@ fn source_health_from_verification(
         connected_at: state.first_seen(&result.source),
         telemetry_configured: telemetry_configured_for_source(&result.source),
         reconciliation_enabled: state.reconciliation_enabled(&result.source),
+        source_paused: false,
     }
 }
 
@@ -4814,6 +4816,7 @@ fn source_health_from_agent_status(
         connected_at: state.first_seen(&snapshot.source),
         telemetry_configured: telemetry_configured_for_source(&snapshot.source),
         reconciliation_enabled: state.reconciliation_enabled(&snapshot.source),
+        source_paused: false,
     }
 }
 
@@ -6295,6 +6298,45 @@ mod tests {
         assert_eq!(runtime.service_version.as_deref(), Some("0.1.30-rc1"));
         assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
         assert!(runtime.version_match);
+    }
+
+    #[test]
+    fn uploaded_runtime_identity_and_heartbeat_carry_no_executable_path_or_pid() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T07:00:00Z",
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+        let heartbeat = runtime_heartbeat_for_status(&status, &runtime, 7);
+
+        assert_eq!(runtime.service_executable_path, None);
+        assert_eq!(runtime.service_pid, None);
+        assert_eq!(runtime.service_executable_path_class, "app_bundle_helper");
+        assert_eq!(heartbeat.executable_path, "app_bundle_helper");
+
+        let runtime_json = serde_json::to_value(&runtime).expect("runtime json");
+        assert!(runtime_json.get("service_executable_path").is_none());
+        assert!(runtime_json.get("service_pid").is_none());
+        let exe = std::env::current_exe().expect("test executable");
+        let exe = exe.display().to_string();
+        for json in [
+            runtime_json.to_string(),
+            serde_json::to_string(&heartbeat).expect("heartbeat json"),
+        ] {
+            assert!(
+                !json.contains(&exe),
+                "uploaded JSON carries the executable path"
+            );
+            assert!(
+                !json.contains("\"/Users/"),
+                "uploaded JSON carries a home path"
+            );
+        }
     }
 
     #[test]
@@ -9140,6 +9182,7 @@ mod tests {
             connected_at: Some("2026-05-05T09:00:00Z".to_string()),
             telemetry_configured: Some(true),
             reconciliation_enabled: Some(true),
+            source_paused: false,
         }
     }
 

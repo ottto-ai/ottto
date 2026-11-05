@@ -75,12 +75,7 @@ pub(crate) fn routed_for_test(
     {
         return index;
     }
-    let prior = if on.is_some() {
-        state_v2::money_test_support::resident(&index)
-    } else {
-        index
-    };
-    let (path, cold) = publish_route(&prior, dir);
+    let (path, cold) = publish_route(&index, dir);
     let others = own.take().map_or_else(Vec::new, |route| {
         let mut others = route.others;
         others.push(route.path);
@@ -108,11 +103,9 @@ pub(crate) fn continue_route_for_test(cache: &sampled_scan::SharedCache, route: 
     });
 }
 
-/// `index`'s files with no continuation, on their own route: RAM is released
-/// and each head retired, so the next read of each is a Full as a first read
-/// is. A released cache alone keeps the heads, as in production.
-pub(crate) fn forget_continuations_for_test(cache: &sampled_scan::SharedCache, index: &ScanIndex) {
-    cache.clear();
+/// `index`'s files with no continuation, on their own route: each head is
+/// retired, so the next read of each is a Full as a first read is.
+pub(crate) fn forget_continuations_for_test(_cache: &sampled_scan::SharedCache, index: &ScanIndex) {
     if let Some(route) = route_of(index) {
         state_v2::retire_tail(&route, index.files.keys().cloned()).unwrap();
     }
@@ -185,7 +178,7 @@ fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     (path, cold)
 }
 
-/// A restart of `index` as its own install: its resident graph published on
+/// A restart of `index` as its own install: its graph published on
 /// a new route, so another install's commits from the same prior never stale
 /// it. An unrouted index is returned as is.
 pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
@@ -193,7 +186,7 @@ pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
         return index.clone();
     }
     // A restart from disk: runtime-only fields are gone, as through a file.
-    publish_route(&state_v2::money_test_support::resident(index), dir).1
+    publish_route(index, dir).1
 }
 
 /// This thread's process total of the Tail counter `name{label}`, summed over
@@ -220,28 +213,19 @@ impl Continuation {
     }
 }
 
-/// `key`'s continuation: for a source with a Tail codec its head on
-/// `index`'s route (this pass's staged head, else the committed one), as the
-/// RAM-era fixture read its retained checkpoint; any other source's retained
-/// copy.
+/// `key`'s continuation: its head on `index`'s route (this pass's staged
+/// head, else the committed one), as the RAM-era fixture read its retained
+/// checkpoint.
 pub(crate) fn continuation_for_test(
     source: SnapshotSource,
-    cache: &sampled_scan::SharedCache,
+    _cache: &sampled_scan::SharedCache,
     index: &ScanIndex,
     key: &str,
 ) -> Option<Continuation> {
     let certificate = match source {
         SnapshotSource::ClaudeCode => head_certificate::<tail_source::claude::Claude>(index, key)?,
         SnapshotSource::Codex => head_certificate::<tail_source::codex::Codex>(index, key)?,
-        SnapshotSource::Pi => {
-            return cache
-                .retained_checkpoint(key)
-                .map(|checkpoint| Continuation {
-                    audit_debt: checkpoint.audit_debt(),
-                    last_full_verified: checkpoint.last_full_verified(),
-                    sealed_offset: checkpoint.sealed_offset(),
-                })
-        }
+        SnapshotSource::Pi => head_certificate::<tail_source::pi::Pi>(index, key)?,
     };
     Some(Continuation {
         audit_debt: certificate
@@ -269,14 +253,9 @@ fn head_certificate<S: tail_source::TailSource>(
     Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
 }
 
-/// A routed graph read back resident, for byte comparisons; an unrouted one
-/// as is.
+/// The graph compared byte for byte, routed or not.
 pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
-    if route_of(index).is_some() {
-        state_v2::money_test_support::resident(index)
-    } else {
-        index.clone()
-    }
+    index.clone()
 }
 
 /// A scan fixture's page continues from its owner's route; with no cache it
@@ -295,7 +274,7 @@ pub(crate) fn route_for_test(
         if !fixture_route {
             return index;
         }
-        let mut copy = state_v2::money_test_support::resident(&index);
+        let mut copy = index.clone();
         copy.v2_mut().persistence_v2 = None;
         carry_runtime(&index, &mut copy);
         return copy;
@@ -365,7 +344,7 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
         return index.save(path).unwrap();
     };
     save_on_route(index, &route).unwrap();
-    let mut copy = state_v2::money_test_support::resident(index);
+    let mut copy = index.clone();
     copy.v2_mut().persistence_v2 = None;
     // A fresh copy each save: its generation is the route's, not this file's.
     let _ = fs::remove_file(path);
@@ -456,15 +435,6 @@ impl E2ScanFixture {
         forget_continuations_for_test(&self.cache, index);
     }
 
-    pub(crate) fn evict_for_pressure(&self, index: &ScanIndex) {
-        let mut retained = self.cache.retained().unwrap();
-        let empty = sampled_scan::RetainedCache::default();
-        let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
-        assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
-        drop(retained);
-        forget_continuations_for_test(&self.cache, index);
-    }
-
     #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
     pub(crate) fn scan(
         &self,
@@ -512,8 +482,23 @@ impl E2ScanFixture {
         source: SnapshotSource,
         roots: &[PathBuf],
         support: &Path,
+        index: ScanIndex,
+        sampled: bool,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        self.scan_other_page(source, roots, support, index, sampled, 100, &[])
+    }
+
+    /// The same native acquisition with a bounded page and watcher hints.
+    #[expect(clippy::too_many_arguments, reason = "test helper, 8 scan inputs")]
+    pub(crate) fn scan_other_page(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        support: &Path,
         mut index: ScanIndex,
         sampled: bool,
+        limit: usize,
+        hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         index.activate_effective_upload_body_witness_revision(
             crate::snapshot_sync::effective_upload_body_witness_revision(source),
@@ -524,9 +509,9 @@ impl E2ScanFixture {
             index,
             "2026-10-27T08:00:00Z",
             183,
-            100,
+            limit,
             Some(support),
-            &[],
+            hints,
             false,
         );
         if sampled {
@@ -764,16 +749,16 @@ pub(crate) fn write_exclusions(support: &Path, sessions: &[&str]) {
     fs::write(path, lines).unwrap();
 }
 
-/// A real fail-closed exclusion-list result, scoped to this fixture index.
+/// Ordinary (pre-`e2`) money for every family, scoped to this fixture index:
+/// the list names every family.
 pub(crate) fn ordinary_index(mut index: ScanIndex) -> ScanIndex {
-    index.claude_reemission_exclusions = claude_reemission_exclusions::ReemissionExclusions::parse(
-        b"malformed synthetic exclusion input",
-    );
+    index.claude_reemission_exclusions =
+        claude_reemission_exclusions::ReemissionExclusions::listing_every_family_for_test();
     index
 }
 
-/// Ordinary-money parser fixture through the existing native parser and real
-/// paused-adoption input. No alternate resolver or money builder.
+/// Ordinary-money parser fixture through the existing native parser, every
+/// family listed. No alternate resolver or money builder.
 pub(crate) fn parse_ordinary(
     path: &Path,
     at: &str,
@@ -817,13 +802,6 @@ pub(super) fn parse_ordinary_with_metadata(
             }),
         )
         .map(|parsed| parsed.snapshots)
-}
-
-/// Persist a real malformed-list input to exercise fail-closed ordinary money.
-pub(crate) fn pause_adoption(support: &Path) {
-    let path = claude_reemission_exclusions::ReemissionExclusions::path(support);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, b"malformed synthetic exclusion input").unwrap();
 }
 
 /// Telemetry retention dependency row: an account hold on `key`.

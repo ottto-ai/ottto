@@ -279,8 +279,7 @@ fn held<T>(result: Result<T>) -> Result<T> {
     result
 }
 
-/// Present root: caller already owns CheckpointLock, BEFORE v1 decode.
-/// Missing root calls the same function from check_missing's existing lock.
+/// Caller owns CheckpointLock, before missing-root validation or v1 decode.
 /// Without a support dir (unit tests, tools) `importable` is false and only an
 /// existing route loads. The returned flag says the caller's v1 load may import.
 pub(in super::super) fn load_locked(
@@ -347,13 +346,7 @@ fn load_with_custody(
                                 Ok((db.stamp()? == stamp).then_some(stamp))
                             },
                         )?;
-                        if let Some((mut index, mut cx, digests, _)) = image {
-                            // Same session and stamp: rollovers its commits
-                            // wrote stay committed for graphs that outlive
-                            // this load.
-                            if !session.cx.ambiguous {
-                                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
-                            }
+                        if let Some((mut index, cx, digests, _)) = image {
                             session.cx = cx;
                             adopt(state, digests, &session.cx);
                             index.v2_mut().persistence_v2 = Some(runtime.clone());
@@ -549,7 +542,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             );
             let mut random = [0_u8; 16];
             std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            let generation = import::import_generation(index)?;
+            let generation = import::import_generation(index, original)?;
             let identity = Identity {
                 format: FORMAT,
                 db_id: crate::hex::encode(&random),
@@ -589,10 +582,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
         db.audit_headers()?;
         let stamp = db.stamp()?;
-        ensure!(
-            stamp.0 == import::import_generation(index)?,
-            Hold::DbUnavailable
-        );
+        ensure!(stamp.0 == identity.fence_generation, Hold::DbUnavailable);
         index.generation = stamp.0;
         let digests = kinds::baseline(index, &mut cx)?;
         index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
@@ -635,9 +625,6 @@ pub(in super::super) fn save_locked(
                 let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let digests = kinds::baseline(&previous, &mut cx)?;
-                // Committed rollovers outlive the dropped baseline: a sibling
-                // graph saved after a claim-only save still skips them.
-                cx.cold_rolled = std::mem::take(&mut session.cx.cold_rolled);
                 session.cx = cx;
                 digests
             }
@@ -648,14 +635,7 @@ pub(in super::super) fn save_locked(
         }
         recovered_write(path, progress_owner, &id, session, |session| {
             session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
-            let saved = import::save(
-                &mut session.db,
-                &id,
-                previous,
-                index,
-                &mut session.cx,
-                claim_only,
-            );
+            let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
             // A commit published the stage; otherwise it waits for the next
             // save or the exit commit.
             if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
@@ -1236,7 +1216,7 @@ fn read_txn_at<R>(
 #[path = "runtime_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(in super::super) use tests::{erase_published, materialized, with_session_db};
+pub(in super::super) use tests::{erase_published, with_session_db};
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]

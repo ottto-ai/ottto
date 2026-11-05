@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const MAX_LOCAL_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 pub(crate) const LINEAGE_SAMPLES: usize = 4;
 pub(crate) const MAX_FENCED_CENSUS_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_FENCED_CENSUS_ENTRIES: usize = 32_768;
@@ -253,7 +252,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for UnreadableSamples {
 /// (with the cause it names one call site) and, when the site names a file,
 /// that file's root class, kind and the first 8 bytes of `digest(index key)`
 /// (lineage's `file_key_digest`) as a big-endian `u64`. Never path text. One
-/// flat record, so 32 samples stay inside `MAX_LOCAL_DIAGNOSTIC_BYTES`.
+/// flat record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct UnreadableSample {
     line: u32,
@@ -747,13 +746,11 @@ pub(crate) struct IdentityConflictTaxonomy {
     pub state_cross_root_progress_only_keys: u32,
     pub state_cross_root_identity_field_keys: u32,
     pub state_cross_root_field_differs: StateRowFieldDiffs,
-    /// All loaders' conflict keys after every home, and the subsets the merged
-    /// created classification and the prior scan's durable state-only
-    /// entities still name. Spawn edges whose parent is a conflict key count
-    /// once per child.
+    /// All loaders' conflict keys after every home, and the subset the merged
+    /// created classification still names. Spawn edges whose parent is a
+    /// conflict key count once per child.
     pub conflict_keys_total: u32,
     pub conflict_keys_state_created: u32,
-    pub conflict_keys_prior_state_only: u32,
     pub conflict_parent_child_edges: u32,
 }
 impl IdentityConflictTaxonomy {
@@ -917,8 +914,7 @@ pub(crate) const CREATOR_PREVIOUSLY_UPLOADED: usize = 8;
 
 /// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
 /// finished parses (a singleton, or a joined group's single replay parse,
-/// each folded once), summed with saturation. Owned by the scan result and
-/// borrowed into the local terminal journal as `local_codex_counting_v2`;
+/// each folded once), summed with saturation. Owned by the scan result;
 /// also present for active-cutover scans or tombstone bookkeeping. Usage vectors are
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -981,7 +977,7 @@ crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evi
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
-crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
+crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_parent_child_edges);
 crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::unit_enum!(false;
     LoaderReason: Complete | Io | SqliteBusy | SqliteOpenOrQuery | SqliteRowDecode
@@ -1135,7 +1131,7 @@ mod tests {
         assert!(!serde_json::to_string(&evidence).unwrap().contains("secret"));
     }
     #[test]
-    fn fully_populated_schema_stays_bounded_and_content_free() {
+    fn fully_populated_schema_stays_content_free() {
         let mut diagnostics = CodexScanDiagnostics {
             version: 1,
             generation: u64::MAX,
@@ -1180,7 +1176,6 @@ mod tests {
             state_cross_root_field_differs: field_differs,
             conflict_keys_total: u32::MAX,
             conflict_keys_state_created: u32::MAX,
-            conflict_keys_prior_state_only: u32::MAX,
             conflict_parent_child_edges: u32::MAX,
         };
         // Counters saturate instead of wrapping.
@@ -1258,10 +1253,8 @@ mod tests {
             open_turn_ui_pending_usage_this_scan: max,
             open_turn_ui_pending_unsummable_this_scan: u64::MAX,
         };
-        // The journal carries both blocks; together they keep the old cap.
         let mut bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
         bytes.extend(serde_json::to_vec_pretty(&receipts).unwrap());
-        assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);
         let text = String::from_utf8(bytes).unwrap();
         for forbidden in ["/Users", "credential", "raw session id"] {
             assert!(!text.contains(forbidden));

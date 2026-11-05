@@ -434,7 +434,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `durable_tail_restart_full_alarm` | retired: `tail_reconstruct_after_head` counts each case |
 | `store_write_after_save_failed`, `store_write_failed`, `store_faults`, `durable_write_failed_published`, `mutation_unproved` | `tail_set_aside{class,attempts,age}`, `tail_apply.set_aside`, SQLite save errors |
 | `restore_attempts`, `restored`, `missing`, `refused_record`, `corrupt_body`, `not_rederived`, `recovery_full`, `resource_full` | `tail_db_loads`, `tail_reconstruct` |
-| `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads`. Retired on the page block |
+| `full_causes.restore_outcome.{restored,held,pending,stale.<reason>}` | Claude: `tail_db_loads` (reuse is `tail_db_loads.hit`). Retired on the page block; `restore_outcome.miss` stays |
 | `held_keys`, `durable_held[9]`, `held_census`, `format_hold`, `retired_upgrade_missing` | `tail_db_loads{held}` and census-red |
 | `behind_accepted` | Retired: a file below its accepted entry reads Full (`tail_shorter_file_full`) |
 | `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
@@ -562,8 +562,8 @@ written. Counts saturate at `u64::MAX`.
 
 `counts.line_delivery` is keyed by the fixed name of the page's one registered
 line observer, for example `{"footprint": {...}}`. The observer receives the
-physical lines the page's primary reads already consumed; group,
-native-comparison and one-shot reads deliver nothing. All values are
+physical lines the page's primary reads already consumed; group and
+one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
 
 - `lines`: newline-complete physical lines delivered, including blank,
@@ -825,10 +825,9 @@ owner's process-retained bound using a conservative layout-independent allowance
 (1,536 bytes per entry for a possible B-tree node, boxed content witness and
 pinned absence witness, plus a
 root and state header).
-Codex-version, native-comparison and continuation graphs are admitted first;
+Codex-version and continuation graphs are admitted first;
 this memo is charged only from the remainder. Its own refusal drops only the
-memo details and cannot discard those admitted sibling graphs or BASE-exit
-native comparison. An unsupported sibling alone does not discard a memo that
+memo details and cannot discard those admitted sibling graphs. An unsupported sibling alone does not discard a memo that
 fits the available allowance. Persistently refused memo details remain unknown
 and require the existing counted recovery path until they can be retained.
 An empty memo releases its B-tree root and optional heap charge. The existing
@@ -967,7 +966,7 @@ file records only the last non-success outer/inner outcome and actual invalidati
 Census v3 adds a fixed eight-category unreadable-event histogram, an explicit
 unattributed remainder for old traversals, and existing terminal-loss shares.
 Categories identify the original failing branch, not an OS diagnosis or distinct
-files; see [branch attribution](session-2026-10-12-codex-unreadable-causes.md).
+files.
 The census remains limited to 8 KiB; the sidecar to 1 KiB. Healthy attempts add
 no sidecar write or unlink. Both are owner-only disposable atomic caches without
 fsync, excluded from public status, upload DTOs and diagnostics bundles.
@@ -976,9 +975,8 @@ These files are structural diagnostic evidence, not health, current account,
 delivery, checkpoint or ACK proof. A separately scoped reader needs matching exact
 PID/start tuples before and after, image continuity, freshness and attempt ordering.
 Unavailable identity, equal-attempt contradiction or foreign-current writer evidence
-gives UNKNOWN; files show last persisted, never latest executed. See the
-[carrier contract](session-2026-10-11-codex-census-outcome-carrier.md) before interpreting
-either file. This adds no reader, runtime repair or installed acceptance.
+gives UNKNOWN; files show last persisted, never latest executed. This adds no
+reader, runtime repair or installed acceptance.
 
 ## Approved Upload
 
@@ -1250,7 +1248,7 @@ The checkpointed-upload log includes a process-lifetime count of settlement
 decisions for Rejected pages with non-progressing, restorable local holds.
 Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
-reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
+reset it.
 
 ## Prior Held Family Observation
 
@@ -1274,8 +1272,8 @@ canonical digests, not collected content.
 
 ## Claude Re-read Attribution Counters
 
-Schema 2's existing `native_collection_page` and `native_comparison_decision`
-records can include two sparse, counts-only objects for `source: claude_code`:
+Schema 2's existing `native_collection_page`
+record can include two sparse, counts-only objects for `source: claude_code`:
 `counts.claude_reread` and `counts.retained_cache_page_events`. A
 `native_collection_page` for any other source can carry
 `counts.retained_cache_page_events` only. Missing keys
@@ -1287,15 +1285,14 @@ always-on link scrape tokenized, and `links_over_limit`, links left off an
 upload because their value exceeds the receiver's 512-character limit.
 
 Collection counters cover initialization and all cooperative steps of one page,
-including steps before a pause or a move to another worker thread. Comparison
-counters cover preparation (including load normalization) and post-collection
-finalization/save. These are disjoint event intervals: sum their events for the
+including steps before a pause or a move to another worker thread. Additional
+collection records cover preparation (including load normalization) and
+post-collection finalization/save. These are disjoint event intervals: sum their events for the
 page; neither object is a gauge or a count of distinct files across pages.
 Nested operations, other sources and other threads cannot contribute to the
 active interval. Abandoned collection pages have no completed collection line.
-With comparison disabled, the existing `disabled_before_lease` decision still
-reports the gate; additional rows on that same decision stage report nonzero
-preparation/save events after work, without creating a comparison permit.
+The same collection stage reports nonzero preparation/save events after work,
+including early preparation failures when no page is collected.
 
 A due terminal that skips whole-index re-arm can additionally emit
 `counts.rearm_veto_ignored`, a sparse object with the closed keys
@@ -1389,29 +1386,25 @@ counters rather than treating diagnostic row count as a page/file count.
   next real content change. User effect: such sessions may show no
   subscription until then.
 
-`retained_cache_page_events` reuses the existing cache lifecycle event keys and
-sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
-`copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
-`prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
-cumulative, cross-source and labelled `unknown`), these are exact deltas from
-operations executed by that source's page. Eviction/clear counts describe the
-causing page, **not** the source of each victim in the shared cache. No victim
-identity/history is retained. Existing refusal causes include entry/key/frozen
-charge, layout/disabled, live reservation, missing/invalid plan, incomplete or
-lossy reduction, unsealed EOF, clone/finalization bounds and poisoned locks.
+`retained_cache_page_events` keeps its name but carries only the content-free
+page counters that share `process_retained_cache_lifecycle_totals`' event keys:
+`prefix_excluded_bodies`, `prefix_tag_clears`, `pi_cost_refused_overflow`,
+`pi_cost_precision_rounded`, `pi_fork_copies_skipped_entries`,
+`pi_fork_copies_skipped_tokens`, `codex_non_default_thread_tier`,
+`usage_iteration_model_differs`, `usage_unknown_numeric_key` and the OTLP skip
+counters below. Unlike the
+process totals (cumulative, cross-source, labelled `unknown`), these are exact
+deltas from that source's page.
 
-Three additional page-only keys refine those existing sites:
-
-- `insert_count_entries_evicted` and `insert_byte_entries_evicted` partition
-  `insert_entries_evicted`: each victim counts as count pressure when the count
-  cap is exceeded before removal, otherwise byte/layout-bound pressure. Entry
-  bound refusals remain `insert_entry_bound_refused`; they are not evictions.
-- `reinsert_failed`: one destructive cache hit whose acquisition ends without a
-  successful reinsertion, including eligibility/prepare/parse/retention failure
-  and refused insertion. A fixed boolean follows the active read across steps;
-  it stores no identity and disarms only after admission. Events are recorded
-  when that attempt ends, potentially on a later cooperative step. Process
-  termination cannot report an unfinished attempt.
+The in-memory reduction cache is gone: every continuation loads its stored
+Tail state, counted by `tail_db_loads` (reuse is `tail_db_loads.hit`). Its
+keys are no longer emitted: `take_*`, `insert_*`,
+`cursor_reservation_entries_evicted`, `copy_refusal_*`, `clear_*`,
+`retention_*`, `insert_count_entries_evicted`, `insert_byte_entries_evicted`,
+`reinsert_failed`, and in `sampled_acquisition.acquisition_admission`
+`cache_lookup_miss_unknown_origin`, `retained_entry` and
+`retained_entry_rejected_by_eligibility`. `sampled_audit_account_release`
+no longer reports `marker_staged`.
 
 All diagnostics are best-effort local stderr observations. Their counters never
 feed collection, proof, save, memory admission, account attribution or upload
@@ -1472,13 +1465,13 @@ if the final combined cancellation funding refuses them.
 
 ### Claude Contract Debt Counters (schema 2 additive)
 
-The existing `native_collection_page` / `native_comparison_decision` carrier
+The existing `native_collection_page` carrier
 also includes sparse, counts-only `identity_contract_transition`
 (`from_empty`, `to_empty`, `collector_e2_grouping`, `mid_traversal_placeholder`)
 and `identity_contract_latch` (`set`, `cleared`). The existing synchronous
 preparation, collection and finish scopes own these deltas: merge disjoint
 scopes, never sum a repeated scope twice. Relay-token and activity-hint errors
-retain the last contract and reach the existing early decision/unwind carrier,
+retain the last contract and reach the existing early collection/unwind carrier,
 including when no page is collected. There is no new event stream or wire
 check-in payload.
 
@@ -1541,9 +1534,9 @@ The digest is RAM-only authority and is never emitted in diagnostic records.
 
 Completed `native_collection_page` records can include
 `counts.full_causes.restore_outcome.miss.<class>` for every source: saturating
-u64 counts, scoped to that page, of files read with neither a retained
-reduction nor a Tail load, by the class below. A Tail load's outcome is counted
-by `tail_db_loads` instead.
+u64 counts, scoped to that page, of files read without a Tail load, by the
+class below. A Tail load's outcome is counted by `tail_db_loads` instead; reuse
+is `tail_db_loads.hit`, with no `restored` alias.
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.
@@ -1668,6 +1661,21 @@ Counts are per parsed usage line, not per unique request; rereads count again. I
 is a cumulative saturating process total with no key name, path or session id,
 and it never affects money.
 
+## Claude OTLP spans and relay requests not stored
+
+These `process_retained_cache_lifecycle_totals` counters tell a request Claude
+Code never reported apart from one the daemon received and did not keep. A
+`claude_code.llm_request` span stores no ownership row when it carries
+`success=false` (`llm_request_span_success_false`), no session id
+(`llm_request_span_missing_session_id`) or no start time
+(`llm_request_span_missing_start_time`); other span names are not counted. The
+local relay counts connections refused at its concurrency limit
+(`otlp_relay_busy_503`), malformed HTTP requests (`otlp_relay_bad_framing_400`,
+also one `bad_framing` log line), Claude exports acknowledged while Claude
+collection is off (`otlp_relay_collection_disabled`) and bodies with an
+unsupported content encoding (`otlp_relay_unknown_content_encoding`). Counts
+only: no ids, paths or payload content, and they never affect money.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
@@ -1679,16 +1687,14 @@ sessions, decoded bytes or money. No path or session id is included.
 | Cause | Unsupported boundary |
 | --- | --- |
 | `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
-| `CompressedProofParentUnsupported` | Retired proof parent reader; not emitted by current builds |
-| `CompressedProofChildUnsupported` | Retired proof child reader; not emitted by current builds |
-| `CompressedParentSideUnsupported` | Retired parent side acquisition; not emitted by current builds |
 | `CompressedGroupProbeUnsupported` | Group ordering probe |
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
-| `CompressedParentLedgerUnbound` | Retired parent-ledger hold; not emitted by current builds. A compressed legacy user fork counts best effort like a plain one |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
 | `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
+| `CompressedDecodeFailed` | Invalid or damaged encoded input |
+| `CompressedDecodedOverLimit` | An explicitly bounded decoder exceeded its caller’s bound |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
@@ -1704,10 +1710,44 @@ header facts, then releases retained copies, counted in
 `cursor_reservation_entries_evicted`. It never drops a suspended proof, join
 owner, witness or durable owed state. A released copy can mean one more existing
 `state_missing` Full. `decoder_refused_header_occupancy` is no longer counted.
-Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
-A claim that cannot fit evicts nothing. It or a busy singleton yields `None`, counts
-`CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
-evidence. Callers disclose the yielded file in the unreadable census.
+Only one paid decoder is live per process. Full streams use the ordinary decoded-byte
+page budget, without an archive file-size cap. A claim that cannot fit evicts nothing.
+It or a busy singleton yields `None`, counts `CompressedAdmissionRefused` on
+`codex_zst_refused`, and changes no acquisition evidence. The ordinary candidate is
+requeued with its census/watcher flags before yielding. No archive reservation,
+retry timer, Held queue or separate power/work gate remains.
+
+Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
+win before header/body selection, and both encodings use the same mtime age rules;
+compressed rollouts keep their original modification time, so they age as the plain file did.
+Legacy archive member keys retain first-seen eligibility under the ordinary 60-day gate;
+no disposition or attempt count is applied, and normal header/ownership admission remains.
+Never-seen old plain and compressed files are skipped equally.
+One secure header opener
+supplies ownership proof. The inventory has no file-count, directory-count, cache
+population or cumulative read-volume cap; optional header facts still use reclaimable
+state-memory credit, and the existing per-header recognition bound remains.
+`inventory_hold` uses the existing unreadable causes and sampled failed-file counts.
+A proven acquisition failure withholds only its dependent ownership set; an unknown
+header remains a wildcard over every potentially colliding session. Header/listing
+uncertainty still prevents absence-based evidence collection. An owning-header change
+holds that pass’s Codex publication until the next pass; a rollout moved while it is being
+read is carried on a later pass. Multi-file compressed sessions remain unsupported for
+grouped replay.
+
+A proven representation/path carry preserves old logical fingerprints, ACK/context
+facts and debt in one prepare-time transaction, using the ordinary graph delta and
+Tail save. RAM adopts the destination after COMMIT; ordinary saves keep their
+original per-file boundaries. A failed carry holds only its proven owner and counts
+on the existing inventory cause. Rename performs no header, sample,
+decoder or body read and no POST. A compressed rollout rewritten by the provider as
+a new plaintext file is read in full once (counted), as any replaced file is today.
+A restart mid-first-read re-decodes the prefix, counted on
+`codex_zst_decoded_bytes`; completed stored bodies retry without transcript reads.
+Older archive fields and causes within them remain decode-compatible and inert; downgrade
+scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo one
+header attempt per archive; no money effect. Whether an older binary decodes carried
+state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
 On close, `codex_zst_input` on the #799 carrier reports consumed
 `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
@@ -1847,41 +1887,18 @@ backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
 
-## Codex state-only identity coverage
+## Codex state-only fallback (removed)
 
-Prior coverage retains both the uniquely resolved filename identity and the
-existing committed header/counting or protected owner hash, including a header
-outside both filename candidates. Accepted-owner coverage requires nonempty
-exact file incidence whose entities are accepted, not quarantined or decode-held;
-a permanent refusal or local wire-size rejection grants no new coverage.
+The daemon no longer sends a Codex session's bare total from the local state
+database when the session has no readable rollout. Every Codex usage body comes
+from a parsed rollout. A session whose rollout is gone sends nothing in its
+place, and the server keeps the body it already holds. A rollout that parses to
+no usage stays uncounted. The `codex_state_only*` `local_resources` lines are
+gone. An older store's state-only fields and the residue's blocked session ids
+decode and drop; the next save writes neither. The status body no longer carries
+`last_census_residue_blocked_session_count`, so the server reads it as 0.
 
-Checkpoint retention and expiry follow the existing rules; local retention
-changes are deferred. The backend downgrade fence
-(`usage_accounting_authority_downgrade`) protects attributed usage floors against
-an uncontracted state-only successor. Local coverage reduces redundant emission;
-it does not replace that backend money protection.
-
-With a prior snapshot fingerprint, exactly two evidence-supported filename
-identities, and no committed owner coverage, both candidates are withheld from
-state-only output. No fingerprint preserves ordinary fallback; zero supported
-candidates are not counted. The existing `local_resources` carrier emits at most
-one `codex_state_only_ambiguous_identity` line per state-only pass, whose
-`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
-observations in that pass. Repeated passes observe the same entries again: this
-is NOT a distinct-entry/file/session count, and sums must not be reported as
-files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
-is the saturating sum of the supported state threads' `tokens_used` per observed
-ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
-possibly withheld state-only usage: repeated candidates and already-covered
-usage can contribute again. A zero-token observation reports zero tokens. Only
-aggregate counts and token sums are logged, with no paths, ids or per-session
-values.
-
-A later complete native parse still emits its exclusive body for a session with
-an earlier state-only row. An emitted total alone does not prove a server-side
-overwrite; backend authority rules independently govern successor acceptance.
-
-### Retired-pin recovery
+## Retired-pin recovery
 
 An exact retired v1 pin is a missing reduction, never decoded as current.
 Quiet files consume zero transcript bytes. A grown file takes the existing
@@ -2028,19 +2045,6 @@ unavailable scalar counts are null and missing kinds are unknown, not zero.
 timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
 counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
-`account_windows_alarm` and `account_windows_retained` still report retained
-account-window pressure without capping owed history; `account_windows_retained`
-also reports `uncollapsed`, the windows older than their equal-evidence run's
-newest left in a store-only archive (boundaries unchecked), and `replaced` and
-`pushed`, the store-only archive rollovers this save wrote that replaced their
-run's newest window or were appended (resident archives, kept only with raw
-holds or before a complete v2 load, are not counted). A complete v2 load keeps archived account
-windows in the store, so the retained-pending byte diagnostic is unavailable while
-any family is store-only. A save refuses with `state_v2_cold_row_unknown` (count
-`cold_row_unknown`) when a stored archived row no longer matches its baseline, and
-with `state_v2_cold_lineage_miss` (count `cold_lineage_miss`) when a graph's archive
-view predates a commit it shares no rollover with; both hold and remove nothing.
-These events contain no keys, paths, restart names, reference tuples or digests.
 
 ### Option (ii): `identity_retained` bucket rows
 
@@ -2103,17 +2107,17 @@ or rewrite adds a revision timed at the live mtime, and only the file's own
 matched exact upload receipt retires it, and only the prefix it covers (a newer
 suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
 receipt elsewhere retires nothing. A rewritten file folds its old debt into the
-new object with the earliest time. Codex archives count by compressed size, and
+new object with the earliest time. Compressed Codex extents count by compressed size, and
 outside the discovery window no new debt starts. `outstanding_files` counts every
 owed file, `held_files` those whose debt is read or held rather than unread
 (every hold reason counts alike), `unread_bytes` the bytes no read reached, and
-`never_indexed_files` this walk's owed files with no index entry yet (archives
-aside), whose age is a lower bound. `over_6h_files` counts those whose oldest
+`never_indexed_files` this walk's owed files with no index entry yet, including
+compressed rollouts, whose age is a lower bound. `over_6h_files` counts those whose oldest
 owed change is more than 21,600 seconds old, and `oldest_age_s` is the oldest of
 those ages, with `oldest_age_lower_bound` true when that age is a lower bound or
 some debt has no known age. `no_upload_required_files` counts this walk's files
-that owe nothing by per-file evidence: a confirmed-empty file or an empty archive
-at its stamp, and a Claude subagent journal, which the snapshot rule excludes
+that owe nothing by per-file evidence: a confirmed-empty file at its stamp,
+and a Claude subagent journal, which the snapshot rule excludes
 from upload. `deleted_unaccepted_files` is the cumulative count of files erased
 while still owed: a complete walk erases the debt of a file it no longer lists
 and whose index entry is gone. `last_complete_discovery_at` is the Unix time a

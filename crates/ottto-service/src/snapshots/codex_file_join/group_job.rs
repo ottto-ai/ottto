@@ -30,11 +30,6 @@ pub(in crate::snapshots) fn new_group_parser(
     traces: Option<Arc<CodexTurnTraceMap>>,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )?;
     let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
@@ -96,29 +91,13 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
 }
 
 /// The settleable disclosure of one member of a refused group (outcome R).
-pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosure {
+pub(in crate::snapshots) fn refusal_disclosure() -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::HeldTerminal,
         cause: ownership::GROUP,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![owner.to_owned()],
         diagnostic_reason: FileReason::OwnershipIncomplete,
-        parsed_snapshot_count: 0,
-        held: cursor::HeldCounts::default(),
-    }
-}
-
-/// The strict debt a parked `ProbeBudgetOrder` group discloses again
-/// (round 3): never settleable, the owner held.
-fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
-    cursor::Disclosure {
-        reason: cursor::DebtReason::ProbeBudgetOrder,
-        cause: ownership::GROUP,
-        ownership_incomplete_file_count: 0,
-        zero_snapshot_usage_evidence: false,
-        state_only_blocked_session_ids: vec![owner.to_owned()],
-        diagnostic_reason: FileReason::NotParsedThisCycle,
         parsed_snapshot_count: 0,
         held: cursor::HeldCounts::default(),
     }
@@ -158,7 +137,6 @@ pub(in crate::snapshots) fn disclose_members(
 /// A genuine open/read failure, line loss, receipt, owner or creator
 /// conflict: strict, exactly as before P2.
 pub(in crate::snapshots) fn disclose_strict(
-    owner: &str,
     members: &[CandidateFile],
     targets: DisclosureTargets<'_>,
 ) {
@@ -170,10 +148,6 @@ pub(in crate::snapshots) fn disclose_strict(
     targets
         .residue_index_keys
         .extend(members.iter().map(|member| local_index_key(&member.path)));
-    targets.residue_blocked_session_ids.insert(owner.to_owned());
-    targets
-        .codex_state_only_blocked_session_ids
-        .insert(owner.to_owned());
 }
 
 /// How one boot step ended.
@@ -330,7 +304,7 @@ impl GroupBoot {
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member, None, &mut 0) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -383,6 +357,18 @@ impl GroupBoot {
         index: &ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
+        // Group plans and the live-prefix certificate still use physical
+        // extents/end_byte_offset. Decoded offsets cannot satisfy those facts.
+        // Refuse before identification/probing can sample compressed bytes.
+        if refuse_compressed_codex(
+            Some(&self.group.members[self.identified].path),
+            None,
+            CodexZstCause::GroupReadUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
         if let Some(events) = launch_events {
@@ -457,7 +443,6 @@ impl GroupBoot {
                         && receipt.as_ref().map_or(true, |receipt| {
                             receipt.version == RECEIPT_VERSION
                                 && receipt.derivation == SnapshotSource::Codex.parser_version()
-                                && receipt.tiers.len() <= MAX_APPLIED_TIERS
                         })
                 })
         })
@@ -647,7 +632,6 @@ impl GroupBoot {
                 first.size_bytes,
                 !index.files.contains_key(&local_index_key(&first.path)),
             ),
-            comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
             previous_upload_body_witness: index.last_upload_body_witness(&last),
@@ -687,7 +671,6 @@ impl GroupBoot {
                 dependencies,
                 memo_digest,
                 scope: cursor::group_scope(),
-                walked: None,
                 consumed_before: 0,
             })),
         }))
@@ -702,12 +685,6 @@ pub(in crate::snapshots) struct JobInputs<'a> {
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     match open_candidate_file(SnapshotSource::Codex, member) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
@@ -726,12 +703,6 @@ fn legacy_tee(
     metadata: &CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
-    refuse_compressed_codex(
-        Some(&member.path),
-        None,
-        CodexZstCause::GroupReadUnsupported,
-    )
-    .map_err(|_| GroupEnd::Strict)?;
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
@@ -778,24 +749,16 @@ pub(in crate::snapshots) struct GroupJob {
     /// `cursor::group_scope` at job start: every resume and the
     /// emission compare it with the current index.
     pub(in crate::snapshots) scope: String,
-    /// The last walked copy-budget charge of a group read without the
-    /// cursor (a cursor job keeps it in its `JobMeta`).
-    pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
-    /// Bytes the completed members' readers consumed: the copy budget measures a group's
-    /// input cumulatively, so a member swap needs no walk (R2-L3).
+    /// Bytes the completed members' readers consumed, plus each member
+    /// swap's charge (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
-    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
+    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
     consumed_before);
 
 impl GroupJob {
-    /// A legacy tee takes every consumed record too.
-    pub(in crate::snapshots) fn has_tee(&self) -> bool {
-        self.tee.is_some()
-    }
-
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
         std::mem::take(&mut self.legacy_baselines)
     }
@@ -1053,7 +1016,7 @@ fn member_eof(
                 inputs.attribution,
             )
             .map_err(|_| GroupEnd::Strict)?;
-        if !parsed.complete() {
+        if !parsed.progress_complete() {
             return Err(GroupEnd::Strict);
         }
         let mut snapshots = parsed.snapshots;
@@ -1171,7 +1134,8 @@ fn open_member(
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.
-        let (bytes, _, read, _) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
+        let (bytes, _, read, _) =
+            read_header_bytes(&member, None, &mut 0).map_err(|_| GroupEnd::Changed)?;
         group.charge = group.charge.saturating_add(read as u64);
         if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
             return Err(GroupEnd::Changed);
@@ -1284,7 +1248,9 @@ pub(in crate::snapshots) fn end_group(
                                 stamp.clone(),
                             ),
                             group.dependencies.clone(),
-                            probe_order_disclosure(&group.owner),
+                            // Round 3: the strict debt a parked group
+                            // discloses again, never settleable.
+                            cursor::strict_disclosure(cursor::DebtReason::ProbeBudgetOrder),
                             reason.append_curable() && position + 1 == group.members.len(),
                         );
                     }
@@ -1299,7 +1265,7 @@ pub(in crate::snapshots) fn end_group(
             if let Some(lease) = lease {
                 cursor::end_group_lease(lease, &active);
             }
-            disclose_strict(&group.owner, &group.members, targets.reborrow());
+            disclose_strict(&group.members, targets.reborrow());
             cursor::dequeue_members(index, &group.members);
         }
         GroupEnd::Refused {
@@ -1308,7 +1274,7 @@ pub(in crate::snapshots) fn end_group(
             offset,
             at_eof,
         } => {
-            let disclosure = refusal_disclosure(&group.owner);
+            let disclosure = refusal_disclosure();
             let live_failed = position + 1 == group.members.len();
             if let Some(context) = sampling {
                 // §d.4: growth of the live member may cure this refusal, so
@@ -1384,7 +1350,7 @@ pub(in crate::snapshots) fn end_group(
             if let Some(lease) = lease {
                 lease.release();
             }
-            disclose_strict(&group.owner, &group.members, targets.reborrow());
+            disclose_strict(&group.members, targets.reborrow());
             cursor::dequeue_members(index, &group.members);
         }
     }

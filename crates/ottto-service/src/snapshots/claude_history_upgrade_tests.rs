@@ -1156,8 +1156,11 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
 /// is not a candidate this cycle (a settlement, a re-offer outside the scan
 /// hints, a #692 in-place resend): no literal of the listed family passes
 /// either upload path and it never stamps revision 3, while an unlisted
-/// family keeps both. A paused list denies every literal and every
-/// revision-3 stamp.
+/// family keeps both. [money] A paused list holds adoption only: it stamps
+/// no file (G3's lag) but filters literals by the digests it still has, so
+/// with them kept the listed family stays off `e2` (G4), and with none (a
+/// list missing after install) every family takes `e2` until the list is
+/// back (G5, disclosed).
 #[test]
 fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
     with_max_gated_claude_revision(3, || {
@@ -1208,18 +1211,34 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
                 .collect::<Vec<_>>()
         };
 
-        let mut resend = items.clone();
-        index.retain_claude_history_emission_permitted(&mut resend);
-        let mut seam = items.clone();
-        index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut seam);
-        for kept in [&resend, &seam] {
-            assert_eq!(kept.len(), 6, "every body plus the unlisted literals");
-            let kept_literals = literals(kept.as_slice());
-            assert_eq!(kept_literals.len(), 2, "{kept_literals:?}");
-            assert!(kept_literals
-                .iter()
-                .all(|source| !listed_sources.contains(source)));
-        }
+        // Both upload paths: the resend hook and the emission seam.
+        let upload_paths = |index: &mut ScanIndex| {
+            let mut resend = items.clone();
+            index.retain_claude_history_emission_permitted(&mut resend);
+            let mut seam = items.clone();
+            index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut seam);
+            [resend, seam]
+        };
+        let only_unlisted_literals = |index: &mut ScanIndex| {
+            for kept in upload_paths(index) {
+                assert_eq!(kept.len(), 6, "every body plus the unlisted literals");
+                let kept_literals = literals(kept.as_slice());
+                assert_eq!(kept_literals.len(), 2, "{kept_literals:?}");
+                assert!(kept_literals
+                    .iter()
+                    .all(|source| !listed_sources.contains(source)));
+            }
+            let index: &ScanIndex = index;
+            let applies = |slot| {
+                crate::snapshots::claude_request_money::e2::family_applies(
+                    index,
+                    &session(slot),
+                    None,
+                )
+            };
+            assert!(applies(0) && !applies(1), "only the unlisted family folds");
+        };
+        only_unlisted_literals(&mut index);
         for (key, entry) in index.files.clone() {
             let listed = listed_sources.contains(&entry.source_file_fingerprint);
             assert_eq!(
@@ -1244,24 +1263,49 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
             );
         }
 
-        // The list goes missing after install: paused, so no literal passes
-        // and nothing stamps revision 3.
-        fs::remove_file(ReemissionExclusions::path(&support)).unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        assert!(index.claude_reemission_exclusions.pauses_adoption());
-        let mut paused = items.clone();
-        index.retain_claude_history_emission_permitted(&mut paused);
-        assert!(literals(paused.as_slice()).is_empty());
-        assert_eq!(paused.len(), 4, "the bodies stay");
         let (key, entry) = index
             .files
             .iter()
             .find(|(_, entry)| !listed_sources.contains(&entry.source_file_fingerprint))
             .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
             .unwrap();
-        index.re_owe_effective_upload_body_witness_revision(&key, 2);
-        assert!(!index.stamp_effective_upload_body_witness_revision(&key, &entry, 3));
-        assert_eq!(index.files[&key].effective_upload_body_witness_revision, 2);
+        let no_stamp = |index: &mut ScanIndex| {
+            assert!(index.claude_reemission_exclusions.pauses_adoption());
+            index.re_owe_effective_upload_body_witness_revision(&key, 2);
+            assert!(!index.stamp_effective_upload_body_witness_revision(&key, &entry, 3));
+            assert_eq!(index.files[&key].effective_upload_body_witness_revision, 2);
+        };
+
+        // G4: paused with its digests kept (closure overflow).
+        let installed = index.claude_reemission_exclusions.clone();
+        index.claude_reemission_exclusions =
+            installed.with_state_for_test(ListState::ClosureOverflow);
+        only_unlisted_literals(&mut index);
+        no_stamp(&mut index);
+
+        // G5: the list goes missing after install. No digest is left, so
+        // every literal passes both paths and the listed family folds.
+        fs::remove_file(ReemissionExclusions::path(&support)).unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        for kept in upload_paths(&mut index) {
+            assert_eq!(kept.len(), 8, "every body and every literal");
+        }
+        assert!(crate::snapshots::claude_request_money::e2::family_applies(
+            &index,
+            &session(1),
+            None
+        ));
+        no_stamp(&mut index);
+
+        // Once the list is back, the listed family is denied again.
+        fs::write(
+            ReemissionExclusions::path(&support),
+            format!("{}\n", digest(&session(1))),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        assert!(!index.claude_reemission_exclusions.pauses_adoption());
+        only_unlisted_literals(&mut index);
         let _ = fs::remove_dir_all(home);
     });
 }

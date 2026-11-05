@@ -272,50 +272,28 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed causes for native archive reader refusal and owed custody.
+/// Live compressed-input refusal causes. Numeric slots remain frozen;
+/// retired causes have no producers and their old serialized values stay inert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
     ReplayNotAuthorized = 0,
-    #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported = 1,
-    #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported = 2,
-    #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
     GroupProbeUnsupported = 4,
     #[serde(rename = "CompressedGroupReadUnsupported")]
     GroupReadUnsupported = 5,
-    #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound = 6,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported = 7,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused = 8,
     #[serde(rename = "CompressedDecodeFailed")]
     DecodeFailed = 9,
-    #[serde(rename = "CompressedOwnerUnproven")]
-    OwnerUnproven = 10,
-    #[serde(rename = "CompressedOutputHeld")]
-    OutputHeld = 11,
     #[serde(rename = "CompressedDecodedOverLimit")]
     DecodedOverLimit = 12,
-    #[serde(rename = "CompressedHeaderInvalid")]
-    HeaderInvalid = 13,
-    #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 14,
     #[serde(rename = "CompressedHeaderUnfunded")]
     HeaderUnfunded = 15,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 16,
-    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
-    #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 17,
-    #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 18,
-    #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 19,
     #[doc(hidden)]
     #[serde(skip)]
     __Count = 20,
@@ -327,28 +305,17 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-/// Every counted cause; the length is checked against `__Count`.
-const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+/// Live counted causes; holes retain the old numeric slots.
+const CODEX_ZST_ALL: [CodexZstCause; 9] = [
     CodexZstCause::ReplayNotAuthorized,
-    CodexZstCause::ProofParentUnsupported,
-    CodexZstCause::ProofChildUnsupported,
-    CodexZstCause::ParentSideUnsupported,
     CodexZstCause::GroupProbeUnsupported,
     CodexZstCause::GroupReadUnsupported,
-    CodexZstCause::ParentLedgerUnbound,
     CodexZstCause::PhysicalOffsetUnsupported,
     CodexZstCause::AdmissionRefused,
     CodexZstCause::DecodeFailed,
-    CodexZstCause::OwnerUnproven,
-    CodexZstCause::OutputHeld,
     CodexZstCause::DecodedOverLimit,
-    CodexZstCause::HeaderInvalid,
-    CodexZstCause::CorrectionUnapplied,
     CodexZstCause::HeaderUnfunded,
     CodexZstCause::CompatibilityUnfunded,
-    CodexZstCause::DecoderRefusedHeaderOccupancy,
-    CodexZstCause::FamilyUnproven,
-    CodexZstCause::ArchiveEquivalenceUnproven,
 ];
 struct CodexZstRefused {
     counters: [AtomicU64; CODEX_ZST_CAUSES],
@@ -432,42 +399,6 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
         return;
     }
     cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
-}
-
-/// Per-pass observations, not distinct entries/files or a lifetime counter.
-pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
-    if observations > 0 {
-        traversal_point(
-            "codex_state_only_ambiguous_identity",
-            "codex",
-            &BTreeMap::from([
-                ("codex_state_only_ambiguous_identity", observations),
-                ("codex_state_only_ambiguous_identity_tokens", tokens),
-            ]),
-        );
-    }
-}
-
-/// One terminal append call, before later policy/no-op suppression; never wire data.
-pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
-    if scanned != 0 || emitted != 0 || noops != 0 {
-        traversal_point(
-            "codex_state_only",
-            "codex",
-            &BTreeMap::from([(
-                "codex_state_only",
-                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
-            )]),
-        );
-    }
-}
-
-pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
-    traversal_point(
-        "codex_zst_held",
-        "codex",
-        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
-    );
 }
 
 /// Sidecar read attempts and actual input bytes since the last Claude page.
@@ -1037,24 +968,13 @@ impl Probe {
     fn observation(&self) -> Observation {
         Observation::between(wall_us(self.started), self.process, process_sample())
     }
-    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
-        self.collection_with_account_pending(source, counts, None);
-    }
-    pub(crate) fn collection_with_account_pending(
-        &self,
-        source: &str,
-        counts: CollectionCounts,
-        pending: Option<ClaudeAccountRetainedPending>,
-    ) {
         #[derive(Serialize)]
         struct Counts {
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
             collection: CollectionCounts,
-            #[serde(flatten)]
-            pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
@@ -1147,7 +1067,6 @@ impl Probe {
             },
             refusal_exposure: self.refusal_exposure,
             collection: counts,
-            pending,
             identity: if claude {
                 crate::snapshots::claude_request_identity::take_identity_counts()
             } else {
@@ -1192,16 +1111,6 @@ impl Probe {
     }
 }
 
-/// All retained account-pending families, including held/incomplete families;
-/// a conservative local-only gauge, never an authority or eviction decision.
-#[derive(Debug, Serialize)]
-pub(crate) struct ClaudeAccountRetainedPending {
-    pub(crate) claude_account_retained_pending_families: usize,
-    /// Pretty JSON bytes of the retained field, including its field wrapper.
-    pub(crate) claude_account_retained_pending_bytes: u64,
-    #[serde(flatten)]
-    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
-}
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(
@@ -1596,17 +1505,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
-/// Local alarm, at most hourly: a complete Claude terminal kept the retired
-/// family tombstone uncertainty fence up, because more absent witnessed roots
-/// need a tombstone than fit under the cap. Counts only; no path, id or wire
-/// event.
-pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) {
-    traversal_point(
-        "claude_absent_family_tombstone_uncertain",
-        "claude_code",
-        counts,
-    );
-}
 /// Shadow, once per Claude page: per-family census completion counts
 /// (`family_census_complete`, `family_census_incomplete{reason}`,
 /// `family_complete_deferred{quantum}`), `pending_census_members`, the
@@ -1758,92 +1656,6 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
-/// One preparation/page observation, never a permit or authority input.
-/// None means that boundary was not reached, not a known false/zero result.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub(crate) struct NativeComparisonDecision {
-    pub(crate) layout_supported: bool,
-    pub(crate) lease_generation: Option<u64>,
-    pub(crate) fold_index_generation: Option<u64>,
-    pub(crate) allowed_at_bind: Option<bool>,
-    pub(crate) controller_created: bool,
-    pub(crate) controller_current_at_finish: Option<bool>,
-    pub(crate) selected_save: bool,
-    pub(crate) upload_fully_settled: Option<bool>,
-    pub(crate) clean_at_finish: Option<bool>,
-    pub(crate) retained_permit: Option<bool>,
-    pub(crate) revoke_calls: usize,
-    pub(crate) admission_refusal_calls: usize,
-    pub(crate) hit_policy_calls: usize,
-    pub(crate) deferred_decisions: usize,
-    pub(crate) latched_base_decisions: usize,
-    pub(crate) other_base_decisions: usize,
-    pub(crate) correction_mint: Option<NativeMint>,
-    pub(crate) outcome: NativeDecisionOutcome,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NativeDecisionOutcome {
-    #[default]
-    Abandoned,
-    CadenceWait,
-    Finished,
-    DisabledBeforeLease,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub(crate) struct NativeMint {
-    pub(crate) window_available: bool,
-    pub(crate) candidates: usize,
-    pub(crate) insertions: usize,
-    /// This is before later window staging/retirement, not a retained grant.
-    pub(crate) receipts_after_mint: usize,
-}
-/// Inline Cell permits the final read-only negative view to report decisions.
-/// It owns no graph and is included in its lease's existing layout charge.
-pub(crate) struct NativeDecision(
-    pub(crate) std::cell::Cell<NativeComparisonDecision>,
-    std::cell::Cell<claude_reread::Counts>,
-);
-impl NativeDecision {
-    pub(crate) fn new() -> Self {
-        Self(
-            std::cell::Cell::new(NativeComparisonDecision {
-                layout_supported: crate::heap_layout_bound::layout_supported(),
-                ..Default::default()
-            }),
-            std::cell::Cell::new(Default::default()),
-        )
-    }
-    pub(crate) fn update(&self, update: impl FnOnce(&mut NativeComparisonDecision)) {
-        let mut value = self.0.get();
-        update(&mut value);
-        self.0.set(value);
-    }
-    pub(crate) fn add_page_events(&self, counts: claude_reread::Counts) {
-        let mut value = self.1.get();
-        value.merge(counts);
-        self.1.set(value);
-    }
-    pub(crate) fn emit(&self) {
-        #[derive(Serialize)]
-        struct Counts {
-            #[serde(flatten)]
-            decision: NativeComparisonDecision,
-            #[serde(flatten)]
-            events: claude_reread::Counts,
-        }
-        traversal_point(
-            "native_comparison_decision",
-            "claude_code",
-            &Counts {
-                decision: self.0.get(),
-                events: self.1.get().with_current(),
-            },
-        );
-    }
-}
-crate::heap_layout_bound::no_heap!(false; NativeDecision);
-
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
@@ -1983,8 +1795,6 @@ impl AssessedBool {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct AcquisitionAdmission {
     pub(crate) attempts: usize,
-    pub(crate) cache_lookup_miss_unknown_origin: usize,
-    pub(crate) retained_entry: AssessedBool,
     pub(crate) owning_header_current: AssessedBool,
     pub(crate) state_census_complete: AssessedBool,
     pub(crate) sidecar_census_complete: AssessedBool,
@@ -1997,7 +1807,6 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) audit_debt_present: AssessedBool,
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
-    pub(crate) retained_entry_rejected_by_eligibility: usize,
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
@@ -2312,36 +2121,42 @@ mod tests {
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
-        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
-            ReplayNotAuthorized,
-            ProofParentUnsupported,
-            ProofChildUnsupported,
-            ParentSideUnsupported,
-            GroupProbeUnsupported,
-            GroupReadUnsupported,
-            ParentLedgerUnbound,
-            PhysicalOffsetUnsupported,
-            AdmissionRefused,
-            DecodeFailed,
-            OwnerUnproven,
-            OutputHeld,
-            DecodedOverLimit,
-            HeaderInvalid,
-            CorrectionUnapplied,
-            HeaderUnfunded,
-            CompatibilityUnfunded,
-            DecoderRefusedHeaderOccupancy,
-            FamilyUnproven,
-            ArchiveEquivalenceUnproven,
+        // Frozen numeric slots survive as holes; only live producers keep
+        // enum variants. Old archive causes decode through the inert fields.
+        const ALL: [Option<super::CodexZstCause>; super::CODEX_ZST_CAUSES] = [
+            Some(ReplayNotAuthorized),
+            None,
+            None,
+            None,
+            Some(GroupProbeUnsupported),
+            Some(GroupReadUnsupported),
+            None,
+            Some(PhysicalOffsetUnsupported),
+            Some(AdmissionRefused),
+            Some(DecodeFailed),
+            None,
+            None,
+            Some(DecodedOverLimit),
+            None,
+            None,
+            Some(HeaderUnfunded),
+            Some(CompatibilityUnfunded),
+            None,
+            None,
+            None,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
-        assert_eq!(
-            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
-            "decoder_refused_header_occupancy"
-        );
+        assert!(serde_json::from_str::<super::CodexZstCause>(
+            "\"decoder_refused_header_occupancy\""
+        )
+        .is_err());
         let mut labels = std::collections::BTreeSet::new();
 
-        for (index, cause) in ALL.iter().enumerate() {
+        for (index, cause) in ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cause)| cause.as_ref().map(|cause| (index, cause)))
+        {
             assert_eq!(*cause as usize, index);
             let label = serde_json::to_string(cause).unwrap();
             assert!(labels.insert(label.clone()), "unique persisted label");
@@ -2552,8 +2367,6 @@ mod tests {
             completed_guard_bytes: u64::MAX,
             acquisition_admission: AcquisitionAdmission {
                 attempts: usize::MAX,
-                cache_lookup_miss_unknown_origin: usize::MAX,
-                retained_entry: gate,
                 owning_header_current: gate,
                 state_census_complete: gate,
                 sidecar_census_complete: gate,
@@ -2566,7 +2379,6 @@ mod tests {
                 audit_debt_present: gate,
                 audit_slot_available: gate,
                 sampling_allowed: gate,
-                retained_entry_rejected_by_eligibility: usize::MAX,
                 prepare_started: usize::MAX,
                 prepare_failed: usize::MAX,
             },
@@ -2619,97 +2431,6 @@ mod tests {
         assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
-    }
-
-    #[test]
-    fn native_comparison_decision_distinguishes_unreached_saved_and_retained() {
-        use crate::snapshots::claude_native_comparison::lifecycle::{Lifecycle, Scope};
-        let owner = std::sync::Arc::new(Lifecycle::default());
-        let (_, rows) = capture(|| {
-            let mut abandoned = owner.begin();
-            abandoned.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            drop(abandoned);
-            // Logical lifecycle fixture: the native conjunction is supplied to
-            // the existing settlement seam, not a supported native-path claim.
-            let mut saved = owner.begin();
-            saved.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            saved.note_selected_save(true);
-            saved.finish(true);
-            let mut retained = owner.begin();
-            retained.bind_scope(Scope::from_arguments(format_args!(
-                "private-synthetic-scope"
-            )));
-            assert!(retained.allowed());
-            retained.note_selected_save(false);
-            retained.finish(true);
-        });
-        assert_eq!(rows.len(), 3);
-        let a = &rows[0]["counts"];
-        assert_eq!(a["outcome"], "abandoned");
-        assert_eq!(a["allowed_at_bind"], false);
-        assert_eq!(a["selected_save"], false);
-        assert_eq!(a["retained_permit"], false);
-        for unknown in [
-            "correction_mint",
-            "controller_current_at_finish",
-            "upload_fully_settled",
-        ] {
-            assert!(a[unknown].is_null(), "unreached {unknown} is unknown");
-        }
-        let b = &rows[1]["counts"];
-        assert_eq!(b["allowed_at_bind"], false);
-        assert_eq!(b["selected_save"], true);
-        assert_eq!(b["retained_permit"], true);
-        assert_eq!(rows[2]["counts"]["allowed_at_bind"], true);
-        for row in rows {
-            assert_eq!(row["stage"], "native_comparison_decision");
-            assert_eq!(row["counts"]["deferred_decisions"], 0);
-            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
-            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
-            let text = serde_json::to_string(&row).unwrap();
-            assert!(!text.contains("private-synthetic-scope"));
-        }
-    }
-
-    #[test]
-    fn native_comparison_decision_maximum_width_is_bounded() {
-        let diagnostic = NativeDecision::new();
-        diagnostic.update(|d| {
-            *d = NativeComparisonDecision {
-                layout_supported: true,
-                lease_generation: Some(u64::MAX),
-                fold_index_generation: Some(u64::MAX),
-                allowed_at_bind: Some(false),
-                controller_created: false,
-                controller_current_at_finish: Some(false),
-                selected_save: false,
-                upload_fully_settled: Some(false),
-                clean_at_finish: Some(false),
-                retained_permit: Some(false),
-                revoke_calls: usize::MAX,
-                admission_refusal_calls: usize::MAX,
-                hit_policy_calls: usize::MAX,
-                deferred_decisions: usize::MAX,
-                latched_base_decisions: usize::MAX,
-                other_base_decisions: usize::MAX,
-                correction_mint: Some(NativeMint {
-                    window_available: false,
-                    candidates: usize::MAX,
-                    insertions: usize::MAX,
-                    receipts_after_mint: usize::MAX,
-                }),
-                outcome: NativeDecisionOutcome::DisabledBeforeLease,
-            }
-        });
-        let (_, rows) = capture(|| diagnostic.emit());
-        assert_eq!(rows.len(), 1);
-        let text = serde_json::to_string(&rows[0]).unwrap();
-        assert!(text.len() < 4096);
-        println!("NATIVE_COMPARISON_DECISION_MAX_WIDTH bytes={} inline_bytes={} no_resource_samples=true", text.len(), std::mem::size_of::<NativeDecision>());
     }
 
     #[test]
@@ -2933,8 +2654,8 @@ mod tests {
     fn claude_page_events_use_existing_carriers_without_source_leakage() {
         let (_, rows) = capture(|| {
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            claude_reread::restored(true, false, false);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
             probe.collection(
@@ -2948,8 +2669,8 @@ mod tests {
             );
             // Another source's page: its retained-cache events and nothing else.
             let scope = claude_reread::Scope::begin(true);
-            claude_reread::clear(true);
-            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            claude_reread::restored(true, false, false);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
             let mut probe = Probe::start();
             probe.page_events.merge(scope.finish());
             probe.collection(
@@ -2963,25 +2684,24 @@ mod tests {
             );
             let scope = claude_reread::Scope::begin(true);
             claude_reread::restored(true, false, true);
-            NativeDecision::new().emit();
-            drop(scope);
+            claude_reread::emit_without_lease(scope.finish());
         });
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["source"], "claude_code");
         assert_eq!(
-            rows[0]["counts"]["claude_reread"]["account_reproof_cleared"],
+            rows[0]["counts"]["claude_reread"]["restored_empty_sibling"],
             1
         );
         assert_eq!(
-            rows[0]["counts"]["retained_cache_page_events"]["take_hit"],
+            rows[0]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
             1
         );
         assert!(rows[1]["counts"].get("claude_reread").is_none());
         assert_eq!(
-            rows[1]["counts"]["retained_cache_page_events"]["take_hit"],
+            rows[1]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
             1
         );
-        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["stage"], "native_collection_page");
         assert_eq!(
             rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
             1
@@ -3018,12 +2738,12 @@ mod tests {
         let record = &records[0];
         assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
         assert_eq!(record["source"], "unknown");
-        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert_eq!(record["counts"]["prefix_excluded_bodies"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        // The four Pi fields, the Codex tier field and the two Claude usage
-        // fields stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2523);
+        // The four Pi fields, the Codex tier field, the two Claude usage
+        // fields and the seven OTLP skip fields stay bounded at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 2901);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

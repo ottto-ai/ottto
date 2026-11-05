@@ -234,11 +234,11 @@ fn missing_stored_state_is_an_incomplete_reconstruction() {
                 meta.elements_per_page = 64;
             }
         }),
-        Err(ReconstructCause::Incompatible)
+        Err(ReconstructCause::INCOMPATIBLE)
     );
     assert_eq!(
         load_edited(&|staged| staged.revision = 0),
-        Err(ReconstructCause::Incompatible)
+        Err(ReconstructCause::INCOMPATIBLE)
     );
     let mut loaded = acc.clone();
     Claude::decode_head(staged.revision, &staged.head, &mut loaded).unwrap();
@@ -307,6 +307,6 @@ fn head_identity_binds_route_file_and_capture_mode_only() {
     );
     assert_eq!(
         identity("session.jsonl", true).check(&before.head),
-        Err(ReconstructCause::Incompatible)
+        Err(ReconstructCause::INCOMPATIBLE)
     );
 }

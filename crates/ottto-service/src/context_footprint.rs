@@ -14,7 +14,8 @@ use crate::instruction_inventory::{
 };
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
+    load_snapshot_device_credentials, ActivityHintResponse, RelayTokenAuthorizationRejected,
+    SnapshotApiClient,
 };
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
@@ -232,32 +233,60 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
     let codex_preludes = Arc::clone(&daemon.codex_preludes);
+    let inputs = daemon.footprint_cwds.inputs();
+    let mut harvest = move || {
+        let claude = harvest_all_once(&home, &support_dir, &projection);
+        // Codex session starts share this thread: no extra background job.
+        if let Err(error) =
+            crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+        {
+            eprintln!(
+                "codex session start harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+        }
+        claude
+    };
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
-            let refused = match harvest_all_once(&home, &support_dir, &projection) {
-                Ok(outcome) => outcome.refused > 0,
-                Err(error) => {
-                    eprintln!(
-                        "context footprint harvest skipped: {}",
-                        crate::snapshot_sync::safe_error(&error)
-                    );
-                    false
-                }
-            };
-            // Codex session starts share this thread: no extra background job.
-            if let Err(error) =
-                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
-            {
-                eprintln!(
-                    "codex session start harvest skipped: {}",
-                    crate::snapshot_sync::safe_error(&error)
-                );
-            }
-            std::thread::sleep(next_context_cycle_delay(refused));
+            std::thread::sleep(context_cycle(&inputs, &mut harvest));
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
+}
+
+/// Waits for snapshot sync's first usable delivery (returns at once after it;
+/// the flag never resets), harvests, and answers the delay before the next.
+fn context_cycle(
+    inputs: &FootprintInputs,
+    harvest: &mut impl FnMut() -> Result<ContextHarvestOutcome>,
+) -> Duration {
+    let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
+    let refused = match harvest() {
+        Ok(outcome) => outcome.refused > 0,
+        Err(error) => {
+            eprintln!(
+                "context footprint harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+            false
+        }
+    };
+    next_context_cycle_delay(refused)
+}
+
+/// Set by the first snapshot-sync delivery a harvest can use, from the Claude
+/// or Codex observer; one per daemon, shared by both feeds, RAM only.
+#[derive(Debug, Default)]
+pub(crate) struct FootprintInputs(Mutex<bool>, std::sync::Condvar);
+
+impl FootprintInputs {
+    pub(crate) fn deliver(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.1.notify_all();
+    }
 }
 
 fn harvest_all_once(
@@ -305,6 +334,10 @@ fn harvest_source(
 ) -> Result<ContextHarvestOutcome> {
     let relay_token =
         client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode)?;
+    // Each upload mints its own token just before it posts, as the Codex path
+    // does: the probes take tens of seconds, and another minter on this device
+    // can rebind its machine id in that gap.
+    let mint = || client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode);
     let identity = destination_identity(device, machine_id, api_base_url);
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
@@ -316,7 +349,7 @@ fn harvest_source(
             let _ = fs::remove_file(&marker);
             return harvest_recent_workspaces(
                 client,
-                &relay_token,
+                &mint,
                 support_dir,
                 &identity,
                 home,
@@ -334,7 +367,7 @@ fn harvest_source(
 
     harvest_recent_workspaces(
         client,
-        &relay_token,
+        &mint,
         support_dir,
         &identity,
         home,
@@ -363,7 +396,7 @@ fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn harvest_recent_workspaces(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     home: &Path,
@@ -412,7 +445,7 @@ fn harvest_recent_workspaces(
             Ok(mut request) => {
                 match upload_if_changed(
                     client,
-                    relay_token,
+                    mint_relay_token,
                     support_dir,
                     identity,
                     &mut request,
@@ -422,6 +455,15 @@ fn harvest_recent_workspaces(
                     Ok(false) => skipped += 1,
                     Err(error) => {
                         failed += 1;
+                        if let Some(rejected) =
+                            error.downcast_ref::<RelayTokenAuthorizationRejected>()
+                        {
+                            eprintln!(
+                                "context footprint upload unauthorized: HTTP {}",
+                                rejected.status
+                            );
+                            continue;
+                        }
                         eprintln!(
                             "context footprint upload skipped for workspace_hash={}: {}",
                             request.workspace_hash,
@@ -683,7 +725,14 @@ fn capture_claude_context(
 }
 
 fn configure_claude_context_command(command: &mut Command, include_mcp_servers: bool) -> Duration {
-    command.args(["-p", "/context", "--output-format", "json"]);
+    // Like the /usage refresher: a probe must not leave a saved session behind.
+    command.args([
+        "-p",
+        "/context",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+    ]);
     if !include_mcp_servers {
         // Keep strict mode everywhere except the single sampled workspace.
         // Dropping it globally would double-count MCP across the context and
@@ -1279,7 +1328,7 @@ const PROJECTED_FILE_BYTES: usize = 256;
 /// then are known, and nothing is known while snapshot sync does not read
 /// Claude.
 #[derive(Debug, Default)]
-pub(crate) struct CwdProjection(Mutex<Projection>);
+pub(crate) struct CwdProjection(Mutex<Projection>, Arc<FootprintInputs>);
 
 /// Counters are since daemon start, for the cycle metrics line.
 #[derive(Debug, Default)]
@@ -1333,6 +1382,11 @@ impl CwdProjection {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The wake shared with the Codex feed.
+    pub(crate) fn inputs(&self) -> Arc<FootprintInputs> {
+        Arc::clone(&self.1)
+    }
+
     /// One snapshot-sync pass's observer.
     pub(crate) fn observer(self: &Arc<Self>) -> Box<CwdObserver> {
         self.lock().passes += 1;
@@ -1365,6 +1419,9 @@ impl CwdProjection {
             remember_cwd(&mut known, cwd);
         }
         if let Some(mtime) = file.mtime {
+            if !known.is_empty() && mtime.elapsed().unwrap_or_default() <= RECENT_WORKSPACE_WINDOW {
+                self.1.deliver();
+            }
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
             projection.files.insert(file.object, entry);
@@ -1534,7 +1591,7 @@ struct FootprintCacheEntry {
 
 pub(crate) fn upload_if_changed(
     client: &SnapshotApiClient,
-    relay_token: &str,
+    mint_relay_token: &dyn Fn() -> Result<String>,
     support_dir: &Path,
     identity: &str,
     request: &mut ContextFootprintIngestRequest,
@@ -1554,7 +1611,8 @@ pub(crate) fn upload_if_changed(
     }
     let payload = serde_json::to_value(request)
         .map_err(|error| anyhow!("encode context footprint: {error}"))?;
-    client.upload_context_footprint(relay_token, &payload)?;
+    let relay_token = mint_relay_token()?;
+    client.upload_context_footprint(&relay_token, &payload)?;
     write_json_atomic(
         &path,
         &FootprintCacheEntry {
@@ -1817,7 +1875,8 @@ mod tests {
                 payload
             );
             let arguments = fs::read_to_string(fixture.fake.root.join("arguments")).unwrap();
-            assert!(arguments.starts_with("\n-p\n/context\n--output-format\njson\n"));
+            assert!(arguments
+                .starts_with("\n-p\n/context\n--no-session-persistence\n--output-format\njson\n"));
             assert_eq!(arguments.contains("--strict-mcp-config"), !sampled);
             assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
         }
@@ -2378,6 +2437,47 @@ mod tests {
         (found, path_scopes)
     }
 
+    /// Regression: at daemon start no snapshot pass has delivered a
+    /// transcript yet, so the thread must wait for the first delivery instead
+    /// of harvesting nothing and sleeping six hours.
+    #[test]
+    fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
+        let home = temp_dir("startup-wake");
+        let now = SystemTime::now();
+        let dir = home.join("work").join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        write_discovery_transcripts(&home, now, &[(60, vec![dir.as_path()])]);
+        let mut files = Vec::new();
+        let projects = home.join(".claude").join("projects");
+        collect_recent_jsonl_files(&projects, now, &mut files, &mut 0);
+        let projection = Arc::new(CwdProjection::default());
+        let cycle = {
+            let projection = Arc::clone(&projection);
+            std::thread::spawn(move || {
+                // Each harvest records how many workspaces it could see.
+                let mut seen = Vec::new();
+                let delay = context_cycle(&projection.1, &mut || {
+                    seen.push(projection.recent_cwds(SystemTime::now()).len());
+                    Ok(ContextHarvestOutcome::default())
+                });
+                (seen, delay)
+            })
+        };
+
+        project_transcripts(&projection, &files);
+
+        let (seen, delay) = cycle.join().unwrap();
+        assert_eq!(seen, [1], "one harvest, after the delivery");
+        assert_eq!(delay, CONTEXT_FOOTPRINT_INTERVAL);
+        let mut later = 0;
+        let delay = context_cycle(&projection.1, &mut || {
+            later += 1;
+            Ok(ContextHarvestOutcome::default())
+        });
+        assert_eq!((later, delay), (1, CONTEXT_FOOTPRINT_INTERVAL));
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn projected_discovery_matches_reading_every_file() {
         let home = temp_dir("early-stop");
@@ -2718,6 +2818,58 @@ mod tests {
         );
         drop(state);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_disabled_refusal_is_not_a_receipt() {
+        let support = temp_dir("footprint-source-disabled");
+        let (client, server) = crate::snapshot_client::config_upload_backend(
+            r#"{"accepted":false,"reason":"source_disabled"}"#,
+        );
+        let mut request = sample_request();
+        let error = upload_if_changed(
+            &client,
+            &|| Ok("synthetic-relay".to_string()),
+            &support,
+            "synthetic-destination",
+            &mut request,
+            FootprintRules {
+                policy: Default::default(),
+                names_withheld: false,
+            },
+        )
+        .unwrap_err();
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("POST /api/v1/context-footprint/snapshot "));
+        assert!(error.is::<crate::snapshot_client::UploadRefused>());
+        assert!(!cache_path(&support, &request.workspace_hash).exists());
+
+        let (client, server) = crate::snapshot_client::config_upload_backend(
+            r#"{"accepted":false,"reason":"source_disabled"}"#,
+        );
+        request.agent_source = "codex".to_string();
+        let error = crate::codex_prelude_footprint::upload_if_changed(
+            &client,
+            "synthetic-relay",
+            &support,
+            "synthetic-destination",
+            &mut request,
+            FootprintRules {
+                policy: Default::default(),
+                names_withheld: false,
+            },
+            Some(1),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.is::<crate::snapshot_client::UploadRefused>());
+        assert!(!support
+            .join(crate::codex_prelude_footprint::STATE_DIR)
+            .join(format!("{}.json", request.workspace_hash))
+            .exists());
+        fs::remove_dir_all(support).unwrap();
     }
 
     fn sample_request() -> ContextFootprintIngestRequest {

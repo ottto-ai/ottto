@@ -99,6 +99,45 @@ pub struct LocalDeviceCredentialBinding {
     #[serde(flatten)]
     pub device: LocalDeviceBinding,
     pub credential_generation: u64,
+    #[serde(flatten)]
+    pub continuity: DeviceCredentialContinuity,
+}
+
+/// A device binding with its optional continuity, as read from a legacy or a
+/// generation-bound file. The retained prior device keeps this whole envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalDeviceEnvelope {
+    #[serde(flatten)]
+    pub device: LocalDeviceBinding,
+    #[serde(flatten)]
+    pub continuity: DeviceCredentialContinuity,
+}
+
+/// Additive fields that let a later same-account claim keep this credential's
+/// local snapshot history. Older readers ignore them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCredentialContinuity {
+    /// Server-authenticated account a setup claim installed this credential for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<LocalCredentialOwner>,
+    /// Predecessor namespace carried by a confirmed same-account successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_namespace: Option<SnapshotNamespaceAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCredentialOwner {
+    pub user_id: String,
+    pub organization_id: String,
+    pub api_base_url: String,
+}
+
+/// Valid only while the active secret matches the commitment, so a credential
+/// installed by any other writer falls back to its own namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotNamespaceAlias {
+    pub namespace: String,
+    pub secret_commitment_sha256: String,
 }
 
 /// Exact non-secret authority inputs used to request a prepared relay-device
@@ -124,6 +163,10 @@ pub struct PendingDeviceCredentialRequestAuthority {
     /// preparation request. The prior secret itself is never journaled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_secret_commitment_sha256: Option<String>,
+    /// The prior device's snapshot namespace, journaled only when this setup
+    /// claim is the prior owner's account on the same API and machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_snapshot_namespace: Option<String>,
 }
 
 /// Non-secret half of a prepared relay-device credential. The candidate
@@ -410,6 +453,14 @@ impl FileDeviceStore {
             .load_or_parsing_as("generation-bound device binding", || None)
     }
 
+    pub fn load_envelope(&self) -> Result<Option<LocalDeviceEnvelope>> {
+        self.file().load_or(|| None)
+    }
+
+    pub fn save_envelope(&self, envelope: &LocalDeviceEnvelope) -> Result<()> {
+        self.file().save(envelope)
+    }
+
     pub fn save_with_credential_generation(
         &self,
         device: &LocalDeviceCredentialBinding,
@@ -624,6 +675,7 @@ mod tests {
                 sources: vec!["pi".into()],
             },
             credential_generation: 1,
+            continuity: DeviceCredentialContinuity::default(),
         };
         store.save_with_credential_generation(&binding).unwrap();
         let mut bytes = serde_json::to_vec(&binding).unwrap();
@@ -656,12 +708,24 @@ mod tests {
                 sources: vec!["codex".to_string()],
             },
             credential_generation: 7,
+            continuity: DeviceCredentialContinuity {
+                owner: Some(LocalCredentialOwner {
+                    user_id: "user-one".to_string(),
+                    organization_id: "org-one".to_string(),
+                    api_base_url: "https://api.ottto.net".to_string(),
+                }),
+                snapshot_namespace: Some(SnapshotNamespaceAlias {
+                    namespace: "e".repeat(64),
+                    secret_commitment_sha256: format!("sha256:{}", "f".repeat(64)),
+                }),
+            },
         };
 
         store
             .save_with_credential_generation(&generation_bound)
             .expect("save generation-bound device");
 
+        // Released readers ignore the continuity fields.
         assert_eq!(
             store.load().expect("legacy load"),
             Some(generation_bound.device.clone())
@@ -670,8 +734,24 @@ mod tests {
             store
                 .load_with_credential_generation()
                 .expect("generation load"),
-            Some(generation_bound)
+            Some(generation_bound.clone())
         );
+        let envelope = store.load_envelope().expect("envelope load").unwrap();
+        assert_eq!(envelope.device, generation_bound.device);
+        assert_eq!(envelope.continuity, generation_bound.continuity);
+
+        // The retained prior keeps the whole envelope without a generation.
+        let prior = FileDeviceStore::new(path.with_file_name(PRIOR_DEVICE_FILE_NAME));
+        prior.save_envelope(&envelope).expect("save prior envelope");
+        assert_eq!(prior.load_envelope().unwrap(), Some(envelope.clone()));
+        assert_eq!(prior.load().unwrap(), Some(envelope.device.clone()));
+
+        // A legacy writer drops the continuity.
+        store.save(&envelope.device).expect("legacy save");
+        let legacy = store.load_envelope().unwrap().unwrap();
+        assert_eq!(legacy.continuity, DeviceCredentialContinuity::default());
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("owner") && !json.contains("snapshot_namespace"));
     }
 
     #[test]
@@ -697,6 +777,7 @@ mod tests {
                 prior_device_id: Some("device-prior".to_string()),
                 prior_device_sources: Some(vec!["codex".to_string()]),
                 prior_secret_commitment_sha256: Some(format!("sha256:{}", "c".repeat(64))),
+                canonical_snapshot_namespace: Some("d".repeat(64)),
             }),
             device: LocalDeviceBinding {
                 device_id: "device-next".to_string(),

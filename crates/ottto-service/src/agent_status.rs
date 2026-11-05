@@ -4355,12 +4355,12 @@ fn collect_claude_status(
                     ),
                 ));
             }
-            if let Some(max_plan) = refined_max_plan {
+            if let Some(max_plan) = refined_max_plan.and_then(|plan| claude_plan_name(Some(plan))) {
                 snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                     "claude_max_rate_limit_tier_detected",
                     AgentDiagnosticSeverity::Info,
                     format!(
-                        "Claude Max tier resolved to {max_plan} from local Claude Code account metadata."
+                        "Claude plan tier resolved to {max_plan} from local Claude Code account metadata."
                     ),
                 ));
             }
@@ -4533,6 +4533,7 @@ fn collect_claude_status(
                 stable.credential.access_token.clone(),
                 stable.credential.access_expires_at.clone(),
                 &caller,
+                current_unix_seconds,
             )
         }
         _ => {
@@ -6063,6 +6064,7 @@ fn collect_registered_claude_slot_step(
         access_token,
         resolved.credential.access_expires_at.clone(),
         &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
+        current_unix_seconds,
     );
     match custom_claude_snapshot_from_usage(
         resolved,
@@ -7853,14 +7855,21 @@ fn claude_oauth_plan_type_for_label(oauth: &ClaudeCliOauthAccount) -> Option<Str
     Some(refined.unwrap_or(base)).filter(|plan| !plan.is_empty())
 }
 
-/// "Claude Max 20x", "Claude Team Premium", ... for a local message.
+/// "Claude Ultra", "Claude Team Premium", ... for a local message.
 fn claude_plan_label(plan_type: Option<&str>) -> Option<String> {
+    claude_plan_name(plan_type).map(|name| format!("Claude {name}"))
+}
+
+/// "Ultra", "Team Premium", ... Plan ids keep their old names: `max_5x` is
+/// Max, `max_20x` is Ultra, and a bare `max` (tier unknown) is either.
+fn claude_plan_name(plan_type: Option<&str>) -> Option<String> {
     let plan = normalize_plan_type(plan_type?.to_string());
     let plan = plan.strip_prefix("claude_").unwrap_or(&plan);
     let label = match plan {
         "" => return None,
-        "max_20x" => "Max 20x".to_string(),
-        "max_5x" => "Max 5x".to_string(),
+        "max_20x" => "Ultra".to_string(),
+        "max_5x" => "Max".to_string(),
+        "max" => "Max or Ultra".to_string(),
         other => other
             .split('_')
             .filter(|word| !word.is_empty())
@@ -7873,7 +7882,7 @@ fn claude_plan_label(plan_type: Option<&str>) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     };
-    Some(format!("Claude {label}"))
+    Some(label)
 }
 
 /// Local-only explanation naming the plans of both logins. It never names an
@@ -11110,17 +11119,20 @@ fn collect_claude_oauth_usage_with_access_token(
         access_token,
         None,
         caller,
+        current_unix_seconds,
     )
 }
 
 /// `credential_expires_at` is the access-token expiry metadata of the same
-/// credential, used only to notice rotation; it is never the token.
+/// credential, used only to notice rotation; it is never the token. `clock`
+/// is the wall clock (`current_unix_seconds`) outside fixed-instant tests.
 fn collect_claude_oauth_usage_with_credential(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     access_token: Option<String>,
     credential_expires_at: Option<String>,
     caller: &ClaudeOAuthUsageCaller,
+    clock: fn() -> u64,
 ) -> ClaudeOAuthUsageOutcome {
     let mut outcome = collect_claude_oauth_usage_unstamped(
         account_identifier_hash,
@@ -11128,6 +11140,7 @@ fn collect_claude_oauth_usage_with_credential(
         access_token,
         credential_expires_at.as_deref(),
         caller,
+        clock,
     );
     if let Ok(usage) = &mut outcome.result {
         claude_oauth_stamp_account_identity(
@@ -11181,8 +11194,9 @@ fn collect_claude_oauth_usage_unstamped(
     access_token: Option<String>,
     credential_expires_at: Option<&str>,
     caller: &ClaudeOAuthUsageCaller,
+    clock: fn() -> u64,
 ) -> ClaudeOAuthUsageOutcome {
-    let now = current_unix_seconds();
+    let now = clock();
     let mirror_legacy_default = caller.mirrors_legacy_default();
     // Every pass is evidence of where this caller's login is signed in; a
     // passive reading must have been fetched inside that continuous run.
@@ -11581,7 +11595,7 @@ fn collect_claude_oauth_usage_unstamped(
     // refresh token.
     // A fresh clock sample: cache, breaker and lock reads above can block, and
     // the Mac can sleep, after `now` was taken.
-    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
+    if claude_access_token_locally_expired(credential_expires_at, clock()) {
         drop(token);
         let result = match exact_stale_fallback {
             Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
@@ -11645,7 +11659,7 @@ fn collect_claude_oauth_usage_unstamped(
         hook();
     }
     // Last check, with a clock read immediately before the request.
-    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
+    if claude_access_token_locally_expired(credential_expires_at, clock()) {
         drop(token);
         let result = match exact_stale_fallback {
             Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
@@ -11661,7 +11675,7 @@ fn collect_claude_oauth_usage_unstamped(
         .with_check_outcome(
             "claude_oauth_usage_check_suppressed",
             "This Claude login's access token has expired locally and Claude Code has not refreshed it yet; no provider request was made, and any served readings are last-known local readings.",
-            current_unix_seconds(),
+            clock(),
         );
     }
     if claude_transient_failure_held(account_identifier_hash, organization_identifier_hash, now) {
@@ -11684,7 +11698,7 @@ fn collect_claude_oauth_usage_unstamped(
         return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
             "claude_oauth_usage_check_suppressed",
             "The latest Claude OAuth quota request failed moments ago; no provider request was made, and any served readings are last-known local readings.",
-            current_unix_seconds(),
+            clock(),
         );
     }
     // "Background limit refresh" off: the daemon's own passes read no
@@ -11766,7 +11780,7 @@ fn collect_claude_oauth_usage_unstamped(
                     organization_identifier_hash,
                     body: &value,
                     read: usage_read,
-                    observed_at_epoch_seconds: current_unix_seconds(),
+                    observed_at_epoch_seconds: clock(),
                     previous_credit_balances: &previous_credit_balances,
                     latest_activity_at,
                     now,
@@ -11854,7 +11868,7 @@ fn collect_claude_oauth_usage_unstamped(
                 now,
                 mirror_legacy_default,
             );
-            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", clock()));
             diagnostics.push(claude_oauth_usage_rate_limited_diagnostic(
                 usage_read,
                 retry_after,
@@ -11904,12 +11918,12 @@ fn collect_claude_oauth_usage_unstamped(
                         &mut claude_transient_failures(),
                         account_identifier_hash,
                         organization_identifier_hash,
-                        current_unix_seconds(),
+                        clock(),
                     );
                     Vec::new()
                 }
             };
-            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", clock()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
                 account_identifier_hash,
                 organization_identifier_hash,
@@ -11946,7 +11960,7 @@ fn collect_claude_oauth_usage_unstamped(
         .with_check_outcome(
             "claude_oauth_usage_check_failed",
             "The latest Claude OAuth response could not be read as quota data.",
-            current_unix_seconds(),
+            clock(),
         );
     };
     // This is the local successful response time, never a provider-supplied
@@ -11957,7 +11971,7 @@ fn collect_claude_oauth_usage_unstamped(
             organization_identifier_hash,
             body: &value,
             read: usage_read,
-            observed_at_epoch_seconds: current_unix_seconds(),
+            observed_at_epoch_seconds: clock(),
             previous_credit_balances: &previous_credit_balances,
             latest_activity_at,
             now,
@@ -30114,6 +30128,7 @@ for line in sys.stdin:
                 token,
                 expiry,
                 &caller,
+                current_unix_seconds,
             );
             assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
             assert!(result.diagnostics[0].retry_after.is_none());
@@ -34901,7 +34916,7 @@ exit 0
             slot.collection.diagnostics[0].code,
             ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch
         );
-        assert!(message.contains("Claude Max 20x"), "{message}");
+        assert!(message.contains("Claude Ultra"), "{message}");
         assert!(message.contains("Claude Team Premium"), "{message}");
         assert!(!message.contains('@'), "{message}");
         assert!(
@@ -34951,7 +34966,7 @@ exit 0
             assert!(!diagnostics.contains('@'), "no email in diagnostic uploads");
         }
         assert!(
-            !wire.contains("Claude Max 20x"),
+            !wire.contains("Claude Ultra"),
             "the local message is not uploaded"
         );
         assert!(!wire.contains("fixture-secret"), "no token in uploads");
@@ -35620,7 +35635,15 @@ exit 0
     fn binding_mismatch_message_names_plans_only() {
         assert_eq!(
             claude_plan_label(Some("max_20x")).as_deref(),
-            Some("Claude Max 20x")
+            Some("Claude Ultra")
+        );
+        assert_eq!(
+            claude_plan_label(Some("claude_max_5x")).as_deref(),
+            Some("Claude Max")
+        );
+        assert_eq!(
+            claude_plan_label(Some("max")).as_deref(),
+            Some("Claude Max or Ultra")
         );
         assert_eq!(
             claude_plan_label(Some("claude_team_premium")).as_deref(),
@@ -35632,7 +35655,7 @@ exit 0
         );
         assert_eq!(claude_plan_label(None), None);
         let message = claude_slot_binding_mismatch_message(Some("team_premium"), Some("max_20x"));
-        assert!(message.contains("a different Claude Max 20x account"));
+        assert!(message.contains("a different Claude Ultra account"));
         assert!(message.contains("the Claude Team Premium account"));
         let unknown = claude_slot_binding_mismatch_message(None, None);
         assert!(unknown.contains("a different Claude account"));
@@ -37046,6 +37069,7 @@ exit 44
             Some("fixture-access".to_string()),
             Some(expires_at),
             &ClaudeOAuthUsageCaller::Default,
+            current_unix_seconds,
         );
         *CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap() = None;
         assert_eq!(provider_calls(), before, "the lapsed token was not sent");

@@ -26,27 +26,6 @@ fn write_field<T: Serialize + ?Sized>(
     cx.presence.entry(slot.into()).or_insert(true);
     Ok(())
 }
-/// Codex archive custody is written only while held: archives non-empty or a
-/// deferred alarm owed. Stores without it (every Claude store) keep their exact
-/// rows and presence, and an absent root reads empty at any layout.
-pub(super) const ARCHIVE_KINDS: [&str; 2] =
-    ["v1_field.archives", "v1_field.archive_deferred_alarm_count"];
-fn read_archive_kind<T: serde::de::DeserializeOwned + Serialize + Default>(
-    tx: &mut dyn Transaction,
-    kind: &str,
-    mode: mapper::Members,
-    seed: &mut mapper::Digests,
-) -> Result<T> {
-    if tx.get(&mapper::key(kind, "", 0)?)?.is_none() {
-        // Members without their root are still damage.
-        ensure!(
-            tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
-            "state_v2_missing_manifest"
-        );
-        return Ok(T::default());
-    }
-    mapper::field_read(tx, kind, mode, Some(seed), T::default)
-}
 fn read_field<T: serde::de::DeserializeOwned + Serialize>(
     kind: &str,
     tx: &mut dyn Transaction,
@@ -205,7 +184,6 @@ pub(super) fn merge_cas_at(
         None,
         || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
     )?;
-    kinds_census::hydrate_cas_controls(tx, &mut custody)?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
         .v2_entries()
@@ -349,6 +327,13 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         &serde_json::to_vec(&index.schema_version)?,
     )?;
     macro_rules! save {
+        // Stamps go one row per entity; field_mode finds no two-kind entry,
+        // so the stamp-free header stays one Field row.
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
+            let proof = &index.upload_context_proof;
+            write_field(&proof.header(), "upload_context_proof", $head, rows, cx)?;
+            rows.map($stamps, &proof.entity_stamps)?;
+        };
         (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             // Like the v1 serializer: only versioned cursor fences persist.
             let inventory = &index.claude_desktop_store_inventory;
@@ -365,18 +350,6 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
-    if !index.archives.is_empty() || index.archive_deferred_alarm_count != 0 {
-        let [archives, deferred] = ARCHIVE_KINDS;
-        mapper::field_write(rows, archives, &index.archives, mapper::Members::Map)?;
-        cx.presence.entry("archives".into()).or_insert(true);
-        write_field(
-            &index.archive_deferred_alarm_count,
-            "archive_deferred_alarm_count",
-            deferred,
-            rows,
-            cx,
-        )?;
-    }
     write_holds(index, rows)?;
     rows.raw(
         RowKey::Meta("field_presence".into()),
@@ -403,16 +376,21 @@ pub(super) fn hydrate_txn(
     // Retired kinds are never read: hydrate's retired walk names their rows,
     // so the next save removes them.
     macro_rules! load {
+        // A layout-5 header holds every stamp inline; the next save splits it.
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
+            use super::super::upload_context_receipt::{EntityStamp, ProofState};
+            let mut proof: ProofState =
+                read_field($head, tx, Some(&mut cx.digests), Default::default)?;
+            let stamps = mapper::read_map::<EntityStamp>(tx, $stamps, None, Some(&mut cx.digests))?;
+            proof.entity_stamps.extend(stamps);
+            index.upload_context_proof = proof;
+        };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             index.$f = read_field($kind, tx, Some(&mut cx.digests), || ScanIndex::default().$f)?;
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
-    let [archives, deferred] = ARCHIVE_KINDS;
-    index.archives = read_archive_kind(tx, archives, mapper::Members::Map, &mut cx.digests)?;
-    index.archive_deferred_alarm_count =
-        read_archive_kind(tx, deferred, mapper::Members::Field, &mut cx.digests)?;
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

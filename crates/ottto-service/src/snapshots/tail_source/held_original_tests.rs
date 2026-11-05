@@ -154,7 +154,7 @@ fn a_held_original_conserves_its_dependent_copy_money() {
                 },
             )
             .unwrap();
-            index = state.save_reload(&mut index).0;
+            index = state.save_reload(&mut index);
         }
         if arm == "held_grown" {
             write(

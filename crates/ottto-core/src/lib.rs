@@ -22,11 +22,12 @@ pub use account_store::{
     default_device_path, default_machine_path, default_pending_device_credential_path,
     default_prior_device_path, default_sources_dir, default_support_dir,
     is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
-    FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore,
-    FilePendingDeviceCredentialStore, FileSourceStateStore, LocalConnectionBinding,
-    LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding, LocalSourceState,
-    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority,
+    DeviceCredentialContinuity, FileAccountStore, FileConnectionStore, FileDeviceStore,
+    FileMachineStore, FilePendingDeviceCredentialStore, FileSourceStateStore,
+    LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding,
+    LocalDeviceEnvelope, LocalMachineBinding, LocalSourceState, PendingClaimCredentialCommit,
+    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority,
+    SnapshotNamespaceAlias,
 };
 pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,

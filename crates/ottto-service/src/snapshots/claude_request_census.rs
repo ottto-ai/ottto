@@ -16,9 +16,9 @@
 //!
 //! Census state follows the working index (`self`), never `previous`: a held
 //! or partially committed key keeps the record of the revision this window
-//! parsed, even when its entry reverts. A #588 selected restore invalidates
-//! the key's record instead (fail-closed), keeping only the first-seen birth
-//! of the same physical object (a birth stub every reader treats as absent).
+//! parsed, even when its entry reverts. A failed object/scope check invalidates
+//! the record, keeping only the first-seen birth of the same physical object
+//! (a birth stub every reader treats as absent).
 
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref, rfc3339_unix_seconds,
@@ -559,27 +559,29 @@ impl ClaudeRequestCensus {
     }
 
     /// `e2` copy decisions, once per folder per page: every MAIN transcript
-    /// record (never a subagent) directly in `folder` (an index key) holding
-    /// some of the sorted unique `wanted` hashes, with its key, session and
-    /// the hashes it holds. The caller decides whether the record proves
-    /// anything (current revision, other session, earlier birth). The same
-    /// walk as `family_transcript_holders`, over the folder's key range only.
-    /// None when `deadline` passes: the caller cannot decide.
+    /// record (never a subagent) directly in `folder` (an index key; None:
+    /// every folder) holding some of the sorted unique `wanted` hashes, with
+    /// its key, session and the hashes it holds. The caller decides whether
+    /// the record proves anything (current revision, other session, earlier
+    /// birth). The same walk as `family_transcript_holders`, over the folder's
+    /// key range only. None when `deadline` passes: the caller cannot decide.
     pub(crate) fn main_transcript_holders<'a>(
         &'a self,
-        folder: &str,
+        folder: Option<&str>,
         wanted: &[u64],
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut visit: impl FnMut(&'a str, &'a str, &'a ClaudeRequestCensusRecord, &[u64]),
     ) -> Option<()> {
         if wanted.is_empty() {
             return Some(());
         }
         #[cfg(test)]
-        if walk_deadline_forced(MAIN_WALK) {
+        if deadline.is_some() && walk_deadline_forced(MAIN_WALK) {
             return None;
         }
-        let prefix = format!("{folder}{}", std::path::MAIN_SEPARATOR);
+        let prefix = folder
+            .map(|folder| format!("{folder}{}", std::path::MAIN_SEPARATOR))
+            .unwrap_or_default();
         let children = self
             .records
             .range::<str, _>((
@@ -588,10 +590,11 @@ impl ClaudeRequestCensus {
             ))
             .take_while(|(key, _)| key.starts_with(&prefix))
             .filter(|(key, record)| {
-                !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR) && !record.is_birth_stub()
+                (folder.is_none() || !key[prefix.len()..].contains(std::path::MAIN_SEPARATOR))
+                    && !record.is_birth_stub()
             });
         let mut hits = Vec::new();
-        Self::walk_transcript_holders(children, Some(deadline), |key, member, record| {
+        Self::walk_transcript_holders(children, deadline, |key, member, record| {
             if member.subagent_stem.is_some() {
                 return;
             }
@@ -1897,8 +1900,7 @@ pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     })
 }
 
-/// A parse that reaches no record (a failed finish, or a native comparison
-/// target whose record allocation is not prepaid) leaves the key without
+/// A parse that reaches no record after a failed finish leaves the key without
 /// one, never with an older revision's.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
     if !index.persistence_available() {

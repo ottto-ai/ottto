@@ -1555,7 +1555,8 @@ fn start_verdict_matches_the_folded_session_start() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// One native read: reuse `old` when the reader accepts it, retain, finish.
+/// One native read: reuse `old` when the reader accepts it, keep a copy of the
+/// sealed reduction (as a stored head would), finish.
 fn native_read(
     path: &Path,
     old: Option<
@@ -1584,23 +1585,17 @@ fn native_read(
     .expect("parser");
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
     let mode = parser
-        .prepare_acquisition(old, &scope, debt, now)
+        .prepare_acquisition(old.map(Box::new), &scope, debt, now)
         .expect("prepare");
     while !parser.step().expect("step") {}
     let acquisition = parser
-        .retain_reduction(
-            &scope,
-            now,
-            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
-        )
+        .retain_reduction(&scope, now)
         .expect("retain")
         .expect("retained");
-    let retained = acquisition
-        .reduction
-        .map(|state| crate::transcript_cache::Retained {
-            checkpoint: acquisition.checkpoint,
-            state,
-        });
+    let retained = (!acquisition.unsealed).then(|| crate::transcript_cache::Retained {
+        checkpoint: acquisition.checkpoint,
+        state: parser.durable_test_reduction_copy(),
+    });
     let parsed = parser
         .finish(
             &expected,

@@ -1,7 +1,7 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
-    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ClaudeAbsenceCounters, ScanIndex,
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
@@ -107,7 +107,6 @@ pub(super) fn retiring(
     traversal: &ScanTraversalCheckpoint,
     raw_complete: bool,
     unsettled_causes: u16,
-    absence: Option<(ClaudeAbsenceCounters, bool)>,
     gates: CensusGates,
 ) {
     #[derive(Serialize)]
@@ -123,22 +122,6 @@ pub(super) fn retiring(
         counts: &'a ScanTraversalCounts,
         max_unread_bytes: u64,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
-        /// Claude only: retired-family tombstone process totals, and the
-        /// index's tombstone uncertainty fence.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_hits: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tombstone_decode_drops: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstones_cleared: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_uncertain: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tombstone_fence_raised_on_upgrade: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        absent_family_tombstone_aged_out: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fence_lowering_skipped_scratch_fallback: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -164,16 +147,6 @@ pub(super) fn retiring(
             counts: &traversal.counts,
             max_unread_bytes: traversal.counts.max_unread_bytes,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
-            absent_family_tombstone_hits: absence.map(|(counts, _)| counts.tombstone_hits),
-            tombstone_decode_drops: absence.map(|(counts, _)| counts.tombstone_decode_drops),
-            absent_family_tombstones_cleared: absence.map(|(counts, _)| counts.tombstones_cleared),
-            absent_family_tombstone_uncertain: absence.map(|(_, uncertain)| uncertain),
-            tombstone_fence_raised_on_upgrade: absence
-                .map(|(counts, _)| counts.tombstone_fence_raised_on_upgrade),
-            absent_family_tombstone_aged_out: absence
-                .map(|(counts, _)| counts.absent_family_tombstone_aged_out),
-            fence_lowering_skipped_scratch_fallback: absence
-                .map(|(counts, _)| counts.fence_lowering_skipped_scratch_fallback),
         },
     );
 }
@@ -729,10 +702,9 @@ mod tests {
             "not_found_sites":([[u64::MAX, u64::MAX]; 5]),
             "vanished_audit_debt_dropped":u64::MAX,
             "vanished_request_census_removed":u64::MAX,
-            "parent_missing_removals":u64::MAX,"vanished_pin_refusals":u64::MAX,
             "overflowed":true})
         );
-        assert_eq!(totals.as_object().unwrap().len(), 9);
+        assert_eq!(totals.as_object().unwrap().len(), 7);
         assert_eq!(row["observation"]["wall_elapsed_us"], 0);
         for field in [
             "shared_process_cpu_delta_us",
@@ -807,18 +779,6 @@ mod tests {
                     index.traversal.as_ref().unwrap(),
                     true,
                     u16::MAX,
-                    // `false` is the longer spelling of the fence state.
-                    (source == SnapshotSource::ClaudeCode).then_some((
-                        ClaudeAbsenceCounters {
-                            tombstone_hits: u64::MAX,
-                            tombstone_decode_drops: u64::MAX,
-                            tombstones_cleared: u64::MAX,
-                            tombstone_fence_raised_on_upgrade: u64::MAX,
-                            absent_family_tombstone_aged_out: u64::MAX,
-                            fence_lowering_skipped_scratch_fallback: u64::MAX,
-                        },
-                        false,
-                    )),
                     CensusGates {
                         clean_followup: true,
                         ..Default::default()
@@ -835,68 +795,6 @@ mod tests {
                 10
             );
             assert_complete_max_row(rows[0].clone());
-        }
-    }
-    // The Claude retiring row names every absence total
-    // and the fence state with their values (and the upgrade fence
-    // count, the aged-out tombstone and skipped-lowering
-    // counts); other sources omit them all.
-    #[test]
-    fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
-        const NAMES: [&str; 7] = [
-            "absent_family_tombstone_hits",
-            "tombstone_decode_drops",
-            "absent_family_tombstones_cleared",
-            "absent_family_tombstone_uncertain",
-            "tombstone_fence_raised_on_upgrade",
-            "absent_family_tombstone_aged_out",
-            "fence_lowering_skipped_scratch_fallback",
-        ];
-        for source in [
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Pi,
-        ] {
-            for uncertain in [false, true] {
-                let mut index = ScanIndex::default();
-                ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
-                let (_, rows) = capture(|| {
-                    retiring(
-                        source,
-                        7,
-                        index.traversal.as_ref().unwrap(),
-                        true,
-                        0,
-                        (source == SnapshotSource::ClaudeCode).then_some((
-                            ClaudeAbsenceCounters {
-                                tombstone_hits: 1,
-                                tombstone_decode_drops: 2,
-                                tombstones_cleared: 3,
-                                tombstone_fence_raised_on_upgrade: 5,
-                                absent_family_tombstone_aged_out: 6,
-                                fence_lowering_skipped_scratch_fallback: 7,
-                            },
-                            uncertain,
-                        )),
-                        CensusGates::default(),
-                    )
-                });
-                assert_eq!(rows.len(), 1);
-                let counts = &rows[0]["counts"];
-                if source == SnapshotSource::ClaudeCode {
-                    for (name, value) in NAMES.iter().zip(1..) {
-                        if *name == "absent_family_tombstone_uncertain" {
-                            assert_eq!(counts[*name], json!(uncertain), "{name}");
-                        } else {
-                            assert_eq!(counts[*name], json!(value), "{name}");
-                        }
-                    }
-                } else {
-                    for name in NAMES {
-                        assert!(counts.get(name).is_none(), "{source:?}: {name}");
-                    }
-                }
-            }
         }
     }
 }

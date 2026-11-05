@@ -2,7 +2,7 @@
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
 use super::super::tests::{
-    counting_v2_unbound_fixture, fixture, legacy_index, member, replay_group, scan, usage,
+    counting_v2_unbound_fixture, fixture, member, replay_group, scan, usage,
 };
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
@@ -386,38 +386,6 @@ fn chain_rows(owner: &str, prefix: &str, created: &str, start: u64, count: u64) 
 }
 
 #[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn blocked_owner_released_when_all_members_vanish_on_clean_walk() {
-    let root = refused_fixture();
-    write_rows(
-        &root.join("sessions/c.jsonl"),
-        &member(OTHER, "healthy", 100, 100),
-    );
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
-    fs::remove_file(root.join("sessions/a.jsonl")).unwrap();
-    fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
-    // A later generation walks the corpus again.
-    index.traversal = None;
-    for _ in 0..8 {
-        let (next, _) = sampled(&root, index, 10, &cache);
-        index = next;
-        if !index.codex_state_only_blocked_session_ids.contains(OWNER) {
-            break;
-        }
-    }
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(OWNER),
-        "B releases the owner it blocked once every member left the census"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn v2_group_with_ui_only_turn_held_until_turn_hook() {
     let root = temp_root("v2");
     let first = "11111111-aaaa-4aaa-8aaa-111111111111";
@@ -579,7 +547,7 @@ fn duplicate_origin_stub_replayed_first_does_not_change_live_context() {
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert!(parsed.progress_complete());
     assert_eq!(parsed.snapshots.len(), 1);
     assert_eq!(parsed.snapshots[0].input_tokens, 100);
     assert!(
@@ -960,11 +928,10 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
         Err(GroupEnd::Strict)
     ));
     let cache = Arc::new(SharedCache::default());
-    let (index, result) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let (_, result) = sampled(&root, ScanIndex::default(), 10, &cache);
     let after = counters(&cache);
     assert_eq!(after.memo_records, 0, "{after:?}");
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -988,13 +955,12 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
         &root.join("sessions/b.jsonl"),
         &[turn("44444444-aaaa-4aaa-8aaa-444444444444")],
     );
-    let ((index, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    let ((_, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
     assert_eq!(bytes, 0, "a memo hit replays no byte despite live growth");
     assert_eq!(group_replays(), refused, "no second replay or replay bytes");
     assert_eq!(counters(&cache).memo_records, first.memo_records);
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "re-disclosed as settleable residue");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1155,7 +1121,6 @@ fn state_bound_group_parks_on_live_stamp_until_a_real_change() {
         assert_eq!(bound.jobs_state_bound, 1, "{bound:?}");
         assert_eq!(cache.cursor_reserved(), 0);
         assert!(first.snapshots.is_empty());
-        assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
         // A new generation without a capacity or input change: no attempt.
         let ((index, _), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
         assert_eq!(bytes, 0, "never retried per generation");
@@ -1380,7 +1345,7 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
 }
 
 #[test]
-fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
+fn restart_mid_job_reboots_group_once_with_one_body() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1392,20 +1357,12 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
             counters(&before).jobs_paused > 0
         });
         assert!(first.snapshots.is_empty());
-        assert!(
-            index.codex_state_only_blocked_session_ids.contains(OWNER),
-            "F8: no state-only body for the owner of a paused group"
-        );
         // Restart: the RAM cache and its paused job are gone; the index is
         // saved and loaded.
         drop(before);
         let path = root.join("index.json");
         index.save(&path).unwrap();
         let index = ScanIndex::load(&path).unwrap();
-        assert!(
-            index.codex_state_only_blocked_session_ids.contains(OWNER),
-            "F8 across a restart"
-        );
         let after = Arc::new(SharedCache::default());
         let replay = group_replays();
         let ((_, done, earlier), bytes) =
@@ -1432,17 +1389,15 @@ fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
 }
 
 #[test]
-fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
+fn refused_group_debt_survives_save_and_restart() {
     let root = refused_fixture();
 
     let cache = Arc::new(SharedCache::default());
     let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(first.census_complete, "{first:?}");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     let path = root.join("index.json");
     index.save(&path).unwrap();
     let mut loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.codex_state_only_blocked_session_ids.contains(OWNER));
     assert_eq!(
         loaded
             .traversal
@@ -1452,13 +1407,12 @@ fn refused_group_debt_and_blocked_owner_survive_save_and_restart() {
         "residue survives save and load"
     );
     // A new process: no memo, one bounded re-attempt, the same settleable
-    // debt and the same blocked owner.
+    // debt and no body.
     loaded.traversal = None;
     let restarted = Arc::new(SharedCache::default());
-    let (index, again) = sampled(&root, loaded, 10, &restarted);
+    let (_, again) = sampled(&root, loaded, 10, &restarted);
     assert!(again.snapshots.is_empty());
     assert!(again.census_complete, "{again:?}");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1480,282 +1434,6 @@ fn upload_context_change_keeps_paused_group() {
     });
     let after = counters(&cache);
     assert_eq!(after.jobs_invalidated, 0, "{after:?}");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn unchanged_group_releases_persisted_blocked_owner() {
-    let (root, _) = fixture();
-    let previous = ScanIndex::default();
-    let (mut index, mut result) = scan(&root, previous.clone(), 2);
-    finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
-    result.finish_codex_capture_boundary(&mut index);
-    let accepted = result
-        .snapshots
-        .iter()
-        .map(|item| item.snapshot_fingerprint.clone())
-        .collect::<BTreeSet<_>>();
-    let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
-    let path = root.join("index.json");
-    settled.save(&path).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
-    // A block a previous process persisted (F8) without its RAM provenance.
-    loaded
-        .codex_state_only_blocked_session_ids
-        .insert(OWNER.to_owned());
-    let (index, restarted) = scan(&root, loaded, 2);
-    assert_eq!(
-        restarted.semantic_noop_count, 2,
-        "the group boots unchanged"
-    );
-    assert!(
-        !index.codex_state_only_blocked_session_ids.contains(OWNER),
-        "R1-L3: no job or debt holds the owner"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn group_with_legacy_tee_is_byte_charged() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (root, inventory) = fixture();
-    let previous = legacy_index(&inventory, None);
-    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
-    loop {
-        match boot.step(None, &previous) {
-            Boot::Pending => {}
-            Boot::Ready => break,
-            _ => panic!("the legacy group boots"),
-        }
-    }
-    let metadata = CodexTitleMetadata::default();
-    let mut job = boot
-        .into_job(JobInputs {
-            metadata: &metadata,
-            traces: None,
-
-            index: &previous,
-        })
-        .unwrap();
-    assert!(job.group.as_ref().unwrap().tee.is_some());
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert!(matches!(
-        step_group(&mut job, &inputs),
-        GroupStep::Read(Ok(false))
-    ));
-    let cache = Arc::new(SharedCache::default());
-    let mut owned = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        &[root.join("sessions")],
-        previous,
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
-    *owned.active_file = Some(job);
-    // The group read without the cursor is charged by bytes
-    // (`completed_bound`, tee inputs taken out), never refused by the
-    // per-line visit walk, so retained singleton copies survive.
-    assert!(owned.sampled_copy_budget() > 0);
-    let walked = owned
-        .active_file
-        .as_ref()
-        .and_then(|active| active.group.as_ref())
-        .and_then(|group| group.walked);
-    assert!(
-        walked.is_some_and(|(charge, _, _)| charge != usize::MAX),
-        "{walked:?}"
-    );
-    assert!(owned.sampled_copy_budget() > 0, "the E3 estimate");
-    // L-A1: a group active owns a proof and tee, so even a measured copy
-    // refusal keeps the conservative release.
-    let (_, measured) = owned.sampled_copy_parts();
-    assert!(measured.is_some(), "precondition: residents measured");
-    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_for_copy_refusal(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            measured,
-        )
-    });
-    assert_eq!(lifecycle.clear_other_active, 1);
-    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-    // Given a Tail acquisition and with every other
-    // borrowed-state conjunct cleared, the group conjunct alone keeps the job
-    // off shape F, so its refusal keeps ClearOtherActive and its completion
-    // never reaches R0's release.
-    let active = owned.active_file.as_deref_mut().unwrap();
-    let mut file = fs::File::open(&active.candidate.path).unwrap();
-    let plan = crate::transcript_acquisition::ReadPlan::prepare(
-        &mut file,
-        None,
-        &Scope("group-fixture".into()),
-        None,
-        100,
-    )
-    .unwrap();
-    let sampling = active.sampling.replace(sampled_scan::Active {
-        key: String::new(),
-        scope: Scope("group-fixture".into()),
-        mode: crate::transcript_acquisition::ReadMode::Tail,
-        audit_due: None,
-        retained_hint: Some((0, 0)),
-        retained_finalization_charge: 0,
-        retained_usage: None,
-        reinsertion: Default::default(),
-        tier_prefix_replay: false,
-    });
-    let acquisition = active.parser.reader.acquisition.replace(plan);
-    let replay = active.parser.accumulator.codex_tier_replay.take();
-    let aliases = std::mem::take(&mut active.aliases);
-    let receipts = std::mem::take(&mut active.applied_receipts);
-    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
-    let cursor = active.cursor.take();
-    assert!(active.group.is_some());
-    assert!(!sampled_scan::borrows_only_retained_reduction(active));
-    let group = active.group.take();
-    assert!(
-        sampled_scan::borrows_only_retained_reduction(active),
-        "precondition: only the group conjunct differs from shape F"
-    );
-    active.group = group;
-    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_for_copy_refusal(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            measured,
-        )
-    });
-    assert_eq!(lifecycle.clear_other_active, 1, "a Tail group job");
-    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
-    let active = owned.active_file.as_deref_mut().unwrap();
-    active.sampling = sampling;
-    active.parser.reader.acquisition = acquisition;
-    active.parser.accumulator.codex_tier_replay = replay;
-    active.aliases = aliases;
-    active.applied_receipts = receipts;
-    active.comparison_target = comparison_target;
-    active.cursor = cursor;
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// A byte-charged group job whose real charge overflows the
-/// state budget beside full residents is walked to the whole state budget,
-/// so its refusal evicts to fit on that charge: one entry for an overflow
-/// below one entry's charge, never a wipe-all clear. Its copy-budget record is that
-/// walk, not `usize::MAX`, so the next step's estimate opens the budget and
-/// nothing is released again.
-///
-/// Red at round 1 (66e5315c): the walk stopped at the remaining room,
-/// recorded `usize::MAX` and cleared every filler (`ClearOtherActive`).
-#[test]
-fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    use crate::snapshots::cache_policy_tests as policy;
-    let (root, inventory) = fixture();
-    let previous = legacy_index(&inventory, None);
-    let mut boot = GroupBoot::new(inventory.groups().into_values().next().unwrap(), &previous);
-    loop {
-        match boot.step(None, &previous) {
-            Boot::Pending => {}
-            Boot::Ready => break,
-            _ => panic!("the legacy group boots"),
-        }
-    }
-    let metadata = CodexTitleMetadata::default();
-    let mut job = boot
-        .into_job(JobInputs {
-            metadata: &metadata,
-            traces: None,
-
-            index: &previous,
-        })
-        .unwrap();
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert!(matches!(
-        step_group(&mut job, &inputs),
-        GroupStep::Read(Ok(false))
-    ));
-    // The job's own state grows by bytes past the room the fillers leave.
-    job.parser
-        .accumulator
-        .provider_skills
-        .extend((0..4800).map(|n| format!("group-{n:05}-{}", "x".repeat(1000))));
-    let (cache, filler_charge) = policy::filled_cache();
-    let mut owned = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        &[root.join("sessions")],
-        previous,
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
-    *owned.active_file = Some(job);
-    let (budget, step) = owned.sampled_copy_step();
-    let walked = owned
-        .active_file
-        .as_ref()
-        .and_then(|active| active.group.as_ref())
-        .and_then(|group| group.walked);
-    let receipt =
-        format!("budget={budget} step={step:?} walked={walked:?} filler_charge={filler_charge}");
-    eprintln!("CACHE_POLICY test=M1_group_overflow {receipt}");
-    assert_eq!(
-        budget, 0,
-        "precondition: the group overflows the room; {receipt}"
-    );
-    assert!(
-        step.active.is_some() && walked.map(|(charge, _, _)| charge) == step.active,
-        "F2: the real walk is the refusal's charge and the E3 record; {receipt}"
-    );
-    let overflow = step
-        .resident
-        .zip(step.active)
-        .map(|(resident, active)| (resident + active).saturating_sub(policy::POLICY_STATE_BYTES));
-    assert!(
-        overflow.is_some_and(|overflow| overflow > 0 && overflow < filler_charge),
-        "precondition: an overflow below one entry; {receipt}"
-    );
-    let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-        sampled_scan::release_cache_to_fit(
-            owned.sampling.as_ref(),
-            owned.active_file.as_deref(),
-            step,
-        )
-    });
-    assert_eq!(
-        policy::wipe_clears(&counts),
-        0,
-        "F2: a wipe-all clear; {counts:?}"
-    );
-    assert_eq!(counts.copy_refusal_entries_evicted, 1, "{counts:?}");
-    assert_eq!(policy::fillers_resident(&cache), policy::FILLERS - 1);
-    assert!(
-        owned.sampled_copy_budget() > 0,
-        "F2: the next step's E3 estimate keeps the budget shut"
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1891,14 +1569,13 @@ fn probe_budget_fallback_refusal_is_strict_and_not_memoized() {
     let (_, ordered) = scan(&root, ScanIndex::default(), 10);
     assert!(!ordered.snapshots.is_empty(), "probes order the group");
     let cache = Arc::new(SharedCache::default());
-    let (index, result) = with_test_limits(2048, 1, 64, || {
+    let (_, result) = with_test_limits(2048, 1, 64, || {
         sampled(&root, ScanIndex::default(), 10, &cache)
     });
     let after = counters(&cache);
     assert_eq!(after.memo_records, 0, "{after:?}");
     assert!(result.snapshots.is_empty());
     assert!(result.unreadable_path_count > 0, "strict AliasParser debt");
-    assert!(index.codex_state_only_blocked_session_ids.contains(OWNER));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2169,387 +1846,6 @@ fn active_cutover_resume_follows_every_member_ack() {
     }
 }
 
-// #641 join release: J-T2..J-T6 and J-T12 beside J-T1 above.
-
-/// `owner` is blocked: no state-only body publishes for it.
-fn held_owner(index: &ScanIndex, owner: &str) -> bool {
-    index.codex_state_only_blocked_session_ids.contains(owner)
-}
-
-fn session_key(root: &Path, name: &str) -> String {
-    local_index_key(&root.join("sessions").join(name))
-}
-
-/// The owners whose block `key`'s latest disclosure holds.
-fn claims(index: &ScanIndex, key: &str) -> Option<BTreeSet<String>> {
-    index.codex_state_only_blocked_by_file.get(key).cloned()
-}
-
-/// J-T1's steps after its first page: members `a` and `b` leave, then later
-/// generations walk the corpus until `done` (at most 8 pages).
-fn walk_without_members(
-    root: &Path,
-    mut index: ScanIndex,
-    cache: &Arc<SharedCache>,
-    done: impl Fn(&ScanIndex) -> bool,
-) -> ScanIndex {
-    fs::remove_file(root.join("sessions/a.jsonl")).unwrap();
-    fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
-    index.traversal = None;
-    for _ in 0..8 {
-        let (next, _) = sampled(root, index, 10, cache);
-        index = next;
-        if done(&index) {
-            break;
-        }
-    }
-    index
-}
-
-/// J-T1's fixture after its first page: `OWNER` blocked by its refused group.
-fn refused_first_page(cache: &Arc<SharedCache>) -> (PathBuf, ScanIndex) {
-    let root = refused_fixture();
-    write_rows(
-        &root.join("sessions/c.jsonl"),
-        &member(OTHER, "healthy", 100, 100),
-    );
-    let (index, _) = sampled(&root, ScanIndex::default(), 10, cache);
-    assert!(held_owner(&index, OWNER));
-    (root, index)
-}
-
-/// J-T2: the release removes only the recorded members' claims on the
-/// owner. A departed non-member key (never on disk, so never in the census)
-/// keeps its claim, and with it the owner's block.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
-    let cache = Arc::new(SharedCache::default());
-    let (root, mut index) = refused_first_page(&cache);
-    let [a, b, n] = ["a.jsonl", "b.jsonl", "n.jsonl"].map(|name| session_key(&root, name));
-    index
-        .codex_state_only_blocked_by_file
-        .insert(n.clone(), BTreeSet::from([OWNER.to_owned()]));
-    let index = walk_without_members(&root, index, &cache, |index| {
-        !claims(index, &a).is_some_and(|owners| owners.contains(OWNER))
-    });
-    for key in [&a, &b] {
-        assert!(
-            !claims(&index, key).is_some_and(|owners| owners.contains(OWNER)),
-            "the member's own claim is released"
-        );
-    }
-    assert_eq!(claims(&index, &n), Some(BTreeSet::from([OWNER.to_owned()])));
-    assert!(
-        held_owner(&index, OWNER),
-        "the non-member claim still holds it"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// A clean walk's traversal whose census is exactly `census`.
-fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoint {
-    crate::snapshots::ScanTraversalCheckpoint {
-        context_fingerprint: "join-release-fixture".to_string(),
-        census_window_end: "2026-10-06T23:00:00Z".to_string(),
-        scan_roots: Vec::new(),
-        pending_directories: std::collections::VecDeque::new(),
-        pending_candidates: std::collections::VecDeque::new(),
-        observed_index_keys: Default::default(),
-
-        oversized_discovery: Default::default(),
-        codex_rollout_paths: census.iter().map(|key| (*key).to_owned()).collect(),
-        codex_join_directory_census: None,
-        reconciliation_upper_bound: None,
-        reconciliation_after: None,
-        reconciliation_started: false,
-        watcher_hint_seen: false,
-        codex_freshness_yield: false,
-        retired_codex_parent_resolution_retry_required: serde::de::IgnoredAny,
-        unhealthy_retry_attempt: 0,
-        unhealthy_retry_not_before_unix_seconds: None,
-        counts: crate::snapshots::ScanTraversalCounts::default(),
-        residue: crate::snapshots::ScanTraversalResidue::default(),
-        listing_started_unix_seconds: None,
-        listing_owed_requeued_unix_seconds: Default::default(),
-    }
-}
-
-/// `OWNER` recorded for members `a` and `b` (both claiming it, blocked),
-/// beside a departed non-member claim `n`.
-fn recorded_release_fixture(cache: &SharedCache) -> (ScanIndex, [String; 3]) {
-    let members = [candidate("a.jsonl", 100), candidate("b.jsonl", 200)];
-    cache.record_join_owner(OWNER, &members);
-    let keys = [
-        local_index_key(&members[0].path),
-        local_index_key(&members[1].path),
-        local_index_key(Path::new("/fixture/sessions/n.jsonl")),
-    ];
-    let mut index = ScanIndex::default();
-    for key in &keys {
-        index
-            .codex_state_only_blocked_by_file
-            .insert(key.clone(), BTreeSet::from([OWNER.to_owned()]));
-    }
-    index
-        .codex_state_only_blocked_session_ids
-        .insert(OWNER.to_owned());
-    (index, keys)
-}
-
-/// J-T4 (a): an unclean walk (a rejected symlink) releases nothing.
-#[test]
-fn join_release_waits_for_a_clean_census() {
-    let cache = Arc::new(SharedCache::default());
-    let (root, index) = refused_first_page(&cache);
-    let before = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
-        .map(|key| claims(&index, &key));
-    assert!(before
-        .iter()
-        .all(|owners| owners.as_ref().is_some_and(|owners| owners.contains(OWNER))));
-    std::os::unix::fs::symlink(
-        root.join("sessions/c.jsonl"),
-        root.join("sessions/link.jsonl"),
-    )
-    .unwrap();
-    let index = walk_without_members(&root, index, &cache, |_| false);
-    assert!(held_owner(&index, OWNER));
-    let after = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
-        .map(|key| claims(&index, &key));
-    assert_eq!(after, before);
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// J-T4 (b): an inventoried header naming the owner keeps it (main's `keep`).
-#[test]
-fn join_release_keeps_an_owner_a_header_still_names() {
-    let cache = Arc::new(SharedCache::default());
-    let (root, index) = refused_first_page(&cache);
-    let before = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
-        .map(|key| claims(&index, &key));
-    assert!(before
-        .iter()
-        .all(|owners| owners.as_ref().is_some_and(|owners| owners.contains(OWNER))));
-    write_rows(
-        &root.join("sessions/d.jsonl"),
-        &member(OWNER, "single", 100, 100),
-    );
-    let index = walk_without_members(&root, index, &cache, |_| false);
-    assert!(held_owner(&index, OWNER));
-    let after = [session_key(&root, "a.jsonl"), session_key(&root, "b.jsonl")]
-        .map(|key| claims(&index, &key));
-    assert_eq!(after, before);
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// J-T5: releasing `OWNER` removes only its claims: `OTHER`'s claim on the
-/// same member key and its block survive; an emptied key is removed.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs macOS heap layout"
-)]
-fn join_release_of_one_owner_never_deletes_another() {
-    let cache = Arc::new(SharedCache::default());
-    let (root, mut index) = refused_first_page(&cache);
-    let [a, b] = ["a.jsonl", "b.jsonl"].map(|name| session_key(&root, name));
-    index
-        .codex_state_only_blocked_by_file
-        .entry(a.clone())
-        .or_default()
-        .insert(OTHER.to_owned());
-    index
-        .codex_state_only_blocked_session_ids
-        .insert(OTHER.to_owned());
-    let index = walk_without_members(&root, index, &cache, |index| !held_owner(index, OWNER));
-    assert!(!held_owner(&index, OWNER), "B's provenance releases it");
-    assert_eq!(claims(&index, &a), Some(BTreeSet::from([OTHER.to_owned()])));
-    assert!(held_owner(&index, OTHER));
-    assert_eq!(claims(&index, &b), None);
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// J-T6: provenance refused at admission (no room) is never recorded, so
-/// the owner stays blocked when its members leave (J-T1 is the control).
-#[test]
-fn join_provenance_refused_at_admission_keeps_the_owner_blocked() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let root = refused_fixture();
-    write_rows(
-        &root.join("sessions/c.jsonl"),
-        &member(OTHER, "healthy", 100, 100),
-    );
-    let (index, _) = with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
-    assert!(held_owner(&index, OWNER));
-    let index = walk_without_members(&root, index, &cache, |_| false);
-    assert!(held_owner(&index, OWNER));
-    for name in ["a.jsonl", "b.jsonl"] {
-        assert!(
-            claims(&index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER))
-        );
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// J-T1's parity holds under one oversized job. A later group whose
-/// pause can never fit (`JoinStateBound`, another root on the same cache)
-/// forgets no provenance, so `OWNER` is still released when its members
-/// leave. Before the fix the hopeless reserve evicted every entry first.
-#[test]
-fn hopeless_pause_keeps_join_provenance_for_the_release() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    const BIG: &str = "33333333-cccc-4ccc-8ccc-333333333333";
-    let cache = Arc::new(SharedCache::default());
-    let (root, index) = refused_first_page(&cache);
-    let big = temp_root("hopeless-pause");
-    write_rows(
-        &big.join("sessions/a.jsonl"),
-        &chain_rows(BIG, "a", "2026-10-01T10:00:00Z", 0, 30),
-    );
-    write_rows(
-        &big.join("sessions/b.jsonl"),
-        &chain_rows(BIG, "b", "2026-10-01T10:30:00Z", 300, 30),
-    );
-    let _ = with_test_limits(2048, 1024, 64, || {
-        with_test_state_budget(1, || sampled(&big, ScanIndex::default(), 10, &cache))
-    });
-    assert_eq!(counters(&cache).jobs_state_bound, 1);
-    assert_eq!(cache.cursor_reserved(), 0);
-    let index = walk_without_members(&root, index, &cache, |index| !held_owner(index, OWNER));
-    assert!(
-        !held_owner(&index, OWNER),
-        "the hopeless pause left B's provenance in place"
-    );
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(big).unwrap();
-}
-
-/// R2-L4: the release's paused-job keep arm, at scan level. A live paused
-/// group job of `OWNER` in another namespace (K10 leaves it in the slot)
-/// keeps `OWNER` blocked although its recorded members left a clean walk
-/// (J-T1 is the control: without the arm, the same walk releases it). The queued and active arms cannot be isolated
-/// here: a queued or active group's members are in this walk, so their
-/// headers hold the owner first.
-#[test]
-fn join_release_keeps_the_paused_group_owner() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let paged = paged_corpus("paused-keep");
-    with_test_limits(2048, 1024, 64, || {
-        let mut index = ScanIndex::default();
-        for _ in 0..256 {
-            let (next, _) = sampled_in(
-                &paged,
-                index,
-                10,
-                &cache,
-                "2026-10-06T23:00:00Z",
-                "paused-keep",
-            );
-            index = next;
-            if counters(&cache).jobs_paused > 0 {
-                return;
-            }
-        }
-        panic!("no pause: {:?}", counters(&cache));
-    });
-    assert_eq!(cache.cursor_group_owner().as_deref(), Some(OWNER));
-    // Recorded last, so `OWNER`'s provenance names `root`'s members (the
-    // paused group's queueing recorded its own members first).
-    let (root, index) = refused_first_page(&cache);
-    let index = walk_without_members(&root, index, &cache, |_| false);
-    assert_eq!(
-        cache.cursor_group_owner().as_deref(),
-        Some(OWNER),
-        "the foreign paused job is still live: {:?}",
-        counters(&cache)
-    );
-    // F8 re-blocks a paused owner every page, so the arm shows in the
-    // members' claims: the release would have removed them (J-T2).
-    assert!(held_owner(&index, OWNER));
-    for name in ["a.jsonl", "b.jsonl"] {
-        assert!(
-            claims(&index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER)),
-            "the paused group kept {name}'s claim"
-        );
-    }
-    // Tail control (delta L-a): once the foreign job goes stale (K10: 16
-    // cursor pages) this namespace's resume evicts it, and the next clean
-    // walk releases the same claims. So the provenance named `root`'s
-    // members all along, and only the paused arm kept it.
-    let owned = |index: &ScanIndex, name: &str| {
-        claims(index, &session_key(&root, name)).is_some_and(|owners| owners.contains(OWNER))
-    };
-    let mut index = index;
-    for _ in 0..24 {
-        index.traversal = None;
-        let (next, _) = sampled(&root, index, 10, &cache);
-        index = next;
-        if !owned(&index, "a.jsonl") {
-            break;
-        }
-    }
-    assert_eq!(cache.cursor_group_owner(), None, "{:?}", counters(&cache));
-    for name in ["a.jsonl", "b.jsonl"] {
-        assert!(!owned(&index, name), "released once the job left: {name}");
-    }
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(paged).unwrap();
-}
-
-/// J-T12: a missing traversal skips the release (never an empty census) and
-/// keeps the provenance; with a census lacking the members the same call
-/// releases the owner exactly once and puts the traversal back unchanged.
-#[test]
-fn join_release_skips_a_missing_traversal() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let cache = Arc::new(SharedCache::default());
-    let (mut index, [a, b, n]) = recorded_release_fixture(&cache);
-    index.codex_state_only_blocked_by_file.remove(&n);
-    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
-    assert!(index.traversal.is_none());
-    assert!(held_owner(&index, OWNER));
-    for key in [&a, &b] {
-        assert_eq!(
-            claims(&index, key),
-            Some(BTreeSet::from([OWNER.to_owned()]))
-        );
-    }
-    // Control: the provenance survived the skip.
-    index.traversal = Some(census_traversal(&["/fixture/sessions/c.jsonl"]));
-    let traversal = serde_json::to_value(index.traversal.as_ref()).unwrap();
-    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
-    assert_eq!(
-        serde_json::to_value(index.traversal.as_ref()).unwrap(),
-        traversal
-    );
-    assert!(!held_owner(&index, OWNER));
-    assert_eq!(claims(&index, &a), None);
-    assert_eq!(claims(&index, &b), None);
-    // Released once: the provenance went with it.
-    index
-        .codex_state_only_blocked_by_file
-        .insert(a.clone(), BTreeSet::from([OWNER.to_owned()]));
-    index
-        .codex_state_only_blocked_session_ids
-        .insert(OWNER.to_owned());
-    crate::snapshots::release_departed_join_owners(&mut index, &cache, |_| false);
-    assert!(held_owner(&index, OWNER));
-    assert_eq!(cache.cursor_reserved(), 0);
-}
-
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -2562,7 +1858,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
         "chmod_sealed",
         "append_sealed",
         "replace_sealed",
-        "poison_replace_sealed",
     ] {
         let root = paged_corpus("wake-content");
         let cache = Arc::new(SharedCache::default());
@@ -2589,7 +1884,7 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 "append_sealed" => {
                     append_rows(&path, &[turn("66666666-aaaa-4aaa-8aaa-666666666666")])
                 }
-                "replace_sealed" | "poison_replace_sealed" => {
+                "replace_sealed" => {
                     let modified = fs::metadata(&path).unwrap().modified().unwrap();
                     let replacement = path.with_extension("replacement");
                     fs::copy(&path, &replacement).unwrap();
@@ -2599,9 +1894,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                         .unwrap()
                         .set_modified(modified)
                         .unwrap();
-                    if change == "poison_replace_sealed" {
-                        cache.poison_retained();
-                    }
                     assert_ne!(
                         fs::metadata(&path).unwrap().ino(),
                         fs::metadata(&replacement).unwrap().ino()
@@ -2630,22 +1922,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
                 assert_eq!(bytes, 0, "{change}: zero wakes");
                 assert_eq!(group_replays(), replay);
-            } else if change == "poison_replace_sealed" {
-                // A poisoned retained-cache lock makes the resumed state
-                // unmeasurable: the one fresh attempt hits the state bound
-                // again instead of remaining paused or completing unpaged.
-                assert_eq!(after.parked_hits, 1, "{change}: must wake");
-                assert_eq!(after.jobs_state_bound, 2, "{change}: one new bound attempt");
-                assert!(
-                    bytes > 0 && bytes <= first_bytes,
-                    "{change}: at most one bounded partial-prefix read: {bytes}/{first_bytes}"
-                );
-                assert!(cache.paused_group_position().is_none());
-                assert_eq!(
-                    group_replays(),
-                    replay,
-                    "the partial attempt never completes"
-                );
             } else {
                 assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
                 assert!(bytes > 0, "{change}: must wake");
@@ -2684,28 +1960,21 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         assert!(matches!(boot.probe(0), Boot::Strict));
         assert_eq!(boot.charge, 0);
     });
+    // The shared boot boundary precedes the parser, member swap and legacy
+    // tee. Those internal helpers receive only members admitted here.
+    for position in 0..group.members.len() {
+        let mut boot = GroupBoot::new(group.clone(), &index);
+        boot.identified = position;
+        boot.group.members[position] = compressed.clone();
+        assert_refused(CodexZstCause::GroupReadUnsupported, || {
+            assert!(matches!(boot.identify(None, &index, None), Boot::Strict));
+            assert_eq!(
+                boot.identified, position,
+                "refused before member acquisition"
+            );
+        });
+    }
     let metadata = CodexTitleMetadata::default();
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(open_member_file(&mut compressed).is_err());
-        assert!(new_group_parser(
-            File::open(&compressed.path).unwrap(),
-            &compressed,
-            &metadata,
-            None,
-            codex_counting_version::AckEvidence::None
-        )
-        .is_err());
-        let expected =
-            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
-        assert!(legacy_tee(
-            &expected,
-            &compressed,
-            &File::open(&compressed.path).unwrap(),
-            &metadata,
-            None,
-        )
-        .is_err());
-    });
     let mut boot = GroupBoot::new(group, &index);
     loop {
         match boot.step(None, &index) {
@@ -2718,40 +1987,9 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-
             index: &index,
         })
         .unwrap();
-    let before = active.parser.reader.consumed_bytes();
-    let group = active.group.as_deref_mut().unwrap();
-    group.current = 1;
-    group.members[1] = compressed;
-    let join = active
-        .parser
-        .accumulator
-        .codex_tier_replay
-        .as_mut()
-        .unwrap()
-        .join
-        .take()
-        .unwrap();
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(matches!(
-            open_member(&mut active, join, &inputs),
-            Err(GroupEnd::Strict)
-        ));
-        assert_eq!(
-            active.parser.reader.consumed_bytes(),
-            before,
-            "swap never reset the reader"
-        );
-    });
     active.candidate.path.set_extension("jsonl.zst");
     let cache = Arc::new(SharedCache::default());
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {

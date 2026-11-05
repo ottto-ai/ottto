@@ -897,6 +897,20 @@ pub(crate) fn revoke_now() {
     }
 }
 
+/// How many revokes `run` asks for on this thread, with no supervisor to wait on.
+#[cfg(test)]
+pub(crate) fn count_revokes(run: impl FnOnce()) -> u64 {
+    let admission = Arc::new(Admission::default());
+    let endpoint = Endpoint {
+        sender: mpsc::channel().0,
+        admission: admission.clone(),
+    };
+    let previous = TEST_ENDPOINT.with(|value| value.replace(Some(endpoint)));
+    run();
+    TEST_ENDPOINT.with(|value| *value.borrow_mut() = previous);
+    admission.generation.load(Ordering::SeqCst)
+}
+
 pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<AtomicU16>) {
     let (sender, receiver) = mpsc::channel();
     let admission = Arc::new(Admission::default());

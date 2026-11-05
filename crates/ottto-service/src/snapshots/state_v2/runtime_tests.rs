@@ -62,17 +62,6 @@ thread_local! {
     pub(super) static COMMIT_BEFORE_GROWTH_CLAIM: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-use crate::snapshots::account_pending_retention::ArchivedWindows;
-
-/// A loaded graph with its cold archives read back from the session store.
-pub(in crate::snapshots) fn materialized(index: &ScanIndex) -> ScanIndex {
-    let mut view = index.clone();
-    with_session_db(index, |db| {
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        kinds_accounts::materialize(&mut tx, &mut view).unwrap();
-    });
-    view
-}
 
 /// Apply a per-store seam to the live session store behind `index`; the
 /// failed save's reload reopens the store without it.
@@ -321,256 +310,11 @@ fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());
     assert_eq!(index.generation, G + 1);
-    // [money] Archived account windows stay row-only through the latched OFF
-    // load and save, and read back with the pre-switch placement.
-    let f = Fixture::new();
-    let window = member_window;
-    let mut pre = ScanIndex::default();
-    pre.claude_account_family_pending.insert(
-        "family".into(),
-        crate::snapshots::ClaudeAccountFamilyPending {
-            current: window(30),
-            previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
-            confirmed_absent_members: BTreeSet::new(),
-        },
-    );
-    f.import_graph(Some(&pre));
-    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-    let cold = |index: &ScanIndex| {
-        matches!(
-            index.claude_account_family_pending["family"].previous_windows,
-            ArchivedWindows::Cold(_)
-        )
-    };
-    let mut index = load_with(&f.path, false).unwrap().unwrap();
-    assert!(cold(&index));
-    assert!(save_with(&f.path, &mut index).unwrap());
-    let reloaded = load_with(&f.path, false).unwrap().unwrap();
-    assert!(cold(&reloaded));
-    assert_eq!(
-        materialized(&reloaded).claude_account_family_pending,
-        pre.claude_account_family_pending
-    );
     // A fresh route must decode the missing semantic rows, never treat them as empty.
     let f = Fixture::new();
     f.import(false);
     fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
-}
-/// A synthetic account window ending on October `day`.
-fn account_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
-    crate::snapshots::ClaudeAccountFamilyPendingWindow {
-        version: crate::snapshots::CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
-        census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
-        account_identifier_hash: "d".repeat(64),
-        evidence_request_count: 0,
-        census_complete: false,
-        members: BTreeMap::new(),
-        member_requests: BTreeMap::new(),
-        invalid: false,
-    }
-}
-/// An `account` window ending on October `day`: one request per member,
-/// tagged with this window's identity revision (64 hex, as decode requires;
-/// accounts are hex letters).
-fn tagged_window(
-    day: u32,
-    account: char,
-    members: &[&str],
-) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
-    let mut window = account_window(day);
-    window.account_identifier_hash = account.to_string().repeat(64);
-    for (n, member) in members.iter().enumerate() {
-        // Members of one window need distinct 16-hex prefixes.
-        let hash = format!("{:016x}{}", u64::from(day) * 16 + n as u64, "0".repeat(48));
-        let mut requests =
-            crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
-                .unwrap();
-        requests.identity_revision = Some(format!("{account}{day:063x}"));
-        window.members.insert((*member).into(), 1);
-        window.member_requests.insert((*member).into(), requests);
-        window.evidence_request_count += 1;
-    }
-    window
-}
-/// An account window with one member request set. Decode marks a window
-/// without member requests invalid, so a typed fixture stored as valid needs
-/// one to load back canonical.
-fn member_window(day: u32) -> crate::snapshots::ClaudeAccountFamilyPendingWindow {
-    let mut window = account_window(day);
-    let hash = format!("{:016x}{}", day, "0".repeat(48));
-    let requests =
-        crate::snapshots::ClaudeAccountRequestSet::from_full_hashes(&BTreeSet::from([hash]))
-            .unwrap();
-    window.members.insert("member".into(), 1);
-    window.member_requests.insert("member".into(), requests);
-    window.evidence_request_count = 1;
-    window
-}
-/// [money] A held page's subset save commits the working graph's queued cold
-/// rollovers; the committed-load route (every pass load, a growth claim's
-/// load and claim-only save) re-hydrates the same session; the retry's
-/// working graph adopts the generation, rolls on and checkpoints without a
-/// lineage miss. The family switches account mid-session and every window
-/// carries tagged member request sets. The held member keeps its committed
-/// file entry while the accepted one advances, and the store reads back the
-/// same per-account rows as the resident path.
-#[test]
-fn cold_rollovers_a_held_page_subset_commits_settle_the_working_graph() {
-    use crate::snapshots::{
-        ClaudeAccountFamilyPending as Family, ClaudeAccountFamilyPendingWindow as Window,
-    };
-    const A: &str = "/synthetic/family/a.jsonl";
-    const B: &str = "/synthetic/family/b.jsonl";
-    let fingerprint = |c: char| c.to_string().repeat(64);
-    fn family(index: &mut ScanIndex) -> &mut Family {
-        index
-            .claude_account_family_pending
-            .get_mut("family")
-            .unwrap()
-    }
-    fn window(day: u32, account: char, members: &[&str]) -> Window {
-        tagged_window(day, account, members)
-    }
-    fn roll(index: &mut ScanIndex, day: u32) {
-        let family = family(index);
-        let old = std::mem::replace(&mut family.current, window(day, 'b', &[A, B]));
-        family.archive(old, true);
-    }
-    let run = |cold: bool, race: bool| {
-        let f = Fixture::new();
-        let mut pre = ScanIndex::default();
-        for (key, c) in [(A, '1'), (B, '2')] {
-            let entry =
-                crate::snapshots::tests::manifest_index_entry(Some(fingerprint(c).as_str()));
-            pre.files.insert(key.into(), entry);
-            pre.accepted_snapshot_fingerprints.insert(fingerprint(c));
-        }
-        pre.claude_account_family_pending.insert(
-            "family".into(),
-            Family {
-                current: window(27, 'b', &[A, B]),
-                previous_windows: ArchivedWindows::Resident(vec![
-                    window(25, 'a', &[A]),
-                    window(26, 'a', &[A]),
-                ]),
-                confirmed_absent_members: BTreeSet::new(),
-            },
-        );
-        f.import_graph(Some(&pre));
-        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
-        let loaded = load_with(&f.path, false).unwrap().unwrap();
-        let mut working = if cold { loaded } else { materialized(&loaded) };
-        let committed = working.clone();
-        // This page changed both members; A is accepted, B's upload is held.
-        for (key, c) in [(A, '3'), (B, '4')] {
-            working
-                .files
-                .get_mut(key)
-                .unwrap()
-                .last_snapshot_fingerprint = Some(fingerprint(c));
-        }
-        roll(&mut working, 28);
-        assert_eq!(
-            matches!(
-                family(&mut working).previous_windows,
-                ArchivedWindows::Cold(_)
-            ),
-            cold
-        );
-        let mut subset = working.committable_subset_with_local_holds(
-            &committed,
-            &BTreeSet::from([fingerprint('3')]),
-            &BTreeMap::new(),
-            &BTreeSet::from([fingerprint('4')]),
-        );
-        assert!(save_with(&f.path, &mut subset).unwrap());
-        if race {
-            // The race: another connection deletes the family's oldest
-            // archived row (outside the endpoint tail) while this session's
-            // load hydrates.
-            let mut oldest = None;
-            with_session_db(&subset, |db| {
-                let mut tx = db.begin(TxnMode::Read).unwrap();
-                let control = mapper::key("account.current", "family", 1).unwrap();
-                let header = tx.get(&control).unwrap().unwrap();
-                let (_, _, ids): (Option<u64>, u64, Vec<u64>) =
-                    mapper::read(&mut tx, &header, None).unwrap();
-                oldest = Some(mapper::key("account_window", "family", ids[0]).unwrap());
-            });
-            DELETE_DURING_HYDRATE.with(|delete| delete.set(oldest));
-            let _ = load_with(&f.path, false);
-            let (before, after) = RACED_STAMPS.with(std::cell::Cell::take).unwrap();
-            assert_eq!(before.0, after.0, "the generation is unchanged");
-            assert_ne!(before.1, after.1, "the full stamp moved");
-            // Nothing from that hydrate was adopted: the load reopened, so a
-            // graph that outlived it refuses instead of skipping its lineage
-            // over the missing row.
-            working.generation = subset.generation;
-            roll(&mut working, 29);
-            let mut checkpoint = working.committable_subset_with_local_holds(
-                &subset,
-                &BTreeSet::from([fingerprint('4')]),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-            );
-            assert!(save_with(&f.path, &mut checkpoint).is_err());
-            return None;
-        }
-        let mut claim = load_with(&f.path, false).unwrap().unwrap();
-        assert_eq!(
-            claim.files[A].last_snapshot_fingerprint,
-            Some(fingerprint('3'))
-        );
-        assert_eq!(
-            claim.files[B].last_snapshot_fingerprint,
-            Some(fingerprint('2'))
-        );
-        assert!(save_with_mode(&f.path, &mut claim, true, None).unwrap());
-        working.generation = claim.generation;
-        roll(&mut working, 29);
-        let mut checkpoint = working.committable_subset_with_local_holds(
-            &claim,
-            &BTreeSet::from([fingerprint('4')]),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        );
-        assert!(save_with(&f.path, &mut checkpoint).unwrap());
-        let reloaded = load_with(&f.path, false).unwrap().unwrap();
-        assert_eq!(
-            reloaded.files[B].last_snapshot_fingerprint,
-            Some(fingerprint('4'))
-        );
-        let mut view = materialized(&reloaded);
-        Some(family(&mut view).clone())
-    };
-    let cold = run(true, false).unwrap();
-    assert_eq!(cold, run(false, false).unwrap());
-    assert!(run(true, true).is_none());
-    let archive = cold.previous_windows.resident();
-    assert_eq!(
-        archive,
-        &[
-            window(25, 'a', &[A]),
-            window(26, 'a', &[A]),
-            window(27, 'b', &[A, B]),
-            window(28, 'b', &[A, B]),
-        ]
-    );
-    assert_eq!(cold.current, window(29, 'b', &[A, B]));
-    // Positive control: both accounts, every window tagged and nonempty.
-    let accounts: BTreeSet<_> = archive
-        .iter()
-        .map(|w| w.account_identifier_hash.clone())
-        .collect();
-    assert_eq!(accounts.len(), 2);
-    assert!(archive
-        .iter()
-        .chain([&cold.current])
-        .all(|w| !w.member_requests.is_empty()
-            && w.member_requests
-                .values()
-                .all(|r| r.identity_revision.is_some())));
 }
 /// [format] publication pending pause does not touch v1.
 #[test]
@@ -587,19 +331,41 @@ fn publication_pending_pause_does_not_touch_v1() {
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
 
-/// [behaviour] a load naming its support dir imports v1 and publishes custody.
+/// [behaviour] a support-dir load imports v1 or a missing root and publishes custody.
 #[test]
 fn support_dir_load_imports_and_publishes() {
+    use crate::snapshots::{ScanIndexLoadOrigin, SnapshotSource};
+    let source = SnapshotSource::ClaudeCode;
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    let index = ScanIndex::load_for_snapshot_source(
-        &f.path,
-        crate::snapshots::SnapshotSource::ClaudeCode,
-        &f.support,
-    )
-    .unwrap();
+    let index = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert!(published(&f.path).unwrap());
+    assert_eq!(
+        index.generation, 1,
+        "present originals still advance on import"
+    );
+
+    let f = Fixture::new();
+    let (index, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Missing);
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
+    let (mut reopened, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&reopened));
+    assert_eq!(reopened.generation, index.generation);
+    assert_eq!(
+        reopened.accepted_snapshot_fingerprints,
+        index.accepted_snapshot_fingerprints
+    );
+    assert!(save_with(&f.path, &mut reopened).unwrap());
+    let (saved, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert!(saved.files.is_empty() && saved.generation >= 1);
+    assert!(!origin.is_fresh(&saved));
 }
 
 /// [format] absent parent containment guard never promotes a database.
@@ -832,7 +598,6 @@ mod hydrate_parity {
     use crate::snapshots as s;
     use s::lenient_decode;
     use serde_json::value::RawValue;
-    use std::collections::BTreeSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn seed() -> ScanIndex {
@@ -886,15 +651,8 @@ mod hydrate_parity {
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
-        // A loaded graph's cold account archives do not serialize: compare
-        // the windows it stores.
-        let view = if crate::snapshots::state_v2::money_test_support::has_cold_archive(actual) {
-            materialized(actual)
-        } else {
-            actual.clone()
-        };
         assert_eq!(
-            serde_json::to_value(&view).unwrap(),
+            serde_json::to_value(actual).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         assert!(actual.decode_holds.same_as(&expected.decode_holds));
@@ -1007,7 +765,7 @@ mod hydrate_parity {
     }
     fn typed_case(index: ScanIndex) -> ScanIndex {
         let bytes = serde_json::to_vec(&index).unwrap();
-        // Mapped tombstone codecs, like serde, reconstruct decoded evidence.
+        // Mapped codecs, like serde, reconstruct decoded evidence.
         let mapped = serde_json::from_slice(&bytes).unwrap();
         compare(&bytes, mapped)
     }
@@ -1030,9 +788,9 @@ mod hydrate_parity {
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }
     }
-    /// [format] every hydrate runs deadline drop cutoff and tombstone rules.
+    /// [format] every hydrate runs deadline drop and cutoff rules.
     #[test]
-    fn every_hydrate_runs_deadline_drop_cutoff_and_tombstone_rules() {
+    fn every_hydrate_runs_deadline_drop_and_cutoff_rules() {
         let mut index = seed();
         let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
         quarantine.retry_after_unix_seconds = u64::MAX;
@@ -1056,36 +814,6 @@ mod hydrate_parity {
         assert!(!actual.snapshot_activity_at.contains_key(&"c".repeat(64)));
         assert!(!actual.accepted_snapshot_fingerprints.contains("bad"));
         assert!(!actual.claude_history_gate_loaded);
-
-        let mut index = seed();
-        index.claude_retired_family_tombstones_initialized = true;
-        let actual = typed_case(index);
-        assert!(actual.claude_retired_family_tombstones_initialized);
-    }
-    /// [money] missing and damaged retirement evidence keep the v1 uncertainty and commitment.
-    #[test]
-    fn missing_and_damaged_retirement_evidence_keep_the_v1_uncertainty_and_commitment() {
-        for missing in [false, true] {
-            let mut index = seed();
-            index.claude_retired_family_tombstones_initialized = true;
-            let mut value = serde_json::to_value(index).unwrap();
-            if missing {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("claude_retired_family_tombstones");
-            } else {
-                value["claude_retired_family_tombstones"] =
-                    serde_json::json!({"invalid": "timestamp"});
-            }
-            let bytes = serde_json::to_vec(&value).unwrap();
-            // The importer already carries the original tombstone repair
-            // commitment. Hydration must settle without forgetting or doubling it.
-            let mapped = lenient_decode::read_bounded(&bytes).unwrap();
-            let actual = compare(&bytes, mapped);
-            assert!(actual.claude_retired_family_tombstones_uncertain);
-            assert_eq!(actual.decode_holds.v2_provenance().1, 1);
-        }
     }
     /// [format] v2 load rearms legacy terminal with the v1 pacing rule.
     #[test]
@@ -1139,9 +867,9 @@ mod hydrate_parity {
             .retry_after_unix_seconds = 0;
         assert_graph(&expected, &actual);
     }
-    /// [money] typed unbound authority rearms files and collapse uses shared load tail.
+    /// [money] typed unbound authority rearms files.
     #[test]
-    fn typed_unbound_authority_rearms_files_and_collapse_uses_shared_load_tail() {
+    fn typed_unbound_authority_rearms_files() {
         let mut index = seed();
         index
             .claude_usage_family_witnesses
@@ -1154,57 +882,6 @@ mod hydrate_parity {
         assert!(actual.files["/synthetic/family.jsonl"]
             .source_file_fingerprint
             .is_empty());
-
-        let mut index = seed();
-        let window = |day| s::ClaudeAccountFamilyPendingWindow {
-            version: "v2".into(),
-            census_window_end: format!("2026-10-{day:02}T00:00:00Z"),
-            account_identifier_hash: "d".repeat(64),
-            evidence_request_count: 0,
-            census_complete: true,
-            members: BTreeMap::new(),
-            member_requests: BTreeMap::new(),
-            invalid: false,
-        };
-        index.claude_account_family_pending.insert(
-            "other-family".into(),
-            s::ClaudeAccountFamilyPending {
-                current: window(30),
-                previous_windows: ArchivedWindows::Resident(vec![
-                    window(25),
-                    window(26),
-                    window(27),
-                ]),
-                confirmed_absent_members: BTreeSet::new(),
-            },
-        );
-        // The shared load tail never walks a cold archive: the windows a v1
-        // load collapses stay in the store, counted as uncollapsed. Publish
-        // the decoded graph, as typed_case does: decode marks these
-        // member-less windows invalid, and rows hold only canonical values.
-        let index: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        let f = Fixture::new();
-        publish(&f, &index);
-        let (actual, _) = ScanIndex::load_inner_with_support(
-            &f.path,
-            Some(s::SnapshotSource::ClaudeCode),
-            None,
-            SystemTime::now(),
-        )
-        .unwrap();
-        let family = &actual.claude_account_family_pending["other-family"];
-        assert!(matches!(family.previous_windows, ArchivedWindows::Cold(_)));
-        assert_eq!(family.previous_windows.uncollapsed(), 2);
-        assert_eq!(actual.claude_account_window_retention.roots_refused, 0);
-        assert_eq!(actual.claude_account_window_retention.windows_collapsed, 0);
-        assert_eq!(
-            materialized(&actual).claude_account_family_pending["other-family"]
-                .previous_windows
-                .resident()
-                .len(),
-            3
-        );
     }
     /// [money] raw quarantine repairs and opaque file freezes match v1 custody.
     #[test]
@@ -1237,16 +914,6 @@ mod hydrate_parity {
         assert_eq!(actual.decode_holds.v2_provenance().1, 1);
 
         let mut index = seed();
-        // A complete hydrate with raw holds keeps account archives resident.
-        let window = member_window;
-        index.claude_account_family_pending.insert(
-            "account-family".into(),
-            s::ClaudeAccountFamilyPending {
-                current: window(30),
-                previous_windows: ArchivedWindows::Resident(vec![window(25), window(27)]),
-                confirmed_absent_members: BTreeSet::new(),
-            },
-        );
         let key = "/synthetic/family.jsonl";
         let canonical = serde_json::to_string(&index).unwrap();
         let old = raw_slot(canonical.as_bytes(), "files", key);
@@ -1258,10 +925,6 @@ mod hydrate_parity {
         attach_raw(&mut index, "files", key, &raw);
         let actual = compare(&bytes, index);
         assert!(actual.decode_holds_family("family"));
-        assert!(matches!(
-            &actual.claude_account_family_pending["account-family"].previous_windows,
-            ArchivedWindows::Resident(windows) if windows.len() == 2
-        ));
         assert!(actual.claude_usage_authority_quarantine.is_empty());
     }
     /// [money] original mistyped authority freezes siblings before canonicalization and bound control repairs.
@@ -1346,10 +1009,9 @@ pub(super) fn over_row_limit() -> BTreeSet<String> {
     BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
 }
 
-/// Real-shaped money (usage tokens, accepted proof, file progress) plus one
-/// family whose tagged windows switch account a -> b: a positive money and
-/// placement control for whole-store comparisons.
-fn two_account_graph() -> ScanIndex {
+/// Real-shaped money (usage tokens, accepted proof, file progress) plus two
+/// family member files: a positive money control for whole-store comparisons.
+fn real_shaped_graph() -> ScanIndex {
     const A: &str = "/synthetic/family/a.jsonl";
     const B: &str = "/synthetic/family/b.jsonl";
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -1364,17 +1026,6 @@ fn two_account_graph() -> ScanIndex {
         index.files.insert(key.into(), entry);
         index.accepted_snapshot_fingerprints.insert(fingerprint);
     }
-    index.claude_account_family_pending.insert(
-        "family".into(),
-        crate::snapshots::ClaudeAccountFamilyPending {
-            current: tagged_window(27, 'b', &[A, B]),
-            previous_windows: ArchivedWindows::Resident(vec![
-                tagged_window(25, 'a', &[A]),
-                tagged_window(26, 'a', &[A]),
-            ]),
-            confirmed_absent_members: BTreeSet::new(),
-        },
-    );
     index
 }
 
@@ -1407,7 +1058,7 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
         let f = Fixture::new();
         let progress = br#"{"generation":0}"#;
         let mut index =
-            super::super::money_test_support::publish(&two_account_graph(), &f.path, progress);
+            super::super::money_test_support::publish(&real_shaped_graph(), &f.path, progress);
         assert_eq!(index.generation, G);
         if fault {
             assert_eq!(collection_page_limit(&index, 250), 250);
@@ -1454,11 +1105,10 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
         assert!(save_with(&f.path, &mut index).unwrap());
         assert_eq!(index.generation, G + 1);
         assert_eq!(collection_page_limit(&index, 250), 250);
-        let saved = serde_json::to_vec(&materialized(&index)).unwrap();
+        let saved = serde_json::to_vec(&index).unwrap();
         let reloaded = load_with(&f.path, false).unwrap().unwrap();
         assert_eq!(reloaded.generation, G + 1);
-        let view = materialized(&reloaded);
-        assert_eq!(serde_json::to_vec(&view).unwrap(), saved);
+        assert_eq!(serde_json::to_vec(&reloaded).unwrap(), saved);
         let key = mapper::key("scan_state.traversal", "", 0).unwrap();
         with_session_db(&reloaded, |db| {
             let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1473,26 +1123,18 @@ fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
                 "state_v2_value_admission"
             );
         });
-        view
+        reloaded
     };
     let clean = run(false);
     assert_eq!(
         serde_json::to_vec(&run(true)).unwrap(),
         serde_json::to_vec(&clean).unwrap()
     );
-    // Positive control: two accounts placed and the typed birth store
-    // present. The fixture's usage-pending rows are a retired kind and load
-    // as nothing.
-    let accounts: BTreeSet<_> = clean.claude_account_family_pending["family"]
-        .previous_windows
-        .resident()
-        .iter()
-        .chain([&clean.claude_account_family_pending["family"].current])
-        .map(|w| w.account_identifier_hash.clone())
-        .collect();
-    assert_eq!(accounts.len(), 2);
+    // Positive control: the typed birth store present. The fixture's
+    // usage-pending and account rows are retired kinds and load as nothing.
     let value = serde_json::to_value(&clean).unwrap();
     assert!(value.get("claude_usage_family_pending").is_none());
+    assert!(value.get("claude_account_family_pending").is_none());
     let birth = serde_json::to_vec(&clean.claude_money_birth_store).unwrap();
     assert!((1024 * 1024..4 * 1024 * 1024).contains(&birth.len()));
     assert_eq!(
@@ -1607,8 +1249,6 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     seed.generation = 0;
     let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
     let committed = current.clone();
-    // Loads keep account archives cold; compare the bytes the store holds.
-    let committed_view = materialized(&committed);
     let committed_generation = current.generation;
     let committed_context = current.historical_replay_generation.clone();
     assert!(current.prepare_historical_replay("uncommitted-context".into()));
@@ -1626,8 +1266,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         Ok(())
     })
     .unwrap();
-    // Publication returns a public load, which settles the tombstone marker.
-    // Compare at that same boundary after rollback, including load settlement.
+    // Publication returns a public load. Compare at that same boundary after
+    // rollback, including load settlement.
     let restored = ScanIndex::load(&f.path).unwrap_or_else(|e| {
         panic!(
             "reload after FULL: {e:#}; cause={:?}",
@@ -1635,8 +1275,8 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
         )
     });
     assert_eq!(
-        serde_json::to_vec(&materialized(&restored)).unwrap(),
-        serde_json::to_vec(&committed_view).unwrap()
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&committed).unwrap()
     );
     assert!(restored.decode_holds.same_as(&committed.decode_holds));
     assert_eq!(

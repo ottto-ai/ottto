@@ -848,7 +848,10 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
     assert_eq!(revisions(&reloaded, FILE).len(), 1);
     save_with(&f.path, &mut reloaded).unwrap();
     with_session_db(&reloaded, |db| {
-        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(5));
+        assert_eq!(
+            db.read_control::<u32>("catalogue_layout").unwrap(),
+            Some(catalogue::LAYOUT)
+        );
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for key in &new_roots {
             assert!(tx.get(key).unwrap().is_some(), "{key:?}");
@@ -1261,3 +1264,6 @@ pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static 
     });
     counts
 }
+
+#[path = "tail_carry_tests.rs"]
+mod carry_tests;

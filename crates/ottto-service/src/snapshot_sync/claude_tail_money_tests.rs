@@ -914,6 +914,381 @@ fn codex_content_only_caller_matches_cold_full() {
     }
 }
 
+/// [money] An indexed sibling transcript deleted after a committed page is
+/// retired through its directory's complete read and secure absence proof.
+/// The live file's next page emits the same envelope through its retained
+/// Tail, a cold Full and a restarted owner. Pi retires the sibling in every
+/// arm; Codex protection may keep it, identically in every arm. The live
+/// entry stays. Same-build proof only: no receipt.
+#[test]
+fn deleted_sibling_retires_without_changing_live_money() {
+    const SIBLING: &str = "5b1b1b1b-0000-4000-8000-00000000c0de";
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let name = format!("deleted_sibling_{}", source.api_slug());
+        if !supported(&name) {
+            return;
+        }
+        let _cutover = crate::snapshots::TestCutover::set(0);
+        let c = corpus(&name);
+        let mut disk = Disk::with_route(&c, source);
+        let (live, sibling) = (c.root.join("live.jsonl"), c.root.join("sibling.jsonl"));
+        let header = |id: &str| {
+            json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+                "payload":{"id":id,"timestamp":"2026-10-27T07:00:00Z"}})
+            .to_string()
+                + "\n"
+        };
+        let (scanner, live_body, sibling_body, growth) = if source == SnapshotSource::Codex {
+            (
+                E2ScanFixture::default(),
+                header(ROOT) + &codex_rows("turn-a", 10),
+                header(SIBLING) + &codex_rows("turn-s", 5).replace(ROOT, SIBLING),
+                codex_rows("turn-b", 30),
+            )
+        } else {
+            (
+                disk.owner(source),
+                pi_seed(),
+                pi_seed().replacen("synthetic-pi-session", "synthetic-pi-sibling", 1),
+                pi_json(pi_turn(
+                    "message",
+                    Some("sibling-growth"),
+                    20,
+                    "2026-10-27T06:01:00Z",
+                )),
+            )
+        };
+        for (path, body) in [(&live, &live_body), (&sibling, &sibling_body)] {
+            std::fs::write(path, body).unwrap();
+            input_clock(path);
+        }
+        if source == SnapshotSource::Codex {
+            disk.begin(&scanner, source);
+        }
+        let (mut index, scan, _) = other_page(&c, &scanner, source, ScanIndex::default());
+        assert!(!scan.snapshots.is_empty(), "{source:?}");
+        let key = |path: &Path| path.to_string_lossy().into_owned();
+        assert!(index.files.contains_key(&key(&sibling)), "{source:?}");
+        let prior = disk.commit(&scanner.cache, source, &mut index);
+        std::fs::remove_file(&sibling).unwrap();
+        append(&live, &growth);
+        input_clock(&live);
+        let restart = disk.owner(source);
+        let (tail_index, tail, _) = other_page(&c, &scanner, source, prior.clone());
+        let (full_index, full, _) =
+            other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+        let (mut restored_index, restored, _) = other_page(&c, &restart, source, prior.clone());
+        let wire = other_wire(source, &full);
+        assert_eq!(other_wire(source, &tail), wire, "{source:?}: Tail");
+        assert_eq!(other_wire(source, &restored), wire, "{source:?}: restart");
+        // Codex protection may keep the sibling's custody; every route agrees.
+        let custody = |index: &ScanIndex| index.files.contains_key(&key(&sibling));
+        for index in [&tail_index, &full_index, &restored_index] {
+            assert!(index.files.contains_key(&key(&live)), "{source:?}");
+            assert_eq!(custody(index), custody(&full_index), "{source:?}");
+            assert!(
+                source == SnapshotSource::Codex || !custody(index),
+                "{source:?}"
+            );
+        }
+        // Before the save, the durable state keeps the sibling's custody, and
+        // a partial upload's commit keeps the committed predecessor.
+        assert!(
+            custody(&ScanIndex::load(disk.path(source)).unwrap()),
+            "{source:?}: before the save"
+        );
+        let partial = tail_index.committable_subset(
+            &prior,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert!(custody(&partial), "{source:?}: partial upload");
+        // After the save, a restarted owner's next page brings no stale key
+        // back through its observations.
+        let saved = disk.commit(&restart.cache, source, &mut restored_index);
+        assert_eq!(custody(&saved), custody(&full_index), "{source:?}: saved");
+        let quiet = disk.owner(source);
+        let (quiet_index, _, _) = other_page(&c, &quiet, source, saved.clone());
+        assert!(
+            custody(&saved) || !custody(&quiet_index),
+            "{source:?}: a retired key comes back after the restart"
+        );
+        assert!(quiet_index.files.contains_key(&key(&live)), "{source:?}");
+    }
+}
+
+/// [money] A sibling session deleted after its delivered page retires on the
+/// next page, whose live body's ACK is then lost. A lost response, a refusal
+/// and a response missing an entity ACK settle nothing; the exact stored-body
+/// ACK settles the body once, and a retry sends nothing. The live body equals
+/// the same page's without the deletion. Same-build proof only: no receipt.
+#[test]
+fn deleted_sibling_lost_ack_settles_once() {
+    const SIBLING: &str = "5b1b1b1b-0000-4000-8000-00000000c1a0";
+    let name = "deleted_sibling_lost_ack";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus(name);
+        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let sibling = c.root(SIBLING, &line(SIBLING, "s1", AT, 5));
+        input_clock(&path);
+        input_clock(&sibling);
+        let disk = Disk::new(&c);
+        let (scanner, prior) = warm_claude(&c, &disk);
+        let sibling_key = sibling.to_string_lossy().into_owned();
+        assert!(prior.files.contains_key(&sibling_key));
+        grow(&path, "r2", 20);
+        let mut control = c.raw(&E2ScanFixture::default(), prior.clone(), 100, true, &[]);
+        control.enrich(&c);
+        control.finish();
+        assert!(control.index.files.contains_key(&sibling_key));
+        std::fs::remove_file(&sibling).unwrap();
+        let mut page = c.raw(&scanner, prior, 100, true, &[]);
+        page.enrich(&c);
+        page.finish();
+        assert!(
+            !page.index.files.contains_key(&sibling_key),
+            "the sibling retires"
+        );
+        let items = page.scan.snapshots.clone();
+        assert!(!items.is_empty(), "the live growth emits");
+        let lost = |_: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            Err(anyhow::anyhow!("response lost after durable remote write"))
+        };
+        let refused =
+            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+                let mut response = ack(batch)?;
+                response.rejected_entities = std::mem::take(&mut response.accepted_entities)
+                    .into_iter()
+                    .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: entity.source_session_id,
+                        snapshot_fingerprint: entity.snapshot_fingerprint,
+                        occurrence_count: entity.occurrence_count,
+                        reason: "usage_accounting_authority_downgrade".into(),
+                        detail: "synthetic refusal".into(),
+                        permanent: true,
+                    })
+                    .collect();
+                response.accepted = 0;
+                response.sessions_reconciled = 0;
+                Ok(response)
+            };
+        let mut progress = e2_progress();
+        let _ = upload(&items, &mut progress, refused);
+        assert!(progress.accepted_fingerprints.is_empty(), "refused");
+        let mut progress = e2_progress();
+        let mut omitted = std::collections::BTreeSet::new();
+        let _ = upload(&items, &mut progress, |batch| {
+            let mut response = ack(batch)?;
+            let entity = response.accepted_entities.pop().expect("one entity ACK");
+            omitted.insert(entity.snapshot_fingerprint);
+            response.accepted -= 1;
+            response.sessions_reconciled = response.accepted;
+            Ok(response)
+        });
+        assert!(!omitted.is_empty());
+        assert!(
+            omitted
+                .iter()
+                .all(|fingerprint| !progress.accepted_fingerprints.contains(fingerprint)),
+            "a missing entity ACK settles nothing"
+        );
+        let mut progress = e2_progress();
+        let (result, _, _) = upload(&items, &mut progress, lost);
+        assert!(result.is_err(), "the response is lost");
+        assert!(progress.accepted_fingerprints.is_empty(), "lost");
+        let (result, wire, _) = upload(&items, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let (_, control_wire, _) = upload(&control.scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(wire, control_wire, "the deletion moves no live money");
+        assert_eq!(
+            progress
+                .accepted_fingerprints
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            items
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the exact stored-body ACK settles every body"
+        );
+        let (result, resent, _) = upload(&items, &mut progress, ack);
+        assert!(result.is_ok() && resent.is_empty(), "settled once");
+    });
+}
+
+/// B2 (#1351) receipts. `claude_bad_record_sibling`: a malformed record
+/// between valid responses never counts and its siblings count on every arm.
+/// `claude_paused_suffix`: an unterminated final response is pending on its
+/// first read and counts once after it completes.
+fn claude_bad_record_case(name: &str) {
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = claude_corpus(name);
+        let mut disk = Disk::new(&c);
+        let (scanner, mut prior) = warm_claude(&c, &disk);
+        let malformed = match name {
+            "claude_bad_record_sibling" => {
+                // A response cut short: its request and usage never count.
+                let bad = line(ROOT, "bad", AT, 99);
+                let bad = bad[..bad.len() - 3].to_owned() + "\n";
+                append(&path, &(bad + &line(ROOT, "r2", AT, 20)));
+                1
+            }
+            "claude_paused_suffix" => {
+                let r2 = line(ROOT, "r2", AT, 20);
+                let (start, rest) = r2.split_at(r2.len() / 2);
+                append(&path, start);
+                input_clock(&path);
+                let mut paused = c.raw(&scanner, prior, 100, true, &[]);
+                assert_eq!(paused.modes, (0, 1, 0), "the first read Tails the suffix");
+                paused.enrich(&c);
+                paused.finish();
+                assert_eq!(
+                    paused.scan.malformed_json_line_count, 0,
+                    "pending, not loss"
+                );
+                assert!(
+                    paused
+                        .scan
+                        .snapshots
+                        .iter()
+                        .all(|item| item.request_count == 1),
+                    "the unfinished response never counts"
+                );
+                accept_page(&mut paused);
+                prior = disk.commit(&paused.cache, SnapshotSource::ClaudeCode, &mut paused.index);
+                append(&path, rest);
+                0
+            }
+            _ => unreachable!(),
+        };
+        input_clock(&path);
+        let restart = disk.owner(SnapshotSource::ClaudeCode);
+        let mut pages = claude_pages(
+            &c,
+            &scanner,
+            &restart,
+            [prior.clone(), prior.clone(), prior],
+            (0, 1, 0),
+        );
+        finish_claude_pages(&c, &mut pages);
+        for page in &pages {
+            literal(page);
+            assert_eq!(page.scan.malformed_json_line_count, malformed);
+            assert_eq!(total(page), 2, "r1 and r2 count once; the bad record never");
+        }
+        receipt(name, &[compare_claude_uploads(&pages)]);
+    });
+}
+#[test]
+fn claude_bad_record_sibling() {
+    claude_bad_record_case("claude_bad_record_sibling");
+}
+#[test]
+fn claude_paused_suffix() {
+    claude_bad_record_case("claude_paused_suffix");
+}
+
+/// B2 (#1351) receipt: an invalid native usage record between valid Codex
+/// turns never counts; its siblings count exactly as in a rollout without it.
+#[test]
+fn codex_bad_record_sibling() {
+    let name = "codex_bad_record_sibling";
+    if !supported(name) {
+        return;
+    }
+    let _cutover = crate::snapshots::TestCutover::set(0);
+    let source = SnapshotSource::Codex;
+    let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
+    let thread = json!({"input_tokens":25,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":27});
+    let bad = [
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:01Z","payload":{"type":"task_started","turn_id":"turn-bad"}}),
+        json!({"type":"token_usage_record","timestamp":"2026-10-27T07:00:02Z","payload":{"thread_id":ROOT,"turn_id":"turn-bad","response_id":"turn-bad","usage":{"input_tokens":"invalid"},"thread_token_usage":thread}}),
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:04Z","payload":{"type":"task_complete","turn_id":"turn-bad"}}),
+    ].iter().map(|v| v.to_string()+"\n").collect::<String>();
+    let siblings = codex_rows("turn-b", 20) + &codex_rows("turn-c", 30);
+    let c = corpus(name);
+    let mut disk = Disk::with_route(&c, source);
+    let path = c.root.join("rollout.jsonl");
+    std::fs::write(&path, header.clone() + &codex_rows("turn-a", 10)).unwrap();
+    input_clock(&path);
+    let scanner = E2ScanFixture::default();
+    disk.begin(&scanner, source);
+    let prior = {
+        let (mut index, scan, _) = other_page(&c, &scanner, source, ScanIndex::default());
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&accepted);
+        disk.commit(&scanner.cache, source, &mut index)
+    };
+    append(
+        &path,
+        &(codex_rows("turn-b", 20) + &bad + &codex_rows("turn-c", 30)),
+    );
+    input_clock(&path);
+    let restart = disk.owner(source);
+    save_inputs(&c);
+    let (_, tail, modes) = other_page(&c, &scanner, source, prior.clone());
+    assert_eq!(modes, (0, 1, 0), "must continue from the Codex route head");
+    let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior.clone());
+    assert_eq!(modes, (1, 0, 0));
+    let (_, restored, modes) = other_page(&c, &restart, source, prior);
+    assert_eq!(
+        modes,
+        (0, 1, 0),
+        "a restarted owner continues from the same head"
+    );
+    // The same rollout without the bad turn, read cold, is the money oracle.
+    let control = corpus(&format!("{name}-control"));
+    let control_path = control.root.join("rollout.jsonl");
+    std::fs::write(
+        &control_path,
+        header + &codex_rows("turn-a", 10) + &siblings,
+    )
+    .unwrap();
+    input_clock(&control_path);
+    let (_, oracle, _) = other_page(
+        &control,
+        &E2ScanFixture::default(),
+        source,
+        ScanIndex::default(),
+    );
+    let totals = |scan: &SourceScanResult| {
+        scan.snapshots.iter().fold((0, 0, 0), |(r, i, o), s| {
+            (r + s.request_count, i + s.input_tokens, o + s.output_tokens)
+        })
+    };
+    assert!(totals(&oracle).0 > 0);
+    for scan in [&tail, &full, &restored] {
+        assert_eq!(
+            totals(scan),
+            totals(&oracle),
+            "valid siblings count; the bad record never"
+        );
+    }
+    let (a, b) = (other_wire(source, &tail), other_wire(source, &full));
+    let d = other_wire(source, &restored);
+    assert_eq!(a, b);
+    assert_eq!(d, b, "restarted envelope differs from cold Full");
+    receipt(
+        name,
+        &[ReceiptBody {
+            raw: a,
+            source,
+            items: tail.snapshots.clone(),
+        }],
+    );
+}
+
 /// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
 /// exactly the cross-build receipts above, so these print a distinct line and
 /// write no receipt; the job still runs them and fails on any assertion.
@@ -1767,7 +2142,8 @@ fn pi_time_and_invalid_evidence() {
         u64::MAX - 9,
         "2026-10-27T06:01:00Z",
     );
-    let scan = pi_splits("pi_usage_overflow", &pi_seed(), vec![huge], 0);
+    let scan = pi_splits("pi_usage_overflow", &pi_seed(), vec![huge], 1);
+    assert_eq!(scan.snapshots[0].input_tokens, 10);
     assert_eq!(scan.dropped_usage_record_count, 1);
 }
 
@@ -1822,6 +2198,64 @@ fn pi_cli_fork_preserves_double_count() {
         ),
         EXPECTED_FORK_TOTALS
     );
+    proof.finish();
+}
+
+/// [money] A Pi fork child whose parent transcript is deleted. The next
+/// page retires the parent through its directory's complete read, and a
+/// later page with a partial census (a rejected symlink) continues the
+/// child's ledger: each growth emits a cold Full's body through the retained
+/// Tail and through a new owner restarted from the saved state.
+#[cfg(unix)]
+#[test]
+fn pi_fork_child_keeps_its_ledger_when_its_parent_retires() {
+    let name = "pi_fork_child_parent_retired";
+    pi_row!(name);
+    let (c, mut disk, parent, scanner, prior, mut proof) = pi_disk_corpus(name, &pi_seed());
+    let fork = c.root.join("fork.jsonl");
+    let copied = pi_seed()
+        .lines()
+        .skip(1)
+        .map(|s| s.to_owned() + "\n")
+        .collect::<String>();
+    let parent_ref = parent.to_string_lossy().into_owned();
+    let mut header: Value =
+        serde_json::from_str(&pi_header("synthetic-fork-session", 3, Some(&parent_ref))).unwrap();
+    header["timestamp"] = json!("2026-10-27T07:00:00Z");
+    std::fs::write(&fork, pi_json(header) + &copied).unwrap();
+    input_clock(&fork);
+    disk.begin(&scanner, SnapshotSource::Pi);
+    let (mut forked, scan, _) = other_page(&c, &scanner, SnapshotSource::Pi, prior);
+    assert_eq!(scan.snapshots.len(), 1, "the child's first read");
+    let key = |path: &Path| path.to_string_lossy().into_owned();
+    let mut prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut forked);
+    assert!(prior.files.contains_key(&key(&parent)));
+    std::fs::remove_file(&parent).unwrap();
+    for (step, response, input, at) in [
+        (0, "fork-one", 20, "2026-10-27T07:01:00Z"),
+        (1, "fork-two", 30, "2026-10-27T07:02:00Z"),
+    ] {
+        if step == 1 {
+            std::os::unix::fs::symlink(c.base.join("nowhere"), c.root.join("census-link")).unwrap();
+        }
+        pi_grow(&fork, pi_turn("message", Some(response), input, at));
+        let restart = disk.owner(SnapshotSource::Pi);
+        let (mut restored, full) = pi_pages(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            prior.clone(),
+            PiPageExpect::modes((0, 1, 0), (0, 1, 0)),
+        );
+        assert_eq!(full.snapshots.len(), 1, "step {step}: only the child grows");
+        if step == 1 {
+            assert!(!full.census_complete, "the census is partial");
+        }
+        prior = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+        assert!(!prior.files.contains_key(&key(&parent)), "step {step}");
+        assert!(prior.files.contains_key(&key(&fork)), "step {step}");
+    }
     proof.finish();
 }
 
@@ -2173,9 +2607,8 @@ fn codex_admission_branches_preserve_emitted_totals() {
             .collect::<String>();
         let path = c.root.join("rollout.jsonl");
         if name == "dropped-staging" {
-            // The existing policy quarantines the whole entity, including its valid
-            // sibling usage. Exercise that policy after a genuine disk restore
-            // and Tail, as well as from RAM and a cold byte-zero read.
+            // Invalid records are isolated after a genuine disk restore and
+            // Tail, as well as from RAM and a cold byte-zero read.
             let source = SnapshotSource::Codex;
             let _cutover = crate::snapshots::TestCutover::set(0);
             let mut disk = Disk::with_route(&c, source);
@@ -2206,28 +2639,15 @@ fn codex_admission_branches_preserve_emitted_totals() {
             assert_eq!(arms[1].2, (1, 0, 0));
             // The restarted owner continues from the same committed Codex head.
             assert_eq!(arms[2].2, (0, 1, 0));
-            for (index, scan, _) in &arms {
+            for (_, scan, _) in &arms {
                 assert_eq!(scan.dropped_usage_record_count, 1);
                 assert_eq!(scan.recognized_usage_drop_count, 1);
-                assert!(
-                    scan.snapshots.is_empty(),
-                    "quarantine emits neither money nor a $0 body"
+                assert_eq!(scan.snapshots.len(), 1);
+                assert_eq!(
+                    scan.snapshots[0].input_tokens, 2,
+                    "seed plus the valid staging sibling, never the invalid record"
                 );
-                let key = prior.files.keys().next().unwrap();
-                assert!(
-                    index
-                        .files
-                        .get(key)
-                        .map_or(true, |entry| entry.source_file_fingerprint.is_empty()
-                            || entry.size_bytes < std::fs::metadata(&path).unwrap().len()),
-                    "the lossy extent never settles"
-                );
-                // An ordinary next generation still discovers the held file
-                // and counts its dropped usage; no manual re-arm is needed.
-                let (_, retry, _) =
-                    other_page(&c, &E2ScanFixture::default(), source, index.clone());
-                assert!(retry.snapshots.is_empty());
-                assert_eq!(retry.dropped_usage_record_count, 1);
+                assert!(!other_wire(source, scan).is_empty());
             }
             let emitted = |scan: &SourceScanResult| serde_json::to_vec(&scan.snapshots).unwrap();
             assert_eq!(emitted(&arms[0].1), emitted(&arms[1].1));
@@ -2301,11 +2721,14 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         );
         progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
+        // Reuse these outcomes with a B2 loss-bearing successor.
+        append(&path, "{broken\n");
         grow(&path, "next", 20);
         let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
         successor.enrich(&c);
         successor.finish();
         let fulls = successor.modes.0;
+        assert_eq!(successor.scan.malformed_json_line_count, 1);
         if let Some(disposition) = disposition {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
                 let mut response = ack(batch)?;
@@ -2353,6 +2776,11 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         cold.finish();
         assert!(fulls + actual.modes.0 <= 1);
         assert!(!actual.scan.snapshots.is_empty());
+        assert_eq!(actual.scan.malformed_json_line_count, 1);
+        assert_eq!(
+            serde_json::to_value(&actual.index).unwrap()["terminal_jsonl_dispositions"],
+            serde_json::to_value(&cold.index).unwrap()["terminal_jsonl_dispositions"]
+        );
         let (a, actual_wire, _) = upload(&actual.scan.snapshots, &mut e2_progress(), ack);
         let (b, cold_wire, _) = upload(&cold.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
@@ -2529,6 +2957,478 @@ fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
     let root = sent.iter().find(|item| item.source_session_id == ROOT);
     let answer = root.and_then(|item| item.cache_conflict_answer.clone());
     assert_eq!(answer.map(|(c, _)| c), Some(challenge.to_owned()));
+}
+
+/// A second Claude session with no `forkedFrom` proof, so its body carries
+/// no cache patch beside the forked ROOT's patched body.
+const UNPATCHED: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+/// The production prepare when the account requires head-CAS: a session with
+/// a saved head keeps its patch, one without a head travels unpatched.
+fn under_required_cas(
+    items: &[SnapshotItem],
+    progress: &SnapshotUploadProgress,
+) -> Vec<SnapshotItem> {
+    let mut items = items.to_vec();
+    for item in &mut items {
+        prepare_snapshot_cache_for_upload(item, progress, true, true, &BTreeSet::new());
+    }
+    items
+}
+
+/// One route's upload of its page under the saved cache ledger, with the
+/// observed post-ACK placement ledger.
+fn mixed_route(
+    page: &Page,
+    progress: &SnapshotUploadProgress,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    let sent = under_required_cas(&page.scan.snapshots, progress);
+    let mut progress = progress.clone();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let (status, batches, _) = upload(&sent, &mut progress, ack);
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let mut result = crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
+        mode,
+        SnapshotSource::ClaudeCode,
+        batches,
+        &sent,
+    );
+    result.modes = page.modes;
+    result.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            sent.iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    result
+}
+
+/// [money] A mixed page (a patched forked session beside an
+/// unpatched one that switches organization mid-session, plus a side call)
+/// emits equal bodies, totals and
+/// account/organization placement, including the actual post-ACK ledger, on
+/// the warm Tail, the cold Full and the restored owner. Every route sends one
+/// class-pure request per patch class.
+#[test]
+fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("mixed_class_page");
+        let root = forked_root(&mut c);
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
+        let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
+        input_clock(&other);
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        c.evidence_for(UNPATCHED, &[api_for(UNPATCHED, "u1", 7, 70)], &[]);
+        let disk = Disk::new(&c);
+        let warm = E2ScanFixture::capturing_identity();
+        disk.begin(&warm, SnapshotSource::ClaudeCode);
+        let mut progress = e2_progress();
+        // ROOT already holds a server head; UNPATCHED has none yet, so under
+        // a required head-CAS its body travels without cache rows.
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(ROOT), "d".repeat(64));
+
+        let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        first.finish();
+        let sent = under_required_cas(&first.scan.snapshots, &progress);
+        assert!(sent
+            .iter()
+            .any(|item| item.source_session_id == ROOT && item.cache_observations.is_some()));
+        assert!(sent
+            .iter()
+            .any(|item| item.source_session_id == UNPATCHED && item.cache_observations.is_none()));
+        let (result, _, _) = upload(&sent, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        settle_index_after_upload(&mut first.index, &first.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+        assert_eq!(
+            progress.accepted_cache_heads.get(&cache_session_key(ROOT)),
+            Some(&"e".repeat(64))
+        );
+        assert!(!progress
+            .accepted_cache_heads
+            .contains_key(&cache_session_key(UNPATCHED)));
+
+        // Both sessions grow; the unpatched one switches organization, and a
+        // side call with no transcript owner arrives.
+        append(&root, &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20));
+        let switch = json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        append(
+            &other,
+            &(switch + &marker(org_b) + &line(UNPATCHED, "u2", "2026-08-02T07:00:30Z", 9)),
+        );
+        input_clock(&root);
+        input_clock(&other);
+        c.evidence(
+            &[
+                api("r1", 10, 100),
+                api("r2", 20, 200),
+                api("mixed-side", 5, 50),
+            ],
+            &[],
+        );
+        c.evidence_for(
+            UNPATCHED,
+            &[
+                api_for(UNPATCHED, "u1", 7, 70),
+                api_for(UNPATCHED, "u2", 9, 90),
+            ],
+            &[],
+        );
+        let restart = E2ScanFixture::capturing_identity();
+        disk.begin(&restart, SnapshotSource::ClaudeCode);
+        let cold = E2ScanFixture::capturing_identity();
+        let restarted = c.raw(&restart, prior.clone(), 100, true, &[]);
+        let mut pages = [
+            c.raw(&warm, prior.clone(), 100, true, &[]),
+            c.raw(&cold, prior, 100, true, &[]),
+            restarted,
+        ];
+        assert_eq!(
+            pages[1].modes.1 + pages[1].modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        finish_claude_pages(&c, &mut pages);
+        let [tail, full, disk_page] = &pages;
+        let routes = [
+            mixed_route(tail, &progress, Mode::Ram),
+            mixed_route(full, &progress, Mode::ColdFull),
+            mixed_route(disk_page, &progress, Mode::DiskRestore),
+        ];
+        for route in &routes {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        money_oracle::assert_equivalent(&routes[1], &routes[0]);
+        money_oracle::assert_equivalent(&routes[1], &routes[2]);
+        money_oracle::assert_no_smaller_reemit(ROOT, &routes[1], &routes[0], &routes[1], false);
+        // Two organizations on the unpatched session: placement is not vacuous.
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
+        assert!(
+            other_body.contains(&a) && other_body.contains(&b),
+            "two organizations"
+        );
+        println!("MIXED_CLASS_PAGE_ORACLE VERIFIED arms=ram_tail,cold_full,restored_tail requests_per_route=2");
+    });
+}
+
+/// The mixed page's placement is not vacuous: the patched session's body
+/// holds at least two tagged placements (accounts/organizations) and its
+/// request evidence. A request with no evidence carries, by design, the
+/// account of the latest earlier request with its own telemetry; it is never
+/// an untagged share. Here the gap (12 input tokens) follows r2 (20, login
+/// 2), so login 2 holds r2 and the gap, plus any 5-token share (the side call
+/// or the fork's copied line) the oracle places. Returns input tokens per
+/// placement, for the check that every arm places them the same.
+fn assert_mixed_placement_nonvacuous(
+    route: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+) -> BTreeMap<String, u64> {
+    let body = &route.snapshots[ROOT];
+    let evidence = body["request_evidence"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let placement = |row: &Value| -> Option<String> {
+        if let Some(account) = row.get("account_identifier_hash").and_then(Value::as_str) {
+            return Some(account.to_owned());
+        }
+        let index = row.get("evidence_ref").and_then(Value::as_u64)? as usize;
+        Some(evidence.get(index)?.to_string())
+    };
+    let (mut tagged, mut untagged) = (BTreeMap::<String, u64>::new(), 0u64);
+    for row in body["model_usage"].as_array().into_iter().flatten() {
+        let parts = row.get("identity_parts").and_then(Value::as_array);
+        for part in parts.map_or(std::slice::from_ref(row), Vec::as_slice) {
+            let input = part["input_tokens"].as_u64().unwrap_or_default();
+            match placement(part) {
+                Some(key) => *tagged.entry(key).or_default() += input,
+                None => untagged += input,
+            }
+        }
+    }
+    assert!(tagged.len() >= 2, "{:?}: two tagged placements", route.mode);
+    assert!(
+        !evidence.is_empty(),
+        "{:?}: request evidence present",
+        route.mode
+    );
+    // The gap carries r2's account: no untagged share, and login 2 holds
+    // r2's 20 plus the gap's 12 (and 0, 5 or 10 from 5-token shares). Under
+    // login 1 or untagged, login 2 would hold 20, 25 or 30.
+    assert_eq!(
+        untagged, 0,
+        "{:?}: the evidence gap carries the earlier account",
+        route.mode
+    );
+    let carried = tagged.get(&"2".repeat(64)).copied().unwrap_or_default();
+    assert!(
+        matches!(carried.checked_sub(12), Some(20 | 25 | 30)),
+        "{:?}: the evidence gap sits under r2's login ({carried} input tokens)",
+        route.mode
+    );
+    tagged
+}
+
+/// The oracle detects a corrupted placement and a corrupted post-ACK ledger
+/// on this page, with identical totals.
+fn assert_mixed_placement_corruption_detected(
+    cold: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    other: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+) {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
+    let mut wrong = other.clone();
+    wrong.snapshots.get_mut(ROOT).unwrap()["request_evidence"][0]["provider_workspace_hash"] =
+        json!("f".repeat(64));
+    assert!(std::panic::catch_unwind(|| money_oracle::assert_equivalent(cold, &wrong)).is_err());
+    let mut wrong = other.clone();
+    wrong.accepted_identity_buckets.as_mut().unwrap()[ROOT] = json!("corrupt");
+    assert!(std::panic::catch_unwind(|| money_oracle::assert_equivalent(cold, &wrong)).is_err());
+}
+
+/// [money] One combined positive control on a MIXED page. The patched
+/// forked session switches account mid-session (two accounts and two
+/// organizations), has a side call with no transcript owner and a response
+/// with no evidence beside tagged rows (by design the gap carries the
+/// account of the latest earlier request with its own telemetry, on every
+/// arm); the unpatched session switches organization. After an older owner's quiet
+/// commit, the upgraded owner, the warm Tail and the cold Full emit equal
+/// bodies, placement and actual post-ACK ledger; a restart between pages then
+/// continues to the cold Full's result again. Every request is class-pure,
+/// and corrupting placement or the ledger fails the oracle.
+#[test]
+fn mixed_class_page_placement_survives_upgrade_and_restarts() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("mixed_class_page_placement");
+        let root = forked_root(&mut c);
+        let org_a = "11111111-1111-4111-8111-111111111111";
+        let org_b = "22222222-2222-4222-8222-222222222222";
+        let marker = |org: &str| {
+            json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"credential_org","organizationUuid":org}})
+            .to_string()
+                + "\n"
+        };
+        let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
+        input_clock(&other);
+        // (request, tokens, login, organization) on the patched session, each
+        // with its trace ownership row: an API row without an owner stays
+        // untagged (incomplete evidence).
+        let root_evidence = |rows: &[(&str, u64, char, char)]| {
+            let api = rows
+                .iter()
+                .map(|(request, tokens, login, org)| {
+                    api_login(ROOT, request, *tokens, *login, Some(*org))
+                })
+                .collect::<Vec<_>>();
+            let traces = rows
+                .iter()
+                .map(|(request, ..)| trace_for(ROOT, request, ""))
+                .collect::<Vec<_>>();
+            c.evidence(&api, &traces);
+        };
+        // (request, tokens) on the unpatched session: its organizations come
+        // from transcript markers, as on the mixed page above.
+        let other_evidence = |rows: &[(&str, u64)]| {
+            let api = rows
+                .iter()
+                .map(|(request, tokens)| api_for(UNPATCHED, request, *tokens, *tokens * 10))
+                .collect::<Vec<_>>();
+            c.evidence_for(UNPATCHED, &api, &[]);
+        };
+        root_evidence(&[("r1", 10, '1', '7')][..]);
+        other_evidence(&[("u1", 7)][..]);
+        let disk = Disk::new(&c);
+        let warm = E2ScanFixture::capturing_identity();
+        disk.begin(&warm, SnapshotSource::ClaudeCode);
+        let mut progress = e2_progress();
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(ROOT), "d".repeat(64));
+
+        let mut first = c.raw(&warm, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        first.finish();
+        let sent = under_required_cas(&first.scan.snapshots, &progress);
+        let (result, wire, _) = upload(&sent, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(wire.len(), 2, "one request per patch class");
+        settle_index_after_upload(&mut first.index, &first.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut first.index,
+            &first.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
+
+        // Upgrade: the older owner's next pass commits again without
+        // rewriting a head; the upgraded owner continues from that index.
+        let mut quiet = c.raw(&warm, prior, 100, true, &[]);
+        quiet.enrich(&c);
+        quiet.finish();
+        accept_page(&mut quiet);
+        let committed = disk.commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
+
+        // Page 1: the patched session switches account, adds a response with
+        // no evidence and a side call; the unpatched one switches organization.
+        append(
+            &root,
+            &(line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)
+                + &line(ROOT, "gap", "2026-08-02T07:00:25Z", 12)),
+        );
+        let switch = json!({"type":"attachment","sessionId":UNPATCHED,
+            "attachment":{"type":"session_context","context":{}}})
+        .to_string()
+            + "\n";
+        append(
+            &other,
+            &(switch + &marker(org_b) + &line(UNPATCHED, "u2", "2026-08-02T07:00:30Z", 9)),
+        );
+        input_clock(&root);
+        input_clock(&other);
+        let page_one = [
+            ("r1", 10, '1', '7'),
+            ("r2", 20, '2', '8'),
+            ("mixed-side", 5, '2', '8'),
+        ];
+        root_evidence(&page_one[..]);
+        other_evidence(&[("u1", 7), ("u2", 9)][..]);
+        let upgraded = E2ScanFixture::capturing_identity();
+        disk.begin(&upgraded, SnapshotSource::ClaudeCode);
+        let upgraded_page = c.raw(&upgraded, committed.clone(), 100, true, &[]);
+        let mut pages = [
+            c.raw(&warm, committed.clone(), 100, true, &[]),
+            c.raw(
+                &E2ScanFixture::capturing_identity(),
+                committed,
+                100,
+                true,
+                &[],
+            ),
+            upgraded_page,
+        ];
+        assert_eq!(
+            pages[1].modes.1 + pages[1].modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        finish_claude_pages(&c, &mut pages);
+        let routes = [
+            mixed_route(&pages[0], &progress, Mode::Ram),
+            mixed_route(&pages[1], &progress, Mode::ColdFull),
+            mixed_route(&pages[2], &progress, Mode::DiskRestore),
+        ];
+        for route in &routes {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        let cold_placed = assert_mixed_placement_nonvacuous(&routes[1]);
+        money_oracle::assert_equivalent(&routes[1], &routes[0]);
+        money_oracle::assert_equivalent(&routes[1], &routes[2]);
+        for route in [&routes[0], &routes[2]] {
+            assert_eq!(
+                assert_mixed_placement_nonvacuous(route),
+                cold_placed,
+                "{:?}: the gap's placement on every arm",
+                route.mode
+            );
+        }
+        assert_mixed_placement_corruption_detected(&routes[1], &routes[2]);
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
+        assert!(
+            other_body.contains(&a) && other_body.contains(&b),
+            "two organizations"
+        );
+
+        // Restart between pages: the upgraded owner's page is accepted and
+        // committed; a new owner continues page 2 from that index.
+        let [_, _, mut upgraded_page] = pages;
+        accept_page(&mut upgraded_page);
+        let next = disk.commit(
+            &upgraded_page.cache,
+            SnapshotSource::ClaudeCode,
+            &mut upgraded_page.index,
+        );
+        append(&root, &line(ROOT, "r3", "2026-08-02T07:00:40Z", 30));
+        append(&other, &line(UNPATCHED, "u3", "2026-08-02T07:00:50Z", 11));
+        input_clock(&root);
+        input_clock(&other);
+        let mut page_two = page_one.to_vec();
+        page_two.push(("r3", 30, '1', '7'));
+        root_evidence(&page_two[..]);
+        other_evidence(&[("u1", 7), ("u2", 9), ("u3", 11)][..]);
+        let restarted = E2ScanFixture::capturing_identity();
+        disk.begin(&restarted, SnapshotSource::ClaudeCode);
+        let mut restart_page = c.raw(&restarted, next.clone(), 100, true, &[]);
+        let mut cold_page = c.raw(&E2ScanFixture::capturing_identity(), next, 100, true, &[]);
+        assert_eq!(
+            cold_page.modes.1 + cold_page.modes.2,
+            0,
+            "cold arm reads Full"
+        );
+        for page in [&mut restart_page, &mut cold_page] {
+            page.enrich(&c);
+            page.finish();
+        }
+        let restart_route = mixed_route(&restart_page, &progress, Mode::Restart);
+        let cold_route = mixed_route(&cold_page, &progress, Mode::ColdFull);
+        for route in [&restart_route, &cold_route] {
+            money_oracle::assert_class_pure_requests(route);
+            assert_eq!(route.batches.len(), 2, "{:?}", route.mode);
+        }
+        let cold_placed = assert_mixed_placement_nonvacuous(&cold_route);
+        money_oracle::assert_equivalent(&cold_route, &restart_route);
+        assert_eq!(
+            assert_mixed_placement_nonvacuous(&restart_route),
+            cold_placed,
+            "restart between pages: the gap's placement"
+        );
+        assert_mixed_placement_corruption_detected(&cold_route, &restart_route);
+        println!(
+            "MIXED_CLASS_PAGE_PLACEMENT VERIFIED arms=ram_tail,cold_full,upgraded_owner,restart_between_pages"
+        );
+    });
 }
 
 /// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS

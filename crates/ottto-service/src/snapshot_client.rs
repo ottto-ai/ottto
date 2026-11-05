@@ -923,6 +923,11 @@ fn default_occurrence_count() -> u64 {
     1
 }
 
+/// A body that carries a cache patch declares head CAS for its whole request.
+pub(crate) fn declares_head_cas(item: &crate::snapshots::SnapshotItem) -> bool {
+    item.cache_observations.is_some()
+}
+
 /// The existing public ACK version for additive body evidence. Keep synthetic
 /// transport responses on the same contract as the production ACK validator;
 /// internal envelope versions are not public ACK versions.
@@ -1015,11 +1020,7 @@ impl SnapshotBatchResponse {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<()> {
-        let enforce_head_cas = enforce_head_cas
-            || request
-                .snapshots
-                .iter()
-                .any(|item| item.cache_observations.is_some());
+        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -1523,8 +1524,7 @@ pub struct SnapshotStatusRequest {
     /// class by class, by equality, that every loss a receipt discloses is
     /// exactly the loss the daemon settled — instead of taking an opaque error
     /// code on faith. Additive: a backend that predates them ignores them.
-    /// `#[serde(default)]` so a terminal-status journal written by an older
-    /// daemon still reloads.
+    /// `#[serde(default)]` so a body that predates them still deserializes.
     #[serde(default)]
     pub last_terminal_ownership_incomplete_file_count: u64,
     #[serde(default)]
@@ -1545,14 +1545,11 @@ pub struct SnapshotStatusRequest {
     #[serde(default)]
     pub last_census_residue_settled: bool,
     /// Cardinalities of the local residue witness, COUNTS ONLY. The witness
-    /// itself holds local filesystem index keys and Codex session ids; neither
-    /// ever reaches the wire.
+    /// itself holds local filesystem index keys; they never reach the wire.
     #[serde(default)]
     pub last_census_residue_index_key_count: u64,
     #[serde(default)]
     pub last_census_residue_archived_rollout_count: u64,
-    #[serde(default)]
-    pub last_census_residue_blocked_session_count: u64,
     /// Census-member queue plus carry replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_census_pending_file_count: Option<u64>,
@@ -1639,7 +1636,6 @@ impl SnapshotStatusRequest {
             last_census_residue_settled,
             last_census_residue_index_key_count,
             last_census_residue_archived_rollout_count,
-            last_census_residue_blocked_session_count,
             last_census_pending_file_count,
             last_census_block_cause,
             consecutive_failures,
@@ -1782,10 +1778,6 @@ impl SnapshotStatusRequest {
                 "last_census_residue_archived_rollout_count",
                 *last_census_residue_archived_rollout_count,
             ),
-            (
-                "last_census_residue_blocked_session_count",
-                *last_census_residue_blocked_session_count,
-            ),
             ("consecutive_failures", *consecutive_failures),
         ] {
             if value != 0 {
@@ -1904,6 +1896,10 @@ fn require_cloud_session_success(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("config upload refused: source_disabled")]
+pub(crate) struct UploadRefused;
+
 /// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
 /// error so the caller can refresh credentials; 400/422 means the `label`
 /// contract drifted.
@@ -1912,9 +1908,17 @@ fn relay_token_upload_response(
     label: &str,
 ) -> Result<Value> {
     match sent {
-        Ok(response) => response
-            .into_json()
-            .map_err(|error| anyhow!("parse {label} response failed: {error}")),
+        Ok(response) => {
+            let body: Value = response
+                .into_json()
+                .map_err(|error| anyhow!("parse {label} response failed: {error}"))?;
+            if body.get("accepted").and_then(Value::as_bool) == Some(false)
+                && body.get("reason").and_then(Value::as_str) == Some("source_disabled")
+            {
+                return Err(UploadRefused.into());
+            }
+            Ok(body)
+        }
         Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
             Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                 status: code,
@@ -2346,11 +2350,7 @@ impl SnapshotApiClient {
         )>,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
-        let enforce_head_cas = enforce_head_cas
-            || request
-                .snapshots
-                .iter()
-                .any(|item| item.cache_observations.is_some());
+        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
         let body = if retry.is_some() && enforce_head_cas {
             crate::snapshot_retry::encode_json(
                 &request.wire_with_head_cas(),
@@ -3110,6 +3110,12 @@ impl SnapshotApiClient {
         self.upload_local_health(relay_token, "projection", request)
     }
 
+    /// Saves one source's pause/resume; replies with the heartbeat's
+    /// `source_control` block.
+    pub fn upload_source_control(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        self.upload_local_health(relay_token, "source-control", request)
+    }
+
     /// POST to `/api/v1/apps/health/{kind}` with the relay token.
     fn upload_local_health(
         &self,
@@ -3493,23 +3499,64 @@ pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
 
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
     ensure_no_incomplete_device_credential_promotion()?;
-    let device =
-        crate::local_resource_diagnostics::credential_file_read(FileDeviceStore::default().load())?
-            .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    let envelope = crate::local_resource_diagnostics::credential_file_read(
+        FileDeviceStore::default().load_envelope(),
+    )?
+    .ok_or_else(|| anyhow!("relay device binding is missing"))?;
     let secret = crate::local_resource_diagnostics::credential_file_read(
         KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
             .load()
             .map_err(anyhow::Error::new),
     )
     .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
-    Ok((device, secret))
+    let alias = envelope.continuity.snapshot_namespace.as_ref();
+    crate::snapshot_sync::carry_snapshot_namespace(&envelope.device, &secret, alias);
+    Ok((envelope.device, secret))
 }
+
+#[cfg(test)]
+pub(crate) use tests::config_upload_backend;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    pub(crate) fn config_upload_backend(
+        body: &'static str,
+    ) -> (SnapshotApiClient, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        (client, server)
+    }
+
+    #[test]
+    fn source_disabled_refusal_requires_both_fields() {
+        for (body, refused) in [
+            (r#"{"accepted":false,"reason":"source_disabled"}"#, true),
+            (r#"{"accepted":true,"reason":"source_disabled"}"#, false),
+            (r#"{"reason":"source_disabled"}"#, false),
+            (r#"{"accepted":false}"#, false),
+        ] {
+            let response = ureq::Response::new(200, "OK", body).unwrap();
+            let result = relay_token_upload_response(Ok(response), "config");
+            if refused {
+                assert!(result.unwrap_err().is::<UploadRefused>());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    serde_json::from_str::<Value>(body).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn bounded_unit_test_agent_refuses_production_before_dns_or_tls() {
@@ -3756,36 +3803,6 @@ mod tests {
             hint.session_request_identity_retained_contract.as_deref(),
             Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
         );
-    }
-
-    /// An older daemon's terminal-status journal predates the residue fields.
-    /// It must still reload — with the residue absent, not as a parse error —
-    /// so a daemon upgrade never strands the last committed receipt.
-    #[test]
-    fn a_journaled_receipt_without_residue_fields_reloads_with_them_absent() {
-        let mut committed = serde_json::to_value(clean_checkin_request()).expect("receipt JSON");
-        let body = committed.as_object_mut().expect("object");
-        for name in [
-            "last_terminal_ownership_incomplete_file_count",
-            "last_terminal_zero_snapshot_usage_evidence_count",
-            "last_terminal_recognized_usage_drop_count",
-            "last_terminal_dropped_usage_record_count",
-            "last_terminal_over_line_cap_count",
-            "last_census_residue_settled",
-            "last_census_residue_index_key_count",
-            "last_census_residue_archived_rollout_count",
-            "last_census_residue_blocked_session_count",
-        ] {
-            assert!(body.remove(name).is_some(), "{name} is on the wire");
-        }
-        let reloaded: SnapshotStatusRequest =
-            serde_json::from_value(committed).expect("a pre-residue journal reloads");
-        assert!(!reloaded.last_census_residue_settled);
-        assert_eq!(reloaded.last_terminal_dropped_usage_record_count, 0);
-        assert_eq!(reloaded.last_census_residue_index_key_count, 0);
-        reloaded
-            .validate_declared_report_kind()
-            .expect("the reloaded beat is still truthful");
     }
 
     #[test]
@@ -4156,7 +4173,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 0,
@@ -4361,10 +4377,6 @@ mod tests {
                 Box::new(|r| r.last_census_residue_archived_rollout_count = 1),
             ),
             (
-                "last_census_residue_blocked_session_count",
-                Box::new(|r| r.last_census_residue_blocked_session_count = 1),
-            ),
-            (
                 "consecutive_failures",
                 Box::new(|r| r.consecutive_failures = 1),
             ),
@@ -4460,7 +4472,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 1,
@@ -4534,7 +4545,6 @@ mod tests {
             last_census_residue_settled: false,
             last_census_residue_index_key_count: 0,
             last_census_residue_archived_rollout_count: 0,
-            last_census_residue_blocked_session_count: 0,
             last_census_pending_file_count: None,
             last_census_block_cause: None,
             consecutive_failures: 0,

@@ -4,16 +4,11 @@ use std::path::Path;
 use toml_edit::{DocumentMut, ImDocument, Item, Key, TableLike};
 
 use super::fence::{
-    remove_fence_with_validator, upsert_fence_with_validator, upsert_would_change_with_validator,
-    AgentConfigResult, FenceWriteResult,
+    remove_fence_with_validator, upsert_fence_with_validator, AgentConfigResult, FenceWriteResult,
 };
 
 pub fn upsert_fence(path: &Path, body: &str) -> AgentConfigResult<FenceWriteResult> {
     upsert_fence_with_validator(path, body, validate_toml)
-}
-
-pub fn upsert_would_change(path: &Path, body: &str) -> AgentConfigResult<bool> {
-    upsert_would_change_with_validator(path, body, validate_toml)
 }
 
 pub fn remove_fence(path: &Path) -> AgentConfigResult<FenceWriteResult> {

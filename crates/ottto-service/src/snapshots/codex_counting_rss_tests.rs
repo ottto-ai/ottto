@@ -250,9 +250,6 @@ fn grown_unretained_history_is_read_in_the_next_rss_round() {
                 NOW,
             );
             assert!(observed.max_priority_witnesses > sampled_jsonl::MAX_PRIORITY_WITNESSES);
-            assert!(cache
-                .retained_sealed_offset(&local_index_key(&path))
-                .is_none());
             assert!(cache.counters_for_test().jobs_paused > 0);
             let cold = out.clone();
             let mut tail = BufWriter::new(File::create(root.join("tail.jsonl")).unwrap());

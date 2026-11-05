@@ -57,6 +57,9 @@ pub(super) const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
 /// Family roots one pass remembers as walked. Past it, a
 /// family is walked again for each of its candidates: slower, never skipped.
 const MAX_WALKED_ROOTS: usize = 4_096;
+/// Not hex, so no parsed list can carry it (`listing_every_family_for_test`).
+#[cfg(test)]
+const EVERY_FAMILY_FOR_TEST: &str = "every-family";
 
 /// A family's `<root>/subagents` directory as stat-ed before its walk:
 /// modification time and inode, or `None` when it did not exist.
@@ -235,6 +238,16 @@ impl ReemissionExclusions {
         self
     }
 
+    /// Test seam: an installed list that names every family, the
+    /// ordinary-money lever of the shared parse fixtures (a paused list holds
+    /// adoption only, so it no longer keeps a family off `e2`).
+    #[cfg(test)]
+    pub(crate) fn listing_every_family_for_test() -> Self {
+        let mut list = Self::with_state(ListState::Installed);
+        list.digests.insert(EVERY_FAMILY_FOR_TEST.to_owned());
+        list
+    }
+
     pub(crate) fn state(&self) -> ListState {
         self.state
     }
@@ -381,6 +394,10 @@ impl ReemissionExclusions {
     }
 
     fn contains(&self, digest: &HexDigest) -> bool {
+        #[cfg(test)]
+        if self.digests.contains(EVERY_FAMILY_FOR_TEST) {
+            return true;
+        }
         self.digests.contains(digest.as_str())
     }
 }

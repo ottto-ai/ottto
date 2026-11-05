@@ -3,8 +3,7 @@
 //! its retained-heap category. It generates main's ScanIndex heap layout walk,
 //! the accepted kinds, kind dispatch, per-group field mappings, the original
 //! field inventory and the retained-heap side sums. Hand code stays only for
-//! `hook` fields: account-window ordinals, shared-evidence projections, raw
-//! custody. Entries keep each group's existing write
+//! `hook` fields: shared-evidence projections, raw custody. Entries keep each group's existing write
 //! order; the heap walk sums monotonically, so its order is not observable.
 use super::*;
 
@@ -27,12 +26,6 @@ macro_rules! scan_index_fields {
             generation => Misc (control check_field) [] side,
             known_configured_scan_roots => Misc (misc check_field Set) ["v1_field.known_configured_scan_roots" => 1] side,
             legacy_unresolved_root_file_witnesses => Misc (misc check_field Set) ["v1_field.legacy_unresolved_root_file_witnesses" => 1] side,
-            codex_state_only_snapshot_fingerprints => Misc (misc check_field Map) ["v1_field.codex_state_only_snapshot_fingerprints" => 1] side,
-            codex_state_only_blocked_session_ids => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_session_ids" => 1] side,
-            codex_state_only_blocked_by_file => Misc (misc check_field Map) ["v1_field.codex_state_only_blocked_by_file" => 1] side,
-            codex_state_only_blocked_unattributed => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
-            codex_state_only_blocked_legacy => Misc (misc check_field Set) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
-            codex_state_only_blocked_attributed => Misc (misc check_field Field) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
             codex_parent_ownership_refs => Misc (retired none) ["v1_field.codex_parent_ownership_refs" => 1] side,
             codex_parent_ownership_ledgers => Misc (retired none) ["v1_field.codex_parent_ownership_ledgers" => 1] side,
             codex_parent_side_requests => Misc (retired none) ["v1_field.codex_parent_side_requests" => 1] side,
@@ -84,12 +77,12 @@ macro_rules! scan_index_fields {
             claude_money_birth_store => Misc (misc check_field Field) ["v1_field.birth_store" => 1] side,
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
-            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2] side,
-            // Codex archive custody: rows only while held (kinds_misc::ARCHIVE_KINDS).
-            archives => Misc (hook check_field) ["v1_field.archives" => 2] side,
-            archive_deferred_alarm_count => Misc (hook check_field) ["v1_field.archive_deferred_alarm_count" => 2] side,
-            archive_pass => Misc (runtime none) [] side,
-            decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_account_family_witnesses" => 1, "raw_hold.claude_account_family_pending" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,
+            // Its stamps are one row per entity, as accepted.entity (layout 6).
+            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6] side,
+            // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
+            retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
+            retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
+            decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,
             files => Files (map check_map) ["file.progress" => 1] own,
             terminal_jsonl_dispositions => Files (map check_map) ["file.terminal" => 1] side,
             file_snapshot_fingerprints => Files (map check_map) ["file.entities" => 1] side,
@@ -101,26 +94,25 @@ macro_rules! scan_index_fields {
             // request sets through the group's reference extractor. An earlier
             // store's raw holds of the field retire with it.
             retired_claude_usage_family_pending => Accounts (retired none) ["usage.pending" => 1, "raw_hold.claude_usage_family_pending" => 1] side,
-            claude_account_family_witnesses => Accounts (map check_map) ["proof.account" => 1] side,
+            retired_claude_account_family_witnesses => Accounts (retired none) ["proof.account" => 1, "raw_hold.claude_account_family_witnesses" => 1] side,
             claude_usage_family_witnesses => Accounts (map check_map) ["proof.usage" => 1] side,
             claude_usage_authority_quarantine => Accounts (map check_map) ["refusal.authority" => 1] side,
             claude_account_deferred_holds => Accounts (map check_map) ["proof.deferred_account" => 1] side,
             session_account_bindings => Accounts (map check_map) ["setting.binding" => 1] side,
-            claude_account_family_pending => Accounts (hook check_map) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1] own,
+            retired_claude_account_family_pending => Accounts (retired none) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1, "raw_hold.claude_account_family_pending" => 1] side,
             claude_request_census => Census (hook check_field) ["file.census" => 1] own,
             retired_family_requests => Census (retired none) ["family.requests" => 1] side,
-            claude_retired_family_tombstones => Census (hook check_field) ["tombstone.claude_retired_family_tombstones" => 1] side,
+            retired_claude_retired_family_tombstones => Census (retired none) ["tombstone.claude_retired_family_tombstones" => 1] side,
             retired_claude_duplicate_request_owners => Census (retired none) ["v1_field.duplicate_owners" => 1] side,
             retired_claude_owned_start_census => Census (retired none) ["proof.owned_start" => 1] side,
             claude_request_census_shadow => Census (scalar check_field) ["v1_field.census_shadow" => 1] side,
             retired_claude_duplicate_request_witness_overflowed => Census (retired none) ["setting.claude_duplicate_request_witness_overflowed" => 1] side,
-            claude_retired_family_tombstones_initialized => Census (scalar check_field) ["setting.claude_retired_family_tombstones_initialized" => 1] side,
-            claude_retired_family_tombstones_uncertain => Census (scalar check_field) ["setting.claude_retired_family_tombstones_uncertain" => 1] side,
+            retired_claude_retired_family_tombstones_initialized => Census (retired none) ["setting.claude_retired_family_tombstones_initialized" => 1] side,
+            retired_claude_retired_family_tombstones_uncertain => Census (retired none) ["setting.claude_retired_family_tombstones_uncertain" => 1] side,
             persistence_root => Misc (runtime none) [] side,
             persistence_unavailable => Misc (runtime none) [] side,
             persistence_controls => Misc (runtime none) [] side,
             persistence_legacy_recovery => Misc (runtime none) [] side,
-            claude_account_window_retention => Accounts (runtime none) [] side,
             withheld_memo => Accounts (runtime none) [] side,
             codex_counting_moved_evidence => Misc (runtime none) [] side,
             active_quarantine_witness => Misc (runtime none) [] side,
@@ -143,6 +135,13 @@ macro_rules! scan_index_fields {
             retired_completed_context_curve_replay_generation => Misc (retired none) [] side,
             // Retired: an earlier store's rows are accepted on load and purged by the next save.
             retired_claude_desktop_census_witness => Misc (retired none) ["v1_field.claude_desktop_census_witness" => 1] side,
+            // An earlier store's rows stay accepted and are never read or written.
+            retired_codex_state_only_snapshot_fingerprints => Misc (retired none) ["v1_field.codex_state_only_snapshot_fingerprints" => 1] side,
+            retired_codex_state_only_blocked_session_ids => Misc (retired none) ["v1_field.codex_state_only_blocked_session_ids" => 1] side,
+            retired_codex_state_only_blocked_by_file => Misc (retired none) ["v1_field.codex_state_only_blocked_by_file" => 1] side,
+            retired_codex_state_only_blocked_unattributed => Misc (retired none) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
+            retired_codex_state_only_blocked_legacy => Misc (retired none) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
+            retired_codex_state_only_blocked_attributed => Misc (retired none) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
             codex_counting_evictions => Misc (runtime none) [] side,
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
@@ -188,6 +187,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (3, "copy-prefix recovery nonce"),
     (4, "tail store"),
     (5, "folder login ledger + tail revision + head envelope"),
+    (6, "upload context proof stamps one row per entity"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
@@ -231,10 +231,12 @@ pub(super) fn introduced(kind: &str) -> Result<u32> {
 /// Before layout controls existed, this authenticated inventory contained every
 /// field known to its writer, including fields absent in the imported v1 JSON.
 pub(super) fn legacy_layout(presence: &BTreeMap<String, bool>) -> u32 {
+    // A field's later kinds (a newer split) say nothing about its writer.
+    let first = |field: &str| LAYOUTS.iter().find(|(_, f, _)| *f == field).map(|e| e.2);
     LAYOUTS
         .iter()
         .filter(|(_, field, _)| presence.contains_key(*field))
-        .map(|(_, _, layout)| *layout)
+        .filter_map(|(_, field, _)| first(field))
         .max()
         .unwrap_or(1)
 }
@@ -289,10 +291,20 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
     scan_index_fields!(each check);
     if matches!(
         field,
-        "upload_context_fingerprint"
+        "archives"
+            | "archive_deferred_alarm_count"
+            | "upload_context_fingerprint"
             | "claude_desktop_census_witness"
+            | "codex_state_only_snapshot_fingerprints"
+            | "codex_state_only_blocked_session_ids"
+            | "codex_state_only_blocked_by_file"
+            | "codex_state_only_blocked_unattributed"
+            | "codex_state_only_blocked_legacy"
+            | "codex_state_only_blocked_attributed"
             | "claude_folder_login_ledger"
             | "claude_usage_family_pending"
+            | "claude_account_family_witnesses"
+            | "claude_account_family_pending"
             | "claude_duplicate_request_owners"
             | "claude_duplicate_request_witness_overflowed"
             | "claude_owned_start_census"
@@ -302,6 +314,9 @@ pub(super) fn inventory_field<'de, A: serde::de::MapAccess<'de>>(
             | "claude_request_identity_contract_changed"
             | "claude_stale_family_carry"
             | "held_audit_progress"
+            | "claude_retired_family_tombstones"
+            | "claude_retired_family_tombstones_initialized"
+            | "claude_retired_family_tombstones_uncertain"
     ) {
         // TOMBSTONE: decode-and-drop, as the v1 decoder does.
         map.next_value::<serde::de::IgnoredAny>()?;
@@ -324,10 +339,17 @@ mod tests {
         // A retired kind keeps its group (and so its shared-set routing).
         assert_eq!(group("family.requests"), Some(Group::Census));
         assert_eq!(group("usage.pending"), Some(Group::Accounts));
-        for kind in ["usage.pending", "family.requests", "proof.owned_start"] {
+        assert_eq!(group("account_window"), Some(Group::Accounts));
+        for kind in [
+            "usage.pending",
+            "family.requests",
+            "proof.owned_start",
+            "account_window",
+            "proof.account",
+        ] {
             assert!(retired(kind), "{kind}");
         }
-        assert!(!retired("file.census") && !retired("proof.usage"));
+        assert!(!retired("file.census") && !retired("proof.usage") && !retired("setting.binding"));
         assert!(OWNED.iter().any(|(kind, _)| retired(kind)));
         // Each graph kind is introduced at a supported layout.
         assert!(LAYOUTS.iter().all(|(_, _, l)| (1..=LAYOUT).contains(l)));
@@ -336,6 +358,7 @@ mod tests {
         assert_eq!(introduced("tail.head").unwrap(), TAIL_LAYOUT);
         assert_eq!(introduced("tail.revision").unwrap(), 5);
         assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
+        assert_eq!(introduced("proof.upload_context").unwrap(), 6);
         assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
         // An unversioned store's inventory never names a layout-5 field, so its
         // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).

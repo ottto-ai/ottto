@@ -246,9 +246,11 @@ fn qualify_all(
             Err(Coverage::UnreadableEvidence)
         };
         let disposition = match proof {
-            Ok(account) => {
+            Ok((account, external)) => {
                 changed |= set_claude_account_hash(item, Some(account.to_string()));
-                if original_event_clocks_complete(item) {
+                if external {
+                    Coverage::UnsupportedDestination
+                } else if original_event_clocks_complete(item) {
                     Coverage::Complete
                 } else {
                     Coverage::UnprovedEventClock
@@ -428,7 +430,7 @@ fn qualify<'a>(
     item: &SnapshotItem,
     requests: &BTreeMap<(&str, &str), Option<&'a ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
-) -> Result<&'a str, Coverage> {
+) -> Result<(&'a str, bool), Coverage> {
     let root = if let Some((root, agent)) = item.source_session_id.split_once("_agent-") {
         if root.is_empty() || agent.is_empty() {
             return Err(Coverage::UnprovedRequestOwner);
@@ -460,11 +462,17 @@ fn qualify<'a>(
     {
         return Err(Coverage::KnownAccountConflict);
     }
-    for row in item
-        .model_usage
-        .iter()
-        .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
-    {
+    let rows = || {
+        item.model_usage
+            .iter()
+            .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
+    };
+    // A child billed only outside the subscription keeps its own proved login
+    // on the wire; it still never counts toward subscription coverage.
+    let external = root != item.source_session_id
+        && rows().next().is_some()
+        && rows().all(|row| !local_subscription(row));
+    for row in rows() {
         if row
             .account_identifier_hash
             .as_deref()
@@ -472,11 +480,11 @@ fn qualify<'a>(
         {
             return Err(Coverage::KnownAccountConflict);
         }
-        if !local_subscription(row) {
+        if !external && !local_subscription(row) {
             return Err(Coverage::UnsupportedDestination);
         }
     }
-    Ok(account)
+    Ok((account, external))
 }
 
 fn request_accounts<'a>(

@@ -1489,8 +1489,8 @@ docs = docs.replace(
 docs = docs.replace("assert_collector_manifest_contract", "assert_manifest")
 docs = docs.replace("CollectorManifestContract", "ManifestContract")
 docs = docs.replace(
-    "uv run python scripts/generate_connector_registry.py --check",
-    "uv run python scripts/generate_connector_registry.py",
+    "a maintainer regenerates the registry before merge",
+    "edit the registry by hand",
 )
 docs = docs.replace(
     "Official first-party fixtures must not expose raw prompts, responses, tool\n"
@@ -1528,7 +1528,7 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_docs" >/tmp/public-cont
 fi
 grep -q "connector docs must route source-package tests through the public Rust testkit" \
   /tmp/public-contract-broken-connector-docs.out
-grep -q "connector docs must preserve registry generator check command" \
+grep -q "connector docs must say who regenerates the registry" \
   /tmp/public-contract-broken-connector-docs.out
 grep -q "connector docs must preserve fixture raw-content prohibition" \
   /tmp/public-contract-broken-connector-docs.out

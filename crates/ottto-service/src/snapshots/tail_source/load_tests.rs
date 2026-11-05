@@ -122,10 +122,10 @@ pub(super) fn counted(loaded: &Loaded) -> (String, Vec<String>) {
 pub(super) fn read(
     route: &Route,
     path: &Path,
-    taken: Option<Box<Taken<CachedJsonlReduction>>>,
+    taken: Option<Box<Retained<CachedJsonlReduction>>>,
 ) -> (OwnedJsonlParser, ReadMode, u64) {
     let mut parser = route.open(path);
-    let Ok(mode) = parser.prepare_acquisition_owned(taken, &scope(), None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(taken, &scope(), None, NOW) else {
         panic!("the read prepares");
     };
     let start = parser
@@ -384,6 +384,71 @@ fn absent_heads_are_classified_by_custody() {
     let (load, records) = loaded(&route, &path, &owed);
     assert!(matches!(load, Load::Cold(None)));
     assert_eq!(counted(&records), ("miss".into(), vec![]));
+}
+
+/// [behaviour] An index key retired because its file is proven absent splits
+/// the Tail lifecycle. Its removed `file.progress` row retires the reduction
+/// in that same save, with no census; a head with unresolved revisions keeps
+/// them under a metadata-only head. An orphan head (no progress row) lingers,
+/// never loaded, through saves until the healthy census retires it, which
+/// still keeps the metadata-only debt.
+#[test]
+fn a_retired_index_key_retires_at_save_and_an_orphan_waits_for_the_census() {
+    let mut route = route();
+    let [(gone_path, gone), (owed_path, owed), (_, orphan)] =
+        ["gone", "owed", "orphan"].map(|name| committed(&mut route, &format!("{name}.jsonl"), 3));
+    for key in [&gone, &owed] {
+        route.index.files.insert(
+            key.clone(),
+            serde_json::from_value::<ScanIndexEntry>(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap(),
+        );
+    }
+    let common = route.head(&owed).unwrap().common;
+    state_v2::observe_tail(
+        &route.path,
+        &owed,
+        state_v2::Observation {
+            representation: common.representation,
+            summary: common.debt,
+            added: vec![b"debt".to_vec()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    route.save(false);
+    for (path, key) in [(&gone_path, &gone), (&owed_path, &owed)] {
+        std::fs::remove_file(path).unwrap();
+        route.index.remove_file_entry_unless_held(key);
+        assert!(!route.index.files.contains_key(key));
+    }
+    for save in 0..2 {
+        route.save(false);
+        let keys = state_v2::tail_head_keys(&route.index).unwrap();
+        assert!(
+            !keys.contains(&gone),
+            "{save}: retired at the removing save"
+        );
+        assert!(route.marker(&gone).is_none(), "{save}");
+        assert!(route.head(&owed).unwrap().metadata_only, "{save}");
+        assert!(
+            route.head(&orphan).is_some_and(|head| !head.metadata_only),
+            "{save}: the orphan lingers until the census"
+        );
+    }
+    let none = BTreeSet::new();
+    retire_absent(SnapshotSource::ClaudeCode, &route.index, &none, &none);
+    route.save(false);
+    let keys = state_v2::tail_head_keys(&route.index).unwrap();
+    assert!(!keys.contains(&orphan) && !keys.contains(&gone));
+    assert!(
+        route.head(&owed).unwrap().metadata_only,
+        "absence keeps debt"
+    );
 }
 
 /// [behaviour] C′: a head bound to another destination's route is retired

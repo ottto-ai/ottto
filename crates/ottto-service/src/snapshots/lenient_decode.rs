@@ -29,7 +29,6 @@ pub(super) struct Holds(
     RepairProvenance,
     BTreeSet<[u8; 32]>, // held file family roots; fixed-size metadata per hold
     BTreeSet<[u8; 32]>, // known protected owners; no reverse file scan
-    bool,               // any held file has unknown ownership
 );
 // Fixed-size multiset commitment to negative records repaired/dropped at the
 // persistence boundary. Neither corpus size nor Clone adds retained allocations.
@@ -118,8 +117,6 @@ impl Holds {
                 field,
                 "files"
                     | "growth_retention"
-                    | "claude_account_family_witnesses"
-                    | "claude_account_family_pending"
                     | "claude_usage_family_witnesses"
                     | "claude_usage_authority_quarantine"
                     | "quarantined_snapshot_fingerprints"
@@ -177,7 +174,6 @@ impl Holds {
             self.0 = BTreeMap::new();
             self.2 = BTreeSet::new();
             self.3 = BTreeSet::new();
-            self.4 = false;
             return;
         }
         let files = self.0.get("files");
@@ -193,10 +189,6 @@ impl Holds {
             .flat_map(|slots| slots.values())
             .filter_map(|raw| raw.owner().map(repair_key))
             .collect();
-        self.4 = files
-            .into_iter()
-            .flat_map(|slots| slots.values())
-            .any(|raw| raw.owner().is_none());
     }
     #[cfg(test)]
     pub(super) fn provenance_receipt(&self) -> (usize, u64, u128) {
@@ -324,21 +316,11 @@ impl Serialize for ScanIndex {
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
         )?;
-        field!(archives, BTreeMap::is_empty);
-        field!(archive_deferred_alarm_count, is_zero_u64);
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
         field!(known_configured_scan_roots, BTreeSet::is_empty);
         field!(legacy_unresolved_root_file_witnesses, BTreeSet::is_empty);
-        field!(codex_state_only_snapshot_fingerprints, BTreeMap::is_empty);
-        field!(codex_state_only_blocked_session_ids, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_by_file, BTreeMap::is_empty);
-        field!(codex_state_only_blocked_unattributed, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_legacy, BTreeSet::is_empty);
-        field!(codex_state_only_blocked_attributed, std::ops::Not::not);
         field!(claude_desktop_title_files, BTreeMap::is_empty);
-        field!(held claude_account_family_witnesses);
-        field!(held claude_account_family_pending);
         field!(held claude_usage_family_witnesses);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
         field!(
@@ -346,9 +328,6 @@ impl Serialize for ScanIndex {
             ClaudeRequestCensusShadowState::is_empty
         );
         field!(held claude_usage_authority_quarantine);
-        field!(claude_retired_family_tombstones);
-        field!(claude_retired_family_tombstones_initialized);
-        field!(claude_retired_family_tombstones_uncertain, is_false);
         field!(claude_account_deferred_holds, BTreeMap::is_empty);
         field!(claude_request_identity_contract, Option::is_none);
         field!(claude_desktop_store_cursor, Option::is_none);
@@ -424,12 +403,12 @@ pub(super) const FIELDS: &[&str] = &[
     "terminal_jsonl_dispositions",
     "known_configured_scan_roots",
     "legacy_unresolved_root_file_witnesses",
-    "codex_state_only_snapshot_fingerprints",
-    "codex_state_only_blocked_session_ids",
-    "codex_state_only_blocked_by_file",
-    "codex_state_only_blocked_unattributed",
-    "codex_state_only_blocked_legacy",
-    "codex_state_only_blocked_attributed",
+    "codex_state_only_snapshot_fingerprints", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_session_ids", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_by_file", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_unattributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_legacy", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "codex_state_only_blocked_attributed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "codex_parent_ownership_refs",
     "codex_parent_ownership_ledgers",
     "codex_parent_side_requests",
@@ -442,16 +421,16 @@ pub(super) const FIELDS: &[&str] = &[
     "codex_parent_proof_seq",
     "codex_proof_index_incarnation",
     "claude_desktop_title_files",
-    "claude_account_family_witnesses",
-    "claude_account_family_pending",
+    "claude_account_family_witnesses", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_account_family_pending", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_usage_family_witnesses",
     "claude_usage_family_pending", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_request_census",
     "claude_request_census_shadow",
     "claude_usage_authority_quarantine",
-    "claude_retired_family_tombstones",
-    "claude_retired_family_tombstones_initialized",
-    "claude_retired_family_tombstones_uncertain",
+    "claude_retired_family_tombstones", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_retired_family_tombstones_initialized", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
+    "claude_retired_family_tombstones_uncertain", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_duplicate_request_owners", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_duplicate_request_witness_overflowed", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "claude_owned_start_census", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
@@ -558,15 +537,9 @@ fn header_field(name: &str) -> bool {
 /// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
 /// replay generations without which the rebuild would arm a replay the
 /// damaged index had completed (that replay clears carried state). Each uses
-/// the load's own field decoder; tombstone loss fences without refusing
-/// identity carry, and the accepted ledger keeps the load's rule
+/// the load's own field decoder, and the accepted ledger keeps the load's rule
 /// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
-    // These gate authority re-entry. Carry their own lenient, fail-closed
-    // decoding policy, including uncertainty after lost retirement evidence.
-    "claude_retired_family_tombstones",
-    "claude_retired_family_tombstones_initialized",
-    "claude_retired_family_tombstones_uncertain",
     "session_account_bindings",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
@@ -588,8 +561,6 @@ struct Counts {
     files: usize,
     families: usize,
     authority_repairs: usize,
-    // Decode-only provenance, never persisted or copied from an index.
-    tombstone_marker_intact: bool,
 }
 struct Decoder<R> {
     reader: R,
@@ -1076,7 +1047,6 @@ fn finish_decode(
     );
     if !map_only && index.persistence_available() {
         index.drop_unbound_claude_authority_records(stage);
-        settle_retired_family_decode(index);
     }
     if map_only
         && (!index.decode_holds.is_empty()
@@ -1190,8 +1160,6 @@ impl Decoder<std::io::Cursor<Vec<u8>>> {
                 );
             }};
         }
-        field!(claude_account_family_witnesses);
-        field!(claude_account_family_pending);
         field!(claude_usage_family_witnesses);
         field!(claude_usage_authority_quarantine);
         self.reader = std::io::Cursor::new(input.0);
@@ -1268,8 +1236,6 @@ pub(super) fn post_decode_hydrated(
             .growth_retention
             .extend(decoder.records("growth_retention", span, true)?);
     }
-    records!(claude_account_family_witnesses);
-    records!(claude_account_family_pending);
     records!(claude_usage_family_witnesses);
     for (key, record) in &index.quarantined_snapshot_fingerprints {
         if !decoder
@@ -1366,15 +1332,7 @@ pub(super) fn read_identity_carry(
     };
     let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
-    // Repair drops the family witnesses, so its later downgrade check cannot
-    // recover evidence lost by a pre-bridge or damaged tombstone source.
-    // Loss never refuses Repair or withholds unrelated identity bindings.
-    let intact = decoder.counts.tombstone_marker_intact
-        && carry.claude_retired_family_tombstones.decoded
-        && !carry.claude_retired_family_tombstones.damaged;
-    carry.claude_retired_family_tombstones_uncertain |= !intact;
     carry.decode_holds = decoder.holds;
-    settle_retired_family_decode(&mut carry);
     if sampled_scan::codex_cursor::OpenStamp::capture(decoder.reader.get_ref())? != before {
         return Err(Error::Refused("input changed during decode"));
     }
@@ -1454,24 +1412,6 @@ fn migrate_carried_ack_debt(index: &mut ScanIndex) -> std::result::Result<(), Er
     Ok(())
 }
 
-fn settle_retired_family_decode(index: &mut ScanIndex) {
-    let initialized = index.claude_retired_family_tombstones_initialized;
-    if index.claude_retired_family_tombstones_initialized
-        && !index.claude_retired_family_tombstones.decoded
-    {
-        // Missing evidence under the marker must also make a stale CAS
-        // writer reload, just as a damaged-present map does below.
-        index
-            .decode_holds
-            .1
-            .add("claude_retired_family_tombstones", "", [0; 32]);
-    }
-    index.settle_claude_retired_family_tombstone_decode();
-    // Preserve a valid legacy marker at the raw codec boundary. Public load
-    // settlement and every save own initialization; repair here still raises
-    // uncertainty for damaged or missing retirement evidence.
-    index.claude_retired_family_tombstones_initialized = initialized;
-}
 impl<R: BufRead + Seek> Decoder<R> {
     fn ws(&mut self) -> std::result::Result<Option<u8>, Error> {
         loop {
@@ -1694,7 +1634,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
-        self.records_checked(field, span, debt, |_| false, None)
+        self.records_checked(field, span, debt, |_| false)
     }
     fn records_checked<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -1702,16 +1642,9 @@ impl<R: BufRead + Seek> Decoder<R> {
         span: Span,
         debt: bool,
         repaired: impl Fn(&T) -> bool,
-        unknown: Option<fn() -> T>,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
-            if let Some(unknown) = unknown {
-                return Ok(BTreeMap::from([(
-                    codex_compressed_input::UNKNOWN_ARCHIVE_SCOPE.to_owned(),
-                    unknown(),
-                )]));
-            }
             if debt {
                 return Err(Error::Refused("unkeyed negative collection"));
             }
@@ -1733,7 +1666,6 @@ impl<R: BufRead + Seek> Decoder<R> {
             } else {
                 self.typed(value)
             };
-            let decoded = decoded.or_else(|error| unknown.map(|f| f()).ok_or(error));
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
@@ -1812,7 +1744,6 @@ impl<R: BufRead + Seek> Decoder<R> {
             span,
             true,
             |record: &SnapshotQuarantineRecord| !snapshot_quarantine_deadline_is_bounded(record),
-            None,
         )?;
         self.repair_held(
             "quarantined_snapshot_fingerprints",
@@ -1911,20 +1842,11 @@ impl<R: BufRead + Seek> Decoder<R> {
             if let Some(name) = name {
                 if matches!(
                     name,
-                    "claude_account_family_witnesses"
-                        | "claude_account_family_pending"
-                        | "claude_usage_family_witnesses"
-                        | "claude_usage_authority_quarantine"
+                    "claude_usage_family_witnesses" | "claude_usage_authority_quarantine"
                 ) {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
-                    if name == "claude_desktop_store_inventory" && pass == Pass::Full {
-                        with_claude_absence_counters(|counts| {
-                            counts.tombstone_decode_drops =
-                                counts.tombstone_decode_drops.saturating_add(1);
-                        });
-                    }
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
                     } else if name == "claude_request_census_shadow" {
@@ -1954,12 +1876,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             } else {
                                 self.history_scalar(value, Some(String::new()))?
                             };
-                            if inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
-                                with_claude_absence_counters(|counts| {
-                                    counts.tombstone_decode_drops =
-                                        counts.tombstone_decode_drops.saturating_add(1);
-                                });
-                            } else {
+                            if !inventory.as_ref().is_some_and(|digest| digest.len() != 64) {
                                 index.claude_desktop_store_inventory = inventory;
                             }
                         }
@@ -1973,23 +1890,8 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "files" => {
                             index.files = self.records::<Shared<_>>("files", value, true)?.into()
                         }
-                        "archive_deferred_alarm_count" => {
-                            index.archive_deferred_alarm_count =
-                                self.diagnostic_timestamp(value)?.unwrap_or(0)
-                        }
-                        "archives" => {
-                            index.archives = self
-                                .records_checked(
-                                    "archives",
-                                    value,
-                                    false,
-                                    |_| false,
-                                    Some(codex_compressed_input::ArchiveEvidence::unknown),
-                                )?
-                                .into_iter()
-                                .map(|(key, a)| (key, a.checked()))
-                                .collect()
-                        }
+                        // Retired original fields retain their positional slots.
+                        "archives" | "archive_deferred_alarm_count" => {}
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
                         }
@@ -2002,24 +1904,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "legacy_unresolved_root_file_witnesses" => {
                             index.legacy_unresolved_root_file_witnesses = self.typed(value)?
                         }
-                        "codex_state_only_snapshot_fingerprints" => {
-                            index.codex_state_only_snapshot_fingerprints = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_session_ids" => {
-                            index.codex_state_only_blocked_session_ids = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_by_file" => {
-                            index.codex_state_only_blocked_by_file = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_unattributed" => {
-                            index.codex_state_only_blocked_unattributed = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_legacy" => {
-                            index.codex_state_only_blocked_legacy = self.typed(value)?
-                        }
-                        "codex_state_only_blocked_attributed" => {
-                            index.codex_state_only_blocked_attributed = self.typed(value)?
-                        }
+                        "codex_state_only_snapshot_fingerprints"
+                        | "codex_state_only_blocked_session_ids"
+                        | "codex_state_only_blocked_by_file"
+                        | "codex_state_only_blocked_unattributed"
+                        | "codex_state_only_blocked_legacy"
+                        | "codex_state_only_blocked_attributed" => {} // TOMBSTONE: decode-and-drop.
                         "codex_parent_ownership_refs"
                         | "codex_parent_ownership_ledgers"
                         | "codex_parent_side_requests"
@@ -2036,21 +1926,16 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_desktop_title_files" => {
                             index.claude_desktop_title_files = self.typed(value)?
                         }
-                        "claude_account_family_witnesses" => {
-                            index.claude_account_family_witnesses =
-                                self.records("claude_account_family_witnesses", value, true)?
-                        }
-                        "claude_account_family_pending" => {
-                            index.claude_account_family_pending =
-                                self.records("claude_account_family_pending", value, true)?
-                        }
                         "claude_usage_family_witnesses" => {
                             index.claude_usage_family_witnesses = self
                                 .records::<Shared<_>>("claude_usage_family_witnesses", value, true)?
                                 .into()
                         }
-                        // TOMBSTONE: decode-and-drop (retired global census state).
+                        // TOMBSTONE: decode-and-drop (retired global census
+                        // and family account state).
                         "claude_usage_family_pending"
+                        | "claude_account_family_witnesses"
+                        | "claude_account_family_pending"
                         | "claude_duplicate_request_owners"
                         | "claude_duplicate_request_witness_overflowed"
                         | "claude_owned_start_census"
@@ -2059,7 +1944,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         | "claude_full_rearm_progress"
                         | "claude_request_identity_contract_changed"
                         | "claude_stale_family_carry"
-                        | "held_audit_progress" => {}
+                        | "held_audit_progress"
+                        | "claude_retired_family_tombstones"
+                        | "claude_retired_family_tombstones_initialized"
+                        | "claude_retired_family_tombstones_uncertain" => {}
                         "claude_request_census" => {
                             index.claude_request_census = self
                                 .census(value, "claude_request_census")?
@@ -2072,56 +1960,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine = self.authorities(value)?
-                        }
-                        "claude_retired_family_tombstones" => {
-                            index.claude_retired_family_tombstones = self
-                                .history_scalar(value, None::<ClaudeRetiredFamilyTombstones>)?
-                                .unwrap_or_else(|| {
-                                    with_claude_absence_counters(|counts| {
-                                        counts.tombstone_decode_drops =
-                                            counts.tombstone_decode_drops.saturating_add(1);
-                                    });
-                                    ClaudeRetiredFamilyTombstones {
-                                        decoded: true,
-                                        damaged: true,
-                                        ..Default::default()
-                                    }
-                                });
-                            if index.claude_retired_family_tombstones.damaged {
-                                let hash = self.hash_span(value)?;
-                                self.holds.1.add(name, "", hash);
-                            }
-                        }
-                        "claude_retired_family_tombstones_initialized"
-                        | "claude_retired_family_tombstones_uncertain" => {
-                            self.reader.seek(SeekFrom::Start(value.start))?;
-                            let boolean = matches!(self.ws()?, Some(b't' | b'f'));
-                            // Reuse #705's flag codec, including its drop count.
-                            #[derive(Deserialize)]
-                            #[serde(transparent)]
-                            struct Flag(
-                                #[serde(deserialize_with = "deserialize_fail_closed_flag")] bool,
-                            );
-                            let flag = self
-                                .history_scalar(value, None::<Flag>)?
-                                .map(|flag| flag.0)
-                                .unwrap_or_else(|| {
-                                    with_claude_absence_counters(|counts| {
-                                        counts.tombstone_decode_drops =
-                                            counts.tombstone_decode_drops.saturating_add(1);
-                                    });
-                                    true
-                                });
-                            if !boolean {
-                                let hash = self.hash_span(value)?;
-                                self.holds.1.add(name, "", hash);
-                            }
-                            if name == "claude_retired_family_tombstones_initialized" {
-                                self.counts.tombstone_marker_intact = boolean && flag;
-                                index.claude_retired_family_tombstones_initialized = flag;
-                            } else {
-                                index.claude_retired_family_tombstones_uncertain = flag;
-                            }
                         }
                         "claude_account_deferred_holds" => {
                             index.claude_account_deferred_holds = self.typed(value)?
@@ -2423,12 +2261,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         self.counts.authority_repairs -= 1;
                     }
                     match field {
-                        "claude_account_family_witnesses" => {
-                            index.claude_account_family_witnesses.remove(&key);
-                        }
-                        "claude_account_family_pending" => {
-                            index.claude_account_family_pending.remove(&key);
-                        }
                         "claude_usage_family_witnesses" => {
                             index.claude_usage_family_witnesses.remove(&key);
                         }
@@ -2528,8 +2360,6 @@ impl ScanIndex {
             || self.decode_holds.2.contains(&repair_key(root))
             || [
                 "claude_usage_authority_quarantine",
-                "claude_account_family_witnesses",
-                "claude_account_family_pending",
                 "claude_usage_family_witnesses",
             ]
             .iter()
@@ -2571,12 +2401,7 @@ impl ScanIndex {
                 !self.file_snapshot_fingerprints.contains_key(*key) && !self.decode_holds_file(key)
             })
             .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
-        let state = self
-            .codex_state_only_snapshot_fingerprints
-            .iter()
-            .filter(|(id, _)| !self.decode_holds_codex_owner(id))
-            .map(|(_, fingerprint)| fingerprint.as_str());
-        exact.chain(legacy).chain(state)
+        exact.chain(legacy)
     }
     pub(super) fn decode_holds_indexed_entity(&self, key: &str, fingerprint: &str) -> bool {
         self.decode_holds_file(key) || self.decode_holds_entity(fingerprint)
@@ -2588,13 +2413,6 @@ impl ScanIndex {
             .into_iter()
             .flat_map(|slots| slots.values())
             .map(|raw| raw.owner())
-    }
-    pub(super) fn decode_holds_codex_owner(&self, id: &str) -> bool {
-        self.decode_holds.4
-            || self
-                .decode_holds
-                .3
-                .contains(&repair_key(&codex_protected_owner(id)))
     }
     pub(super) fn preserve_decode_held_files(
         &mut self,
@@ -2653,11 +2471,6 @@ impl ScanIndex {
                 .contains(&repair_key(&codex_protected_owner(&item.source_session_id)))
         {
             return true;
-        }
-        if source == SnapshotSource::Codex && item.source_file_fingerprint.is_none() {
-            // An opaque file may have lost the only logical-owner disclosure.
-            // Preserve the state-only domain fence until protected history is understood.
-            return self.decode_holds_codex_owner(&item.source_session_id);
         }
         false
     }

@@ -43,6 +43,33 @@ fn revision_value_roundtrips_and_refuses_other_versions() {
     }
 }
 
+/// What a 0.1.219 walk recorded for a never-read Codex archive: a
+/// metadata-only Archive head owing the whole archive, unread, from its mtime
+/// (a lower bound). It commits with the next save.
+pub(in crate::snapshots) fn seed_archive_whole_unread(index: &ScanIndex, path: &Path) {
+    let live = std::fs::metadata(path).unwrap();
+    let owed = [Revision {
+        extent: Extent::ArchiveWhole {
+            compressed_bytes: live.len(),
+        },
+        first_change_at: live
+            .modified()
+            .ok()
+            .and_then(unix_nanos)
+            .map(|nanos| nanos / 1_000_000),
+        lower_bound: true,
+        reason_bits: UNREAD,
+    }];
+    let observation = Observation {
+        representation: Representation::Archive,
+        summary: summary(&owed, None),
+        added: owed.iter().map(Revision::encode).collect(),
+        ..Default::default()
+    };
+    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    state_v2::observe_tails(&route, vec![(local_index_key(path), observation)]).unwrap();
+}
+
 pub(in crate::snapshots) fn entry(path: &Path) -> ScanIndexEntry {
     let live = std::fs::metadata(path).unwrap();
     let mut entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({
@@ -84,7 +111,11 @@ fn age(path: &Path, seconds: u64) {
 }
 
 /// One single-page walk of `roots`: its `freshness_alarm` counts.
-fn walk(source: SnapshotSource, roots: &[PathBuf], index: &mut ScanIndex) -> serde_json::Value {
+pub(in crate::snapshots) fn walk(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+) -> serde_json::Value {
     index.traversal = None;
     ensure_bounded_traversal(
         source,
@@ -172,7 +203,7 @@ impl Fixture {
     }
     /// The walk's observations commit with the next full save; reload them.
     pub(in crate::snapshots) fn save(&mut self) {
-        self.index = self.session.save_reload(&mut self.index).0;
+        self.index = self.session.save_reload(&mut self.index);
     }
     pub(in crate::snapshots) fn close(self) {
         let Self {

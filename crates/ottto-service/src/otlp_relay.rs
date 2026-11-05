@@ -1,4 +1,5 @@
 use crate::control::handle_request;
+use crate::local_resource_diagnostics::cache_lifecycle::{record as refused, Event};
 use crate::snapshot_client::load_snapshot_device_credentials;
 use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
@@ -204,6 +205,8 @@ fn dispatch_relay_connection_with_activity(
     // flood can't exhaust threads or memory. The guard releases the slot on
     // handler exit.
     let Some(guard) = ConnectionGuard::acquire() else {
+        // Counted, not logged: a busy burst would be one line per connection.
+        refused(Event::OtlpRelayBusy503);
         let _ = write_json_response(
             &mut stream,
             503,
@@ -759,6 +762,8 @@ fn handle_client_at(
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
+            refused(Event::OtlpRelayBadFraming400);
+            relay_log!("local OTLP relay refused a request: bad_framing");
             write_json_response(
                 &mut stream,
                 400,
@@ -878,8 +883,11 @@ fn capture_local_evidence(
 ) -> std::result::Result<(), LocalCaptureFailure> {
     if source != SnapshotSource::ClaudeCode
         || !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces")
-        || !claude_collection_enabled(support_dir)
     {
+        return Ok(());
+    }
+    if !claude_collection_enabled(support_dir) {
+        refused(Event::OtlpRelayCollectionDisabled);
         return Ok(());
     }
     let body = decoded_request_body(request).ok_or(LocalCaptureFailure::Undecodable)?;
@@ -937,7 +945,10 @@ fn decoded_request_body(request: &HttpRequest) -> Option<std::borrow::Cow<'_, [u
                 .ok()?;
             (inflated.len() <= MAX_OTLP_BODY_BYTES).then_some(std::borrow::Cow::Owned(inflated))
         }
-        Some(_) => None,
+        Some(_) => {
+            refused(Event::OtlpRelayUnknownContentEncoding);
+            None
+        }
     }
 }
 
@@ -1950,9 +1961,53 @@ pub(crate) mod tests {
             ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
             MAX_CONCURRENT_RELAY_CONNECTIONS
         );
+        let (_client, server) = loopback_pair();
+        let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            dispatch_relay_connection(server, SnapshotSource::ClaudeCode, &test_daemon())
+        });
+        assert_eq!(counts.otlp_relay_busy_503, 1);
 
         drop(guards);
         assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
+    }
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        (client, listener.accept().expect("accept").0)
+    }
+
+    /// [behaviour] A refused or unstored relay request counts its closed reason.
+    #[test]
+    fn refused_relay_requests_count_their_reason() {
+        let dir = crate::test_scratch::ScratchDir::new("relay-refusal-reasons");
+        let mut encoded = otlp_post("/v1/traces", "application/json", CLAUDE_LLM_REQUEST_TRACE);
+        encoded
+            .headers
+            .insert("content-encoding".to_string(), "br".to_string());
+        let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            let (mut client, server) = loopback_pair();
+            client.write_all(b"POST v1/logs HTTP/1.1\r\n\r\n").unwrap();
+            handle_client_at(
+                server,
+                SnapshotSource::ClaudeCode,
+                test_daemon(),
+                None,
+                &dir,
+            )
+            .unwrap();
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &encoded, &dir);
+            assert_eq!(
+                response.status, 200,
+                "not granted: acknowledged, not stored"
+            );
+            grant_claude(&dir);
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &encoded, &dir);
+            assert_eq!(response.status, 400);
+        });
+        assert_eq!(counts.otlp_relay_bad_framing_400, 1);
+        assert_eq!(counts.otlp_relay_collection_disabled, 1);
+        assert_eq!(counts.otlp_relay_unknown_content_encoding, 1);
     }
 
     /// One scripted `accept` result for [`ScriptedAcceptor`].

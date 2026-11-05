@@ -187,13 +187,12 @@ impl Drop for FinishServer {
     }
 }
 
-fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
+fn permanent_finish_pipeline(outcome: FinishOutcome) {
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} supported_positive=UNEXECUTED layout_supported=false").unwrap();
         return;
     }
     let fixture = IdentityPipelineHome::new();
-    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("permanent-finish-support");
     let secrets = fixture.base.join("permanent-finish-secrets");
@@ -260,9 +259,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         })
         .unwrap()
         .expect("real due native preparation");
-        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
-        "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
+        let (preparation, index, scan) = collect_preparation_with_rotation(frame);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
         assert_eq!(scan.census_complete, !unclean);
         let selected_losses = [
@@ -394,7 +391,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
                 admit_residue
             );
         }
-        let retained_valid = daemon.native_comparison.retained_valid_for_test();
         for (key, expected) in [
             "last_malformed_json_line_count",
             "last_invalid_utf8_line_count",
@@ -410,11 +406,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             );
         }
         assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
-        if cycle > 0 || !outcome.retains_refusal_across_quiet_cycles() {
-            assert_eq!(retained_valid, expected_valid,
-            "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
-        }
-        writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} cycle={cycle} selected_save=true refusal_not_accepted=true refusal_debt_retained=true retained_valid={retained_valid}").unwrap();
+        writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} cycle={cycle} selected_save=true refusal_not_accepted=true refusal_debt_retained=true").unwrap();
         if cycle == 0 && outcome.retains_refusal_across_quiet_cycles() {
             // Change only the source revision, not usage or its body witness. The
             // normal-window pass must perform its own native parse and retain the
@@ -437,24 +429,24 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
+fn permanent_finish_real_pipeline_preserves_refusal_and_status_failures() {
     for outcome in [
         FinishOutcome::PermanentStatusFailure,
         FinishOutcome::PermanentUncleanCensus,
     ] {
-        permanent_finish_pipeline(outcome, false);
+        permanent_finish_pipeline(outcome);
     }
 }
 
 /// [regress] A cycle whose only offered entity conflicts quarantines that
 /// entity on its own retry clock. It used to count as a source failure and
-/// climb the whole-source 1 min to 1 h ladder. The lease stays revoked.
+/// climb the whole-source 1 min to 1 h ladder.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
-    permanent_finish_pipeline(FinishOutcome::Retryable, false);
+    permanent_finish_pipeline(FinishOutcome::Retryable);
 }
 
 /// F1: body A is refused as dominated, then a newer body B of the same entity
@@ -473,7 +465,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         return;
     }
     let fixture = IdentityPipelineHome::new();
-    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("pending-newer-body-support");
     let secrets = fixture.base.join("pending-newer-body-secrets");
@@ -527,7 +518,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         })
         .unwrap()
         .expect("real due native preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
+        let (preparation, index, scan) = collect_preparation_with_rotation(frame);
         assert!(scan.census_complete);
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
@@ -614,6 +605,11 @@ pub(crate) mod prior_index_lifetime_tests {
 // Same real prepare/finish pipeline; owns a test-thread re-offer clock.
 pub(crate) mod reason_reoffer_pipeline_tests {
     include!("reason_reoffer_pipeline_tests.rs");
+}
+
+// Same real prepare/finish pipeline across a same-account re-login.
+pub(crate) mod relogin_pipeline_tests {
+    include!("relogin_pipeline_tests.rs");
 }
 
 thread_local! {
@@ -853,7 +849,7 @@ impl AckFinishHome {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame);
+        let (preparation, index, mut scan) = collect_preparation_with_rotation(frame);
         assert!(scan.census_complete, "{cycle}: the real scan is clean");
         assert_eq!(
             scan.snapshots.len(),

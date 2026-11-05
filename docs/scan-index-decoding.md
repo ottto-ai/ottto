@@ -13,8 +13,7 @@ it introduces no automatic release. A held file without exact incidence keeps
 its prior membership UNKNOWN. Acceptance pruning, including partial commits, retains existing ACKs while
 that uncertainty exists, and legacy reconciliation neither reopens ACKs nor seals
 until incidence is known. This creates no acceptance or manifest membership;
-an explicit exact empty set remains known empty. An opaque Codex file with unknown ownership
-also fences state-only publication, since its lost owner cannot safely be named.
+an explicit exact empty set remains known empty.
 
 Hold admission checks lexically delimited keys before String allocation and
 charges their original wire bytes, values and per-slot bookkeeping before
@@ -24,8 +23,7 @@ payload allocation. Repairs release the complete charge; output restart admissio
 uses that same charge. Oversized
 keys take the counted budget path without allocating a large key buffer.
 Excess damage uses the existing load quarantine or CAS error. The load diagnostic
-names the prior-history gated rebuild, which requires #712 to land first; the
-existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
+names the prior-history gated rebuild; the existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
 If this same checkpoint has a `.corrupt` sibling timestamped within 24 hours,
 the next over-budget load refuses in place instead of rebuilding again. The
 existing backup name supplies the rename timestamp (mtime survives rename);

@@ -99,7 +99,7 @@ pub(in crate::snapshots::tail_source) fn load<S: TailSource>(
 
 /// A state database route in a fresh directory.
 pub(in crate::snapshots::tail_source) struct Route {
-    _session: ColdSession,
+    pub(in crate::snapshots::tail_source) _session: Option<ColdSession>,
     pub(in crate::snapshots::tail_source) dir: PathBuf,
     pub(in crate::snapshots::tail_source) path: PathBuf,
     pub(in crate::snapshots::tail_source) index: ScanIndex,
@@ -122,7 +122,7 @@ pub(in crate::snapshots::tail_source) fn route_for(source: Source) -> Route {
     let (session, index) = ColdSession::publish(source, &ScanIndex::default(), &dir);
     Route {
         path: session.path().to_owned(),
-        _session: session,
+        _session: Some(session),
         dir,
         index,
     }
@@ -188,11 +188,7 @@ impl Route {
         scope: &Scope,
     ) -> (PendingTail, Result<ParsedJsonlFile>) {
         let completed = parser
-            .retain_reduction(
-                scope,
-                NOW,
-                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
-            )
+            .retain_reduction(scope, NOW)
             .unwrap()
             .expect("a clean fixture is certified");
         at_pre(&mut parser.accumulator);
@@ -255,9 +251,11 @@ fn only_the_native_verdict_stages() {
     let mut route = route();
     let (rejected, mut late) = route.complete("a.jsonl", &lines(3), None, |_| {});
     let (accepted, native) = route.complete("b.jsonl", &lines(3), None, |_| {});
-    assert!(finish_loss_free(&late) && finish_loss_free(&native));
+    assert!(
+        late.as_ref().unwrap().progress_complete() && native.as_ref().unwrap().progress_complete()
+    );
     // Positive usage that yielded no entity is found only at finalization.
-    late.as_mut().unwrap().zero_snapshot_usage_evidence = true;
+    late.as_mut().unwrap().ownership_incomplete_file_count = 1;
     let (a, b) = (rejected.key.clone(), accepted.key.clone());
     rejected.publish(&late);
     accepted.publish(&native);
@@ -334,7 +332,7 @@ fn a_finish_field_at_pre_sets_only_its_file_aside() {
         acc.account_identifier_hash = Some("a".repeat(64));
     });
     let (sibling, native) = route.complete("b.jsonl", &lines(3), None, |_| {});
-    assert!(finish_loss_free(&odd_native));
+    assert!(odd_native.as_ref().unwrap().progress_complete());
     let (a, b) = (odd.key.clone(), sibling.key.clone());
     odd.publish(&odd_native);
     sibling.publish(&native);
@@ -397,4 +395,12 @@ fn an_append_restates_only_the_open_pages() {
     let stored = head.table.iter().map(|(c, m)| (*c, m.meta)).collect();
     Claude::validate_loaded(&acc, &stored).unwrap();
     assert_eq!(acc.claude_responses.values().len(), 301);
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        if self._session.is_none() {
+            state_v2::money_test_support::erase_published(&self.path);
+        }
+    }
 }

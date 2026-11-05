@@ -60,8 +60,8 @@ diagnostic carrier does not count these cache-upload refusals. Existing finished
 sessions change only on their next natural upload; no new collection, history
 read, replay, or version bump is added.
 
-The omitted count is null (unknown) when the retained Codex request book exceeds
-65,536 records, the physical read report is incomplete, duplicate request IDs
+The omitted count is null (unknown) when the physical read report is
+incomplete, duplicate request IDs
 have conflicting slots, or a request timestamp cannot be parsed. These cases
 send an empty partial patch, preserving accepted observations. Preparation also
 uses null when accepted IDs lie outside the selected prefix, or when adding

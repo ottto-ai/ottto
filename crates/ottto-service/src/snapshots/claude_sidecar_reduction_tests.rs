@@ -353,16 +353,24 @@ fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     seed_predecessor_from(fixture, cache, ScanIndex::default())
 }
 /// Legacy reported-usage rebuild and selectors run only on ordinary money:
-/// the real paused (fail-closed) list, read from the support directory the
-/// way a sync cycle loads it. The list is runtime-only and the raw scanner
-/// never loads it, so it rides on the input index (and on every index the
-/// scanner hands back).
+/// a real list that names the fixture's family, read from the support
+/// directory the way a sync cycle loads it. The list is runtime-only and the
+/// raw scanner never loads it, so it rides on the input index (and on every
+/// index the scanner hands back).
 fn ordinary_money_index(fixture: &Fixture) -> ScanIndex {
-    crate::snapshots::e2_pipeline_scan_fixture::pause_adoption(&fixture.support);
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(
+        &fixture.support,
+        &[fixture.session.as_str()],
+    );
     let mut index = ScanIndex::default();
     index.load_claude_reemission_exclusions(&fixture.support);
-    assert!(index.claude_reemission_exclusions.pauses_adoption());
+    assert!(listed(&index, fixture));
     index
+}
+fn listed(index: &ScanIndex, fixture: &Fixture) -> bool {
+    index
+        .claude_reemission_exclusions
+        .excludes(&fixture.session, None)
 }
 /// Stores on `index` the family witness an older build left for the
 /// fixture's family, from a fresh parse and the current evidence: an upgraded
@@ -382,8 +390,8 @@ fn store_family_witness(fixture: &Fixture, index: &mut ScanIndex) {
 fn seed_ordinary_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     let index = seed_predecessor_from(fixture, cache, ordinary_money_index(fixture));
     assert!(
-        index.claude_reemission_exclusions.pauses_adoption(),
-        "the paused list survives the seed scan"
+        listed(&index, fixture),
+        "the listed family survives the seed scan"
     );
     index
 }
@@ -392,26 +400,10 @@ fn seed_predecessor_from(
     cache: &Arc<SharedCache>,
     input: ScanIndex,
 ) -> ScanIndex {
-    let index = settle(enriched(
+    settle(enriched(
         fixture,
         raw_scan(fixture, input, Some(cache.clone()), |_| {}),
-    ));
-    let bound = cache.inner.lock().unwrap().resident_bound();
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(bound.unwrap() <= state_bytes());
-    } else {
-        assert!(
-            bound.is_none(),
-            "unsupported layout must not acquire a charge"
-        );
-        for key in index.files.keys() {
-            assert!(
-                cache.take(key).is_none(),
-                "unsupported layout must retain no native state"
-            );
-        }
-    }
-    index
+    ))
 }
 // Both branches execute the real scanner. Unsupported CI verifies Full fallback;
 // only the separately compiler-bound supported run verifies actual reuse.
@@ -433,7 +425,7 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
-    // native grains, so the family reads ordinary money (paused list).
+    // native grains, so the family reads ordinary money (listed family).
 
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
@@ -441,7 +433,7 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
     f.evidence(2); // Includes req_1 from before the latest transcript response.
     store_family_witness(&f, &mut prior);
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
+    assert!(listed(&cached.index, &f));
     assert_layout_mode(cached.modes, (0, 0, 1));
     assert_eq!(
         cached.native_bytes,
@@ -586,7 +578,7 @@ fn child_metadata_and_desktop_identity_reselect_without_invalidating_reduction()
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
-    // native grains, so the family reads ordinary money (paused list).
+    // native grains, so the family reads ordinary money (listed family).
 
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
@@ -600,7 +592,7 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     file.write_all(b"\n").unwrap();
     drop(file);
     let mut cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
+    assert!(listed(&cached.index, &f));
     assert_layout_mode(cached.modes, (0, 0, 1));
     assert_oracle(&f, &cached, prior);
     assert!(
@@ -618,20 +610,14 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
 }
 
 #[test]
-fn restart_and_copy_budget_refusal_keep_full_fallback() {
-    for retained_budget in [false, true] {
+fn restart_and_forgotten_continuation_keep_full_fallback() {
+    for restart in [false, true] {
         let f = Fixture::new(1);
         let cache = Arc::new(SharedCache::default());
         let prior = seed_predecessor(&f, &cache);
-        let cache = if retained_budget {
-            Arc::new(SharedCache {
-                withheld_memo: Default::default(),
-                cap_pace: Default::default(),
-                inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
-                cursor: Default::default(),
-                quiet: Default::default(),
-                test_route: Default::default(),
-            })
+        let cache = if restart {
+            // A new owner on its own route: the prior's heads are not its own.
+            Arc::new(SharedCache::default())
         } else {
             crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
                 &cache, &prior,
@@ -672,7 +658,7 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
-    // native grains, so the family reads ordinary money (paused list).
+    // native grains, so the family reads ordinary money (listed family).
 
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
@@ -685,7 +671,7 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
         .unwrap();
     file.set_len(64 * 1024 * 1024).unwrap(); // Sparse; refused before decoding.
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
-    assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
+    assert!(listed(&cached.index, &f));
     assert_oracle(&f, &cached, prior);
     assert!(!cached.index.claude_usage_authority_quarantine.is_empty());
     let held = settle(cached);
@@ -781,7 +767,7 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to
-    // native grains, so the family reads ordinary money (paused list).
+    // native grains, so the family reads ordinary money (listed family).
 
     for conflict in [false, true] {
         let f = Fixture::new(2);
@@ -801,7 +787,7 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
             f.write_rows(false, &f.api[..2]);
         }
         let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-        assert!(cached.index.claude_reemission_exclusions.pauses_adoption());
+        assert!(listed(&cached.index, &f));
         assert_layout_mode(cached.modes, (0, 0, 1));
         assert_oracle(&f, &cached, prior);
         // Positive control: the refusal is observed on real bodies.
@@ -965,9 +951,9 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
         |_| {},
     ));
     let key = local_index_key(&f.path);
-    // Ordinary money (paused list) rides on the settled index into the
-    // recovery scan below.
-    assert!(index.claude_reemission_exclusions.pauses_adoption());
+    // Ordinary money (every family listed) rides on the settled index into
+    // the recovery scan below.
+    assert!(listed(&index, &f));
     assert!(index.claude_desktop_identity_census_complete);
     assert!(!index.files[&key].source_file_fingerprint.is_empty());
     index.claude_account_deferred_holds.insert(
@@ -1016,10 +1002,7 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
             },
         )
     });
-    assert!(recovered
-        .index
-        .claude_reemission_exclusions
-        .pauses_adoption());
+    assert!(listed(&recovered.index, &f));
     assert_eq!(recovered.result.snapshots.len(), 1);
     assert_eq!(recovered.result.snapshots[0].source_session_id, f.session);
     assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());

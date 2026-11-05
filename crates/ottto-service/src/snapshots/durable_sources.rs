@@ -16,9 +16,6 @@ pub(crate) struct Properties {
     /// route's custody wins, and clearing it would let v1 load the frozen
     /// JSON. Leaving needs an explicit export back to v1.
     pub(crate) state_v2: bool,
-    /// Support folders of its context-footprint upload witnesses, one
-    /// `<workspace>.json` each; a resume drops them so the next pass re-sends.
-    pub(crate) footprint_witnesses: &'static [&'static str],
 }
 
 // Enum ordinals index this table and Stores' slots.
@@ -27,19 +24,16 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         state_v2: true,
-        footprint_witnesses: &[crate::context_footprint::STATE_DIR],
     },
     Properties {
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         state_v2: true,
-        footprint_witnesses: &[crate::codex_prelude_footprint::STATE_DIR],
     },
     Properties {
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         state_v2: true,
-        footprint_witnesses: &[],
     },
 ];
 

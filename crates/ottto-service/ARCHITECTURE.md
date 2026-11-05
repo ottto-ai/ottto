@@ -24,6 +24,31 @@ file-system hint / periodic listing → select file → read new bytes from save
   by cause. Re-reading unchanged content that was already uploaded is treated as a bug.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
+- **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
+  ordinary first-read selection, reducer, modification-time age rules and decoded-byte page
+  budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
+  inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
+  census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
+  population/read-volume limit. Compressed rollouts keep their original modification time,
+  so they age as the plain file did. Legacy held archive member keys count as already seen
+  for the ordinary first-read age gate; their values remain inert, and header/ownership
+  admission still applies. A provider-written new plaintext object takes the existing
+  counted Full path; only a returning original object can continue from its saved suffix.
+  A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
+  EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
+- **Codex ownership.** One secure header opener supplies ordinary membership proof for either
+  encoding. A failure holds its file and decisions depending on it; an unknown header remains
+  a wildcard over every potentially colliding owner. Any missing header/listing proof still
+  prevents absence-based counting-evidence collection. Boundary validation covers surviving
+  singleton sessions and joined groups: it re-checks the directories and headers of the homes
+  holding them, and the inventory holds an owner seen in two homes. A change in an unrelated
+  home is the next pass's fact. A header owner that changes in a checked home during a pass
+  holds that pass’s Codex publication until revalidation on the next pass.
+  A proven compression or same-object move commits the old and new graph closures
+  and Tail keys together during preparation; RAM adopts the destination after COMMIT.
+  A refused carry holds only its predecessor's proven owner and counts as inventory debt.
+  A rollout moved while a reader owns it waits for a later pass. Multi-file compressed
+  sessions remain unsupported for grouped replay.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
@@ -33,8 +58,22 @@ Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
 unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
 use retained bodies; transcripts are read again only for changed input. Unknown
-non-permanent reasons hold their entity without invalidating sibling ACKs. See
-[refusal custody](../../docs/development/refused-snapshot-reassessment.md).
+non-permanent reasons hold their entity without invalidating sibling ACKs.
+
+**Refusal custody.** A fresh permanent `accepted_log_stale_older_upload` refusal
+follows the existing dominated, terminal residue path and never becomes an
+accepted-body ACK. An optional per-record `exposure` observation, written only
+when a fresh permanent refusal is recorded, separates those records from legacy
+ones; a missing or malformed observation keeps a stale record owed, and legacy
+dispositions never change. The refusal owner keeps exact body witnesses for owed
+revisions and suppresses identical owed bytes; changed input gets its own offer
+and exact acknowledgement. Unknown non-permanent reasons, including
+`accepted_log_stale_older_mixed`, use ordinary RetryPending custody for that
+entity only. A body witness is not a stored body: missing body custody never
+triggers transcript reconstruction, and legacy owed entities never ride
+quarantine, re-offer, audit or revision-triggered reconstruction. Diagnostics add
+scalar owed/held counts to the existing refusal records; only a rising owed count
+raises the refusal alarm. Claude, Codex and Pi share this machinery.
 
 ## Stores
 
@@ -59,6 +98,17 @@ non-permanent reasons hold their entity without invalidating sibling ACKs. See
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
   retried, never via full erasure.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
+- Proven Codex compression and same-object relocation carry the existing logical state,
+  fingerprints, exact ACK/context facts and debt without reading or uploading. Compression
+  proof is an absent plaintext predecessor and its exact same-directory `.zst` sibling with
+  the same session identity; a relocation requires physical object/content equality. The old
+  and new graph closures, Tail keys, fragments and head binding move in one rollback unit of
+  the ordinary save. A failed save exposes the complete old or complete new state.
+  A provider-written new plaintext object follows the existing replaced-file path: one counted
+  Full and one whole-session replacement. Returning the original object retains ordinary Tail
+  continuation. The old archive catalogue entries remain accepted and inert; their physical rows
+  are neither hydrated nor rewritten, and old field/cause ordinals and formats stay unchanged.
+  Compatibility with older binaries is decode-only; older scheduling may replay retained work.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
@@ -100,6 +150,27 @@ switches. Per-source code is limited to the root layout, the file reader and red
 rules that really differ: copied-prefix deduplication for Claude, cumulative deltas for Codex and
 forks for Pi. Source capabilities are table fields, not `== Source::Claude` checks in shared code.
 
+## Module map: snapshots/ (target; migration in progress)
+
+`snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
+the target, not an enforced layout; today most code still sits in `snapshots.rs`.
+
+- `snapshots.rs`: the facade (at most 400 lines): module declarations, re-exports and the entry
+  points other modules call.
+- `sources/{claude,codex,pi}/`: per-source code only, as described above.
+- Shared stages: `wire/`, `discovery/`, `scan/`, `scan_index/`, `session_facts/`, `usage/` and
+  `upload/`.
+- Existing subtrees that stay as they are: `state_v2/` and `tail_source/`.
+- `tests/`: tests that span stages; test data under `tests/fixtures/`.
+
+Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
+except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and
+wrappers change; edits to listed validator files that anchor on moved code are reported) and
+`scripts/check_test_id_map.py` (every test keeps its ID or has a row in
+`scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
+`scripts/check_source_layout.py` reports how far the tree is from the target.
+
 ## Never drop data
 
 - A size, count or time limit may pace, defer or spill work, with a counted warning or alarm. It
@@ -115,10 +186,9 @@ forks for Pi. Source capabilities are table fields, not `== Source::Claude` chec
 
 ## One version
 
-- A runtime switch is a support-directory marker (normally `local_switch!`), never an environment
-  variable alone, and it is temporary. Its OFF state preserves existing behaviour except for
-  explicitly documented changes. When retired, the feature is either on by default with the OFF
-  path deleted, or deleted.
+- A runtime switch is a support-directory marker, never an environment variable alone, and it is
+  temporary. Its OFF state preserves existing behaviour except for explicitly documented changes.
+  When retired, the feature is either on by default with the OFF path deleted, or deleted.
 - No parallel old/new versions are kept "just in case": old formats are read once and migrated;
   retired persisted fields are decoded and dropped at the next save, and retired wire fields stay
   accepted by the receiver.
@@ -135,11 +205,11 @@ sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, uninstall) reaches every store and is counted when it fails.
 Source removal, grant loss, logout, account switch and forget installation only stop
-collection and keep local state; re-enabling a source resumes from it and drops only
-that source's upload witnesses. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+collection and keep local state; re-enabling a source resumes from it and drops
+nothing, so nothing already sent is re-sent. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
 
 Local collection never depends on an upload setting. No read-side identity (file scope, Codex
-group scope, traversal, memos, tier receipts, archives) includes a setting, the attribution key, a
+group scope, traversal, memos, tier receipts) includes a setting, the attribution key, a
 server capability or the replay directive; the upload filter applies them at send. Delivery proofs
 keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
 file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and

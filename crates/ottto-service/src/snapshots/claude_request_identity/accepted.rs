@@ -14,7 +14,7 @@ const MAX_SHARES: usize = 1_536;
 /// Keep the released ledger limit when the receiver has not raised the cap.
 pub(super) const fn max_shares(item_cap: usize) -> usize {
     if item_cap > MAX_ITEM_BYTES {
-        item_cap / 320
+        max_parts_per_item(item_cap)
     } else {
         MAX_SHARES
     }
@@ -370,10 +370,6 @@ pub(crate) fn bind_test_session_context_key(key: Option<[u8; 32]>) {
     with_session_context_key(|bound| {
         *bound = Some(key.map(|key| FingerprintKey(Zeroizing::new(key))))
     });
-}
-
-pub(super) fn session_context_key_bound() -> bool {
-    with_session_context_key(|bound| matches!(bound, Some(Some(_))))
 }
 
 fn truncated(digest: [u8; 32]) -> [u8; 16] {

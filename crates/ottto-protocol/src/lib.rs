@@ -184,30 +184,7 @@ pub struct DaemonStatus {
     pub local_health_events: Vec<LocalHealthEventV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_ledger: Vec<LocalHealthCommandResultV1>,
-    /// Content-free, process-local comparison progress. Omitted by older or
-    /// inactive daemons. Never provider evidence or server snapshot metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_comparison: Option<NativeComparisonStatus>,
     pub generated_at: Rfc3339Timestamp,
-}
-
-/// Known current-process deferral counts are conservative upper bounds until
-/// a complete settled census reconciles them. Missing counts mean UNKNOWN,
-/// never zero. New-local candidates have no prior local ACK witness; this is
-/// not a claim about server history. A restarted process cannot recover age.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeComparisonStatus {
-    pub observation_available: bool,
-    pub in_flight: bool,
-    pub deferred_family_count: Option<u64>,
-    pub withheld_candidate_count: Option<u64>,
-    pub withheld_new_local_candidate_count: Option<u64>,
-    pub oldest_deferred_age_millis: Option<u64>,
-    pub unknown_age_family_count: Option<u64>,
-    pub prior_process_debt_unknown: bool,
-    pub base_exit_family_count: Option<u64>,
-    pub process_base_exit: bool,
-    pub counts_are_upper_bounds: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -777,6 +754,11 @@ pub struct SourceHealth {
     /// "managed by workspace" state) and for daemons that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_enabled: Option<bool>,
+    /// This source alone is paused on this Mac (Pause, or the web's per-source
+    /// off), as opposed to the machine-wide collection switch. Always sent;
+    /// absent only from daemons that predate per-source pause.
+    #[serde(default)]
+    pub source_paused: bool,
 }
 
 /// Bounded machine-local status from the latest completed incremental
@@ -889,8 +871,10 @@ pub struct ActiveSession {
     /// Content-free reason the daemon withheld this session's account, so an
     /// app can say why instead of a bare "unknown". Closed values:
     /// `multiple_accounts` (the session's own request evidence names more than
-    /// one account) and `incomplete_request_evidence` (one account, but not
-    /// every billed request has a request witness). Only ever set while
+    /// one account), `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness) and `too_many_accounts`
+    /// (more accounts than one upload may carry, so the session is held and
+    /// not uploaded). Only ever set while
     /// `account_identifier_hash` is absent, and never names an account. Apps
     /// must treat an unknown value as no reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -906,6 +890,13 @@ pub struct ActiveSession {
     /// configured default standing in for observed evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_reasoning_effort: Option<String>,
+    /// Pi only: the provider route of the same newest usage row as
+    /// `latest_model`, as the transcript names it (normalized, for example
+    /// `google_vertex`). A display label for a source with no account; it
+    /// never names an account or an auth kind. Absent for other sources and
+    /// when the row records no provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<String>,
     /// The account handling this session NOW: the identity of the session's
     /// newest own request, never the current login or a lifetime payer.
     /// Absent when the daemon could not compute it (older daemon, source
@@ -4425,6 +4416,13 @@ pub enum LocalControlCommand {
         action_type: String,
         api_base_url: Option<String>,
     },
+    /// Pause (`enabled: false`) or resume one source's collection on this
+    /// Mac and save it to the account. Replies
+    /// `{source, source_paused, server_saved}`.
+    SourceCollection {
+        source: SourceKind,
+        enabled: bool,
+    },
     TelemetryControl {
         action: TelemetryControlAction,
         source: SourceKind,
@@ -5348,6 +5346,25 @@ mod tests {
                 action_type: "install_source".to_string(),
                 api_base_url: None,
             }
+        );
+    }
+
+    /// [format] The Companion's Pause/Resume command: exact wire JSON.
+    #[test]
+    fn source_collection_command_wire_shape() {
+        let command = LocalControlCommand::SourceCollection {
+            source: SourceKind::ClaudeCode,
+            enabled: false,
+        };
+        let wire = serde_json::json!({
+            "command": "source_collection",
+            "source": "claude_code",
+            "enabled": false
+        });
+        assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
         );
     }
 
@@ -8566,6 +8583,7 @@ mod tests {
                 account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
+                provider_route: None,
                 current_account: None,
                 account_history: Vec::new(),
             }],
@@ -8607,9 +8625,21 @@ mod tests {
         assert!(value["sessions"][0]
             .as_object()
             .is_some_and(|session| !session.contains_key("account_withheld_reason")));
+        // Absent, not null, outside Pi.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("provider_route")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut pi = reconciliation.clone();
+        pi.sessions[0].provider_route = Some("google_vertex".to_string());
+        let value = serde_json::to_value(&pi).expect("serialize pi reconciliation");
+        assert_eq!(value["sessions"][0]["provider_route"], "google_vertex");
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize pi reconciliation");
+        assert_eq!(round_tripped, pi);
 
         let mut withheld = reconciliation.clone();
         withheld.sessions[0].account_identifier_hash = None;

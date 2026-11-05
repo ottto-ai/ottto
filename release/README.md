@@ -294,7 +294,7 @@ stable release gate and stable preflight pass:
 ```bash
 ./scripts/homebrew_formula.sh \
   --manifest dist/macos/release-manifest.json \
-  --output /path/to/homebrew-ottto/Formula/ottto.rb
+  --output /path/to/homebrew-tap/Formula/ottto.rb
 ```
 
 The formula generator refuses non-stable manifests, `latest/` artifact URLs,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_footprint::FootprintInputs;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
@@ -17,7 +18,11 @@ const OBSERVER_BYTES: usize =
 pub(super) type Start = (FileObject, CodexPrelude, PathBuf, bool, SystemTime);
 type Scopes = Vec<(String, String)>;
 #[derive(Default)]
-pub(crate) struct CodexPreludeFeed(Mutex<Feed>, OnceLock<std::io::Result<()>>);
+pub(crate) struct CodexPreludeFeed(
+    Mutex<Feed>,
+    OnceLock<std::io::Result<()>>,
+    Arc<FootprintInputs>,
+);
 impl std::fmt::Debug for CodexPreludeFeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CodexPreludeFeed(..)")
@@ -144,6 +149,10 @@ impl Feed {
     }
 }
 impl CodexPreludeFeed {
+    /// A feed whose usable starts wake the shared footprint harvest thread.
+    pub(crate) fn new(inputs: Arc<FootprintInputs>) -> Self {
+        Self(Mutex::default(), OnceLock::new(), inputs)
+    }
     fn lock(&self) -> MutexGuard<'_, Feed> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -324,6 +333,10 @@ impl LineObserver for Observer {
             let mut p = o.parser.finish();
             if o.capped {
                 (p.agents_md, p.skills_body) = (None, None);
+            }
+            if p.is_owned_fresh_start() && file.mtime.and_then(|m| m.elapsed().ok()) <= Some(STALE)
+            {
+                self.feed.2.deliver();
             }
             State::Done(Box::new(p), o.capped)
         } else if *end == DeliveryEnd::Complete {

@@ -44,7 +44,10 @@ case "$1 $2" in
   api\ *rules/branches*)
     if [ -f "$d/rules" ]; then cat "$d/rules"; else printf '[{"type":"merge_queue"}]\n'; fi ;;
   "api graphql") reply queue ;;
+  api\ *check-runs/*/annotations*) reply annotations ;;
   api\ *check-runs*) reply checks ;;
+  api\ *actions/runs/*/jobs*) reply jobs ;;
+  api\ *actions/runs/[0-9]*) reply run ;;
   api\ *actions/runs*event=merge_group*) reply queue_runs ;;
   api\ *actions/runs*) reply runs ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
@@ -77,7 +80,7 @@ new_case() {
 pr_json() {
   jq -n --arg s "$2" --argjson d "$3" --arg h "$4" --arg m "$5" --arg fork "${6:-}" \
     '{id: "PR_node7", state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
-      baseRefName: "main", headRefName: "feature",
+      title: "fix: a change", baseRefName: "main", headRefName: "feature",
       isCrossRepository: ($fork != ""),
       headRepository: {name: "repo"},
       headRepositoryOwner: {login: (if $fork == "" then "example" else $fork end)}}' \
@@ -155,6 +158,7 @@ run_guard() {
   local expected="$1" status=0
   shift
   MERGE_GUARD_TEST_DIR="$case_dir" PATH="$FAKE_BIN:$PATH" \
+    OTTTO_PR_TITLE_DENY_FILE="${DENY_FILE:-$TMP_DIR/no-title-deny-file}" \
     bash "$GUARD" "$@" > "$case_dir/out" 2>&1 || status=$?
   if [ "$status" -ne "$expected" ]; then
     fail "exit $status, expected $expected; output:"
@@ -279,6 +283,105 @@ expect_output 'rechecking before reporting removal'
 expect_output 'removed from merge queue'
 expect_output 'merge_group run 800: failure https://example.invalid/actions/runs/800 (head queue-sha)'
 
+# GitHub never started the queue's Mac job: enqueue the same head again.
+QUEUE_RUN='{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}'
+NOT_ACQUIRED_JOBS='{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":92,"status":"completed","conclusion":"success","steps":[{"conclusion":"success"}]}]}'
+NOT_ACQUIRED_NOTE='[{"message":"The job was not acquired by Runner of type hosted even after multiple attempts"}]'
+
+# removed_case <name> <jobs json> <annotations json>: queued once, then gone.
+removed_case() {
+  green_case "$1"
+  queue_json queue.1 OPEN "$SHA" QUEUED
+  queue_json queue OPEN "$SHA" ""
+  # The first runs read, before the enqueue, finds no earlier queue run.
+  printf '%s' '{"workflow_runs":[]}' > "$case_dir/queue_runs.1"
+  printf '%s' "$QUEUE_RUN" > "$case_dir/queue_runs"
+  printf '%s' '{"status":"completed"}' > "$case_dir/run"
+  printf '%s' "$2" > "$case_dir/jobs"
+  printf '%s' "$3" > "$case_dir/annotations"
+}
+
+removed_case not-acquired-requeues "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+queue_json queue.4 OPEN "$SHA" QUEUED
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 2
+expect_log 'actions/runs/800/jobs'
+expect_log 'check-runs/91/annotations'
+expect_no_log 'check-runs/92/annotations'
+expect_output 'never got a runner (GitHub capacity); enqueuing PR #7 again (1 of 2)'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# At most two re-enqueues, each on a newer run; then the removal is reported.
+removed_case not-acquired-gives-up "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 801' > "$case_dir/queue_runs.3"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 802' > "$case_dir/queue_runs.4"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 3
+expect_output '(2 of 2)'
+expect_output 'removed from merge queue'
+
+# A removal with no newer run than the one already used is not re-enqueued.
+removed_case stale-run-is-not-reused "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 2
+expect_output '(1 of 2)'
+expect_count 'actions/runs/800/jobs' 1
+
+# An unfinished job (it may still fail) defers the verdict; a partial job
+# list is never evidence.
+removed_case unfinished-job-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$NOT_ACQUIRED_JOBS" | jq '.jobs[1].status = "in_progress" | .jobs[1].conclusion = null' > "$case_dir/jobs.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_output '(1 of 2)'
+expect_count "$ENQUEUE_CALL" 2
+expect_count 'actions/runs/800/jobs' 2
+removed_case partial-job-list-is-not-requeued \
+  "$(printf '%s' "$NOT_ACQUIRED_JOBS" | jq -c '.total_count = 3')" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'annotations'
+
+# A job that ran a step failed for real: no re-enqueue, no annotation read.
+removed_case started-job-is-not-requeued \
+  '{"total_count":1,"jobs":[{"id":91,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_log 'actions/runs/800/jobs'
+expect_no_log 'annotations'
+
+# A not-acquired job beside a job that really failed: no re-enqueue.
+removed_case mixed-failure-is-not-requeued \
+  '{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":93,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A queue run that existed before this guard run enqueued says nothing about it.
+removed_case earlier-run-is-not-used "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+rm "$case_dir/queue_runs.1"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'actions/runs/800/jobs'
+
+# A run that is still in progress defers the verdict until it finishes.
+removed_case unfinished-run-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' '{"status":"in_progress"}' > "$case_dir/run.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_count "$ENQUEUE_CALL" 2
+
+# A cancelled job without GitHub's note may be anything: no re-enqueue.
+removed_case cancelled-without-note-is-not-requeued "$NOT_ACQUIRED_JOBS" \
+  '[{"message":"The operation was canceled."}]'
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'removed from merge queue'
+
 # A rerun after a timeout: GitHub refuses to enqueue a PR that is already queued.
 green_case rerun-resumes-queued-wait
 printf '1' > "$case_dir/enqueue_exit"
@@ -296,6 +399,64 @@ run_guard 3 7
 expect_output 'no merge queue on main'
 expect_no_log 'gh pr ready'
 expect_no_log 'check-runs'
+
+# set_title <file> <title>
+set_title() {
+  jq --arg t "$2" '.title = $t' "$case_dir/$1" > "$case_dir/$1.next"
+  mv "$case_dir/$1.next" "$case_dir/$1"
+}
+
+DENY_FILE="$TMP_DIR/deny.ere"
+printf '# internal tags\n\nnever-matches-anything\n\\(TAG[0-9]\\)\n' > "$DENY_FILE"
+
+# A draft whose title matches the list is refused before it is marked ready or
+# any check is read, and the message does not print the list.
+green_case denied-title-refused
+pr_json pr OPEN true "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG1)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+if grep -F -q 'TAG[0-9]' "$case_dir/out"; then
+  fail "output prints the deny pattern"
+fi
+expect_no_log 'gh pr ready'
+expect_no_log 'check-runs'
+expect_no_log 'gh enqueue'
+
+# A title edited to a denied one while checks are pending is refused at the
+# next PR read, before enqueue.
+green_case title-denied-while-waiting
+pr_json pr.1 OPEN false "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG2)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+expect_no_log 'gh enqueue'
+
+# Comment and blank lines never match: a clean title passes the same list.
+green_case clean-title-with-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A list with only comments and blank lines, or an empty file, checks nothing.
+printf '# nothing yet\n\n   \n' > "$DENY_FILE"
+green_case comment-only-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+: > "$DENY_FILE"
+green_case empty-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A pattern grep cannot evaluate refuses instead of letting the title through.
+printf 'fix: [unclosed\n' > "$DENY_FILE"
+green_case invalid-deny-pattern-refused
+run_guard 3 7
+expect_output 'could not be evaluated'
+expect_no_log 'gh enqueue'
+unset DENY_FILE
 
 new_case usage-errors
 run_guard 2

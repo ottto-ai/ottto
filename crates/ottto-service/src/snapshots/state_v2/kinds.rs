@@ -1,6 +1,5 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
-use super::super::account_pending_retention::Archived;
 use super::*;
 use anyhow::{bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,21 +14,12 @@ pub(super) struct KindCx {
     /// Original field presence, obtained before any v1 normalization.
     pub(super) presence: BTreeMap<String, bool>,
     // Hydration scratch, consumed when the baseline is seeded.
-    pub(super) account_ids: BTreeMap<String, Vec<u64>>,
     pub(super) digests: mapper::Digests,
-    pub(super) account_controls: usize,
-    /// Per cold family, the last rollover a committed save wrote. A sibling
-    /// graph (checkpoint subset, retry working graph) skips what it names.
-    pub(super) cold_rolled: BTreeMap<String, u64>,
-    /// Outcomes of the store-only rollovers this save writes. A sibling's
-    /// committed rollovers are skipped, and a failed save's are discarded.
-    pub(super) archived: Archived,
-    /// Archive reads an ordinary save may spend compacting whole families.
-    pub(super) compact_allowance: Option<usize>,
-    pub(super) compaction: kinds_accounts::Compaction,
     /// A full save's staged Tail state; claim-only saves leave this `None` and
     /// publish none. The save's owner takes it back after the attempt.
     pub(super) tail: Option<tail::TailStage>,
+    /// Only the synchronous prepare-time transaction owns this move.
+    pub(super) carry: Option<(String, tail::PathCarry)>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
     /// Rows of retired kinds this hydrate found, by key only: their values are
@@ -43,30 +33,24 @@ pub(super) struct KindCx {
 pub(super) struct Baseline {
     pub(super) generation: u64,
     pub(super) rows: BTreeMap<RowKey, [u8; 32]>,
-    windows: BTreeMap<String, kinds_accounts::WindowBaseline>,
 }
-fn enumerate(
-    index: &ScanIndex,
-    rows: &mut mapper::Rows<'_>,
-    windows: &BTreeMap<String, kinds_accounts::WindowBaseline>,
-    cx: &mut KindCx,
-) -> Result<BTreeMap<String, kinds_accounts::WindowBaseline>> {
+fn enumerate(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut KindCx) -> Result<()> {
     rows.raw(
         RowKey::Meta("catalogue_layout".into()),
         &serde_json::to_vec(&catalogue::LAYOUT)?,
     )?;
     kinds_misc::rows(index, rows, cx)?;
     kinds_files::rows(index, rows)?;
-    let windows = kinds_accounts::rows(index, rows, windows, cx)?;
+    kinds_accounts::rows(index, rows)?;
     kinds_census::rows(index, rows)?;
-    Ok(windows)
+    Ok(())
 }
 pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
     let mut rows = mapper::Rows {
         seed: std::mem::take(&mut cx.digests),
         ..Default::default()
     };
-    let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
+    enumerate(index, &mut rows, cx)?;
     let mut stored = rows.finish()?;
     // Defaults are logical state, not rows the older store actually owns. They
     // must be absent from the baseline so the first save writes them all.
@@ -92,7 +76,6 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
     Ok(Baseline {
         generation: index.generation,
         rows: stored,
-        windows,
     })
 }
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
@@ -113,11 +96,7 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
             RowKey::Meta("generation".into()),
             &serde_json::to_vec(&index.generation)?,
         )?;
-        let windows = enumerate(index, &mut rows, &BTreeMap::new(), cx)?;
-        cx.account_ids = windows
-            .into_iter()
-            .map(|(family, window)| (family, window.ids))
-            .collect();
+        enumerate(index, &mut rows, cx)?;
         rows.finish()?;
         Ok(())
     })();
@@ -130,17 +109,14 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
 }
 
 /// Decode all four groups from one snapshot into an unpublished graph. Account
-/// skeletons precede census-owned request membership; no partial graph escapes.
-/// Test view: cold archives are read back resident, for graph comparisons.
+/// maps precede census-owned request membership; no partial graph escapes.
 #[cfg(test)]
 pub(super) fn hydrate(
     store: &mut sqlite::Sqlite,
     binding: super::super::scan_index_persistence::Binding,
 ) -> Result<(ScanIndex, KindCx)> {
     let mut tx = store.begin(TxnMode::Read)?;
-    let (mut index, cx) = hydrate_txn(&mut tx, binding)?;
-    kinds_accounts::materialize(&mut tx, &mut index)?;
-    Ok((index, cx))
+    hydrate_txn(&mut tx, binding)
 }
 pub(super) fn hydrate_txn(
     tx: &mut dyn Transaction,
@@ -161,6 +137,18 @@ pub(super) fn hydrate_txn(
     // because no group happens to scan it. Inventory the closed kind catalogue
     // in bounded pages before installing any semantic state. The same walk
     // names every retired kind's rows, from their headers only.
+    // Only held Codex members carry old first-seen evidence. Empty manifests
+    // and other sources retain main's ordinary retired-kind cleanup.
+    let legacy_archive_members = matches!(
+        binding.source,
+        super::super::scan_index_persistence::Source::Codex
+    ) && !tx
+        .scan_kind(
+            &RecordKind::parse("v1_field.archives")?,
+            Some(&mapper::key("v1_field.archives", "", 0)?),
+            1,
+        )?
+        .is_empty();
     let mut after = None;
     let mut retired = BTreeSet::new();
     loop {
@@ -182,7 +170,15 @@ pub(super) fn hydrate_txn(
                 catalogue::group(kind.name()).is_some(),
                 "state_v2_unmapped_kind"
             );
-            if catalogue::retired(kind.name()) {
+            // Legacy archive member keys retain first-seen evidence. Their
+            // values stay inert; no policy state or baseline digest is loaded.
+            if catalogue::retired(kind.name())
+                && !(legacy_archive_members
+                    && matches!(
+                        kind.name(),
+                        "v1_field.archives" | "v1_field.archive_deferred_alarm_count"
+                    ))
+            {
                 retired.insert(header.key.clone());
             }
         }
@@ -199,6 +195,7 @@ pub(super) fn hydrate_txn(
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
+    super::telemetry::hydrate_checkpoint("hydrate_after_files", 0, None);
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
     super::telemetry::hydrate_checkpoint("hydrate_after_accounts", 0, None);
     kinds_census::hydrate_txn(tx, &mut index, &mut cx)?;
@@ -214,13 +211,10 @@ pub(super) fn delta(
 ) -> Result<Baseline> {
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
-    cx.archived = Archived::default();
-    cx.compaction = Default::default();
     let result = (|| {
         let mut rows = mapper::Rows {
             tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
-            // A staged file's own graph rows commit or roll back with its Tail.
             closures: cx
                 .tail
                 .iter()
@@ -229,14 +223,27 @@ pub(super) fn delta(
                 .collect(),
             ..Default::default()
         };
-        let windows = enumerate(next, &mut rows, &previous.windows, cx)?;
+        if let Some((to, carry)) = &cx.carry {
+            rows.closures
+                .entry(carry.from.as_bytes().to_vec())
+                .or_default();
+            rows.closures.entry(to.as_bytes().to_vec()).or_default();
+        }
+        enumerate(next, &mut rows, cx)?;
+        if let Some((to, carry)) = &cx.carry {
+            // Take BOTH closures before finish: predecessor deletion, destination
+            // graph and all Tail rows share this transaction's COMMIT/rollback.
+            let mut closure = rows.take_closure(carry.from.as_bytes())?;
+            closure.extend(rows.take_closure(to.as_bytes())?);
+            tail::write_closure(rows.tx()?, &closure)?;
+            tail::move_tail(rows.tx()?, to.as_bytes(), carry)?;
+        }
         let retired = tail::removed_files(&rows.old);
         cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
         let digests = rows.finish()?;
         Ok(Baseline {
             generation: next.generation,
             rows: digests,
-            windows,
         })
     })();
     cx.valid = result.is_ok();
@@ -271,6 +278,10 @@ pub(super) fn save_graph(
             Hold::ForeignBinding
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
+        if let Some((to, carry)) = &pending.carry {
+            // CAS-restored custody joins the same map move before encoding.
+            next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+        }
         super::super::lenient_decode::check_held_output(next)?;
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;
@@ -282,6 +293,7 @@ pub(super) fn save_graph(
                 next.generation = generation;
                 // RAM is ahead of a rolled-back file's committed rows: reload
                 // them. The stage is published; the file reselects.
+                pending.carry = None;
                 if pending.tail_rolled_back {
                     pending.tail = None;
                     bail!(Hold::ReloadRequired);
@@ -291,38 +303,6 @@ pub(super) fn save_graph(
                     bail!(Hold::ReloadRequired);
                 }
                 digests.generation = generation;
-                let mut count = 0_u64;
-                let mut windows = 0_u64;
-                let mut max = 0_u64;
-                let mut uncollapsed = 0_u64;
-                for (root, family) in &mut next.claude_account_family_pending {
-                    // Stored windows, current included, as this save left them.
-                    let ids = digests
-                        .windows
-                        .get(root)
-                        .map_or(&[][..], |w| w.ids.as_slice());
-                    let n = ids.len() as u64;
-                    count += u64::from(n > 64);
-                    windows += n;
-                    max = max.max(n);
-                    family.previous_windows.saved(
-                        ids.split_last().map_or(&[][..], |(_, archived)| archived),
-                        pending.compaction.done.contains(root),
-                    );
-                    uncollapsed += family.previous_windows.uncollapsed() as u64;
-                }
-                if count != 0 {
-                    telemetry::event("account_windows_alarm", &count);
-                }
-                telemetry::event(
-                    "account_windows_retained",
-                    &serde_json::json!({
-                        "windows": windows, "max_per_family": max, "families_over_64": count,
-                        "uncollapsed": uncollapsed,
-                        "replaced": pending.archived.replaced, "pushed": pending.archived.pushed
-                    }),
-                );
-                telemetry::event("account_windows_compacted", &pending.compaction.counts);
                 Ok(digests)
             }
             DurableCommitOutcome::Published(generation) => {

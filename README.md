@@ -249,6 +249,7 @@ collection authority.
 Current locked commands:
 
 ```bash
+ottto --version # -V also prints the release version without contacting the daemon
 ottto status --json
 ottto status --json --watch
 ottto receipts --json
@@ -464,10 +465,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   stable `otm_…` machine identity.
 - `ottto logout --local-only --forget-installation --confirm` is the emergency
   variant for when Ottto cannot be reached. It performs the same local reset
-  without contacting Ottto, so the server registration is not released: this
-  Mac stays registered to the old Ottto account, and a different account can
-  connect it only after the old account removes this Mac on its Apps page
-  (Disconnect).
+  without contacting Ottto, so the server registration is not released. If the
+  old Ottto account was deleted or already disconnected this Mac, a different
+  account signs in and chooses Replace it on the claim page. Otherwise this Mac
+  stays registered to the old account, and a different account can connect it
+  only after the old account removes this Mac on its Apps page (Disconnect).
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).
@@ -517,8 +519,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `net.ottto.Companion` bundle identifier, so dev and preview builds keep
   working unconfigured. `OTTTO_COMPANION_TEAM_ID` and
   `OTTTO_COMPANION_CODE_REQUIREMENT` override both, for running a release daemon
-  against a locally built app (see
-  [`docs/session-2026-09-16-companion-code-requirement.md`](docs/session-2026-09-16-companion-code-requirement.md))
+  against a locally built app.
 - a macOS packaging rehearsal script that builds the SwiftUI app bundle, embeds
   Rust CLI/daemon helpers, ad-hoc seals dev/preview bundles, writes a release
   manifest, and separates those internal builds from stable
