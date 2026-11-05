@@ -670,6 +670,7 @@ fn account_attribution(
     if let Some(account_hash) = snapshot_account_hash {
         return Some(attribution_from_account_hash(
             account_hash,
+            snapshot,
             status,
             "snapshot_account_identity",
         ));
@@ -925,16 +926,24 @@ fn lineage_account_attribution(
 
 fn attribution_from_account_hash(
     account_hash: String,
+    snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
     source: &str,
 ) -> AccountAttribution {
     let matching_observation = status.plan_observations.iter().find(|observation| {
         observation.account_identifier_hash.as_deref() == Some(account_hash.as_str())
     });
+    let organization_identifier_hash = matching_observation
+        .and_then(|observation| observation.organization_identifier_hash.clone())
+        .or_else(|| {
+            // Other Codex logins have no plan observation in the default home's
+            // status. Their own creator pair can complete this local display key.
+            let (creator_account, workspace) = crate::snapshots::codex_creator_pair(snapshot)?;
+            (creator_account == account_hash).then(|| workspace.to_string())
+        });
     AccountAttribution {
         account_identifier_hash: Some(account_hash),
-        organization_identifier_hash: matching_observation
-            .and_then(|observation| observation.organization_identifier_hash.clone()),
+        organization_identifier_hash,
         subscription_product: matching_observation
             .and_then(|observation| observation.subscription_product.clone()),
         source: source.to_string(),
@@ -2319,6 +2328,120 @@ mod tests {
             active.account_attribution_source.as_deref(),
             Some("snapshot_account_identity")
         );
+    }
+
+    #[test]
+    fn codex_bound_sessions_complete_their_local_account_workspace_key() {
+        let account = |id| ottto_core::billing_identity_hash("openai", "account", id).unwrap();
+        let workspace = |id| ottto_core::billing_identity_hash("openai", "workspace", id).unwrap();
+        let default_account = account("default-login");
+        let slot_account = account("slot-login");
+        let default_workspace = workspace("default-workspace");
+        let slot_workspace = workspace("slot-workspace");
+        let mut status = test_status();
+        status.source = ottto_protocol::SourceKind::Codex;
+        let mut observation = test_plan_observation(
+            "default-status",
+            &default_account,
+            AgentStatusConfidence::High,
+        );
+        observation.organization_identifier_hash = Some(default_workspace.clone());
+        status.plan_observations.push(observation);
+
+        for (name, bound_account, creator_account, creator_workspace, disposition, expected_org) in [
+            (
+                "other-slot",
+                &slot_account,
+                &slot_account,
+                Some(&slot_workspace),
+                None,
+                Some(&slot_workspace),
+            ),
+            (
+                "default-observation-wins",
+                &default_account,
+                &default_account,
+                Some(&slot_workspace),
+                None,
+                Some(&default_workspace),
+            ),
+            (
+                "mismatched-creator",
+                &slot_account,
+                &default_account,
+                Some(&default_workspace),
+                None,
+                None,
+            ),
+            (
+                "missing-workspace",
+                &slot_account,
+                &slot_account,
+                None,
+                None,
+                None,
+            ),
+            (
+                "conflicting-creator",
+                &slot_account,
+                &slot_account,
+                Some(&slot_workspace),
+                Some("conflict"),
+                None,
+            ),
+        ] {
+            let dir = temp_dir(name);
+            let mut snapshot = test_snapshot(name, "2026-07-19T10:04:00Z");
+            snapshot.model_usage[0].account_identifier_hash = Some(bound_account.clone());
+            snapshot.usage_buckets[0].model_usage[0].account_identifier_hash =
+                Some(bound_account.clone());
+            snapshot.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "openai",
+                account_identifier_hash: Some(creator_account.clone()),
+                provider_workspace_hash: creator_workspace.cloned(),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "codex_creator_header:v1",
+                identity_disposition: disposition,
+                source_created_at: None,
+            });
+
+            let result = reconcile_active_sessions(
+                &dir,
+                SnapshotSource::Codex,
+                &[snapshot],
+                Some(&status),
+                None,
+                "2026-07-19T10:05:00Z",
+            )
+            .unwrap();
+            assert_eq!(result.sessions.len(), 1, "{name}");
+            let active = &result.sessions[0];
+            // Companion cards require both account and workspace hashes exactly;
+            // creator workspace hashes already use the card's workspace namespace.
+            assert_eq!(
+                active.account_identifier_hash.as_ref(),
+                Some(bound_account),
+                "{name}"
+            );
+            assert_eq!(
+                active.organization_identifier_hash.as_ref(),
+                expected_org,
+                "{name}"
+            );
+            assert_eq!(
+                active.account_attribution_source.as_deref(),
+                Some("snapshot_account_identity"),
+                "{name}"
+            );
+            assert_eq!(
+                read_active_session_reconciliation(&dir, SnapshotSource::Codex)
+                    .unwrap()
+                    .sessions,
+                result.sessions,
+                "{name}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
