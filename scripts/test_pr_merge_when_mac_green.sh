@@ -44,7 +44,9 @@ case "$1 $2" in
   api\ *rules/branches*)
     if [ -f "$d/rules" ]; then cat "$d/rules"; else printf '[{"type":"merge_queue"}]\n'; fi ;;
   "api graphql") reply queue ;;
+  api\ *check-runs/*/annotations*) reply annotations ;;
   api\ *check-runs*) reply checks ;;
+  api\ *actions/runs/*/jobs*) reply jobs ;;
   api\ *actions/runs*event=merge_group*) reply queue_runs ;;
   api\ *actions/runs*) reply runs ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
@@ -278,6 +280,54 @@ expect_count "$ENQUEUE_CALL" 1
 expect_output 'rechecking before reporting removal'
 expect_output 'removed from merge queue'
 expect_output 'merge_group run 800: failure https://example.invalid/actions/runs/800 (head queue-sha)'
+
+# GitHub never started the queue's Mac job: enqueue the same head again.
+QUEUE_RUN='{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}'
+NOT_ACQUIRED_JOBS='{"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":92,"status":"completed","conclusion":"success","steps":[{"conclusion":"success"}]}]}'
+NOT_ACQUIRED_NOTE='[{"message":"The job was not acquired by Runner of type hosted even after multiple attempts"}]'
+
+# removed_case <name> <jobs json> <annotations json>: queued once, then gone.
+removed_case() {
+  green_case "$1"
+  queue_json queue.1 OPEN "$SHA" QUEUED
+  queue_json queue OPEN "$SHA" ""
+  printf '%s' "$QUEUE_RUN" > "$case_dir/queue_runs"
+  printf '%s' "$2" > "$case_dir/jobs"
+  printf '%s' "$3" > "$case_dir/annotations"
+}
+
+removed_case not-acquired-requeues "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+queue_json queue.4 OPEN "$SHA" QUEUED
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 2
+expect_log 'actions/runs/800/jobs'
+expect_log 'check-runs/91/annotations'
+expect_no_log 'check-runs/92/annotations'
+expect_output 'never got a runner (GitHub capacity); enqueuing PR #7 again (1 of 2)'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# At most two re-enqueues; then the removal is reported.
+removed_case not-acquired-gives-up "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 3
+expect_output '(2 of 2)'
+expect_output 'removed from merge queue'
+
+# A job that ran a step failed for real: no re-enqueue, no annotation read.
+removed_case started-job-is-not-requeued \
+  '{"jobs":[{"id":91,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'annotations'
+
+# A cancelled job without GitHub's note may be anything: no re-enqueue.
+removed_case cancelled-without-note-is-not-requeued "$NOT_ACQUIRED_JOBS" \
+  '[{"message":"The operation was canceled."}]'
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'removed from merge queue'
 
 # A rerun after a timeout: GitHub refuses to enqueue a PR that is already queued.
 green_case rerun-resumes-queued-wait
