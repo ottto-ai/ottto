@@ -6,18 +6,6 @@ use super::super::pi::Pi;
 use super::tests::{scope, Route, NOW};
 use super::transition_tests::{self as transition, FixtureSource};
 use super::*;
-use crate::snapshots::scan_index_persistence::Source;
-
-impl FixtureSource for Pi {
-    const INDEX: Source = Source::Pi;
-    const APPLY: fn(&serde_json::Value, &mut SnapshotAccumulator) = apply_pi_line;
-    fn name() -> String {
-        "session.jsonl".into()
-    }
-    fn lines(size: usize) -> Vec<String> {
-        super::super::pi::tests::lines(size, 0, None)
-    }
-}
 
 /// [regress] A fresh destination commits its first Tail before a restart;
 /// an unchanged pass reads nothing and an append reads only its suffix.
@@ -92,9 +80,10 @@ fn fresh_destination_first_cycle_keeps_tail_across_restart() {
                     panic!("first saved Tail survives for {:?}/{presence}", S::SOURCE);
                 };
                 let mut parser = transition::open::<S>(&transcript);
-                let mode = parser
-                    .prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
-                    .unwrap();
+                let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
+                else {
+                    panic!("the restarted read prepares");
+                };
                 if append {
                     assert!(matches!(mode, ReadMode::Tail));
                     assert_eq!(

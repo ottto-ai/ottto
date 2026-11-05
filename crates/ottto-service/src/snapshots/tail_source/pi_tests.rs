@@ -13,11 +13,7 @@ const SESSION: &str = "synthetic-pi-tail-session";
 /// A header (naming `parent` when set), a user prompt, then `responses`
 /// assistant turns a minute apart, each with its own response id. The first
 /// `paired` turns are repeated as `message_end`, which pairs them.
-pub(in crate::snapshots) fn lines(
-    responses: usize,
-    paired: usize,
-    parent: Option<&str>,
-) -> Vec<String> {
+fn lines(responses: usize, paired: usize, parent: Option<&str>) -> Vec<String> {
     let at = |minute: usize| format!("2026-10-27T{:02}:{:02}:00Z", 6 + minute / 60, minute % 60);
     let mut lines = vec![
         json!({"type":"session","version":3,"id":SESSION,"timestamp":at(0),
