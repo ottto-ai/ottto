@@ -231,10 +231,12 @@ pub(super) fn introduced(kind: &str) -> Result<u32> {
 /// Before layout controls existed, this authenticated inventory contained every
 /// field known to its writer, including fields absent in the imported v1 JSON.
 pub(super) fn legacy_layout(presence: &BTreeMap<String, bool>) -> u32 {
+    // A field's later kinds (a newer split) say nothing about its writer.
+    let first = |field: &str| LAYOUTS.iter().find(|(_, f, _)| *f == field).map(|e| e.2);
     LAYOUTS
         .iter()
         .filter(|(_, field, _)| presence.contains_key(*field))
-        .map(|(_, _, layout)| *layout)
+        .filter_map(|(_, field, _)| first(*field))
         .max()
         .unwrap_or(1)
 }
