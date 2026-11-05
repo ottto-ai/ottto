@@ -452,8 +452,8 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
 /// Repeated reads count again; missing/refused files add nothing. No identities.
 /// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
 /// Retention: pairs deleted (and their bytes), pairs kept by a protection,
-/// copy or write fence (of them, by the copy rule), and pairs kept by a read or
-/// unlink fault.
+/// copy or write fence (of them, by the copy rule), pairs kept by a read or
+/// unlink fault, and held pairs (and their bytes) with no listed transcript.
 #[derive(Default, Serialize)]
 struct ClaudeSidecarReparse {
     #[serde(skip_serializing_if = "is_zero")]
@@ -470,10 +470,14 @@ struct ClaudeSidecarReparse {
     claude_telemetry_held_copied: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_telemetry_read_fault: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_bytes: u64,
 }
-process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
+process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9]);
 pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
-    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0, 0]);
+    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0, 0, 0, 0]);
 }
 /// One Claude telemetry retention run.
 #[derive(Default, PartialEq, Eq)]
@@ -483,6 +487,8 @@ pub(crate) struct ClaudeTelemetryRetention {
     pub(crate) held_roots: u64,
     pub(crate) held_copied: u64,
     pub(crate) read_fault: u64,
+    pub(crate) held_no_transcript_roots: u64,
+    pub(crate) held_no_transcript_bytes: u64,
 }
 pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
     add_claude_sidecar_counts([
@@ -493,9 +499,11 @@ pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
         run.held_roots,
         run.held_copied,
         run.read_fault,
+        run.held_no_transcript_roots,
+        run.held_no_transcript_bytes,
     ]);
 }
-fn add_claude_sidecar_counts(deltas: [u64; 7]) {
+fn add_claude_sidecar_counts(deltas: [u64; 9]) {
     with_claude_sidecar_reparse(|counts| {
         for (counter, delta) in counts.iter().zip(deltas) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
@@ -511,7 +519,15 @@ fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
         claude_telemetry_held_roots: counts[4].swap(0, Relaxed),
         claude_telemetry_held_copied: counts[5].swap(0, Relaxed),
         claude_telemetry_read_fault: counts[6].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_roots: counts[7].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_bytes: counts[8].swap(0, Relaxed),
     })
+}
+
+/// Test seam: drain this thread's Claude page counters as their logged keys.
+#[cfg(test)]
+pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
+    serde_json::to_value(take_claude_sidecar_reparse()).unwrap()
 }
 
 /// Nonzero-only counters on the existing native_collection_page line. They
@@ -2266,6 +2282,8 @@ mod tests {
             claude_telemetry_retention(ClaudeTelemetryRetention {
                 held_roots: 3,
                 held_copied: 1,
+                held_no_transcript_roots: 2,
+                held_no_transcript_bytes: 7,
                 ..Default::default()
             });
             Probe::start().collection("claude_code", collection());
@@ -2273,6 +2291,8 @@ mod tests {
         let counts = &rows[0]["counts"];
         assert_eq!(counts["claude_telemetry_held_roots"], 3);
         assert_eq!(counts["claude_telemetry_held_copied"], 1);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_roots"], 2);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_bytes"], 7);
     }
 
     #[test]

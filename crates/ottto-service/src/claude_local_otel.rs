@@ -1436,6 +1436,21 @@ fn telemetry_member(path: &Path) -> std::result::Result<Option<ApiFileGeneration
     }
 }
 
+/// A pair's present-member bytes from metadata only; no body is opened.
+/// `Ok(None)`: both members are NotFound. `Err`: a member is a read fault.
+pub(crate) fn telemetry_pair_bytes(
+    support_dir: &Path,
+    stem: &str,
+) -> std::result::Result<Option<u64>, ()> {
+    let mut bytes = None;
+    for path in telemetry_member_paths(support_dir, stem) {
+        if let Some(generation) = telemetry_member(&path)? {
+            *bytes.get_or_insert(0) += generation.bytes;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Read one pair with the existing decoders. `Ok(None)`: both members are
 /// NotFound (the session has no telemetry). `Err`: a read fault (symlink,
 /// unreadable, malformed row, session mismatch, or a member that changed while
