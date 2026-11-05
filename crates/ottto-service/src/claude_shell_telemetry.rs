@@ -126,7 +126,7 @@ fn inspect(path: &Path, label: &str, relay_port: Option<u16>) -> Profile {
         label: label.into(),
         ..Default::default()
     };
-    let read = || -> io::Result<String> {
+    let read = || -> io::Result<Vec<u8>> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -139,8 +139,8 @@ fn inspect(path: &Path, label: &str, relay_port: Option<u16>) -> Profile {
         if !before.is_file() {
             return Err(io::Error::other("not a regular profile"));
         }
-        let mut body = String::new();
-        file.read_to_string(&mut body)?;
+        let mut body = Vec::new();
+        file.read_to_end(&mut body)?;
         let after = file.metadata()?;
         if before.len() != after.len() || before.modified()? != after.modified()? {
             return Err(io::Error::other("profile changed"));
@@ -161,6 +161,7 @@ fn inspect(path: &Path, label: &str, relay_port: Option<u16>) -> Profile {
             return profile;
         }
     };
+    let body = String::from_utf8_lossy(&body);
     let mut fenced = false;
     for line in body.lines() {
         if line.trim() == FENCE_START {
@@ -207,6 +208,21 @@ fn finding(home: Option<&Path>, relay_port: Option<u16>) -> Option<HealthProblem
     if profiles.is_empty() {
         return None;
     }
+    if !profiles.iter().any(|p| p.lines > 0) {
+        let labels = profiles
+            .iter()
+            .map(|p| p.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(HealthProblem {
+            code: StableProblemCode::Unknown,
+            title: TITLE.into(),
+            detail: format!(
+                "Shell profile check: unknown; could not read {labels}; run Verify again."
+            ),
+            retryable: true,
+        });
+    }
     let unknown = profiles.iter().any(|p| p.unknown);
     let files = profiles
         .iter()
@@ -224,7 +240,7 @@ fn finding(home: Option<&Path>, relay_port: Option<u16>) -> Option<HealthProblem
         })
         .collect::<Vec<_>>()
         .join("; ");
-    let detail = format!("Claude Desktop inherits telemetry settings from your shell profile (files={}: {}). Shell profile check: {}. other_loopback means a port that is not Ottto's relay; remote means elsewhere. These settings can prevent Ottto from receiving these sessions. Remove or comment out those lines, then quit and reopen Claude Desktop and start a new session. Unreadable profiles need a new Verify check. Ottto leaves these profile lines unchanged.", profiles.len(), files, if unknown { "unknown" } else { "complete" });
+    let detail = format!("Claude Desktop may inherit telemetry settings from your shell profile (files={}: {}). Shell profile check: {}. other_loopback means a port that is not Ottto's relay; remote means elsewhere. These settings can prevent Ottto from receiving these sessions. Remove or comment out those lines, then quit and reopen Claude Desktop and start a new session. Unreadable profiles need a new Verify check. Ottto leaves these profile lines unchanged.", profiles.len(), files, if unknown { "unknown" } else { "complete" });
     Some(HealthProblem {
         code: StableProblemCode::Unknown,
         title: TITLE.into(),
@@ -269,21 +285,24 @@ pub(crate) fn problem(
 mod tests {
     use super::*;
 
+    const OBSERVED_EXPORTS: &str = concat!(
+        "export CLAUDE_CODE_ENABLE_TELEMETRY=1\n",
+        "export OTEL_LOGS_EXPORTER=otlp\n",
+        "export OTEL_METRICS_EXPORTER=otlp\n",
+        "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n",
+        "export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318\n",
+        "export OTEL_EXPORTER_OTLP_HEADERS='Authorization=synthetic-secret'\n"
+    );
+
     /// [regress] Inline telemetry exports are reported without serializing values.
     #[test]
     fn shell_telemetry_profile_finding_is_names_and_classes_only() {
         let home = crate::test_scratch::ScratchDir::new("shell-telemetry");
-        let body = concat!(
-            "export CLAUDE_CODE_ENABLE_TELEMETRY=1\n",
-            "export OTEL_LOGS_EXPORTER=otlp\n",
-            "export OTEL_METRICS_EXPORTER=otlp\n",
-            "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n",
-            "export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318\n",
-            "export OTEL_EXPORTER_OTLP_HEADERS='Authorization=synthetic-secret'\n"
-        );
+        let body = OBSERVED_EXPORTS;
         fs::write(home.join(".zshrc"), body).unwrap();
         let problem = finding(Some(&home), Some(43119)).unwrap();
         assert!(is_problem(&problem));
+        assert!(problem.detail.starts_with("Claude Desktop may inherit"));
         assert_eq!(crate::local_health_problem_code_slug(&problem), CODE);
         let wire = serde_json::to_string(&problem).unwrap();
         for safe in [
@@ -333,7 +352,28 @@ mod tests {
         // A directory exercises an unreadable profile, including when tests run as root.
         fs::create_dir(home.join(".bashrc")).unwrap();
         let unknown = finding(Some(&home), Some(43119)).unwrap();
-        assert!(unknown.detail.contains(".bashrc: 0 lines"));
-        assert!(unknown.detail.contains("Shell profile check: unknown"));
+        assert_eq!(
+            unknown.detail,
+            "Shell profile check: unknown; could not read .bashrc; run Verify again."
+        );
+    }
+
+    /// [regress] A non-UTF-8 comment must not hide the observed telemetry exports.
+    #[test]
+    fn shell_telemetry_scans_non_utf8_profile() {
+        let home = crate::test_scratch::ScratchDir::new("shell-profile-encoding");
+        let mut bytes = OBSERVED_EXPORTS.as_bytes().to_vec();
+        bytes.extend_from_slice(b"# Latin-1 comment: \xe9\n");
+        fs::write(home.join(".zshrc"), bytes).unwrap();
+        let problem = finding(Some(&home), Some(43119)).unwrap();
+        for expected in [
+            ".zshrc: 6 lines",
+            "other_loopback",
+            "header_present=true",
+            "telemetry_enabled_literal_present=true",
+            "read=complete",
+        ] {
+            assert!(problem.detail.contains(expected), "missing {expected}");
+        }
     }
 }
