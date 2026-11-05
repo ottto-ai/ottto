@@ -13,6 +13,9 @@ use serde_json::json;
 fn previous_release_workspace_fact_and_per_kind_versions() {
     // v0.1.221 Fact::Workspace: kind, version, Some, byte length, UTF-8 cwd.
     const PREVIOUS: &[u8] = b"\x02\x01\x01\x12/tmp/prior-release";
+    // Bound v2 bytes from the original field-by-field writer: same UTF-8
+    // options and field order after replacing it with durable_struct!.
+    const BOUND: &[u8] = b"\x02\x02\x01\x12/tmp/prior-release\x01\x04hash\x01\x0egit_common_dir\x01\x0frepository_root\x01\x09workspace\x01\x08git_root";
     for source in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
@@ -26,6 +29,18 @@ fn previous_release_workspace_fact_and_per_kind_versions() {
         );
         assert!(acc.repository_binding.is_none());
         assert_eq!(fact_pages(&acc).unwrap(), [(2, PREVIOUS.to_vec())]);
+        read_fact_page(2, BOUND, &mut acc).unwrap();
+        assert_eq!(
+            acc.repository_binding,
+            Some(crate::context_footprint::RepositoryIdentity {
+                repository_hash: Some("hash".into()),
+                repository_identity_source: Some("git_common_dir".into()),
+                workspace_kind: Some("repository_root".into()),
+                repository_label: Some("workspace".into()),
+                repository_label_source: Some("git_root".into()),
+            })
+        );
+        assert_eq!(fact_pages(&acc).unwrap(), [(2, BOUND.to_vec())]);
         assert_eq!(
             read_fact_page(0, &[0, 2, 1, 1, b'x'], &mut acc),
             Err(ReconstructCause::INCOMPATIBLE)
@@ -128,19 +143,31 @@ fn capture_restore<S: TailSource>(
     );
     let missing = resolve_repository_identity(&cwd, true);
     assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
-    // The stored reduction is PRE, as in the normal native finish.
-    if S::SOURCE == SnapshotSource::ClaudeCode {
-        restored.finalize_claude_responses_e2(None);
-    }
-    // Neither stale path-cache state nor a later failed measurement wins.
-    let items = restored.into_items_with_repository_identity(
-        &path,
-        "2026-10-20T16:00:00Z",
-        "a".repeat(64),
-        None,
-        Some(missing),
-        false,
-    );
+    // Exercise the production load and native finish, including forwarding
+    // the restored binding to into_items, without reading transcript bytes.
+    let mut parser = native_cold::parser(S::SOURCE, &path, File::open(&path).unwrap(), apply);
+    let load::Load::Reused(taken, base) = load::load::<S>(
+        &route.index,
+        &route.path,
+        &local_index_key(&path),
+        &HeadIdentity::new(&route.path, S::SOURCE, &route.dir, &path, false),
+        &mut File::open(&path).unwrap(),
+        &scope(),
+        &codex::tests::candidate(&path),
+        &parser.accumulator,
+    ) else {
+        panic!("the committed reduction restores");
+    };
+    assert!(matches!(
+        parser
+            .prepare_acquisition(Some(taken), &scope(), None, NOW)
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Unchanged
+    ));
+    assert_eq!(parser.reader.consumed_bytes(), 0);
+    let (_, native) = route.finish_under::<S>(&path, parser, base, |_| {}, &scope());
+    let native = native.unwrap();
+    let items = native.snapshots;
     assert_eq!(items[0].repository_hash, expected.repository_hash);
     assert_eq!(items[0].repository_label, expected.repository_label);
     assert_eq!(items[0].workspace_kind, expected.workspace_kind);

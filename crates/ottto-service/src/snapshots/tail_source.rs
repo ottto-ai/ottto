@@ -9,6 +9,7 @@
 //! cause the caller counts, never a default-empty success.
 use super::state_v2::{Collection, CollectionMeta, Shape as PageShape};
 use super::*;
+use crate::context_footprint::RepositoryIdentity;
 use crate::durable_tail_codec::{durable_field, Corrupt, Dec, Durable, Enc, HDigest, Refuse};
 use crate::transcript_acquisition::DurableCertificate;
 
@@ -820,6 +821,14 @@ const FACTS: [Fact; 6] = [
 const FACT_VERSION: u64 = 1;
 const WORKSPACE_BINDING_VERSION: u64 = 2;
 
+crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
+    U repository_hash: Option<String>,
+    U repository_identity_source: Option<String>,
+    U workspace_kind: Option<String>,
+    U repository_label: Option<String>,
+    U repository_label_source: Option<String>,
+});
+
 impl Fact {
     fn present(self, acc: &SnapshotAccumulator) -> bool {
         match self {
@@ -861,11 +870,7 @@ impl Fact {
                     .transpose()?
                     .put(e)?;
                 if let Some(binding) = &acc.repository_binding {
-                    binding.repository_hash.put(e)?;
-                    binding.repository_identity_source.put(e)?;
-                    binding.workspace_kind.put(e)?;
-                    binding.repository_label.put(e)?;
-                    binding.repository_label_source.put(e)?;
+                    binding.put(e)?;
                 }
                 Ok(())
             }
@@ -904,13 +909,7 @@ impl Fact {
             Self::Workspace => {
                 into.workspace_path = <Option<String> as Durable>::take(&mut d)?.map(PathBuf::from);
                 into.repository_binding = if version == WORKSPACE_BINDING_VERSION {
-                    Some(crate::context_footprint::RepositoryIdentity {
-                        repository_hash: <Option<String> as Durable>::take(&mut d)?,
-                        repository_identity_source: <Option<String> as Durable>::take(&mut d)?,
-                        workspace_kind: <Option<String> as Durable>::take(&mut d)?,
-                        repository_label: <Option<String> as Durable>::take(&mut d)?,
-                        repository_label_source: <Option<String> as Durable>::take(&mut d)?,
-                    })
+                    Some(RepositoryIdentity::take(&mut d)?)
                 } else {
                     None
                 };

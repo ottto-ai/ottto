@@ -162,6 +162,12 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
+impl RepositoryIdentity {
+    pub(crate) fn is_repository(&self) -> bool {
+        self.repository_hash.is_some()
+    }
+}
+
 impl SpawnEnv {
     fn claude_command(&self) -> Result<Command> {
         let Some(program) = crate::command_env::executable_path("claude") else {
@@ -751,17 +757,14 @@ pub(crate) fn resolve_repository_identity(
     workspace: &Path,
     labels_enabled: bool,
 ) -> RepositoryIdentity {
-    // Only an explicit Git diagnostic on a readable directory proves non-Git.
-    let toplevel = fs::read_dir(workspace)
-        .map_err(|_| GitOutputError::Failed)
-        .and_then(|_| {
-            git_output_capped(
-                workspace,
-                &["rev-parse", "--show-toplevel"],
-                GIT_STDOUT_MAX_BYTES,
-                true,
-            )
-        });
+    if fs::read_dir(workspace).is_err() {
+        return unresolved_repository_identity("unknown");
+    }
+    let toplevel = git_stdout_capped(
+        workspace,
+        &["rev-parse", "--show-toplevel"],
+        GIT_STDOUT_MAX_BYTES,
+    );
     let toplevel = match toplevel {
         Ok(bytes) => match String::from_utf8(bytes)
             .ok()
@@ -770,7 +773,7 @@ pub(crate) fn resolve_repository_identity(
             Some(raw) => absolutize_git_path(workspace, raw.trim()),
             None => return unresolved_repository_identity("unknown"),
         },
-        Err(GitOutputError::NotRepository) => return unresolved_repository_identity("non_git"),
+        Err(GitOutputError::Failed) => return unresolved_repository_identity("non_git"),
         Err(_) => return unresolved_repository_identity("unknown"),
     };
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
@@ -869,7 +872,6 @@ pub(crate) enum GitOutputError {
     Failed,
     TooLarge,
     TimedOut,
-    NotRepository,
 }
 
 /// Successful git stdout, read while git runs so output over the pipe buffer
@@ -881,22 +883,13 @@ pub(crate) fn git_stdout_capped(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<Vec<u8>, GitOutputError> {
-    git_output_capped(dir, args, max_bytes, false)
-}
-
-fn git_output_capped(
-    dir: &Path,
-    args: &[&str],
-    max_bytes: usize,
-    classify_not_repository: bool,
-) -> Result<Vec<u8>, GitOutputError> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args).stdout(Stdio::piped());
-    if classify_not_repository {
-        command.env("LC_ALL", "C").stderr(Stdio::piped());
-    } else {
-        command.stderr(Stdio::null());
-    }
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = command.spawn().map_err(|_| GitOutputError::Failed)?;
     let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
     fn stop(
@@ -910,24 +903,6 @@ fn git_output_capped(
     let Some(stdout) = child.stdout.take() else {
         return stop(child, GitOutputError::Failed);
     };
-    // Drain stderr concurrently with stdout, under the same command deadline.
-    let errors = child.stderr.take().map(|stderr| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let spawned = std::thread::Builder::new()
-            .name("ottto-git-stderr".into())
-            .spawn(move || {
-                let mut bytes = Vec::new();
-                let result = stderr
-                    .take(GIT_STDOUT_MAX_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-                    .map(|_| bytes);
-                let _ = sender.send(result);
-            });
-        (spawned, receiver)
-    });
-    if errors.as_ref().is_some_and(|(spawned, _)| spawned.is_err()) {
-        return stop(child, GitOutputError::Failed);
-    }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
         .name("ottto-git-stdout".to_string())
@@ -959,20 +934,6 @@ fn git_output_capped(
         return Err(GitOutputError::TooLarge);
     }
     if !status.success() {
-        if let Some((_, errors)) = errors {
-            match errors.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Ok(bytes))
-                    if status.code() == Some(128)
-                        && bytes.starts_with(
-                            b"fatal: not a git repository (or any of the parent directories): .git",
-                        ) =>
-                {
-                    return Err(GitOutputError::NotRepository);
-                }
-                Err(_) => return Err(GitOutputError::TimedOut),
-                _ => {}
-            }
-        }
         return Err(GitOutputError::Failed);
     }
     Ok(bytes)
@@ -1839,10 +1800,7 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
         })
         .filter(|label| {
             let lower = label.to_ascii_lowercase();
-            !lower.contains(".claude")
-                && !lower.contains(".codex")
-                && !label.contains(['/', '\\', '\0'])
-                && !label.contains("://")
+            !lower.contains(".claude") && !lower.contains(".codex") && !label.contains('\\')
         })
 }
 
@@ -2316,7 +2274,7 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 
-    /// [regress] A readable non-repository is distinct from missing or broken Git evidence.
+    /// [regress] An existing folder with a failed Git lookup is distinct from a missing cwd.
     #[test]
     fn repository_identity_marks_non_git_without_repository_hash() {
         let dir = temp_dir("repo-identity-non-git");
@@ -2332,7 +2290,7 @@ mod tests {
         assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
         fs::write(dir.join(".git"), "gitdir: missing-metadata\n").unwrap();
         let broken = resolve_repository_identity(&dir, true);
-        assert_eq!(broken.workspace_kind.as_deref(), Some("unknown"));
+        assert_eq!(broken.workspace_kind.as_deref(), Some("non_git"));
         let _ = fs::remove_dir_all(&dir);
     }
 

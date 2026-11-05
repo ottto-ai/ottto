@@ -10247,11 +10247,8 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
-        let repository_identity = self.repository_binding.clone().or_else(|| {
-            self.workspace_path.as_deref().map(|workspace| {
-                measured_repository_identity
-                    .unwrap_or_else(|| cached_repository_identity(workspace))
-            })
+        let repository_identity = self.workspace_path.as_deref().map(|workspace| {
+            measured_repository_identity.unwrap_or_else(|| cached_repository_identity(workspace))
         });
         let workspace_display_label = repository_identity
             .as_ref()
@@ -10726,7 +10723,7 @@ fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::Rep
 
     let identity = crate::context_footprint::resolve_repository_identity(workspace, true);
     // Negative observations must not delay a later git init or repaired lookup.
-    if identity.repository_hash.is_some() {
+    if identity.is_repository() {
         if let Ok(mut guard) = cache.lock() {
             if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
                 guard.clear();
@@ -14650,7 +14647,7 @@ impl OwnedSourceScan {
                     claude_title_metadata: (source == SnapshotSource::ClaudeCode)
                         .then_some(&claude_title_metadata),
                     attribution_context,
-                    repository_identity: parser.accumulator.repository_binding.clone(),
+                    repository_identity: None,
                     money_context: Some(claude_request_money::e2::ReadContext {
                         index,
                         path: &candidate.path,
@@ -18129,7 +18126,7 @@ impl OwnedJsonlParser {
                     .map(cached_repository_identity)
             });
         if let Some(identity) = &repository_identity {
-            if identity.repository_hash.is_some() {
+            if identity.is_repository() {
                 accumulator.repository_binding = Some(identity.clone());
             }
         }
