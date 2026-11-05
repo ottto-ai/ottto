@@ -2,7 +2,9 @@
 //! records, per-file entries, source fingerprints and the canonical file-set
 //! digests it records.
 
+mod candidate_decision;
 pub(super) mod entry;
+mod entry_retirement;
 pub(super) mod file_set_digest;
 mod load;
 pub(super) mod save;
