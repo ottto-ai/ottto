@@ -898,8 +898,11 @@ fn proof_split_check(path: &str, layout: u32) {
     let mut writes = Vec::new();
     for change in [false, true] {
         if change {
+            // A swap keeps every private string, so the existing erasure
+            // bookkeeping adds no control row to the delta.
             let stamps = &mut reopened.upload_context_proof.entity_stamps;
-            stamps.values_mut().next().unwrap().body_witness = "f".repeat(64);
+            let stamp = stamps.values_mut().next().unwrap();
+            std::mem::swap(&mut stamp.body_witness, &mut stamp.context_fingerprint);
         }
         let before = db.save_row_attempts().0;
         previous =
