@@ -290,7 +290,7 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                     |s| s.snapshot_fingerprint.as_str(),
                     snapshot_upload_body_witness,
                     |s| Some(s.source_session_id.as_str()),
-                    |_| false,
+                    |_| 0,
                     |_| None,
                     &mut InplaceRetryBudget::default(),
                     |batch| {

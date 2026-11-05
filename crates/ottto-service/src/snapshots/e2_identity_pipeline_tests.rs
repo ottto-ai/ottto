@@ -761,7 +761,8 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let mut lines = String::new();
     let mut api = Vec::new();
     let mut trace = Vec::new();
-    for n in 1..=17 {
+    // One more own login than an item may carry.
+    for n in 1..=33 {
         let request = format!("req_{n}");
         lines.push_str(&format!("{}\n", json!({
             "timestamp": format!("2026-08-02T07:00:{n:02}Z"), "type": "assistant",
@@ -791,15 +792,15 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert!(e2_is_literal(item));
-    assert_eq!(item.request_count, 17);
+    assert_eq!(item.request_count, 33);
     assert_eq!(
         e2_login_counts(item),
-        BTreeMap::from([(None, 17)]),
-        "SOURCE: lost seventeenth-key proof cannot borrow the starting or sixteenth login"
+        BTreeMap::from([(None, 33)]),
+        "SOURCE: lost 33rd-key proof cannot borrow the starting or 32nd login"
     );
     assert_eq!(
         item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0017")
+        Some("0.0033")
     );
     let display = item.claude_account_display.as_deref().unwrap();
     assert_eq!(display.current.status, "unknown");
@@ -810,10 +811,10 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     );
     assert_eq!(item.request_identity_refusals, 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
-    // The existing seventeen-request fixture also reaches the cap through
+    // The existing 33-request fixture also reaches the cap through
     // a forward twin, a backward twin, and a twin occupying a later own key's
     // slot. No raised byte limit is required for provenance to remain owed.
-    for gaps in [vec![1], vec![17], (2..=16).step_by(2).collect()] {
+    for gaps in [vec![1], vec![33], (2..=32).step_by(2).collect()] {
         let own = api
             .iter()
             .filter(|row| !gaps.iter().any(|n| row.request_id == format!("req_{n}")))
@@ -852,7 +853,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
                 on[0].cost, off[0].cost,
                 "{gaps:?}: money conserved while Held"
             );
-            assert_eq!(on[0].request_count, 17);
+            assert_eq!(on[0].request_count, 33);
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
             assert!(
                 e2_source_counts(&on[0])

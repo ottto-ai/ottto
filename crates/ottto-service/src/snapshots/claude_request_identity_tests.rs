@@ -215,12 +215,19 @@ fn w0_r5_bounds_match_daemon_caps() {
     );
     assert_eq!(bounds["parts_per_row"], identity::MAX_PARTS_PER_ROW as u64);
     // The receiver derives its parts bound from the advertised item cap; the
-    // daemon's construction bound stays stricter (over it = counted hold).
+    // daemon's construction bound is the same function of this pass's cap.
     assert_eq!(
         bounds["total_parts"],
         (identity::MAX_ADVERTISED_ITEM_BYTES / 320) as u64
     );
-    assert!(bounds["total_parts"].as_u64().unwrap() >= identity::MAX_PARTS_PER_ITEM as u64);
+    assert_eq!(
+        bounds["total_parts"],
+        identity::max_parts_per_item(identity::MAX_ADVERTISED_ITEM_BYTES) as u64
+    );
+    assert_eq!(
+        identity::max_parts_per_item(identity::MAX_ITEM_BYTES),
+        2_048
+    );
     assert_eq!(bounds["bucket_rows"], identity::MAX_ROWS as u64);
     assert_eq!(bounds["top_level_rows"], identity::MAX_ROWS as u64);
     assert_eq!(
@@ -566,8 +573,8 @@ fn w0_r5_builder_reproduces_tagged_bodies() {
 #[test]
 fn w0_r5_cap_fallbacks_match_bodies() {
     for (tagged, fallback) in [
-        ("new-cap-identities-16", "new-cap-identities-17-fallback"),
-        ("new-cap-evidence-16", "new-cap-evidence-17-fallback"),
+        ("new-cap-identities-32", "new-cap-identities-33-fallback"),
+        ("new-cap-evidence-32", "new-cap-evidence-33-fallback"),
     ] {
         let bodies = w0_bodies();
         let find = |name: &str| typed_item(&bodies.iter().find(|(n, _, _)| n == name).unwrap().1);
@@ -599,9 +606,10 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         grow(target);
         grow(&mut built.model_usage[0]);
         let result = identity::apply(&mut built, &contributions).unwrap();
-        if tagged == "new-cap-evidence-16" {
-            // Revised cap policy: this two-hour body can retain the newest
-            // eight keys; W0's old whole-item fallback is no longer required.
+        if tagged == "new-cap-evidence-32" {
+            // Revised cap policy: this two-hour body (9 keys, then 23 plus the
+            // extra one) can retain the newest hour's 24 keys; W0's old
+            // whole-item fallback is no longer required.
             assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
             assert!(built.usage_buckets[0].model_usage[0]
                 .identity_parts
@@ -609,7 +617,7 @@ fn w0_r5_cap_fallbacks_match_bodies() {
             assert!(built.usage_buckets[1].model_usage[0]
                 .identity_parts
                 .is_some());
-            assert_eq!(built.request_evidence.len(), 8);
+            assert_eq!(built.request_evidence.len(), 24);
             assert_eq!(identity::semantic_leaf(&built)["refused"], true);
             sticky_assert_reconciled(&built);
             continue;
@@ -1274,11 +1282,12 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
 }
 
 /// A stored head from a build that dropped a file's markers past a count does
-/// not load, so that file reads cold; any other stored head still loads.
+/// not load, so that file reads cold; any other stored head still loads, and a
+/// stored retired flip position is dropped.
 #[test]
 fn stored_markers_load_unless_an_earlier_build_dropped_them() {
     use crate::durable_tail_codec::{Dec, Durable, Enc, HDigest};
-    let stored = |dropped: bool| {
+    let stored = |dropped: bool, flip: Option<u64>| {
         Enc::count_write(1 << 10, |e| {
             Vec::<identity::OrgMarker>::new().put(e)?;
             None::<identity::OrgMarker>.put(e)?;
@@ -1286,18 +1295,20 @@ fn stored_markers_load_unless_an_earlier_build_dropped_them() {
             None::<String>.put_h(e, "OrgMarkers.context_digest")?;
             false.put(e)?;
             None::<u64>.put(e)?;
-            None::<u64>.put(e)
+            flip.put(e)
         })
         .unwrap()
     };
-    let bytes = stored(false);
-    let mut d = Dec::new(&bytes);
-    assert_eq!(
-        identity::OrgMarkers::take(&mut d),
-        Ok(identity::OrgMarkers::default())
-    );
-    assert_eq!(d.finish(), Ok(()));
-    assert!(identity::OrgMarkers::take(&mut Dec::new(&stored(true))).is_err());
+    for flip in [None, Some(7)] {
+        let bytes = stored(false, flip);
+        let mut d = Dec::new(&bytes);
+        assert_eq!(
+            identity::OrgMarkers::take(&mut d),
+            Ok(identity::OrgMarkers::default())
+        );
+        assert_eq!(d.finish(), Ok(()));
+    }
+    assert!(identity::OrgMarkers::take(&mut Dec::new(&stored(true, None))).is_err());
 }
 
 #[test]
@@ -3710,7 +3721,7 @@ fn an_unsplittable_row_untags_its_newest_request() {
 /// The display never changes the wire bytes or the fingerprint.
 #[test]
 fn fallback_withholds_and_ineligible_items_carry_no_display() {
-    let requests = (0..17_u8)
+    let requests = (0..=identity::MAX_AUTHORITY_KEYS)
         .map(|n| DisplayRequest {
             plan: Some("max"),
             bucket: HOUR_10,
@@ -3738,8 +3749,8 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
             None,
             None,
             owned("max"),
-            17,
-            17,
+            33,
+            33,
             owned("2026-09-01T10:01:00Z"),
             false
         )]
@@ -3785,6 +3796,66 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
     assert_eq!(timed.snapshot_fingerprint, untimed.snapshot_fingerprint);
     let wire = serde_json::to_string(&timed).unwrap();
     assert!(!wire.contains("latest_request_at") && !wire.contains("last_used_at"));
+}
+
+/// The account limit is 32 per item. Up to it the session uploads tagged;
+/// one more account holds it under a raised item cap, and the hold names
+/// itself locally as `too_many_accounts` so the app can show it.
+#[test]
+fn account_limit_holds_over_32_with_a_visible_reason() {
+    let session = |accounts: usize| {
+        let requests = (0..accounts)
+            .map(|n| DisplayRequest {
+                plan: Some("max"),
+                bucket: HOUR_10,
+                tokens: 1,
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(format!("{n:064x}")),
+                    org: Some("a".repeat(64)),
+                    basis: identity::TELEMETRY,
+                    account_source: None,
+                }),
+                at: Some("2026-09-01T10:01:00Z"),
+            })
+            .collect::<Vec<_>>();
+        let (mut item, timed) = display_item(&requests);
+        sticky_receiver_totals(&mut item);
+        let proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+        let result = identity::apply_with_reserved_bytes_for_test(
+            &mut item,
+            &proof,
+            &identity::AcceptedBuckets::for_test(),
+            0,
+            Some(2_097_152),
+        )
+        .unwrap();
+        (item, result)
+    };
+    for accounts in [17, identity::MAX_AUTHORITY_KEYS] {
+        let (item, result) = session(accounts);
+        assert!(
+            matches!(result, Tagged::Sent { .. }),
+            "{accounts}: {result:?}"
+        );
+        assert_eq!(
+            item.usage_buckets[0].model_usage[0]
+                .identity_parts
+                .as_ref()
+                .map(Vec::len),
+            Some(accounts)
+        );
+        assert_eq!(item.claude_account_withheld_reason, None, "{accounts}");
+    }
+    let (item, result) = session(identity::MAX_AUTHORITY_KEYS + 1);
+    assert_eq!(result, Tagged::Held);
+    assert_eq!(
+        item.claude_account_withheld_reason,
+        Some(CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+    );
+    assert_eq!(
+        CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS,
+        "too_many_accounts"
+    );
 }
 
 /// End to end on parsed requests: the newest own request's account is

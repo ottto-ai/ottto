@@ -223,8 +223,14 @@ fn paused_e2_ack_loss_restart_exact_receipt() {
         );
         money_oracle::assert_equivalent(&cold, &result(&replay, Mode::Restart));
         let mut progress = e2_progress();
+        // Patched and unpatched bodies travel in separate requests; the
+        // server refuses one entity overall.
+        let mut refused_once = false;
         let (status, _, _) = upload(&replay.scan.snapshots, &mut progress, |items| {
             let mut response = ack(items)?;
+            if std::mem::replace(&mut refused_once, true) {
+                return Ok(response);
+            }
             let mut refused = response.accepted_entities.pop().unwrap();
             response.accepted -= 1;
             refused.head_etag = None;

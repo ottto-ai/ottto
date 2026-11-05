@@ -256,7 +256,6 @@ pub struct LocalDaemon {
     footprint_cwds: Arc<context_footprint::CwdProjection>,
     codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
-    native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     relay_mismatch: Arc<otlp_relay::RelayMismatchDebounce>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -484,9 +483,6 @@ impl LocalDaemon {
             codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
                 snapshot_sync::home_dir().ok().as_deref(),
             )),
-            native_comparison: Arc::new(
-                snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
-            ),
             relay_mismatch: Arc::default(),
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
@@ -649,7 +645,7 @@ impl LocalDaemon {
         // perform settings I/O while holding the daemon state lock.
         let relay = self.state()?.relay.clone();
         let observed = otlp_relay::approved_endpoint_mismatch(&relay);
-        let mut status = {
+        let status = {
             let mut state = self.state()?;
             observe_scan_index_health_changes(&mut state);
             // Pair the relay finding with the same captured state and canonical
@@ -659,9 +655,6 @@ impl LocalDaemon {
             );
             status_from_state_with_relay_finding(&mut state, finding)
         };
-        if snapshots::claude_native_comparison::enabled() {
-            status.native_comparison = Some(self.native_comparison.status());
-        }
         Ok(status)
     }
 
@@ -3453,6 +3446,7 @@ fn local_health_capabilities(status: &DaemonStatus) -> Vec<String> {
         "service.reconcile".to_string(),
         "source.remove".to_string(),
         "backfill.v1".to_string(),
+        "source_control:v1".to_string(),
     ];
     for source in &status.sources {
         capabilities.push(format!("verify.{}", source_slug(&source.source)));

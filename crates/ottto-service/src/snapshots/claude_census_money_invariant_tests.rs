@@ -550,7 +550,7 @@ fn rename_keeps_whole_record() {
         .claude_request_census_mut_for_test()
         .insert_for_test(from, whole.clone());
     let total = index.claude_request_census_for_test().hash_total_for_test();
-    index.rekey_account_custody(from, to);
+    index.rekey_account_custody(from, to, None);
     let census = index.claude_request_census_for_test();
     assert_eq!(census.record_for_test(to), Some(&whole));
     assert!(census.record_for_test(from).is_none());
@@ -564,7 +564,7 @@ fn rename_keeps_whole_record() {
     index
         .claude_request_census_mut_for_test()
         .insert_for_test(to, own.clone());
-    index.rekey_account_custody(from, to);
+    index.rekey_account_custody(from, to, None);
     let census = index.claude_request_census_for_test();
     assert_eq!(census.record_for_test(to), Some(&own));
     assert!(census.record_for_test(from).is_none());

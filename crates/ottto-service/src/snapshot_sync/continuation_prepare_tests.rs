@@ -135,11 +135,6 @@ impl ContinuationFixture {
     fn preparation(&self, attribution: bool) -> SourcePreparation {
         let status = test_agent_status(SourceKind::Codex);
         SourcePreparation {
-            native_comparison_reservation: None,
-            native_comparison_lease: None,
-            prepared_claude_evidence: None,
-            terminal_native_traversal: None,
-            native_comparison_controller: None,
             retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
@@ -382,7 +377,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     assert!(prepared.legacy_reconciliation_pending.is_empty());
     assert!(prepared.active_legacy_reconciliation.is_empty());
     assert!(prepared.claude_scan_roots.is_none());
-    assert!(prepared.native_comparison_lease.is_none());
     assert!(prepared.scan.is_some());
 
     // The ordinary tail on the same loaded state (no hint, budget, save or
@@ -433,13 +427,17 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
 }
 
 /// A continuation page loads the upload ledger afresh and mirrors its open
-/// head-CAS challenges into the page's index, as the ordinary prepare does,
-/// so a session that owes an answer never continues from Tail state there.
+/// head-CAS challenges of sessions holding a saved base into the page's
+/// index, as the ordinary prepare does, so a session that owes an answer
+/// never continues from Tail state there.
 #[test]
 fn a_continuation_page_mirrors_an_open_head_conflict() {
     let fixture = ContinuationFixture::quiescent("continuation-head-conflict");
     let key = cache_session_key("synthetic-conflicted-session");
     let (mut progress, _) = fixture.load();
+    progress
+        .accepted_cache_heads
+        .insert(key.clone(), "e".repeat(64));
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {

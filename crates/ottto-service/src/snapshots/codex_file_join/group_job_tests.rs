@@ -1542,7 +1542,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     let replay = active.parser.accumulator.codex_tier_replay.take();
     let aliases = std::mem::take(&mut active.aliases);
     let receipts = std::mem::take(&mut active.applied_receipts);
-    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
     let cursor = active.cursor.take();
     assert!(active.group.is_some());
     assert!(!sampled_scan::borrows_only_retained_reduction(active));
@@ -1567,7 +1566,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     active.parser.accumulator.codex_tier_replay = replay;
     active.aliases = aliases;
     active.applied_receipts = receipts;
-    active.comparison_target = comparison_target;
     active.cursor = cursor;
     fs::remove_dir_all(root).unwrap();
 }
@@ -2224,28 +2222,21 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         assert!(matches!(boot.probe(0), Boot::Strict));
         assert_eq!(boot.charge, 0);
     });
+    // The shared boot boundary precedes the parser, member swap and legacy
+    // tee. Those internal helpers receive only members admitted here.
+    for position in 0..group.members.len() {
+        let mut boot = GroupBoot::new(group.clone(), &index);
+        boot.identified = position;
+        boot.group.members[position] = compressed.clone();
+        assert_refused(CodexZstCause::GroupReadUnsupported, || {
+            assert!(matches!(boot.identify(None, &index, None), Boot::Strict));
+            assert_eq!(
+                boot.identified, position,
+                "refused before member acquisition"
+            );
+        });
+    }
     let metadata = CodexTitleMetadata::default();
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(open_member_file(&mut compressed).is_err());
-        assert!(new_group_parser(
-            File::open(&compressed.path).unwrap(),
-            &compressed,
-            &metadata,
-            None,
-            codex_counting_version::AckEvidence::None
-        )
-        .is_err());
-        let expected =
-            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
-        assert!(legacy_tee(
-            &expected,
-            &compressed,
-            &File::open(&compressed.path).unwrap(),
-            &metadata,
-            None,
-        )
-        .is_err());
-    });
     let mut boot = GroupBoot::new(group, &index);
     loop {
         match boot.step(None, &index) {
@@ -2258,40 +2249,9 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
-
             index: &index,
         })
         .unwrap();
-    let before = active.parser.reader.consumed_bytes();
-    let group = active.group.as_deref_mut().unwrap();
-    group.current = 1;
-    group.members[1] = compressed;
-    let join = active
-        .parser
-        .accumulator
-        .codex_tier_replay
-        .as_mut()
-        .unwrap()
-        .join
-        .take()
-        .unwrap();
-    let no_scope = |_: &CandidateFile| None;
-    let inputs = StepInputs {
-        metadata: &metadata,
-        attribution: None,
-        live_scope: &no_scope,
-    };
-    assert_refused(CodexZstCause::GroupReadUnsupported, || {
-        assert!(matches!(
-            open_member(&mut active, join, &inputs),
-            Err(GroupEnd::Strict)
-        ));
-        assert_eq!(
-            active.parser.reader.consumed_bytes(),
-            before,
-            "swap never reset the reader"
-        );
-    });
     active.candidate.path.set_extension("jsonl.zst");
     let cache = Arc::new(SharedCache::default());
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {

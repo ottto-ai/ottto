@@ -59,11 +59,6 @@ impl Counts {
         c.contributions[N] = 0;
         (c.contributions, meta)
     }
-    pub(crate) fn summary_with_archive(&self, total: usize, archives: usize) -> Summary {
-        let (mut counts, meta) = self.summary(total);
-        counts[N] = archives;
-        (counts, meta)
-    }
 }
 pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String {
     let mut line = String::new();

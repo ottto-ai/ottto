@@ -31,6 +31,9 @@ mod codex_zst_downgrade_probe {
         assert_eq!(serde_json::to_value(&decoded.files).unwrap(), serde_json::to_value(&control.files).unwrap());
         assert_eq!(decoded.file_snapshot_fingerprints, control.file_snapshot_fingerprints);
         assert!(!decoded.file_snapshot_fingerprints.is_empty());
+        assert_eq!(decoded.accepted_snapshot_fingerprints.len(), 1, "only the carried ACKed body has credit");
+        assert!(decoded.files.keys().all(|key| key.ends_with(".jsonl.zst")), "both logical entries were carried");
+        assert!(decoded.files.values().all(|entry| entry.last_upload_body_witness.is_some()), "unACKed body witness is preserved too");
         assert_eq!(decoded.accepted_snapshot_fingerprints, control.accepted_snapshot_fingerprints);
         for entry in decoded.files.values() {
             assert_eq!(entry.scan_identity_version.as_deref(), Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION));
@@ -126,7 +129,8 @@ def main():
                          "ZST_OLD_DECODER_VERIFIED " + label)
         fixture_test(repo, "codex_compressed_input::tests::verify_codex_zst_downgrade_roundtrip", env)
         fixture_test(repo, "codex_compressed_input::tests::historical_census_saved_singleton_schedules_a1_on_reupgrade", env)
-        print(json.dumps({"status": "VERIFIED", "stable": STABLE, "base": args.base}))
+        print(json.dumps({"status": "VERIFIED", "stable": STABLE, "base": args.base,
+                          "guarantee": "decode-only; rollback scheduling, transcript reads and POSTs are not asserted"}))
 
 
 if __name__ == "__main__":

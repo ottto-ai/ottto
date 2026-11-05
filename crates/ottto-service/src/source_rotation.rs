@@ -11,127 +11,6 @@ pub(crate) const PARKED_BUDGET: usize = OVERLAP_BUDGET / 4;
 const TURN_STEPS: usize = 64;
 const TURN_TIME: Duration = Duration::from_millis(16);
 
-/// One moving reservation paid from the current rotation remainder. No Clone,
-/// persistence, independent allowance or second owner. Actual owned storage is
-/// counted by its containing graph; only unused future storage is charged here.
-pub(crate) struct PaidReservation {
-    total: usize,
-    allocated: usize,
-    remaining: Option<usize>,
-    recovery: usize,
-}
-impl PaidReservation {
-    pub(crate) fn from_remainder(
-        remaining: Option<usize>,
-        total: usize,
-        allocated: usize,
-    ) -> Option<Self> {
-        (allocated <= total && total <= remaining?).then_some(Self {
-            total,
-            allocated,
-            remaining,
-            recovery: 0,
-        })
-    }
-    /// Check BEFORE avoidable allocation. A failed request leaves all existing
-    /// recovery capacity owned and paid; it is never an instruction to drop it.
-    pub(crate) fn permits(&self, prospective_allocated: usize) -> bool {
-        prospective_allocated
-            .checked_add(self.recovery)
-            .is_some_and(|needed| needed <= self.total)
-    }
-    /// Replace future credit with actual owned storage after a bounded move or
-    /// allocation. The caller has already preflighted capacity with permits().
-    pub(crate) fn record_allocated(&mut self, allocated: usize) -> bool {
-        if !self.permits(allocated) {
-            return false;
-        }
-        self.allocated = allocated;
-        true
-    }
-    /// Refresh from the SAME rotation after the queue and retained process
-    /// owners. Unknown prevents new optional growth, while
-    /// the already-paid recovery promise remains owned.
-    pub(crate) fn at_turn(&mut self, remaining: Option<usize>) {
-        self.remaining = remaining;
-    }
-    pub(crate) fn allocated(&self) -> usize {
-        self.allocated
-    }
-    pub(crate) fn allocation_ceiling(&self) -> usize {
-        self.total
-    }
-    /// A private canonical constructor has dropped every temporary/result it
-    /// created. Release only its extra peak, retaining all capacity that was
-    /// funded before the call and every mandatory recovery promise.
-    pub(crate) fn release_temporary_peak(&mut self, previous_ceiling: usize) {
-        self.total = self
-            .total
-            .min(previous_ceiling.max(self.allocated + self.recovery));
-    }
-    pub(crate) fn grow_for(&mut self, prospective_allocated: usize) -> bool {
-        let Some(needed) = prospective_allocated.checked_add(self.recovery) else {
-            return false;
-        };
-        let total = self.total.max(needed);
-        if !self.remaining.is_some_and(|available| total <= available) {
-            return false;
-        }
-        self.total = total;
-        true
-    }
-    /// Protect mandatory selected-state restoration before any deferral or
-    /// offer. Later optional allocations cannot consume this unused credit.
-    pub(crate) fn reserve_recovery(&mut self, bytes: usize) -> bool {
-        let recovery = self.recovery.max(bytes);
-        let Some(needed) = self.allocated.checked_add(recovery) else {
-            return false;
-        };
-        let total = self.total.max(needed);
-        if !self.remaining.is_some_and(|available| total <= available) {
-            return false;
-        }
-        self.total = total;
-        self.recovery = recovery;
-        true
-    }
-    /// Mandatory recovery may use its existing credit even after the current
-    /// optional allowance becomes unknown. This grants no new allocation.
-    #[cfg(test)]
-    pub(crate) fn permits_recovery_peak(&self, prospective_allocated: usize) -> bool {
-        prospective_allocated <= self.total
-    }
-    pub(crate) fn recovery_is_reserved(&self) -> bool {
-        self.recovery != 0
-            && self
-                .allocated
-                .checked_add(self.recovery)
-                .is_some_and(|needed| needed <= self.total)
-    }
-    #[cfg(test)]
-    pub(crate) fn recovery_bytes_for_test(&self) -> usize {
-        self.recovery
-    }
-    #[cfg(test)]
-    pub(crate) fn remaining_for_test(&self) -> Option<usize> {
-        self.remaining
-    }
-    pub(crate) fn retire_speculation(&mut self) {
-        // Call only after speculative temporaries are gone and actual owned
-        // storage was reconciled. Never release protected recovery capacity.
-        self.total = self.allocated + self.recovery;
-    }
-    fn unused(&self) -> usize {
-        self.total - self.allocated
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for PaidReservation {
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        counter.add(self.unused())
-    }
-}
-
 pub(crate) enum Step<F, C> {
     Pending(F),
     Complete(C),
@@ -406,7 +285,7 @@ mod retained_budget_tests {
     }
 
     #[test]
-    fn native_comparison_local_refusal_never_finishes_source_and_siblings_progress() {
+    fn local_refusal_never_finishes_source_and_siblings_progress() {
         let mut owner = ProofOwner {
             refuse_at: Some(0),
             ..Default::default()
@@ -539,7 +418,7 @@ mod retained_budget_tests {
     }
 
     #[test]
-    fn native_comparison_remainder_reaches_prepare_step_finish() {
+    fn remainder_reaches_prepare_step_finish() {
         let mut owner = ProofOwner::default();
         run(&mut owner, &[0, 1], PARKED_BUDGET);
         let granted = |stage| {
@@ -559,7 +438,7 @@ mod retained_budget_tests {
     }
 
     #[test]
-    fn native_comparison_unknown_remainder_is_none_at_all_existing_owner_seams() {
+    fn unknown_remainder_is_none_at_all_existing_owner_seams() {
         let mut owner = ProofOwner {
             persistent_unknown: true,
             ..Default::default()
@@ -570,99 +449,6 @@ mod retained_budget_tests {
             owner.outcomes,
             vec![(0, true), (1, true)],
             "unknown optional budget preserves ordinary serial collection"
-        );
-    }
-
-    #[test]
-    fn native_comparison_paid_reservation_exact_limit_refusal_preserves_obligation() {
-        assert!(PaidReservation::from_remainder(None, 1, 0).is_none());
-        assert!(PaidReservation::from_remainder(Some(63), 64, 0).is_none());
-        assert!(PaidReservation::from_remainder(Some(64), 64, 65).is_none());
-        let mut paid = PaidReservation::from_remainder(Some(64), 64, 0).unwrap();
-        assert!(paid.permits(64));
-        assert!(!paid.permits(65));
-        assert!(!paid.record_allocated(65));
-        assert_eq!(
-            paid.unused(),
-            64,
-            "refusal does not abandon required future recovery"
-        );
-        assert!(paid.record_allocated(64));
-        assert_eq!(paid.unused(), 0);
-        assert!(paid.record_allocated(0));
-        assert_eq!(
-            paid.unused(),
-            64,
-            "freed storage remains paid until reservation retires"
-        );
-    }
-
-    #[test]
-    fn native_comparison_paid_recovery_cannot_be_spent_on_later_optional_growth() {
-        let mut paid = PaidReservation::from_remainder(Some(64), 32, 8).unwrap();
-        assert!(paid.reserve_recovery(16));
-        assert!(!paid.permits(17));
-        assert!(paid.grow_for(17));
-        assert!(paid.record_allocated(17));
-        assert_eq!(paid.unused(), 16);
-        assert!(!paid.reserve_recovery(48));
-        assert_eq!(
-            paid.unused(),
-            16,
-            "refused enlargement preserves the funded promise"
-        );
-        let before_constructor = paid.allocation_ceiling();
-        assert!(paid.grow_for(32));
-        paid.release_temporary_peak(before_constructor);
-        assert_eq!(paid.allocation_ceiling(), before_constructor);
-        assert_eq!(paid.unused(), 16, "temporary refund preserves recovery");
-        paid.at_turn(None);
-        assert!(
-            !paid.grow_for(17),
-            "unknown new allowance grants no optional growth"
-        );
-        assert!(paid.permits_recovery_peak(33));
-        assert!(!paid.permits_recovery_peak(34));
-        assert!(paid.record_allocated(8));
-        assert!(
-            paid.permits_recovery_peak(33),
-            "releasing storage cannot discard paid recovery"
-        );
-    }
-
-    #[test]
-    fn native_comparison_paid_reservation_replaces_charge_on_real_allocation_and_move() {
-        if !crate::heap_layout_bound::layout_supported() {
-            eprintln!("native_comparison_paid_reservation: supported_positive=UNEXECUTED");
-            return;
-        }
-        struct Reserved {
-            storage: Vec<u8>,
-            paid: PaidReservation,
-        }
-        crate::heap_layout_bound::fields!(Reserved; storage, paid);
-        let mut frame = Reserved {
-            storage: Vec::new(),
-            paid: PaidReservation::from_remainder(Some(4096), 4096, 0).unwrap(),
-        };
-        let bound = |value: &Reserved| crate::heap_layout_bound::bound(value, 8192).unwrap();
-        let before = bound(&frame);
-        assert!(frame.paid.permits(4096));
-        frame.storage.try_reserve_exact(4096).unwrap();
-        assert!(frame.paid.record_allocated(frame.storage.capacity()));
-        assert_eq!(
-            bound(&frame),
-            before,
-            "capacity replaces future credit, never double granted"
-        );
-        let mut completed = frame; // no reservation/storage clone
-        assert_eq!(bound(&completed), before);
-        drop(std::mem::take(&mut completed.storage));
-        assert!(completed.paid.record_allocated(0));
-        assert_eq!(
-            bound(&completed),
-            before,
-            "unused recovery remains part of the charge"
         );
     }
 }

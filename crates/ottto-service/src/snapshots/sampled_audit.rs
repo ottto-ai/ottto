@@ -7,6 +7,7 @@ use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
 use crate::transcript_cache::CACHE_ENTRIES;
 
 // v1 did not distinguish an ordinary Tail from a published FE prefix.
+#[cfg(test)]
 pub(super) const UNVERIFIED_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v1";
 const UNVERIFIED_STEM: &str = "semantic_sync:v2+sampled_unverified:";
 const PROVENANCE_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v2";

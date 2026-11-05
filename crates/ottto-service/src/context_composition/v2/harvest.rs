@@ -74,29 +74,6 @@ pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
     support_dir.join("context_composition").join(STATE_DIR)
 }
 
-/// A resumed source: its scope upload ACKs go, so its next daily run re-sends
-/// every kept scope. Scope state, pins, install records and run health stay.
-/// A running worker holds the lease, so busy is an error the resume retries.
-pub(crate) fn drop_upload_acks(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    let dir = state_dir(support_dir);
-    let scopes = dir.join("scopes");
-    let Some((_, source)) = source_order(0).into_iter().find(|(id, _)| *id == source) else {
-        return Ok(());
-    };
-    if !scopes.exists() {
-        return Ok(());
-    }
-    let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
-    for scope_id in disk_scopes(&dir, source) {
-        match fs::remove_file(super::upload::ack_path(&dir, source, &scope_id)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            removed => removed?,
-        }
-    }
-    super::checkpoint::sync_dir(&scopes)?;
-    Ok(())
-}
-
 // -------------------------------------------------------------------------
 // Loop and gate.
 // -------------------------------------------------------------------------
@@ -2671,6 +2648,73 @@ fn upload_other_scopes(
 pub(super) mod tests {
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
+
+    fn composition_reply(body: &'static str) -> (super::super::upload::UploadResult, bool) {
+        use super::super::{
+            aggregate::{day_of, Window},
+            file::Source,
+            scope::{Scope, ScopeInfo},
+            upload::{ack_path, upload_scope, UploadTarget},
+        };
+        let state = crate::test_scratch::private_dir("composition-upload-reply");
+        let (client, server) = crate::snapshot_client::config_upload_backend(body);
+        let mut uploader = super::ClientUploader {
+            client: &client,
+            relay_token: "synthetic-relay".to_string(),
+        };
+        let scope = Scope::new(
+            "synthetic-scope",
+            ScopeInfo {
+                workspace_hash: "synthetic-workspace".to_string(),
+                workspace_path: String::new(),
+                identity: Default::default(),
+                common_dir: None,
+            },
+        );
+        let mut target = UploadTarget {
+            uploader: &mut uploader,
+            machine_id: "synthetic-machine",
+            destination: "synthetic-destination",
+            policy: Default::default(),
+            details_enabled: false,
+            names_withheld: false,
+        };
+        let result = upload_scope(
+            &state,
+            Source::Claude,
+            &scope,
+            &mut target,
+            time::OffsetDateTime::now_utc(),
+            Window::ending(day_of(time::OffsetDateTime::now_utc().date())),
+        );
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("POST /api/v1/context-composition/snapshot "));
+        let acked = ack_path(&state, Source::Claude, &scope.scope_id).exists();
+        std::fs::remove_dir_all(state).unwrap();
+        (result, acked)
+    }
+
+    #[test]
+    fn source_disabled_refusal_is_not_a_receipt() {
+        let (result, acked) = composition_reply(r#"{"accepted":false,"reason":"source_disabled"}"#);
+        assert_eq!(result.outcome, super::super::upload::UploadOutcome::Failed);
+        assert!(result.receipt.is_none());
+        assert!(!acked);
+    }
+
+    #[test]
+    fn composition_newer_capture_reply_still_acks() {
+        let (result, acked) =
+            composition_reply(r#"{"accepted":false,"daily_rollup_rows_written":0}"#);
+        assert_eq!(
+            result.outcome,
+            super::super::upload::UploadOutcome::Uploaded
+        );
+        assert_eq!(result.receipt.unwrap().rows_written, Some(0));
+        assert!(acked);
+    }
 
     thread_local! {
         static FAIL_SCOPE_COMMIT: Cell<bool> = const { Cell::new(false) };

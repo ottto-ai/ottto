@@ -17,7 +17,6 @@ fn state_bytes() -> usize {
 }
 
 pub(super) mod codex_cursor;
-pub(crate) use codex_cursor::ArchivePass;
 #[cfg(unix)]
 mod retired_records;
 #[cfg(all(test, unix))]
@@ -761,11 +760,10 @@ pub(super) fn releases_at_completion(active: &OwnedActiveFile, index: &ScanIndex
         }) && sampled_singleton(active))
 }
 
-/// One file on its own plan: no comparison, cursor job, group, alias, receipt
+/// One file on its own plan: no cursor job, group, alias, receipt
 /// or tier join. Each conjunct is checked even where another implies it today.
 fn sampled_singleton(active: &OwnedActiveFile) -> bool {
-    !active.comparison_target
-        && active.cursor.is_none()
+    active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()
         && active.applied_receipts.is_empty()
@@ -2191,34 +2189,8 @@ pub(super) fn new_source_parser(
         identity_capture,
         cache,
     } = options;
-    let input = if source == SnapshotSource::Codex
-        && is_compressed_codex_rollout(Some(&candidate.path), None)
-    {
-        let key = local_index_key(&candidate.path);
-        anyhow::ensure!(
-            index.archives.get(&key).is_some_and(|a| a.ready_full()),
-            "archive reservation unavailable"
-        );
-        let input = cache
-            .map(|c| OpenedInput::funded(file, c))
-            .transpose()?
-            .flatten()
-            .ok_or(codex_compressed_input::ArchiveAdmissionYield)?;
-        let attempts = index
-            .archives
-            .get(&key)
-            .and_then(|a| a.work.as_ref())
-            .map_or(0, |w| w.attempts);
-        crate::local_resource_diagnostics::traversal_point(
-            if attempts > 1 {
-                "codex_zst_first_read_retry"
-            } else {
-                "codex_zst_first_read"
-            },
-            "codex",
-            &serde_json::json!({"full_attempts":1}),
-        );
-        input
+    let input = if source == SnapshotSource::Codex {
+        OpenedInput::encoded(file, &candidate.path, cache)?
     } else {
         OpenedInput::plain(file)
     };

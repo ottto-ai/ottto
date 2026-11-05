@@ -260,7 +260,6 @@ struct ReofferPipeline {
     transport: crate::net_resilience::TransportCycleOutcome,
     retry: live_snapshot_retry::LiveRetryOwner,
     _guards: Vec<EnvVarGuard>,
-    _native: crate::snapshots::claude_native_comparison::TestScope,
 }
 
 impl ReofferPipeline {
@@ -275,7 +274,6 @@ impl ReofferPipeline {
 
     fn build(name: &str, first: Answer, start: u64, capture: bool) -> Self {
         let fixture = IdentityPipelineHome::new();
-        let native = crate::snapshots::claude_native_comparison::enable_for_test();
         let cadence = IdentityPipelineCadence::new();
         let support = fixture.base.join(format!("{name}-support"));
         let secrets = fixture.base.join(format!("{name}-secrets"));
@@ -312,7 +310,6 @@ impl ReofferPipeline {
             transport: crate::net_resilience::TransportCycleOutcome::default(),
             retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _guards: guards,
-            _native: native,
         }
     }
 
@@ -358,7 +355,7 @@ impl ReofferPipeline {
             .prepare_cycle(now)
             .unwrap()
             .expect("real due preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame);
+        let (preparation, index, scan) = collect_preparation_with_rotation(frame);
         assert_eq!(
             scan.census_complete, complete,
             "synthetic census is complete unless authority debt withholds it"
@@ -1267,7 +1264,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             String::as_str,
             |_| body.clone(),
             |_| Some("synthetic-session"),
-            |_| false,
+            |_| 0,
             |_| None,
             &mut budget,
             |items| {
@@ -1340,8 +1337,9 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
 }
 
 /// After a restart, the first real ordinary prepare mirrors an open head-CAS
-/// challenge from the persisted upload ledger into the scan index, so the
-/// session's files read a native Full; another session is not mirrored.
+/// challenge of a session holding a saved base from the persisted upload
+/// ledger into the scan index, so the session's files read a native Full;
+/// another session is not mirrored.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -1356,6 +1354,9 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
     assert!(first.result.is_ok(), "{:?}", first.result);
     let key = cache_session_key(IDENTITY_PIPELINE_ROOT);
     let mut progress = first.progress.clone();
+    progress
+        .accepted_cache_heads
+        .insert(key.clone(), "e".repeat(64));
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {

@@ -191,6 +191,7 @@ impl Fixture {
                 list_all,
                 true,
                 &[],
+                None,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),
@@ -1562,3 +1563,23 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
 }
 
 mod codex_archive_tests;
+
+/// [regress] A positive remove hint in a retained Codex generation retires
+/// this listing's absent key even if an earlier page observed it.
+#[test]
+fn codex_current_listing_removal_retires_an_earlier_generation_observation() {
+    let f = Fixture::new();
+    let index = f.retained_codex();
+    let key = local_index_key(&f.path);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&key));
+    assert!(index.files.contains_key(&key));
+    fs::remove_file(&f.path).unwrap();
+    let (index, _, _, _) =
+        f.page_hinted(SnapshotSource::Codex, index, std::slice::from_ref(&f.path));
+    assert!(!index.files.contains_key(&key));
+}

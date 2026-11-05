@@ -1,5 +1,7 @@
 # Permanent-refusal source finish
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 A completed Claude source cycle can settle transport while retaining exact
 permanent refusals as visible error debt. Its permanent-success return used to
 bypass the common native-comparison lease finalizer, even when the cycle had

@@ -24,6 +24,29 @@ file-system hint / periodic listing → select file → read new bytes from save
   by cause. Re-reading unchanged content that was already uploaded is treated as a bug.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
+- **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
+  ordinary first-read selection, reducer, modification-time age rules and decoded-byte page
+  budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
+  inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
+  census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
+  population/read-volume limit. Compressed rollouts keep their original modification time,
+  so they age as the plain file did. Legacy held archive member keys count as already seen
+  for the ordinary first-read age gate; their values remain inert, and header/ownership
+  admission still applies. A provider-written new plaintext object takes the existing
+  counted Full path; only a returning original object can continue from its saved suffix.
+  A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
+  EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
+- **Codex ownership.** One secure header opener supplies ordinary membership proof for either
+  encoding. A failure holds its file and decisions depending on it; an unknown header remains
+  a wildcard over every potentially colliding owner. Any missing header/listing proof still
+  prevents absence-based counting-evidence collection. Boundary validation covers surviving
+  singleton sessions and joined groups across registered homes. A header owner that changes
+  during a pass holds that pass’s Codex publication until revalidation on the next pass.
+  A proven compression or same-object move commits the old and new graph closures
+  and Tail keys together during preparation; RAM adopts the destination after COMMIT.
+  A refused carry holds only its predecessor's proven owner and counts as inventory debt.
+  A rollout moved while a reader owns it waits for a later pass. Multi-file compressed
+  sessions remain unsupported for grouped replay.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
@@ -59,6 +82,17 @@ non-permanent reasons hold their entity without invalidating sibling ACKs. See
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
   retried, never via full erasure.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
+- Proven Codex compression and same-object relocation carry the existing logical state,
+  fingerprints, exact ACK/context facts and debt without reading or uploading. Compression
+  proof is an absent plaintext predecessor and its exact same-directory `.zst` sibling with
+  the same session identity; a relocation requires physical object/content equality. The old
+  and new graph closures, Tail keys, fragments and head binding move in one rollback unit of
+  the ordinary save. A failed save exposes the complete old or complete new state.
+  A provider-written new plaintext object follows the existing replaced-file path: one counted
+  Full and one whole-session replacement. Returning the original object retains ordinary Tail
+  continuation. The old archive catalogue entries remain accepted and inert; their physical rows
+  are neither hydrated nor rewritten, and old field/cause ordinals and formats stay unchanged.
+  Compatibility with older binaries is decode-only; older scheduling may replay retained work.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
@@ -153,11 +187,11 @@ sent.
 The Companion session list uses local titles and workspace labels before upload filtering.
 Erasure (retirement, uninstall) reaches every store and is counted when it fails.
 Source removal, grant loss, logout, account switch and forget installation only stop
-collection and keep local state; re-enabling a source resumes from it and drops only
-that source's upload witnesses. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
+collection and keep local state; re-enabling a source resumes from it and drops
+nothing, so nothing already sent is re-sent. User-facing detail: [docs/privacy.md](../../docs/privacy.md).
 
 Local collection never depends on an upload setting. No read-side identity (file scope, Codex
-group scope, traversal, memos, tier receipts, archives) includes a setting, the attribution key, a
+group scope, traversal, memos, tier receipts) includes a setting, the attribution key, a
 server capability or the replay directive; the upload filter applies them at send. Delivery proofs
 keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
 file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
