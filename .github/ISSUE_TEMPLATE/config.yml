@@ -1,11 +1,14 @@
 blank_issues_enabled: true
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/ottto-ai/ottto/blob/main/SECURITY.md
-    about: Do not open a public issue. Follow the private reporting steps in SECURITY.md.
-  - name: Account, billing, or organization help
+    url: https://github.com/ottto-ai/ottto/security/advisories/new
+    about: Report privately on GitHub, or email security@ottto.net. Do not open a public issue. See SECURITY.md.
+  - name: Report a code of conduct concern
+    url: https://github.com/ottto-ai/ottto/blob/main/CODE_OF_CONDUCT.md#reporting-an-issue
+    about: Email conduct@ottto.net. Reports are handled privately.
+  - name: Account, billing, or private help
     url: https://github.com/ottto-ai/ottto/blob/main/SUPPORT.md
-    about: Use the support contacts in SUPPORT.md for anything private.
+    about: Anything tied to your Ottto account or organization goes to support@ottto.net, not a public issue.
   - name: Documentation
     url: https://github.com/ottto-ai/ottto/blob/main/docs/README.md
     about: Install, setup, privacy, diagnostics, and troubleshooting guides.
