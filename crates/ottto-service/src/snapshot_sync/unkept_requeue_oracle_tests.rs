@@ -1147,6 +1147,12 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 let mut expected = cold.snapshots.clone();
                 let body = expected.get_mut(entity).unwrap();
                 let actual = &final_route.snapshots[entity];
+                assert!(body.get("context_posture_withheld").is_none());
+                assert_eq!(actual["context_posture_withheld"], "unknown_birth");
+                body.as_object_mut().unwrap().insert(
+                    "context_posture_withheld".into(),
+                    serde_json::json!("unknown_birth"),
+                );
                 for field in [
                     "cache_observations",
                     "compaction_count",
