@@ -1016,6 +1016,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         terminal_unix_seconds: at,
         event_clock_complete: true,
         marker,
+        spanless_first: false,
     }
 }
 
@@ -3951,8 +3952,19 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
 
-/// [money] Request-local login requires a complete, original root's first response.
-/// Positive rows deliberately fail until the request-local classifier rule ships.
+/// RFC 3339 `offset` seconds from the span-less first-request cutoff.
+fn spanless_clock(offset: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(
+        i64::try_from(identity::SPANLESS_FIRST_REQUEST_FROM).unwrap() + offset,
+    )
+    .unwrap()
+    .format(&Rfc3339)
+    .unwrap()
+}
+
+/// [money] Request-local login requires an original root's first response,
+/// judged on the prefix up to it: later id-less or multi-iteration responses
+/// never revoke it.
 #[test]
 fn spanless_first_request_own_login_classifier_table() {
     with_max_gated_claude_revision(3, || {
@@ -3960,13 +3972,16 @@ fn spanless_first_request_own_login_classifier_table() {
         for case in [
             "file-first",
             "login-only",
+            "id-less-after",
+            "multi-iteration-after",
+            "progressive-first",
+            "zero-usage-before",
             "resume-switch",
             "fork-parent",
             "inherited-prefix",
             "subagent-file",
             "id-less-first",
             "repeated-response-id",
-            "incomplete-transcript",
             "empty-client-id",
             "duplicate-rows",
             "cross-root",
@@ -3977,13 +3992,25 @@ fn spanless_first_request_own_login_classifier_table() {
             "pre-cutoff",
         ] {
             let dir = temp_dir(&format!("spanless-own-login-{case}"));
-            let at = if case == "pre-cutoff" {
-                "2026-11-05T23:59:59Z"
-            } else {
-                "2026-11-06T00:00:00Z"
-            };
+            let at = &spanless_clock(if case == "pre-cutoff" { -1 } else { 0 });
             let mut lines = vec![owned_response("first", at, 10, 1)];
             match case {
+                "id-less-after" => {
+                    let mut later = owned_response("no-id", &spanless_clock(1), 3, 1);
+                    later.as_object_mut().unwrap().remove("requestId");
+                    lines.push(later);
+                }
+                "multi-iteration-after" => {
+                    let mut later = owned_response("later", &spanless_clock(1), 10, 10);
+                    later["message"]["usage"]["iterations"] = json!([
+                        {"input_tokens": 5, "output_tokens": 5},
+                        {"input_tokens": 5, "output_tokens": 5}
+                    ]);
+                    lines.push(later);
+                }
+                // One response written as two progressive records.
+                "progressive-first" => lines.insert(0, owned_response("first", at, 10, 0)),
+                "zero-usage-before" => lines.insert(0, api_error_response(Some("zero"), at)),
                 "resume-switch" => lines.insert(0, owned_response("earlier", at, 3, 1)),
                 "fork-parent" => lines.insert(
                     0,
@@ -4013,8 +4040,14 @@ fn spanless_first_request_own_login_classifier_table() {
             if case == "subagent-file" {
                 raw.source_session_id = format!("{ROOT}_agent-child");
             }
-            if case == "incomplete-transcript" {
-                raw.claude_context_curve_request_index_complete = false;
+            // The file-wide shape flags fall; the prefix verdict stands.
+            match case {
+                "id-less-after" => assert!(!raw.claude_context_curve_identity_complete),
+                "multi-iteration-after" => {
+                    assert!(!raw.claude_context_curve_request_index_complete);
+                }
+                "progressive-first" => assert_eq!(raw.request_count, 1),
+                _ => {}
             }
             if case == "bad-clock" {
                 raw.claude_usage_occurrences
@@ -4079,14 +4112,22 @@ fn spanless_first_request_own_login_classifier_table() {
             let evidence = ScanEvidence::new(&api, &traces, roots).with_scope(&cross);
             identity::apply_scan(&mut items, &evidence, BTreeMap::new());
             let tagged = items[0].request_evidence.iter().any(|entry| {
-                entry.identity_basis
-                    == if case == "login-only" {
-                        identity::TELEMETRY_LOGIN
-                    } else {
-                        identity::TELEMETRY
-                    }
+                entry.account_source.is_none()
+                    && entry.identity_basis
+                        == if case == "login-only" {
+                            identity::TELEMETRY_LOGIN
+                        } else {
+                            identity::TELEMETRY
+                        }
             });
-            let expected = matches!(case, "file-first" | "login-only");
+            let expected = matches!(
+                case,
+                "file-first"
+                    | "login-only"
+                    | "id-less-after"
+                    | "multi-iteration-after"
+                    | "progressive-first"
+            );
             if tagged != expected {
                 failures.push(case);
             }
@@ -4096,5 +4137,45 @@ fn spanless_first_request_own_login_classifier_table() {
             failures.is_empty(),
             "request-local classifier rows: {failures:?}"
         );
+    });
+}
+
+/// [money] A Desktop span-less first response: the fold and the recent
+/// activity path read one verdict, accepted from the cutoff and refused before.
+#[test]
+fn spanless_first_request_desktop_fold_and_activity_agree() {
+    with_max_gated_claude_revision(3, || {
+        for (offset, accepted) in [(0, true), (-1, false)] {
+            let dir = temp_dir(&format!("spanless-desktop-{accepted}"));
+            let at = spanless_clock(offset);
+            let mut first = owned_response("first", &at, 10, 1);
+            first["entrypoint"] = json!("claude-desktop");
+            let mut raw = parse_ordinary_session(&dir, &[marker(ORG_1), first]).remove(0);
+            raw.collected_at = spanless_clock(offset + 30);
+            let original = SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: Some(OWNER_A.into()),
+                provider_workspace_hash: Some(org_hash(ORG_1)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("complete"),
+                source_created_at: Some(spanless_clock(offset - 1)),
+            };
+            let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
+            row.observed_at.clone_from(&at);
+            row.request_identity = Some(org_identity(&org_hash(ORG_1)));
+            let (api, traces) = reports(vec![signed(row)], vec![]);
+            let evidence = ScanEvidence::new(&api, &traces, BTreeSet::new());
+            let activity =
+                identity::collect_request_owned_activity(&raw, &evidence, Some(&original));
+            let mut items = vec![raw];
+            identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
+            let fold = items[0].request_evidence.iter().any(|entry| {
+                entry.identity_basis == identity::TELEMETRY && entry.account_source.is_none()
+            });
+            let recent = activity.at(OWNER_A, &org_hash(ORG_1)).is_some();
+            assert_eq!((fold, recent), (accepted, accepted), "{at}");
+            let _ = fs::remove_dir_all(dir);
+        }
     });
 }
