@@ -3950,3 +3950,151 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
+
+/// [money] Request-local login requires a complete, original root's first response.
+/// Positive rows deliberately fail until the request-local classifier rule ships.
+#[test]
+fn spanless_first_request_own_login_classifier_table() {
+    with_max_gated_claude_revision(3, || {
+        let mut failures = Vec::new();
+        for case in [
+            "file-first",
+            "login-only",
+            "resume-switch",
+            "fork-parent",
+            "inherited-prefix",
+            "subagent-file",
+            "id-less-first",
+            "repeated-response-id",
+            "incomplete-transcript",
+            "empty-client-id",
+            "duplicate-rows",
+            "cross-root",
+            "unreadable-owner",
+            "foreign-owner",
+            "bad-clock",
+            "bad-org",
+            "pre-cutoff",
+        ] {
+            let dir = temp_dir(&format!("spanless-own-login-{case}"));
+            let at = if case == "pre-cutoff" {
+                "2026-11-05T23:59:59Z"
+            } else {
+                "2026-11-06T00:00:00Z"
+            };
+            let mut lines = vec![owned_response("first", at, 10, 1)];
+            match case {
+                "resume-switch" => lines.insert(0, owned_response("earlier", at, 3, 1)),
+                "fork-parent" => lines.insert(
+                    0,
+                    json!({"type":"fork-context-ref", "sessionId":ROOT,
+                    "parentSessionId":OTHER_ROOT, "timestamp":at}),
+                ),
+                "inherited-prefix" => lines.insert(
+                    0,
+                    json!({"type":"assistant", "sessionId":ROOT,
+                    "timestamp":at, "forkedFrom":{"sessionId":OTHER_ROOT,"messageUuid":"copied"},
+                    "message":{"id":"copied","model":"claude-haiku-4-5",
+                    "usage":{"input_tokens":3,"output_tokens":1}}}),
+                ),
+                "id-less-first" => {
+                    let mut first = owned_response("no-id", at, 3, 1);
+                    first.as_object_mut().unwrap().remove("requestId");
+                    lines.insert(0, first);
+                }
+                "repeated-response-id" => {
+                    let mut repeated = owned_response("first", at, 3, 1);
+                    repeated["message"]["id"] = json!("distinct-response");
+                    lines.push(repeated);
+                }
+                _ => {}
+            }
+            let mut raw = parse_ordinary_session(&dir, &lines).remove(0);
+            if case == "subagent-file" {
+                raw.source_session_id = format!("{ROOT}_agent-child");
+            }
+            if case == "incomplete-transcript" {
+                raw.claude_context_curve_request_index_complete = false;
+            }
+            if case == "bad-clock" {
+                raw.claude_usage_occurrences
+                    .get_mut("first")
+                    .unwrap()
+                    .event_clock_complete = false;
+            }
+            let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
+            row.observed_at = at.into();
+            if case != "login-only" {
+                row.request_identity = Some(org_identity(D64));
+            }
+            if case == "empty-client-id" {
+                row.client_request_id.clear();
+            }
+            if case == "bad-org" {
+                row.request_identity
+                    .as_mut()
+                    .unwrap()
+                    .organization
+                    .disposition = crate::claude_local_otel::ClaudeIdentityDisposition::Conflict;
+            }
+            let row = signed(row);
+            let (mut api, mut traces) = reports(vec![row.clone()], vec![]);
+            if case == "duplicate-rows" {
+                api.evidence.get_mut(ROOT).unwrap().push(row);
+            }
+            if case == "cross-root" {
+                api.evidence.insert(
+                    OTHER_ROOT.into(),
+                    vec![signed(complete_api_row(OTHER_ROOT, "first", 1, 10, 1, 0))],
+                );
+            }
+            if case == "foreign-owner" {
+                traces
+                    .evidence
+                    .get_mut(ROOT)
+                    .unwrap()
+                    .push(complete_trace_row(ROOT, "first", "foreign"));
+            }
+            // A named owner with an unreadable sidecar is not an absent owner.
+            let roots = if case == "unreadable-owner" {
+                BTreeSet::from([OTHER_ROOT.to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+            let mut items = vec![raw];
+            let parents = if case == "unreadable-owner" {
+                vec![(ROOT.to_owned(), OTHER_ROOT.to_owned())]
+            } else {
+                vec![]
+            };
+            let scope = super::super::claude_cross_root_evidence::EvidenceScope::of_page(
+                &items,
+                &ScanIndex::default(),
+                &root_set(),
+                parents,
+                &api.evidence,
+            );
+            let cross =
+                super::super::claude_cross_root_evidence::CrossRootEvidence::new(&items, scope);
+            let evidence = ScanEvidence::new(&api, &traces, roots).with_scope(&cross);
+            identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+            let tagged = items[0].request_evidence.iter().any(|entry| {
+                entry.identity_basis
+                    == if case == "login-only" {
+                        identity::TELEMETRY_LOGIN
+                    } else {
+                        identity::TELEMETRY
+                    }
+            });
+            let expected = matches!(case, "file-first" | "login-only");
+            if tagged != expected {
+                failures.push(case);
+            }
+            let _ = fs::remove_dir_all(dir);
+        }
+        assert!(
+            failures.is_empty(),
+            "request-local classifier rows: {failures:?}"
+        );
+    });
+}
