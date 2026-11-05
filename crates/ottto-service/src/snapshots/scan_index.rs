@@ -2,12 +2,15 @@
 //! records, per-file entries, source fingerprints and the canonical file-set
 //! digests it records.
 
+mod accounts;
 pub(super) mod entry;
 pub(super) mod file_set_digest;
+mod historical_replay;
 mod load;
 pub(super) mod save;
 pub(super) mod serde_lenient;
 pub(super) mod source_fingerprint;
+mod test_accessors;
 
 use super::*;
 use super::{
