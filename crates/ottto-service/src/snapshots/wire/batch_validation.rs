@@ -1,12 +1,16 @@
 //! Validation of a snapshot batch request before upload: schema version,
 //! source, fingerprints, and the per-item and per-batch wire sizes.
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::content_hash::{
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
     snapshot_semantic_envelope,
 };
-use super::{SnapshotBatchRequest, SnapshotItemWire};
+use super::{SnapshotBatchRequest, SnapshotItem, SnapshotItemWire};
 use crate::snapshots::{
-    snapshot_source_from_api_slug, validate_snapshot_item, MAX_SEMANTIC_ENVELOPE_BYTES,
+    row_key_from_model_usage, snapshot_source_from_api_slug, usage_totals_equal,
+    usage_totals_from_item, usage_totals_from_model_usage, usage_totals_has_usage, RowKey,
+    UsageTotals, MAX_COMPACTION_TIMESTAMPS, MAX_MODEL_USAGE_ROWS, MAX_SEMANTIC_ENVELOPE_BYTES,
     MAX_SNAPSHOT_BATCH_WIRE_BYTES, MAX_SNAPSHOT_ITEM_WIRE_BYTES, SNAPSHOT_SCHEMA_VERSION,
 };
 
@@ -71,5 +75,103 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
             "snapshot batch wire body is {batch_size} bytes; maximum is {MAX_SNAPSHOT_BATCH_WIRE_BYTES}"
         ));
     }
+    Ok(())
+}
+
+pub(in crate::snapshots) fn validate_snapshot_item(
+    index: usize,
+    item: &SnapshotItem,
+) -> Result<(), String> {
+    if item.model_usage.len() > MAX_MODEL_USAGE_ROWS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
+        ));
+    }
+    if item.compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
+        ));
+    }
+    if item.compaction_events.len() > MAX_COMPACTION_TIMESTAMPS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_events"
+        ));
+    }
+    crate::session_attribution::validate_fact_limits(&item.attribution_facts)
+        .map_err(|error| format!("snapshot[{index}] {error}"))?;
+    let expected = usage_totals_from_item(item);
+    let expected_has_usage = usage_totals_has_usage(&expected);
+    if expected_has_usage && item.usage_buckets.is_empty() {
+        return Err(format!(
+            "snapshot[{index}] has usage totals but no usage_buckets"
+        ));
+    }
+
+    let mut top_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
+    for row in &item.model_usage {
+        let row_key = row_key_from_model_usage(row);
+        if top_rows
+            .insert(row_key, usage_totals_from_model_usage(row))
+            .is_some()
+        {
+            return Err(format!(
+                "snapshot[{index}] has duplicate top-level model_usage rows"
+            ));
+        }
+    }
+
+    let mut bucket_totals = UsageTotals::default();
+    let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
+    for (bucket_index, bucket) in item.usage_buckets.iter().enumerate() {
+        if bucket.model_usage.len() > MAX_MODEL_USAGE_ROWS {
+            return Err(format!(
+                "snapshot[{index}].usage_buckets[{bucket_index}] has more than {MAX_MODEL_USAGE_ROWS} model_usage rows"
+            ));
+        }
+        if bucket.model_usage.is_empty() {
+            return Err(format!(
+                "snapshot[{index}].usage_buckets[{bucket_index}] has no model_usage rows"
+            ));
+        }
+        let mut seen_bucket_rows = BTreeSet::new();
+        for row in &bucket.model_usage {
+            let row_key = row_key_from_model_usage(row);
+            if !seen_bucket_rows.insert(row_key.clone()) {
+                return Err(format!(
+                    "snapshot[{index}].usage_buckets[{bucket_index}] has duplicate model_usage rows"
+                ));
+            }
+            let totals = usage_totals_from_model_usage(row);
+            if !bucket_totals.add(&totals) || !bucket_rows.entry(row_key).or_default().add(&totals)
+            {
+                return Err(format!(
+                    "snapshot[{index}] usage_buckets counters overflow wire bounds"
+                ));
+            }
+        }
+    }
+
+    if !usage_totals_equal(&bucket_totals, &expected) {
+        return Err(format!(
+            "snapshot[{index}] usage_buckets totals do not match snapshot totals"
+        ));
+    }
+
+    if !bucket_rows.is_empty() {
+        if top_rows.keys().collect::<Vec<_>>() != bucket_rows.keys().collect::<Vec<_>>() {
+            return Err(format!(
+                "snapshot[{index}] usage_buckets model rows do not match top-level model_usage rows"
+            ));
+        }
+        for (row_key, top_totals) in &top_rows {
+            let bucket_row = bucket_rows.get(row_key).expect("checked key set");
+            if !usage_totals_equal(bucket_row, top_totals) {
+                return Err(format!(
+                    "snapshot[{index}] usage_buckets model row totals do not match top-level model_usage"
+                ));
+            }
+        }
+    }
+
     Ok(())
 }

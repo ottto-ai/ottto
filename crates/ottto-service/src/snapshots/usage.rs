@@ -1,5 +1,10 @@
 //! Provider price lines: the per-model prompt-length lines every source
 //! stamps its per-request `context_bucket` from, and the bucket rule itself.
+//!
+//! `cache_observations` prepares the cache-observation upload state of one
+//! item against its acknowledged predecessor.
+
+pub(super) mod cache_observations;
 
 use super::rfc3339_unix_seconds;
 use super::scan::limits::in_codex_forward_evidence_epoch;

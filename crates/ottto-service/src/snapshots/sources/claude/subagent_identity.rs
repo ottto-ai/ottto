@@ -2,7 +2,6 @@
 //! parent session's tree, and the agent metadata and workflow labels read
 //! from the provider's sidecars.
 
-use crate::snapshots::claude_usage_sidecars_fingerprint;
 use crate::snapshots::scan::json_fields::{string_at, string_eq_at};
 use crate::snapshots::scan_index::file_set_digest::sha256_hex;
 use serde_json::Value;
@@ -373,6 +372,22 @@ pub(in crate::snapshots) fn claude_subagent_sidecar_fingerprint(
         &manifest_stat,
         &effort_fingerprint,
     ])
+}
+
+pub(in crate::snapshots) fn claude_usage_sidecars_fingerprint(
+    support_dir: &Path,
+    session_id: &str,
+) -> String {
+    let api = crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id);
+    let trace = crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+        support_dir,
+        session_id,
+    );
+    if api.is_empty() && trace.is_empty() {
+        String::new()
+    } else {
+        sha256_hex(&["claude_usage_sidecars:v1", api.as_str(), trace.as_str()])
+    }
 }
 
 /// Conservative allowlist for provider-supplied identifiers that become

@@ -14,6 +14,20 @@ use crate::snapshots::{SessionAccountBinding, SnapshotItem};
 use serde_json::Value;
 use std::path::Path;
 
+pub(in crate::snapshots) fn codex_rows_all(
+    item: &SnapshotItem,
+    mode: impl Fn(Option<&str>) -> bool,
+) -> bool {
+    let mut rows = item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter()),
+    );
+    rows.next()
+        .is_some_and(|row| mode(row.auth_mode.as_deref()))
+        && rows.all(|row| mode(row.auth_mode.as_deref()))
+}
+
 /// A Codex item's complete positive creator pair: (account, workspace).
 pub(crate) fn codex_creator_pair(item: &SnapshotItem) -> Option<(&str, &str)> {
     let evidence = item.session_account_evidence.as_ref().filter(|evidence| {
