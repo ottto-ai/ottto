@@ -200,14 +200,7 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for case in [
-        "missing",
-        "malformed",
-        "unknown",
-        "wrong_body",
-        "count",
-        "overlap",
-    ] {
+    for case in ["missing", "malformed", "unknown", "count", "overlap"] {
         let items = items(3);
         let mut ledger = progress();
         let mut accepted = 0;
@@ -229,9 +222,6 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
                     }
                     "unknown" => {
                         ack.entity_ack_contract = Some("future:v9".into());
-                    }
-                    "wrong_body" => {
-                        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
                     }
                     "count" => {
                         ack.accepted = 3;
@@ -256,6 +246,52 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         assert_eq!(accepted, 0);
         assert!(ledger.accepted_body_witnesses.is_empty());
         assert!(ledger.quarantined_fingerprints.is_empty());
+    }
+    // A wrong body witness names its own ref: only that body is set aside,
+    // never certified, and its siblings settle from their own exact ACK.
+    let items = items(3);
+    let mut ledger = progress();
+    let mut accepted = 0;
+    let mut sends = 0;
+    let mut refused = None;
+    let outcome = upload_resumable_batches_with_body_witness(
+        &items,
+        "codex",
+        &mut ledger,
+        &mut accepted,
+        |i| i.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            sends += 1;
+            let mut ack = response(&batch, 0);
+            if sends == 1 {
+                // `response` reverses order: accepted_entities[0] is batch[1].
+                ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+                refused = Some(batch[1].clone());
+            }
+            ack.validate_entity_ack(&request(batch))?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(sends, 2);
+    assert_eq!(accepted, 2);
+    let refused = refused.unwrap().snapshot_fingerprint;
+    assert!(!ledger.accepted_body_witnesses.contains_key(&refused));
+    assert_eq!(
+        ledger.quarantined_fingerprints[&refused].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert_eq!(ledger.quarantined_fingerprints.len(), 1);
+    for item in items.iter().filter(|i| i.snapshot_fingerprint != refused) {
+        assert_eq!(
+            ledger
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint),
+            Some(&snapshot_upload_body_witness(item))
+        );
     }
 }
 
@@ -1543,7 +1579,8 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
     let mut ledger = progress();
     let saves = std::cell::Cell::new(0usize);
     let saves_before_cas = std::cell::Cell::new(None);
-    let error = bootstrap_cache_heads(
+    let mut refusals = Vec::new();
+    let deferred = bootstrap_cache_heads(
         &probes,
         "h360-witness",
         &mut ledger,
@@ -1561,26 +1598,35 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
                     reference.body_witness_digest = Some("0".repeat(64));
                 }
             }
-            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
-            Ok(ack)
+            let checked = ack.validate_entity_ack_with_head_cas(&request(batch), cas);
+            if let Err(error) = &checked {
+                assert_eq!(
+                    snapshot_upload_error_class(error),
+                    Some(SnapshotUploadErrorClass::BackendResponse)
+                );
+                refusals.push(upload_failure_diagnostic(error));
+            }
+            checked.map(|()| ack)
         },
         |_| {
             saves.set(saves.get() + 1);
             Ok(())
         },
     )
-    .unwrap_err();
+    .unwrap();
     assert_eq!(
-        snapshot_upload_error_class(&error),
-        Some(SnapshotUploadErrorClass::BackendResponse)
+        refusals,
+        ["kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"]
     );
+    // The refused probe names its own ref: it is set aside under its bounded
+    // retry with one save, and no head is minted.
+    assert_eq!(deferred, 1);
     assert_eq!(
-        upload_failure_diagnostic(&error),
-        "kind=backend_response, detail=snapshot ACK lacks exact durable context curve body witness proof"
+        saves_before_cas.get().map(|saved| saved + 1),
+        Some(saves.get())
     );
-    assert_eq!(saves_before_cas.get(), Some(saves.get()));
     assert!(ledger.accepted_cache_heads.is_empty());
-    assert!(!cache_head_probe_held(&ledger, &probes[0]));
+    assert!(cache_head_probe_held(&ledger, &probes[0]));
 }
 
 #[test]

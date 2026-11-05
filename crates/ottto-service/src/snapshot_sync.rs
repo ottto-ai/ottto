@@ -20,7 +20,7 @@ use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected, CensusBlockCause,
-    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
+    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected, RefusedSnapshotIndexes,
     RelayTokenAuthorizationRejected, ShedSnapshotIndexes, SnapshotAckRejected, SnapshotApiClient,
     SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
     CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
@@ -992,16 +992,19 @@ pub(crate) fn checkpoint_account_release_for_test(
 }
 
 /// The page items a server answer names: an indexed validation rejection
-/// (422) or an identity-deferral shed (503). `None` when nothing is named or
-/// a location falls outside this page; that failure keeps its own path (a
-/// shed stays a whole-pass shed).
+/// (422), an identity-deferral shed (503) or ACK refs that echoed another
+/// body witness. `None` when nothing is named or a location falls outside
+/// this page; that failure keeps its own path (a shed stays a whole-pass shed).
 fn server_named_items(error: &anyhow::Error, indices: &[usize]) -> Option<BTreeSet<usize>> {
-    let named = match error.downcast_ref::<ShedSnapshotIndexes>() {
-        Some(named) => &named.0,
-        None => error
+    let named = if let Some(named) = error.downcast_ref::<ShedSnapshotIndexes>() {
+        &named.0
+    } else if let Some(named) = error.downcast_ref::<RefusedSnapshotIndexes>() {
+        &named.0
+    } else {
+        error
             .downcast_ref::<BatchRejected>()?
             .snapshot_indexes
-            .as_ref()?,
+            .as_ref()?
     };
     named
         .iter()
@@ -10637,28 +10640,26 @@ where
             }
             Err(error) if server_named_items(&error, &indices).is_some() => {
                 let held = server_named_items(&error, &indices).expect("named items");
-                // The server named these items: a validation rejection, or an
-                // identity deferral that waits for its identity only. Hold
-                // them; their siblings and later batches continue this pass.
-                let (status, reason, identity_retry_at) =
-                    match error.downcast_ref::<UploadShed>().copied() {
-                        Some(shed) => (
-                            shed.status,
-                            "identity_deferred",
-                            Some(
-                                current_unix_seconds()
-                                    .saturating_add(shed_backoff(shed.retry_after).as_secs()),
-                            ),
+                // The server named these items: a validation rejection, an
+                // identity deferral that waits for its identity only, or ACK
+                // refs that echoed another body witness. Hold them; their
+                // siblings settle only from their own exact ACK, re-sent in
+                // this pass, and later batches continue.
+                let (status, reason, identity_retry_at) = match (
+                    error.downcast_ref::<UploadShed>().copied(),
+                    error.downcast_ref::<BatchRejected>(),
+                ) {
+                    (Some(shed), _) => (
+                        Some(shed.status),
+                        "identity_deferred",
+                        Some(
+                            current_unix_seconds()
+                                .saturating_add(shed_backoff(shed.retry_after).as_secs()),
                         ),
-                        None => (
-                            error
-                                .downcast_ref::<BatchRejected>()
-                                .expect("typed rejection")
-                                .status,
-                            "validation_reject",
-                            None,
-                        ),
-                    };
+                    ),
+                    (None, Some(rejected)) => (Some(rejected.status), "validation_reject", None),
+                    (None, None) => (None, "body_witness_refused", None),
+                };
                 let before = progress.clone();
                 for index in &held {
                     let item_fingerprint = fingerprint(&items[*index]);
@@ -14849,6 +14850,15 @@ mod tests {
         )
     }
 
+    /// The real due-retry selection, with a held body's deadline reached.
+    fn lease_due_retry(progress: &mut SnapshotUploadProgress, fingerprint: &str) {
+        if let Some(record) = progress.quarantined_fingerprints.get_mut(fingerprint) {
+            record.retry_after_unix_seconds = 0;
+            progress.prepare_quarantine_retries(&BTreeMap::new());
+            assert!(progress.active_quarantine_retries.contains(fingerprint));
+        }
+    }
+
     /// [money] A lost ACK response leaves no checkpoint; only the exact
     /// creator-domain proof (public v7) settles the retry, after which the
     /// settled body is a no-op.
@@ -14958,22 +14968,40 @@ mod tests {
                 // The cache-declared neighbour domain cannot settle it.
                 (Some(13), Some(digest.clone())),
             ] {
-                upload_resumable_batches_with_body_witness(
+                lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
+                let mut calls = 0;
+                let outcome = upload_resumable_batches_with_body_witness(
                     &items,
                     &unique_poison_scope(),
                     &mut progress,
                     &mut accepted,
                     |snapshot| snapshot.snapshot_fingerprint.as_str(),
                     snapshot_upload_body_witness,
-                    |batch| checked_response(batch, version, proof.clone(), unchanged),
+                    |batch| {
+                        calls += 1;
+                        checked_response(batch, version, proof.clone(), unchanged)
+                    },
                     |_| Ok(()),
                 )
-                .expect_err("missing/wrong proof or capability domain cannot settle retry");
+                .unwrap();
+                // The refusal names the body: it is set aside, never settled.
+                assert_eq!(
+                    (outcome, calls),
+                    (ResumableUploadResult::Deferred { count: 1 }, 1),
+                    "missing/wrong proof or capability domain cannot settle retry"
+                );
                 assert_eq!(accepted, 0);
                 assert!(progress.accepted_fingerprints.is_empty());
-                assert!(!progress.contains_body(&items[0].snapshot_fingerprint, &digest));
+                assert!(!progress
+                    .accepted_body_witnesses
+                    .contains_key(&items[0].snapshot_fingerprint));
+                assert_eq!(
+                    progress.quarantined_fingerprints[&items[0].snapshot_fingerprint].disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
             }
         }
+        lease_due_retry(&mut progress, &items[0].snapshot_fingerprint);
         let mut retry_calls = 0;
         upload_resumable_batches_with_body_witness(
             &items,
