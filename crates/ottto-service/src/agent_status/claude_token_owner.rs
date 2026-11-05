@@ -39,8 +39,9 @@ enum Verdict {
 }
 
 /// Each home's latest token and its verdict, keyed by home: one entry for
-/// the default home and one per registered slot, bounded by the registered
-/// slots. Tests keep one map per test thread.
+/// the default home and one per registered slot. A new token replaces its
+/// home's entry and never reuses an old verdict. Tests keep one map per test
+/// thread.
 type Owners = BTreeMap<String, (String, Verdict)>;
 
 #[cfg(not(test))]
@@ -63,13 +64,6 @@ thread_local! {
 #[cfg(test)]
 fn with_owners<R>(use_owners: impl FnOnce(&mut Owners) -> R) -> R {
     OWNERS.with(|owners| use_owners(&mut owners.borrow_mut()))
-}
-
-/// Drop a removed slot's verdict.
-pub(super) fn forget(home: &str) {
-    with_owners(|owners| {
-        owners.remove(home);
-    });
 }
 
 /// A content fingerprint of the stored token (never a file time).
@@ -232,9 +226,9 @@ mod tests {
 
     /// [behaviour] Each home keeps its own verdict: the default home and a
     /// slot proving in turn over two passes make one call each, never
-    /// evicting each other, and removing the slot drops only its verdict.
+    /// evicting each other.
     #[test]
-    fn each_home_keeps_its_own_verdict_until_the_slot_is_removed() {
+    fn each_home_keeps_its_own_verdict() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         fn respond(token: &str) -> Result<Value, u16> {
@@ -250,9 +244,6 @@ mod tests {
             assert!(proven_owner("claude_slot_owner", "slot-token", true).is_some());
         }
         assert_eq!(CALLS.load(Ordering::SeqCst), 2, "one call per home's token");
-        forget("claude_slot_owner");
-        assert!(proven_owner("claude_slot_owner", "slot-token", false).is_none());
-        assert!(proven_owner("default", "default-token", false).is_some());
         PROFILE_TEST_RESPONSE.with(|cell| cell.set(None));
     }
 }
