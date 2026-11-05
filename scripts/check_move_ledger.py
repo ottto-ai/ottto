@@ -17,19 +17,28 @@ across files. Before comparing, only these glue classes are reversed:
   (e) the indentation an item loses when an inline module becomes a file.
 
 Then every base item must equal exactly one head item byte for byte (comments,
-attributes, cfgs), and items that land in one file keep their base order. One
-exception covers a fn signature rustfmt re-wraps (say once a visibility token
-makes it too long): a `fn` item whose text before `fn` and whose body, from its
-opening `{`, are byte for byte equal, whose only visibility token is the
-item-level one before `fn` (not inside an attribute) and whose signature holds
-no `!` (so no macro call) still matches, listed as `reflowed`, when its
-signature tokens are equal with whitespace dropped. Literals and comments stay
-exact, whitespace between two punctuation tokens that could join (`& &` vs
-`&&`) still counts, and only a trailing `,` closing the fn's own generic list or
-outer parameter list may be added or dropped. Every other item must match byte
-for byte. An item must sit under the same module attributes (`#[cfg(..)]` and
-the like), may only lose nesting, and every path literal must resolve, from its
-new file, to a target with the same bytes.
+attributes, cfgs), and items that land in one file keep their base order. Two
+exceptions cover what rustfmt re-wraps once a visibility token makes a line too
+long; both still match, listed as `reflowed`, only if the part that may
+re-wrap (the fn signature, the whole struct) holds no `!` (a macro can see token
+boundaries this lexer does not keep):
+
+  - a `fn` whose text before `fn` and whose body, from its opening `{`, are
+    byte for byte equal and whose only visibility token is the item-level one
+    before `fn`, when its signature tokens are equal with whitespace dropped;
+    only a trailing `,` closing its own generic list or outer parameter list
+    may be added or dropped;
+  - a struct with named fields whose text is byte for byte equal outside its
+    field declarations (from each field name to its `,`), when each field's
+    tokens are equal with whitespace dropped; a visibility token may stand only
+    at the start of a field or before `struct`, and is judged per field.
+
+In both, literals and comments stay exact and whitespace between two
+punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
+item must match byte for byte. An item must sit under the same module
+attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
+literal must resolve, from its new file, to a target with the same bytes.
+Edits to the files in VALIDATOR_EDITS are listed and not checked.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -57,6 +66,12 @@ import rust_source_tree as rst
 GLUE = {"use", "mod-decl", "include", "inner-doc"}
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 REPORT_LIMIT = 50
+# Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
+# by path or text, so their edits are listed as validator edits and never checked as moves.
+VALIDATOR_EDITS = {
+    "crates/ottto-service/tests/support/scan_index_v201.rs",
+    "scripts/test_codex_zst_downgrade.py",
+}
 DIFF_LIMIT = 40
 
 
@@ -94,35 +109,78 @@ def squash(text: str) -> str:
 
 # Punctuation that never joins a neighbour into one Rust token, so whitespace beside it is layout.
 JOINLESS = set("()[]{},;")
+Code = list[tuple[str, str, bool, int]]  # (kind, text, whitespace before it, offset) per non-whitespace token
 
 
-def reflow_key(unit: Unit) -> tuple | None:
-    """What a rustfmt re-wrap of a fn signature keeps (see the module docs), or None when `unit` gets no
-    reflow pass: not a fn, no body, an unexpected signature shape, a visibility token other than one at
-    item level before `fn` (outside attributes), or any `!` in the signature (a macro call can see token
-    boundaries this lexer does not keep)."""
-    if unit.kind != "fn" or len(unit.vis) > 1:
-        return None
-    tokens = rst.tokenize(unit.text)
-    # (kind, text, whitespace before it, offset) of every non-whitespace token.
-    code = [(token.kind, unit.text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws",
-             token.start) for index, token in enumerate(tokens) if token.kind != "ws"]
-    fn_at = body_at = vis_depth = None
-    vis_at = unit.vis[0][0] if unit.vis else None
+def code_tokens(text: str) -> Code:
+    tokens = rst.tokenize(text)
+    return [(token.kind, text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws", token.start)
+            for index, token in enumerate(tokens) if token.kind != "ws"]
+
+
+def depth_at(code: Code, offset: int) -> int:
+    """The bracket depth at text offset `offset` (where a removed visibility token stood)."""
     depth = 0
-    for index, (kind, piece, _, start) in enumerate(code):
-        if vis_at is not None and vis_depth is None and start >= vis_at:
-            vis_depth = depth  # bracket depth where the removed visibility token stood
-        if kind == "ident" and piece == "fn" and depth == 0 and fn_at is None:
-            fn_at = index
-        elif kind == "punct" and piece == "{" and depth == 0 and fn_at is not None:
+    for kind, piece, _, start in code:
+        if start >= offset:
+            break
+        if kind == "punct":
+            depth += (piece in "([{") - (piece in ")]}")
+    return depth
+
+
+def layout_free(code: Code, first: int, stop: int, drop: set[int] = frozenset()) -> tuple[str, ...]:
+    """Tokens first..stop-1 without whitespace, but with a " " where whitespace separated two punctuation
+    tokens that could join (`& &` vs `&&`); tokens in `drop` are left out."""
+    out: list[str] = []
+    prev = None
+    for index in range(first, stop):
+        if index in drop:
+            continue
+        kind, piece, spaced, _ = code[index]
+        if (spaced and index - 1 not in drop and prev is not None and prev[0] == kind == "punct"
+                and prev[1] not in JOINLESS and piece not in JOINLESS):
+            out.append(" ")
+        out.append(piece)
+        prev = (kind, piece)
+    return tuple(out)
+
+
+def reflow(unit: Unit) -> tuple[tuple, list[tuple[int, str]]] | None:
+    """(key, visibility) of a rustfmt re-wrap (see the module docs), or None when `unit` gets no reflow
+    pass. Two units with equal keys are a reflowed move; the visibility rows are keyed by place (0 for
+    the item, 1.. for each struct field) instead of text offset, which the re-wrap shifts. Any `!` means
+    no pass: a macro call can see token boundaries this lexer does not keep."""
+    if unit.kind not in ("fn", "struct"):
+        return None
+    code = code_tokens(unit.text)
+    keyword = next((index for index, (kind, piece, _, _) in enumerate(code)
+                    if kind == "ident" and piece == unit.kind and depth_at(code, code[index][3]) == 0), None)
+    if keyword is None:
+        return None
+    items = [offset for offset, _ in unit.vis if offset <= code[keyword][3] and depth_at(code, offset) == 0]
+    if len(items) > 1:
+        return None
+    if unit.kind == "fn":
+        return fn_reflow(unit, code, keyword, items)
+    return struct_reflow(unit, code, keyword, items)
+
+
+def fn_reflow(unit: Unit, code: Code, fn_at: int, items: list[int]):
+    """A fn whose text before `fn` and body are byte for byte equal; only its signature may re-wrap, and
+    only a trailing `,` closing its own generic list or outer parameter list may be added or dropped."""
+    if len(unit.vis) != len(items):
+        return None
+    depth = 0
+    body_at = None
+    for index in range(fn_at, len(code)):
+        kind, piece, _, _ = code[index]
+        if kind == "punct" and piece == "{" and depth == 0:
             body_at = index
             break
         if kind == "punct":
             depth += (piece in "([{") - (piece in ")]}")
-    if fn_at is None or body_at is None or (vis_at is not None and (vis_at > code[fn_at][3] or vis_depth != 0)):
-        return None
-    if any(code[index][:2] == ("punct", "!") for index in range(fn_at, body_at)):
+    if body_at is None or any(code[index][:2] == ("punct", "!") for index in range(fn_at, body_at)):
         return None
     drop = set()
     at = fn_at + 2  # after `fn name`
@@ -140,18 +198,82 @@ def reflow_key(unit: Unit) -> tuple | None:
         return None
     if code[at - 1][:2] == ("punct", ","):
         drop.add(at - 1)
-    signature: list[str] = []
-    prev = None
-    for index in range(fn_at, body_at):
-        if index in drop:
-            continue
+    key = (unit.container, unit.text[:code[fn_at][3]], layout_free(code, fn_at, body_at, drop),
+           unit.text[code[body_at][3]:])
+    return key, [(0, token) for _, token in unit.vis]
+
+
+def struct_reflow(unit: Unit, code: Code, struct_at: int, items: list[int]):
+    """A struct with named fields whose text is byte for byte equal outside its field declarations (from
+    each field name to its `,`); inside one, only whitespace may differ, and a field may only gain or lose
+    a visibility token at its start."""
+    if any(piece == "!" and kind == "punct" for kind, piece, _, _ in code):
+        return None
+    body_at = next((index for index in range(struct_at, len(code)) if code[index][0] == "punct"
+                    and code[index][1] in "{(;"), None)
+    if body_at is None or code[body_at][1] != "{":
+        return None  # a tuple or unit struct, or a header with parentheses
+    close_at = closing(code, body_at, len(code), angle=False)
+    if close_at is None:
+        return None
+    # Field declarations: split the body at commas outside brackets and angle brackets.
+    spans: list[tuple[int, int]] = []  # (field name, one past its last token)
+    first = body_at + 1
+    nest = level = 0
+    for index in range(body_at + 1, close_at + 1):
         kind, piece, spaced, _ = code[index]
-        if (spaced and index - 1 not in drop and prev is not None and prev[0] == kind == "punct"
-                and prev[1] not in JOINLESS and piece not in JOINLESS):
-            signature.append(" ")
-        signature.append(piece)
-        prev = (kind, piece)
-    return unit.container, unit.text[:code[fn_at][3]], tuple(signature), unit.text[code[body_at][3]:]
+        if index < close_at and kind == "punct":
+            if piece in "([{":
+                nest += 1
+            elif piece in ")]}":
+                nest -= 1
+            elif nest == 0 and piece == "<":
+                level += 1
+            elif nest == 0 and piece == ">" and not (code[index - 1][1] == "-" and not spaced):
+                level -= 1
+        if index == close_at or (nest == level == 0 and kind == "punct" and piece == ","):
+            name = first
+            while name < index and code[name][0] in ("doc", "comment"):
+                name += 1
+            while name + 1 < index and code[name][:2] == ("punct", "#") and code[name + 1][1] == "[":
+                name = closing_bracket(code, name + 1, index) + 1
+                while name < index and code[name][0] in ("doc", "comment"):
+                    name += 1
+            if name < index:
+                if not (code[name][0] == "ident" and code[name + 1][:2] == ("punct", ":")
+                        and code[name + 2][1] != ":"):
+                    return None
+                spans.append((name, index + 1 if index < close_at else index))
+            first = index + 1
+    if nest or level:
+        return None
+    field_vis = {code[name][3]: number for number, (name, _) in enumerate(spans, 1)}
+    vis = []
+    for offset, token in unit.vis:
+        place = 0 if offset in items else field_vis.get(offset)
+        if place is None:
+            return None  # a visibility token that is not the item's or at the start of a field
+        vis.append((place, token))
+    parts: list = [unit.container]
+    cursor = 0
+    for name, stop in spans:
+        parts += [unit.text[cursor:code[name][3]], layout_free(code, name, stop)]
+        cursor = code[stop - 1][3] + len(code[stop - 1][1])
+    parts.append(unit.text[cursor:])
+    return tuple(parts), vis
+
+
+def closing_bracket(code: Code, open_at: int, stop: int) -> int:
+    """The index of the `]` that closes the `[` at `open_at` (or `stop` when it is missing)."""
+    nest = 0
+    for index in range(open_at, stop):
+        if code[index][0] == "punct" and code[index][1] in "([{":
+            nest += 1
+        elif code[index][0] == "punct" and code[index][1] in ")]}":
+            nest -= 1
+            if nest == 0:
+                return index
+    return stop
 
 
 def closing(code: list[tuple[str, str, bool, int]], open_at: int, stop: int, angle: bool) -> int | None:
@@ -399,10 +521,11 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
     # A unit with no reflow pass gets a key of its own, so it never pairs.
-    reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_key(unit) or (id(unit),))
-    # The only visibility of a reflowed unit is its leading one: compare it at one offset.
-    ledger.reflowed = [(replace(old, vis=[(0, token) for _, token in old.vis]),
-                        replace(new, vis=[(0, token) for _, token in new.vis])) for old, new in reflowed]
+    reflow_of = {id(unit): reflow(unit) or ((id(unit),), unit.vis) for unit in lost + gained}
+    reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_of[id(unit)][0])
+    # A re-wrap shifts text offsets, so reflowed units compare visibility by place instead.
+    ledger.reflowed = [(replace(old, vis=reflow_of[id(old)][1]), replace(new, vis=reflow_of[id(new)][1]))
+                       for old, new in reflowed]
     ledger.pairs = sorted(pairs + ledger.reflowed, key=lambda pair: (pair[0].file, pair[0].seq))
     moves = module_moves(ledger.pairs, head_modules)
     explain_differences(ledger, lost, gained)
@@ -566,8 +689,12 @@ def main(argv: list[str] | None = None) -> int:
         base = args.base or rst.default_base(repo)
         base_sha = rst.git(repo, "rev-parse", "--verify", f"{base}^{{commit}}").strip()
         head_sha = rst.git(repo, "rev-parse", "--verify", f"{args.head}^{{commit}}").strip()
-        changed = [path for path in rst.changed_files(repo, base_sha, head_sha) if path.endswith(".rs")]
+        every = rst.changed_files(repo, base_sha, head_sha)
+        changed = [path for path in every if path.endswith(".rs") and path not in VALIDATOR_EDITS]
         print(f"move-ledger: base {base_sha[:12]} head {head_sha[:12]}: {len(changed)} changed .rs files")
+        validators = [path for path in every if path in VALIDATOR_EDITS]
+        if validators:
+            print(f"move-ledger: validator edits: {', '.join(validators)}")
         if not changed:
             print("move-ledger: nothing to check")
             return 0

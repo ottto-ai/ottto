@@ -148,8 +148,9 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 - `tests/`: tests that span stages; test data under `tests/fixtures/`.
 
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
-except that a fn with an unchanged body may have a signature rustfmt re-wrapped; only visibility,
-`use`/`mod` lines, path literals and wrappers change) and
+except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and
+wrappers change; edits to listed validator files that anchor on moved code are reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.

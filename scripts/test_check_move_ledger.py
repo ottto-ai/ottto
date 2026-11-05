@@ -486,6 +486,78 @@ class LedgerTests(unittest.TestCase):
                 self.assertEqual(status, 1, out)
                 self.assertIn(' 0 reflowed,', out)
 
+    FIELDS = code('''
+        /// Holds the scan state.
+        #[derive(Debug, Default)]
+        pub(crate) struct Index {
+            /// Entries by path.
+            entries: Vec<u32>,
+            #[serde(default)]
+            claude_usage_authority_quarantine_records_by_session: Option<Vec<u32>>,
+            codex_counting_tombstones_by_session_identifier: Vec<u64>,
+        }
+    ''')
+    WRAPPED_FIELDS = code('''
+        /// Holds the scan state.
+        #[derive(Debug, Default)]
+        pub(crate) struct Index {
+            /// Entries by path.
+            pub(super) entries: Vec<u32>,
+            #[serde(default)]
+            pub(super) claude_usage_authority_quarantine_records_by_session:
+                Option<Vec<u32>>,
+            pub(super) codex_counting_tombstones_by_session_identifier:
+                Vec<u64>,
+        }
+    ''')
+
+    def test_struct_fields_wrapped_after_a_visibility_token_are_a_reflowed_move(self):
+        status, out = self.move_long(self.WRAPPED_FIELDS, self.FIELDS)
+        self.assertEqual(status, 0, out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+        self.assertIn('reflowed struct Index (crates/demo/src/snapshots.rs:', out)
+
+    def test_struct_field_reflow_rejects_any_other_change(self):
+        wrapped, fields = self.WRAPPED_FIELDS, self.FIELDS
+        swapped = wrapped.replace(
+            '    /// Entries by path.\n    pub(super) entries: Vec<u32>,\n', '').replace(
+            '        Vec<u64>,\n', '        Vec<u64>,\n    /// Entries by path.\n    pub(super) entries: Vec<u32>,\n')
+        self.assertNotEqual(swapped, wrapped)
+        for name, before, after in (
+            ('type', fields, wrapped.replace('        Vec<u64>,', '        Vec<u32>,')),
+            ('name', fields, wrapped.replace('pub(super) entries:', 'pub(super) entry:')),
+            ('order', fields, swapped),
+            ('attribute', fields, wrapped.replace('#[serde(default)]', '#[serde(skip)]')),
+            ('macro', fields.replace('Vec<u64>', 'ty!(u64)'), wrapped.replace('Vec<u64>', 'ty!(u64)')),
+            ('attribute pub', fields.replace('#[serde(default)]', '#[cfg_attr(any(), dummy(pub))]'),
+             wrapped.replace('#[serde(default)]', '#[cfg_attr(any(), dummy())]')),
+            ('tuple', 'pub(crate) struct Pair(u32, u64);\n',
+             'pub(crate) struct Pair(\n    pub(super) u32,\n    pub(super) u64,\n);\n'),
+        ):
+            with self.subTest(name):
+                status, out = self.move_long(after, before)
+                self.assertEqual(status, 1, out)
+                self.assertIn(' 0 reflowed,', out)
+        status, out = self.move_long(wrapped.replace('pub(super) entries', 'pub(crate) entries'), fields)
+        self.assertEqual(status, 1, out)
+        self.assertIn('1 reflowed', out)
+        self.assertIn('widened: struct Index', out)
+
+    def test_validator_edits_are_listed_and_only_for_listed_files(self):
+        listed = 'crates/ottto-service/tests/support/scan_index_v201.rs'
+        other = 'crates/ottto-service/tests/support/other_v201.rs'
+        test = 'fn anchors() {\n    assert!(true);\n}\n'
+        base = self.repo.commit({'crates/ottto-service/Cargo.toml': '[package]\nname = "s"\n', listed: test,
+                                 other: test, 'scripts/test_codex_zst_downgrade.py': 'print(1)\n'})
+        head = self.repo.commit({listed: test.replace('true', '!false'),
+                                 'scripts/test_codex_zst_downgrade.py': 'print(2)\n'})
+        status, out = run(self.repo, base, head)
+        self.assertEqual(status, 0, out)
+        self.assertIn(f'validator edits: {listed}, scripts/test_codex_zst_downgrade.py', out)
+        status, out = run(self.repo, head, self.repo.commit({other: test.replace('true', '!false')}))
+        self.assertEqual(status, 1, out)
+        self.assertIn('changed: fn anchors', out)
+
     def test_report_mode_exits_zero_and_no_rust_change_is_a_pass(self):
         status, out = self.move(ROOT.replace('fn second() {}', 'fn second() { todo!() }'), None, '--report')
         self.assertEqual(status, 0)
