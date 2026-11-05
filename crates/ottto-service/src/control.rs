@@ -22,13 +22,13 @@ use ottto_core::{
     default_prior_device_path, default_support_dir, execute_local_uninstall,
     generate_control_token, install_owner_for_path, local_lifecycle_home_dir, plan_local_uninstall,
     redact_inline, release_channel_from_str, ClaudeConfigSlotSettingsError,
-    CodexAccountSlotSettingsError, ControlTokenStore, FileAccountStore,
+    CodexAccountSlotSettingsError, ControlTokenStore, DeviceCredentialContinuity, FileAccountStore,
     FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, FileConnectionStore,
     FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
-    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding,
-    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority, TokenStoreError, UninstallExecutionOptions,
-    OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding,
+    LocalDeviceEnvelope, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, SnapshotNamespaceAlias, TokenStoreError,
+    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
@@ -5842,13 +5842,17 @@ fn complete_pending_auth_claim(
                 backfill_policy: completed.backfill_policy.clone(),
                 backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
             };
-            let pending = pending_device_credential_from_preparation(
+            let mut pending = pending_device_credential_from_preparation(
                 &validated_api_base_url(None)?,
                 prepared,
                 false,
                 Some(claim_commit),
                 completion.request_authority.clone(),
             )?;
+            continue_prior_snapshot_namespace(
+                &mut pending,
+                completion.prior_device_credential.as_ref(),
+            );
             stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
             stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
             let staged = FilePendingDeviceCredentialStore::default()
@@ -5976,7 +5980,9 @@ fn complete_pending_auth_claim(
         completed.backfill_cutoff_at.as_deref(),
         &completed.user.id,
         match &relay_credentials {
-            ClaimRelayDeviceCredential::Legacy(device, secret) => Some((device, secret.as_str())),
+            ClaimRelayDeviceCredential::Legacy(device, secret) => Some(
+                crate::snapshot_sync::snapshot_destination_namespace(device, secret, None),
+            ),
             ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
         },
     )?;
@@ -6026,12 +6032,9 @@ fn persist_claim_backfill_policy(
     policy: Option<&str>,
     cutoff_at: Option<&str>,
     user_id: &str,
-    destination: Option<(&LocalDeviceBinding, &str)>,
+    namespace: Option<String>,
 ) -> Result<(), LocalApiError> {
     let support_dir = default_support_dir();
-    let namespace = destination.map(|(device, secret)| {
-        crate::snapshot_sync::snapshot_upload_destination_namespace(device, secret)
-    });
     crate::backfill::apply_claim_backfill_policy_for_destination(
         &support_dir,
         policy,
@@ -6243,7 +6246,10 @@ fn install_staged_account_switch(
         staged
             .relay_device
             .as_ref()
-            .zip(staged.relay_device_secret.as_deref()),
+            .zip(staged.relay_device_secret.as_deref())
+            .map(|(device, secret)| {
+                crate::snapshot_sync::snapshot_destination_namespace(device, secret, None)
+            }),
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
@@ -6674,8 +6680,12 @@ fn stage_pending_setup_run_token_with_store<S: ControlTokenStore + ?Sized>(
     Ok(())
 }
 
-fn secret_sha256(value: &str) -> String {
+pub(crate) fn secret_sha256(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+pub(crate) fn secret_commitment_matches(commitment: &str, secret: &str) -> bool {
+    constant_work_eq(commitment.as_bytes(), secret_sha256(secret).as_bytes())
 }
 
 fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
@@ -6694,13 +6704,9 @@ fn validate_pending_candidate_secret(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
 ) -> Result<(), LocalApiError> {
-    let candidate_commitment = secret_sha256(candidate_secret);
     if candidate_secret.trim().is_empty()
         || !valid_secret_commitment(&pending.secret_commitment_sha256)
-        || !constant_work_eq(
-            pending.secret_commitment_sha256.as_bytes(),
-            candidate_commitment.as_bytes(),
-        )
+        || !secret_commitment_matches(&pending.secret_commitment_sha256, candidate_secret)
     {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6728,6 +6734,14 @@ fn validate_pending_prior_credential_binding(
             .identity_continuity_capability
             .as_deref()
             .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+        || authority
+            .canonical_snapshot_namespace
+            .as_deref()
+            .is_some_and(|namespace| {
+                authority.flow != "setup_claim"
+                    || authority.prior_device_id.is_none()
+                    || !crate::hex::is_sha256_lower(namespace)
+            })
     {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6790,6 +6804,16 @@ fn write_and_verify_active_device_credential(
     let expected_binding = LocalDeviceCredentialBinding {
         device: pending.device.clone(),
         credential_generation: pending.credential_generation,
+        continuity: DeviceCredentialContinuity {
+            owner: pending.claim_commit.as_ref().and_then(|claim| {
+                Some(LocalCredentialOwner {
+                    user_id: claim.target_user_id.clone(),
+                    organization_id: claim.account.organization.as_ref()?.id.clone(),
+                    api_base_url: pending.api_base_url.clone(),
+                })
+            }),
+            snapshot_namespace: pending_snapshot_alias(pending),
+        },
     };
 
     active_secret_store
@@ -6807,6 +6831,21 @@ fn write_and_verify_active_device_credential(
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(())
+}
+
+/// The journaled same-account namespace, bound to the staged candidate secret.
+fn pending_snapshot_alias(
+    pending: &PendingDeviceCredentialPreparation,
+) -> Option<SnapshotNamespaceAlias> {
+    let namespace = pending
+        .request_authority
+        .as_ref()?
+        .canonical_snapshot_namespace
+        .clone()?;
+    Some(SnapshotNamespaceAlias {
+        namespace,
+        secret_commitment_sha256: pending.secret_commitment_sha256.clone(),
+    })
 }
 
 fn clear_pending_device_credential(
@@ -6975,7 +7014,11 @@ fn write_and_verify_pending_claim_commit(
         claim.backfill_policy.as_deref(),
         claim.backfill_cutoff_at.as_deref(),
         &claim.target_user_id,
-        Some((&pending.device, candidate_secret)),
+        Some(crate::snapshot_sync::snapshot_destination_namespace(
+            &pending.device,
+            candidate_secret,
+            pending_snapshot_alias(pending).as_ref(),
+        )),
     )?;
     write_and_verify_active_device_credential(
         pending,
@@ -11699,6 +11742,36 @@ fn device_credential_request_authority(
         prior_device_id: prior.map(|value| value.device_id.clone()),
         prior_device_sources: prior.map(|value| value.device_sources.clone()),
         prior_secret_commitment_sha256: prior.map(|value| secret_sha256(&value.device_secret)),
+        canonical_snapshot_namespace: None,
+    }
+}
+
+/// Journal the prior device's snapshot namespace when this setup claim is the
+/// prior owner's user and organization on the same API and machine. Any other
+/// claim (or the register route) starts its own namespace, as before.
+fn continue_prior_snapshot_namespace(
+    pending: &mut PendingDeviceCredentialPreparation,
+    prior: Option<&PriorDeviceCredential>,
+) {
+    let (Some(prior), Some(claim), Some(authority)) = (
+        prior,
+        pending.claim_commit.as_ref(),
+        pending.request_authority.as_mut(),
+    ) else {
+        return;
+    };
+    let Some(owner) = prior.owner.as_ref() else {
+        return;
+    };
+    if authority.flow == "setup_claim"
+        && authority.prior_device_id.as_deref() == Some(prior.device_id.as_str())
+        && pending.device.machine_id.as_deref() == Some(authority.machine_id.as_str())
+        && claim.account.user.as_ref().map(|user| &user.id) == Some(&owner.user_id)
+        && claim.account.organization.as_ref().map(|org| &org.id) == Some(&owner.organization_id)
+        && claim.connection.api_base_url.trim_end_matches('/')
+            == owner.api_base_url.trim_end_matches('/')
+    {
+        authority.canonical_snapshot_namespace = Some(prior.snapshot_namespace.clone());
     }
 }
 
@@ -11713,6 +11786,8 @@ fn same_prior_device_authority(
             let actual_secret_commitment = secret_sha256(&actual.device_secret);
             expected.device_id == actual.device_id
                 && expected.device_sources == actual.device_sources
+                && expected.owner == actual.owner
+                && expected.snapshot_namespace == actual.snapshot_namespace
                 && constant_work_eq(
                     expected_secret_commitment.as_bytes(),
                     actual_secret_commitment.as_bytes(),
@@ -11859,6 +11934,10 @@ struct PriorDeviceCredential {
     device_id: String,
     device_sources: Vec<String>,
     device_secret: String,
+    /// Account the credential was installed for, if known.
+    owner: Option<LocalCredentialOwner>,
+    /// The namespace its local snapshot history lives under.
+    snapshot_namespace: String,
 }
 
 fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
@@ -11868,12 +11947,30 @@ fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCreden
         return prior_device_credential_with_stores(
             &active_store,
             &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            connected_account_owner(),
         );
     }
+    // A retained prior carries the owner recorded before logout reset the account.
     prior_device_credential_with_stores(
         &FileDeviceStore::new(default_prior_device_path()),
         &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
+        None,
     )
+}
+
+/// Owner of a legacy active binding written before credentials recorded one:
+/// the bound account, only while it is connected.
+fn connected_account_owner() -> Option<LocalCredentialOwner> {
+    let account = FileAccountStore::default().load().ok()?;
+    let connection = FileConnectionStore::default().load().ok()??;
+    if account.state != LocalAccountState::Connected {
+        return None;
+    }
+    Some(LocalCredentialOwner {
+        user_id: account.user?.id,
+        organization_id: account.organization?.id,
+        api_base_url: connection.api_base_url,
+    })
 }
 
 fn retain_prior_device_credential_for_logout() -> Result<(), LocalApiError> {
@@ -11882,6 +11979,7 @@ fn retain_prior_device_credential_for_logout() -> Result<(), LocalApiError> {
         &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
         &FileDeviceStore::new(default_prior_device_path()),
         &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
+        connected_account_owner(),
     )
 }
 
@@ -11890,8 +11988,9 @@ fn retain_prior_device_credential_with_stores(
     active_secret_store: &impl ControlTokenStore,
     prior_device_store: &FileDeviceStore,
     prior_secret_store: &impl ControlTokenStore,
+    legacy_owner: Option<LocalCredentialOwner>,
 ) -> Result<(), LocalApiError> {
-    let Some(device) = active_device_store.load().or_state_poisoned()? else {
+    let Some(mut envelope) = active_device_store.load_envelope().or_state_poisoned()? else {
         return Ok(());
     };
     let secret = match active_secret_store.load() {
@@ -11909,11 +12008,14 @@ fn retain_prior_device_credential_with_stores(
         }
         Err(_) => return Err(LocalApiError::StatePoisoned),
     };
-    if device.device_id.trim().is_empty() || secret.trim().is_empty() {
+    if envelope.device.device_id.trim().is_empty() || secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
     prior_secret_store.save(&secret).or_state_poisoned()?;
-    prior_device_store.save(&device).or_state_poisoned()
+    envelope.continuity.owner = envelope.continuity.owner.take().or(legacy_owner);
+    prior_device_store
+        .save_envelope(&envelope)
+        .or_state_poisoned()
 }
 
 fn clear_prior_device_credential() -> Result<(), LocalApiError> {
@@ -11933,18 +12035,28 @@ fn clear_prior_device_selector() -> Result<(), LocalApiError> {
 fn prior_device_credential_with_stores(
     device_store: &FileDeviceStore,
     secret_store: &impl ControlTokenStore,
+    legacy_owner: Option<LocalCredentialOwner>,
 ) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
-    let Some(device) = device_store.load().or_state_poisoned()? else {
+    let Some(LocalDeviceEnvelope { device, continuity }) =
+        device_store.load_envelope().or_state_poisoned()?
+    else {
         return Ok(None);
     };
     let device_secret = secret_store.load().or_state_poisoned()?;
     if device.device_id.trim().is_empty() || device_secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
+    let snapshot_namespace = crate::snapshot_sync::snapshot_destination_namespace(
+        &device,
+        &device_secret,
+        continuity.snapshot_namespace.as_ref(),
+    );
     Ok(Some(PriorDeviceCredential {
         device_id: device.device_id,
         device_sources: device.sources,
         device_secret,
+        owner: continuity.owner.or(legacy_owner),
+        snapshot_namespace,
     }))
 }
 
@@ -18740,6 +18852,8 @@ for line in sys.stdin:
             device_id: "device-prior".to_string(),
             device_sources: vec!["codex".to_string(), "pi".to_string()],
             device_secret: prior_secret.to_string(),
+            owner: None,
+            snapshot_namespace: "a".repeat(64),
         };
         device_credential_request_authority(
             "setup_claim",
@@ -19240,6 +19354,8 @@ for line in sys.stdin:
                 device_id: old_device.device_id.clone(),
                 device_sources: old_device.sources.clone(),
                 device_secret: old_secret.clone(),
+                owner: None,
+                snapshot_namespace: "a".repeat(64),
             }),
             Some(IDENTITY_CONTINUITY_CAPABILITY),
         ));
@@ -22294,6 +22410,8 @@ for line in sys.stdin:
             device_id: "device_prior".to_string(),
             device_sources: vec!["codex".to_string()],
             device_secret: "secret_prior".to_string(),
+            owner: None,
+            snapshot_namespace: "a".repeat(64),
         };
         let repeat =
             telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
@@ -22643,7 +22761,7 @@ for line in sys.stdin:
         let missing_secret = MemoryTokenStore::new();
 
         assert!(matches!(
-            prior_device_credential_with_stores(&device_store, &missing_secret),
+            prior_device_credential_with_stores(&device_store, &missing_secret, None),
             Err(LocalApiError::StatePoisoned)
         ));
         assert!(device_store
@@ -32084,6 +32202,416 @@ X-API-Key = "otel_redacted"
             ControlToken::new("token").expect("token"),
             "2026-05-05T09:20:00Z",
         )
+    }
+
+    const RELOGIN_CUTOFF: &str = "2026-10-01T00:00:00Z";
+
+    fn relogin_env(name: &str) -> [EnvVarGuard; 2] {
+        let secrets = telemetry_key_store_root(&format!("{name}-secret"));
+        fs::create_dir_all(&secrets).expect("secret root");
+        [
+            EnvVarGuard::set_path(
+                "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                &telemetry_key_store_root(name),
+            ),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+        ]
+    }
+
+    fn relogin_device(device_id: &str, sources: &[&str]) -> LocalDeviceBinding {
+        LocalDeviceBinding {
+            device_id: device_id.to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+        }
+    }
+
+    fn relogin_account(user: &str, org: &str) -> (LocalAccountBinding, LocalConnectionBinding) {
+        let mut account = connected_account();
+        account.user.as_mut().unwrap().id = user.to_string();
+        account.organization.as_mut().unwrap().id = org.to_string();
+        let connection = LocalConnectionBinding {
+            setup_run_id: format!("setup-{user}"),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some(format!("claim-{user}")),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        (account, connection)
+    }
+
+    /// A legacy (owner-less) active device of connected `user`; its first claim
+    /// set a dated cutoff and completed Codex backfill on the returned namespace.
+    fn install_legacy_active(device_id: &str, sources: &[&str], user: &str) -> String {
+        let (account, connection) = relogin_account(user, "org_test");
+        FileAccountStore::default().save(&account).unwrap();
+        FileConnectionStore::default().save(&connection).unwrap();
+        let device = relogin_device(device_id, sources);
+        FileDeviceStore::default().save(&device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("secret-0")
+            .unwrap();
+        let namespace = raw_namespace(device_id, "secret-0");
+        let support = default_support_dir();
+        crate::backfill::apply_claim_backfill_policy_for_destination(
+            &support,
+            Some("from"),
+            Some(RELOGIN_CUTOFF),
+            user,
+            Some(&namespace),
+        )
+        .unwrap();
+        let codex = crate::snapshots::SnapshotSource::Codex;
+        crate::backfill::update_backfill_state(&support, |state| {
+            crate::backfill::mark_backfill_complete_for_destination(state, codex, &namespace)
+        })
+        .unwrap();
+        namespace
+    }
+
+    /// The local-only logout steps that matter here: retain, then reset.
+    fn relogin_local_logout() {
+        retain_prior_device_credential_for_logout().unwrap();
+        FileAccountStore::default().reset().unwrap();
+        FileConnectionStore::default().reset().unwrap();
+        FileDeviceStore::default().reset().unwrap();
+        let secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        secret.delete().unwrap();
+    }
+
+    /// A setup claim by `user`/`org` rotating `prior` to `next` (dated
+    /// backfill at the first cutoff), decided as at stage time.
+    fn relogin_claim(
+        prior: &PriorDeviceCredential,
+        user: &str,
+        org: &str,
+        next: LocalDeviceBinding,
+    ) -> (PendingDeviceCredentialPreparation, String, String) {
+        let candidate = format!("candidate-{}-{}", next.device_id, "secret".repeat(3));
+        let setup_token = format!("setup-{}-{}", next.device_id, "token".repeat(3));
+        let (account, connection) = relogin_account(user, org);
+        let mut pending = test_pending_device_credential(&next.device_id, true);
+        pending.request_authority = Some(device_credential_request_authority(
+            "setup_claim",
+            &next.device_id,
+            &test_machine(),
+            Some(prior),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        pending.device = next;
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            target_user_id: user.to_string(),
+            account,
+            connection,
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: Some("from".to_string()),
+            backfill_cutoff_at: Some(RELOGIN_CUTOFF.to_string()),
+        });
+        continue_prior_snapshot_namespace(&mut pending, Some(prior));
+        (pending, candidate, setup_token)
+    }
+
+    fn journaled_namespace(pending: &PendingDeviceCredentialPreparation) -> Option<String> {
+        let authority = pending.request_authority.as_ref()?;
+        authority.canonical_snapshot_namespace.clone()
+    }
+
+    fn stored_journal_namespace() -> Option<String> {
+        let pending = FilePendingDeviceCredentialStore::default().load().unwrap();
+        journaled_namespace(&pending?)
+    }
+
+    /// Stage, confirm and promote through startup recovery.
+    fn promote_relogin(pending: &PendingDeviceCredentialPreparation, candidate: &str, token: &str) {
+        stage_pending_device_credential(pending, candidate).unwrap();
+        stage_pending_setup_run_token(pending, token).unwrap();
+        let store = FilePendingDeviceCredentialStore::default();
+        mark_pending_device_credential_confirmed(pending, "2026-11-05T00:00:00Z", &store).unwrap();
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+    }
+
+    /// What the snapshot loader and resolver use for the active credential.
+    fn active_namespace() -> String {
+        let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+        crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &secret)
+    }
+
+    fn raw_namespace(device_id: &str, secret: &str) -> String {
+        let device = relogin_device(device_id, &[]);
+        crate::snapshot_sync::snapshot_destination_namespace(&device, secret, None)
+    }
+
+    fn cutoff_destination() -> Option<String> {
+        let state = crate::backfill::load_backfill_state(&default_support_dir());
+        assert_eq!(state.backfill_cutoff_at.as_deref(), Some(RELOGIN_CUTOFF));
+        state.backfill_cutoff_destination_namespace
+    }
+
+    #[test]
+    #[serial]
+    /// [regress] R1/R4: a same-account claim re-login keeps the local
+    /// namespace for each source, re-claimed while bound or after a local
+    /// logout of a legacy (owner-less) device, along A→B and A→B→C. A grant
+    /// added by the successor, or dropped by the next, changes nothing; the
+    /// first claim's dated cutoff stays bound to the namespace.
+    fn same_account_relogin_keeps_snapshot_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for source in ["claude_code", "codex", "pi"] {
+            let grants: [&[&str]; 2] = [&["claude_code", "codex", "pi"], &[source]];
+            for (logout, links) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+                let row = format!("{source}, logout={logout}, links={links}");
+                let _env = relogin_env(&format!("relogin-keep-{source}-{logout}-{links}"));
+                let id = |link: usize| format!("device-{source}-{link}");
+                let canonical = install_legacy_active(&id(0), &[source], "user_test");
+                for link in 1..=links {
+                    if logout {
+                        relogin_local_logout();
+                    }
+                    let prior = prior_device_credential_for_registration().unwrap().unwrap();
+                    assert_eq!(prior.snapshot_namespace, canonical, "{row}");
+                    let next = relogin_device(&id(link), grants[link - 1]);
+                    let (pending, candidate, token) =
+                        relogin_claim(&prior, "user_test", "org_test", next);
+                    assert_eq!(journaled_namespace(&pending), Some(canonical.clone()));
+                    promote_relogin(&pending, &candidate, &token);
+                    assert_eq!(active_namespace(), canonical, "{row}");
+                    assert_ne!(raw_namespace(&id(link), &candidate), canonical);
+                    let binding = FileDeviceStore::default().load_envelope().unwrap().unwrap();
+                    let owner = binding.continuity.owner.unwrap();
+                    assert_eq!(
+                        [owner.user_id, owner.organization_id],
+                        ["user_test", "org_test"]
+                    );
+                    let alias = binding.continuity.snapshot_namespace.unwrap();
+                    assert_eq!(alias.namespace, canonical, "{row}: copied, never chained");
+                    assert_eq!(cutoff_destination(), Some(canonical.clone()), "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    /// R5: a claim that does not prove the same account on the same API and
+    /// machine journals no namespace; the promoted credential resolves raw
+    /// and inherits none of the predecessor's backfill completion. "0-case"
+    /// rows are defensive checks no current caller reaches.
+    fn relogin_refusals_start_a_fresh_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        type Pending = PendingDeviceCredentialPreparation;
+        fn claim(pending: &mut Pending) -> &mut PendingClaimCredentialCommit {
+            pending.claim_commit.as_mut().unwrap()
+        }
+        fn authority(pending: &mut Pending) -> &mut PendingDeviceCredentialRequestAuthority {
+            pending.request_authority.as_mut().unwrap()
+        }
+        let promoted = |row: &str, edit: &dyn Fn(&mut Pending, &mut PriorDeviceCredential)| {
+            let _env = relogin_env(&format!("relogin-refuse-{row}"));
+            let canonical = install_legacy_active("device-refuse-a", &["codex"], "user_test");
+            let mut prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let next = relogin_device("device-refuse-b", &["codex"]);
+            let (mut pending, candidate, token) =
+                relogin_claim(&prior, "user_test", "org_test", next);
+            let original = pending.claim_commit.clone().unwrap();
+            authority(&mut pending).canonical_snapshot_namespace = None;
+            edit(&mut pending, &mut prior);
+            let prior = Some(&prior).filter(|_| row != "no prior");
+            continue_prior_snapshot_namespace(&mut pending, prior);
+            // A claim the commit validator refuses cannot promote at all.
+            let commit = pending.claim_commit.get_or_insert_with(|| original.clone());
+            if commit.account.user.is_none() {
+                commit.account.user = original.account.user;
+            }
+            promote_relogin(&pending, &candidate, &token);
+            let namespace = active_namespace();
+            let owed = |namespace: &str| {
+                let state = crate::backfill::load_backfill_state(&default_support_dir());
+                crate::backfill::pending_backfill_sources_for_destination(&state, namespace)
+            };
+            let codex = crate::snapshots::SnapshotSource::Codex;
+            assert!(!owed(&canonical).contains(&codex), "{row}");
+            let inherited = !owed(&namespace).contains(&codex);
+            (pending, namespace, candidate, inherited)
+        };
+        let fresh = |row: &str, edit: &dyn Fn(&mut Pending, &mut PriorDeviceCredential)| {
+            let (pending, namespace, candidate, inherited) = promoted(row, edit);
+            assert_eq!(journaled_namespace(&pending), None, "{row}");
+            assert!(!inherited, "{row}: no predecessor completion");
+            let raw = raw_namespace("device-refuse-b", &candidate);
+            assert_eq!(namespace, raw, "{row}");
+        };
+        let (control, namespace, _, inherited) = promoted("control", &|_, _| {});
+        assert!(inherited, "control keeps its completion");
+        assert_eq!(journaled_namespace(&control), Some(namespace), "kept");
+        fresh("different user", &|p, _| {
+            claim(p).target_user_id += "x";
+            claim(p).account.user.as_mut().unwrap().id += "x";
+        });
+        fresh("other org", &|p, _| {
+            claim(p).account.organization.as_mut().unwrap().id += "x"
+        });
+        fresh("None user", &|p, _| claim(p).account.user = None);
+        fresh("None org", &|p, _| claim(p).account.organization = None);
+        fresh("None machine", &|p, _| p.device.machine_id = None);
+        fresh("other machine", &|p, _| {
+            p.device.machine_id = Some("other".into())
+        });
+        fresh("no prior", &|_, _| {});
+        fresh("no owner", &|_, prior| prior.owner = None);
+        fresh("api differs", &|_, prior| {
+            prior.owner.as_mut().unwrap().api_base_url = "https://api.other.example".into()
+        });
+        fresh("register route", &|p, _| {
+            authority(p).flow = "register".into()
+        });
+        fresh("0-case: foreign prior", &|_, prior| prior.device_id += "x");
+        fresh("0-case: no claim commit", &|p, _| p.claim_commit = None);
+
+        // No journal carries a namespace on the register route or malformed.
+        for (flow, namespace) in [("register", "a".repeat(64)), ("setup_claim", "zz".into())] {
+            let mut pending = control.clone();
+            authority(&mut pending).flow = flow.into();
+            authority(&mut pending).canonical_snapshot_namespace = Some(namespace);
+            let refused = validate_pending_prior_credential_binding(&pending);
+            assert_eq!(refused, Err(LocalApiError::StatePoisoned), "{flow}");
+        }
+
+        // The loader takes an alias only with this secret's commitment, even
+        // when its namespace is another credential's raw hash, and a reload
+        // after a legacy save stripped it resolves raw in the same process.
+        let _env = relogin_env("relogin-carry");
+        let device = relogin_device("device-carry", &["codex"]);
+        let install = |namespace: String, commitment: &str| {
+            let snapshot_namespace = Some(SnapshotNamespaceAlias {
+                namespace,
+                secret_commitment_sha256: secret_sha256(commitment),
+            });
+            let continuity = DeviceCredentialContinuity {
+                owner: None,
+                snapshot_namespace,
+            };
+            let envelope = LocalDeviceEnvelope {
+                device: device.clone(),
+                continuity,
+            };
+            FileDeviceStore::default().save_envelope(&envelope).unwrap();
+        };
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("secret-1")
+            .unwrap();
+        let s1_raw = raw_namespace("device-carry", "secret-1");
+        install(s1_raw.clone(), "secret-2");
+        assert_eq!(active_namespace(), s1_raw);
+        let s2 = crate::snapshot_sync::snapshot_upload_destination_namespace(&device, "secret-2");
+        assert_eq!(s2, raw_namespace("device-carry", "secret-2"), "foreign");
+        install("Z".repeat(64), "secret-1");
+        assert_eq!(active_namespace(), s1_raw, "malformed alias");
+        install("c".repeat(64), "secret-1");
+        assert_eq!(active_namespace(), "c".repeat(64));
+        FileDeviceStore::default().save(&device).unwrap();
+        assert_eq!(active_namespace(), s1_raw, "legacy save, then reload");
+        drop(_env);
+
+        // Different user, owner retained after a local logout of user A.
+        let _env = relogin_env("relogin-cross-account");
+        install_legacy_active("device-cross-a", &["codex"], "user_a");
+        relogin_local_logout();
+        let prior = prior_device_credential_for_registration().unwrap().unwrap();
+        let next = relogin_device("device-cross-b", &["codex"]);
+        let (pending, candidate, token) = relogin_claim(&prior, "user_b", "org_test", next);
+        assert_eq!(journaled_namespace(&pending), None);
+        promote_relogin(&pending, &candidate, &token);
+        let fresh = raw_namespace("device-cross-b", &candidate);
+        assert_eq!(active_namespace(), fresh, "owner retained, different user");
+        assert_eq!(
+            cutoff_destination(),
+            Some(fresh),
+            "the new account's cutoff"
+        );
+    }
+
+    #[test]
+    #[serial]
+    /// R2: a crash at each journal step keeps the namespace decided before
+    /// staging; it comes only from the immutable journal, never from hashing
+    /// the old device with the new secret. Unconfirmed cuts recover through
+    /// the server (the existing recovery tests), so they assert the journal.
+    fn relogin_crash_cuts_keep_the_journaled_namespace() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let restart = recover_pending_device_credential_at_startup;
+        let fenced = || crate::snapshot_client::load_snapshot_device_credentials().is_err();
+        for (cut, row) in [
+            "staged",
+            "guards passed",
+            "confirmed",
+            "candidate secret written",
+            "envelope written and read back",
+            "claim commit blocked",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _env = relogin_env(&format!("relogin-cut-{cut}"));
+            let canonical = install_legacy_active("device-cut-a", &["codex"], "user_test");
+            let prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let next = relogin_device("device-cut-b", &["codex"]);
+            let (mut pending, candidate, token) =
+                relogin_claim(&prior, "user_test", "org_test", next);
+            pending.preconfirm_guards_passed = false;
+            stage_pending_device_credential(&pending, &candidate).unwrap();
+            stage_pending_setup_run_token(&pending, &token).unwrap();
+            assert_eq!(stored_journal_namespace(), Some(canonical.clone()), "{row}");
+            if cut == 0 {
+                assert_eq!(
+                    active_namespace(),
+                    canonical,
+                    "{row}: old credential usable"
+                );
+                continue;
+            }
+            let store = FilePendingDeviceCredentialStore::default();
+            let pending = mark_pending_device_credential_guards_passed(&pending, &store).unwrap();
+            let confirmed = (cut >= 2).then(|| {
+                let at = "2026-11-05T00:00:00Z";
+                mark_pending_device_credential_confirmed(&pending, at, &store).unwrap()
+            });
+            let active_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+            if cut >= 3 {
+                active_secret.save(&candidate).unwrap();
+            }
+            if let Some(confirmed) = confirmed.as_ref().filter(|_| cut >= 4) {
+                let devices = FileDeviceStore::default();
+                write_and_verify_active_device_credential(
+                    confirmed,
+                    &candidate,
+                    &devices,
+                    &active_secret,
+                )
+                .unwrap();
+            }
+            if cut == 5 {
+                let connection = ottto_core::default_connection_path();
+                fs::remove_file(&connection).unwrap();
+                fs::create_dir(&connection).unwrap();
+                assert_eq!(restart(), Err(LocalApiError::StatePoisoned), "{row}");
+                fs::remove_dir(&connection).unwrap();
+            }
+            assert!(fenced(), "{row}");
+            assert_eq!(stored_journal_namespace(), Some(canonical.clone()), "{row}");
+            if cut >= 2 {
+                assert_eq!(restart(), Ok(true), "{row}");
+                assert_eq!(active_namespace(), canonical, "{row}: restart");
+                assert_eq!(restart(), Ok(false), "{row}");
+                assert_eq!(active_namespace(), canonical, "{row}: second restart");
+            }
+        }
     }
 
     fn connected_account() -> LocalAccountBinding {
