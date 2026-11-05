@@ -676,7 +676,7 @@ fn unkept_non_audit_key_rotates_at_page_limit_one() {
     fs::write(
         path,
         fs::read_to_string(path).unwrap()
-            + r#"{"type":"user","message":{"role":"user","content":"append"}}"#
+            + r#"{"timestamp":"2026-08-02T07:05:00Z","type":"assistant","sessionId":"a1111111-1111-4111-8111-111111111111","requestId":"req_matrix_append","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":5,"output_tokens":5}}}"#
             + "\n",
     )
     .unwrap();

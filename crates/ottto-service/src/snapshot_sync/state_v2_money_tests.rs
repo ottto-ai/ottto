@@ -12,7 +12,16 @@ pub(super) fn tagged_api(
     tokens: u64,
     account: Option<&str>,
 ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
-    tag(api(request, tokens, tokens * 10), account)
+    tagged_api_for(ROOT, request, tokens, account)
+}
+
+pub(super) fn tagged_api_for(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    account: Option<&str>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    tag(api_for(session, request, tokens, tokens * 10), account)
 }
 
 /// A telemetry row that names `account` (None: a present but invalid login).

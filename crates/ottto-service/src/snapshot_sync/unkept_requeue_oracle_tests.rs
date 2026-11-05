@@ -415,7 +415,11 @@ fn retained_unkept_revisions_requeue_for_every_source_and_failure() {
                         assert_eq!(quiet.modes.0, 0);
                         assert_eq!(quiet_bytes, 0, "settled restart consumes no transcript");
                         if source == SOURCE {
-                            assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+                            assert_eq!(
+                                crate::snapshots::all_transcript_opens_for_test() - opens,
+                                paths.len(),
+                                "clean follow-up identity-opens each file once, reads none"
+                            );
                             assert!(samples.is_empty());
                             let mut control = accept(source, &quiet);
                             control.mode = Mode::Restart;
@@ -439,28 +443,27 @@ fn retained_unkept_revisions_requeue_for_every_source_and_failure() {
 /// growth before retry follows ordinary update rules and preserves accepted buckets.
 #[test]
 fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
+    const GAP: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
     with_e2(|| {
         for grows in [false, true] {
             let (mut c, path) = placement_corpus("unkept-lost-ack");
-            crate::snapshots::write_claude_reemission_list_for_test(&c.support, &[ROOT]);
-            c.evidence(
-                &[
-                    api_login(ROOT, "a", 10, '1', Some('7')),
-                    api_login(ROOT, "b", 20, '2', Some('8')),
-                    super::super::state_v2_money_tests::tagged_api("gap", 12, None),
-                    api_login(ROOT, "agent", 5, '2', Some('8')),
-                    api_login(ROOT, "side", 4, '2', Some('8')),
-                ],
-                &[
-                    trace("a", ""),
-                    trace("b", ""),
-                    trace("gap", ""),
-                    trace("agent", "agent-000"),
-                    trace("side", ""),
-                ],
-            );
+            // A separate listed root carries the evidence-gap control: one
+            // valid tag, then a present but invalid login. ROOT stays on e2.
+            crate::snapshots::write_claude_reemission_list_for_test(&c.support, &[GAP]);
             // Independent pending roots keep the walk alive after root + agent.
             c.root(COPY, &line(COPY, "sibling", AT, 9));
+            c.root(
+                GAP,
+                &(line(GAP, "g1", AT, 10) + &line(GAP, "g2", "2026-08-02T07:01:00Z", 12)),
+            );
+            c.evidence_for(
+                GAP,
+                &[
+                    api_login(GAP, "g1", 10, '4', Some('5')),
+                    super::super::state_v2_money_tests::tagged_api_for(GAP, "g2", 12, None),
+                ],
+                &[trace_for(GAP, "g1", ""), trace_for(GAP, "g2", "")],
+            );
             let (session, prior) = StateV2ColdSession::publish(
                 Source::Claude,
                 &ScanIndex::default(),
@@ -517,7 +520,6 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     &[
                         api_login(ROOT, "a", 10, '1', Some('7')),
                         api_login(ROOT, "b", 20, '2', Some('8')),
-                        super::super::state_v2_money_tests::tagged_api("gap", 12, None),
                         api_login(ROOT, "agent", 5, '2', Some('8')),
                         api_login(ROOT, "side", 4, '2', Some('8')),
                         api_login(ROOT, "after-switch", 6, '3', Some('9')),
@@ -525,7 +527,6 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     &[
                         trace("a", ""),
                         trace("b", ""),
-                        trace("gap", ""),
                         trace("agent", "agent-000"),
                         trace("side", ""),
                         trace("after-switch", ""),
@@ -689,7 +690,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 &ScanIndex::default(),
                 &c.base.join("state"),
             );
-            let initial = page(&c, prior, 100, true);
+            let mut initial = page(&c, prior, 100, true);
             let mut prior_body = result(&initial, Mode::ColdFull);
             accepted(&mut prior_body, &initial.scan.snapshots);
             let mut destination = initial
@@ -699,6 +700,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 .cloned()
                 .map(|item| (item.source_session_id.clone(), item))
                 .collect::<BTreeMap<_, _>>();
+            initial.finish();
             let (prior, mut sender) = commit_native_with_progress(SOURCE, &session, initial);
             append(
                 &root,
