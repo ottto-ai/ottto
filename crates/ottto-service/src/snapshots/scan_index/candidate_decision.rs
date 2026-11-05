@@ -3,7 +3,10 @@
 use crate::snapshots::*;
 
 impl ScanIndex {
-    pub(in crate::snapshots) fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
+    pub(in crate::snapshots) fn candidate_decision(
+        &self,
+        candidate: &CandidateFile,
+    ) -> CandidateDecision {
         self.candidate_decision_with_reason(candidate).0
     }
 
@@ -24,7 +27,11 @@ impl ScanIndex {
     }
 
     #[cfg(test)]
-    pub(in crate::snapshots) fn candidate_decision_at(&self, candidate: &CandidateFile, now: u64) -> CandidateDecision {
+    pub(in crate::snapshots) fn candidate_decision_at(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+    ) -> CandidateDecision {
         self.candidate_decision_with_reason_at(candidate, now).0
     }
 
@@ -352,7 +359,10 @@ impl ScanIndex {
 
     /// This member is selected only because its family owes
     /// a proof correction (no witness change and no due retry).
-    pub(in crate::snapshots) fn claude_authority_correction_only(&self, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn claude_authority_correction_only(
+        &self,
+        candidate: &CandidateFile,
+    ) -> bool {
         self.claude_authority_correction_owed(&candidate.path)
             && self
                 .claude_usage_authority_candidate_requires_family_reparse(candidate)
@@ -429,13 +439,19 @@ impl ScanIndex {
         (!witness_matches || !revision_matches || retry_due).then_some(root_session_id)
     }
 
-    pub(in crate::snapshots) fn last_snapshot_fingerprint(&self, candidate: &CandidateFile) -> Option<String> {
+    pub(in crate::snapshots) fn last_snapshot_fingerprint(
+        &self,
+        candidate: &CandidateFile,
+    ) -> Option<String> {
         self.files
             .get(&local_index_key(&candidate.path))
             .and_then(|entry| entry.last_snapshot_fingerprint.clone())
     }
 
-    pub(in crate::snapshots) fn last_upload_body_witness(&self, candidate: &CandidateFile) -> Option<String> {
+    pub(in crate::snapshots) fn last_upload_body_witness(
+        &self,
+        candidate: &CandidateFile,
+    ) -> Option<String> {
         self.files
             .get(&local_index_key(&candidate.path))
             .and_then(|entry| entry.last_upload_body_witness.clone())
@@ -553,7 +569,10 @@ impl ScanIndex {
         }
     }
 
-    pub(in crate::snapshots) fn terminal_jsonl_loss(&self, candidate: &CandidateFile) -> Option<&TerminalJsonlLoss> {
+    pub(in crate::snapshots) fn terminal_jsonl_loss(
+        &self,
+        candidate: &CandidateFile,
+    ) -> Option<&TerminalJsonlLoss> {
         self.terminal_jsonl_dispositions
             .get(&local_index_key(&candidate.path))
             .filter(|disposition| {

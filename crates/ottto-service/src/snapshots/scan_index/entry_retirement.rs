@@ -5,7 +5,11 @@ use crate::snapshots::*;
 impl ScanIndex {
     /// Retire only obligations made unfulfillable by positively proven absence.
     /// Codex protection retains the entry and its own lineage/receipt state.
-    pub(in crate::snapshots) fn retire_absent_account_hold(&mut self, key: &str, members: &AccountMoveObservations) -> bool {
+    pub(in crate::snapshots) fn retire_absent_account_hold(
+        &mut self,
+        key: &str,
+        members: &AccountMoveObservations,
+    ) -> bool {
         if !self.claude_account_deferred_holds.contains_key(key) {
             return false;
         }
@@ -119,7 +123,10 @@ impl ScanIndex {
     /// does at the next healthy terminal. The hold is later dropped by a
     /// complete census. Returns false, retiring nothing, for an entry
     /// without audit debt or one a decode hold keeps.
-    pub(in crate::snapshots) fn retire_vanished_claude_audit_debt_entry(&mut self, key: &str) -> bool {
+    pub(in crate::snapshots) fn retire_vanished_claude_audit_debt_entry(
+        &mut self,
+        key: &str,
+    ) -> bool {
         if !self.persistence_available() || self.decode_holds_file(key) {
             return false;
         }
@@ -141,7 +148,10 @@ impl ScanIndex {
     /// Of `keys`, those whose entry holds a parsed, nonempty body witness that
     /// is not ACKed: deleting the file now loses that usage. Withheld-account
     /// keys keep their own deletion count. Taken before a vanished-key retirement.
-    pub(in crate::snapshots) fn unacked_bodies<'a>(&self, keys: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+    pub(in crate::snapshots) fn unacked_bodies<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<&'a String> {
         keys.into_iter()
             .filter(|key| {
                 !self.claude_account_deferred_holds.contains_key(*key)
@@ -158,7 +168,11 @@ impl ScanIndex {
     }
 
     /// Counts each of `unacked` the retirement removed; it holds or resends nothing.
-    pub(in crate::snapshots) fn count_unacked_retired(&self, source: SnapshotSource, unacked: Vec<&String>) {
+    pub(in crate::snapshots) fn count_unacked_retired(
+        &self,
+        source: SnapshotSource,
+        unacked: Vec<&String>,
+    ) {
         for key in unacked
             .into_iter()
             .filter(|key| !self.files.contains_key(*key))
@@ -270,7 +284,10 @@ impl ScanIndex {
             .retain(|key, _| files.contains_key(key) || holds.contains("files", key));
     }
 
-    pub(in crate::snapshots) fn effective_upload_body_witness_revision_requires_adoption(&self, key: &str) -> bool {
+    pub(in crate::snapshots) fn effective_upload_body_witness_revision_requires_adoption(
+        &self,
+        key: &str,
+    ) -> bool {
         let active = self.active_effective_upload_body_witness_revision;
         active != 0
             && self.files.get(key).map_or(true, |entry| {
@@ -285,7 +302,10 @@ impl ScanIndex {
 
     /// Use the existing physical listing stamp, independent of parser, upload
     /// context or retry revisions. A refusal grants no transcript read.
-    pub(in crate::snapshots) fn stale_refusal_holds_unchanged_input(&self, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn stale_refusal_holds_unchanged_input(
+        &self,
+        candidate: &CandidateFile,
+    ) -> bool {
         let key = local_index_key(&candidate.path);
         self.file_snapshot_fingerprints
             .get(&key)

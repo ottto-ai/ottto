@@ -28286,7 +28286,6 @@ impl ScanIndex {
                     .contains_key(fingerprint)
         });
     }
-
 }
 
 pub(crate) use sources::codex::identity::codex_creator_pair;
