@@ -2877,7 +2877,7 @@ mod tests {
     /// closed reason and stores no ownership row.
     #[test]
     fn skipped_llm_request_spans_count_their_reason_without_a_row() {
-        use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+        use crate::local_resource_diagnostics::cache_lifecycle::observe;
         let dir = std::env::temp_dir().join(format!("ottto-trace-skip-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let attr = |key: &str, value: Value| serde_json::json!({"key": key, "value": value});
@@ -2887,28 +2887,31 @@ mod tests {
         );
         let failed = attr("success", serde_json::json!({"boolValue": false}));
         let start = Some("1785708000000000000");
-        let cases: [(Vec<Value>, Option<&str>, fn(&Counts) -> u64); 3] = [
-            (vec![session.clone(), failed], start, |c| {
-                c.llm_request_span_success_false
-            }),
-            (vec![], start, |c| c.llm_request_span_missing_session_id),
-            (vec![session], None, |c| {
-                c.llm_request_span_missing_start_time
-            }),
+        let cases = [
+            (vec![session.clone(), failed], start),
+            (vec![], start),
+            (vec![session], None),
         ];
-        for (attributes, start, counter) in cases {
-            let mut span =
-                serde_json::json!({"name": "claude_code.llm_request", "attributes": attributes});
-            if let Some(start) = start {
-                span["startTimeUnixNano"] = Value::from(start);
-            }
-            let body = serde_json::json!({"resourceSpans": [{"scopeSpans": [{"spans": [span]}]}]});
-            let body = serde_json::to_vec(&body).unwrap();
-            let (stored, counts) =
-                observe(|| capture_claude_llm_request_traces(&dir, &body, "application/json"));
-            assert_eq!(stored.unwrap(), 0);
-            assert_eq!(counter(&counts), 1, "{counts:?}");
-        }
+        let (stored, counts) = observe(|| {
+            cases.map(|(attributes, start)| {
+                let mut span = serde_json::json!({"name": "claude_code.llm_request", "attributes": attributes});
+                if let Some(start) = start {
+                    span["startTimeUnixNano"] = Value::from(start);
+                }
+                let body = serde_json::json!({"resourceSpans": [{"scopeSpans": [{"spans": [span]}]}]});
+                let body = serde_json::to_vec(&body).unwrap();
+                capture_claude_llm_request_traces(&dir, &body, "application/json").unwrap()
+            })
+        });
+        assert_eq!(stored, [0; 3]);
+        assert_eq!(
+            [
+                counts.llm_request_span_success_false,
+                counts.llm_request_span_missing_session_id,
+                counts.llm_request_span_missing_start_time,
+            ],
+            [1; 3]
+        );
         assert!(!dir.exists());
     }
 
