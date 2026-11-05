@@ -183,7 +183,7 @@ fn checkpoint(
     index_path: &Path,
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
-    let progress_path = index_path.with_extension("progress.json");
+    let progress_path = snapshot_upload_progress_path(index_path);
     progress.save(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,
@@ -503,9 +503,8 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                 );
             }
             owed = ScanIndex::load(session.path())
-                .map(|loaded| {
+                .inspect(|loaded| {
                     assert_eq!(loaded.generation, owed.generation);
-                    loaded
                 })
                 .unwrap();
             let mut retry = page(&c, owed, 100, true);
@@ -590,7 +589,11 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
 #[test]
 fn watcher_only_append_requeues_after_a_partial_checkpoint() {
     with_e2(|| {
-        let (c, path) = placement_corpus("unkept-watcher-only");
+        let (mut c, path) = placement_corpus("unkept-watcher-only");
+        let pending = SESSIONS[..2]
+            .iter()
+            .map(|id| c.root(id, &line(id, "pending", AT, 1)))
+            .collect::<Vec<_>>();
         let (session, prior) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
@@ -598,15 +601,16 @@ fn watcher_only_append_requeues_after_a_partial_checkpoint() {
         );
         let prior = commit(&session, page(&c, prior, 100, true));
         let mut retained = prior.clone();
-        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_with_pending_for_test(
             &mut retained,
             SOURCE,
             std::slice::from_ref(&c.root),
             "2026-08-02T08:00:00Z",
             183,
+            &pending,
         );
         append(&path, &line(ROOT, "hint-append", "2026-08-02T07:04:00Z", 6));
-        let mut first = hinted(&c, retained, 1, true, std::slice::from_ref(&path));
+        let mut first = hinted(&c, retained, 2, true, std::slice::from_ref(&path));
         assert!(first.finish().held_fingerprints.is_empty());
         assert_eq!(first.scan.scanned_file_count, 1);
         assert!(!first.scan.census_complete);

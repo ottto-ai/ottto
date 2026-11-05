@@ -3517,11 +3517,37 @@ pub(crate) fn checkpoint_unselected_for_test(
     index_path: &Path,
     progress_path: &Path,
 ) -> Result<ScanIndex> {
+    checkpoint_page_for_test(index, committed, scan, index_path, progress_path, false)
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_page_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+    accept: bool,
+) -> Result<ScanIndex> {
     let mut progress = SnapshotUploadProgress::load(
         progress_path,
         &format!("{:064x}", 588),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )?;
+    if accept {
+        use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+        let (result, _, _) = upload_source_under(
+            scan.source,
+            SnapshotUploadPolicy::default(),
+            &scan.snapshots,
+            &mut progress,
+            ack,
+        );
+        anyhow::ensure!(
+            result? == ResumableUploadResult::Completed,
+            "fixture exact ACK"
+        );
+    }
     progress.save(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,

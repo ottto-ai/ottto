@@ -29558,19 +29558,22 @@ impl ScanIndex {
 
     /// A partial checkpoint keeps the traversal after scanned keys were
     /// dequeued. Requeue new or source-changed revisions this save did not
-    /// keep; ordinary candidate selection still owns reads and holds.
+    /// keep; restored audit-due entries wait for the next walk so their
+    /// selection priority cannot starve the remaining census.
     pub(crate) fn requeue_unkept_scanned_keys(
         &mut self,
         source: SnapshotSource,
         working: &ScanIndex,
         locally_held: &BTreeSet<String>,
     ) {
+        let audit_now = sampled_scan::now_seconds();
         let unkept = working
             .files
             .iter()
             .filter(|(key, entry)| {
                 self.files.get(*key).map_or(true, |kept| {
                     kept.source_file_fingerprint != entry.source_file_fingerprint
+                        && !kept.audit_requires_full(audit_now)
                 }) && !working.decode_holds_file(key)
                     && !entry
                         .last_snapshot_fingerprint

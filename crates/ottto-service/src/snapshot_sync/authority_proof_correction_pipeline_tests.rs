@@ -1544,7 +1544,30 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
     let (_, grant) = fixture.reach_grant();
-    let shed = fixture.generation(grant.hour + 1, |_| ApcUpload::Shed);
+    // Failed delivery keeps this walk open. Stop at the targeted offer;
+    // generation completion is required only after successful recovery.
+    let shed_until = |hour: u32, target: Option<&str>| {
+        let mut pages = Vec::new();
+        for number in 0..APC_MAX_PAGES {
+            let page = fixture.page(
+                &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
+                ApcUpload::Shed,
+            );
+            assert!(page.index.scan_traversal_in_progress_for_test());
+            assert_eq!(page.record().unwrap().correction.unwrap().1, grant.owed);
+            let offered = page.offered_bodies.iter().any(|(member, (fp, _))| {
+                grant.owed.contains(member)
+                    && target.map_or(true, |target| member == target)
+                    && page.offered.contains(fp)
+            });
+            pages.push(page);
+            if offered {
+                return pages;
+            }
+        }
+        panic!("the targeted correction is offered within {APC_MAX_PAGES} pages");
+    };
+    let shed = shed_until(grant.hour + 1, None);
     // The first owed member whose corrected body was offered and shed.
     let (member, stale_page) = shed
         .iter()
@@ -1574,7 +1597,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 
     // The new revision's body is offered and shed too, so neither body is
     // accepted when the late ACK of the old one arrives.
-    let current = fixture.generation(grant.hour + 2, |_| ApcUpload::Shed);
+    let current = shed_until(grant.hour + 2, Some(&member));
     let reparsed = current
         .iter()
         .find(|page| page.parsed.contains(&member))

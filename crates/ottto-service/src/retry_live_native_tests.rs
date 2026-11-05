@@ -93,6 +93,7 @@ struct PiLiveFixture {
     progress_path: PathBuf,
     baseline: ScanIndex,
     working: ScanIndex,
+    scan: SourceScanResult,
     items: Vec<SnapshotItem>,
     progress: SnapshotUploadProgress,
     live: Option<live_snapshot_retry::LiveAuthority>,
@@ -190,7 +191,7 @@ impl PiLiveFixture {
         finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut working);
         assert_eq!(scan.snapshots.len(), files);
         assert!(crate::snapshots::all_transcript_opens_for_test() > opens_before);
-        let items = scan.snapshots;
+        let items = scan.snapshots.clone();
         let opens_after_scan = crate::snapshots::all_transcript_opens_for_test();
         live.validate_capture(&home.0, &items, &working).unwrap();
         assert_eq!(
@@ -207,6 +208,7 @@ impl PiLiveFixture {
             progress_path,
             baseline,
             working,
+            scan,
             items,
             progress,
             live: Some(live),
@@ -279,7 +281,7 @@ impl PiLiveFixture {
             &self.baseline,
             &self.progress,
             &self.items,
-            None,
+            Some(&self.scan),
             &BTreeSet::new(),
             &self.index_path,
             &self.progress_path,
@@ -691,13 +693,15 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             "2026-10-06T10:05:00Z",
             30,
         );
-        let scanned = f.working.clone();
-        let key = f.working.files.keys().next().unwrap().clone();
-        let entry = f.working.files.remove(&key).unwrap();
-        f.working
-            .requeue_unkept_scanned_keys(SnapshotSource::Pi, &scanned, &BTreeSet::new());
-        f.working.files.insert_shared(key, entry);
         let mut owner = f.capture(Duration::from_millis(30));
+        assert_eq!(
+            crate::snapshots::e2_pipeline_scan_fixture::pending_keys_for_test(&f.baseline),
+            f.working.files.keys().cloned().collect()
+        );
+        assert!(
+            crate::snapshots::e2_pipeline_scan_fixture::pending_keys_for_test(&f.working)
+                .is_empty()
+        );
         assert!(owner.enabled());
         let opens_before_retry = crate::snapshots::all_transcript_opens_for_test();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

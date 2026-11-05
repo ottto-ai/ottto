@@ -294,6 +294,24 @@ pub(crate) fn retain_indexed_walk_for_test(
     collected_at: &str,
     backfill_window_days: u64,
 ) {
+    retain_indexed_walk_with_pending_for_test(
+        index,
+        source,
+        roots,
+        collected_at,
+        backfill_window_days,
+        &[],
+    );
+}
+
+pub(crate) fn retain_indexed_walk_with_pending_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    collected_at: &str,
+    backfill_window_days: u64,
+    pending: &[PathBuf],
+) {
     ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
     advance_bounded_directory_traversal(source, index, backfill_window_days, None);
     let walk = index.traversal.as_ref().expect("indexed walk");
@@ -307,7 +325,21 @@ pub(crate) fn retain_indexed_walk_for_test(
         // listing_unchanged would reject even that not-yet-due obligation.
         assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
     }
-    index.traversal.as_mut().unwrap().pending_candidates.clear();
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .retain(|candidate| pending.contains(&candidate.path));
+}
+
+pub(crate) fn pending_keys_for_test(index: &ScanIndex) -> BTreeSet<String> {
+    index
+        .traversal
+        .iter()
+        .flat_map(|walk| &walk.pending_candidates)
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect()
 }
 
 /// The time a fixture's next visit is taken to come after its last. The
