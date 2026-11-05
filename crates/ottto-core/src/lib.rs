@@ -22,7 +22,7 @@ pub use account_store::{
     default_device_path, default_machine_path, default_pending_device_credential_path,
     default_prior_device_path, default_sources_dir, default_support_dir, hashed_hardware_id,
     is_hashed_hardware_id, is_persistent_installation_id, is_persistent_machine_id,
-    normalize_hardware_id, source_state_file_name, DeviceCredentialContinuity, FileAccountStore,
+    prefixed_sha256_id, source_state_file_name, DeviceCredentialContinuity, FileAccountStore,
     FileConnectionStore, FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore,
     FileSourceStateStore, LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding,
     LocalDeviceCredentialBinding, LocalDeviceEnvelope, LocalMachineBinding, LocalSourceState,

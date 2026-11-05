@@ -228,55 +228,42 @@ pub struct PendingClaimCredentialCommit {
 pub struct LocalMachineBinding {
     pub machine_id: String,
     pub installation_id: String,
-    /// One-way hardware id (see [`hashed_hardware_id`]), never the raw
-    /// platform identifier. Absent in legacy `machine.json` files and raw in
-    /// files written by older daemons; the daemon backfills or hashes it on
-    /// next boot.
+    /// One-way hardware id ([`hashed_hardware_id`]). Absent in legacy
+    /// `machine.json` files and raw in files written by older daemons; the
+    /// daemon backfills or hashes it on next boot.
     #[serde(default)]
     pub hardware_uuid: Option<String>,
 }
 
-/// Domain-separation prefix mixed into every hardware id digest. The `v1` is
-/// part of the shared format: changing it changes every id.
-const HARDWARE_ID_DIGEST_DOMAIN: &str = "ottto-hardware:v1:";
-const HASHED_HARDWARE_ID_PREFIX: &str = "oth_";
-const HASHED_HARDWARE_ID_HEX_LEN: usize = 32;
-
-/// One-way id for a raw platform hardware identifier (macOS
-/// `IOPlatformUUID`): `oth_` + the first 32 lowercase hex characters of
-/// `sha256("ottto-hardware:v1:" + raw.trim())`. The backend derives the same
-/// value from raw ids it received earlier, so this format is a wire contract
-/// and must stay byte-identical.
-pub fn hashed_hardware_id(raw: &str) -> String {
-    let digest = Sha256::digest(format!("{HARDWARE_ID_DIGEST_DOMAIN}{}", raw.trim()).as_bytes());
+/// `<prefix>_` + the first 32 hex characters of the seed's SHA-256 digest. The
+/// shared shape behind `machine_id` (`otm_`), `account_scope` (`otu_`) and the
+/// hardware id (`oth_`); each caller owns its own prefix so none can be
+/// confused for another or for the randomly minted `installation_id` (`oti_`).
+pub fn prefixed_sha256_id(prefix: &str, seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
     let hex = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!(
-        "{HASHED_HARDWARE_ID_PREFIX}{}",
-        &hex[..HASHED_HARDWARE_ID_HEX_LEN]
-    )
+    format!("{prefix}_{}", &hex[..32])
+}
+
+/// One-way id for a raw platform hardware id (macOS `IOPlatformUUID`):
+/// `oth_` + the first 32 hex characters of
+/// `sha256("ottto-hardware:v1:" + raw.trim())`. The backend derives the same
+/// value, so this format must stay byte-identical.
+pub fn hashed_hardware_id(raw: &str) -> String {
+    prefixed_sha256_id("oth", &format!("ottto-hardware:v1:{}", raw.trim()))
 }
 
 /// Whether `value` already has the [`hashed_hardware_id`] shape
 /// (`^oth_[0-9a-f]{32}$`).
 pub fn is_hashed_hardware_id(value: &str) -> bool {
-    value.len() == HASHED_HARDWARE_ID_PREFIX.len() + HASHED_HARDWARE_ID_HEX_LEN
-        && value.starts_with(HASHED_HARDWARE_ID_PREFIX)
-        && value[HASHED_HARDWARE_ID_PREFIX.len()..]
+    value.len() == 36
+        && value.starts_with("oth_")
+        && value[4..]
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// Hashes a raw hardware id persisted by an older daemon; an id that is
-/// already hashed is returned unchanged.
-pub fn normalize_hardware_id(value: &str) -> String {
-    if is_hashed_hardware_id(value) {
-        value.to_string()
-    } else {
-        hashed_hardware_id(value)
-    }
 }
 
 /// Persisted daemon-side state for a single source. It carries the real
@@ -529,20 +516,8 @@ json_file_store! {
 }
 
 impl FilePendingDeviceCredentialStore {
-    /// Loads the journal with any raw hardware id written by an older daemon
-    /// replaced by its hash, so a retry from this daemon reproduces the same
-    /// request authority instead of looking like a rebind.
     pub fn load(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
-        let mut pending: Option<PendingDeviceCredentialPreparation> =
-            self.file().load_or(|| None)?;
-        if let Some(hardware_uuid) = pending
-            .as_mut()
-            .and_then(|pending| pending.request_authority.as_mut())
-            .and_then(|authority| authority.hardware_uuid.as_mut())
-        {
-            *hardware_uuid = normalize_hardware_id(hardware_uuid);
-        }
-        Ok(pending)
+        self.file().load_or(|| None)
     }
 
     pub fn reset(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
@@ -829,7 +804,7 @@ mod tests {
                 credential_preparation_idempotency_key: format!("sha256:{}", "b".repeat(64)),
                 machine_id: "machine-one".to_string(),
                 installation_id: "install-one".to_string(),
-                hardware_uuid: Some(hashed_hardware_id("hardware-one")),
+                hardware_uuid: Some("hardware-one".to_string()),
                 account_scope: Some("account-one".to_string()),
                 identity_continuity_capability: Some("prior_device_credential_v1".to_string()),
                 prior_device_id: Some("device-prior".to_string()),
@@ -858,118 +833,17 @@ mod tests {
         assert_eq!(store.load().expect("load reset"), None);
     }
 
-    /// Fake, UUID-shaped input shared with the backend's tests. Expected value:
-    /// `printf 'ottto-hardware:v1:%s' '00000000-0000-4000-8000-000000000000' | shasum -a 256`
-    /// truncated to 32 hex characters.
-    const SHARED_FAKE_HARDWARE_UUID: &str = "00000000-0000-4000-8000-000000000000";
-    const SHARED_FAKE_HARDWARE_ID: &str = "oth_275116a0382631a3808f5f844a12ecfa";
-
+    /// Shared with the backend's tests:
+    /// `printf 'ottto-hardware:v1:%s' '00000000-0000-4000-8000-000000000000' | shasum -a 256`.
     #[test]
-    fn hashed_hardware_id_matches_the_shared_vector_and_formula() {
-        assert_eq!(
-            hashed_hardware_id(SHARED_FAKE_HARDWARE_UUID),
-            SHARED_FAKE_HARDWARE_ID
-        );
-        let digest =
-            Sha256::digest(format!("ottto-hardware:v1:{SHARED_FAKE_HARDWARE_UUID}").as_bytes());
-        let hex = format!("{digest:x}");
-        assert_eq!(
-            hashed_hardware_id(SHARED_FAKE_HARDWARE_UUID),
-            format!("oth_{}", &hex[..32])
-        );
-        assert_eq!(
-            hashed_hardware_id(&format!(" \t{SHARED_FAKE_HARDWARE_UUID}\n")),
-            SHARED_FAKE_HARDWARE_ID,
-            "the raw id is trimmed before hashing"
-        );
-        assert_ne!(
-            hashed_hardware_id("00000000-0000-4000-8000-000000000001"),
-            SHARED_FAKE_HARDWARE_ID
-        );
-    }
-
-    #[test]
-    fn hashed_hardware_id_shape_is_strict_and_normalization_is_idempotent() {
-        assert!(is_hashed_hardware_id(SHARED_FAKE_HARDWARE_ID));
-        assert!(!is_hashed_hardware_id(SHARED_FAKE_HARDWARE_UUID));
-        assert!(!is_hashed_hardware_id(
-            &SHARED_FAKE_HARDWARE_ID.to_uppercase()
-        ));
-        assert!(!is_hashed_hardware_id(&format!(
-            "{SHARED_FAKE_HARDWARE_ID}0"
-        )));
-        assert!(!is_hashed_hardware_id(&SHARED_FAKE_HARDWARE_ID[..35]));
-        assert!(!is_hashed_hardware_id(
-            &SHARED_FAKE_HARDWARE_ID.replace("oth_", "otm_")
-        ));
-        assert!(!is_hashed_hardware_id(
-            &SHARED_FAKE_HARDWARE_ID.replacen('2', "g", 1)
-        ));
-        assert_eq!(
-            normalize_hardware_id(SHARED_FAKE_HARDWARE_UUID),
-            SHARED_FAKE_HARDWARE_ID
-        );
-        assert_eq!(
-            normalize_hardware_id(SHARED_FAKE_HARDWARE_ID),
-            SHARED_FAKE_HARDWARE_ID
-        );
-    }
-
-    #[test]
-    fn pending_device_credential_store_hashes_a_raw_journaled_hardware_id() {
-        let path = temp_path("pending-device-raw-hardware")
-            .with_file_name(PENDING_DEVICE_CREDENTIAL_FILE_NAME);
-        let store = FilePendingDeviceCredentialStore::new(&path);
-        let mut journaled = PendingDeviceCredentialPreparation {
-            schema_version: 1,
-            capability: "device_credential_prepare_confirm_v1".to_string(),
-            preparation_id: "preparation-raw-hardware".to_string(),
-            api_base_url: "https://api.ottto.net".to_string(),
-            expires_at: "2026-08-01T00:00:00Z".to_string(),
-            credential_generation: 3,
-            secret_commitment_sha256: format!("sha256:{}", "a".repeat(64)),
-            request_authority: Some(PendingDeviceCredentialRequestAuthority {
-                flow: "register".to_string(),
-                credential_preparation_idempotency_key: format!("sha256:{}", "b".repeat(64)),
-                machine_id: "machine-one".to_string(),
-                installation_id: "install-one".to_string(),
-                hardware_uuid: Some(SHARED_FAKE_HARDWARE_UUID.to_string()),
-                account_scope: None,
-                identity_continuity_capability: None,
-                prior_device_id: None,
-                prior_device_sources: None,
-                prior_secret_commitment_sha256: None,
-            }),
-            device: LocalDeviceBinding {
-                device_id: "device-next".to_string(),
-                machine_id: Some("machine-one".to_string()),
-                sources: vec!["codex".to_string()],
-            },
-            confirmation_authorized: true,
-            preconfirm_guards_passed: false,
-            claim_commit: None,
-            confirmed_at: None,
-        };
-        // An older daemon journaled the raw id.
-        store.save(&journaled).expect("save raw journal");
-        assert!(fs::read_to_string(&path)
-            .expect("read raw journal")
-            .contains(SHARED_FAKE_HARDWARE_UUID));
-
-        let loaded = store.load().expect("load journal").expect("journal");
-        journaled
-            .request_authority
-            .as_mut()
-            .expect("authority")
-            .hardware_uuid = Some(SHARED_FAKE_HARDWARE_ID.to_string());
-        assert_eq!(loaded, journaled, "only the hardware id is normalized");
-
-        // Rewriting the loaded value persists the hash and nothing raw.
-        store.save(&loaded).expect("save normalized journal");
-        let rewritten = fs::read_to_string(&path).expect("read normalized journal");
-        assert!(rewritten.contains(SHARED_FAKE_HARDWARE_ID));
-        assert!(!rewritten.contains(SHARED_FAKE_HARDWARE_UUID));
-        assert_eq!(store.load().expect("reload journal"), Some(journaled));
+    fn hashed_hardware_id_matches_the_shared_vector() {
+        let raw = "00000000-0000-4000-8000-000000000000";
+        let hashed = "oth_275116a0382631a3808f5f844a12ecfa";
+        assert_eq!(hashed_hardware_id(raw), hashed);
+        assert_eq!(hashed_hardware_id(&format!(" {raw}\n")), hashed);
+        assert!(is_hashed_hardware_id(hashed));
+        assert!(!is_hashed_hardware_id(raw));
+        assert!(!is_hashed_hardware_id(&hashed.to_uppercase()));
     }
 
     #[test]
