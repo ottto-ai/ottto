@@ -74,29 +74,6 @@ pub(super) fn state_dir(support_dir: &Path) -> PathBuf {
     support_dir.join("context_composition").join(STATE_DIR)
 }
 
-/// A resumed source: its scope upload ACKs go, so its next daily run re-sends
-/// every kept scope. Scope state, pins, install records and run health stay.
-/// A running worker holds the lease, so busy is an error the resume retries.
-pub(crate) fn drop_upload_acks(support_dir: &Path, source: SnapshotSource) -> Result<()> {
-    let dir = state_dir(support_dir);
-    let scopes = dir.join("scopes");
-    let Some((_, source)) = source_order(0).into_iter().find(|(id, _)| *id == source) else {
-        return Ok(());
-    };
-    if !scopes.exists() {
-        return Ok(());
-    }
-    let _lease = lock_state(&dir)?.ok_or_else(|| anyhow!("composition_state_busy"))?;
-    for scope_id in disk_scopes(&dir, source) {
-        match fs::remove_file(super::upload::ack_path(&dir, source, &scope_id)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            removed => removed?,
-        }
-    }
-    super::checkpoint::sync_dir(&scopes)?;
-    Ok(())
-}
-
 // -------------------------------------------------------------------------
 // Loop and gate.
 // -------------------------------------------------------------------------
