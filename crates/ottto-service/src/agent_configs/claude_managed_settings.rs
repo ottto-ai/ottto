@@ -243,8 +243,22 @@ mod unix {
     struct Directory(File, Option<u64>);
     impl Directory {
         fn open(path: &Path, private: bool) -> io::Result<Self> {
+            use std::os::unix::ffi::OsStrExt;
             if !path.is_absolute() {
                 return Err(invalid("settings directory must be absolute"));
+            }
+            if !private {
+                // The user's own root follows their directory links, as Claude
+                // does; the settings file itself is still opened no-follow.
+                let path = CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| invalid("invalid settings directory"))?;
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                return Ok(Self(file(fd)?, None));
             }
             let fd = unsafe {
                 libc::open(
@@ -252,12 +266,11 @@ mod unix {
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
             };
-            let mut directory = Self(file(fd)?, private.then_some(SETTINGS_LIMIT));
+            let mut directory = Self(file(fd)?, Some(SETTINGS_LIMIT));
             for component in path.components() {
                 match component {
                     Component::RootDir => {}
                     Component::Normal(name) => {
-                        use std::os::unix::ffi::OsStrExt;
                         let name = CString::new(name.as_bytes())
                             .map_err(|_| invalid("invalid directory component"))?;
                         directory.0 =
@@ -267,10 +280,7 @@ mod unix {
                 }
             }
             let metadata = directory.0.metadata()?;
-            if private
-                && (metadata.uid() != unsafe { libc::geteuid() }
-                    || metadata.mode() & 0o777 != 0o700)
-            {
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
                 return Err(invalid("managed settings directory must be owner-only"));
             }
             Ok(directory)
