@@ -10,9 +10,6 @@ trap 'rm -rf "$tmp_dir"' EXIT
 write_config() {
   local repo="$1"
   mkdir -p "$repo/config"
-  cat > "$repo/config/roots.txt" <<'ROOTS'
-public/
-ROOTS
   cat > "$repo/config/deny-patterns.tsv" <<'DENY'
 # scope	regex	description
 path	(^|/)backend(/|$)	backend path denied
@@ -49,7 +46,7 @@ EOF
 git -C "$clean_repo" add public
 git -C "$clean_repo" commit -qm clean
 run_scan "$clean_repo" >/tmp/public-secret-clean.out
-grep -q "current candidate file" /tmp/public-secret-clean.out
+grep -q "checked 1 HEAD blob(s)" /tmp/public-secret-clean.out
 
 history_repo="$tmp_dir/history"
 init_repo "$history_repo"
@@ -65,14 +62,8 @@ Secret removed before export.
 EOF
 git -C "$history_repo" add public
 git -C "$history_repo" commit -qm clean
-# [behaviour] HEAD-only scans ignore removed history; explicit audits keep it.
+# [behaviour] The HEAD-only scan ignores content removed from history.
 run_scan "$history_repo" >"$tmp_dir/head-only.out"
-if PUBLIC_SECRET_SCAN_ALL_REFS=1 run_scan "$history_repo" >/tmp/public-secret-history.out 2>&1; then
-  echo "Expected historical bearer token to fail secret scan" >&2
-  exit 1
-fi
-grep -q "historical content denied" /tmp/public-secret-history.out
-grep -q "bearer token denied" /tmp/public-secret-history.out
 
 current_repo="$tmp_dir/current"
 init_repo "$current_repo"
@@ -88,23 +79,11 @@ fi
 grep -q "HEAD content denied" /tmp/public-secret-current.out
 grep -q "local operator path denied" /tmp/public-secret-current.out
 
-staged_repo="$tmp_dir/staged"
-init_repo "$staged_repo"
-cat > "$staged_repo/public/README.md" <<'EOF'
-# Public Files
-EOF
-git -C "$staged_repo" add public
-git -C "$staged_repo" commit -qm staged-clean
-mkdir -p "$tmp_dir/staged-output"
-cat > "$tmp_dir/staged-output/README.md" <<'EOF'
-See docs/dev/internal-session-note.md.
-EOF
-if run_scan "$staged_repo" --staged-output "$tmp_dir/staged-output" >/tmp/public-secret-staged.out 2>&1; then
-  echo "Expected staged private docs reference to fail secret scan" >&2
+if run_scan "$current_repo" --staged-output "$tmp_dir/missing" >"$tmp_dir/retired-option.out" 2>&1; then
+  echo "Expected the retired --staged-output option to be refused" >&2
   exit 1
 fi
-grep -q "staged output content denied" /tmp/public-secret-staged.out
-grep -q "private docs denied" /tmp/public-secret-staged.out
+grep -q "unknown argument: --staged-output" "$tmp_dir/retired-option.out"
 
 path_repo="$tmp_dir/path"
 init_repo "$path_repo"
@@ -134,12 +113,8 @@ EOF
 git -C "$side_ref_repo" add public
 git -C "$side_ref_repo" commit -qm unrelated-build-output
 git -C "$side_ref_repo" checkout -q "$main_branch"
+# [behaviour] Other local refs are not part of the checked HEAD tree.
 run_scan "$side_ref_repo" >/tmp/public-secret-side-ref-default.out
-if PUBLIC_SECRET_SCAN_ALL_REFS=1 run_scan "$side_ref_repo" >/tmp/public-secret-side-ref-all.out 2>&1; then
-  echo "Expected explicit all-refs secret scan to fail on unrelated local branch" >&2
-  exit 1
-fi
-grep -q "historical content denied" /tmp/public-secret-side-ref-all.out
 
 # [behaviour] Working/index/untracked content and removed history are not HEAD.
 printf 'Bearer abcdefghijklmnopqrstuvwxyz123456\n' > "$clean_repo/public/README.md"

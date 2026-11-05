@@ -2,6 +2,9 @@
 /target/
 /crates/target/
 
+# Release and packaging output
+/dist/
+
 # Python bytecode from scripts/
 __pycache__/
 *.py[cod]

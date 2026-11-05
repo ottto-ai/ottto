@@ -22,6 +22,13 @@
 
 # Checks and tools
 
+- Keep public files standalone and free of secrets, customer data, private repo
+  references, and operator paths; `scripts/public_repo_secret_scan.sh` enforces
+  the committed `public-export/deny-patterns.tsv` policy.
+- `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
+  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
+  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run the relevant
+  surface/contract checks when their inputs change.
 - Use existing Cargo tooling and CI. Establish an affected baseline once, run
   compile/focused tests per code patch, then existing formatting, Clippy, and
   changed-crate tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
@@ -104,14 +111,3 @@
   tests. Use one stable PR/task identity, standard review for ordinary behavior and
   strict for sensitive invariants. Cosmetic or purely mechanical changes may skip
   with a concrete reason; report skipped/unavailable review honestly.
-
-# Public export
-
-- Keep public files standalone and free of secrets, customer data, private repo
-  references, and operator paths. Follow the contribution/export tooling already
-  in this repo.
-- New root export files need `public-export/roots.txt` and `public-export/path-map.tsv`
-  entries. `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
-  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
-  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run relevant
-  export/contract checks when their inputs change.

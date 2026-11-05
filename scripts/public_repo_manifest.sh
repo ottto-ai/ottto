@@ -17,16 +17,13 @@ the git tree of one commit. PUBLIC_EXPORT_MANIFEST.json is not committed: every
 tracked file except a root PUBLIC_EXPORT_MANIFEST.json becomes one record with
 path, SHA-256, size, mode (0644, or 0755 for executable blobs), and executable
 bit, and content_sha256 is the SHA-256 of those records as compact sorted JSON.
-This is the same digest public_repo_export_bundle.sh writes for a bundle
-exported from a clean checkout of that commit, so it does not depend on the
-working tree, umask, or file system.
+It does not depend on the working tree, umask, or file system.
 
 Actions:
   --digest            print content_sha256
   --facts             print manifest facts as JSON (content_sha256, counts,
                       source_commit, public_roots)
-  --compare <file>    require a manifest file (for example an export bundle's
-                      PUBLIC_EXPORT_MANIFEST.json) to equal the derived manifest
+  --compare <file>    require a manifest file to equal the derived manifest
   --guard             fail when the commit or the index still tracks a root
                       PUBLIC_EXPORT_MANIFEST.json
 
@@ -124,8 +121,8 @@ repo_path = Path(repo_arg)
 if not repo_path.is_dir():
     die(f"repository root is not a directory: {repo_arg}")
 repo_root = repo_path.resolve()
-# Decide by the checkout's own top level: dist/public-export/ottto lives inside
-# the repository, and git would silently answer for the outer checkout.
+# Decide by the checkout's own top level: for a directory nested inside a
+# checkout, git would silently answer for the outer checkout.
 toplevel = git("rev-parse", "--show-toplevel").decode("utf-8").strip()
 if Path(toplevel).resolve() != repo_root:
     die(f"--repo must be the top level of a git checkout: {repo_arg}")
@@ -297,6 +294,7 @@ if tracked_manifest_oid is not None:
 if action == "digest":
     print(digest)
 elif action == "facts":
+    # Older commits still list export roots; trees without the file report none.
     public_roots: list[str] = []
     if any(path == "public-export/roots.txt" for path, _mode, _oid in entries):
         roots_text = git("show", f"{commit}:public-export/roots.txt").decode("utf-8")
