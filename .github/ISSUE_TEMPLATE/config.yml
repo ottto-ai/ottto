@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ottto-ai/ottto/blob/main/SECURITY.md
+    about: Do not open a public issue. Follow the private reporting steps in SECURITY.md.
+  - name: Account, billing, or organization help
+    url: https://github.com/ottto-ai/ottto/blob/main/SUPPORT.md
+    about: Use the support contacts in SUPPORT.md for anything private.
+  - name: Documentation
+    url: https://github.com/ottto-ai/ottto/blob/main/docs/README.md
+    about: Install, setup, privacy, diagnostics, and troubleshooting guides.

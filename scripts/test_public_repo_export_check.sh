@@ -71,7 +71,11 @@ if run_check "$secret_repo" >/tmp/public-export-secret.out 2>&1; then
   echo "Expected local user path to fail public export check" >&2
   exit 1
 fi
-grep -q "local operator path denied" /tmp/public-export-secret.out
+grep -q "local operator path denied: public/README.md:1$" /tmp/public-export-secret.out
+if grep -q "Raw operator output" /tmp/public-export-secret.out; then
+  echo "Export check must not print matched content" >&2
+  exit 1
+fi
 
 docs_repo="$tmp_dir/private-docs"
 init_repo "$docs_repo"

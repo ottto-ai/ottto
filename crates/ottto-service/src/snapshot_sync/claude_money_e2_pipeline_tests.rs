@@ -830,6 +830,25 @@ fn upload_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_source_under(
+        SnapshotSource::ClaudeCode,
+        upload_policy,
+        items,
+        progress,
+        respond,
+    )
+}
+fn upload_source_under(
+    source: SnapshotSource,
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     Result<ResumableUploadResult>,
@@ -853,7 +872,8 @@ fn upload_under(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let wire = request_under(upload_policy, &batch);
+            let mut wire = request_under(upload_policy, &batch);
+            wire.source = source.api_slug().into();
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");
             sent.push(canonical(&wire));
