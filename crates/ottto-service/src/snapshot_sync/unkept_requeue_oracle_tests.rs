@@ -1005,19 +1005,33 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 continue;
             }
             crate::snapshots::state_v2::release_collection_page_limit_for_test(&loaded);
-            let mut retry = page(&c, loaded, 100, true);
+            let mut retry = if reoffer.is_some() {
+                // The refused body was built with this cycle's accepted-share
+                // hints (as the sync loop does); re-read it from the same inputs.
+                let mut retry = c.raw(
+                    &E2ScanFixture::capturing_identity(),
+                    loaded,
+                    100,
+                    true,
+                    &[root.clone(), agent.clone()],
+                );
+                retry.enrich_with(&c, Some(&mut sender.accepted_identity_buckets));
+                retry
+            } else {
+                page(&c, loaded, 100, true)
+            };
             assert!(retry.finish().held_fingerprints.is_empty());
             let already_acked = sender.accepted_fingerprints.clone();
             let mut physical_posts = 0;
-            let mut reoffered = false;
+            let mut offered = Vec::new();
             let (status, _) = send(SOURCE, &retry, &mut sender, |items| {
                 physical_posts += items.len();
-                if let Some((faulted, body)) = &reoffer {
-                    reoffered |= items.iter().any(|item| {
-                        item.snapshot_fingerprint == *faulted
-                            && snapshot_upload_body_witness(item) == *body
-                    });
-                }
+                offered.extend(items.iter().map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
+                    )
+                }));
                 if fault == "mixed_file" {
                     for item in items {
                         assert!(
@@ -1033,7 +1047,31 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
             });
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             if let Some((faulted, body)) = &reoffer {
-                assert!(reoffered, "the due retry re-offers the exact refused body");
+                let short = |hash: &str| hash.chars().take(8).collect::<String>();
+                let pairs = offered
+                    .iter()
+                    .map(|(fp, witness)| (short(fp), short(witness)))
+                    .collect::<Vec<_>>();
+                let witnesses = offered
+                    .iter()
+                    .filter(|(fp, _)| fp == faulted)
+                    .map(|(_, witness)| witness)
+                    .collect::<Vec<_>>();
+                if witnesses.is_empty() || witnesses.iter().any(|witness| *witness != body) {
+                    eprintln!(
+                        "retry offered (fp, witness): {pairs:?}; refused ({}, {})",
+                        short(faulted),
+                        short(body)
+                    );
+                }
+                assert!(
+                    !witnesses.is_empty(),
+                    "the due retry's POST offers the refused fingerprint"
+                );
+                assert!(
+                    witnesses.iter().all(|witness| *witness == body),
+                    "the offered item's body witness equals the refused one"
+                );
                 assert_eq!(
                     sender.accepted_body_witnesses.get(faulted),
                     Some(body),
