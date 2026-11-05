@@ -233,32 +233,60 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
     let codex_preludes = Arc::clone(&daemon.codex_preludes);
+    let inputs = daemon.footprint_cwds.inputs();
+    let mut harvest = move || {
+        let claude = harvest_all_once(&home, &support_dir, &projection);
+        // Codex session starts share this thread: no extra background job.
+        if let Err(error) =
+            crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+        {
+            eprintln!(
+                "codex session start harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+        }
+        claude
+    };
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
-            let refused = match harvest_all_once(&home, &support_dir, &projection) {
-                Ok(outcome) => outcome.refused > 0,
-                Err(error) => {
-                    eprintln!(
-                        "context footprint harvest skipped: {}",
-                        crate::snapshot_sync::safe_error(&error)
-                    );
-                    false
-                }
-            };
-            // Codex session starts share this thread: no extra background job.
-            if let Err(error) =
-                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
-            {
-                eprintln!(
-                    "codex session start harvest skipped: {}",
-                    crate::snapshot_sync::safe_error(&error)
-                );
-            }
-            std::thread::sleep(next_context_cycle_delay(refused));
+            std::thread::sleep(context_cycle(&inputs, &mut harvest));
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
+}
+
+/// Waits for snapshot sync's first usable delivery (returns at once after it;
+/// the flag never resets), harvests, and answers the delay before the next.
+fn context_cycle(
+    inputs: &FootprintInputs,
+    harvest: &mut impl FnMut() -> Result<ContextHarvestOutcome>,
+) -> Duration {
+    let arrived = inputs.0.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(inputs.1.wait_while(arrived, |arrived| !*arrived));
+    let refused = match harvest() {
+        Ok(outcome) => outcome.refused > 0,
+        Err(error) => {
+            eprintln!(
+                "context footprint harvest skipped: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+            false
+        }
+    };
+    next_context_cycle_delay(refused)
+}
+
+/// Set by the first snapshot-sync delivery a harvest can use, from the Claude
+/// or Codex observer; one per daemon, shared by both feeds, RAM only.
+#[derive(Debug, Default)]
+pub(crate) struct FootprintInputs(Mutex<bool>, std::sync::Condvar);
+
+impl FootprintInputs {
+    pub(crate) fn deliver(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.1.notify_all();
+    }
 }
 
 fn harvest_all_once(
@@ -1300,7 +1328,7 @@ const PROJECTED_FILE_BYTES: usize = 256;
 /// then are known, and nothing is known while snapshot sync does not read
 /// Claude.
 #[derive(Debug, Default)]
-pub(crate) struct CwdProjection(Mutex<Projection>);
+pub(crate) struct CwdProjection(Mutex<Projection>, Arc<FootprintInputs>);
 
 /// Counters are since daemon start, for the cycle metrics line.
 #[derive(Debug, Default)]
@@ -1354,6 +1382,11 @@ impl CwdProjection {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The wake shared with the Codex feed.
+    pub(crate) fn inputs(&self) -> Arc<FootprintInputs> {
+        Arc::clone(&self.1)
+    }
+
     /// One snapshot-sync pass's observer.
     pub(crate) fn observer(self: &Arc<Self>) -> Box<CwdObserver> {
         self.lock().passes += 1;
@@ -1386,6 +1419,9 @@ impl CwdProjection {
             remember_cwd(&mut known, cwd);
         }
         if let Some(mtime) = file.mtime {
+            if !known.is_empty() && mtime.elapsed().unwrap_or_default() <= RECENT_WORKSPACE_WINDOW {
+                self.1.deliver();
+            }
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
             projection.files.insert(file.object, entry);
@@ -2399,6 +2435,47 @@ mod tests {
         let mut found = discover_workspaces(cwds, &mut path_scopes, repository_scope);
         found.truncate(MAX_WORKSPACES_PER_CYCLE);
         (found, path_scopes)
+    }
+
+    /// Regression: at daemon start no snapshot pass has delivered a
+    /// transcript yet, so the thread must wait for the first delivery instead
+    /// of harvesting nothing and sleeping six hours.
+    #[test]
+    fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
+        let home = temp_dir("startup-wake");
+        let now = SystemTime::now();
+        let dir = home.join("work").join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        write_discovery_transcripts(&home, now, &[(60, vec![dir.as_path()])]);
+        let mut files = Vec::new();
+        let projects = home.join(".claude").join("projects");
+        collect_recent_jsonl_files(&projects, now, &mut files, &mut 0);
+        let projection = Arc::new(CwdProjection::default());
+        let cycle = {
+            let projection = Arc::clone(&projection);
+            std::thread::spawn(move || {
+                // Each harvest records how many workspaces it could see.
+                let mut seen = Vec::new();
+                let delay = context_cycle(&projection.1, &mut || {
+                    seen.push(projection.recent_cwds(SystemTime::now()).len());
+                    Ok(ContextHarvestOutcome::default())
+                });
+                (seen, delay)
+            })
+        };
+
+        project_transcripts(&projection, &files);
+
+        let (seen, delay) = cycle.join().unwrap();
+        assert_eq!(seen, [1], "one harvest, after the delivery");
+        assert_eq!(delay, CONTEXT_FOOTPRINT_INTERVAL);
+        let mut later = 0;
+        let delay = context_cycle(&projection.1, &mut || {
+            later += 1;
+            Ok(ContextHarvestOutcome::default())
+        });
+        assert_eq!((later, delay), (1, CONTEXT_FOOTPRINT_INTERVAL));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
