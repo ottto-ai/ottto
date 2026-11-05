@@ -256,7 +256,7 @@ write_manifest \
   "$sha" \
   "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/Ottto-macos-arm64.dmg" \
   "$stable_manifest"
-"$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" >/dev/null
+"$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" --record-sha256 >/dev/null
 "$PREFLIGHT" --manifest "$stable_manifest" --dry-run >/dev/null
 
 tampered_helper_manifest="$TMP_DIR/tampered-helper-manifest.json"
@@ -268,6 +268,27 @@ if "$PREFLIGHT" --manifest "$tampered_helper_manifest" --dry-run >/dev/null 2>&1
   exit 1
 fi
 "$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" >/dev/null
+"$PREFLIGHT" --manifest "$stable_manifest" --dry-run >/dev/null
+
+missing_helper_sha_manifest="$TMP_DIR/missing-helper-sha-manifest.json"
+jq 'del(.install_methods.verified_native_installer.sha256)' \
+  "$stable_manifest" > "$missing_helper_sha_manifest"
+if "$PREFLIGHT" --manifest "$missing_helper_sha_manifest" --dry-run >"$TMP_DIR/missing-helper-sha.out" 2>&1; then
+  echo "Expected a stable manifest without the installer helper SHA-256 to fail stable preflight" >&2
+  exit 1
+fi
+grep -Fq "install_methods.verified_native_installer.sha256 must be a lowercase SHA-256" \
+  "$TMP_DIR/missing-helper-sha.out"
+
+wrong_helper_sha_manifest="$TMP_DIR/wrong-helper-sha-manifest.json"
+jq '.install_methods.verified_native_installer.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
+  "$stable_manifest" > "$wrong_helper_sha_manifest"
+if "$PREFLIGHT" --manifest "$wrong_helper_sha_manifest" --dry-run >"$TMP_DIR/wrong-helper-sha.out" 2>&1; then
+  echo "Expected an installer helper SHA-256 mismatch to fail stable preflight" >&2
+  exit 1
+fi
+grep -Fq "verified native installer helper SHA-256 does not match the manifest" \
+  "$TMP_DIR/wrong-helper-sha.out"
 
 dev_manifest="$TMP_DIR/dev-manifest.json"
 write_manifest \

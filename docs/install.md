@@ -49,16 +49,27 @@ Homebrew opt path.
 
 ## Verified Native DMG Helper
 
-When a stable release advertises a verified native installer helper, download
-the public script from the release notes and verify the published checksum
-before running it:
+When a stable release advertises a verified native installer helper, the
+stable release manifest publishes the helper's immutable URL and SHA-256 under
+`install_methods.verified_native_installer`. Download the helper from that URL
+and check it against the manifest before running it (`jq` ships with macOS 15
+and later):
 
 ```bash
-curl -fsSL <published-install-macos-url> -o install-macos.sh
-shasum -a 256 install-macos.sh
-sh install-macos.sh
+curl -fsSL https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json \
+  -o release-manifest.json
+helper_url="$(jq -r '.install_methods.verified_native_installer.url' release-manifest.json)"
+helper_sha="$(jq -r '.install_methods.verified_native_installer.sha256' release-manifest.json)"
+curl -fsSL "$helper_url" -o install-macos.sh
+echo "$helper_sha  install-macos.sh" | shasum -a 256 -c -
+bash install-macos.sh
 ottto status --json
 ```
+
+Stop if `shasum` reports a mismatch or the manifest has no `sha256` for the
+helper. The SHA-256 is part of the signed manifest bytes, so
+`release-manifest.json.sig` covers it; see
+[Release Verification](release-verification.md).
 
 The helper verifies and opens the signed native DMG or PKG. It must not install
 mutable shell payloads, clear quarantine, or bootstrap launchd itself. After the

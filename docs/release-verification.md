@@ -37,7 +37,8 @@ A stable release manifest must include:
 - immutable artifact URLs;
 - SHA-256 for every artifact;
 - install-owner metadata;
-- optional install-method metadata for helpers that are not runtime owners;
+- optional install-method metadata for helpers that are not runtime owners,
+  including each helper's immutable URL and SHA-256;
 - rollback metadata;
 - signing, notarization, stapling, and Gatekeeper state for macOS artifacts;
 - CycloneDX SBOM URL and SHA-256;

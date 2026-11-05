@@ -315,8 +315,15 @@ manifest only after the stable release gate and stable preflight pass:
 ```bash
 ./scripts/hosted_native_installer.sh \
   --manifest dist/macos/release-manifest.json \
-  --output dist/macos/install-macos.sh
+  --output dist/macos/install-macos.sh \
+  --record-sha256
 ```
+
+`--record-sha256` writes the generated wrapper's SHA-256 into the manifest at
+`install_methods.verified_native_installer.sha256`. Run it before attestation
+binding and manifest signing so the signed manifest publishes the exact digest
+of the served `install-macos.sh`; stable preflight fails when the field is
+missing or does not match the file.
 
 The wrapper is a terminal convenience around the native signed artifact. It
 downloads the immutable `release-manifest.json`, verifies that the manifest is
@@ -460,7 +467,7 @@ AWS/CDN prerequisites before publish:
 10. Generate the Homebrew tap formula from the exact manifest and run the tap QA
    checklist.
 11. Generate `install-macos.sh` from the exact manifest with
-   `hosted_native_installer.sh` and run its dry-run/static QA.
+   `hosted_native_installer.sh --record-sha256` and run its dry-run/static QA.
 12. Upload the app, CLI, daemon archives, `release-manifest.json`, the
     CycloneDX SBOM, the Homebrew formula output, and `install-macos.sh` to the
     immutable versioned prefix.
