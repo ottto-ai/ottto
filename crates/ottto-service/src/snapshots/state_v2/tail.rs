@@ -248,27 +248,6 @@ impl Observation {
                 .map_or(0, |facts| facts.owner.len() as u64)
     }
 }
-/// A head a live retry keeps between saves: its buffers, plus one full tree
-/// node per map entry and root, as `tree_nodes` charges a map.
-impl crate::heap_layout_bound::HeapLayoutBound for StagedFile {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::tree_nodes;
-        let Self {
-            revision: _,
-            head,
-            collections,
-            pages,
-            obsolete,
-            change: _,
-        } = self;
-        tree_nodes::<Collection, CollectionMeta>(collections.len(), c)?;
-        tree_nodes::<(Collection, u64), Vec<u8>>(pages.len(), c)?;
-        tree_nodes::<(Collection, u64), ()>(obsolete.len(), c)?;
-        c.add(pages.values().try_fold(head.capacity(), |sum, page| {
-            sum.checked_add(page.capacity())
-        })?)
-    }
-}
 enum Entry {
     File(StagedFile),
     Failed(SetAsideCause),
@@ -406,20 +385,13 @@ impl TailStage {
             self.retire.insert(key);
         }
     }
-    /// Takes the heads staged for `keys`; set-asides and debt stay.
-    pub(super) fn unstage(
-        &mut self,
-        keys: impl IntoIterator<Item = String>,
-    ) -> Vec<(String, StagedFile)> {
-        let mut taken = Vec::new();
-        for key in keys {
-            if matches!(self.files.get(key.as_bytes()), Some(Entry::File(_))) {
-                if let Some(Entry::File(file)) = self.files.remove(key.as_bytes()) {
-                    taken.push((key, file));
-                }
+    /// Drops the heads staged for `keys`; set-asides and debt stay.
+    pub(super) fn unstage(&mut self, keys: impl IntoIterator<Item = String>) {
+        for key in keys.into_iter().map(String::into_bytes) {
+            if matches!(self.files.get(&key), Some(Entry::File(_))) {
+                self.files.remove(&key);
             }
         }
-        taken
     }
     /// Files staged with their complete new state.
     pub(super) fn staged(&self) -> impl Iterator<Item = &Vec<u8>> {

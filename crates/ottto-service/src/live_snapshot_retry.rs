@@ -244,7 +244,6 @@ impl LiveRetryOwner {
             items,
             working,
             committed,
-            crate::snapshots::UnstagedTails::take(working),
             progress,
             index_path,
             progress_path,

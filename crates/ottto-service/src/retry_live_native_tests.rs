@@ -1054,7 +1054,6 @@ fn bounded_retry_json_escape_admission_declines_before_retained_copy_and_wire_gr
             &f.items,
             &f.working,
             &f.baseline,
-            Default::default(),
             &f.progress,
             &f.index_path,
             &f.progress_path,

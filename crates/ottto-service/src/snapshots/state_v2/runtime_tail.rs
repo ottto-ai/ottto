@@ -54,20 +54,14 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
     })
 }
 /// Files a save does not keep: their staged heads go, the committed ones stay.
-/// The heads wait for this pass's live retry, which may keep the files later.
 pub(in crate::snapshots) fn unstage_tail(
     path: &Path,
     keys: impl IntoIterator<Item = String>,
 ) -> Result<()> {
     with_state(path, |state| {
-        let unstaged = state.tail.unstage(keys);
-        state.unstaged.extend(unstaged);
+        state.tail.unstage(keys);
         Ok(())
     })
-}
-/// The heads unstaged on this route since the last take.
-pub(in crate::snapshots) fn take_unstaged_tail(path: &Path) -> Result<Vec<(String, StagedFile)>> {
-    with_state(path, |state| Ok(std::mem::take(&mut state.unstaged)))
 }
 /// This file's completion could not encode: its predecessor stays.
 pub(in crate::snapshots) fn set_aside_tail(
@@ -236,7 +230,6 @@ pub(super) fn commit_at_exit(path: &Path, runtime: &std::sync::Weak<Runtime>) ->
 /// dropped and counted, its next read replaying from the previous head.
 pub(super) fn discard_at_exit(path: &Path) {
     let _ = with_state(path, |state| {
-        state.unstaged.clear();
         let dropped = std::mem::take(&mut state.tail);
         if !dropped.is_empty() {
             telemetry::event(

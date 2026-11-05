@@ -29741,9 +29741,8 @@ impl ScanIndex {
         }
         // A partial save commits a Tail head only for an entry it keeps or a
         // held file's custody: any other restored or omitted file keeps its
-        // committed head, and its next read starts there. A Pi live retry
-        // stages the left-out heads again (`UnstagedTails`). A route error
-        // here also fails the save that would commit.
+        // committed head, and its next read starts there. A route error here
+        // also fails the save that would commit.
         if !every_batch_sent {
             if let Ok(Some(route)) = state_v2::runtime_path(self) {
                 let unkept = self.files.iter().filter(|(key, entry)| {
@@ -54814,53 +54813,6 @@ pub(crate) fn state_v2_baseline_release(
     index: &ScanIndex,
 ) -> state_v2::BaselineRelease {
     state_v2::BaselineRelease::new(path, index)
-}
-/// Tail heads a partial save left out. A Pi live retry keeps them and stages
-/// them again for its own partial save, whose keep-or-held rule then decides
-/// them as the first save's did.
-#[derive(Default)]
-pub(crate) struct UnstagedTails(Vec<(String, state_v2::StagedFile)>);
-impl UnstagedTails {
-    /// What `index`'s route unstaged since the last take.
-    pub(crate) fn take(index: &ScanIndex) -> Self {
-        Self(
-            state_v2::runtime_path(index)
-                .ok()
-                .flatten()
-                .and_then(|route| state_v2::take_unstaged_tail(&route).ok())
-                .unwrap_or_default(),
-        )
-    }
-    /// Runs `save` with these heads staged again; afterwards they are the
-    /// heads it left out. A failed save commits none of them.
-    pub(crate) fn around<T>(
-        &mut self,
-        index: &ScanIndex,
-        save: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let route = state_v2::runtime_path(index).ok().flatten();
-        let staged = std::mem::take(&mut self.0);
-        let keys = staged
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        if let Some(route) = &route {
-            for (key, file) in staged {
-                let _ = state_v2::stage_tail(route, &key, file);
-            }
-        }
-        let result = save();
-        if let (Some(route), Err(_)) = (&route, &result) {
-            let _ = state_v2::unstage_tail(route, keys);
-        }
-        *self = Self::take(index);
-        result
-    }
-}
-impl crate::heap_layout_bound::HeapLayoutBound for UnstagedTails {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)
-    }
 }
 pub(crate) fn state_v2_side_effect_guard(
     path: &Path,
