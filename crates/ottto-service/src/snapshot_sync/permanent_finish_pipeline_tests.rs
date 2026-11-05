@@ -404,9 +404,10 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                     record.disposition,
                     SnapshotQuarantineDisposition::RetryPending
                 );
+                assert!(record.upload_body_witness.is_some());
                 assert_eq!(
-                    record.upload_body_witness.as_ref(),
-                    offered_witnesses.get(fp)
+                    record.upload_body_witness,
+                    progress.quarantined_fingerprints[fp].upload_body_witness
                 );
                 assert!(!saved.accepted_snapshot_fingerprint_recorded(fp));
             }
