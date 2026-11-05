@@ -272,50 +272,28 @@ pub(crate) struct ClaudeIdentityOverCapBytes {
     pub(crate) after_shed: usize,
 }
 
-/// Closed causes for native archive reader refusal and owed custody.
+/// Live compressed-input refusal causes. Numeric slots remain frozen;
+/// retired causes have no producers and their old serialized values stay inert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
     ReplayNotAuthorized = 0,
-    #[serde(rename = "CompressedProofParentUnsupported")]
-    ProofParentUnsupported = 1,
-    #[serde(rename = "CompressedProofChildUnsupported")]
-    ProofChildUnsupported = 2,
-    #[serde(rename = "CompressedParentSideUnsupported")]
-    ParentSideUnsupported = 3,
     #[serde(rename = "CompressedGroupProbeUnsupported")]
     GroupProbeUnsupported = 4,
     #[serde(rename = "CompressedGroupReadUnsupported")]
     GroupReadUnsupported = 5,
-    #[serde(rename = "CompressedParentLedgerUnbound")]
-    ParentLedgerUnbound = 6,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported = 7,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused = 8,
     #[serde(rename = "CompressedDecodeFailed")]
     DecodeFailed = 9,
-    #[serde(rename = "CompressedOwnerUnproven")]
-    OwnerUnproven = 10,
-    #[serde(rename = "CompressedOutputHeld")]
-    OutputHeld = 11,
     #[serde(rename = "CompressedDecodedOverLimit")]
     DecodedOverLimit = 12,
-    #[serde(rename = "CompressedHeaderInvalid")]
-    HeaderInvalid = 13,
-    #[serde(rename = "CompressedCorrectionUnapplied")]
-    CorrectionUnapplied = 14,
     #[serde(rename = "CompressedHeaderUnfunded")]
     HeaderUnfunded = 15,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded = 16,
-    // No longer counted: a decoder reclaims header occupancy. Kept for old logs.
-    #[serde(rename = "decoder_refused_header_occupancy")]
-    DecoderRefusedHeaderOccupancy = 17,
-    #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven = 18,
-    #[serde(rename = "ArchiveEquivalenceUnproven")]
-    ArchiveEquivalenceUnproven = 19,
     #[doc(hidden)]
     #[serde(skip)]
     __Count = 20,
@@ -327,28 +305,17 @@ impl std::fmt::Display for CodexZstCause {
 }
 impl std::error::Error for CodexZstCause {}
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-/// Every counted cause; the length is checked against `__Count`.
-const CODEX_ZST_ALL: [CodexZstCause; CODEX_ZST_CAUSES] = [
+/// Live counted causes; holes retain the old numeric slots.
+const CODEX_ZST_ALL: [CodexZstCause; 9] = [
     CodexZstCause::ReplayNotAuthorized,
-    CodexZstCause::ProofParentUnsupported,
-    CodexZstCause::ProofChildUnsupported,
-    CodexZstCause::ParentSideUnsupported,
     CodexZstCause::GroupProbeUnsupported,
     CodexZstCause::GroupReadUnsupported,
-    CodexZstCause::ParentLedgerUnbound,
     CodexZstCause::PhysicalOffsetUnsupported,
     CodexZstCause::AdmissionRefused,
     CodexZstCause::DecodeFailed,
-    CodexZstCause::OwnerUnproven,
-    CodexZstCause::OutputHeld,
     CodexZstCause::DecodedOverLimit,
-    CodexZstCause::HeaderInvalid,
-    CodexZstCause::CorrectionUnapplied,
     CodexZstCause::HeaderUnfunded,
     CodexZstCause::CompatibilityUnfunded,
-    CodexZstCause::DecoderRefusedHeaderOccupancy,
-    CodexZstCause::FamilyUnproven,
-    CodexZstCause::ArchiveEquivalenceUnproven,
 ];
 struct CodexZstRefused {
     counters: [AtomicU64; CODEX_ZST_CAUSES],
@@ -432,14 +399,6 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
         return;
     }
     cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
-}
-
-pub(crate) fn codex_zst_held(cause: CodexZstCause, count: usize) {
-    traversal_point(
-        "codex_zst_held",
-        "codex",
-        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, count)]))]),
-    );
 }
 
 /// Sidecar read attempts and actual input bytes since the last Claude page.
@@ -2251,36 +2210,42 @@ mod tests {
     #[test]
     fn compressed_causes_have_distinct_pinned_indices() {
         use super::CodexZstCause::*;
-        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
-            ReplayNotAuthorized,
-            ProofParentUnsupported,
-            ProofChildUnsupported,
-            ParentSideUnsupported,
-            GroupProbeUnsupported,
-            GroupReadUnsupported,
-            ParentLedgerUnbound,
-            PhysicalOffsetUnsupported,
-            AdmissionRefused,
-            DecodeFailed,
-            OwnerUnproven,
-            OutputHeld,
-            DecodedOverLimit,
-            HeaderInvalid,
-            CorrectionUnapplied,
-            HeaderUnfunded,
-            CompatibilityUnfunded,
-            DecoderRefusedHeaderOccupancy,
-            FamilyUnproven,
-            ArchiveEquivalenceUnproven,
+        // Frozen numeric slots survive as holes; only live producers keep
+        // enum variants. Old archive causes decode through the inert fields.
+        const ALL: [Option<super::CodexZstCause>; super::CODEX_ZST_CAUSES] = [
+            Some(ReplayNotAuthorized),
+            None,
+            None,
+            None,
+            Some(GroupProbeUnsupported),
+            Some(GroupReadUnsupported),
+            None,
+            Some(PhysicalOffsetUnsupported),
+            Some(AdmissionRefused),
+            Some(DecodeFailed),
+            None,
+            None,
+            Some(DecodedOverLimit),
+            None,
+            None,
+            Some(HeaderUnfunded),
+            Some(CompatibilityUnfunded),
+            None,
+            None,
+            None,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
-        assert_eq!(
-            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
-            "decoder_refused_header_occupancy"
-        );
+        assert!(serde_json::from_str::<super::CodexZstCause>(
+            "\"decoder_refused_header_occupancy\""
+        )
+        .is_err());
         let mut labels = std::collections::BTreeSet::new();
 
-        for (index, cause) in ALL.iter().enumerate() {
+        for (index, cause) in ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cause)| cause.as_ref().map(|cause| (index, cause)))
+        {
             assert_eq!(*cause as usize, index);
             let label = serde_json::to_string(cause).unwrap();
             assert!(labels.insert(label.clone()), "unique persisted label");

@@ -2743,6 +2743,58 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn source_disabled_refusal_is_not_a_receipt() {
+        let support = temp_dir("footprint-source-disabled");
+        let (client, server) = crate::snapshot_client::config_upload_backend(
+            r#"{"accepted":false,"reason":"source_disabled"}"#,
+        );
+        let mut request = sample_request();
+        let error = upload_if_changed(
+            &client,
+            &|| Ok("synthetic-relay".to_string()),
+            &support,
+            "synthetic-destination",
+            &mut request,
+            FootprintRules {
+                policy: Default::default(),
+                names_withheld: false,
+            },
+        )
+        .unwrap_err();
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("POST /api/v1/context-footprint/snapshot "));
+        assert!(error.is::<crate::snapshot_client::UploadRefused>());
+        assert!(!cache_path(&support, &request.workspace_hash).exists());
+
+        let (client, server) = crate::snapshot_client::config_upload_backend(
+            r#"{"accepted":false,"reason":"source_disabled"}"#,
+        );
+        request.agent_source = "codex".to_string();
+        let error = crate::codex_prelude_footprint::upload_if_changed(
+            &client,
+            "synthetic-relay",
+            &support,
+            "synthetic-destination",
+            &mut request,
+            FootprintRules {
+                policy: Default::default(),
+                names_withheld: false,
+            },
+            Some(1),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.is::<crate::snapshot_client::UploadRefused>());
+        assert!(!support
+            .join(crate::codex_prelude_footprint::STATE_DIR)
+            .join(format!("{}.json", request.workspace_hash))
+            .exists());
+        fs::remove_dir_all(support).unwrap();
+    }
+
     fn sample_request() -> ContextFootprintIngestRequest {
         ContextFootprintIngestRequest {
             agent_source: "claude-code".to_string(),

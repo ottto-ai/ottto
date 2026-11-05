@@ -69,22 +69,11 @@ fn no_key_stores_no_field_and_fails_closed() {
     let markers = markers.unwrap();
     assert_eq!(markers.context_digest, None);
     assert_eq!(markers.context_position, Some(0));
-    assert_eq!(markers.context_flip_position, Some(2));
     assert!(matches!(
         markers.verdict(0, false),
         MarkerVerdict::Trusted(_)
     ));
     assert_eq!(markers.verdict(2, false), MarkerVerdict::UntrustedFlip);
-}
-
-/// Without a key, a second sentence before any marker also ends the email.
-#[test]
-fn no_key_second_sentence_before_a_marker_ends_the_email() {
-    bind_session_context_key(None);
-    let mut markers = None;
-    note_marker_line(&mut markers, &sentence("one@example.invalid"), 0);
-    note_marker_line(&mut markers, &sentence("two@example.invalid"), 1);
-    assert_eq!(markers.unwrap().context_flip_position, Some(1));
 }
 
 /// A missing digest keeps the first-sentence rule, and a real sentence change
@@ -95,14 +84,11 @@ fn missing_digest_is_a_first_sentence_and_a_real_change_still_flips() {
     note_marker_line(&mut markers, &sentence("one@example.invalid"), 0);
     let state = markers.as_ref().unwrap();
     assert!(!state.context_changed);
-    assert_eq!(state.context_flip_position, None);
     note_marker_line(&mut markers, &org(ORG_1), 0);
     note_marker_line(&mut markers, &sentence("one@example.invalid"), 1);
-    assert_eq!(markers.as_ref().unwrap().context_flip_position, None);
 
     note_marker_line(&mut markers, &sentence("two@example.invalid"), 2);
     let state = markers.as_ref().unwrap();
-    assert_eq!(state.context_flip_position, Some(2));
     assert!(state.context_changed);
     note_marker_line(&mut markers, &org(ORG_2), 2);
     assert!(matches!(
@@ -114,7 +100,6 @@ fn missing_digest_is_a_first_sentence_and_a_real_change_still_flips() {
     note_marker_line(&mut first_after_marker, &org(ORG_1), 0);
     note_marker_line(&mut first_after_marker, &sentence("one@example.invalid"), 1);
     assert!(first_after_marker.as_ref().unwrap().context_changed);
-    assert_eq!(first_after_marker.unwrap().context_flip_position, None);
 }
 
 /// Each post-first-bind key change: a scrubbed parse takes the next sentence as a
@@ -138,7 +123,6 @@ fn scrubbed_digest_is_a_fresh_baseline_and_trusts_no_flip() {
 
             note_marker_line(&mut markers, &sentence(next), 1);
             assert!(!markers.as_ref().unwrap().context_changed);
-            assert_eq!(markers.as_ref().unwrap().context_flip_position, Some(1));
             note_marker_line(&mut markers, &org(ORG_2), 1);
             assert_eq!(
                 markers.as_ref().unwrap().verdict(1, false),

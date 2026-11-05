@@ -64,8 +64,8 @@ fn has_head(index: &ScanIndex, path: &Path) -> bool {
 /// only, to the second, for both encodings: the walk (where G7 starts no
 /// debt), a watcher hint and the Codex roster. Read
 /// evidence keeps the walk window: an indexed file stays observed (never
-/// pruned) and an archive with a body witness is listed; a Held archive
-/// without one is not. A file already queued still opens, and a skipped file
+/// pruned) and a compressed file with ordinary read evidence is listed; an unread
+/// compressed file without it is not. A file already queued still opens, and a skipped file
 /// that grows is listed for its first read.
 #[test]
 fn first_read_bound_admits_only_files_with_read_evidence() {
@@ -84,8 +84,8 @@ fn first_read_bound_admits_only_files_with_read_evidence() {
             cases.extend([
                 ("held-61.jsonl.zst", now - 61 * DAY, false),
                 ("witnessed-61.jsonl.zst", now - 61 * DAY, true),
-                ("cut-out.jsonl.zst", cutoff - 1, false),
-                ("cut-in.jsonl.zst", cutoff + 1, true),
+                ("compressed-cut-out.jsonl.zst", cutoff - 1, false),
+                ("compressed-cut-in.jsonl.zst", cutoff + 1, true),
             ]);
         }
         for (name, modified, _) in &cases {
@@ -98,17 +98,10 @@ fn first_read_bound_admits_only_files_with_read_evidence() {
             .files
             .insert(local_index_key(&indexed), entry(&indexed));
         if codex {
-            let held = codex_compressed_input::ArchiveEvidence::unknown();
-            let mut witnessed = codex_compressed_input::ArchiveEvidence::unknown();
-            witnessed.work.as_mut().unwrap().body_witness = Some("body".into());
-            for (name, archive) in [
-                ("held-61.jsonl.zst", held),
-                ("witnessed-61.jsonl.zst", witnessed),
-            ] {
-                f.index
-                    .archives
-                    .insert(local_index_key(&path(name)), archive);
-            }
+            let witnessed = path("witnessed-61.jsonl.zst");
+            f.index
+                .files
+                .insert(local_index_key(&witnessed), entry(&witnessed));
         }
         unselected_page(f.source.api_slug());
         walk_at(&mut f, CENSUS);
@@ -186,18 +179,24 @@ fn first_read_bound_admits_only_files_with_read_evidence() {
 #[test]
 fn listed_then_aged_file_is_still_read_and_settles() {
     for store in STORES {
-        let mut f = Fixture::new(store, "first-read-edge");
-        let file = f.file("edge.jsonl", 10);
-        set_mtime(&file, census() - 59 * DAY);
-        assert_eq!(walk_at(&mut f, CENSUS)["outstanding_files"], 1, "{store:?}");
-        f.save();
-        assert!(has_head(&f.index, &file), "{store:?}");
-        assert_eq!(walk_at(&mut f, LATER)["outstanding_files"], 1, "{store:?}");
-        assert!(candidates(&f.index).contains(&file), "{store:?}");
-        f.index.files.insert(local_index_key(&file), entry(&file));
-        accept(f.source, &mut f.index, &file);
-        assert_eq!(walk_at(&mut f, LATER)["outstanding_files"], 0, "{store:?}");
-        f.close();
+        for name in if store == Source::Codex {
+            vec!["edge.jsonl", "edge.jsonl.zst"]
+        } else {
+            vec!["edge.jsonl"]
+        } {
+            let mut f = Fixture::new(store, "first-read-edge");
+            let file = f.file(name, 10);
+            set_mtime(&file, census() - 59 * DAY);
+            assert_eq!(walk_at(&mut f, CENSUS)["outstanding_files"], 1, "{store:?}");
+            f.save();
+            assert!(has_head(&f.index, &file), "{store:?}");
+            assert_eq!(walk_at(&mut f, LATER)["outstanding_files"], 1, "{store:?}");
+            assert!(candidates(&f.index).contains(&file), "{store:?}");
+            f.index.files.insert(local_index_key(&file), entry(&file));
+            accept(f.source, &mut f.index, &file);
+            assert_eq!(walk_at(&mut f, LATER)["outstanding_files"], 0, "{store:?}");
+            f.close();
+        }
     }
 }
 

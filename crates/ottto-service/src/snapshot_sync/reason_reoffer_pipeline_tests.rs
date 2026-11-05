@@ -1267,7 +1267,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             String::as_str,
             |_| body.clone(),
             |_| Some("synthetic-session"),
-            |_| false,
+            |_| 0,
             |_| None,
             &mut budget,
             |items| {
@@ -1340,8 +1340,9 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
 }
 
 /// After a restart, the first real ordinary prepare mirrors an open head-CAS
-/// challenge from the persisted upload ledger into the scan index, so the
-/// session's files read a native Full; another session is not mirrored.
+/// challenge of a session holding a saved base from the persisted upload
+/// ledger into the scan index, so the session's files read a native Full;
+/// another session is not mirrored.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -1356,6 +1357,9 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
     assert!(first.result.is_ok(), "{:?}", first.result);
     let key = cache_session_key(IDENTITY_PIPELINE_ROOT);
     let mut progress = first.progress.clone();
+    progress
+        .accepted_cache_heads
+        .insert(key.clone(), "e".repeat(64));
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {

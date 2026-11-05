@@ -213,7 +213,7 @@ fn bootstrap_cache_heads_with_budget(
                 |item| item.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |item| Some(item.source_session_id.as_str()),
-                |_| false,
+                |_| 0,
                 |_| None,
                 inplace_retry,
                 |items| upload(items, enforce_head_cas),
@@ -1346,6 +1346,20 @@ fn identity_cache_wire_reserve(
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
+}
+
+/// Request class of one main-upload body: 2 for a legacy reconciliation,
+/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
+/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
+/// for a whole request when one body carries a patch, so the packer never
+/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
+/// with a server head it never claimed.
+fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+    if legacy {
+        2
+    } else {
+        u8::from(crate::snapshot_client::declares_head_cas(snapshot))
+    }
 }
 
 /// Answer each owed head-CAS challenge on the outgoing body of its session.
@@ -4234,14 +4248,10 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
-            ownership_incomplete_file_count: scan_result
-                .ownership_incomplete_file_count
-                .saturating_add(scan_result.archive_owed_count)
-                as u64,
-            causes: scan_result.causes.summary_with_archive(
-                scan_result.ownership_incomplete_file_count,
-                scan_result.archive_owed_count,
-            ),
+            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -6271,17 +6281,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("read reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -7089,13 +7089,14 @@ fn prepare_sync_source_inner(
         &mut watcher_hints.list_all,
         request_identity_capture,
         &copy_prefix_scope,
+        Some((daemon.transcript_cache.as_ref(), &sampled_scope)),
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
     .with_codex_versions(daemon.codex_versions.clone());
     // A walk already running keeps the request: the first pass after it lists.
     crate::snapshot_watcher::defer_listing(source, watcher_hints.list_all);
-    scan.rehome_withheld_baseline(&mut committed_index);
+    scan.rehome_withheld_baseline(&mut committed_index)?;
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -7536,14 +7537,8 @@ fn capture_codex_recovery_evidence(
     progress_path: &Path,
     validate_authority: impl Fn() -> Result<()>,
 ) {
-    let (mut captured, changed, held) =
+    let (mut captured, changed) =
         index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
-    scan_result.hold_codex_groups(
-        index,
-        committed_index,
-        &held,
-        "recovery capture exceeds retained evidence cap",
-    );
     if !changed.is_empty() {
         let protected = scan_result
             .snapshots
@@ -8370,7 +8365,12 @@ fn finish_sync_source(
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
-            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            |snapshot| {
+                snapshot_upload_batch_class(
+                    snapshot,
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+                )
+            },
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
@@ -8488,19 +8488,6 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    if !index.archives.is_empty() {
-        index.settle_archive_outcome(|fp| {
-            upload_progress
-                .accepted_body_witnesses
-                .get(fp)
-                .filter(|_| {
-                    !upload_progress
-                        .context_resend
-                        .requires_resend(fp, &upload_progress.accepted_body_contexts)
-                })
-                .map(String::as_str)
-        });
-    }
     // Shed and upload-error partial checkpoint: save wholly settled files,
     // then release adopted ACK capacity against the full scan's references
     // (#778 R2-2). A failed save is logged and yields `None`; a failed
@@ -9278,9 +9265,16 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
-    // A session that owes a head-CAS answer reads natively, never from Tail.
+    // A session whose upload can carry a head-CAS answer reads natively, never
+    // from Tail. The answer replaces a saved base (`attach_head_conflict_answers`);
+    // a challenge without one never answers, and an ordinary accept clears it.
     index.activate_head_conflict_sessions(
-        progress.head_conflict_challenges.keys().cloned().collect(),
+        progress
+            .head_conflict_challenges
+            .keys()
+            .filter(|key| progress.accepted_cache_heads.contains_key(*key))
+            .cloned()
+            .collect(),
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
@@ -10782,7 +10776,7 @@ where
         fingerprint,
         body_witness,
         |_| None,
-        |_| false,
+        |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
         upload,
@@ -11240,9 +11234,9 @@ pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
 /// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
 /// group. A single body over the byte bound is its own group and meets the
 /// existing request preflight.
-fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+fn literal_family_groups(members: Vec<(usize, usize, u8)>) -> Vec<Vec<(usize, usize, u8)>> {
     let mut groups = Vec::new();
-    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut group = Vec::<(usize, usize, u8)>::new();
     let mut bytes = 2usize;
     for member in members {
         if !group.is_empty()
@@ -11293,7 +11287,7 @@ where
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
-    BatchClass: Fn(&T) -> bool,
+    BatchClass: Fn(&T) -> u8,
     LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -11408,9 +11402,11 @@ where
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so
     // without literal items (gate off) packing is the previous order.
-    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
-    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
-    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
+    // Each unit also carries its family key: the class of its family's first
+    // group, or its own class for a single body (see the class sort below).
+    let mut order = Vec::<(usize, usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<(usize, u8)>::with_capacity(pending_by_fingerprint.len());
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, u8)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
         let item = (
             index,
@@ -11421,7 +11417,7 @@ where
             Some(root) => literal_families.entry(root).or_default().push(item),
             None => {
                 order.push(item);
-                unit_ends.push(order.len());
+                unit_ends.push((order.len(), item.2));
             }
         }
     }
@@ -11430,15 +11426,16 @@ where
             let member = session_id(&items[*index]);
             (member != Some(root), member)
         });
+        let family_key = members[0].2;
         for group in literal_family_groups(members) {
             order.extend(group);
-            unit_ends.push(order.len());
+            unit_ends.push((order.len(), family_key));
         }
     }
     let mut units = Vec::with_capacity(unit_ends.len());
     let mut start = 0;
-    for end in unit_ends {
-        units.push(order[start..end].to_vec());
+    for (end, family_key) in unit_ends {
+        units.push((order[start..end].to_vec(), family_key));
         start = end;
     }
     // Preserve the native census/family selection. At this transport boundary
@@ -11446,22 +11443,29 @@ where
     // body shares a request (and its retry latency) with context catch-up.
     let mut ordinary_units = Vec::new();
     let mut catchup_units = Vec::new();
-    for unit in units {
+    for (unit, family_key) in units {
         let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             progress
                 .context_resend
                 .is_catchup(fingerprint(&items[*index]))
         });
         if !ordinary.is_empty() {
-            ordinary_units.push(ordinary);
+            ordinary_units.push((ordinary, family_key));
         }
         if !catchup.is_empty() {
-            catchup_units.push(catchup);
+            catchup_units.push((catchup, family_key));
         }
     }
+    // A request declares head CAS when any body in it carries a cache patch,
+    // so every request is class-pure: an unpatched body never travels under
+    // another body's CAS contract. Stable-sort each lane by family key so
+    // single bodies form one run per class, each family's groups stay
+    // contiguous and root first, and a single-class page keeps its order.
+    ordinary_units.sort_by_key(|(_, family_key)| *family_key);
+    catchup_units.sort_by_key(|(_, family_key)| *family_key);
     let ordinary_entities = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .map(|(index, _, _)| fingerprint(&items[*index]))
         .collect::<BTreeSet<_>>();
     // A bootstrap invocation sees only its probes. It cannot send catch-up
@@ -11471,7 +11475,7 @@ where
         .ordinary_work_is_in(&ordinary_entities);
     let ordinary_bytes = ordinary_units
         .iter()
-        .flatten()
+        .flat_map(|(unit, _)| unit)
         .fold(0usize, |sum, (_, bytes, _)| {
             sum.saturating_add(bytes.saturating_add(2))
         });
@@ -11484,11 +11488,11 @@ where
         .reserve_ordinary_bytes(ordinary_bytes);
     let mut unit_ends = Vec::new();
     order.clear();
-    for unit in ordinary_units {
+    for (unit, _) in ordinary_units {
         order.extend(unit);
         unit_ends.push((order.len(), false));
     }
-    for unit in catchup_units {
+    for (unit, _) in catchup_units {
         let start = order.len();
         for item in unit {
             if ordinary_in_this_call
@@ -13179,6 +13183,7 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{
     archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress,
+    codex_transition_cold_batches,
 };
 
 #[cfg(test)]
@@ -16774,6 +16779,11 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
+    mod class_split_tests {
+        use super::*;
+        include!("snapshot_sync/class_split_tests.rs");
+    }
+
     #[derive(Clone, Serialize)]
     struct SizedUploadItem {
         fingerprint: String,
@@ -18404,7 +18414,7 @@ mod tests {
             String::as_str,
             |item| item.clone(),
             |_| None,
-            |item| reconcile_class.contains(item),
+            |item| 2 * u8::from(reconcile_class.contains(item)),
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
@@ -22006,14 +22016,27 @@ mod tests {
         captured: Arc<Mutex<Vec<String>>>,
         hints: Vec<(u64, &'static str)>,
     ) -> String {
+        snapshot_status_server_with_hint_extras_and_batch(captured, hints, None)
+    }
+
+    fn snapshot_status_server_with_hint_extras_and_batch(
+        captured: Arc<Mutex<Vec<String>>>,
+        hints: Vec<(u64, &'static str)>,
+        batch: Option<Vec<SnapshotItem>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
             let receipt_count = hints.len();
             let mut hints = hints.into_iter();
-            for _ in 0..receipt_count * 3 {
+            let mut ordinary_requests = receipt_count * 3;
+            loop {
                 let (mut stream, _) = listener.accept().expect("accept snapshot status request");
                 let request = read_complete_http_request(&mut stream);
+                // A batch fixture exercises ordinary uploads and fresh relay
+                // acquisition too; its terminal status ends the conversation.
+                let terminal = batch.is_some()
+                    && request.starts_with("POST /api/v1/agent-session-snapshots/status ");
                 let body = if request.contains("/telemetry/devices/") {
                     captured
                         .lock()
@@ -22021,6 +22044,21 @@ mod tests {
                         .push(request);
                     r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
                         .to_string()
+                } else if request.contains("/agent-session-snapshots/batches") {
+                    let items = batch.as_ref().expect("expected snapshot upload");
+                    let entities = items.iter().map(|item| {
+                        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                        serde_json::json!({"source_session_id":item.source_session_id,
+                            "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                            "body_witness_version":version,
+                            "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
+                    }).collect::<Vec<_>>();
+                    captured.lock().unwrap().push(request);
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                        "accepted_entities":entities})
+                    .to_string()
                 } else if request.contains("/activity-hints") {
                     let (hint, extra) = hints.next().expect("one hint per receipt");
                     format!(
@@ -22041,6 +22079,15 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write snapshot status response");
+                if terminal {
+                    break;
+                }
+                if batch.is_none() {
+                    ordinary_requests -= 1;
+                    if ordinary_requests == 0 {
+                        break;
+                    }
+                }
             }
         });
         format!("http://{address}")
@@ -24282,47 +24329,3 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
-
-/// Continuation's platform gates for archive work: the native signals unless
-/// a caller injects its own. A pass and its continuation pages share them.
-#[derive(Clone)]
-pub(crate) struct ArchiveGates(
-    Option<std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>>,
-);
-impl Default for ArchiveGates {
-    fn default() -> Self {
-        Self::new(None::<continuation::MacPlatformSignals>)
-    }
-}
-impl std::fmt::Debug for ArchiveGates {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ArchiveGates")
-    }
-}
-impl ArchiveGates {
-    pub(crate) fn new(gates: Option<impl continuation::PlatformGates + Send + 'static>) -> Self {
-        Self(gates.map(|g| {
-            std::sync::Arc::new(Mutex::new(g))
-                as std::sync::Arc<Mutex<dyn continuation::PlatformGates + Send>>
-        }))
-    }
-    /// Continuation's power policy: only `Allowed` permits archive work;
-    /// `Refused` and `Unknown` deny.
-    pub(crate) fn power_ready(&self) -> bool {
-        let Some(gates) = self.0.as_ref() else {
-            return continuation::PlatformGates::power(
-                &mut continuation::MacPlatformSignals::default(),
-            ) == continuation::PlatformState::Allowed;
-        };
-        gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .power()
-            == continuation::PlatformState::Allowed
-    }
-}
-
-/// Share continuation's work threshold with archive admission.
-pub(crate) fn archive_work_ready(micros: u64) -> bool {
-    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
-}

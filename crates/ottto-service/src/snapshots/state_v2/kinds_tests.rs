@@ -169,7 +169,7 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
             // Archive custody is written only while held; this fixture holds
             // none. A retired kind is never written.
             if *introduced > previous_layout
-                && !kinds_misc::ARCHIVE_KINDS.contains(kind)
+                && !["v1_field.archives", "v1_field.archive_deferred_alarm_count"].contains(kind)
                 && !field.starts_with("retired_")
             {
                 assert!(

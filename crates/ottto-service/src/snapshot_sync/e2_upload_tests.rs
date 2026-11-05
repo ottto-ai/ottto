@@ -2,14 +2,15 @@
 // Included into `snapshot_sync::tests`; uses its helpers.
 
 #[derive(Clone, Serialize)]
-struct FamilyItem {
-    fingerprint: String,
-    session: String,
+pub(super) struct FamilyItem {
+    pub(super) fingerprint: String,
+    pub(super) session: String,
     payload: String,
     #[serde(skip)]
-    root: Option<String>,
+    pub(super) root: Option<String>,
+    /// Main-upload batch class: 0 ordinary, 1 cache-patched, 2 legacy.
     #[serde(skip)]
-    class: bool,
+    pub(super) class: u8,
 }
 
 fn family_member(root: &str, agent: Option<usize>, payload: usize) -> FamilyItem {
@@ -22,17 +23,17 @@ fn family_member(root: &str, agent: Option<usize>, payload: usize) -> FamilyItem
         session,
         payload: "x".repeat(payload),
         root: Some(root.to_owned()),
-        class: false,
+        class: 0,
     }
 }
 
-fn plain_item(ordinal: u64) -> FamilyItem {
+pub(super) fn plain_item(ordinal: u64) -> FamilyItem {
     FamilyItem {
         fingerprint: format!("{ordinal:064x}"),
         session: format!("plain-{ordinal}"),
         payload: String::new(),
         root: None,
-        class: false,
+        class: 0,
     }
 }
 
@@ -44,13 +45,13 @@ fn fingerprint_seed(session: &str) -> u128 {
     u128::from_be_bytes(digest[..16].try_into().unwrap())
 }
 
-fn family(root: &str, members: usize, payload: usize) -> Vec<FamilyItem> {
+pub(super) fn family(root: &str, members: usize, payload: usize) -> Vec<FamilyItem> {
     (0..members)
         .map(|n| family_member(root, n.checked_sub(1), payload))
         .collect()
 }
 
-fn upload_families(
+pub(super) fn upload_families(
     items: &[FamilyItem],
     progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
@@ -77,7 +78,9 @@ fn upload_families(
     (result, batches)
 }
 
-fn accept_all(batch: &[FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn accept_all(
+    batch: &[FamilyItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     Ok(accepted_batch(batch.len()))
 }
 
@@ -324,7 +327,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |item| Some(item.source_session_id.as_str()),
-            |_| false,
+            |_| 0,
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut InplaceRetryBudget::default(),
             |batch| {

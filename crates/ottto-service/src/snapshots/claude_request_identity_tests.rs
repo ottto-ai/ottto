@@ -1274,11 +1274,12 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
 }
 
 /// A stored head from a build that dropped a file's markers past a count does
-/// not load, so that file reads cold; any other stored head still loads.
+/// not load, so that file reads cold; any other stored head still loads, and a
+/// stored retired flip position is dropped.
 #[test]
 fn stored_markers_load_unless_an_earlier_build_dropped_them() {
     use crate::durable_tail_codec::{Dec, Durable, Enc, HDigest};
-    let stored = |dropped: bool| {
+    let stored = |dropped: bool, flip: Option<u64>| {
         Enc::count_write(1 << 10, |e| {
             Vec::<identity::OrgMarker>::new().put(e)?;
             None::<identity::OrgMarker>.put(e)?;
@@ -1286,18 +1287,20 @@ fn stored_markers_load_unless_an_earlier_build_dropped_them() {
             None::<String>.put_h(e, "OrgMarkers.context_digest")?;
             false.put(e)?;
             None::<u64>.put(e)?;
-            None::<u64>.put(e)
+            flip.put(e)
         })
         .unwrap()
     };
-    let bytes = stored(false);
-    let mut d = Dec::new(&bytes);
-    assert_eq!(
-        identity::OrgMarkers::take(&mut d),
-        Ok(identity::OrgMarkers::default())
-    );
-    assert_eq!(d.finish(), Ok(()));
-    assert!(identity::OrgMarkers::take(&mut Dec::new(&stored(true))).is_err());
+    for flip in [None, Some(7)] {
+        let bytes = stored(false, flip);
+        let mut d = Dec::new(&bytes);
+        assert_eq!(
+            identity::OrgMarkers::take(&mut d),
+            Ok(identity::OrgMarkers::default())
+        );
+        assert_eq!(d.finish(), Ok(()));
+    }
+    assert!(identity::OrgMarkers::take(&mut Dec::new(&stored(true, None))).is_err());
 }
 
 #[test]
