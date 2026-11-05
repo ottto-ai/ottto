@@ -2735,6 +2735,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
         let root_session_id = claude_snapshot_family_root(item);
         if uncertified_roots.contains(&root_session_id) {
             clear_claude_context_posture(item);
+            item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::UnknownBirth);
         } else {
             let multi_file = multi_file_members.contains(&item.source_session_id);
             let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
@@ -37893,6 +37894,8 @@ mod tests {
         item.first_turn_context_tokens = Some(84_043);
         item.compaction_count = Some(3);
         item.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
+        // The withheld marker is wire-only: it cannot move this pin.
+        item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::MultiFile);
 
         let hashes = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
         assert_eq!(
@@ -37963,6 +37966,55 @@ mod tests {
         assert!(wire.get("local_context_points").is_none());
         let wire = serde_json::to_value(&item).expect("serialize");
         assert!(wire.get("compaction_events").is_none());
+    }
+
+    /// `context_posture_withheld` is absent unless ownership is unknown, rides
+    /// only beside a cleared posture (the server refuses anything else), and
+    /// moves no identity, so it starts no re-upload.
+    #[test]
+    fn context_posture_withheld_marks_only_unknown_ownership() {
+        let mut request = valid_v6_batch_request();
+        let policy = request.upload_policy;
+        let mut item = request.snapshots.remove(0);
+        item.peak_context_fill_tokens = Some(250_000);
+        item.compaction_count = Some(1);
+        item.first_own_request_at = Some("2026-08-14T08:00:00Z".to_string());
+        let mut authoritative = item.clone();
+        authoritative.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::AllCopied);
+        assert_eq!(
+            serde_json::to_value(&authoritative).expect("serialize"),
+            serde_json::to_value(&item).expect("serialize")
+        );
+        clear_claude_context_posture(&mut item);
+        for (verdict, reason) in [
+            (ClaudeFileBirthVerdict::MultiFile, "multi_file"),
+            (ClaudeFileBirthVerdict::UnknownBirth, "unknown_birth"),
+        ] {
+            let mut marked = item.clone();
+            marked.claude_file_birth_verdict = Some(verdict);
+            let wire = serde_json::to_value(&marked).expect("serialize");
+            assert_eq!(wire["context_posture_withheld"], reason);
+            // The posture beside the marker is empty.
+            for field in [
+                "peak_context_fill_tokens",
+                "compaction_count",
+                "first_own_request_at",
+            ] {
+                assert!(wire.get(field).is_none(), "{verdict:?} {field}");
+            }
+            assert_eq!(
+                snapshot_semantic_envelope(SnapshotSource::ClaudeCode, &marked, policy),
+                snapshot_semantic_envelope(SnapshotSource::ClaudeCode, &item, policy)
+            );
+            assert_eq!(
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &marked),
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &item)
+            );
+            assert_eq!(
+                snapshot_upload_body_witness(&marked),
+                snapshot_upload_body_witness(&item)
+            );
+        }
     }
 
     #[test]
