@@ -4292,10 +4292,10 @@ fn apply_telemetry_config(
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
             // Explicit, backend-authorized enable also clears the default
             // JSON opt-out written by disable. Per-root user opt-outs and
-            // external exporters survive.
+            // external exporters survive. Settings go first, so kept settings
+            // never get the shell env either.
             let settings =
                 patch_claude_code_settings_with_relay_base(&machine, &relay_base_url, true)?;
             if let Some(kept) = settings.kept {
@@ -4303,6 +4303,7 @@ fn apply_telemetry_config(
                     claude_settings_kept_reason(kept).1.to_string(),
                 ));
             }
+            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
             patch.changed |= settings.changed;
             Ok(patch)
         }
@@ -11127,7 +11128,11 @@ fn run_install_source_action(
 
     let status = if relay_running { "succeeded" } else { "failed" }.to_string();
     let message = if let Some((_, text)) = kept {
-        text.to_string()
+        if relay_running {
+            text.to_string()
+        } else {
+            format!("{text} The local OTLP relay is not listening.")
+        }
     } else if relay_running {
         format!(
             "{} telemetry setup installed",
@@ -12492,7 +12497,7 @@ fn patch_claude_code_settings_at_with_relay_base(
     let created = !path.exists();
     let root = path.parent().ok_or(LocalApiError::StatePoisoned)?;
     let (mut wrapper_changed, mut backup_created) = (false, false);
-    let outcome = reconcile_default(
+    let (written, kept) = reconcile_default(
         root,
         &claude_code_relay_env_with_base(machine, relay_base_url),
         clear_opt_out,
@@ -12513,21 +12518,12 @@ fn patch_claude_code_settings_at_with_relay_base(
             "Claude Code settings could not be safely updated: {error}"
         ))
     })?;
-    Ok(match outcome {
-        Outcome::Changed => ConfigPatchResult {
-            changed: true,
-            created,
-            backup_created,
-            kept: None,
-        },
-        Outcome::Unchanged => ConfigPatchResult {
-            changed: wrapper_changed,
-            ..ConfigPatchResult::default()
-        },
-        kept => ConfigPatchResult {
-            kept: Some(kept),
-            ..ConfigPatchResult::default()
-        },
+    let written = written == Outcome::Changed;
+    Ok(ConfigPatchResult {
+        changed: written || wrapper_changed,
+        created: created && written,
+        backup_created,
+        kept,
     })
 }
 
@@ -12570,16 +12566,19 @@ fn claude_settings_kept_reason(
     kept: crate::agent_configs::claude_managed_settings::Outcome,
 ) -> (&'static str, &'static str) {
     use crate::agent_configs::claude_managed_settings::Outcome;
-    if kept == Outcome::OptedOut {
-        (
+    match kept {
+        Outcome::OptedOut => (
             "opted_out",
-            "Claude Code settings turn telemetry off, so Ottto left them unchanged.",
-        )
-    } else {
-        (
+            "Claude Code settings turn telemetry off, so Ottto left their telemetry settings unchanged.",
+        ),
+        Outcome::Linked => (
+            "linked_settings",
+            "Claude Code settings.json is a link or not a regular file, so Ottto left it unchanged.",
+        ),
+        _ => (
             "external_telemetry",
-            "Claude Code settings send telemetry to another collector, so Ottto left them unchanged.",
-        )
+            "Claude Code settings send telemetry to another collector, so Ottto left their telemetry settings unchanged.",
+        ),
     }
 }
 
@@ -15074,7 +15073,7 @@ fn control_token_validation_base_url(requested: Option<&str>) -> Result<String, 
 /// optionally with a sub-path). Unlike [`is_trusted_api_base_url`] this excludes
 /// the loopback dev allowance, so it is safe to honor even from an untrusted
 /// request body when deciding where to validate a control token.
-fn is_production_api_base_url(value: &str) -> bool {
+pub(crate) fn is_production_api_base_url(value: &str) -> bool {
     if value.contains('@') || value.contains('?') || value.contains('#') {
         return false;
     }
@@ -28609,44 +28608,6 @@ X-API-Key = "otel_redacted"
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// [behaviour] Setup, Fix and refresh never overwrite a default-settings
-    /// opt-out or external exporter: the file stays byte-for-byte, no backup
-    /// or wrapper is written, and the reason is returned.
-    #[test]
-    fn patch_claude_code_settings_keeps_optout_and_external_exporter() {
-        use crate::agent_configs::claude_managed_settings::Outcome;
-        let root = control_test_root("claude-settings-kept");
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("settings.json");
-        let backup_root = root.join("backups");
-        for (body, kept) in [
-            (
-                r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0"}}"#,
-                Outcome::OptedOut,
-            ),
-            (
-                r#"{"env":{"OTEL_LOGS_EXPORTER":"none"}}"#,
-                Outcome::OptedOut,
-            ),
-            (
-                r#"{"env":{"OTEL_EXPORTER_OTLP_ENDPOINT":"https://collector.example"},"statusLine":{"type":"command","command":"user-status"}}"#,
-                Outcome::ExternalTelemetry,
-            ),
-        ] {
-            fs::write(&path, body).unwrap();
-            assert_eq!(
-                patch_claude_code_settings_at(&path, &test_machine(), &backup_root).unwrap(),
-                ConfigPatchResult {
-                    kept: Some(kept),
-                    ..ConfigPatchResult::default()
-                }
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), body);
-            assert!(!backup_root.exists());
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn refresh_repair_preserves_user_claude_statusline_command() {
         let root = std::env::temp_dir().join(format!(
@@ -32182,4 +32143,6 @@ X-API-Key = "otel_redacted"
             account_scope: Some(TEST_ACCOUNT_SCOPE.to_string()),
         }
     }
+
+    mod claude_settings;
 }

@@ -26,14 +26,44 @@ pub(crate) enum Outcome {
     Unchanged,
     OptedOut,
     ExternalTelemetry,
+    /// The default settings.json is a link or not a regular file.
+    Linked,
 }
 
+const ENABLE_FLAGS: [&str; 2] = [
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+];
+
+/// Only an explicit off value opts out. Any other enable-flag value is on and
+/// is written back as "1".
 fn opt_out(key: &str, value: &Value) -> bool {
     match key {
-        "CLAUDE_CODE_ENABLE_TELEMETRY" | "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA" => value != "1",
+        key if ENABLE_FLAGS.contains(&key) => value.as_str().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false"
+            )
+        }),
         "OTEL_METRICS_EXPORTER" | "OTEL_LOGS_EXPORTER" | "OTEL_TRACES_EXPORTER" => value == "none",
         _ => false,
     }
+}
+
+/// Ottto's earlier direct-to-cloud setup: an API-key header and only Ottto
+/// signal endpoints. It is ours, so it moves to the relay.
+fn ottto_direct(env: &Map<String, Value>) -> bool {
+    let mut endpoints = env
+        .iter()
+        .filter(|(key, _)| key.starts_with("OTEL_EXPORTER_OTLP_") && key.ends_with("_ENDPOINT"))
+        .peekable();
+    env.get("OTEL_EXPORTER_OTLP_HEADERS")
+        .and_then(Value::as_str)
+        .is_some_and(|header| header.starts_with("X-API-Key=") && !header.contains(','))
+        && endpoints.peek().is_some()
+        && endpoints.all(|(key, value)| {
+            signal_endpoint_base(key, value).is_some_and(crate::control::is_production_api_base_url)
+        })
 }
 
 /// `clear_opt_out` is the explicit source Enable: it replaces opt-out values
@@ -58,6 +88,15 @@ fn merge(
     if env.iter().any(|(key, value)| opt_out(key, value)) {
         return Ok(Some(Outcome::OptedOut));
     }
+    if ottto_direct(env) {
+        env.retain(|key, _| !MANAGED_KEYS.contains(&key.as_str()));
+    }
+    // Enable flags are on here; "1" replaces any other on value.
+    let compared = || {
+        approved
+            .iter()
+            .filter(|(key, _)| !ENABLE_FLAGS.contains(key))
+    };
     let owned = env
         .get("OTEL_EXPORTER_OTLP_HEADERS")
         .is_some_and(|value| value == "X-Ottto-Local-Relay=claude_code");
@@ -72,7 +111,7 @@ fn merge(
             .is_some_and(|value| owned_signal_endpoint(key, value) == Some(false))
     });
     let customized_owned_value = owned
-        && approved.iter().any(|(key, _)| {
+        && compared().any(|(key, _)| {
             env.get(*key)
                 .is_some_and(|value| !owned_relay_value(key, value))
         });
@@ -80,7 +119,7 @@ fn merge(
         || external_endpoint
         || customized_owned_value
         || (!owned
-            && approved.iter().any(|(key, value)| {
+            && compared().any(|(key, value)| {
                 env.get(*key)
                     .is_some_and(|current| current != value.as_str())
             }))
@@ -103,12 +142,17 @@ fn owned_signal_endpoint(key: &str, value: &Value) -> Option<bool> {
     Some(signal_endpoint_port(key, value).is_some())
 }
 
-fn signal_endpoint_port(key: &str, value: &Value) -> Option<u16> {
+fn signal_endpoint_base<'a>(key: &str, value: &'a Value) -> Option<&'a str> {
     let signal = key
         .strip_prefix("OTEL_EXPORTER_OTLP_")?
         .strip_suffix("_ENDPOINT")?;
-    let suffix = format!("/v1/{}", signal.to_ascii_lowercase());
-    let base = value.as_str()?.strip_suffix(&suffix)?;
+    value
+        .as_str()?
+        .strip_suffix(&format!("/v1/{}", signal.to_ascii_lowercase()))
+}
+
+fn signal_endpoint_port(key: &str, value: &Value) -> Option<u16> {
+    let base = signal_endpoint_base(key, value)?;
     base.strip_prefix("http://127.0.0.1:")
         .or_else(|| base.strip_prefix("http://localhost:"))?
         .parse::<u16>()
@@ -393,17 +437,29 @@ mod unix {
         clear_opt_out: bool,
         edit: impl FnOnce(&mut Value) -> io::Result<()>,
         before_commit: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<Outcome> {
-        update(
+    ) -> io::Result<(Outcome, Option<Outcome>)> {
+        if std::fs::symlink_metadata(root.join("settings.json"))
+            .is_ok_and(|metadata| !metadata.is_file() || metadata.nlink() != 1)
+        {
+            return Ok((Outcome::Unchanged, Some(Outcome::Linked)));
+        }
+        let mut kept = None;
+        let written = update(
             root,
             false,
             false,
-            |settings| match merge(settings, approved, clear_opt_out)? {
-                Some(outcome) => Ok(Some(outcome)),
-                None => edit(settings).map(|()| None),
+            |settings| {
+                // A kept env stays as it was; the root's own edit still runs.
+                let mut merged = settings.clone();
+                kept = merge(&mut merged, approved, clear_opt_out)?;
+                if kept.is_none() {
+                    *settings = merged;
+                }
+                edit(settings).map(|()| None)
             },
             before_commit,
-        )
+        )?;
+        Ok((written, kept))
     }
 
     pub(super) fn disable_settings(root: &Path, default_root: bool) -> io::Result<Outcome> {
@@ -649,96 +705,6 @@ mod unix {
                 );
                 assert_eq!(fs::read_to_string(&path).unwrap(), body);
             }
-            fs::remove_dir_all(root).unwrap();
-        }
-
-        /// [behaviour] The default root shares the managed classifier: an
-        /// opt-out or external exporter stays byte-for-byte (only the explicit
-        /// Enable clears an opt-out); missing, partial and large settings are
-        /// written; a concurrent edit survives.
-        #[test]
-        fn default_root_keeps_optout_and_external_exporter_without_size_limit() {
-            let root = root();
-            let path = root.join("settings.json");
-            let reconcile_at =
-                |clear| reconcile_default(&root, &env(), clear, |_| Ok(()), || Ok(()));
-            for (body, clear, expected) in [
-                (
-                    r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0"}}"#,
-                    false,
-                    Outcome::OptedOut,
-                ),
-                (
-                    r#"{"env":{"OTEL_TRACES_EXPORTER":"none"}}"#,
-                    false,
-                    Outcome::OptedOut,
-                ),
-                (
-                    r#"{"env":{"OTEL_EXPORTER_OTLP_ENDPOINT":"https://collector.example"}}"#,
-                    false,
-                    Outcome::ExternalTelemetry,
-                ),
-                (
-                    r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"https://collector.example/v1/logs"}}"#,
-                    true,
-                    Outcome::ExternalTelemetry,
-                ),
-            ] {
-                fs::write(&path, body).unwrap();
-                assert_eq!(reconcile_at(clear).unwrap(), expected);
-                assert_eq!(fs::read_to_string(&path).unwrap(), body);
-            }
-            for (body, clear) in [
-                (None, false),
-                (
-                    Some(r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0","USER_FLAG":"keep"}}"#),
-                    true,
-                ),
-                (
-                    Some(
-                        r#"{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","USER_FLAG":"keep"}}"#,
-                    ),
-                    false,
-                ),
-            ] {
-                fs::remove_file(&path).ok();
-                if let Some(body) = body {
-                    fs::write(&path, body).unwrap();
-                }
-                assert_eq!(reconcile_at(clear).unwrap(), Outcome::Changed);
-                let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                assert_eq!(written["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "1");
-                assert_eq!(
-                    written["env"]["USER_FLAG"],
-                    body.map_or(Value::Null, |_| "keep".into())
-                );
-            }
-            let large = serde_json::json!({"padding": "x".repeat(SETTINGS_LIMIT as usize + 1)});
-            fs::write(&path, serde_json::to_vec(&large).unwrap()).unwrap();
-            assert_eq!(reconcile_at(false).unwrap(), Outcome::Changed);
-            let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(written["padding"], large["padding"]);
-            fs::write(&path, "{}").unwrap();
-            assert!(reconcile_default(
-                &root,
-                &env(),
-                false,
-                |_| Ok(()),
-                || fs::write(&path, r#"{"user":"concurrent"}"#)
-            )
-            .is_err());
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                r#"{"user":"concurrent"}"#
-            );
-            // Unlike managed roots, the user's root may sit behind a link.
-            let alias = root.with_extension("alias");
-            symlink(&root, &alias).unwrap();
-            assert_eq!(
-                reconcile_default(&alias, &env(), false, |_| Ok(()), || Ok(())).unwrap(),
-                Outcome::Changed
-            );
-            fs::remove_file(alias).unwrap();
             fs::remove_dir_all(root).unwrap();
         }
 
@@ -1005,15 +971,16 @@ pub(crate) fn reconcile(root: &Path, approved: &[(&str, String)]) -> io::Result<
 
 /// Write the approved relay env into the user's default Claude root with the
 /// managed classifier and transaction. `edit` applies the root's own changes
-/// (status line) after the env merge; `before_commit` runs once the new body
-/// is staged and the original is about to be replaced (backup).
+/// (status line) whatever the env outcome; `before_commit` runs once the new
+/// body is staged and the original is about to be replaced (backup). Returns
+/// the write outcome and, when the env was kept, why.
 pub(crate) fn reconcile_default(
     root: &Path,
     approved: &[(&str, String)],
     clear_opt_out: bool,
     edit: impl FnOnce(&mut Value) -> io::Result<()>,
     before_commit: impl FnOnce() -> io::Result<()>,
-) -> io::Result<Outcome> {
+) -> io::Result<(Outcome, Option<Outcome>)> {
     #[cfg(unix)]
     {
         unix::reconcile_default(root, approved, clear_opt_out, edit, before_commit)
