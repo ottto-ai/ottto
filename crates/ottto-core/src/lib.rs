@@ -20,14 +20,14 @@ pub use credential_file::CredentialFileCapRefused;
 pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,
     default_device_path, default_machine_path, default_pending_device_credential_path,
-    default_prior_device_path, default_sources_dir, default_support_dir,
-    is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
-    DeviceCredentialContinuity, FileAccountStore, FileConnectionStore, FileDeviceStore,
-    FileMachineStore, FilePendingDeviceCredentialStore, FileSourceStateStore,
-    LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding,
-    LocalDeviceEnvelope, LocalMachineBinding, LocalSourceState, PendingClaimCredentialCommit,
-    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority,
-    SnapshotNamespaceAlias,
+    default_prior_device_path, default_sources_dir, default_support_dir, hashed_hardware_id,
+    is_hashed_hardware_id, is_persistent_installation_id, is_persistent_machine_id,
+    prefixed_sha256_id, source_state_file_name, DeviceCredentialContinuity, FileAccountStore,
+    FileConnectionStore, FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore,
+    FileSourceStateStore, LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding,
+    LocalDeviceCredentialBinding, LocalDeviceEnvelope, LocalMachineBinding, LocalSourceState,
+    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, SnapshotNamespaceAlias,
 };
 pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,
