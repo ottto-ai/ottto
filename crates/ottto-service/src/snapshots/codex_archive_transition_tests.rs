@@ -966,7 +966,7 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
             let process = Arc::new(sampled_scan::SharedCache::default());
             let (index, read, first) = observed_pass(&c, &compressed, prior, CONTEXT, &process);
             let (index, _, second) = observed_pass(&c, &compressed, index, CONTEXT, &process);
-            let (index, _, third) = observed_pass(&c, &compressed, index, CONTEXT, &process);
+            let (mut index, _, third) = observed_pass(&c, &compressed, index, CONTEXT, &process);
             // A restart: the committed index, a fresh cache and no walk state.
             index.save(session.path()).unwrap();
             crate::snapshots::money_freshness::restart_for_test();
