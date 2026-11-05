@@ -433,7 +433,6 @@ impl PreparedRetry {
             Some(crate::snapshot_retry::RESPONSE_BYTES),
             None,
             None,
-            None,
             Default::default(),
         )?;
         self.working.generation = checkpoint.generation;

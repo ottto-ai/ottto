@@ -752,7 +752,6 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
         &f.progress_path,
         || Ok(()),
         None,
-        None,
         Some(UnsettledUploadCause::Shed),
         None,
         Default::default(),
@@ -2261,7 +2260,6 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
             &f.progress_path,
             || Ok(()),
             None,
-            None,
             Some(UnsettledUploadCause::Shed),
             None,
             Default::default(),
@@ -2400,7 +2398,6 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     Ok(())
                 },
                 read_limit,
-                None,
                 None,
                 None,
                 Default::default(),

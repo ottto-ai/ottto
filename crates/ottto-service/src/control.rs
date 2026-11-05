@@ -9505,7 +9505,8 @@ fn setup_answer(
         }
     };
     let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
-    if source == SourceKind::ClaudeCode {
+    // `disable_source` already revoked with its pause marker.
+    if source == SourceKind::ClaudeCode && answer_type == "skip_source" {
         crate::otlp_relay::legacy::revoke_now();
     }
     setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
@@ -30695,6 +30696,84 @@ X-API-Key = "otel_redacted"
             terminal_refresh_rejection(&LocalApiError::NetworkUnavailable),
             None
         );
+    }
+
+    /// [behaviour] Claude's legacy relay is revoked once per local answer.
+    /// A disable revokes with its pause marker before the POST, so a refused
+    /// POST stays paused; a skip revokes after its POST and pauses nothing.
+    #[test]
+    #[serial]
+    fn setup_answer_revokes_claude_once_and_disable_stays_paused_on_failed_post() {
+        use crate::otlp_relay::legacy::count_revokes;
+        use crate::snapshots::SnapshotSource;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("setup-answer-revoke");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("setup-answer-revoke-secret");
+        fs::create_dir_all(&support_root).expect("support root");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_answer")
+            .expect("persist setup token");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup answer backend");
+        let api_base_url = format!("http://{}", listener.local_addr().expect("address"));
+        thread::spawn(move || {
+            for (status, reason, body) in [
+                (400, "Bad Request", r#"{"detail":"refused"}"#),
+                (
+                    200,
+                    "OK",
+                    r#"{"run":{"id":"setup_answer","status":"waiting_for_user","machine_id":"machine_test"},"sources":[],"next_action":null,"next_question":null}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept setup answer");
+                let request = read_complete_http_request(&mut stream);
+                assert!(request.contains("/api/v1/setup-runs/setup_answer/local-client/answers"));
+                write_json_response(&mut stream, status, reason, body);
+            }
+        });
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_answer".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        let answer = |answer_type: &str| {
+            setup_answer(
+                &daemon,
+                &RequestAuthorization::Token("token".to_string()),
+                SourceKind::ClaudeCode,
+                answer_type.to_string(),
+                Some(api_base_url.clone()),
+            )
+        };
+        let marker =
+            || crate::snapshot_sync::source_marker(&support_root, SnapshotSource::ClaudeCode);
+
+        let revokes = count_revokes(|| {
+            answer("disable_source").expect_err("the backend refuses the disable");
+        });
+        assert_eq!(revokes, 1);
+        assert_eq!(marker().as_deref(), Some("pending"), "fail-closed");
+
+        fs::remove_file(support_root.join("snapshots/claude_code.source-disabled"))
+            .expect("clear the pause marker");
+        let revokes = count_revokes(|| {
+            answer("skip_source").expect("skip is saved");
+        });
+        assert_eq!(revokes, 1);
+        assert_eq!(marker(), None, "a skip pauses nothing");
     }
 
     #[test]

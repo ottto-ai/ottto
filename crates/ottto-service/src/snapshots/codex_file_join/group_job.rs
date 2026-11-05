@@ -633,7 +633,6 @@ impl GroupBoot {
                 first.size_bytes,
                 !index.files.contains_key(&local_index_key(&first.path)),
             ),
-            comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
             previous_upload_body_witness: index.last_upload_body_witness(&last),

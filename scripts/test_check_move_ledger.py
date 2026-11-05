@@ -383,6 +383,109 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn('[crate::snapshots::money::birth -> crate::snapshots::sources::money::birth]', out)
 
+    LONG = code('''
+        /// Checks both arguments.
+        fn long_signature(first_argument: Option<&str>, second_argument: u64) -> bool {
+            first_argument == Some("a b") && second_argument > 0
+        }
+    ''')
+    WRAPPED = code('''
+        /// Checks both arguments.
+        pub(super) fn long_signature(
+            first_argument: Option<&str>,
+            second_argument: u64,
+        ) -> bool {
+            first_argument == Some("a b") && second_argument > 0
+        }
+    ''')
+
+    def move_long(self, moved, original=LONG):
+        files = {src('snapshots.rs'): ROOT + original}
+        if (self.repo.root / src('snapshots/wide.rs')).exists():
+            files[src('snapshots/wide.rs')] = None
+        base = self.repo.commit(files)
+        head = self.repo.commit({src('snapshots.rs'): ROOT + 'mod wide;\n', src('snapshots/wide.rs'): moved})
+        return run(self.repo, base, head)
+
+    def test_a_rustfmt_reflow_after_a_visibility_token_is_a_reflowed_move(self):
+        status, out = self.move_long(self.WRAPPED)
+        self.assertEqual(status, 0, out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+        self.assertIn('reflowed fn long_signature (crates/demo/src/snapshots.rs:', out)
+        self.assertIn('move-only', out)
+
+    def test_a_reflow_that_hides_a_changed_identifier_or_literal_fails(self):
+        for old, new in (('second_argument: u64,', 'second_arg: u64,'), ('Some("a b")', 'Some("a c")')):
+            with self.subTest(new=new):
+                status, out = self.move_long(self.WRAPPED.replace(old, new))
+                self.assertEqual(status, 1, out)
+                self.assertIn('changed: fn long_signature', out)
+                self.assertIn(' 0 reflowed,', out)
+
+    def test_whitespace_inside_a_string_literal_is_not_a_reflow(self):
+        status, out = self.move_long(self.WRAPPED.replace('Some("a b")', 'Some("a  b")'))
+        self.assertEqual(status, 1, out)
+        self.assertIn('changed: fn long_signature', out)
+        self.assertIn(' 0 reflowed,', out)
+
+    def test_a_wrapped_fn_with_a_where_clause_is_reflowed_and_widening_still_fails(self):
+        original = code('''
+            fn applies_to_the_value<T>(value: T, check_value: impl Fn(&T) -> bool, label: &str) -> bool
+            where
+                T: Clone,
+            {
+                check_value(&value.clone()) && !label.is_empty()
+            }
+        ''')
+        wrapped = code('''
+            pub(super) fn applies_to_the_value<T>(
+                value: T,
+                check_value: impl Fn(&T) -> bool,
+                label: &str,
+            ) -> bool
+            where
+                T: Clone,
+            {
+                check_value(&value.clone()) && !label.is_empty()
+            }
+        ''')
+        status, out = self.move_long(wrapped, original)
+        self.assertEqual(status, 0, out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+        status, out = self.move_long(wrapped.replace('T: Clone,', 'T: Clone'), original)
+        self.assertEqual(status, 1, out)
+        status, out = self.move_long(self.WRAPPED.replace('pub(super)', 'pub(crate)'))
+        self.assertEqual(status, 1, out)
+        self.assertIn('1 reflowed', out)
+        self.assertIn('widened: fn long_signature', out)
+
+    def test_reflow_rejects_tuples_macro_commas_joined_operators_and_other_items(self):
+        for before, after in (
+            # A one-element tuple, a comma-sensitive macro call and `& &` vs `&&` in a body.
+            ('fn tuple() -> String {\n    format!("{:?}", (1u8))\n}\n',
+             'pub(super) fn tuple() -> String {\n    format!("{:?}", (1u8,\n    ))\n}\n'),
+            ('fn call() -> u8 {\n    m!(x)\n}\n', 'pub(super) fn call() -> u8 {\n    m!(x,\n    )\n}\n'),
+            ('fn both(b: bool, mut g: impl FnMut() -> bool) -> bool {\n    b & &g()\n}\n',
+             'pub(super) fn both(b: bool, mut g: impl FnMut() -> bool) -> bool {\n    b &&g()\n}\n'),
+            # The same in a signature: punctuation jointness and a comma that is not the list's own.
+            ('fn joined(x: & &u8) {}\n', 'pub(super) fn joined(\n    x: &&u8,\n) {}\n'),
+            ('fn inner(x: (u8)) {}\n', 'pub(super) fn inner(\n    x: (u8,\n    ),\n) {}\n'),
+            # A `pub` inside an attribute is not the item's visibility.
+            ('#[cfg_attr(any(), dummy(pub))]\nfn f() {}\n', '#[cfg_attr(any(), dummy())]\npub fn f(\n) {}\n'),
+            # A macro in the signature can see token boundaries the lexer does not keep.
+            ('fn f(x: ty!("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty!("s" tag),\n) {}\n'),
+            ('fn f(x: ty!(1.0)) {}\n', 'pub(super) fn f(\n    x: ty!(1 . 0),\n) {}\n'),
+            ('fn f(x: ty! /*c*/ ("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty! /*c*/ ("s" tag),\n) {}\n'),
+            ('fn f(x: ty /*c*/ !("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty /*c*/ !("s" tag),\n) {}\n'),
+            # A struct whose field visibilities trade places at the same text offsets.
+            ('pub(crate) struct S {\n    pub(crate) a: u8,\n    b: u8,\n}\n',
+             'pub(crate) struct S {a:u8,pub(crate) b:u8,}\n'),
+        ):
+            with self.subTest(after=after):
+                status, out = self.move_long(after, before)
+                self.assertEqual(status, 1, out)
+                self.assertIn(' 0 reflowed,', out)
+
     def test_report_mode_exits_zero_and_no_rust_change_is_a_pass(self):
         status, out = self.move(ROOT.replace('fn second() {}', 'fn second() { todo!() }'), None, '--report')
         self.assertEqual(status, 0)

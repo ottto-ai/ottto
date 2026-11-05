@@ -189,7 +189,6 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
                 Some(crate::snapshot_retry::RESPONSE_BYTES),
                 None,
                 None,
-                None,
                 Default::default(),
             )
             .is_err());

@@ -491,27 +491,6 @@ fn skip_delivers_no_lines_and_ends_once() {
     assert!(counts.get("lines").is_none() && counts.get("bytes").is_none());
 }
 
-/// A native comparison target is excluded at the one begin site; its
-/// role is final before the first dispatch.
-#[test]
-fn comparison_target_read_calls_no_observer() {
-    let root = Root::new("ld-comparison");
-    append(
-        &root.file(SESSION),
-        &[raw(&row("/w/one", "u1")), b"\n".to_vec()].concat(),
-    );
-    let recorder = Recorder::default();
-    let mut scan = step_until(
-        new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer("test", Box::new(recorder.clone())),
-        |scan| scan.active_file.is_some(),
-    );
-    scan.active_file.as_deref_mut().unwrap().comparison_target = true;
-    let (_, result, _) = finish(scan);
-    assert_eq!(result.scanned_file_count, 1, "the file was read");
-    assert_eq!(recorder.events(), Vec::new());
-}
-
 /// Codex group member reads replay through the group job and call
 /// no observer.
 #[test]

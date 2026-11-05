@@ -1,5 +1,7 @@
 # Path-(a) bridge: authority-only holds no longer mark the sweep
 
+Historical note: the optional Claude comparison experiment was retired in 0.1.220. Current collection counters use `native_collection_page`; ordinary scan and selected-save owners remain.
+
 A bound RetryPending Claude authority family used to stamp
 `bounded_sweep_had_unsettled_upload` from three places: the census-withheld
 branch, the `Completed` hold fallback and the `Rejected`/`Deferred` settlement.

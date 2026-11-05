@@ -811,9 +811,10 @@ fn sticky_unencodable_open_bucket_does_not_erase_independent_older_accepted_proo
     let mut accepted_body = serde_json::to_value(&item).unwrap();
     accepted_body["usage_buckets"].as_array_mut().unwrap().pop();
     accepted.record(&accepted_body);
-    // Seventeen distinct own keys in the current bucket cannot be represented
-    // by one row, but the older accepted bucket remains complete and tiny.
-    for n in 12..26 {
+    // One more distinct own key than the cap in the current bucket cannot be
+    // represented by one row, but the older accepted bucket remains complete
+    // and tiny.
+    for n in 12..12 + identity::MAX_AUTHORITY_KEYS - 2 {
         let mut extra = proof.last().unwrap().clone();
         extra.identity = RequestIdentity::Tagged(AuthorityKey {
             login: Some(format!("{n:064x}")),
@@ -910,7 +911,11 @@ fn sticky_assert_joint_pair_survives(large_parts: bool) {
     let mut accepted_body = serde_json::to_value(&item).unwrap();
     accepted_body["usage_buckets"].as_array_mut().unwrap().pop();
     accepted.record(&accepted_body);
-    let extras = if large_parts { 15 } else { 16 };
+    let extras = if large_parts {
+        15
+    } else {
+        identity::MAX_AUTHORITY_KEYS as u64
+    };
     let prototypes = proof[2..].to_vec();
     for prototype in prototypes {
         for n in 0..extras {
@@ -2679,7 +2684,8 @@ fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {
     assert!(uploadable.is_empty());
 
     // The same last resort covers non-byte caps: no second strip/hold policy.
-    let (mut key_item, mut key_proof) = sticky_session(6);
+    // Three new keys per hour: one more hour than the key cap holds.
+    let (mut key_item, mut key_proof) = sticky_session(identity::MAX_AUTHORITY_KEYS / 3 + 1);
     sticky_receiver_totals(&mut key_item);
     for (index, contribution) in key_proof.iter_mut().enumerate() {
         contribution.identity = RequestIdentity::Tagged(AuthorityKey {
