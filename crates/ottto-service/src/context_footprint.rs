@@ -273,7 +273,8 @@ struct ContextSchedule {
 }
 
 /// Sleeps until the cadence harvests every source seen so far, or a new source's
-/// first inputs arrive: that one is harvested alone, keeping the cadence's time.
+/// first inputs arrive: that one is harvested alone. Either way the next
+/// cadence is due one delay after this harvest.
 fn context_cycle(
     inputs: &FootprintInputs,
     schedule: &mut ContextSchedule,
@@ -303,9 +304,7 @@ fn context_cycle(
             false
         }
     };
-    let next = Instant::now() + next_context_cycle_delay(refused);
-    let kept = schedule.due.filter(|_| first.is_some());
-    schedule.due = Some(kept.map_or(next, |due| due.min(next)));
+    schedule.due = Some(Instant::now() + next_context_cycle_delay(refused));
     schedule.harvested = std::array::from_fn(|i| schedule.harvested[i] || sources[i]);
 }
 
@@ -2504,7 +2503,7 @@ mod tests {
     /// Regression: each source's first harvest waits for its own first
     /// delivery. A Codex start that arrives first is harvested alone and keeps
     /// its cadence while Claude is pending; Claude's later delivery is harvested
-    /// once, then both follow the 6 h cadence.
+    /// alone, once, then both follow the 6 h cadence.
     #[test]
     fn startup_harvest_waits_for_first_delivery_then_keeps_cadence() {
         let home = temp_dir("startup-wake");
@@ -2558,13 +2557,13 @@ mod tests {
         let (seen, schedule) = cycle(schedule).join().unwrap();
         assert_eq!(seen, [[None, Some(1)]]);
         assert!(six_hours(&schedule));
-        // Claude's first delivery: Claude alone, once; the cadence keeps its time.
-        let due = schedule.due;
+        // Claude's first delivery: Claude alone, once; the next cadence is 6 h out.
         let waiting = cycle(schedule);
         project_transcripts(&projection, &files);
         let (seen, mut schedule) = waiting.join().unwrap();
         assert_eq!(seen, [[Some(1), None]]);
-        assert_eq!((schedule.harvested, schedule.due), ([true, true], due));
+        assert_eq!(schedule.harvested, [true, true]);
+        assert!(six_hours(&schedule));
         // Then the 6 h cadence harvests both.
         schedule.due = Some(Instant::now());
         let (seen, schedule) = cycle(schedule).join().unwrap();
