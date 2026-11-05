@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Platform-neutral local logic for the Ottto CLI and service: health summaries, repair planning, diagnostics redaction, and stable errors."
 repository.workspace = true
 homepage.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true

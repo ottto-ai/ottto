@@ -8,6 +8,7 @@ authors.workspace = true
 description = "JSON models for the Ottto local-control protocol, shared by the CLI, service, and app."
 repository.workspace = true
 homepage.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true
