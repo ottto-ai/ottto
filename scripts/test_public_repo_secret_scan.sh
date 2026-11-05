@@ -200,6 +200,24 @@ for path in .claude/config .agents/config tools/ottto-local-platform/x backend/x
   done
 done
 
+# [behaviour] Notes paths are refused in the HEAD tree with location-only output.
+for path in docs/notes/x.md docs/development/x.md docs/session-2026-x.md; do
+  repo="$tmp_dir/notes"
+  rm -rf "$repo"
+  init_repo "$repo"
+  mkdir -p "$(dirname "$repo/$path")"
+  printf 'Bearer abcdefghijklmnopqrstuvwxyz123456\n' > "$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -qm notes
+  expect_failure "$repo" 'HEAD path denied'
+  python3 - "$tmp_dir/negative.out" "$path" <<'CHECK'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+assert text == f'public-secret-scan: HEAD path denied: "{sys.argv[2]}":1\n', text
+CHECK
+done
+
 # [behaviour] An unusual filename is one escaped location, never injected output.
 repo="$tmp_dir/unusual"
 init_repo "$repo"

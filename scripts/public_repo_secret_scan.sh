@@ -264,6 +264,8 @@ FORBIDDEN_PATH = re.compile(
     r"(^|/)(\.claude|\.agents|backend|frontend|infra|dist|target|__pycache__)(/|$)"
     r"|(^|/)tools/ottto-local-platform(/|$)|(^|/)docs/(dev|ai)(/|$)"
     r"|(^|/)[^/]*\.py[co]$|(^|/)\.env(?:\.[^/]*)?(?:/|$)"
+    # Current tree only: history still holds these notes, so the tsv must not.
+    r"|(^|/)docs/notes(/|$)|(^|/)docs/development(/|$)|(^|/)docs/session-20[0-9][0-9]-"
 )
 
 def committed_entries() -> list[tuple[str, str]]:
