@@ -3952,6 +3952,28 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
 include!("claude_request_identity_window_tests.rs");
 include!("claude_request_identity_retained_tests.rs");
 
+/// `lines` parsed by the money fold, the file born an hour before the cutoff
+/// so every record is the file's own whenever the test runs.
+fn parse_spanless(dir: &Path, lines: &[Value]) -> SnapshotItem {
+    let born = (identity::SPANLESS_FIRST_REQUEST_FROM - 3600) * 1_000_000_000;
+    crate::snapshots::claude_request_money::e2::with_fixture_birth(born, || {
+        parse_session(dir, lines).remove(0)
+    })
+}
+
+/// The page's money-fold steps before tagging: reconcile request accounts,
+/// then finish the page.
+fn fold_page(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+    identity::reconcile_request_accounts(items, evidence);
+    crate::snapshots::claude_request_money::e2::finish_page(
+        items,
+        &ScanIndex::default(),
+        crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+        &mut Default::default(),
+        &Default::default(),
+    );
+}
+
 /// RFC 3339 `offset` seconds from the span-less first-request cutoff.
 fn spanless_clock(offset: i64) -> String {
     OffsetDateTime::from_unix_timestamp(
@@ -4036,7 +4058,7 @@ fn spanless_first_request_own_login_classifier_table() {
                 }
                 _ => {}
             }
-            let mut raw = parse_ordinary_session(&dir, &lines).remove(0);
+            let mut raw = parse_spanless(&dir, &lines);
             if case == "subagent-file" {
                 raw.source_session_id = format!("{ROOT}_agent-child");
             }
@@ -4110,6 +4132,7 @@ fn spanless_first_request_own_login_classifier_table() {
             let cross =
                 super::super::claude_cross_root_evidence::CrossRootEvidence::new(&items, scope);
             let evidence = ScanEvidence::new(&api, &traces, roots).with_scope(&cross);
+            fold_page(&mut items, &evidence);
             identity::apply_scan(&mut items, &evidence, BTreeMap::new());
             let tagged = items[0].request_evidence.iter().any(|entry| {
                 entry.account_source.is_none()
@@ -4150,7 +4173,7 @@ fn spanless_first_request_desktop_fold_and_activity_agree() {
             let at = spanless_clock(offset);
             let mut first = owned_response("first", &at, 10, 1);
             first["entrypoint"] = json!("claude-desktop");
-            let mut raw = parse_ordinary_session(&dir, &[marker(ORG_1), first]).remove(0);
+            let mut raw = parse_spanless(&dir, &[marker(ORG_1), first]);
             raw.collected_at = spanless_clock(offset + 30);
             let original = SessionAccountEvidence {
                 provider: "anthropic",
@@ -4166,9 +4189,12 @@ fn spanless_first_request_desktop_fold_and_activity_agree() {
             row.request_identity = Some(org_identity(&org_hash(ORG_1)));
             let (api, traces) = reports(vec![signed(row)], vec![]);
             let evidence = ScanEvidence::new(&api, &traces, BTreeSet::new());
-            let activity =
-                identity::collect_request_owned_activity(&raw, &evidence, Some(&original));
             let mut items = vec![raw];
+            assert!(items[0].claude_money.is_some(), "the money fold reads it");
+            fold_page(&mut items, &evidence);
+            // The activity path as the page stages it, before tagging.
+            let activity =
+                identity::collect_request_owned_activity(&items[0], &evidence, Some(&original));
             identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
             let fold = items[0].request_evidence.iter().any(|entry| {
                 entry.identity_basis == identity::TELEMETRY && entry.account_source.is_none()

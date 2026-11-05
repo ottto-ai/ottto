@@ -5,7 +5,7 @@ use super::*;
 use crate::snapshots::claude_request_identity::{
     take_identity_counts, AcceptedBuckets, SPANLESS_FIRST_REQUEST_FROM, TELEMETRY,
 };
-use crate::snapshots::e2_pipeline_scan_fixture::{continue_route_for_test, route_of};
+use crate::snapshots::e2_pipeline_scan_fixture::route_of;
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle::{assert_equivalent, assert_no_smaller_reemit, assert_quiet_restart_zero_bytes},
     upgrade_from_legacy_store, Mode,
@@ -73,22 +73,22 @@ fn first_request_own_login_transition_oracle() {
                 + &line(ROOT, "switch", &cutoff_clock(2), 13)
                 + &line(ROOT, "gap-c", &cutoff_clock(3), 14)),
         );
-        let child = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        std::fs::write(&child, line(ROOT, "child-gap", &cutoff_clock(4), 15)).unwrap();
+        c.agent(0, &line(ROOT, "child-gap", &cutoff_clock(4), 15));
         rows.extend([
             api_login(ROOT, "switch", 13, 'c', Some('d')),
             api_login(ROOT, "side", 4, 'c', Some('d')),
         ]);
         stamp(&mut rows, &at);
         c.evidence(&rows, &[trace("switch", ""), trace("side", "")]);
-        // A restart keeps the state database and loses only RAM: the new owner
-        // continues from the committed heads. It reads before the retained
-        // owner, whose page is the one settled on the route below.
-        let restored_owner = E2ScanFixture::capturing_identity();
-        continue_route_for_test(&restored_owner.cache, &route_of(&prior).unwrap());
-        let mut restored = pass(&c, &restored_owner, prior.clone());
+        // Both owners read the same committed heads and neither commits while
+        // reading: the retained owner keeps its RAM, the restarted one has only
+        // the state database. Only the retained page is settled below.
+        let route = route_of(&prior).unwrap();
+        scanner.on_committed_route(&route);
         let mut tail = pass(&c, &scanner, prior.clone());
+        let restored_owner = E2ScanFixture::capturing_identity();
+        restored_owner.on_committed_route(&route);
+        let mut restored = pass(&c, &restored_owner, prior.clone());
         let upgraded = upgrade_from_legacy_store(&prior, &c.base.join("upgrade.json"));
         let mut upgrade = pass(&c, &E2ScanFixture::capturing_identity(), upgraded);
         let mut cold = pass(
@@ -150,7 +150,7 @@ fn first_request_own_login_transition_oracle() {
         // must consume no transcript byte and publish no smaller replacement.
         let settled = settle(&c, &prior, tail, &mut e2_progress());
         let restarted = E2ScanFixture::capturing_identity();
-        continue_route_for_test(&restarted.cache, &route_of(&settled).unwrap());
+        restarted.on_committed_route(&route_of(&settled).unwrap());
         let ((quiet, bytes), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
             crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
                 ready(&c, &restarted, settled, 100, true)
@@ -196,9 +196,7 @@ fn first_request_own_login_survives_later_growth() {
                 &(line(ROOT, "first", &cutoff_clock(0), 11)
                     + &line(ROOT, "gap-a", &cutoff_clock(1), 12)),
             );
-            let child = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
-            std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-            std::fs::write(&child, line(ROOT, "child-gap", &cutoff_clock(2), 15)).unwrap();
+            c.agent(0, &line(ROOT, "child-gap", &cutoff_clock(2), 15));
             let mut rows = vec![api_login(ROOT, "first", 11, 'a', Some('b'))];
             stamp(&mut rows, &cutoff_clock(0));
             c.evidence(&rows, &[]);
@@ -275,8 +273,8 @@ fn first_request_own_login_survives_later_growth() {
 }
 
 /// [money] A resume copy holding the span-less first's copied response never
-/// takes the original's own login; the original keeps it, and every response
-/// is counted or removed exactly once.
+/// takes the original's own login; the original keeps it, and each request
+/// counts exactly once.
 #[test]
 fn first_request_own_login_copy_never_takes_the_original_login() {
     with_e2(|| {
@@ -320,11 +318,12 @@ fn first_request_own_login_copy_never_takes_the_original_login() {
                 assert_eq!(placements(root).get(&own('a', 'b', None)), Some(&1));
             }
         }
-        let counted = [ROOT, COPY]
-            .iter()
-            .filter_map(|session| body(&cold, session))
-            .map(|item| item.request_count + item.removed_request_count.unwrap_or(0))
-            .sum::<u64>();
-        assert_eq!(counted, 3, "each response counted or removed once");
+        let root = body(&cold, ROOT).expect("cold Full publishes the original");
+        let copy = body(&cold, COPY).expect("cold Full publishes the copy");
+        assert_eq!(
+            root.request_count + copy.request_count,
+            2,
+            "the original's request and the copy's own turn, each once"
+        );
     });
 }
