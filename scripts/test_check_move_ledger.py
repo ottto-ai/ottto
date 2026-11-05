@@ -470,6 +470,11 @@ class LedgerTests(unittest.TestCase):
             # The same in a signature: punctuation jointness and a comma that is not the list's own.
             ('fn joined(x: & &u8) {}\n', 'pub(super) fn joined(\n    x: &&u8,\n) {}\n'),
             ('fn inner(x: (u8)) {}\n', 'pub(super) fn inner(\n    x: (u8,\n    ),\n) {}\n'),
+            # A `pub` inside an attribute is not the item's visibility.
+            ('#[cfg_attr(any(), dummy(pub))]\nfn f() {}\n', '#[cfg_attr(any(), dummy())]\npub fn f(\n) {}\n'),
+            # A macro in the signature can see token boundaries the lexer does not keep.
+            ('fn f(x: ty!("s"tag)) {}\n', 'pub(super) fn f(\n    x: ty!("s" tag),\n) {}\n'),
+            ('fn f(x: ty!(1.0)) {}\n', 'pub(super) fn f(\n    x: ty!(1 . 0),\n) {}\n'),
             # A struct whose field visibilities trade places at the same text offsets.
             ('pub(crate) struct S {\n    pub(crate) a: u8,\n    b: u8,\n}\n',
              'pub(crate) struct S {a:u8,pub(crate) b:u8,}\n'),

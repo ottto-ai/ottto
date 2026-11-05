@@ -19,16 +19,17 @@ across files. Before comparing, only these glue classes are reversed:
 Then every base item must equal exactly one head item byte for byte (comments,
 attributes, cfgs), and items that land in one file keep their base order. One
 exception covers a fn signature rustfmt re-wraps (say once a visibility token
-makes it too long): a `fn` item whose body, from its opening `{`, is byte for
-byte equal and whose only visibility token is the leading one still matches,
-listed as `reflowed`, when its signature tokens are equal with whitespace
-dropped. Literals and comments stay exact, whitespace between two punctuation
-tokens that could join (`& &` vs `&&`) still counts, and only a trailing `,`
-closing the fn's own generic list or outer parameter list may be added or
-dropped. Every other item must match byte for byte. An item must sit under the
-same module attributes (`#[cfg(..)]` and the like), may only lose nesting, and
-every path literal must resolve, from its new file, to a target with the same
-bytes.
+makes it too long): a `fn` item whose text before `fn` and whose body, from its
+opening `{`, are byte for byte equal, whose only visibility token is the
+item-level one before `fn` (not inside an attribute) and whose signature holds
+no macro call still matches, listed as `reflowed`, when its signature tokens
+are equal with whitespace dropped. Literals and comments stay exact, whitespace
+between two punctuation tokens that could join (`& &` vs `&&`) still counts,
+and only a trailing `,` closing the fn's own generic list or outer parameter
+list may be added or dropped. Every other item must match byte for byte. An
+item must sit under the same module attributes (`#[cfg(..)]` and the like), may
+only lose nesting, and every path literal must resolve, from its new file, to a
+target with the same bytes.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -97,17 +98,21 @@ JOINLESS = set("()[]{},;")
 
 def reflow_key(unit: Unit) -> tuple | None:
     """What a rustfmt re-wrap of a fn signature keeps (see the module docs), or None when `unit` gets no
-    reflow pass: not a fn, no body, an unexpected signature shape, or a visibility token other than the
-    leading one."""
+    reflow pass: not a fn, no body, an unexpected signature shape, a visibility token other than one at
+    item level before `fn` (outside attributes), or a macro call in the signature (a macro can see token
+    boundaries this lexer does not keep)."""
     if unit.kind != "fn" or len(unit.vis) > 1:
         return None
     tokens = rst.tokenize(unit.text)
     # (kind, text, whitespace before it, offset) of every non-whitespace token.
     code = [(token.kind, unit.text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws",
              token.start) for index, token in enumerate(tokens) if token.kind != "ws"]
-    fn_at = body_at = None
+    fn_at = body_at = vis_depth = None
+    vis_at = unit.vis[0][0] if unit.vis else None
     depth = 0
-    for index, (kind, piece, _, _) in enumerate(code):
+    for index, (kind, piece, _, start) in enumerate(code):
+        if vis_at is not None and vis_depth is None and start >= vis_at:
+            vis_depth = depth  # bracket depth where the removed visibility token stood
         if kind == "ident" and piece == "fn" and depth == 0 and fn_at is None:
             fn_at = index
         elif kind == "punct" and piece == "{" and depth == 0 and fn_at is not None:
@@ -115,7 +120,10 @@ def reflow_key(unit: Unit) -> tuple | None:
             break
         if kind == "punct":
             depth += (piece in "([{") - (piece in ")]}")
-    if fn_at is None or body_at is None or any(offset > code[fn_at][3] for offset, _ in unit.vis):
+    if fn_at is None or body_at is None or (vis_at is not None and (vis_at > code[fn_at][3] or vis_depth != 0)):
+        return None
+    if any(code[index][0] == "ident" and code[index + 1][:2] == ("punct", "!")
+           and code[index + 2][1] in ("(", "[", "{") for index in range(fn_at, body_at - 1)):
         return None
     drop = set()
     at = fn_at + 2  # after `fn name`
@@ -135,7 +143,7 @@ def reflow_key(unit: Unit) -> tuple | None:
         drop.add(at - 1)
     signature: list[str] = []
     prev = None
-    for index in range(body_at):
+    for index in range(fn_at, body_at):
         if index in drop:
             continue
         kind, piece, spaced, _ = code[index]
@@ -144,7 +152,7 @@ def reflow_key(unit: Unit) -> tuple | None:
             signature.append(" ")
         signature.append(piece)
         prev = (kind, piece)
-    return unit.container, tuple(signature), unit.text[code[body_at][3]:]
+    return unit.container, unit.text[:code[fn_at][3]], tuple(signature), unit.text[code[body_at][3]:]
 
 
 def closing(code: list[tuple[str, str, bool, int]], open_at: int, stop: int, angle: bool) -> int | None:
