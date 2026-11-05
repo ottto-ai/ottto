@@ -1387,7 +1387,7 @@ pub fn load_claude_effort_by_request(
             let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
-            if &*item.session_id != session_id
+            if *item.session_id != session_id
                 || item.request_id.is_empty()
                 || !VALID_EFFORTS.contains(&item.effort.as_ref())
             {
