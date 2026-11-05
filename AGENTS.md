@@ -4,6 +4,9 @@
   runtime/CLI/protocol; `crates/Cargo.toml` owns connector SDK/testkit. Check both
   only when the change affects both.
 - Daemon (`crates/ottto-service`) work: read [its ARCHITECTURE.md](crates/ottto-service/ARCHITECTURE.md) first.
+- Record lasting design in `docs/` or a crate's `ARCHITECTURE.md`, written for
+  readers of the current code. Dated session, review or rollout notes do not
+  belong in this repository.
 - Make small, cohesive changes. Read callers and state ownership first; separate
   mechanical refactoring from behavior changes. Use private modules and narrow
   interfaces; preserve public paths. File length alone does not justify a split.
