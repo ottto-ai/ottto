@@ -978,10 +978,11 @@ pub(crate) fn provider_context_bucket(
 // Per-page read budget, not a history bound: discovery queues every file in
 // the window into the durable traversal and the rest continues next page.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
-// Directory discovery has its own hard per-tick budget. Candidate parsing was
-// already capped, but recursively walking an arbitrarily large tree before
-// applying that cap made one tick O(all paths). The durable traversal below
-// consumes at most this many directory entries and then resumes next tick.
+// Directory discovery has its own per-tick pacing budget, never a refusal.
+// Recursively walking an arbitrarily large tree in one tick made it O(all
+// paths); the durable traversal below spends about this many directory entries
+// and resumes next tick. One directory wider than the whole budget is listed
+// in full on a fresh tick, and that overdraw ends the tick.
 pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 /// The gap between metadata-only re-listing passes of one kept generation
@@ -26087,8 +26088,8 @@ fn advance_bounded_directory_traversal_with_budget(
         if !metadata.is_dir() {
             continue;
         }
-        let entries = match fs::read_dir(&directory.path) {
-            Ok(entries) => entries,
+        let mut listing = match fs::read_dir(&directory.path) {
+            Ok(listing) => listing,
             Err(_) => {
                 traversal
                     .counts
@@ -26096,11 +26097,11 @@ fn advance_bounded_directory_traversal_with_budget(
                 continue;
             }
         };
-        // Read only the budget still available in this tick, plus one entry as
-        // a bounded proof that the directory must resume. If the full per-tick
-        // budget was available, that same extra entry proves the directory is
-        // too wide to scan truthfully and turns the generation red.
-        let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        // Pacing budget, never a refusal: read the budget still available in
+        // this tick plus one entry. A directory that does not fit a partly
+        // spent tick resumes first next tick; on a fresh tick it is listed in
+        // full and the overdraw ends the tick.
+        let mut entries = listing.by_ref().take(remaining + 1).collect::<Vec<_>>();
         if let Some(census) = traversal
             .codex_join_directory_census
             .as_mut()
@@ -26109,16 +26110,13 @@ fn advance_bounded_directory_traversal_with_budget(
             census.observe(&directory.path, &metadata);
         }
         if entries.len() > remaining {
-            if remaining == max_entries {
-                // In a re-pass this count is restored with the others: the
-                // first walk owns the cap count for a too-wide directory.
-                traversal.counts.directory_entry_cap_exceeded_count += 1;
-            } else {
+            if remaining < max_entries {
                 traversal.pending_directories.push_front(directory);
+                break;
             }
-            break;
+            entries.extend(listing);
         }
-        remaining -= entries.len();
+        remaining = remaining.saturating_sub(entries.len());
         entries.sort_by(|left, right| {
             left.as_ref()
                 .map(|entry| entry.file_name())
@@ -35547,34 +35545,148 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn wide_single_directory_fails_red_without_materializing_past_budget() {
-        let root = temp_dir("bounded-wide-directory");
-        for index in 0..4 {
-            fs::write(root.join(format!("session-{index}.jsonl")), b"{}\n")
+    const WALK_SOURCES: [SnapshotSource; 3] = [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ];
+
+    fn write_sessions(directory: &Path, count: usize) {
+        for index in 0..count {
+            fs::write(directory.join(format!("session-{index}.jsonl")), b"{}\n")
                 .expect("write wide directory fixture");
         }
-        let mut index = ScanIndex::default();
-        ensure_bounded_traversal(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-31T00:00:00Z",
-            BACKFILL_WINDOW_DAYS,
-        );
+    }
+
+    /// One walk tick with a directory budget of 3 entries.
+    fn walk_tick(source: SnapshotSource, index: &mut ScanIndex) {
         advance_bounded_directory_traversal_with_budget(
-            SnapshotSource::Pi,
-            &mut index,
+            source,
+            index,
             BACKFILL_WINDOW_DAYS,
             3,
             None,
         );
-        let traversal = index.traversal.as_mut().expect("traversal");
+    }
 
-        assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
-        assert!(traversal.pending_candidates.is_empty());
-        assert!(traversal.counts.has_errors());
-        let _ = fs::remove_dir_all(root);
+    fn start_walk(source: SnapshotSource, root: &Path) -> ScanIndex {
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            source,
+            &[root.to_path_buf()],
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        index
+    }
+
+    fn candidate_paths(index: &ScanIndex) -> BTreeSet<PathBuf> {
+        let traversal = index.traversal.as_ref().expect("traversal");
+        traversal
+            .pending_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect()
+    }
+
+    /// [regress] A directory wider than the whole per-tick budget is listed
+    /// in full on a fresh tick: the budget paces the walk, never refuses a
+    /// directory, so the generation stays green.
+    #[test]
+    fn wide_single_directory_lists_in_full_on_a_fresh_tick() {
+        for source in WALK_SOURCES {
+            let root =
+                fs::canonicalize(temp_dir("bounded-wide-directory")).expect("canonical root");
+            write_sessions(&root, 4);
+            let mut index = start_walk(source, &root);
+            walk_tick(source, &mut index);
+            let traversal = index.traversal.as_ref().expect("traversal");
+
+            assert_eq!(traversal.pending_candidates.len(), 4, "{source:?}");
+            assert!(traversal.pending_directories.is_empty(), "{source:?}");
+            assert_eq!(
+                traversal.counts.directory_entry_cap_exceeded_count, 0,
+                "{source:?}"
+            );
+            assert!(!traversal.counts.has_errors(), "{source:?}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// [regress] Pacing is unchanged: a wide directory that does not fit a
+    /// partly spent tick is deferred to the front of the queue, and the next
+    /// (fresh) tick lists it in full.
+    #[test]
+    fn wide_directory_defers_on_a_partly_spent_tick_then_lists_in_full() {
+        for source in WALK_SOURCES {
+            let root =
+                fs::canonicalize(temp_dir("bounded-wide-directory-paced")).expect("canonical root");
+            let wide = root.join("wide");
+            fs::create_dir_all(&wide).expect("create wide directory");
+            write_sessions(&wide, 4);
+            fs::write(root.join("root.jsonl"), b"{}\n").expect("write root fixture");
+            let mut index = start_walk(source, &root);
+
+            walk_tick(source, &mut index);
+            let traversal = index.traversal.as_ref().expect("traversal");
+            assert_eq!(
+                traversal
+                    .pending_directories
+                    .front()
+                    .map(|directory| directory.path.clone()),
+                Some(wide.clone()),
+                "{source:?}: deferred to the front"
+            );
+            assert_eq!(traversal.pending_directories.len(), 1, "{source:?}");
+            assert_eq!(
+                candidate_paths(&index),
+                BTreeSet::from([root.join("root.jsonl")]),
+                "{source:?}"
+            );
+
+            walk_tick(source, &mut index);
+            let traversal = index.traversal.as_ref().expect("traversal");
+            assert!(traversal.pending_directories.is_empty(), "{source:?}");
+            assert_eq!(traversal.pending_candidates.len(), 5, "{source:?}");
+            assert_eq!(
+                traversal.counts.directory_entry_cap_exceeded_count, 0,
+                "{source:?}"
+            );
+            assert!(!traversal.counts.has_errors(), "{source:?}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// [regress] A subdirectory inside a directory wider than the budget is
+    /// queued by its full listing and its file is discovered next tick.
+    #[test]
+    fn subdirectory_inside_a_wide_directory_is_discovered() {
+        for source in WALK_SOURCES {
+            let root = fs::canonicalize(temp_dir("bounded-wide-directory-nested"))
+                .expect("canonical root");
+            write_sessions(&root, 4);
+            let nested = root.join("nested");
+            fs::create_dir_all(&nested).expect("create nested directory");
+            let deep = nested.join("deep.jsonl");
+            fs::write(&deep, b"{}\n").expect("write nested fixture");
+            let mut index = start_walk(source, &root);
+
+            walk_tick(source, &mut index);
+            assert_eq!(candidate_paths(&index).len(), 4, "{source:?}");
+            walk_tick(source, &mut index);
+            let traversal = index.traversal.as_ref().expect("traversal");
+            assert!(traversal.pending_directories.is_empty(), "{source:?}");
+            assert_eq!(
+                traversal.counts.directory_entry_cap_exceeded_count, 0,
+                "{source:?}"
+            );
+            assert!(!traversal.counts.has_errors(), "{source:?}");
+            let paths = candidate_paths(&index);
+            assert_eq!(paths.len(), 5, "{source:?}");
+            assert!(paths.contains(&deep), "{source:?}: nested file discovered");
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
