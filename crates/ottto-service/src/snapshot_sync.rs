@@ -7353,7 +7353,7 @@ fn finish_sync_source(
             }
         };
         let (mut disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_retained(
+            apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                 support_dir,
                 &mut scan_result,
                 &mut index,
@@ -8838,7 +8838,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub context_file_birth: crate::snapshots::ClaudeContextFileBirthCounts,
 }
 
-/// The ordinary evidence stage without retained cache or identity ledger inputs.
+/// The ordinary evidence stage without identity ledger or wire budget inputs.
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -8848,7 +8848,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_retained(
+    apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         support_dir,
         scan_result,
         index,
@@ -8869,7 +8869,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_retained(
+    apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         support_dir,
         scan_result,
         index,
@@ -8910,7 +8910,7 @@ fn whole_corpus_evidence() -> bool {
     false
 }
 
-fn apply_claude_local_evidence_to_scan_with_retained(
+fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
