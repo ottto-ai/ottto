@@ -29,7 +29,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
   inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
   census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
-  population/read-volume limit. Compressed rollouts keep their original modification time,
+  population/read-volume limit. A fresh-data page first fills up to half its slots with fresh
+  plain rollouts in queue order, so a hinted archive backlog cannot hold recent sessions back;
+  the rest of that page stays FIFO, archives included.
+  Compressed rollouts keep their original modification time,
   so they age as the plain file did. Legacy held archive member keys count as already seen
   for the ordinary first-read age gate; their values remain inert, and header/ownership
   admission still applies. A provider-written new plaintext object takes the existing

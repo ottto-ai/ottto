@@ -3107,6 +3107,274 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
     });
 }
 
+/// Session id `n` of the fresh backlog: compressed ids sort before plain ones.
+fn backlog_id(archive: bool, n: usize) -> String {
+    format!("019fa666-2222-7333-8444-{}{n:011}", u8::from(!archive))
+}
+
+/// `archives` compressed rollouts queued ahead of `plains` plain ones, none
+/// read yet and every one hinted, so every one is fresh: the queue a real
+/// install held when thousands of old archives were hinted at once.
+fn fresh_backlog(
+    archives: usize,
+    plains: usize,
+) -> (ScanRoot, Vec<PathBuf>, Vec<PathBuf>, ScanIndex) {
+    let fixture = ScanRoot::with_sessions(&[]);
+    let body = |id: &str| {
+        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+            "type": "session_meta", "payload": {"id": id}}));
+        body.extend(token_line(1));
+        body
+    };
+    let archives = (0..archives)
+        .map(|n| {
+            let id = backlog_id(true, n);
+            let path = fixture
+                .root
+                .join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl.zst"));
+            fs::write(&path, zstd::stream::encode_all(&body(&id)[..], 1).unwrap()).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let plains = (0..plains)
+        .map(|n| {
+            let id = backlog_id(false, n);
+            fs::write(fixture.file(&id), body(&id)).unwrap();
+            fixture.file(&id)
+        })
+        .collect::<Vec<_>>();
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
+    // The hint stands in for the watcher or roster hint that marks a file fresh.
+    let traversal = index.traversal.as_mut().unwrap();
+    assert!(traversal.pending_directories.is_empty());
+    traversal
+        .pending_candidates
+        .make_contiguous()
+        .sort_by_key(|candidate| (!archives.contains(&candidate.path), candidate.path.clone()));
+    for candidate in traversal.pending_candidates.iter_mut() {
+        candidate.watcher_hint = true;
+    }
+    let traversal = index.traversal.as_ref().unwrap();
+    let queued = traversal
+        .pending_candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(queued, [archives.clone(), plains.clone()].concat());
+    assert!(traversal
+        .pending_candidates
+        .iter()
+        .all(|candidate| codex_fresh_data_pending(candidate, &index)));
+    (fixture, archives, plains, index)
+}
+
+/// One Codex page of at most four paths, owed as a fresh page.
+fn four_path_page(fixture: &ScanRoot, mut index: ScanIndex, page: u64) -> OwnedSourceScan {
+    // Every page here may be a fresh page; the census and ordinary turns
+    // between fresh pages are unchanged and covered above.
+    if let Some(traversal) = index.traversal.as_mut() {
+        traversal.codex_freshness_yield = false;
+    }
+    OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        &collected_at(page),
+        BACKFILL_WINDOW_DAYS,
+        4,
+        None,
+        &[],
+        false,
+    )
+}
+
+fn selected_keys(scan: &OwnedSourceScan) -> BTreeSet<String> {
+    scan.codex_selected_flags.keys().cloned().collect()
+}
+
+fn keys<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> BTreeSet<String> {
+    paths
+        .into_iter()
+        .map(|path| local_index_key(path.as_path()))
+        .collect()
+}
+
+/// [regress] Recent plain sessions waited hours behind thousands of hinted
+/// old compressed rollouts, because a fresh page took fresh work in FIFO
+/// order. A fresh page now gives up to half its slots to fresh plain
+/// rollouts first; the rest stays FIFO, archives included.
+/// (a) one plain session behind more than a page of archives is selected on
+/// the next fresh page, beside the first archives in queue order;
+/// (b) with only archives waiting, the page is FIFO as before.
+#[test]
+fn a_fresh_page_reads_plain_sessions_ahead_of_an_archive_backlog() {
+    let (fixture, archives, _, index) = fresh_backlog(6, 0);
+    let selected = four_path_page(&fixture, index, 1);
+    assert_eq!(selected_keys(&selected), keys(&archives[..4]));
+    assert!(selected
+        .codex_selected_flags
+        .values()
+        .all(|flags| *flags == (true, true)));
+
+    let (fixture, archives, plains, index) = fresh_backlog(6, 1);
+    let selected = four_path_page(&fixture, index, 1);
+    assert_eq!(
+        selected_keys(&selected),
+        keys(plains.iter().chain(&archives[..3]))
+    );
+    assert!(selected
+        .codex_selected_flags
+        .values()
+        .all(|flags| *flags == (true, true)));
+    assert!(
+        selected
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .codex_freshness_yield
+    );
+}
+
+/// (c) More fresh plain sessions than half a page: each fresh page reserves
+/// two of four slots for them in queue order and gives the other two to the
+/// FIFO, so the archives drain beside them and neither class starves.
+/// (d) [money] The reordered drain emits what one cold Full of the same files
+/// emits; each session is emitted once, and re-hinting every unchanged file
+/// afterwards re-emits nothing.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs validated heap layout"
+)]
+fn reserved_plain_sessions_and_archives_drain_to_cold_money() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (fixture, archives, plains, mut index) = fresh_backlog(8, 6);
+    let cache = Arc::new(SharedCache::default());
+    let scope = || Scope("cursor-fixture".into());
+    let mut emitted = BTreeMap::<String, usize>::new();
+    let mut pages = Vec::new();
+    let mut page = 0;
+    let queued = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| !traversal.pending_candidates.is_empty())
+    };
+    while queued(&index) {
+        page += 1;
+        assert!(page <= 6, "the backlog drains");
+        let selected = four_path_page(&fixture, index, page)
+            .with_sampled_acquisition(Arc::clone(&cache), scope());
+        if page <= 3 {
+            let n = 2 * (page as usize - 1);
+            assert_eq!(
+                selected_keys(&selected),
+                keys(plains[n..n + 2].iter().chain(&archives[n..n + 2])),
+                "page {page}"
+            );
+        }
+        let (next, scan) = finish_published(selected);
+        index = next;
+        for item in &scan.snapshots {
+            *emitted.entry(item.source_session_id.clone()).or_default() += 1;
+        }
+        pages.push(scan);
+    }
+    let mut pages = pages.into_iter();
+    let mut drained = pages.next().unwrap();
+    for scan in pages {
+        drained.snapshots.extend(scan.snapshots);
+    }
+    let all = (0..8)
+        .map(|n| backlog_id(true, n))
+        .chain((0..6).map(|n| backlog_id(false, n)))
+        .map(|id| (id, 1))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(emitted, all, "every session emitted exactly once");
+
+    let (cold_index, cold_scan) = published_scan(
+        &fixture,
+        &Arc::new(SharedCache::default()),
+        ScanIndex::default(),
+        NOW,
+        &[],
+    );
+    assert_eq!(cold_scan.snapshots.len(), all.len());
+    let cold = scan_money(SnapshotSource::Codex, &cold_index, &cold_scan);
+    let route = scan_money(SnapshotSource::Codex, &index, &drained);
+    money_oracle::assert_equivalent(&cold, &route);
+
+    // Every file hinted again, unchanged: none is fresh, each is selected
+    // once more, and nothing is emitted again.
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        &collected_at(page + 1),
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
+    let traversal = index.traversal.as_mut().unwrap();
+    for candidate in traversal.pending_candidates.iter_mut() {
+        candidate.watcher_hint = true;
+    }
+    let traversal = index.traversal.as_ref().unwrap();
+    let rehinted = traversal
+        .pending_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(rehinted, keys(archives.iter().chain(&plains)));
+    assert!(traversal
+        .pending_candidates
+        .iter()
+        .all(|candidate| !codex_fresh_data_pending(candidate, &index)));
+    let mut reselected = BTreeSet::new();
+    for quiet_page in 1..=6 {
+        if !queued(&index) {
+            break;
+        }
+        let selected = four_path_page(&fixture, index, page + 1 + quiet_page)
+            .with_sampled_acquisition(Arc::clone(&cache), scope());
+        reselected.extend(selected_keys(&selected));
+        let (next, quiet) = finish_published(selected);
+        index = next;
+        assert!(
+            quiet.snapshots.is_empty(),
+            "no re-emission of an unchanged file"
+        );
+    }
+    assert!(!queued(&index));
+    assert_eq!(reselected, rehinted);
+    let after = scan_money(SnapshotSource::Codex, &index, &drained);
+    money_oracle::assert_no_smaller_reemit(&backlog_id(false, 5), &route, &after, &cold, false);
+}
+
 /// The session ids `scan` published.
 fn published_ids(scan: &SourceScanResult) -> BTreeSet<&str> {
     scan.snapshots
