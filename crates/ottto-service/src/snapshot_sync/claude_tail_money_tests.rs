@@ -2449,7 +2449,10 @@ fn pi_live_retry_commits_the_shed_head() {
     let durable = |index: &ScanIndex| {
         SnapshotUploadProgress::load_with_recovery(
             &progress_path,
-            &format!("{:064x}", 99),
+            disk.route
+                .parent()
+                .and_then(|dir| dir.file_name()?.to_str())
+                .unwrap(),
             snapshot_quarantine_witness(SnapshotSource::Pi),
             crate::snapshots::ProgressRecovery::for_index(index, &disk.route).unwrap(),
         )
