@@ -27,7 +27,7 @@ When a stable release advertises Homebrew support, install through the published
 tap and let Homebrew own service lifecycle:
 
 ```bash
-brew install <published-tap>/ottto
+brew install ottto-ai/tap/ottto
 brew services start ottto
 ottto status --json
 ```
