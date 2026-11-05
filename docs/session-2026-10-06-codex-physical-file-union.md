@@ -90,8 +90,8 @@ a legitimate correction, including a lower total. If a member cannot return,
 recovery requires explicit review of complete replacement source evidence and
 a scoped index migration; this patch supplies no automatic reset or backfill.
 
-Each file retains at most 512 priority contributions, with no aggregate
-receipt limit per index. Replacement is
+A file retains every priority contribution, with no per-file or aggregate
+receipt limit. Replacement is
 file-owned; there is no age-based selector eviction or silent downgrade to
 standard to satisfy a cap. Missing required, malformed, unknown-version,
 changed-prefix or changed-context evidence holds its correction. A valid future

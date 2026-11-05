@@ -877,7 +877,6 @@ pub(crate) struct LegacyBaseline {
 }
 crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, snapshots);
 const RECEIPT_VERSION: u16 = 1;
-const MAX_APPLIED_TIERS: usize = 512;
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -975,7 +974,6 @@ impl TierReplay {
                 || receipt.derivation != SnapshotSource::Codex.parser_version()
                 || receipt.records == 0
                 || !crate::hex::is_sha256_lower(&receipt.prefix_digest)
-                || receipt.tiers.len() > MAX_APPLIED_TIERS
                 || receipt.tiers.iter().any(|(key, source)| {
                     !crate::hex::is_sha256_lower(key)
                         || source.is_empty()
@@ -1075,7 +1073,7 @@ impl TierReplay {
     }
     pub(super) fn admitted(&mut self, tier: Option<(String, String)>) {
         if let Some((key, source)) = tier {
-            if source.len() > 64 || self.tiers.len() >= MAX_APPLIED_TIERS {
+            if source.len() > 64 {
                 self.invalid = true;
                 return;
             }
@@ -2330,7 +2328,8 @@ pub(super) mod tests {
             &[],
             false,
         );
-        for _ in 0..1000 {
+        // A reader step is one line; one fixture member holds ~1,030 lines.
+        for _ in 0..10_000 {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
@@ -3554,7 +3553,7 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn missing_protected_receipt_rewrite_or_cap_holds_correction_but_scope_does_not() {
+    fn missing_protected_receipt_rewrite_holds_correction_but_scope_does_not() {
         let rows = member("owner", "r", 100, 100);
         let mut replay = TierReplay::new(None, false, "scope".into());
         for row in &rows {
@@ -3578,11 +3577,29 @@ pub(super) mod tests {
             replay.admitted(Some(("a".repeat(64), "derived_from_logs_2".into())));
             assert_eq!(replay.finish().is_err(), holds, "{scope}");
         }
+        // [regress] No per-file tier cap: 513 priority contributions (one past
+        // the former 512) finish, and their receipt replays as valid.
+        let many = (0..513)
+            .map(|i| (format!("{i:064x}"), "derived_from_logs_2".to_string()))
+            .collect::<Vec<_>>();
         let mut replay = TierReplay::new(None, false, "scope".into());
-        for i in 0..=MAX_APPLIED_TIERS {
-            replay.admitted(Some((format!("{i:064x}"), "derived_from_logs_2".into())));
+        for row in &rows {
+            replay.observe(row);
         }
-        assert!(replay.finish().is_err());
+        for tier in &many {
+            replay.admitted(Some(tier.clone()));
+        }
+        let receipt = replay.finish().unwrap().unwrap();
+        assert_eq!(receipt.tiers.len(), 513);
+        let mut replay = TierReplay::new(Some(receipt.clone()), true, "scope".into());
+        assert!(!replay.invalid, "a receipt past 512 tiers is valid");
+        for row in &rows {
+            replay.observe(row);
+        }
+        for tier in &many {
+            replay.admitted(Some(tier.clone()));
+        }
+        assert_eq!(replay.finish().unwrap(), Some(receipt));
     }
     #[test]
     fn malformed_or_missing_captured_metadata_holds_without_resetting_index() {
@@ -3619,10 +3636,11 @@ pub(super) mod tests {
             fs::remove_dir_all(root).unwrap();
         }
     }
-    /// `receipt` with `MAX_APPLIED_TIERS` synthetic priority contributions.
+    /// `receipt` with 512 (the former per-file cap) synthetic priority
+    /// contributions.
     fn full_receipt(receipt: &AppliedTierReceipt) -> AppliedTierReceipt {
         let mut full = receipt.clone();
-        full.tiers = (0..MAX_APPLIED_TIERS)
+        full.tiers = (0..512)
             .map(|n| {
                 (
                     sha256_hex(&["synthetic-tier", &n.to_string()]),
@@ -3769,6 +3787,96 @@ pub(super) mod tests {
                 .index_keys
                 .is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// [regress] T2: a joined group whose priced member grows past the former
+    /// 512-tier cap still uploads, with no hold and every priced row priority.
+    /// T3: with logs_2 gone, a replay from the saved index restores every tier
+    /// from the receipt and emits a byte-identical body.
+    #[test]
+    fn joined_group_past_former_tier_cap_uploads_and_replays_without_downgrade() {
+        let root = native_join_fixture_root(true);
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let (mut working, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        result.finish_codex_capture_boundary(&mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous =
+            working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let path = root.join("sessions/b.jsonl");
+        let key = local_index_key(&path);
+        let tiers = |index: &ScanIndex| {
+            receipt_state(index.files.get(&key))
+                .0
+                .map_or(0, |receipt| receipt.tiers.len())
+        };
+        assert_eq!(tiers(&previous), 1);
+        // 513 more admitted records under b's priority turn, 1 input token each.
+        let mut text = fs::read_to_string(&path).unwrap();
+        for i in 0..513u64 {
+            for row in member(owner, &format!("r-t{i}"), 1, 301 + i)
+                .into_iter()
+                .skip(1)
+            {
+                text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+            }
+        }
+        fs::write(&path, text).unwrap();
+        let (mut after, mut rescanned) = scan(&root, previous.clone(), 2);
+        assert_eq!(rescanned.ownership_incomplete_file_count, 0);
+        assert!(rescanned.census_complete);
+        assert_eq!(rescanned.snapshots.len(), 2, "one alias per group member");
+        for item in &rescanned.snapshots {
+            assert_eq!(item.source_session_id, owner);
+            // Fixture sum: a 100 + b 200 + 513 x 1.
+            assert_eq!(item.input_tokens, 813);
+            let priority = item
+                .model_usage
+                .iter()
+                .filter(|row| {
+                    row.selector_context.get("service_tier").map(String::as_str) == Some("priority")
+                })
+                .map(|row| row.input_tokens)
+                .sum::<u64>();
+            assert_eq!(priority, 713, "every b row is priced priority");
+        }
+        let body = rescanned
+            .snapshots
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tiers(&after), 514, "1 fixture tier + 513 appended");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut rescanned, &mut after);
+        let (capture, _) = after.stage_codex_recovery_capture(&previous, &rescanned.snapshots);
+        rescanned.finish_codex_capture_boundary(&mut after);
+        let accepted = rescanned
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut committed = after.committable_subset(&capture, &accepted, &BTreeMap::new());
+        let saved = root.join("index.json");
+        committed.save(&saved).unwrap();
+        let mut loaded = ScanIndex::load(&saved).unwrap();
+        assert_eq!(tiers(&loaded), 514);
+        // T3: the trace source expires; only the saved receipt can price b.
+        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+        loaded.prepare_historical_replay("tier-cap-replay".into());
+        let (_, replayed) = scan(&root, loaded, 2);
+        assert_eq!(replayed.ownership_incomplete_file_count, 0);
+        assert_eq!(
+            replayed
+                .snapshots
+                .iter()
+                .map(|item| serde_json::to_value(item).unwrap())
+                .collect::<Vec<_>>(),
+            body,
+            "restored from the receipt: no tier downgraded"
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

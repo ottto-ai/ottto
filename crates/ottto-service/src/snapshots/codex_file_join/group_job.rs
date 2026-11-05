@@ -443,7 +443,6 @@ impl GroupBoot {
                         && receipt.as_ref().map_or(true, |receipt| {
                             receipt.version == RECEIPT_VERSION
                                 && receipt.derivation == SnapshotSource::Codex.parser_version()
-                                && receipt.tiers.len() <= MAX_APPLIED_TIERS
                         })
                 })
         })

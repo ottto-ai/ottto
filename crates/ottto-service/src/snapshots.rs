@@ -26482,7 +26482,6 @@ fn refresh_retained_codex_directories(
         _ => return,
     };
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
-    let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
     for directory in moved {
         let Some(scan_root) = traversal.owning_scan_root(&directory).cloned() else {
             continue;
@@ -26507,11 +26506,7 @@ fn refresh_retained_codex_directories(
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
-        let entries = entries.take(remaining + 1).collect::<Vec<_>>();
-        if entries.len() > remaining {
-            break;
-        }
-        remaining -= entries.len();
+        let entries = entries.collect::<Vec<_>>();
         let mut present = BTreeSet::new();
         let mut appeared = Vec::new();
         let mut new_directories = Vec::new();
