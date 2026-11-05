@@ -42,6 +42,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
   singleton sessions and joined groups across every registered home. A new file
   naming a page owner fails; unrelated new files defer to the next roster refresh.
+  New directories are recursively listed with the same helper and their rollouts
+  use the same owner check, including same-owner subagents. Empty directories defer.
+  Validation leaves the census unchanged so the next refresh queues new directories
+  for the existing bounded traversal.
   Every header ownership change and vanished census directory fails closed.
   Refresh and checkpoint share the stable `DirectoryCensus::relist` helper.
   Each boundary re-lists changed directories and re-reads new or changed headers.
@@ -53,7 +57,6 @@ file-system hint / periodic listing → select file → read new bytes from save
   fence: a page-owner candidate or missing filename proof fails the page.
   Unknown or unreadable headers remain conservative failures, including unrelated
   compressed rereads.
-  A new empty day directory still fails one page (about once per home per day).
   A symlink entry that refresh cannot certify can block pages across homes.
   A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
