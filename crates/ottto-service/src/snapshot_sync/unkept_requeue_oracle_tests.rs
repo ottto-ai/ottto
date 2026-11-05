@@ -745,7 +745,8 @@ fn watcher_only_append_requeues_after_a_partial_checkpoint() {
 /// [money] Only exact durable stored-body ACKs settle a file's full incidence.
 /// Invalid/partial responses, not-stored custody and a mixed file retain the
 /// accepted prefix while the ordinary retry produces cold Full money; a
-/// refused ref's debt is its exact-body custody, re-offered when due.
+/// refused ref's debt is its quarantine custody: when due, its entity is
+/// re-read and re-sent with the current body, settling only on its own ACK.
 #[test]
 fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
     with_e2(|| {
@@ -952,7 +953,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     assert!(record.witness == held.witness, "same quarantine witness");
                 }
                 // Release the custody: the due retry re-reads the file and
-                // re-offers this exact body.
+                // re-sends this entity's current body.
                 for record in [
                     loaded
                         .quarantined_snapshot_fingerprints
@@ -971,7 +972,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 // Released custody is not credit: no settlement before its ACK.
                 assert!(!sender.accepted_fingerprints.contains(faulted));
                 assert!(!sender.accepted_body_witnesses.contains_key(faulted));
-                reoffer = Some((faulted.to_string(), body));
+                reoffer = Some((faulted.to_string(), body, item.source_session_id.clone()));
             }
             if fault == "not_stored" {
                 // Receiver head dominance is custody, never stored-body credit.
@@ -1006,8 +1007,9 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
             }
             crate::snapshots::state_v2::release_collection_page_limit_for_test(&loaded);
             let mut retry = if reoffer.is_some() {
-                // The refused body was built with this cycle's accepted-share
-                // hints (as the sync loop does); re-read it from the same inputs.
+                // Re-read with accepted-share hints, as the sync loop does.
+                // The sibling's ACK changed them, so the entity's current body
+                // (and fingerprint) can differ from the refused bytes.
                 let mut retry = c.raw(
                     &E2ScanFixture::capturing_identity(),
                     loaded,
@@ -1028,6 +1030,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 physical_posts += items.len();
                 offered.extend(items.iter().map(|item| {
                     (
+                        item.source_session_id.clone(),
                         item.snapshot_fingerprint.clone(),
                         snapshot_upload_body_witness(item),
                     )
@@ -1046,38 +1049,63 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 ack(items)
             });
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-            if let Some((faulted, body)) = &reoffer {
+            let mut retried = None;
+            if let Some((faulted, body, entity)) = &reoffer {
                 let short = |hash: &str| hash.chars().take(8).collect::<String>();
-                let pairs = offered
+                let triples = offered
                     .iter()
-                    .map(|(fp, witness)| (short(fp), short(witness)))
+                    .map(|(id, fp, witness)| {
+                        (SessionHash::of(id).to_string(), short(fp), short(witness))
+                    })
                     .collect::<Vec<_>>();
-                let witnesses = offered
+                eprintln!(
+                    "retry offered (session, fp, witness): {triples:?}; refused ({}, {}, {})",
+                    SessionHash::of(entity),
+                    short(faulted),
+                    short(body)
+                );
+                // (i) The due retry's POST carries an item for the SAME entity.
+                let same = offered
                     .iter()
-                    .filter(|(fp, _)| fp == faulted)
-                    .map(|(_, witness)| witness)
+                    .filter(|(id, _, _)| id == entity)
                     .collect::<Vec<_>>();
-                if witnesses.is_empty() || witnesses.iter().any(|witness| *witness != body) {
-                    eprintln!(
-                        "retry offered (fp, witness): {pairs:?}; refused ({}, {})",
-                        short(faulted),
-                        short(body)
+                assert!(
+                    !same.is_empty(),
+                    "the due retry's POST carries the refused entity"
+                );
+                assert!(same.iter().all(|offer| *offer == same[0]));
+                let (_, fp, witness) = (*same[0]).clone();
+                // (iii) It settles only on its own exact ACK ...
+                assert_eq!(
+                    sender.accepted_body_witnesses.get(&fp),
+                    Some(&witness),
+                    "the refused entity settles on its own exact ACK"
+                );
+                assert!(!sender.quarantined_fingerprints.contains_key(&fp));
+                // (iv) ... and the refused fingerprint never gets credit,
+                // unless these same bytes were re-sent and exactly ACKed.
+                if fp != *faulted {
+                    assert!(!sender.accepted_fingerprints.contains(faulted));
+                    assert!(!sender.accepted_body_witnesses.contains_key(faulted));
+                } else {
+                    assert_eq!(&witness, body, "same fingerprint, same body");
+                }
+                // (iii) The refused record is cleared or superseded in the
+                // next durable checkpoint: no RetryPending for this entity.
+                let mut after = sender.clone();
+                checkpoint(&retry, &mut after, session.path(), None);
+                let settled = ScanIndex::load(session.path()).unwrap();
+                for key in [faulted, &fp] {
+                    assert!(
+                        !matches!(
+                            settled.quarantined_snapshot_fingerprints.get(key),
+                            Some(record) if record.disposition
+                                == SnapshotQuarantineDisposition::RetryPending
+                        ),
+                        "no RetryPending left for the refused entity"
                     );
                 }
-                assert!(
-                    !witnesses.is_empty(),
-                    "the due retry's POST offers the refused fingerprint"
-                );
-                assert!(
-                    witnesses.iter().all(|witness| *witness == body),
-                    "the offered item's body witness equals the refused one"
-                );
-                assert_eq!(
-                    sender.accepted_body_witnesses.get(faulted),
-                    Some(body),
-                    "the refused ref settles on its exact ACK"
-                );
-                assert!(!sender.quarantined_fingerprints.contains_key(faulted));
+                retried = Some((entity.clone(), fp, witness));
             }
             if fault == "durable_ack" {
                 assert_eq!(
@@ -1088,6 +1116,14 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
             let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
             // Replacements applied at the receiver, assembled from the actual
             // accepted POSTs above, rather than re-scanning an expected body.
+            if let Some((entity, fp, witness)) = &retried {
+                // (ii) The cold-Full comparison below covers the retried item
+                // itself: it is this entity's receiver body, in money and
+                // placement.
+                let item = &destination[entity];
+                assert_eq!(&item.snapshot_fingerprint, fp);
+                assert_eq!(&snapshot_upload_body_witness(item), witness);
+            }
             let mut final_page = retry;
             final_page.scan.snapshots = destination.into_values().collect();
             for item in &final_page.scan.snapshots {
