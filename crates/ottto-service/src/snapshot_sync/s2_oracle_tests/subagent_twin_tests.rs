@@ -130,7 +130,12 @@ fn routes(c: &Corpus) -> RouteResult {
         };
         again.enrich(c);
         money_oracle::assert_equivalent(&grown, &result(&again, mode));
-        let _ = commit(&session, again);
+        // An upgraded prior continues on its own route, never the session's.
+        if upgrade {
+            again.finish();
+        } else {
+            let _ = commit(&session, again);
+        }
         std::fs::write(main, &original).unwrap();
     }
     expected
@@ -237,6 +242,50 @@ fn occurrence_boundary_counts_unusable_and_old_copies() {
     });
 }
 
+/// Body fields a multi-file session's carrier sets: the first page item
+/// carries the summed entity, and a Tail page lists its hinted file first, so
+/// the ended-at time (and the hashes over it) can follow the read route. This
+/// pre-existing difference has no money effect.
+const CARRIER_END: [&str; 6] = [
+    "source_ended_at",
+    "semantic_envelope/component_hashes/lifecycle_activity",
+    "semantic_envelope/content_hash",
+    "semantic_envelope/revision_hash",
+    "semantic_envelope/revision_v2_hash",
+    "snapshot_fingerprint",
+];
+
+/// Money, placement and removed fields exact; any other body difference is
+/// pinned to a changed ended-at time plus the hashes derived from it.
+fn assert_money_equivalent_but_carrier_end(expected: &RouteResult, other: &RouteResult) {
+    money_oracle::assert_placement_equivalent(expected, other);
+    let mut money = Vec::new();
+    money_oracle::entity_differences(expected, other, &mut money);
+    assert!(money.is_empty(), "{:?}:\n{}", other.mode, money.join("\n"));
+    let mut body = Vec::new();
+    money_oracle::diff(
+        "normalized_batch",
+        &expected.normalized,
+        &other.normalized,
+        &mut body,
+    );
+    let mut changed = std::collections::BTreeMap::<&str, bool>::new();
+    for line in &body {
+        let path = line.split(':').next().unwrap();
+        let (snapshot, field) = CARRIER_END
+            .iter()
+            .find_map(|field| Some((path.strip_suffix(field)?, *field)))
+            .unwrap_or_else(|| panic!("{:?}: body drift beyond the carrier: {line}", other.mode));
+        *changed.entry(snapshot).or_default() |= field == "source_ended_at";
+    }
+    assert!(
+        changed.values().all(|ended| *ended),
+        "{:?}: hashes changed without an ended-at change:\n{}",
+        other.mode,
+        body.join("\n")
+    );
+}
+
 /// [money] Append to either child, then opposite children, then only the
 /// main: the old shared prefix stays singular while distinct suffixes add.
 #[test]
@@ -273,12 +322,19 @@ fn growth_on_either_home_and_main_only() {
                 let expected = cold(&c);
                 // Save the prior before either scan takes its growth claim.
                 let restored_prior = session.save_reload(&mut prior);
+                // The main-only append moves the main session's carrier to the
+                // hinted file on Tail; children grow a carrier on both routes.
+                let check: fn(&RouteResult, &RouteResult) = if step == 4 {
+                    assert_money_equivalent_but_carrier_end
+                } else {
+                    money_oracle::assert_equivalent
+                };
                 let warm = hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&path));
                 assert_eq!(warm.modes.0, 0, "append/forced family use Tail");
                 assert!(warm.modes.1 > 0);
-                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+                check(&expected, &result(&warm, Mode::Ram));
                 let restored = hinted(&c, restored_prior, 100, true, std::slice::from_ref(&path));
-                money_oracle::assert_equivalent(&expected, &result(&restored, Mode::DiskRestore));
+                check(&expected, &result(&restored, Mode::DiskRestore));
                 additions += 1;
                 let sum = expected
                     .snapshots
@@ -358,8 +414,17 @@ fn restart_boundaries_and_quiet_settlement() {
             &c.base.join("state"),
         );
         let first = page(&c, index.clone(), 1, true);
-        // A crash before upload cannot grant an ACK or lose either member.
-        let replay = page(&c, ScanIndex::load(session.path()).unwrap(), 100, true);
+        // A crash before upload cannot grant an ACK or lose either member; the
+        // restarted process starts with fresh route state, as its own install.
+        let replay = page(
+            &c,
+            crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(
+                &ScanIndex::load(session.path()).unwrap(),
+                &c.base,
+            ),
+            100,
+            true,
+        );
         let restarted = result(&replay, Mode::Restart);
         money_oracle::assert_equivalent(&expected, &restarted);
         for agent in 0..2 {
