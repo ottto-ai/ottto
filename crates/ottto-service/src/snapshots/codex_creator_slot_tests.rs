@@ -134,6 +134,120 @@ fn codex_creator_pair_names_its_single_subscription_slot() {
     );
 }
 
+#[test]
+fn codex_exec_creator_slot_reaches_active_sessions_with_workspace() {
+    let dir = crate::test_scratch::ScratchDir::canonical("codex-exec-active-slot");
+    let home = dir.join("registered-slot");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let id = "019e253c-5555-7000-9000-eeeeeeeeeeee";
+    let path = home.join("sessions").join(format!("rollout-{id}.jsonl"));
+    let header = serde_json::json!({
+        "timestamp": "2026-07-19T10:00:00Z", "type": "session_meta",
+        "payload": {
+            "id": id, "timestamp": "2026-07-19T10:00:00Z",
+            "creator_user_id": "synthetic-slot-user",
+            "creator_account_id": "synthetic-slot-workspace",
+            "originator": "codex_exec", "source": "exec", "thread_source": "user"
+        }
+    });
+    let usage = serde_json::json!({
+        "timestamp": "2026-07-19T10:04:00Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 100, "output_tokens": 5},
+            "model": "gpt-5.6-codex"
+        }}
+    });
+    fs::write(&path, format!("{header}\n{usage}\n")).unwrap();
+    let mut snapshots =
+        parse_codex_jsonl_file(&path, "2026-07-19T10:05:00Z", "exec-file".into()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert!(exact_session_account_hash(&snapshots[0]).is_none());
+    assert!(codex_rows_all(&snapshots[0], |mode| mode.is_none()));
+
+    let account =
+        ottto_core::billing_identity_hash("openai", "account", "synthetic-slot-user").unwrap();
+    let workspace =
+        ottto_core::billing_identity_hash("openai", "workspace", "synthetic-slot-workspace")
+            .unwrap();
+    let binding = crate::agent_status::CodexHomeBinding {
+        home,
+        account_identifier_hash: account.clone(),
+        workspace_identifier_hash: workspace.clone(),
+        auth_modified_at: UNIX_EPOCH,
+    };
+    let slots = [(account.clone(), workspace.clone(), NAMED)];
+    let mut index = ScanIndex::default();
+    let mut entry = manifest_index_entry(None);
+    entry.source_file_fingerprint = "exec-file".into();
+    index.files.insert(local_index_key(&path), entry);
+    let mut counts = [0; 9];
+    let deferred = index.bind_session_accounts_with_mixed(
+        SnapshotSource::Codex,
+        "machine",
+        &mut snapshots,
+        std::slice::from_ref(&binding),
+        (&slots, &mut counts),
+        &Default::default(),
+    );
+    assert!(deferred.is_empty());
+    assert_eq!(counts, counted(Some(NAMED)));
+    assert_eq!(
+        exact_session_account_hash(&snapshots[0]),
+        Some(account.clone())
+    );
+
+    // The default home's status knows a different login, as in the daemon.
+    let status = serde_json::from_value(serde_json::json!({
+        "source": "codex", "status": "available", "collection_method": "cli_json",
+        "captured_at": "2026-07-19T10:05:00Z", "expires_at": "2026-07-19T10:15:00Z",
+        "account": {
+            "login_state": "signed_in", "confidence": "high",
+            "account_identifier_hash": "default-account",
+            "organization_identifier_hash": "default-workspace"
+        },
+        "plan_observations": [{
+            "account_identifier_hash": "default-account",
+            "organization_identifier_hash": "default-workspace", "confidence": "high"
+        }]
+    }))
+    .unwrap();
+    for (items, login_changed, at) in [
+        (snapshots.as_slice(), false, "2026-07-19T10:05:00Z"),
+        (snapshots.as_slice(), true, "2026-07-19T10:06:00Z"),
+        ([].as_slice(), true, "2026-07-19T10:07:00Z"),
+    ] {
+        let status = crate::agent_status_refresh::status_for_reconciliation(
+            &status,
+            std::slice::from_ref(&binding),
+            login_changed,
+        );
+        assert_eq!(status.account.is_none(), login_changed);
+        let result = crate::active_sessions::reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            items,
+            Some(&status),
+            None,
+            at,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        let active = &result.sessions[0];
+        assert_eq!(active.source_session_id, id);
+        assert_eq!(active.session_kind.as_deref(), Some("headless"));
+        assert_eq!(active.provider_surface.as_deref(), Some("codex_exec"));
+        assert_eq!(active.account_identifier_hash.as_ref(), Some(&account));
+        assert_eq!(
+            active.organization_identifier_hash.as_ref(),
+            Some(&workspace)
+        );
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("snapshot_account_identity")
+        );
+    }
+}
+
 /// [regress] Forward only (D185): a session already uploaded as Unknown stays
 /// Unknown on every later revision, counted, and mints no owner.
 #[test]
