@@ -696,7 +696,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let entry = f.working.files.remove(&key).unwrap();
         f.working
             .requeue_unkept_scanned_keys(SnapshotSource::Pi, &scanned, &BTreeSet::new());
-        f.working.files.insert(key, entry);
+        f.working.files.insert_shared(key, entry);
         let mut owner = f.capture(Duration::from_millis(30));
         assert!(owner.enabled());
         let opens_before_retry = crate::snapshots::all_transcript_opens_for_test();

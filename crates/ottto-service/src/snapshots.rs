@@ -29569,7 +29569,7 @@ impl ScanIndex {
             .files
             .iter()
             .filter(|(key, entry)| {
-                self.files.get(*key).is_none_or(|kept| {
+                self.files.get(*key).map_or(true, |kept| {
                     kept.source_file_fingerprint != entry.source_file_fingerprint
                 }) && !working.decode_holds_file(key)
                     && !entry
