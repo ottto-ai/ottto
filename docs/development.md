@@ -11,10 +11,9 @@ working in this repository also follow the execution rules in
   that touches native macOS behavior (Keychain, launchd, app bundle, signing
   checks). The portable crates also build and test on Linux; see
   [Testing On Linux](#testing-on-linux).
-- **Rust via rustup.** `rust-toolchain.toml` pins the Rust version and the
-  `rustfmt` and `clippy` components, and CI uses the same file. rustup selects
-  that toolchain automatically in this checkout; if it is not installed yet,
-  run `rustup toolchain install` once from the repository root.
+- **Rust via rustup.** Use the Rust version CI pins (see
+  `.github/actions/rust-setup/action.yml`) with the `rustfmt` and `clippy`
+  components.
 - Xcode Command Line Tools (`xcode-select --install`) on macOS.
 - `jq` for schema and registry checks, `python3` for repository scripts, and
   `shellcheck` 0.11.0 if you change shell scripts.
