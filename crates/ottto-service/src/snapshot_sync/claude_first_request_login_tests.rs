@@ -137,14 +137,17 @@ fn first_request_own_login_transition_oracle() {
         );
         assert!(parts_conserve(item));
         assert_eq!(item.request_count, 5);
-        let a = "a".repeat(64);
+        // The child's only request is a seedless gap: with account sources on
+        // it keeps no account, and never the root's later switch C.
         let child = body(&cold, &format!("{ROOT}_agent-000")).expect("child emitted");
         assert!(parts_conserve(child));
+        let c_login = "c".repeat(64);
+        let child_placed = placements(child);
         assert!(
-            placements(child)
+            child_placed
                 .keys()
-                .all(|(_, login, _, _)| login.as_ref() == Some(&a)),
-            "child uses root start A, never the later switch C"
+                .all(|(_, login, _, _)| login.as_ref() != Some(&c_login)),
+            "child never takes the later switch C: {child_placed:?}"
         );
         // The accepted upload's exact receipts are saved; an unchanged restarted scan
         // must consume no transcript byte and publish no smaller replacement.
@@ -209,6 +212,8 @@ fn first_request_own_login_survives_later_growth() {
                 ledger.record(&serde_json::to_value(item).unwrap());
             }
             let accepted = body(&warm, ROOT).expect("the root publishes").clone();
+            let child_id = format!("{ROOT}_agent-000");
+            let accepted_child = body(&warm, &child_id).map(placements);
             let prior = settle(
                 &c,
                 &ScanIndex::default(),
@@ -259,13 +264,11 @@ fn first_request_own_login_survives_later_growth() {
             );
             assert!(parts_conserve(root));
             assert_eq!(root.request_count, accepted.request_count + 1, "{later}");
-            let a = "a".repeat(64);
-            if let Some(child) = body(&tail, &format!("{ROOT}_agent-000")) {
-                assert!(
-                    placements(child)
-                        .keys()
-                        .all(|(_, login, _, _)| login.as_ref() == Some(&a)),
-                    "{later}: the child keeps root start A"
+            if let Some(child) = body(&tail, &child_id) {
+                assert_eq!(
+                    Some(placements(child)),
+                    accepted_child,
+                    "{later}: the child keeps its start"
                 );
             }
         });
