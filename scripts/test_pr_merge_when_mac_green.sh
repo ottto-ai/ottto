@@ -47,6 +47,7 @@ case "$1 $2" in
   api\ *check-runs/*/annotations*) reply annotations ;;
   api\ *check-runs*) reply checks ;;
   api\ *actions/runs/*/jobs*) reply jobs ;;
+  api\ *actions/runs/[0-9]*) reply run ;;
   api\ *actions/runs*event=merge_group*) reply queue_runs ;;
   api\ *actions/runs*) reply runs ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
@@ -291,7 +292,10 @@ removed_case() {
   green_case "$1"
   queue_json queue.1 OPEN "$SHA" QUEUED
   queue_json queue OPEN "$SHA" ""
+  # The first runs read, before the enqueue, finds no earlier queue run.
+  printf '%s' '{"workflow_runs":[]}' > "$case_dir/queue_runs.1"
   printf '%s' "$QUEUE_RUN" > "$case_dir/queue_runs"
+  printf '%s' '{"status":"completed"}' > "$case_dir/run"
   printf '%s' "$2" > "$case_dir/jobs"
   printf '%s' "$3" > "$case_dir/annotations"
 }
@@ -309,8 +313,8 @@ expect_output "merged PR #7 at merge SHA $NEW_SHA"
 
 # At most two re-enqueues, each on a newer run; then the removal is reported.
 removed_case not-acquired-gives-up "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
-printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 801' > "$case_dir/queue_runs.2"
-printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 802' > "$case_dir/queue_runs.3"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 801' > "$case_dir/queue_runs.3"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 802' > "$case_dir/queue_runs.4"
 run_guard 4 7
 expect_count "$ENQUEUE_CALL" 3
 expect_output '(2 of 2)'
@@ -341,11 +345,34 @@ expect_no_log 'annotations'
 
 # A job that ran a step failed for real: no re-enqueue, no annotation read.
 removed_case started-job-is-not-requeued \
-  '{"jobs":[{"id":91,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  '{"total_count":1,"jobs":[{"id":91,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
   "$NOT_ACQUIRED_NOTE"
 run_guard 4 7
 expect_count "$ENQUEUE_CALL" 1
+expect_log 'actions/runs/800/jobs'
 expect_no_log 'annotations'
+
+# A not-acquired job beside a job that really failed: no re-enqueue.
+removed_case mixed-failure-is-not-requeued \
+  '{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":93,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A queue run that existed before this guard run enqueued says nothing about it.
+removed_case earlier-run-is-not-used "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+rm "$case_dir/queue_runs.1"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'actions/runs/800/jobs'
+
+# A run that is still in progress defers the verdict until it finishes.
+removed_case unfinished-run-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' '{"status":"in_progress"}' > "$case_dir/run.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_count "$ENQUEUE_CALL" 2
 
 # A cancelled job without GitHub's note may be anything: no re-enqueue.
 removed_case cancelled-without-note-is-not-requeued "$NOT_ACQUIRED_JOBS" \

@@ -52,7 +52,8 @@ mutation (expectedHeadOid; independent of the repository's auto-merge setting)
 and waits until merged, removed from the queue, the head changes, or timeout.
 When GitHub never started a queue job ("The job was not acquired by Runner",
 a hosted-runner shortage, with no step run), the removal is not a test result:
-the guard enqueues the same head again, at most twice.
+the guard enqueues the same head again, at most twice per guard run, and only
+for a queue run created after this guard run first enqueued the PR.
 The queue's configured merge method applies; no administrator bypass is used.
 Rerunning the guard for a PR that is already queued resumes the wait.
 
@@ -233,6 +234,17 @@ checks_status() {
 
 # Best-effort diagnostics: queue heads differ from the PR head, so identify the
 # latest Public CI queue run by GitHub's queue branch prefix, not the PR SHA.
+# Id of the newest merge_group run of ci.yml for this PR, or 0.
+newest_queue_run_id() {
+  local runs
+  runs="$(gh api "repos/{owner}/{repo}/actions/runs?event=merge_group&per_page=100")" || { echo 0; return; }
+  printf '%s' "$runs" | jq -r --arg prefix "gh-readonly-queue/$base/pr-$pr-" --arg workflow "$CI_WORKFLOW" '
+    [.workflow_runs[]?
+     | select(.event == "merge_group" and .path == $workflow)
+     | select((.head_branch // "") | startswith($prefix)) | .id]
+    | max // 0' 2>/dev/null || echo 0
+}
+
 queue_run_id=""
 report_queue_failure() {
   local runs detail
@@ -297,14 +309,14 @@ queue_query() {
     }'
 }
 
-# True when the PR's current head is queued or already merged. Any read error
-# or head mismatch is false, so the caller reports the enqueue failure.
 # Returns 0 when queue run $1 has finished, every one of its jobs is listed,
 # and every unsuccessful job never ran a step and GitHub annotated it as not
-# acquired by a runner; 2 while any job is unfinished; 1 otherwise, including
+# acquired by a runner; 2 while the run or a job is unfinished; 1 otherwise, including
 # any read error.
 not_acquired_only() {
-  local jobs bad id
+  local run jobs bad id
+  run="$(gh api "repos/{owner}/{repo}/actions/runs/$1")" || return 1
+  printf '%s' "$run" | jq -e '.status == "completed"' >/dev/null || return 2
   jobs="$(gh api "repos/{owner}/{repo}/actions/runs/$1/jobs?per_page=100")" || return 1
   printf '%s' "$jobs" | jq -e '(.jobs | type) == "array" and .total_count == (.jobs | length)' >/dev/null \
     || return 1
@@ -324,6 +336,8 @@ not_acquired_only() {
   done
 }
 
+# True when the PR's current head is queued or already merged. Any read error
+# or head mismatch is false, so the caller reports the enqueue failure.
 already_queued() {
   local response
   response="$(queue_query)" || return 1
@@ -339,7 +353,7 @@ already_queued() {
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
   local response queued_pr state current_sha entry seen_queue=false absent=0
-  local requeues=0 used_run=0 unfinished=0 verdict
+  local requeues=0 unfinished=0 verdict
   while :; do
     if response="$(queue_query)" && queued_pr="$(printf '%s' "$response" | jq -ce '
         select((.errors // [] | length) == 0)
@@ -430,6 +444,8 @@ fi
 log "PR #$pr head $head_sha: waiting for the required checks $REQUIRED_CHECKS (interval ${interval}s, timeout ${timeout}s)"
 waited=0
 started_at=$SECONDS
+# Queue runs at or below this id predate this guard run's enqueue.
+used_run=0
 while :; do
   read_pr
   refuse_unmergeable
@@ -445,6 +461,7 @@ while :; do
         mergeable="$(pr_field mergeable)"
         if [ "$mergeable" = MERGEABLE ]; then
           log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
+          used_run="$(newest_queue_run_id)"
           if ! enqueue; then
             # A rerun after a timeout finds the PR already queued (or just
             # merged); resume waiting instead of reporting a gh failure.
