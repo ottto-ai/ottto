@@ -57,7 +57,8 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
 /// [regress] An indexed validation hold, or an identity deferral or an ACK
 /// ref echoing another body witness naming the same item (each ended the
 /// whole pass), preserves money and lets exact-ACK siblings settle; its
-/// custody survives a restart and reaches a due retry.
+/// custody survives a restart and reaches a due retry. A validated mixed
+/// refusal follows the same custody and is counted as isolated.
 #[test]
 #[serial(client_report)]
 fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
@@ -201,9 +202,11 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 (source, "validation"),
                 (source, "identity"),
                 (source, "witness"),
+                (source, "mixed"),
             ]
         }) {
             let identity = named == "identity";
+            let isolated = usize::from(named == "mixed");
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -328,6 +331,35 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                         .validate_entity_ack(&wire(&batch))
                                         .map(|()| response);
                                 }
+                                if named == "mixed" {
+                                    // A valid entity ACK refusing this item
+                                    // alone as non-permanent mixed usage.
+                                    let mut response = ack(&batch)?;
+                                    response
+                                        .accepted_entities
+                                        .retain(|entity| entity.snapshot_fingerprint != fp);
+                                    response.accepted -= 1;
+                                    response.rejected_entities.push(
+                                        crate::snapshot_client::SnapshotEntityRejection {
+                                            source_session_id: entity.clone(),
+                                            snapshot_fingerprint: fp.clone(),
+                                            reason: "accepted_log_stale_older_mixed".into(),
+                                            detail: String::new(),
+                                            permanent: false,
+                                            occurrence_count: 1,
+                                        },
+                                    );
+                                    response.validate_entity_ack(&wire(&batch))?;
+                                    for item in batch
+                                        .into_iter()
+                                        .filter(|item| item.snapshot_fingerprint != fp)
+                                    {
+                                        backend
+                                            .insert(item.source_session_id.clone(), item.clone());
+                                        emitted.push(item);
+                                    }
+                                    return Ok(response);
+                                }
                                 if identity {
                                     return Err(anyhow::Error::new(UploadShed {
                                         status: 503,
@@ -376,7 +408,10 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             let sent_at = current_unix_seconds();
             let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
             // Deferred, never Shed: the caller sets no source backoff.
-            assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+            assert_eq!(
+                result,
+                ResumableUploadResult::Deferred { count: 1, isolated }
+            );
             assert_eq!(accepted as usize, items.len() - 1);
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
             let record = &progress.quarantined_fingerprints[&fp];
@@ -506,7 +541,10 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             with_retry_clock(deadline, || {
                 assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
                 let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
-                assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+                assert_eq!(
+                    result,
+                    ResumableUploadResult::Deferred { count: 1, isolated }
+                );
                 assert_eq!(accepted, 1);
                 assert_eq!(emitted.len(), 1);
                 assert_eq!(emitted[0].source_session_id, "synthetic-fresh");
@@ -642,7 +680,13 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
         |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(
+        result,
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
+    );
     assert_eq!(accepted, 1);
     assert!(progress.quarantined_fingerprints.contains_key(&refused));
 

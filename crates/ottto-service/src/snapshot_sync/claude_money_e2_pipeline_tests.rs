@@ -2233,7 +2233,10 @@ fn retry_case(conflict: bool) {
         });
         assert_eq!(
             result.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
         );
         assert_eq!(
             first, resent,

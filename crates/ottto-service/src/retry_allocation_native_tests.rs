@@ -417,7 +417,10 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
                             &mut || live.validate_inputs(&f.home.0),
                         );
                         assert!(
-                            matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+                            matches!(
+                                result,
+                                Ok(SnapshotPageOutcome::Settled { conflicted: 0, .. })
+                            ),
                             "{result:?}"
                         );
                         page.restore_live_authority(live);

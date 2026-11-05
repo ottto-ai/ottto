@@ -337,7 +337,10 @@ impl PreparedRetry {
         let machine_id = &self.machine_id;
         let budget = &mut self.budget;
         let outcome = if pending.is_empty() {
-            SnapshotPageOutcome::Settled { conflicted: 0 }
+            SnapshotPageOutcome::Settled {
+                conflicted: 0,
+                isolated: 0,
+            }
         } else {
             attempt_snapshot_page(
                 &self.items,

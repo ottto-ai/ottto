@@ -254,7 +254,10 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(envelope(&refused_wire)["base_head_etag"], stale_head());
     assert_eq!(
@@ -418,7 +421,10 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 },
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        },
         "mismatched witness echo is not a settlement"
     );
     // The named body is set aside under its bounded retry, never accepted.
@@ -448,7 +454,10 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(
         progress.head_conflict_challenges[&key].challenge,
@@ -468,7 +477,10 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(progress.accepted_body_witnesses.is_empty());
     assert_eq!(
@@ -545,7 +557,10 @@ fn a_named_witness_refusal_sets_aside_only_its_body_and_resends_the_owed_answer(
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     let held = |progress: &SnapshotUploadProgress, item: &SnapshotItem| {
         progress.contains_body(
@@ -621,7 +636,7 @@ fn a_named_witness_refusal_sets_aside_only_its_body_and_resends_the_owed_answer(
             .accepted_body_witnesses
             .contains_key(&named.snapshot_fingerprint));
         let deferred = match result {
-            Ok(ResumableUploadResult::Deferred { count }) => Some(count),
+            Ok(ResumableUploadResult::Deferred { count, .. }) => Some(count),
             Ok(other) => panic!("{case}: {other:?}"),
             Err(error) => {
                 assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
@@ -708,7 +723,10 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xa));
     let record = progress.head_conflict_challenges[&key].clone();
@@ -730,7 +748,10 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
     let record = progress.head_conflict_challenges[&key].clone();
@@ -765,7 +786,10 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         });
         assert_eq!(
             result.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
         );
         assert_eq!(envelope(&wire)["base_head_etag"], stale_head());
         assert!(envelope(&wire).get("conflict_head_challenge").is_none());
@@ -781,7 +805,10 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xb));
     assert_eq!(progress.head_conflict_challenges[&key].answer_attempts, 3);
@@ -812,7 +839,10 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(progress.head_conflict_challenges.len(), cap);
     assert!(!progress
@@ -921,7 +951,10 @@ fn plain_conflict_is_probed_within_an_hour() {
     );
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert!(progress.head_conflict_challenges.is_empty());
     let probe =
@@ -1231,7 +1264,10 @@ fn a_stale_refusal_is_answered_by_exactly_one_native_full() {
     });
     assert_eq!(
         result.unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
     );
     assert_eq!(envelope(&stale)["conflict_head_challenge"], challenge(0xa));
     assert_eq!(

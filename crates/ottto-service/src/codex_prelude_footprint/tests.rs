@@ -676,6 +676,14 @@ fn deliver(
     observer.end(&view, &end);
     (want, offset)
 }
+/// One fresh owned session start through the feed, as snapshot sync delivers it.
+pub(crate) fn deliver_fresh_start(feed: &Arc<CodexPreludeFeed>, dir: &Path) {
+    let roots = [dir.join("sessions")];
+    let view = fixture_view(&dir.join("fresh-start"), DeliveryMode::Full, 0);
+    let rows = [meta(json!({})), usage(3)];
+    let (want, _) = deliver(feed, &roots, view, &rows, DeliveryEnd::Complete);
+    assert_eq!(want, Want::Lines);
+}
 fn observed(rows: &[Value]) -> CodexPrelude {
     let dir = ScratchDir::new("prelude-oracle");
     let roots = [dir.join("sessions")];

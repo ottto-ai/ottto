@@ -908,7 +908,10 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         });
         assert_eq!(
             status.unwrap(),
-            ResumableUploadResult::Deferred { count: 1 }
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);
         assert_eq!(progress.quarantined_fingerprints.len(), 1);

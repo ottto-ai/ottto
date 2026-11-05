@@ -223,9 +223,10 @@ fn bootstrap_cache_heads_with_budget(
                 ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
                 // The partitioned uploader persisted each conflicting probe's exact
                 // body quarantine. Carry that hold into the normal upload rather
-                // than discarding every unrelated file's progress.
-                ResumableUploadResult::Deferred { count } => {
-                    deferred = deferred.saturating_add(count);
+                // than discarding every unrelated file's progress. An isolated
+                // refusal is held alone and does not defer the pass.
+                ResumableUploadResult::Deferred { count, isolated } => {
+                    deferred = deferred.saturating_add(count.saturating_sub(isolated));
                 }
                 outcome => {
                     shed = matches!(outcome, ResumableUploadResult::Shed { .. });
@@ -315,10 +316,14 @@ fn with_bootstrap_deferred(
     }
     match result {
         ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
-            ResumableUploadResult::Deferred { count: deferred }
+            ResumableUploadResult::Deferred {
+                count: deferred,
+                isolated: 0,
+            }
         }
-        ResumableUploadResult::Deferred { count } => ResumableUploadResult::Deferred {
+        ResumableUploadResult::Deferred { count, isolated } => ResumableUploadResult::Deferred {
             count: count.saturating_add(deferred),
+            isolated,
         },
         other => other,
     }
@@ -8050,6 +8055,7 @@ fn finish_sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
+    let mut isolated_only = false;
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
     // obligations this full scan references before any selection (#794 F1).
@@ -8127,7 +8133,10 @@ fn finish_sync_source(
                     resolved_permanent_rejections = true;
                     count
                 }
-                ResumableUploadResult::Deferred { count } => count,
+                ResumableUploadResult::Deferred { count, isolated } => {
+                    isolated_only = count == isolated;
+                    count
+                }
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
@@ -8651,7 +8660,14 @@ fn finish_sync_source(
                 state,
             },
         );
-        if !resolved_permanent_rejections {
+        if isolated_only {
+            // Each refused body keeps its own exact retry custody; the sweep
+            // stays unsettled, but the refusal no longer fails the pass.
+            eprintln!(
+                "local snapshot upload completed with {count} refused entity(ies) held for retry for {}",
+                source.api_slug()
+            );
+        } else if !resolved_permanent_rejections {
             return Err(snapshot_entity_deferred(count));
         }
         // Permanent refusals remain disclosed after the durable save; a
@@ -9479,8 +9495,12 @@ enum ResumableUploadResult {
     },
     /// Accepted siblings are durably checkpointed; backend conflicts remain
     /// held for bounded retry and paced context offers wait for a later pass.
+    /// `isolated` (included in `count`) are validated ordinary retryable
+    /// entity refusals, each held alone; when they are all of `count`, the
+    /// pass finishes with them still owed.
     Deferred {
         count: usize,
+        isolated: usize,
     },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
@@ -9836,7 +9856,7 @@ where
 
 #[derive(Debug)]
 enum SnapshotPageOutcome {
-    Settled { conflicted: usize },
+    Settled { conflicted: usize, isolated: usize },
     Disabled(Option<String>),
 }
 
@@ -9959,6 +9979,7 @@ where
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
     let mut conflicted_entities = 0usize;
+    let mut isolated_entities = 0usize;
     let mut head_conflicts_recovered = Vec::new();
     let mut head_conflicts_recorded = Vec::new();
     let entity_ack = match response.entity_ack_contract.as_deref() {
@@ -10201,6 +10222,11 @@ where
                 .filter(|entity| !entity.permanent)
                 .count(),
         );
+        isolated_entities = response
+            .rejected_entities
+            .iter()
+            .filter(|entity| !entity.permanent && entity.ordinary_retryable())
+            .count();
         progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     } else {
         for index in indices {
@@ -10248,6 +10274,7 @@ where
 
     Ok(SnapshotPageOutcome::Settled {
         conflicted: conflicted_entities,
+        isolated: isolated_entities,
     })
 }
 
@@ -10595,6 +10622,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut isolated_entities = 0usize;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -10642,8 +10670,12 @@ where
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
-            Ok(SnapshotPageOutcome::Settled { conflicted }) => {
+            Ok(SnapshotPageOutcome::Settled {
+                conflicted,
+                isolated,
+            }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
+                isolated_entities = isolated_entities.saturating_add(isolated);
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -10832,6 +10864,7 @@ where
     if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
+            isolated: isolated_entities,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {
@@ -12887,7 +12920,13 @@ mod tests {
             |progress| progress.save(&progress_path),
         )
         .unwrap();
-        assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            outcome,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         index.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
@@ -15031,7 +15070,13 @@ mod tests {
                 // The refusal names the body: it is set aside, never settled.
                 assert_eq!(
                     (outcome, calls),
-                    (ResumableUploadResult::Deferred { count: 1 }, 1),
+                    (
+                        ResumableUploadResult::Deferred {
+                            count: 1,
+                            isolated: 0
+                        },
+                        1
+                    ),
                     "missing/wrong proof or capability domain cannot settle retry"
                 );
                 assert_eq!(accepted, 0);
@@ -15243,7 +15288,13 @@ mod tests {
             |state| state.save(&progress_path),
         )
         .expect("conflict remains retryable");
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 0);
 
         index.mark_bounded_sweep_unsettled();
@@ -15778,7 +15829,13 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         assert_eq!(persisted.len(), 2);
@@ -15876,7 +15933,13 @@ mod tests {
         )
         .expect("an all-conflict page remains retryable");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 3,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 0);
         assert!(progress.accepted_fingerprints.is_empty());
         assert_eq!(
@@ -16850,7 +16913,13 @@ mod tests {
                 Ok(accepted_batch(batch.len()))
             }, |_| Ok(()),
         ).expect("indexed rejection holds only the refused entity");
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(accepted, 24);
         assert_eq!(progress.accepted_fingerprints.len(), 24);
         // A retryable rejection now has durable custody rather than retrying every cycle.
@@ -16951,7 +17020,10 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 result,
-                ResumableUploadResult::Deferred { count: 1 } | ResumableUploadResult::Completed
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated: 0
+                } | ResumableUploadResult::Completed
             ));
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
             assert_eq!(accepted, 1);
@@ -17658,7 +17730,13 @@ mod tests {
         )
         .expect("a normal entity conflict is a closed-machine result");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(
+            result,
+            ResumableUploadResult::Deferred {
+                count: 1,
+                isolated: 0
+            }
+        );
         assert_eq!(observed_classes, vec![false, true]);
         assert_eq!(accepted, 1);
         assert!(progress.accepted_fingerprints.contains(&ordinary));
@@ -22394,7 +22472,10 @@ mod tests {
                 &item.snapshot_fingerprint,
                 &snapshot_upload_body_witness(item),
             ) {
-                return Ok(SnapshotPageOutcome::Settled { conflicted: 0 });
+                return Ok(SnapshotPageOutcome::Settled {
+                    conflicted: 0,
+                    isolated: 0,
+                });
             }
             attempt_snapshot_page(
                 &self.items,

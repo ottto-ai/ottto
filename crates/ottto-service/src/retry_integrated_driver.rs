@@ -183,7 +183,10 @@ fn integrated_send(
             .collect::<Vec<_>>();
         let items = std::mem::take(&mut slot.items);
         let result = if pending.is_empty() {
-            Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+            Ok(SnapshotPageOutcome::Settled {
+                conflicted: 0,
+                isolated: 0,
+            })
         } else {
             attempt_snapshot_page(
                 &items,

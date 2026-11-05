@@ -552,8 +552,14 @@ pub struct SnapshotItem {
     /// transcript this item was parsed from. Never serialized.
     #[serde(skip)]
     pub(crate) claude_file_birth: ClaudeFileBirth,
-    /// Local-only result of design E admission; never persisted or uploaded.
-    #[serde(skip)]
+    /// Local result of design E admission. Uploaded only as the withheld
+    /// reason when ownership is unknown, always beside a cleared posture, so
+    /// the server keeps the last known value instead of erasing it. Wire-only:
+    /// outside every semantic component, the fingerprint and the body witness.
+    #[serde(
+        rename = "context_posture_withheld",
+        skip_serializing_if = "ClaudeFileBirthVerdict::posture_not_withheld"
+    )]
     pub(crate) claude_file_birth_verdict: Option<ClaudeFileBirthVerdict>,
     /// Claude Code only: when this session's first own request (design E)
     /// ended, RFC 3339 UTC. Set by the ownership fold only when the

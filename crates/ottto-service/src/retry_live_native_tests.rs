@@ -408,19 +408,28 @@ fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
     let mut turns = 0;
     owner.boundary(due - Duration::from_nanos(1), |_| {
         turns += 1;
-        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+        Ok(SnapshotPageOutcome::Settled {
+            conflicted: 0,
+            isolated: 0,
+        })
     });
     assert_eq!(turns, 0);
     assert_eq!(owner.wake_before(ordinary), due);
     owner.boundary(due, |_| {
         turns += 1;
-        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+        Ok(SnapshotPageOutcome::Settled {
+            conflicted: 0,
+            isolated: 0,
+        })
     });
     assert_eq!(turns, 1);
     assert_eq!(owner.wake_before(ordinary), ordinary);
     owner.boundary(ordinary, |_| {
         turns += 1;
-        Ok(SnapshotPageOutcome::Settled { conflicted: 0 })
+        Ok(SnapshotPageOutcome::Settled {
+            conflicted: 0,
+            isolated: 0,
+        })
     });
     assert_eq!(turns, 1);
 }
@@ -582,7 +591,10 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
             &mut || live.validate_inputs(&f.home.0),
         );
         assert!(
-            matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+            matches!(
+                result,
+                Ok(SnapshotPageOutcome::Settled { conflicted: 0, .. })
+            ),
             "{result:?}"
         );
         page.restore_live_authority(live);
@@ -769,7 +781,10 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                         },
                     );
                     assert!(
-                        matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+                        matches!(
+                            result,
+                            Ok(SnapshotPageOutcome::Settled { conflicted: 0, .. })
+                        ),
                         "live retry failed: {}",
                         result
                             .as_ref()
