@@ -35,7 +35,7 @@ fn tag(
     };
     row.account_identity_checked = true;
     row.account_identifier_hash = account.map(str::to_owned);
-    row.request_identity = Some(ClaudeRequestIdentityEvidence {
+    row.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
         identity_hash_scheme: "provider-sha256:v1".into(),
         account: Attribute {
             // None models a present but invalid login attribute.
@@ -59,7 +59,7 @@ fn tag(
         } else {
             Disposition::Invalid
         },
-    });
+    }));
     row.fingerprint.clear();
     row.fingerprint = format!(
         "sha256:{:x}",

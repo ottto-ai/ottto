@@ -346,7 +346,7 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
                     ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
                 };
                 row.account_identity_checked = true;
-                row.request_identity = Some(ClaudeRequestIdentityEvidence {
+                row.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
                     identity_hash_scheme: "provider-sha256:v1".into(),
                     disposition: ClaudeIdentityDisposition::Complete,
                     account: ClaudeIdentityAttributeEvidence {
@@ -365,7 +365,7 @@ fn always_on_emits_contract5_whatever_the_hint_token_on_scan_worker() {
                         ),
                         resource_hash: None,
                     },
-                });
+                }));
                 row.fingerprint.clear();
                 row.fingerprint = format!(
                     "sha256:{:x}",

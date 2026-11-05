@@ -46,18 +46,18 @@ pub(super) fn rearm_evidence_lines(
 ) -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
-        capture_revision: "claude_api_request:v2".to_string(),
-        session_id: REARM_ROOT.to_string(),
+        capture_revision: "claude_api_request:v2".into(),
+        session_id: REARM_ROOT.into(),
         request_id: request.to_string(),
         client_request_id: format!("client-{request}"),
         observed_at: format!("2026-08-02T07:00:{sequence:02}Z"),
-        model: "claude-haiku-4-5".to_string(),
-        effort: "high".to_string(),
-        query_source: "user".to_string(),
-        speed: "fast".to_string(),
+        model: "claude-haiku-4-5".into(),
+        effort: "high".into(),
+        query_source: "user".into(),
+        speed: "fast".into(),
         cost_usd_micros: Some(100),
         event_sequence: Some(sequence),
-        app_version: "2.1.226".to_string(),
+        app_version: "2.1.226".into(),
         input_tokens: 10,
         output_tokens: 10,
         request_count: 1,
@@ -68,8 +68,8 @@ pub(super) fn rearm_evidence_lines(
         Sha256::digest(serde_json::to_vec(&api).expect("serialize API evidence"))
     );
     let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
-        capture_revision: "claude_llm_request_ownership:v1".to_string(),
-        session_id: REARM_ROOT.to_string(),
+        capture_revision: "claude_llm_request_ownership:v1".into(),
+        session_id: REARM_ROOT.into(),
         request_id: request.to_string(),
         client_request_id: format!("client-{request}"),
         agent_id: agent.unwrap_or_default().to_string(),

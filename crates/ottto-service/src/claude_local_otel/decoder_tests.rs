@@ -40,6 +40,41 @@ fn baseline_trace(bytes: &[u8]) -> TraceSidecarDecoder<'static> {
     state
 }
 
+// The shared-value pool is an allocation detail, not decoded state.
+type ApiView<'s> = (
+    &'s str,
+    &'s [ClaudeLocalOtelEvidence],
+    &'s BTreeSet<String>,
+    &'s BTreeMap<String, usize>,
+    &'s ClaudeLocalOtelLoadHealth,
+);
+fn api_view<'s>(d: &'s ApiSidecarDecoder<'_>) -> ApiView<'s> {
+    (
+        d.session_id,
+        &d.rows,
+        &d.seen_fingerprints,
+        &d.request_rows,
+        &d.health,
+    )
+}
+
+type TraceView<'s> = (
+    &'s str,
+    &'s [ClaudeTraceOwnershipEvidence],
+    &'s BTreeSet<String>,
+    &'s BTreeMap<String, String>,
+    &'s ClaudeTraceOwnershipLoadReport,
+);
+fn trace_view<'s>(d: &'s TraceSidecarDecoder<'_>) -> TraceView<'s> {
+    (
+        d.session_id,
+        &d.rows,
+        &d.seen_fingerprints,
+        &d.request_fingerprints,
+        &d.report,
+    )
+}
+
 // Feed only physical LF-terminated lines; the adapter owns any unfinished bytes.
 fn complete_lines(bytes: &[u8], mut push: impl FnMut(&[u8])) -> &[u8] {
     let sealed = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
@@ -80,13 +115,25 @@ fn api_splits(bytes: &[u8]) {
         let mut state = ApiSidecarDecoder::new("scope", Vec::new());
         let tail = complete_lines(&bytes[..split], |line| state.push_line(line));
         let sealed = split - tail.len();
-        assert_eq!(state, baseline_api(&bytes[..sealed]), "sealed API {split}");
+        assert_eq!(
+            api_view(&state),
+            api_view(&baseline_api(&bytes[..sealed])),
+            "sealed API {split}"
+        );
         let mut eof = state.clone();
         eof.finish_eof(fragment(tail));
-        assert_eq!(eof, baseline_api(&bytes[..split]), "EOF API {split}");
+        assert_eq!(
+            api_view(&eof),
+            api_view(&baseline_api(&bytes[..split])),
+            "EOF API {split}"
+        );
         let tail = complete_lines(&bytes[sealed..], |line| state.push_line(line));
         state.finish_eof(fragment(tail));
-        assert_eq!(state, expected, "continued API {split}");
+        assert_eq!(
+            api_view(&state),
+            api_view(&expected),
+            "continued API {split}"
+        );
     }
 }
 
@@ -97,16 +144,24 @@ fn trace_splits(bytes: &[u8]) {
         let tail = complete_lines(&bytes[..split], |line| state.push_line(line));
         let sealed = split - tail.len();
         assert_eq!(
-            state,
-            baseline_trace(&bytes[..sealed]),
+            trace_view(&state),
+            trace_view(&baseline_trace(&bytes[..sealed])),
             "sealed trace {split}"
         );
         let mut eof = state.clone();
         eof.finish_eof(fragment(tail));
-        assert_eq!(eof, baseline_trace(&bytes[..split]), "EOF trace {split}");
+        assert_eq!(
+            trace_view(&eof),
+            trace_view(&baseline_trace(&bytes[..split])),
+            "EOF trace {split}"
+        );
         let tail = complete_lines(&bytes[sealed..], |line| state.push_line(line));
         state.finish_eof(fragment(tail));
-        assert_eq!(state, expected, "continued trace {split}");
+        assert_eq!(
+            trace_view(&state),
+            trace_view(&expected),
+            "continued trace {split}"
+        );
     }
 }
 
@@ -125,11 +180,8 @@ fn api_row(request: &str, fingerprint: &str) -> ClaudeLocalOtelEvidence {
     }
 }
 
-fn api_fixture(reverse: bool) -> Vec<u8> {
-    let old = api_row("upgrade", "old");
-    let mut richer = old.clone();
-    richer.fingerprint = "richer".into();
-    richer.request_identity = Some(ClaudeRequestIdentityEvidence {
+fn synthetic_identity() -> ClaudeRequestIdentityEvidence {
+    ClaudeRequestIdentityEvidence {
         identity_hash_scheme: "synthetic".into(),
         account: ClaudeIdentityAttributeEvidence {
             origin: ClaudeIdentityAttributeOrigin::Missing,
@@ -144,7 +196,14 @@ fn api_fixture(reverse: bool) -> Vec<u8> {
             log_record_hash: None,
         },
         disposition: ClaudeIdentityDisposition::Missing,
-    });
+    }
+}
+
+fn api_fixture(reverse: bool) -> Vec<u8> {
+    let old = api_row("upgrade", "old");
+    let mut richer = old.clone();
+    richer.fingerprint = "richer".into();
+    richer.request_identity = Some(Arc::new(synthetic_identity()));
     let mut conflict = old.clone();
     conflict.fingerprint = "conflict".into();
     conflict.output_tokens = 9;
@@ -293,14 +352,64 @@ fn trace_continuation_and_eof_match_frozen_whole_file_at_sampled_boundaries() {
     );
 }
 
+// One root decode keeps one allocation per repeated value; values are unchanged.
+#[test]
+fn one_decode_shares_repeated_row_values() {
+    let mut first = api_row("first", "first");
+    first.request_identity = Some(Arc::new(synthetic_identity()));
+    let mut second = api_row("second", "second");
+    second.request_identity = Some(Arc::new(synthetic_identity()));
+    let mut state = ApiSidecarDecoder::new("scope", Vec::new());
+    for row in [&first, &second] {
+        state.push_line(&serde_json::to_vec(row).unwrap());
+    }
+    let (rows, health) = state.into_output();
+    assert!(health.is_complete());
+    assert_eq!(rows, [first, second]);
+    let [a, b] = &rows[..] else {
+        panic!("two rows")
+    };
+    assert!(Arc::ptr_eq(&a.session_id, &b.session_id));
+    assert!(Arc::ptr_eq(&a.capture_revision, &b.capture_revision));
+    assert!(Arc::ptr_eq(&a.model, &b.model));
+    assert!(Arc::ptr_eq(
+        a.request_identity.as_ref().unwrap(),
+        b.request_identity.as_ref().unwrap()
+    ));
+
+    let first = ClaudeTraceOwnershipEvidence {
+        capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.into(),
+        session_id: "scope".into(),
+        request_id: "first".into(),
+        fingerprint: "first".into(),
+        observed_at: "clock".into(),
+        ..Default::default()
+    };
+    let mut second = first.clone();
+    second.request_id = "second".into();
+    second.fingerprint = "second".into();
+    let mut state = TraceSidecarDecoder::new("scope", Vec::new());
+    for row in [&first, &second] {
+        state.push_line(&serde_json::to_vec(row).unwrap());
+    }
+    let (rows, report) = state.into_output();
+    assert_eq!(report.malformed_lines + report.invalid_session_rows, 0);
+    assert_eq!(rows, [first, second]);
+    assert!(Arc::ptr_eq(&rows[0].session_id, &rows[1].session_id));
+    assert!(Arc::ptr_eq(
+        &rows[0].capture_revision,
+        &rows[1].capture_revision
+    ));
+}
+
 // Only the additive identity field may differ across a v2 upgrade replay.
 // Comparing the whole typed row protects every pre-existing usage/ownership field.
 fn baseline_identity_upgrade_replay(
     previous: &ClaudeLocalOtelEvidence,
     incoming: &ClaudeLocalOtelEvidence,
 ) -> bool {
-    if previous.capture_revision != API_REQUEST_CAPTURE_REVISION
-        || incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
+    if *previous.capture_revision != *API_REQUEST_CAPTURE_REVISION
+        || *incoming.capture_revision != *API_REQUEST_CAPTURE_REVISION
         || previous.request_identity.is_none() == incoming.request_identity.is_none()
     {
         return false;
@@ -364,7 +473,7 @@ fn baseline_decode_api_line(
             return;
         }
     };
-    if item.session_id != session_id {
+    if *item.session_id != *session_id {
         health.invalid_session_rows += 1;
         return;
     }
@@ -392,7 +501,7 @@ fn baseline_decode_trace_line(
             return;
         }
     };
-    if item.session_id != session_id {
+    if *item.session_id != *session_id {
         report.invalid_session_rows += 1;
         return;
     }

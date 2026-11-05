@@ -462,7 +462,7 @@ fn e2_carry_pages(
             let native = fs::read_to_string(&path).unwrap();
             fs::write(path, format!("{native}{zero}\n")).unwrap();
             let mut side = complete_api_row(&root, "req_side", 7, 3, 2, 0);
-            side.request_identity = Some(
+            side.request_identity = Some(std::sync::Arc::new(
                 serde_json::from_value(json!({
                     "identity_hash_scheme": "provider-sha256:v1", "disposition": "complete",
                     "account": {"origin": "log_record", "disposition": "complete",
@@ -471,7 +471,7 @@ fn e2_carry_pages(
                         "log_record_hash": "1".repeat(64)}
                 }))
                 .unwrap(),
-            );
+            ));
             e2_resign(&mut side);
             api.push(side);
             trace.push(complete_trace_row(&root, "req_side", ""));
@@ -486,7 +486,7 @@ fn e2_carry_pages(
             {
                 row.account_identifier_hash = None;
                 if *contradictory {
-                    row.request_identity = Some(
+                    row.request_identity = Some(std::sync::Arc::new(
                         serde_json::from_value(json!({
                             "identity_hash_scheme": "provider-sha256:v1",
                             "disposition": "invalid",
@@ -494,7 +494,7 @@ fn e2_carry_pages(
                             "organization": {"origin": "missing", "disposition": "missing"}
                         }))
                         .unwrap(),
-                    );
+                    ));
                 }
                 e2_resign(row);
             }

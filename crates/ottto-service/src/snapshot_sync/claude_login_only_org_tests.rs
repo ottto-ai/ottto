@@ -91,9 +91,7 @@ fn login_only_telemetry_never_borrows_a_proven_marker_org() {
         .to_string()
             + "\n";
         let mut side = api_login(ROOT, "side", 4, 'a', Some('b'));
-        side.request_identity
-            .as_mut()
-            .unwrap()
+        std::sync::Arc::make_mut(side.request_identity.as_mut().unwrap())
             .organization
             .log_record_hash = Some(org_b.clone());
         side.fingerprint.clear();

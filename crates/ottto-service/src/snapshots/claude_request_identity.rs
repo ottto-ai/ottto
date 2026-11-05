@@ -4448,8 +4448,8 @@ pub(super) fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> O
         .account_identifier_hash
         .as_deref()
         .filter(|hash| hash_is_valid(hash))?;
-    (row.session_id == root
-        && row.capture_revision == "claude_api_request:v2"
+    (*row.session_id == *root
+        && *row.capture_revision == *"claude_api_request:v2"
         && row.request_count == 1
         && row.account_identity_checked
         && super::claude_api_evidence_fingerprint_is_valid(row)
@@ -4690,8 +4690,8 @@ pub(super) fn owner_is_foreign(
     root: &str,
     source_session_id: &str,
 ) -> bool {
-    owner.session_id != root
-        || owner.capture_revision != "claude_llm_request_ownership:v1"
+    *owner.session_id != *root
+        || *owner.capture_revision != *"claude_llm_request_ownership:v1"
         || !super::claude_trace_evidence_fingerprint_is_valid(owner)
         || super::claude_trace_owner_session_id(root, &owner.agent_id) != source_session_id
         || owner.client_request_id.is_empty()

@@ -304,26 +304,28 @@ pub(crate) fn claude_request_account_mixed_fixture(
         .map(|i| {
             let mut row = complete_api_row(&root, &format!("req_{i}"), i as u64, 10, 10, 0);
             row.account_identifier_hash = Some(if i <= 2 { a.clone() } else { b.clone() });
-            row.request_identity = Some(crate::claude_local_otel::ClaudeRequestIdentityEvidence {
-                identity_hash_scheme: "provider-sha256:v1".into(),
-                account: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
-                    origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
+            row.request_identity = Some(std::sync::Arc::new(
+                crate::claude_local_otel::ClaudeRequestIdentityEvidence {
+                    identity_hash_scheme: "provider-sha256:v1".into(),
+                    account: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
+                        origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
+                        disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
+                        resource_hash: None,
+                        log_record_hash: row.account_identifier_hash.clone(),
+                    },
+                    organization: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
+                        origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
+                        disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
+                        resource_hash: None,
+                        log_record_hash: Some(if i <= 2 {
+                            "c".repeat(64)
+                        } else {
+                            "d".repeat(64)
+                        }),
+                    },
                     disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
-                    resource_hash: None,
-                    log_record_hash: row.account_identifier_hash.clone(),
                 },
-                organization: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
-                    origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
-                    disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
-                    resource_hash: None,
-                    log_record_hash: Some(if i <= 2 {
-                        "c".repeat(64)
-                    } else {
-                        "d".repeat(64)
-                    }),
-                },
-                disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
-            });
+            ));
             row.cost_usd_micros = Some(1_000_000);
             row.fingerprint.clear();
             row.fingerprint = format!(

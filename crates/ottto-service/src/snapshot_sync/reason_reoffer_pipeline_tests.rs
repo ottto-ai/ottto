@@ -1019,14 +1019,14 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
                 serde_json::from_str(line).unwrap();
             row.account_identity_checked = true;
             row.account_identifier_hash = Some(login.to_string());
-            row.request_identity = Some(
+            row.request_identity = Some(std::sync::Arc::new(
                 serde_json::from_value(serde_json::json!({
                     "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
                     "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
                     "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
                 }))
                 .unwrap(),
-            );
+            ));
             row.fingerprint.clear();
             row.fingerprint = format!(
                 "sha256:{:x}",

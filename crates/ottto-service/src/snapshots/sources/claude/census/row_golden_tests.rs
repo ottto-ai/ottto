@@ -8,6 +8,7 @@ use crate::claude_local_otel::{
     ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence, ClaudeTraceOwnershipEvidence,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 const H1: &str = "11111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const H2: &str = "22222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -68,7 +69,7 @@ fn v2_row() -> ClaudeLocalOtelEvidence {
         request_count: 1,
         account_identity_checked: true,
         account_identifier_hash: Some(H1.into()),
-        request_identity: Some(identity()),
+        request_identity: Some(Arc::new(identity())),
         ..Default::default()
     }
 }

@@ -529,12 +529,14 @@ fn api_login(
     let mut row = api_for(session, request, tokens, tokens * 10);
     row.account_identity_checked = true;
     row.account_identifier_hash = Some(login.clone());
-    row.request_identity = Some(crate::claude_local_otel::ClaudeRequestIdentityEvidence {
-        identity_hash_scheme: "provider-sha256:v1".into(),
-        account: attribute(Some(login)),
-        organization: attribute(org.map(|org| org.to_string().repeat(64))),
-        disposition: ClaudeIdentityDisposition::Complete,
-    });
+    row.request_identity = Some(std::sync::Arc::new(
+        crate::claude_local_otel::ClaudeRequestIdentityEvidence {
+            identity_hash_scheme: "provider-sha256:v1".into(),
+            account: attribute(Some(login)),
+            organization: attribute(org.map(|org| org.to_string().repeat(64))),
+            disposition: ClaudeIdentityDisposition::Complete,
+        },
+    ));
     row.fingerprint.clear();
     row.fingerprint = format!(
         "sha256:{:x}",

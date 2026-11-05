@@ -2310,12 +2310,12 @@ fn e2_identity_telemetry_contradiction_preserves_own_orgs() {
             resource_hash: None,
             log_record_hash: Some(hash),
         };
-        conflicting.request_identity = Some(ClaudeRequestIdentityEvidence {
+        conflicting.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),
             account: attribute("a".repeat(64)),
             organization: attribute(org_hash(ORG_A)),
             disposition: ClaudeIdentityDisposition::Complete,
-        });
+        }));
         let read = sidecar(&[row("a", 1, 10), refingerprint(conflicting)]);
         attach_page(&mut items, &read);
         let api = api_report(&read);
@@ -2414,12 +2414,12 @@ fn identity_api_row(id: &str, sequence: u64, input: u64, org: &str) -> ClaudeLoc
         resource_hash: None,
         log_record_hash: Some(hash),
     };
-    row.request_identity = Some(ClaudeRequestIdentityEvidence {
+    row.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
         identity_hash_scheme: "provider-sha256:v1".into(),
         account: attribute("a".repeat(64)),
         organization: attribute(org_hash(org)),
         disposition: ClaudeIdentityDisposition::Complete,
-    });
+    }));
     refingerprint(row)
 }
 
@@ -2530,7 +2530,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
             ],
         )];
         let mut conflict = identity_api_row("b", 2, 20, ORG_B);
-        let identity = conflict.request_identity.as_mut().unwrap();
+        let identity = std::sync::Arc::make_mut(conflict.request_identity.as_mut().unwrap());
         identity.account.resource_hash = Some("c".repeat(64));
         identity.account.disposition = ClaudeIdentityDisposition::Conflict;
         identity.disposition = ClaudeIdentityDisposition::Conflict;

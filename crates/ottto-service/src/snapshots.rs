@@ -27924,15 +27924,15 @@ mod tests {
             "claude-effort-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: "one".to_string(),
-                session_id: "claude-effort-1".to_string(),
+                session_id: "claude-effort-1".into(),
                 observed_at: "2026-07-11T10:01:00Z".to_string(),
-                model: "claude-opus-4-7".to_string(),
-                effort: "high".to_string(),
+                model: "claude-opus-4-7".into(),
+                effort: "high".into(),
                 input_tokens: 30,
                 output_tokens: 12,
                 request_count: 1,
                 account_identity_checked: true,
-                account_identifier_hash: Some("hash-account-exact".to_string()),
+                account_identifier_hash: Some("hash-account-exact".into()),
                 ..Default::default()
             }],
         )]);
@@ -27981,10 +27981,10 @@ mod tests {
             "claude-effort-cache-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: "legacy-v0.1.77".to_string(),
-                session_id: "claude-effort-cache-1".to_string(),
+                session_id: "claude-effort-cache-1".into(),
                 observed_at: "2026-07-12T15:07:58.852Z".to_string(),
-                model: "claude-opus-4-8".to_string(),
-                effort: "low".to_string(),
+                model: "claude-opus-4-8".into(),
+                effort: "low".into(),
                 input_tokens: 2,
                 output_tokens: 9,
                 // v0.1.77 stored Claude's aggregate cache_creation_tokens in
@@ -28017,10 +28017,10 @@ mod tests {
             "claude-effort-cache-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: "explicit-1h".to_string(),
-                session_id: "claude-effort-cache-1".to_string(),
+                session_id: "claude-effort-cache-1".into(),
                 observed_at: "2026-07-12T15:07:58.852Z".to_string(),
-                model: "claude-opus-4-8".to_string(),
-                effort: "low".to_string(),
+                model: "claude-opus-4-8".into(),
+                effort: "low".into(),
                 input_tokens: 2,
                 output_tokens: 9,
                 cache_creation_1h_tokens: 2014,
@@ -28057,14 +28057,14 @@ mod tests {
         let unique = BTreeMap::from([(
             "claude-account-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
-                session_id: "claude-account-1".to_string(),
-                model: "unmatched-model".to_string(),
-                effort: "high".to_string(),
+                session_id: "claude-account-1".into(),
+                model: "unmatched-model".into(),
+                effort: "high".into(),
                 input_tokens: 2,
                 output_tokens: 1,
                 request_count: 1,
                 account_identity_checked: true,
-                account_identifier_hash: Some(account_a.clone()),
+                account_identifier_hash: Some(account_a.clone().into()),
                 ..Default::default()
             }],
         )]);
@@ -28088,12 +28088,12 @@ mod tests {
             vec![
                 crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
-                    account_identifier_hash: Some(account_a),
+                    account_identifier_hash: Some(account_a.into()),
                     ..Default::default()
                 },
                 crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
-                    account_identifier_hash: Some(account_b),
+                    account_identifier_hash: Some(account_b.into()),
                     ..Default::default()
                 },
             ],
@@ -28117,7 +28117,7 @@ mod tests {
             vec![
                 crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
-                    account_identifier_hash: Some("a".repeat(64)),
+                    account_identifier_hash: Some("a".repeat(64).into()),
                     ..Default::default()
                 },
                 crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -28165,7 +28165,7 @@ mod tests {
                 crate::claude_local_otel::ClaudeLocalOtelEvidence::default(),
                 crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
-                    account_identifier_hash: Some("a".repeat(64)),
+                    account_identifier_hash: Some("a".repeat(64).into()),
                     ..Default::default()
                 },
             ],
@@ -28186,7 +28186,7 @@ mod tests {
             "claude-account-1".to_string(),
             vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 account_identity_checked: true,
-                account_identifier_hash: Some("a".repeat(64)),
+                account_identifier_hash: Some("a".repeat(64).into()),
                 request_count: 1,
                 ..Default::default()
             }],
@@ -28230,14 +28230,14 @@ mod tests {
         let row = |request_id: &str, input_tokens, output_tokens| {
             crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: request_id.to_string(),
-                session_id: "claude-request-id-1".to_string(),
+                session_id: "claude-request-id-1".into(),
                 request_id: request_id.to_string(),
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-opus-4-8".into(),
                 input_tokens,
                 output_tokens,
                 request_count: 1,
                 account_identity_checked: true,
-                account_identifier_hash: Some(account_hash.clone()),
+                account_identifier_hash: Some(account_hash.clone().into()),
                 ..Default::default()
             }
         };
@@ -28369,16 +28369,16 @@ mod tests {
             .map(
                 |(index, hash)| crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     fingerprint: format!("family-{index}"),
-                    session_id: parent.to_string(),
+                    session_id: parent.into(),
                     request_id: format!("req_{}", index + 1),
                     observed_at: format!("2026-08-02T07:00:0{index}Z"),
-                    model: "claude-haiku-4-5".to_string(),
+                    model: "claude-haiku-4-5".into(),
                     // Deliberately differ from transcript token accounting. The
                     // family fallback is proven by one checked row per request.
                     output_tokens: 11,
                     request_count: 1,
                     account_identity_checked: true,
-                    account_identifier_hash: Some(hash.clone()),
+                    account_identifier_hash: Some(hash.clone().into()),
                     ..Default::default()
                 },
             )
@@ -28395,24 +28395,24 @@ mod tests {
         cache_creation_tokens: u64,
     ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
         let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
-            capture_revision: "claude_api_request:v2".to_string(),
-            session_id: parent.to_string(),
+            capture_revision: "claude_api_request:v2".into(),
+            session_id: parent.into(),
             request_id: request_id.to_string(),
             client_request_id: format!("client-{request_id}"),
             observed_at: format!("2026-08-02T07:00:{sequence:02}Z"),
-            model: "claude-haiku-4-5".to_string(),
-            effort: "high".to_string(),
-            query_source: "user".to_string(),
-            speed: "fast".to_string(),
+            model: "claude-haiku-4-5".into(),
+            effort: "high".into(),
+            query_source: "user".into(),
+            speed: "fast".into(),
             cost_usd_micros: Some(100),
             event_sequence: Some(sequence),
-            app_version: "2.1.226".to_string(),
+            app_version: "2.1.226".into(),
             input_tokens,
             output_tokens,
             cache_creation_tokens,
             request_count: 1,
             account_identity_checked: true,
-            account_identifier_hash: Some("a".repeat(64)),
+            account_identifier_hash: Some("a".repeat(64).into()),
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&row).expect("serialize API evidence");
@@ -28426,8 +28426,8 @@ mod tests {
         agent_id: &str,
     ) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
         let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
-            capture_revision: "claude_llm_request_ownership:v1".to_string(),
-            session_id: parent.to_string(),
+            capture_revision: "claude_llm_request_ownership:v1".into(),
+            session_id: parent.into(),
             request_id: request_id.to_string(),
             client_request_id: format!("client-{request_id}"),
             agent_id: agent_id.to_string(),
@@ -29009,11 +29009,11 @@ mod tests {
                 complete_trace_row(&root, "req_5", "a4d1585d310070d0f"),
                 complete_trace_row(&root, "req_6", "a4d1585d310070d0f"),
             ];
-            api[0].request_identity = Some(serde_json::from_value(json!({
+            api[0].request_identity = Some(std::sync::Arc::new(serde_json::from_value(json!({
                 "identity_hash_scheme":"provider-sha256:v1",
                 "account":{"origin":"resource_and_log_record","disposition":"complete","resource_hash":"a".repeat(64),"log_record_hash":"a".repeat(64)},
                 "organization":{"origin":"missing","disposition":"missing"},"disposition":"missing"
-            })).unwrap());
+            })).unwrap()));
             let rehash = |row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence| {
                 row.fingerprint.clear();
                 row.fingerprint = format!(
@@ -29034,10 +29034,7 @@ mod tests {
                 &mixed,
                 &trace
             ));
-            api[0]
-                .request_identity
-                .as_mut()
-                .unwrap()
+            std::sync::Arc::make_mut(api[0].request_identity.as_mut().unwrap())
                 .account
                 .resource_hash = Some("b".repeat(64));
             rehash(&mut api[0]);
@@ -33542,7 +33539,7 @@ mod tests {
         let original = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
         let observed = |request: &str, org: &str| ClaudeLocalOtelEvidence {
             request_id: request.into(),
-            request_identity: Some(ClaudeRequestIdentityEvidence {
+            request_identity: Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
                 identity_hash_scheme: "provider-sha256:v1".into(),
                 account: ClaudeIdentityAttributeEvidence {
                     origin: ClaudeIdentityAttributeOrigin::LogRecord,
@@ -33561,7 +33558,7 @@ mod tests {
                     log_record_hash: Some(org.into()),
                 },
                 disposition: ClaudeIdentityDisposition::Complete,
-            }),
+            })),
             ..Default::default()
         };
         let mut item = original.clone();

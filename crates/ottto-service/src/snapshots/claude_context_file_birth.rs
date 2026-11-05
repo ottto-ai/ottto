@@ -661,11 +661,11 @@ impl ClaudeTelemetryTripwire {
                 .chain(veto_api_rows)
                 .flat_map(|(root, rows)| {
                     rows.iter()
-                        .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+                        .map(move |row| (root.as_str(), row.session_id.as_ref(), &row.request_id))
                 });
             let trace = trace_report.evidence.iter().flat_map(|(root, rows)| {
                 rows.iter()
-                    .map(move |row| (root.as_str(), row.session_id.as_str(), &row.request_id))
+                    .map(move |row| (root.as_str(), row.session_id.as_ref(), &row.request_id))
             });
             api.chain(trace)
                 .filter_map(|(root, session_id, request_id)| {
