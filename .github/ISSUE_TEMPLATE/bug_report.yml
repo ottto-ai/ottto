@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Issues are public. Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/ottto-ai/ottto/blob/main/SECURITY.md).
+        Issues are public. Do not report security vulnerabilities here; report them privately at https://github.com/ottto-ai/ottto/security/advisories/new (see [SECURITY.md](https://github.com/ottto-ai/ottto/blob/main/SECURITY.md)).
         Before you submit, remove passwords, tokens, cookies, API keys, raw prompts or model output, customer data, account or organization identifiers, email addresses, machine names, and paths that include your user name.
   - type: textarea
     id: what-happened

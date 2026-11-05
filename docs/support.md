@@ -72,7 +72,7 @@ ottto diagnostics collect --upload \
   --json
 ```
 
-Support claims come from the product support channel. Do not ask users to paste
+Support claims come from support@ottto.net, the product support channel. Do not ask users to paste
 claims into public issues. Support claims are upload authorization material:
 diagnostics JSON and uploaded bundle content should expose only that a support
 claim was provided, not the claim value. Raw account, user, organization,
@@ -97,7 +97,7 @@ returns to the previous version.
 
 - Security-sensitive reports go to `security@ottto.net`, not public issues.
 - Account, billing, private organization, production backend, or support-claim
-  problems go through the product support channel.
+  problems go through support@ottto.net, the product support channel.
 - Public issues are appropriate only for redacted, reproducible CLI,
   `ottto-service`, installer, public docs, connector SDK/testkit, source
   manifest, schema, or thin agent-adapter bugs.
