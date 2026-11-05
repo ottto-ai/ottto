@@ -3525,11 +3525,55 @@ pub(crate) fn checkpoint_unselected_for_test(
     index_path: &Path,
     progress_path: &Path,
 ) -> Result<ScanIndex> {
+    checkpoint_page_for_test(index, committed, scan, index_path, progress_path, false)
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_page_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+    accept: bool,
+) -> Result<ScanIndex> {
     let mut progress = SnapshotUploadProgress::load(
         progress_path,
         &format!("{:064x}", 588),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )?;
+    if accept {
+        use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+        let mut index = index.clone();
+        let mut scan = scan.clone();
+        let holds = LocalHoldSettlement::classify(
+            scan.source,
+            &mut index,
+            &mut scan,
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        assert!(!holds.any(), "the completed fixture page has no holds");
+        let (result, _, _) = upload_source_under(
+            scan.source,
+            SnapshotUploadPolicy::default(),
+            &scan.snapshots,
+            &mut progress,
+            ack,
+        );
+        anyhow::ensure!(
+            result? == ResumableUploadResult::Completed,
+            "fixture exact ACK"
+        );
+        progress.save(progress_path)?;
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        index.save(index_path)?;
+        return Ok(index);
+    }
     progress.save(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
@@ -3696,8 +3740,8 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         locally_held,
         false,
     );
-    if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
-        committable.keep_unacknowledged_codex_files_owed(index, locally_held);
+    if let Some(scan) = correction_scan {
+        committable.requeue_unkept_scanned_keys(scan.source, index, locally_held);
     }
     if let Some(scan) = correction_scan {
         // Settle no-body grants only against the file/empty/map facts

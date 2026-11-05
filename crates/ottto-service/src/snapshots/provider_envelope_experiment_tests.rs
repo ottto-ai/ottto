@@ -533,11 +533,127 @@ fn selected_restore_keeps_invalidated_census_record_absent() {
         .is_none());
 }
 
+fn selection_page(
+    fixture: &SelectionFixture,
+    prior: ScanIndex,
+    limit: usize,
+) -> (BTreeSet<String>, ScanIndex, SourceScanResult) {
+    let state = fixture.prepare(prior, limit);
+    let selected = state
+        .identified_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect();
+    let (mut index, mut scan) = finish(state);
+    let support = fixture._scratch.join("support");
+    fs::create_dir_all(&support).unwrap();
+    let _ =
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    (selected, index, scan)
+}
+
 #[test]
 fn partial_locked_save_and_restart_keep_exact_debt() {
+    for audit in [false, true] {
+        let (fixture, index, scan, previous) =
+            selected_fixture_from(SelectionFixture::with_audit_deadline(audit));
+        let progress = fixture._scratch.join("partial-progress.json");
+        let selected = crate::snapshot_sync::checkpoint_unselected_for_test(
+            &index,
+            &previous,
+            &scan,
+            &fixture.index_path,
+            &progress,
+        )
+        .unwrap();
+        let key = local_index_key(&fixture.paths[1]);
+        assert_eq!(
+            serde_json::to_vec(&selected.files[&key]).unwrap(),
+            serde_json::to_vec(&previous.files[&key]).unwrap()
+        );
+        let new_key = local_index_key(&fixture.paths[2]);
+        assert!(!selected.files.contains_key(&new_key));
+        assert!(!selected.confirmed_empty_files.contains(&new_key));
+        assert!(selected.bounded_sweep_had_unsettled_upload());
+        let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restarted.files[&key]).unwrap(),
+            serde_json::to_vec(&previous.files[&key]).unwrap()
+        );
+        let mut expected = e2_pipeline_scan_fixture::pending_keys_for_test(&index);
+        expected.extend(
+            fixture.paths[..3]
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| !audit || *slot != 1)
+                .map(|(_, path)| local_index_key(path)),
+        );
+        assert_eq!(expected.len(), if audit { 3 } else { 4 });
+        assert_eq!(
+            restarted
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .len(),
+            expected.len()
+        );
+        assert_eq!(
+            e2_pipeline_scan_fixture::pending_keys_for_test(&restarted),
+            expected
+        );
+        assert_eq!(
+            expected.contains(&key),
+            !audit,
+            "audit-due restored B waits for the next walk"
+        );
+        let mut prior = restarted;
+        let mut read = BTreeSet::new();
+        for _ in 0..expected.len() {
+            let (selected, working, scan) = selection_page(&fixture, prior.clone(), 1);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(scan.scanned_file_count, 1);
+            assert_eq!(
+                scan.completed_parses()
+                    .map(|(key, _)| key.to_string())
+                    .collect::<BTreeSet<_>>(),
+                selected
+            );
+            let key = selected.into_iter().next().unwrap();
+            assert!(read.insert(key.clone()), "a recovered key reads once");
+            let accepted = crate::snapshot_sync::checkpoint_page_for_test(
+                &working,
+                &prior,
+                &scan,
+                &fixture.index_path,
+                &progress,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                accepted.files[&key].source_file_fingerprint,
+                working.files[&key].source_file_fingerprint
+            );
+            prior = ScanIndex::load(&fixture.index_path).unwrap();
+            let remaining = expected.difference(&read).cloned().collect::<BTreeSet<_>>();
+            assert_eq!(
+                e2_pipeline_scan_fixture::pending_keys_for_test(&prior),
+                remaining,
+                "exact ACK prevents requeue"
+            );
+        }
+        assert_eq!(read, expected);
+        assert!(e2_pipeline_scan_fixture::pending_keys_for_test(&prior).is_empty());
+    }
+}
+
+/// [regress] Failed audit B cannot re-enter ahead of A, C and the unread agent.
+#[test]
+fn unkept_audit_key_does_not_starve_pending_census_at_page_limit_one() {
     let (fixture, index, scan, previous) = selected_fixture();
-    let progress = fixture._scratch.join("partial-progress.json");
-    let selected = crate::snapshot_sync::checkpoint_unselected_for_test(
+    let progress = fixture._scratch.join("audit-fair-progress.json");
+    let mut prior = crate::snapshot_sync::checkpoint_unselected_for_test(
         &index,
         &previous,
         &scan,
@@ -545,28 +661,36 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
         &progress,
     )
     .unwrap();
-    let key = local_index_key(&fixture.paths[1]);
+    let audit = local_index_key(&fixture.paths[1]);
+    assert!(prior.files[&audit].audit_requires_full(sampled_scan::now_seconds()));
+    let expected = [0, 2, 3]
+        .map(|slot| local_index_key(&fixture.paths[slot]))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        serde_json::to_vec(&selected.files[&key]).unwrap(),
-        serde_json::to_vec(&previous.files[&key]).unwrap()
+        e2_pipeline_scan_fixture::pending_keys_for_test(&prior),
+        expected
     );
-    let new_key = local_index_key(&fixture.paths[2]);
-    assert!(!selected.files.contains_key(&new_key));
-    assert!(!selected.confirmed_empty_files.contains(&new_key));
-    assert!(selected.bounded_sweep_had_unsettled_upload());
-    let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+    let mut selected_keys = BTreeSet::new();
+    for _ in 0..3 {
+        let (selected, working, scan) = selection_page(&fixture, prior.clone(), 1);
+        assert_eq!(selected.len(), 1);
+        assert!(!selected.contains(&audit));
+        assert!(selected_keys.insert(selected.into_iter().next().unwrap()));
+        prior = crate::snapshot_sync::checkpoint_unselected_for_test(
+            &working,
+            &prior,
+            &scan,
+            &fixture.index_path,
+            &progress,
+        )
+        .unwrap();
+        assert!(!e2_pipeline_scan_fixture::pending_keys_for_test(&prior).contains(&audit));
+        assert!(prior.files[&audit].audit_requires_full(sampled_scan::now_seconds()));
+    }
     assert_eq!(
-        serde_json::to_vec(&restarted.files[&key]).unwrap(),
-        serde_json::to_vec(&previous.files[&key]).unwrap()
-    );
-    assert_eq!(
-        restarted
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .len(),
-        index.traversal.as_ref().unwrap().pending_candidates.len()
+        selected_keys, expected,
+        "every other pending key selected within three failed pages"
     );
 }
 
