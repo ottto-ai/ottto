@@ -962,6 +962,9 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 ] {
                     record.retry_after_unix_seconds = 0;
                 }
+                // That retry comes hours later, so the walk's metadata
+                // re-listing is due again: move only the listing clocks.
+                crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut loaded);
                 assert!(
                     sender.prepare_quarantine_retries(&loaded.quarantined_snapshot_fingerprints)
                 );
