@@ -301,7 +301,7 @@ fn stored_read_under(
         panic!("the committed head is reused with its base");
     };
     let mut parser = open::<Codex>(path);
-    let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), scope, None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(Some(taken), scope, None, NOW) else {
         panic!("the read prepares");
     };
     if !matches!(mode, ReadMode::Unchanged) {
@@ -524,7 +524,7 @@ fn a_codex_content_rewrite_restages_its_fact_and_drops_the_old_value() {
     let Load::Reused(taken, _) = load_at::<Codex>(&route, &path, &key) else {
         panic!("the committed head is reused");
     };
-    let (acc, _, _) = taken.retained.state.finish_view();
+    let (acc, _, _) = taken.state.finish_view();
     assert_eq!(acc.title.as_deref(), Some("After"));
 }
 
@@ -885,7 +885,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
             Load::Reused(taken, Some(base)) if n != 0 => {
                 assert!(matches!(
                     parser
-                        .prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
+                        .prepare_acquisition(Some(taken), &scope(), None, NOW)
                         .unwrap_or_else(|_| panic!("unchanged session prepares Tail")),
                     ReadMode::Tail
                 ));

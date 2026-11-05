@@ -1134,11 +1134,7 @@ pub(crate) mod native_cold {
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
         let checkpoint = parser
-            .retain_reduction(
-                scope,
-                now,
-                sampled_scan::RetainBudget::granted_unclassified(0).excluded(),
-            )
+            .retain_reduction(scope, now)
             .unwrap()
             .expect("a clean native fixture is certified")
             .checkpoint;

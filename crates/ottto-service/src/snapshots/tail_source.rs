@@ -41,22 +41,9 @@ macro_rules! with_codec {
     };
 }
 
-/// Whether `source` has a Tail codec; only `keeps_ram` asks.
-fn has_codec(source: SnapshotSource) -> bool {
-    with_codec!(source, S => S::SOURCE == source)
-}
-
 /// The reduction revision `source`'s codec writes.
 pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
     with_codec!(source, S => S::REDUCTION_REVISION)
-}
-
-/// Whether `source`'s reduction is kept in RAM between reads: exactly when it
-/// has no Tail codec. Retention and the take both key on this one rule, so a
-/// copy is kept only where the next read takes it back. A codec source keeps
-/// none, whatever its route's state.
-pub(in crate::snapshots) fn keeps_ram(source: SnapshotSource) -> bool {
-    !has_codec(source)
 }
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the

@@ -274,18 +274,6 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// A cache admission hint only. Source validation still uses the complete
-    /// stamp, scope, samples and independent audit obligation.
-    pub(crate) fn modified_hint(&self) -> (i64, i64) {
-        #[cfg(unix)]
-        {
-            self.stamp.modified
-        }
-        #[cfg(not(unix))]
-        {
-            (0, 0)
-        }
-    }
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.samples.sealed_offset
     }
@@ -832,20 +820,6 @@ fn select_mode(
 }
 
 impl ReadPlan {
-    /// The admission hint of the checkpoint this plan commits: the commit
-    /// refuses any source stamp but this plan's, and carries it unchanged
-    /// (`Checkpoint::modified_hint`). Copy retention ranks the completed copy
-    /// from it before the commit.
-    pub(crate) fn modified_hint(&self) -> (i64, i64) {
-        #[cfg(unix)]
-        {
-            self.stamp.modified
-        }
-        #[cfg(not(unix))]
-        {
-            (0, 0)
-        }
-    }
     /// Full decisions reset only transient reduction. Durable output/ACK state is
     /// untouched. A full audit debt is cleared only after native completion below.
     pub(crate) fn prepare(

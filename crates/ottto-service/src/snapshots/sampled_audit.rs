@@ -317,37 +317,17 @@ pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<Aud
 }
 
 impl SourceScanResult {
-    /// Transfer a released account hold's acquisition debt before upload/save.
-    /// Working retirements never refund their committed marker reservation.
+    /// Queue a discoverable retry for a released account hold's acquisition
+    /// before upload/save: no stored copy discharges its debt.
     pub(crate) fn preserve_released_account_audits(
         &self,
         index: &mut ScanIndex,
         previous: &ScanIndex,
-        cache: &sampled_scan::SharedCache,
         roots: &[PathBuf],
         backfill_window_days: u64,
     ) {
-        let mut reserved = previous
-            .files
-            .values()
-            .filter(|entry| entry.has_unverified_source())
-            .count()
-            .saturating_add(
-                index
-                    .files
-                    .iter()
-                    .filter(|(key, entry)| {
-                        entry.has_unverified_source()
-                            && !previous
-                                .files
-                                .get(*key)
-                                .is_some_and(ScanIndexEntry::has_unverified_source)
-                    })
-                    .count(),
-            );
-        let mut staged = 0_u64;
         let mut queued = 0_u64;
-        for (key, fingerprint) in self.completed_parses() {
+        for (key, _) in self.completed_parses() {
             if !previous.claude_account_deferred_holds.contains_key(key)
                 || index.claude_account_deferred_holds.contains_key(key)
                 || !index
@@ -356,29 +336,6 @@ impl SourceScanResult {
                     .is_some_and(|entry| !entry.has_unverified_source())
             {
                 continue;
-            }
-            // None is unknown/missing retained custody; keep a discoverable
-            // retry rather than assuming that a missing copy discharged debt.
-            let debt = cache.retained().ok().and_then(|retained| {
-                retained
-                    .peek(key)
-                    .map(|entry| entry.checkpoint.audit_debt())
-            });
-            if debt == Some(None) {
-                continue;
-            }
-            if let Some(Some(debt)) = debt {
-                if reserved < CACHE_ENTRIES
-                    && index
-                        .files
-                        .get(key)
-                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
-                    && index.stage_sampled_audit(key, fingerprint, debt)
-                {
-                    reserved += 1;
-                    staged += 1;
-                    continue;
-                }
             }
             // This existing explicit-reparse witness survives traversal resets
             // and ages. It never labels an audit/clock Full or grants credit.
@@ -407,11 +364,11 @@ impl SourceScanResult {
             }
             queued += 1;
         }
-        if staged + queued > 0 {
+        if queued > 0 {
             crate::local_resource_diagnostics::traversal_point(
                 "sampled_audit_account_release",
                 "claude_code",
-                &serde_json::json!({"marker_staged": staged, "retry_queued": queued}),
+                &serde_json::json!({"retry_queued": queued}),
             );
         }
     }

@@ -686,7 +686,6 @@ struct LocalHoldSettlement {
 
 struct AccountAuditRelease<'a> {
     previous: &'a ScanIndex,
-    cache: &'a crate::snapshots::sampled_scan::SharedCache,
     roots: &'a [PathBuf],
     backfill_window_days: u64,
 }
@@ -939,7 +938,6 @@ pub(crate) fn accept_account_release_for_test(
     mut index: ScanIndex,
     previous: &ScanIndex,
     scan: &mut SourceScanResult,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
     roots: &[PathBuf],
 ) -> ScanIndex {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
@@ -954,7 +952,6 @@ pub(crate) fn accept_account_release_for_test(
     scan.preserve_released_account_audits(
         &mut settled.index,
         previous,
-        cache,
         roots,
         crate::snapshots::BACKFILL_WINDOW_DAYS,
     );
@@ -966,7 +963,6 @@ pub(crate) fn checkpoint_account_release_for_test(
     mut index: ScanIndex,
     previous: &ScanIndex,
     scan: &mut SourceScanResult,
-    cache: &crate::snapshots::sampled_scan::SharedCache,
     roots: &[PathBuf],
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
@@ -988,7 +984,6 @@ pub(crate) fn checkpoint_account_release_for_test(
         Some(UnsettledUploadCause::UploadError),
         Some(AccountAuditRelease {
             previous,
-            cache,
             roots,
             backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
         }),
@@ -1197,7 +1192,6 @@ fn finish_selected_settlement(index: &mut ScanIndex, inputs: SelectedSettlementI
         scan.preserve_released_account_audits(
             index,
             release.previous,
-            release.cache,
             release.roots,
             release.backfill_window_days,
         );
@@ -3706,7 +3700,6 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         scan.preserve_released_account_audits(
             &mut committable,
             release.previous,
-            release.cache,
             release.roots,
             release.backfill_window_days,
         );
@@ -6402,14 +6395,12 @@ fn prepare_sync_source_inner(
         encoded_key.zeroize();
     }
     if source == SnapshotSource::ClaudeCode {
-        // A key change only scrubs what retained parses compare under the old
-        // key: every parse, cursor and count stays, so a server hint never
-        // causes a re-read.
-        if crate::snapshots::claude_request_identity::bind_session_context_key(
+        // A key change is scrubbed where a stored reduction loads
+        // (`tail_source::load`): every parse, cursor and count stays, so a
+        // server hint never causes a re-read.
+        crate::snapshots::claude_request_identity::bind_session_context_key(
             attribution_context.as_ref(),
-        ) {
-            daemon.transcript_cache.scrub_retained_context_digests();
-        }
+        );
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
@@ -7366,7 +7357,6 @@ fn finish_sync_source(
                 support_dir,
                 &mut scan_result,
                 &mut index,
-                Some((&daemon.transcript_cache, &committed_index)),
                 Some(&upload_progress.accepted_identity_buckets),
                 crate::snapshots::claude_request_identity::WireBudget {
                     max_item_bytes: identity_item_cap,
@@ -7644,7 +7634,6 @@ fn finish_sync_source(
             Some(UnsettledUploadCause::UploadError),
             (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                 previous: &committed_index,
-                cache: &daemon.transcript_cache,
                 roots: claude_scan_roots.as_deref().unwrap_or_default(),
                 backfill_window_days: receipt_window_days,
             }),
@@ -8042,7 +8031,6 @@ fn finish_sync_source(
                 Some(cause),
                 (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                     previous: &committed_index,
-                    cache: &daemon.transcript_cache,
                     roots: claude_scan_roots.as_deref().unwrap_or_default(),
                     backfill_window_days: receipt_window_days,
                 }),
@@ -8375,7 +8363,6 @@ fn finish_sync_source(
             body_drains: claude_proof_body_drains,
             audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                 previous: &committed_index,
-                cache: &daemon.transcript_cache,
                 roots: claude_scan_roots.as_deref().unwrap_or_default(),
                 backfill_window_days: receipt_window_days,
             }),
@@ -8866,7 +8853,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         scan_result,
         index,
         None,
-        None,
         Default::default(),
     )
 }
@@ -8887,7 +8873,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         support_dir,
         scan_result,
         index,
-        None,
         accepted_identity_buckets,
         Default::default(),
     )
@@ -8929,7 +8914,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
 ) -> (
@@ -9307,15 +9291,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
             .or_default() += trace_discard_unfolded.len() as u64;
     }
     withheld.extend(trace_discard_unfolded);
-    if let Some((cache, committed)) = retained {
-        cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
-    }
-    let mut identity_custody = (wire_budget.max_item_bytes
-        > crate::snapshots::claude_request_identity::MAX_ITEM_BYTES
-        || accepted_identity_buckets.is_some_and(
-            crate::snapshots::claude_request_identity::AcceptedBuckets::account_source_enabled,
-        ))
-    .then(|| withheld.clone());
     disposition.hold_request_owned(withheld);
     {
         for item in &mut scan_result.snapshots {
@@ -9345,12 +9320,6 @@ fn apply_claude_local_evidence_to_scan_with_retained(
         );
         disposition.copy_invalidated = request_identity.copy_invalidated;
         if !request_identity.held.is_empty() {
-            if let (Some((cache, committed)), Some(withheld)) =
-                (retained, identity_custody.as_mut())
-            {
-                withheld.extend(request_identity.held.iter().cloned());
-                cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, withheld);
-            }
             disposition.hold_request_owned(request_identity.held);
         }
         if let Some(activity) = request_owned_activity {

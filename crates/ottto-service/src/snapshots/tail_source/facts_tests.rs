@@ -23,8 +23,8 @@ fn base(route: &Route, key: &str) -> TailBase {
 }
 
 /// The facts a load restored.
-fn facts(taken: &Taken<CachedJsonlReduction>) -> [Option<String>; 4] {
-    let (acc, _, _) = taken.retained.state.finish_view();
+fn facts(taken: &Retained<CachedJsonlReduction>) -> [Option<String>; 4] {
+    let (acc, _, _) = taken.state.finish_view();
     [
         acc.title.clone(),
         acc.first_prompt_material.clone(),
@@ -226,7 +226,7 @@ fn session_facts_never_reach_diagnostics() {
     assert_eq!(prompt, Some(literal("PROMPT")));
     assert_eq!(display, Some(literal("DISPLAY")));
     assert!(workspace.is_some_and(|path| path.contains(&literal("WORKSPACE"))));
-    let (acc, _, _) = taken.retained.state.finish_view();
+    let (acc, _, _) = taken.state.finish_view();
     assert_eq!(
         acc.session_start.call_files_for_test("toolu_opening"),
         Some(&[literal("PATH")][..])

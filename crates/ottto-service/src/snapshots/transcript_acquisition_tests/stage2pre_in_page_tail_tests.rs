@@ -304,19 +304,8 @@ fn baseline(source: SnapshotSource, rows: usize, pre: usize) -> Baseline {
     );
     let path = fixture.file.0.clone();
     let key = local_index_key(&path);
-    // A codec source's baseline is its committed head, which seals the whole
-    // file; another source's is its retained copy.
+    // The baseline is the committed head, which seals the whole file.
     let sealed = len(&path);
-    if crate::snapshots::tail_source::keeps_ram(source) {
-        let checkpoint = cache
-            .retained_checkpoint(&key)
-            .expect("precondition: the first Full retains a copy");
-        assert_eq!(
-            checkpoint.sealed_offset(),
-            sealed,
-            "precondition: the whole file is sealed"
-        );
-    }
     append_raw(&path, &row_bytes(source, rows..rows + pre));
     Baseline {
         fixture,
@@ -329,24 +318,13 @@ fn baseline(source: SnapshotSource, rows: usize, pre: usize) -> Baseline {
 }
 
 /// Main's failed attempt or the seam's refusal: one unreadable of `cause`,
-/// no retained copy, nothing published.
-fn assert_refused(
-    cache: &sampled_scan::SharedCache,
-    key: &str,
-    result: &SourceScanResult,
-    seen: &Seen,
-    cause: usize,
-    id: &str,
-) {
+/// nothing published.
+fn assert_refused(result: &SourceScanResult, seen: &Seen, cause: usize, id: &str) {
     assert_eq!(
         (seen.unreadable, seen.causes[cause]),
         (1, 1),
         "{id}: one unreadable of cause slot {cause}; causes={:?}",
         seen.causes
-    );
-    assert!(
-        cache.retained_checkpoint(key).is_none(),
-        "{id}: no checkpoint or copy"
     );
     assert!(result.snapshots.is_empty(), "{id}: nothing published");
 }
@@ -373,10 +351,6 @@ fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
     );
     assert_eq!(seen.unreadable, 0, "SP-11 FE: causes={:?}", seen.causes);
     assert!(!tail.snapshots.is_empty(), "SP-11 FE: prefix published");
-    assert!(
-        base.cache.retained_checkpoint(&base.key).is_none(),
-        "SP-11 FE: no copy"
-    );
 }
 
 mod fe_claude_in_page_read_tests;

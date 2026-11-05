@@ -378,6 +378,8 @@ impl HeaderCache {
             .and_then(|()| header.heap_bound(&mut c))
             .map_or(usize::MAX, |()| c.bytes)
     }
+    /// The header facts' resident bytes (tests: the yieldable share).
+    #[cfg(test)]
     pub(in crate::snapshots) fn optional_bytes(&self) -> Option<usize> {
         crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
             .checked_mul(self.entries.len())?
@@ -4632,7 +4634,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         let populated = page(&root, &paths, &cache);
         assert_eq!(populated.reuse_misses, paths.len());
         assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
-        cache.clear();
+        cache.with_cursor(|cursor| cursor.headers.clear());
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
             .unwrap());

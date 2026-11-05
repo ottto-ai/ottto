@@ -872,14 +872,12 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
             index.files.insert(audit_key.clone(), audit_entry.clone());
             previous.files.insert(audit_key, audit_entry);
         }
-        let cache = sampled_scan::SharedCache::default();
         let selected = if partial {
             let progress = fixture._scratch.join("released-progress.json");
             crate::snapshot_sync::checkpoint_account_release_for_test(
                 index,
                 &previous,
                 &mut scan,
-                &cache,
                 &fixture.roots,
                 (&fixture.index_path, &progress),
             )
@@ -889,7 +887,6 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
                 index,
                 &previous,
                 &mut scan,
-                &cache,
                 &fixture.roots,
             );
             selected.save(&fixture.index_path).unwrap();

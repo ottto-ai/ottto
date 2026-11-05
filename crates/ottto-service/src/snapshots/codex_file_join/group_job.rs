@@ -671,7 +671,6 @@ impl GroupBoot {
                 dependencies,
                 memo_digest,
                 scope: cursor::group_scope(),
-                walked: None,
                 consumed_before: 0,
             })),
         }))
@@ -750,24 +749,16 @@ pub(in crate::snapshots) struct GroupJob {
     /// `cursor::group_scope` at job start: every resume and the
     /// emission compare it with the current index.
     pub(in crate::snapshots) scope: String,
-    /// The last walked copy-budget charge of a group read without the
-    /// cursor (a cursor job keeps it in its `JobMeta`).
-    pub(in crate::snapshots) walked: Option<(usize, u64, usize)>,
-    /// Bytes the completed members' readers consumed: the copy budget measures a group's
-    /// input cumulatively, so a member swap needs no walk (R2-L3).
+    /// Bytes the completed members' readers consumed, plus each member
+    /// swap's charge (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
-    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
+    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
     consumed_before);
 
 impl GroupJob {
-    /// A legacy tee takes every consumed record too.
-    pub(in crate::snapshots) fn has_tee(&self) -> bool {
-        self.tee.is_some()
-    }
-
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
         std::mem::take(&mut self.legacy_baselines)
     }

@@ -249,7 +249,6 @@ impl Page {
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    Some((&self.cache, &self.committed)),
                     accepted.as_deref(),
                     wire_budget,
                 )
@@ -3551,9 +3550,6 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         }
         if loss == 1 {
             scanner.evict(&prior);
-        } else if loss == 2 {
-            // Actual capacity eviction through the existing victim mechanism.
-            scanner.evict_for_pressure(&prior);
         }
         let scanner = if loss == 3 { &restarted } else { &scanner };
         let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
@@ -3563,8 +3559,8 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss:
         assert_withheld(&retry, COPY, "external census still unavailable");
         if sampled {
             // On the database route the held-new custody is durable (the
-            // withheld read's census record and committed head): a RAM
-            // clear, eviction or restart still continues it.
+            // withheld read's census record and committed head): an
+            // eviction or restart still continues it.
             assert_eq!(
                 retry.modes,
                 if grow { (0, 1, 0) } else { (0, 0, 1) },
@@ -3643,14 +3639,14 @@ fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
 
 #[test]
 fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, true, loss);
     }
 }
 
 #[test]
 fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
-    for loss in 1..=3 {
+    for loss in [1, 3] {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
 }

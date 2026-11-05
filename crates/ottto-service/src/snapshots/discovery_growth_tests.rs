@@ -1421,7 +1421,7 @@ fn retained_codex_stat_growth_tails_once_with_full_money() {
     assert_eq!(item.cache_read_tokens, 4);
     assert_eq!(item.output_tokens, 6);
     assert_eq!(item.request_count, 2);
-    f.cache.clear();
+    f.cache.with_cursor(|cursor| cursor.headers.clear());
     let (cold_index, cold, _, _) = f.page_at(
         SnapshotSource::Codex,
         ScanIndex::default(),

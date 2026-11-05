@@ -74,8 +74,7 @@ fn fresh_destination_first_cycle_keeps_tail_across_restart() {
                 panic!("first saved Claude Tail survives for {presence}");
             };
             let mut parser = transition::open::<Claude>(&transcript);
-            let Ok(mode) = parser.prepare_acquisition_owned(Some(taken), &scope(), None, NOW)
-            else {
+            let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), None, NOW) else {
                 panic!("the restarted read prepares");
             };
             if append {
