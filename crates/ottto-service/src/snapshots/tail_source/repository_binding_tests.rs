@@ -169,31 +169,41 @@ fn every_source_pins_the_native_observation_before_staging() {
 fn folder_labels_and_failed_lookup_recovery() {
     let route = route_for(Source::Claude);
     let cwd = route.dir.join("new-folder");
-    for exists in [false, true] {
-        if exists {
+    for (exists, init, kind, version) in [
+        (false, false, "unknown", 1),
+        (true, false, "non_git", 1),
+        (true, true, "repository_root", 2),
+        (false, false, "unknown", 1),
+    ] {
+        if !exists && cwd.exists() {
+            fs::remove_dir_all(&cwd).unwrap();
+        }
+        if exists && !cwd.exists() {
             fs::create_dir(&cwd).unwrap();
+        }
+        if init {
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&cwd)
+                .status()
+                .unwrap()
+                .success());
         }
         let (tail, native) =
             route.complete("session.jsonl", &claude::tests::lines(2), None, |acc| {
                 acc.workspace_path = Some(cwd.clone());
             });
         let staged = tail.staged_for_test().unwrap();
-        assert_eq!(
-            staged.pages[&(Collection::SessionFacts, 2)][1],
-            if exists { 2 } else { 1 }
-        );
+        assert_eq!(staged.pages[&(Collection::SessionFacts, 2)][1], version);
         let mut items = native.unwrap().snapshots;
-        assert_eq!(
-            items[0].workspace_kind.as_deref(),
-            Some(if exists { "non_git" } else { "unknown" })
-        );
+        assert_eq!(items[0].workspace_kind.as_deref(), Some(kind));
         assert_eq!(
             items[0].workspace_display_label.as_deref(),
-            Some("new-folder")
+            (!init).then_some("new-folder")
         );
         assert_eq!(
             items[0].workspace_label_source.as_deref(),
-            Some("directory_name")
+            (!init).then_some("directory_name")
         );
         apply_upload_policy(
             SnapshotSource::ClaudeCode,

@@ -10711,6 +10711,11 @@ fn fresh_repository_identity(
 }
 
 fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
+    // A cached path observation cannot locate a session whose cwd has gone.
+    // The shared resolver classifies this failure without spawning Git.
+    if fs::read_dir(workspace).is_err() {
+        return crate::context_footprint::resolve_repository_identity(workspace, true);
+    }
     let cache = repository_identity_cache();
     let now = SystemTime::now();
     if let Ok(guard) = cache.lock() {
@@ -10720,11 +10725,14 @@ fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::Rep
     }
 
     let identity = crate::context_footprint::resolve_repository_identity(workspace, true);
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
-            guard.clear();
+    // Negative observations must not delay a later git init or repaired lookup.
+    if identity.repository_hash.is_some() {
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
+                guard.clear();
+            }
+            guard.insert(workspace.to_path_buf(), (now, identity.clone()));
         }
-        guard.insert(workspace.to_path_buf(), (now, identity.clone()));
     }
     identity
 }
@@ -18108,21 +18116,20 @@ impl OwnedJsonlParser {
             Some(reader)
         };
         // Resolve before PRE stages the session facts, outside the store's
-        // transactions. Capture this session's live observation, not another
-        // session's path-cache entry. Failures retry on ordinary selected work.
+        // transactions. Only positive repository evidence is permanent;
+        // non-Git and unavailable lookups retry on ordinary selected work.
         let repository_identity = accumulator
             .repository_binding
             .clone()
             .or(repository_identity)
             .or_else(|| {
-                accumulator.workspace_path.as_deref().map(|workspace| {
-                    crate::context_footprint::resolve_repository_identity(workspace, true)
-                })
+                accumulator
+                    .workspace_path
+                    .as_deref()
+                    .map(cached_repository_identity)
             });
         if let Some(identity) = &repository_identity {
-            if identity.repository_hash.is_some()
-                || identity.workspace_kind.as_deref() == Some("non_git")
-            {
+            if identity.repository_hash.is_some() {
                 accumulator.repository_binding = Some(identity.clone());
             }
         }
