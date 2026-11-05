@@ -47,7 +47,7 @@ resolved_repo="$(cd "$repo" && pwd -P)"
 
 # The packager must not carry the private-source guard or credential fetch;
 # the release procedure owns those checks.
-if grep -Eiq 'singular|auth git-credential' "$ROOT/scripts/macos_package.sh"; then
+if grep -Eq 'gh api|auth git-credential|require_command gh' "$ROOT/scripts/macos_package.sh"; then
   echo "Package script must not reach a private repository or a gh credential helper" >&2
   exit 1
 fi
