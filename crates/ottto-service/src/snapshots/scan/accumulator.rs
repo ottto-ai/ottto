@@ -1352,6 +1352,47 @@ impl SnapshotAccumulator {
         }
     }
 
+    /// Move independently observed session features into the next member before
+    /// projection. Keep transient call matching and all usage state per member.
+    pub(in crate::snapshots) fn merge_session_features(&mut self, other: &mut Self) -> Option<()> {
+        macro_rules! maps {
+            ($($field:ident),+ $(,)?) => {$({
+                for (key, count) in std::mem::take(&mut other.$field) {
+                    let into = self.$field.entry(key).or_default();
+                    *into = into.checked_add(count)?;
+                }
+            })+};
+        }
+        maps!(
+            activity_tool_counts,
+            activity_mcp_tool_counts,
+            activity_mcp_tool_usage_counts,
+            activity_capability_buckets,
+            tool_usage_counts
+        );
+        macro_rules! counts {
+            ($($field:ident),+ $(,)?) => {$({
+                self.$field = self.$field.checked_add(std::mem::take(&mut other.$field))?;
+            })+};
+        }
+        counts!(
+            activity_patch_operations,
+            activity_lines_added,
+            activity_lines_deleted,
+            activity_web_searches,
+            activity_mcp_calls,
+            activity_subagent_spawns
+        );
+        self.activity_changed_file_hashes
+            .extend(std::mem::take(&mut other.activity_changed_file_hashes));
+        self.activity_skills
+            .extend(std::mem::take(&mut other.activity_skills));
+        self.skill_detector_incomplete |= other.skill_detector_incomplete;
+        self.tool_usage_truncated |= other.tool_usage_truncated;
+        self.add_artifacts(std::mem::take(&mut other.artifacts));
+        Some(())
+    }
+
     pub(in crate::snapshots) fn note_activity_tool(&mut self, name: &str) {
         let Some(name) = bounded_activity_label(name) else {
             return;

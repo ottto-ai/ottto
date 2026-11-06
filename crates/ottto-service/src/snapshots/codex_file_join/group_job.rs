@@ -73,11 +73,11 @@ pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulat
     accumulator.codex_counting_v2()
 }
 
-fn independent_group(group: &Group) -> bool {
-    group.members.iter().any(|member| {
-        codex_archive_path(&member.path)
-            || codex_session_id_candidates_from_path(&member.path).len() > 1
-    })
+pub(super) fn independent_group(group: &Group) -> bool {
+    group
+        .members
+        .iter()
+        .any(|member| codex_session_id_candidates_from_path(&member.path).len() > 1)
 }
 
 /// The group job's logical key: home, owner and the sorted member keys. A
@@ -90,12 +90,7 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
         .collect::<Vec<_>>();
     keys.sort();
     let mut parts = vec![
-        if independent_group(group) {
-            "codex_independent_group_job:v1"
-        } else {
-            "codex_group_job:v1"
-        }
-        .to_owned(),
+        "codex_group_job:v1".to_owned(),
         local_index_key(&group.home),
         group.owner.clone(),
     ];
@@ -260,11 +255,6 @@ impl GroupBoot {
 
     pub(in crate::snapshots) fn independent(&self) -> bool {
         self.independent
-    }
-
-    pub(in crate::snapshots) fn acquisition_key(&self) -> String {
-        // Membership changes must not evade the existing per-key Full pace.
-        group_key(&self.group.home, &self.group.owner)
     }
 
     /// Header and probe bytes read since the last call.
@@ -1180,8 +1170,6 @@ fn member_eof(
         retained[2] = crate::heap_layout_bound::completed_bound(&baseline, usize::MAX);
         group.legacy_baselines.push(baseline);
     }
-    group.lines.0 += report.physical_line_count;
-    group.lines.1 += report.parsed_json_line_count;
     if last {
         // The existing single-file optional witness can be cleared on
         // conflict. A joined body must not reach account fallback through it.
@@ -1196,9 +1184,8 @@ fn member_eof(
         {
             return Err(GroupEnd::Strict);
         }
-        active.parser.reader.report.physical_line_count = group.lines.0;
-        active.parser.reader.report.parsed_json_line_count = group.lines.1;
-        group.finished = true;
+    }
+    if finish_member_report(group, &mut active.parser) {
         return Ok(true);
     }
     // The finished member's unread charge moves to the group before its
@@ -1216,12 +1203,42 @@ fn member_eof(
     Ok(false)
 }
 
+fn finish_member_report(group: &mut GroupJob, parser: &mut OwnedJsonlParser) -> bool {
+    group.lines.0 += parser.reader.report.physical_line_count;
+    group.lines.1 += parser.reader.report.parsed_json_line_count;
+    let last = group.current + 1 == group.members.len();
+    if last {
+        parser.reader.report.physical_line_count = group.lines.0;
+        parser.reader.report.parsed_json_line_count = group.lines.1;
+        group.finished = true;
+    }
+    last
+}
+
+fn install_member_replay(
+    active: &mut OwnedActiveFile,
+    member: CandidateFile,
+    mut join: Box<StreamProof>,
+) {
+    let group = active.group.as_ref().expect("group job");
+    join.begin_member(group.current);
+    let previous = group
+        .previous_receipts
+        .get(&local_index_key(&member.path))
+        .cloned()
+        .unwrap_or_default();
+    let mut replay = TierReplay::new(previous.0, previous.1, group.receipt_scope.clone());
+    replay.join = Some(join);
+    active.parser.accumulator.codex_tier_replay = Some(replay);
+    active.candidate = member;
+}
+
 /// Independent files keep separate parser, selector and cache-detector boundaries.
 /// Completed contributions and admitted keys stay only in this attempt until its
 /// last EOF; a lost process has acquired no folded checkpoint or ACK credit.
 fn independent_member_eof(
     active: &mut OwnedActiveFile,
-    mut join: Box<StreamProof>,
+    join: Box<StreamProof>,
     inputs: &StepInputs<'_>,
 ) -> std::result::Result<bool, GroupEnd> {
     if active.parser.accumulator.codex_counting_v2()
@@ -1230,13 +1247,7 @@ fn independent_member_eof(
         return Err(GroupEnd::Strict);
     }
     let group = active.group.as_mut().expect("group");
-    let report = active.parser.reader.report;
-    group.lines.0 += report.physical_line_count;
-    group.lines.1 += report.parsed_json_line_count;
-    if group.current + 1 == group.members.len() {
-        active.parser.reader.report.physical_line_count = group.lines.0;
-        active.parser.reader.report.parsed_json_line_count = group.lines.1;
-        group.finished = true;
+    if finish_member_report(group, &mut active.parser) {
         return Ok(true);
     }
     let member = group.members[group.current].clone();
@@ -1266,7 +1277,12 @@ fn independent_member_eof(
         inputs.index,
         inputs.cache,
     )?;
-    let old = std::mem::replace(&mut active.parser, parser);
+    let mut old = std::mem::replace(&mut active.parser, parser);
+    active
+        .parser
+        .accumulator
+        .merge_session_features(&mut old.accumulator)
+        .ok_or(GroupEnd::Strict)?;
     let end = old.reader.consumed_bytes();
     let mut parsed = old
         .finish_boxed_native(
@@ -1297,16 +1313,7 @@ fn independent_member_eof(
     group.consumed_before = group.consumed_before.saturating_add(end);
     active.charged_bytes = 0;
     group.current += 1;
-    join.begin_member(group.current);
-    let previous = group
-        .previous_receipts
-        .get(&local_index_key(&next.path))
-        .cloned()
-        .unwrap_or_default();
-    let mut replay = TierReplay::new(previous.0, previous.1, group.receipt_scope.clone());
-    replay.join = Some(join);
-    active.parser.accumulator.codex_tier_replay = Some(replay);
-    active.candidate = next;
+    install_member_replay(active, next, join);
     Ok(false)
 }
 
@@ -1358,7 +1365,7 @@ fn apply_live_eof_record(active: &mut OwnedActiveFile) {
 /// Swap in the next canonical member's reader and its proof context.
 fn open_member(
     active: &mut OwnedActiveFile,
-    mut join: Box<StreamProof>,
+    join: Box<StreamProof>,
     inputs: &StepInputs<'_>,
 ) -> std::result::Result<(), GroupEnd> {
     let paged = active.cursor.is_some();
@@ -1392,12 +1399,6 @@ fn open_member(
         inputs.metadata,
         active.parser.accumulator.codex_turn_traces.clone(),
     )?;
-    let previous = group
-        .previous_receipts
-        .get(&local_index_key(&member.path))
-        .cloned()
-        .unwrap_or_default();
-    let receipt_scope = group.receipt_scope.clone();
     group.tee = tee;
     // The copy budget keeps counting across the swap: no walk per member.
     group.consumed_before = group
@@ -1419,11 +1420,7 @@ fn open_member(
         };
         cursor::arm_group_member(active, &boot, scope.as_ref())?;
     }
-    join.begin_member(position);
-    let mut replay = TierReplay::new(previous.0, previous.1, receipt_scope);
-    replay.join = Some(join);
-    active.parser.accumulator.codex_tier_replay = Some(replay);
-    active.candidate = member;
+    install_member_replay(active, member, join);
     Ok(())
 }
 

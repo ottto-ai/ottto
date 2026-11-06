@@ -214,14 +214,26 @@ pub(crate) fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (result, bytes)
 }
 
+/// Serialize fixtures that require the process-wide paid decoder owner.
+pub(crate) fn codex_decoder_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    super::super::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Observe the same independent byte-reading seams as the Codex archive
 /// transition driver: object samples, header/decoder construction and JSONL.
 /// Unknown/nonzero byte classes never become a fabricated zero receipt.
 pub(crate) fn observe_codex_quiet<T>(run: impl FnOnce() -> T) -> (T, IoBytes) {
+    observe_codex_quiet_with_bytes(|| observe_consumed(run))
+}
+
+/// Same observer for a driver whose page already measures consumption.
+pub(crate) fn observe_codex_quiet_with_bytes<T>(run: impl FnOnce() -> (T, u64)) -> (T, IoBytes) {
     use crate::snapshots::{codex_zst_refusal_tests, START_IDENTITY_SAMPLE_FOR_TEST};
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
     let activity = codex_zst_refusal_tests::activity();
-    let (value, consumed) = observe_consumed(run);
+    let (value, consumed) = run();
     let measured = (samples == START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get)
         && activity == codex_zst_refusal_tests::activity()
         && consumed == 0)

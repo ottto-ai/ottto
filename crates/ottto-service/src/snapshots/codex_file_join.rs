@@ -742,6 +742,16 @@ impl HeaderInventory {
                 .members
                 .push(header.candidate.clone());
         }
+        // Ordinary replacement/carry archives retain main's singleton path.
+        // Revert groups alone acquire their compressed independent members.
+        for group in groups.values_mut() {
+            if !group_job::independent_group(group) {
+                group
+                    .members
+                    .retain(|member| !codex_archive_path(&member.path));
+            }
+        }
+        groups.retain(|_, group| !group.members.is_empty());
         groups
     }
     /// Header uncertainty remains a wildcard; complete current headers name
@@ -2247,6 +2257,7 @@ pub(super) mod tests {
 
     #[test]
     fn ordinary_compressed_header_retains_pending_on_funding_refusal_and_plain_sibling_wins() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
         let (root, fixture) = fixture();
         let sessions = root.join("sessions");
         let plain = fixture.headers[0].candidate.path.clone();
@@ -2284,7 +2295,13 @@ pub(super) mod tests {
         let mut inventory =
             HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
-        assert!(inventory.complete);
+        assert!(
+            inventory.complete,
+            "funded recognition: read={}, refusals={}, causes={}",
+            inventory.read_bytes,
+            inventory.refused.len(),
+            serde_json::to_string(&inventory.unreadable_causes).unwrap()
+        );
         assert_eq!(inventory.headers.len(), 1);
         assert_eq!(inventory.headers[0].owner, fixture.headers[0].owner);
         assert_eq!(inventory.headers[0].candidate.path, compressed);

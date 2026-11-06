@@ -1967,6 +1967,35 @@ pub fn finalize_scan_after_policy_with_body_witness(
         }
     }
 
+    // A combined Codex offer has one carrier. The existing member witness
+    // binds every alias's physical revision to that carrier's filtered body.
+    if source == SnapshotSource::Codex {
+        let offered = index
+            .files
+            .values()
+            .filter_map(|entry| {
+                let marker = entry.codex_joined_member_set.as_ref()?;
+                let entities = by_source_file.get(&entry.source_file_fingerprint)?;
+                let bodies = by_source_file_body_witness.get(&entry.source_file_fingerprint)?;
+                Some((marker.clone(), (entities.clone(), bodies.clone())))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for entry in index.files.values() {
+            if let Some((entities, bodies)) = entry
+                .codex_joined_member_set
+                .as_ref()
+                .and_then(|marker| offered.get(marker))
+            {
+                by_source_file
+                    .entry(entry.source_file_fingerprint.clone())
+                    .or_insert_with(|| entities.clone());
+                by_source_file_body_witness
+                    .entry(entry.source_file_fingerprint.clone())
+                    .or_insert_with(|| bodies.clone());
+            }
+        }
+    }
+
     let mut noop_source_files = BTreeSet::new();
     let mut carried_noop_entities = BTreeSet::new();
     for pending in &result.pending_finalization {
@@ -5119,27 +5148,6 @@ impl OwnedSourceScan {
                 });
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
-                // First independent acquisitions share the existing counted
-                // six-hour Full pacing. Continuation of a running attempt
-                // never returns through boot and spends no second claim.
-                if boot.independent()
-                    && sampling
-                        .as_mut()
-                        .is_some_and(|context| !context.cap_candidate(&boot.acquisition_key()))
-                {
-                    for member in &group_members {
-                        sampled_audit::queue_cap_retry(index, member);
-                    }
-                    if let Some(context) = sampling.as_ref() {
-                        context.cache.group_attempted(
-                            &context.namespace,
-                            &boot_key,
-                            sampled_scan::codex_cursor::census_token(index).as_deref(),
-                        );
-                    }
-                    codex_file_join::disclose_strict(&group_members, targets!());
-                    pending!();
-                }
                 let job = boot.into_job(codex_file_join::JobInputs {
                     metadata: &codex_title_metadata,
                     traces: codex_turn_traces.clone(),
@@ -6102,7 +6110,9 @@ impl OwnedSourceScan {
                     group,
                 } = *active;
                 let mut independent_contributions = Vec::new();
+                let mut independent_group = false;
                 let group_members = group.map_or(0, |mut group| {
+                    independent_group = group.independent;
                     independent_contributions = std::mem::take(&mut group.contributions);
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     group.members.len()
@@ -6704,8 +6714,10 @@ impl OwnedSourceScan {
                             .iter()
                             .cloned()
                             .map(|mut item| {
-                                item.source_file_fingerprint = Some(alias_fingerprint.clone());
-                                item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+                                if !independent_group {
+                                    item.source_file_fingerprint = Some(alias_fingerprint.clone());
+                                    item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+                                }
                                 item
                             })
                             .collect::<Vec<_>>();
@@ -6719,7 +6731,9 @@ impl OwnedSourceScan {
                         census
                             .observed_index_keys
                             .insert(local_index_key(&alias.path));
-                        snapshots.extend(alias_items);
+                        if !independent_group {
+                            snapshots.extend(alias_items);
+                        }
                     }
                 }
                 scanned_session_count += parsed.len();

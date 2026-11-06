@@ -36,19 +36,43 @@ macro_rules! counts {
     }};
 }
 
-/// Existing decimal codec and cost addition; absence is neutral per field,
-/// while a real present zero remains present.
+/// Checked conversion of the existing internal decimal-picos projection.
+fn typed_cost_picos(text: &str) -> Result<u128> {
+    // Internal cost strings were projected from integer picos. This checked
+    // typed conversion has no provider field ceiling or rounding policy.
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    anyhow::ensure!(
+        !whole.is_empty()
+            && fraction.len() <= 12
+            && whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|byte| byte.is_ascii_digit()),
+        "invalid folded typed cost"
+    );
+    let scale = 10u128.pow((12 - fraction.len()) as u32);
+    let whole = whole.parse::<u128>()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>()?
+    };
+    whole
+        .checked_mul(USD_PICO_SCALE)
+        .and_then(|whole| {
+            fraction
+                .checked_mul(scale)
+                .and_then(|fraction| whole.checked_add(fraction))
+        })
+        .ok_or_else(|| anyhow::anyhow!("folded cost overflow"))
+}
+
 fn cost(left: &Option<String>, right: &Option<String>) -> Result<Option<String>> {
     let parse = |value: &Option<String>| -> Result<UsageCosts> {
         Ok(UsageCosts {
             observed: value.is_some(),
             reported: value.is_some(),
-            total: value
-                .as_deref()
-                .map(parse_pi_usd_picos)
-                .transpose()
-                .map_err(|_| anyhow::anyhow!("invalid folded cost"))?
-                .map(|(picos, _)| picos),
+            total: value.as_deref().map(typed_cost_picos).transpose()?,
             ..UsageCosts::default()
         })
     };
@@ -121,6 +145,12 @@ pub(in crate::snapshots) fn fold(
     let carrier = last.remove(0);
     let source = carrier.source_file_fingerprint.clone();
     let collected_at = carrier.collected_at.clone();
+    let features = (
+        carrier.activity_summary.clone(),
+        carrier.tool_usage.clone(),
+        carrier.tool_usage_truncated,
+        carrier.session_artifacts.clone(),
+    );
     earlier.push(carrier);
     earlier.sort_by(|a, b| a.source_started_at.cmp(&b.source_started_at));
     let mut iter = earlier.into_iter();
@@ -245,6 +275,12 @@ pub(in crate::snapshots) fn fold(
     }
     item.usage_buckets
         .sort_by(|a, b| a.bucket_start.cmp(&b.bucket_start));
+    (
+        item.activity_summary,
+        item.tool_usage,
+        item.tool_usage_truncated,
+        item.session_artifacts,
+    ) = features;
     item.source_file_fingerprint = source;
     item.collected_at = collected_at;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);

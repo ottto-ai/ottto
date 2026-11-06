@@ -78,12 +78,14 @@ file-system hint / periodic listing → select file → read new bytes from save
   members, overlap or missing proof hold the complete group without singleton output.
   A first acquisition without saved reductions keeps every contribution and its key
   proof in memory until the full offer is built. It uses the existing counted Full
-  pacing; an interrupted process discards the attempt and the next one reads the group
+  counters; an interrupted process discards the attempt and the next one reads the group
   again. Exact acknowledgement settles only the captured member revisions through
   the existing entity incidence and member-set witness. Accepted unchanged members
   reuse their existing inventory stamps and read no transcript bytes after restart.
   Changed or missing accepted members remain owed when the saved state cannot prove
-  a complete replacement without rereading sealed history. Continuous plain groups
+  a complete replacement without rereading sealed history. Member activity/tool facts
+  merge before their existing projection; changed files stay distinct and artifacts
+  use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
