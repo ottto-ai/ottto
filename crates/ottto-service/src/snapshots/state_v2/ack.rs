@@ -60,9 +60,8 @@ pub(crate) struct ProgressSeal {
     generation: serde_json::Result<u64>,
 }
 impl ProgressSeal {
-    /// `generation`: what the progress CAS already decoded from `bytes`.
-    pub(crate) fn new(bytes: &[u8], generation: Option<u64>) -> Self {
-        let generation = generation.map_or_else(|| progress_generation(bytes), Ok);
+    pub(crate) fn new(bytes: &[u8]) -> Self {
+        let generation = progress_generation(bytes);
         let digest = digest(bytes);
         Self { digest, generation }
     }
@@ -78,7 +77,7 @@ impl<'de> Deserialize<'de> for ProgressSeal {
                 f.write_str("a string")
             }
             fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<ProgressSeal, E> {
-                Ok(ProgressSeal::new(s.as_bytes(), None))
+                Ok(ProgressSeal::new(s.as_bytes()))
             }
         }
         d.deserialize_str(Seal)
@@ -456,7 +455,7 @@ impl ProgressRecovery {
     }
     fn receipt_at(&self, scope: &Scope) -> Result<Receipt> {
         self.checked(scope, |progress: &mut String| {
-            ProgressSeal::new(progress.as_bytes(), None)
+            ProgressSeal::new(progress.as_bytes())
         })
     }
     fn checked<P: serde::de::DeserializeOwned>(
@@ -532,7 +531,7 @@ impl ProgressRecovery {
     ) -> Result<Vec<u8>> {
         let scope = self.current_scope()?;
         let receipt = self.checked(&scope, |seal: &mut ProgressSeal| {
-            std::mem::replace(seal, ProgressSeal::new(&[], Some(0)))
+            std::mem::replace(seal, ProgressSeal::new(&[]))
         })?;
         let previous_digest = previous.as_ref().map(|seal| seal.digest);
         require(
@@ -610,7 +609,7 @@ impl ProgressRecovery {
         previous: Option<&[u8]>,
         next: &[u8],
     ) -> Result<()> {
-        let previous = previous.map(|bytes| ProgressSeal::new(bytes, None));
+        let previous = previous.map(ProgressSeal::new);
         self.before_progress_save(previous, || Ok(next.to_vec()))
             .map(drop)
     }

@@ -2510,11 +2510,16 @@ fn ack_bound_save_allocation_peak_per_progress_byte() {
     progress.save(&path).unwrap();
     let size = std::fs::metadata(&path).unwrap().len() as usize;
     let (_, peak) = crate::retry_allocation_probe::measure(|| progress.save(&path).unwrap());
-    let ratio = peak.requested_peak_with_overlap as f64 / size as f64;
+    let requested = peak.requested_peak as f64 / size as f64;
+    let overlap = peak.requested_peak_with_overlap as f64 / size as f64;
     eprintln!(
-        "progress_save_allocation bytes={size} requested_peak={} with_overlap={} ratio={ratio:.2}",
+        "progress_save_allocation bytes={size} requested_peak={} with_overlap={} \
+         ratio={requested:.2}/{overlap:.2}",
         peak.requested_peak, peak.requested_peak_with_overlap
     );
-    // The build before one-copy saves measured 7.24 on this fixture (Linux CI).
-    assert!(ratio < 6.0, "{ratio:.2}");
+    // Linux CI on this fixture: 6.39/7.24 before one-copy saves, 3.39/4.24 after.
+    assert!(
+        requested < 3.6 && overlap < 4.5,
+        "{requested:.2}/{overlap:.2}"
+    );
 }

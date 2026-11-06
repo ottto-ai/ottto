@@ -177,9 +177,7 @@ fn progress_save_receipt_check_fails_as_the_owned_check_does() {
             hold
         );
         let sealed = binding
-            .before_progress_save(Some(ProgressSeal::new(&old, None)), || {
-                Ok(progress(5, "new"))
-            })
+            .before_progress_save(Some(ProgressSeal::new(&old)), || Ok(progress(5, "new")))
             .unwrap_err()
             .to_string();
         assert_eq!(

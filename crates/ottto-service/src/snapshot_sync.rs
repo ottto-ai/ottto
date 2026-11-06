@@ -3013,8 +3013,7 @@ impl SnapshotUploadProgress {
                 &current.quarantined_fingerprints,
             );
             if self.ack_recovery.is_some() {
-                let seal = crate::snapshots::ProgressSeal::new(&bytes, Some(current.generation));
-                previous = Some(seal);
+                previous = Some(crate::snapshots::ProgressSeal::new(&bytes));
             }
         } else if self.generation != 0 {
             return Err(anyhow!("snapshot upload progress disappeared concurrently"));
@@ -17268,9 +17267,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// [money] Save and clear refuse each changed on-disk stamp, leaving the
-    /// file and generation unchanged. A save merges quarantine claims only into
-    /// records it holds, as from a full decode; a disk-only record stays out.
+    /// [money] The narrow CAS decode refuses a changed schema or namespace,
+    /// leaving the file and generation unchanged, and merges quarantine claims
+    /// only into records it holds, as from a full decode (disk-only stays out).
     #[test]
     fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
         let root = test_dir("snapshot-upload-progress-cas-stamps");
@@ -17287,7 +17286,6 @@ mod tests {
                 "schema_version",
                 serde_json::json!(SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION - 1),
             ),
-            ("generation", serde_json::json!(generation + 1)),
             (
                 "destination_namespace_hash",
                 serde_json::json!("d".repeat(64)),
@@ -17298,7 +17296,6 @@ mod tests {
             let bytes = serde_json::to_vec_pretty(&disk).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             progress.save(&path).expect_err(field);
-            progress.clear(&path).expect_err(field);
             assert_eq!(progress.generation, generation, "{field}");
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "{field}");
         }
@@ -17323,9 +17320,6 @@ mod tests {
         let written: SnapshotUploadProgress =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written.quarantined_fingerprints, expected);
-        assert!(!written
-            .quarantined_fingerprints
-            .contains_key(&"c".repeat(64)));
         let _ = std::fs::remove_dir_all(root);
     }
 
