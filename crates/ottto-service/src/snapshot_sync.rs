@@ -17252,6 +17252,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// [money] Save and clear refuse each changed on-disk stamp, leaving the
+    /// file and generation unchanged. A save merges quarantine claims only into
+    /// records it holds, as from a full decode; a disk-only record stays out.
+    #[test]
+    fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
+        let root = test_dir("snapshot-upload-progress-cas-stamps");
+        let path = root.join("progress-v2.json");
+        let namespace = format!("{:064x}", 44);
+        let mut progress = SnapshotUploadProgress::new(namespace, test_quarantine_witness());
+        progress.quarantine_body(&"a".repeat(64), &"b".repeat(64));
+        progress.save(&path).expect("initial progress");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let generation = progress.generation;
+        for (field, value) in [
+            (
+                "schema_version",
+                serde_json::json!(SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION - 1),
+            ),
+            ("generation", serde_json::json!(generation + 1)),
+            (
+                "destination_namespace_hash",
+                serde_json::json!("d".repeat(64)),
+            ),
+        ] {
+            let mut disk = saved.clone();
+            disk[field] = value;
+            let bytes = serde_json::to_vec_pretty(&disk).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            progress.save(&path).expect_err(field);
+            progress.clear(&path).expect_err(field);
+            assert_eq!(progress.generation, generation, "{field}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{field}");
+        }
+        let mut disk = saved;
+        let records = &mut disk["quarantined_fingerprints"];
+        let contract = records["a".repeat(64)]["reconstruction_contract"]
+            .as_u64()
+            .unwrap();
+        records["a".repeat(64)]["reconstruction_contract"] = serde_json::json!(contract + 1);
+        records["a".repeat(64)]["contract_retry_claims"] = serde_json::json!(1);
+        let disk_only = records["a".repeat(64)].clone();
+        records["c".repeat(64)] = disk_only;
+        let bytes = serde_json::to_vec_pretty(&disk).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let full: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+        let mut expected = progress.quarantined_fingerprints.clone();
+        assert!(crate::snapshots::terminal_contract_retry::merge_maps(
+            &mut expected,
+            &full.quarantined_fingerprints
+        ));
+        progress.save(&path).expect("same stamps save");
+        let written: SnapshotUploadProgress =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.quarantined_fingerprints, expected);
+        assert!(!written
+            .quarantined_fingerprints
+            .contains_key(&"c".repeat(64)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn snapshot_upload_progress_quarantines_truncated_state_and_rebuilds() {
         let root = test_dir("snapshot-upload-progress-corrupt");
