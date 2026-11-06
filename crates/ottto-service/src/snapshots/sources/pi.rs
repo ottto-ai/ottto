@@ -573,9 +573,9 @@ fn text_from_array(value: Option<&Value>) -> Option<String> {
 
 #[derive(Clone, Default)]
 pub(crate) struct PiUsageDedupState {
-    message: BTreeMap<String, usize>,
-    message_end: BTreeMap<String, usize>,
-    paired_digests: BTreeSet<String>,
+    pub(in crate::snapshots) message: BTreeMap<String, usize>,
+    pub(in crate::snapshots) message_end: BTreeMap<String, usize>,
+    pub(in crate::snapshots) paired_digests: BTreeSet<String>,
 }
 
 /// The accumulator's Pi-only state: the usage dedup ledger and the fork
