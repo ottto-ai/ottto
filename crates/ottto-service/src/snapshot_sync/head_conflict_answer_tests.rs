@@ -461,7 +461,7 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     });
     assert!(unanswered[0].ends_with(&format!(
         " bad_refs=1 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
-        snapshot_upload_body_witness(&item),
+        &snapshot_upload_body_witness(&item)[..8],
         parts[0],
         parts[1],
         parts[2],
@@ -512,7 +512,7 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
              echoed_witness_version={version} bad_refs=1 answered=true expected_digest={} account_part={} tool_part={} cache_part={}",
             &key[..8],
             &item.snapshot_fingerprint[..8],
-                crate::snapshots::snapshot_upload_body_witness(&item),
+                &crate::snapshots::snapshot_upload_body_witness(&item)[..8],
                 parts[0], parts[1], parts[2],
             )]
     );

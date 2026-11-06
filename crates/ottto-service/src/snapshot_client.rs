@@ -1383,7 +1383,7 @@ fn warn_body_witness_refusal(
         reference
             .body_witness_version
             .map_or_else(|| "none".to_string(), |version| version.to_string()),
-        snapshot_upload_body_witness(item),
+        &snapshot_upload_body_witness(item)[..8],
         &parts[0][..8],
         &parts[1][..8],
         &parts[2][..8],
@@ -4844,7 +4844,7 @@ mod tests {
                  echoed_witness_version={version} bad_refs=2 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
                 crate::snapshot_sync::SessionHash::of(&first.source_session_id),
                 &first.snapshot_fingerprint[..8],
-                crate::snapshots::snapshot_upload_body_witness(first),
+                &crate::snapshots::snapshot_upload_body_witness(first)[..8],
                 parts[0], parts[1], parts[2],
             )
         );
@@ -4852,8 +4852,8 @@ mod tests {
             crate::snapshots::snapshot_upload_body_witness(first),
             "0".repeat(64),
         );
-        assert!(line.contains(&format!("expected_digest={digest}")));
-        for secret in [&first.source_session_id, &zeros] {
+        assert!(line.contains(&format!("expected_digest={} ", &digest[..8])));
+        for secret in [&first.source_session_id, &zeros, &digest] {
             assert!(!line.contains(secret), "{line}");
         }
         // Both bad refs are named by request index on the typed refusal.
