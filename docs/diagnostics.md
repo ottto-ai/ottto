@@ -1716,6 +1716,18 @@ Counts are per parsed usage line, not per unique request; rereads count again. I
 is a cumulative saturating process total with no key name, path or session id,
 and it never affects money.
 
+## Claude forced-family seeds
+
+The Claude `native_collection_page` line carries, nonzero only,
+`forced_family_seeds` (path twins whose own candidate decision pulled their
+family in, one per twin, keyed by that `CandidateParseReason` label, `other`
+for a Parse without one, or `identification_failed`), and in `page_selection`
+`forced_family_roots` (distinct roots those twins forced) and
+`forced_family_members_pulled` (family paths the closure for every forced root
+names: the ones it adds and the ones already on the page). Counted after
+selection since the previous Claude page; counts only, no ids or paths; they
+never affect selection or money.
+
 ## Claude OTLP spans and relay requests not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude

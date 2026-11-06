@@ -4021,10 +4021,11 @@ impl OwnedSourceScan {
                     )
                     .is_empty()
                 })
-                .filter(|candidate| {
-                    let mut twin = (*candidate).clone();
+                .filter_map(|candidate| {
+                    let mut twin = candidate.clone();
                     prepare_candidate_context(&mut twin);
-                    match open_and_identify_scan_candidate_at(
+                    // A seed: its own Parse decision, or `None` when unidentified.
+                    let seed = open_and_identify_scan_candidate_at(
                         source,
                         twin,
                         &mut ScanCensus::default(),
@@ -4038,28 +4039,26 @@ impl OwnedSourceScan {
                             growth: sampled_audit::growth_active(index)
                                 .then_some(&index.v2().growth_retention),
                         },
-                    ) {
-                        Some((twin, _)) => {
-                            index.candidate_decision_with_reason_at(&twin, audit_now).0
-                                == CandidateDecision::Parse
-                        }
-                        None => true,
-                    }
+                    )
+                    .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, audit_now));
+                    seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
+                        .then_some((candidate.path.as_path(), seed.map(|(_, reason)| reason)))
                 })
-                .map(|candidate| candidate.path.as_path())
-                .partition(|path| {
+                .partition(|(path, _)| {
                     sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
                 });
-            for root in
-                claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
-            {
+            let (read_twins, seeds): (Vec<_>, Vec<_>) = read_twins.into_iter().unzip();
+            let roots =
+                claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups);
+            crate::local_resource_diagnostics::forced_family_seeds(seeds, roots.len());
+            for root in roots {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
                 }
             }
             let paced_twins = paced_twins
                 .into_iter()
-                .map(Path::to_path_buf)
+                .map(|(path, _)| path.to_path_buf())
                 .collect::<BTreeSet<_>>();
             identified_candidates.retain(|candidate| {
                 let paced = paced_twins.contains(&candidate.path);
@@ -4095,6 +4094,7 @@ impl OwnedSourceScan {
                 &forced_claude_family_reparses,
             )
             .into_iter()
+            .inspect(|_| crate::local_resource_diagnostics::forced_family_member_pulled())
             .filter(|path| !already_identified.contains(&local_index_key(path)))
             .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
