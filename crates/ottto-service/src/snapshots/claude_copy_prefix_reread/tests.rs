@@ -428,7 +428,65 @@ fn changed_scope_cannot_rearm() {
     run(&home.join("scope.json"), &support, true).unwrap();
     let before = serde_json::to_value(&index).unwrap();
     fs::write(&paths[0], "changed").unwrap();
+    assert!(prepare(&mut index, &support, std::slice::from_ref(&root)).is_err());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    // Unaccepted or absent intent is never retired: it stays and is refused.
+    let file = support.join("snapshots").join(REQUEST);
+    assert!(file.exists());
+    index.copy_prefix_last_accepted_nonce = Some("another-request".into());
+    assert!(prepare(&mut index, &support, std::slice::from_ref(&root)).is_err());
+    let mut request: Request = bounded_json(&file).unwrap();
+    request.nonce = None;
+    fs::write(&file, serde_json::to_vec(&request).unwrap()).unwrap();
+    index.copy_prefix_last_accepted_nonce = None;
     assert!(prepare(&mut index, &support, &[root]).is_err());
+    assert!(file.exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// [regress] A spent request refused after member changes is retired, once.
+#[test]
+fn refused_spent_request_is_retired_without_touching_debt() {
+    let (home, root, mut index, paths) = setup("copy-prefix-retire-spent");
+    let support = home.join("support");
+    let scope = home.join("scope.json");
+    run(&scope, &support, true).unwrap();
+    let roots = std::slice::from_ref(&root);
+    let pending = prepare(&mut index, &support, roots).unwrap();
+    assert_eq!(pending.len(), 3);
+    let file = support.join("snapshots").join(REQUEST);
+    let accepted = index.copy_prefix_last_accepted_nonce.clone();
+    assert!(accepted.is_some());
+    // A valid accepted request still prepares and stays.
+    assert_eq!(prepare(&mut index, &support, roots).unwrap(), pending);
+    assert!(file.exists());
+    let before = serde_json::to_value(&index).unwrap();
+    let modified = SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(&paths[0])
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert!(prepare(&mut index, &support, roots).unwrap().is_empty());
+    assert!(!file.exists(), "spent request retired");
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    assert_eq!(index.copy_prefix_last_accepted_nonce, accepted);
+    assert!(prepare(&mut index, &support, roots).unwrap().is_empty());
+    // A later explicit replacement publishes new intent, refused as today.
+    super::run(
+        &scope,
+        &support,
+        &home.join("scan-index.json"),
+        true,
+        true,
+        BACKFILL_WINDOW_DAYS,
+    )
+    .unwrap();
+    let next: Request = bounded_json(&file).unwrap();
+    assert!(next.nonce.is_some() && next.nonce != accepted);
+    assert!(prepare(&mut index, &support, roots).is_err());
+    assert!(file.exists());
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
     fs::remove_dir_all(home).unwrap();
 }

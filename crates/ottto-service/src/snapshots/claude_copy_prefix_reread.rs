@@ -364,6 +364,30 @@ pub(crate) fn prepare(
         return Ok(Vec::new());
     }
     let request: Request = bounded_json(&path)?;
+    // An accepted nonce already published this request's debt in the index;
+    // ordinary re-owe and selection own it now. A refused spent request is
+    // retired, never re-armed; the index debt is left exactly as it is.
+    let nonce = request.nonce.clone();
+    let spent = nonce.is_some() && nonce == index.copy_prefix_last_accepted_nonce;
+    match prepare_request(index, request, roots, collected_at, window_days) {
+        // Re-read first: a concurrent `--replace` is new intent, never removed.
+        Err(_) if spent && bounded_json::<Request>(&path).is_ok_and(|r| r.nonce == nonce) => {
+            fs::remove_file(&path)?;
+            sync_checkpoint_parent(&path)?;
+            eprintln!("local Claude copy-prefix re-read: request_retired=1");
+            Ok(Vec::new())
+        }
+        result => result,
+    }
+}
+
+fn prepare_request(
+    index: &mut ScanIndex,
+    request: Request,
+    roots: &[PathBuf],
+    collected_at: &str,
+    window_days: u64,
+) -> Result<Vec<PathBuf>> {
     let mut request = plan(request.members, request.window_days, request.nonce)?;
     let (closed, _) = closure(index, &request)?;
     ensure!(
