@@ -2,7 +2,6 @@
 crates/ottto-service/src/snapshot_sync/claude_money_e2_pipeline_tests.rs	include	../snapshots/codex_legacy_fork_tests.rs
 crates/ottto-service/src/snapshot_sync/claude_money_e2_pipeline_tests.rs	include	../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs
 crates/ottto-service/src/snapshots.rs	include	snapshots/account_pending_retention_tests.rs
-crates/ottto-service/src/snapshots.rs	include	snapshots/authority_proof_correction.rs
 crates/ottto-service/src/snapshots.rs	include	snapshots/authority_proof_correction_tests.rs
 crates/ottto-service/src/snapshots.rs	include	snapshots/census_p2_kept_tests.rs
 crates/ottto-service/src/snapshots.rs	include	snapshots/checkpoint_main_tests.rs

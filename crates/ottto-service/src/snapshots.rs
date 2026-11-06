@@ -1370,7 +1370,17 @@ pub use scan_index::{
     SnapshotQuarantineRecord, SnapshotQuarantineWitness,
 };
 
-include!("snapshots/authority_proof_correction.rs");
+#[cfg(test)]
+pub(crate) use sources::claude::census::authority_proof_correction::claude_authority_drops_for_test;
+#[cfg(test)]
+use sources::claude::census::authority_proof_correction::ClaudeEmptyMapAdvance;
+use sources::claude::census::authority_proof_correction::{
+    claude_authority_record_contract_is_valid, count_claude_authority_unwitnessed_demotion,
+    ClaudeAuthorityProofCorrection,
+};
+pub(crate) use sources::claude::census::authority_proof_correction::{
+    ClaudeCutoffCorrectionCandidate, ClaudeProofBodyDrains, ClaudeProofCorrectionCandidate,
+};
 include!("snapshots/load_containment.rs");
 
 #[cfg(test)]
@@ -48892,10 +48902,6 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached);
-crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);
-crate::heap_layout_bound::fields!(ClaudeAuthorityProofCorrection; proof_witness_fingerprint, owed_member_ids);
-crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, root, member, proof, revision, fingerprint, body_witness);
-crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);
 crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
     U identity: String,

@@ -1,11 +1,30 @@
+//! Claude authority proof correction and exact-settlement bookkeeping.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::snapshots::{
+    claude_history_upgrade, claude_index_path_family_member, claude_index_path_member_ref,
+    claude_snapshot_family_root, claude_usage_authority_preserves_pending, sha256_hex,
+    snapshot_file_upload_body_set_hex, snapshot_fingerprint, ClaudeUsageAuthorityDisposition,
+    ClaudeUsageAuthorityQuarantineDisposition, ClaudeUsageAuthorityQuarantineRecord, ScanIndex,
+    SnapshotItem, SnapshotQuarantineDisposition, SnapshotSource, SourceScanResult,
+    CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION,
+    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+};
+
 #[derive(Debug)]
-struct ClaudeEmptyMapAdvance {
-    root: String,
-    member: String,
-    key: String,
-    revision: String,
-    previous: Option<String>,
+pub(in crate::snapshots) struct ClaudeEmptyMapAdvance {
+    pub(in crate::snapshots) root: String,
+    pub(in crate::snapshots) member: String,
+    pub(in crate::snapshots) key: String,
+    pub(in crate::snapshots) revision: String,
+    pub(in crate::snapshots) previous: Option<String>,
 }
+
+crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);
 
 #[derive(Debug)]
 struct ClaudeProofBodyDrain {
@@ -40,23 +59,27 @@ impl ClaudeProofBodyDrains {
 // A positive-proof correction is local checkpoint bookkeeping. It never
 // authorizes collection, ownership, or acceptance of an unacknowledged body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ClaudeAuthorityProofCorrection {
-    proof_witness_fingerprint: String,
-    owed_member_ids: BTreeSet<String>,
+pub(in crate::snapshots) struct ClaudeAuthorityProofCorrection {
+    pub(in crate::snapshots) proof_witness_fingerprint: String,
+    pub(in crate::snapshots) owed_member_ids: BTreeSet<String>,
 }
+
+crate::heap_layout_bound::fields!(ClaudeAuthorityProofCorrection; proof_witness_fingerprint, owed_member_ids);
 
 // Page-scoped evidence captured after policy/account filtering, before no-op
 // suppression. This is not persisted and contains no new provider evidence.
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeProofCorrectionCandidate {
-    index_key: String,
-    root: String,
-    member: String,
-    proof: String,
-    revision: String,
-    fingerprint: String,
-    body_witness: String,
+    pub(in crate::snapshots) index_key: String,
+    pub(in crate::snapshots) root: String,
+    pub(in crate::snapshots) member: String,
+    pub(in crate::snapshots) proof: String,
+    pub(in crate::snapshots) revision: String,
+    pub(in crate::snapshots) fingerprint: String,
+    pub(in crate::snapshots) body_witness: String,
 }
+
+crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, root, member, proof, revision, fingerprint, body_witness);
 
 #[derive(Debug)]
 pub(crate) struct ClaudeCutoffCorrectionCandidate {
@@ -66,6 +89,8 @@ pub(crate) struct ClaudeCutoffCorrectionCandidate {
     proof: String,
     revision: String,
 }
+
+crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 
 #[cfg(test)]
 impl ClaudeProofCorrectionCandidate {
@@ -101,11 +126,11 @@ pub(crate) fn claude_authority_drops_for_test() -> (usize, usize) {
     CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(std::cell::Cell::get)
 }
 
-fn count_claude_authority_unwitnessed_demotion() {
+pub(in crate::snapshots) fn count_claude_authority_unwitnessed_demotion() {
     CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn claude_authority_record_contract_is_valid(
+pub(in crate::snapshots) fn claude_authority_record_contract_is_valid(
     record: &ClaudeUsageAuthorityQuarantineRecord,
 ) -> bool {
     match (&record.proof_correction, record.contract.as_str()) {
@@ -135,7 +160,7 @@ impl ScanIndex {
     // the upload ledger stay. Its indexed members are re-armed, bounded by
     // family size, so the next pass re-reads the family and re-forms the
     // record against the current witness, or leaves unproven residue.
-    fn drop_unbound_claude_authority_records(&mut self, stage: &str) {
+    pub(in crate::snapshots) fn drop_unbound_claude_authority_records(&mut self, stage: &str) {
         let witnesses = &self.claude_usage_family_witnesses;
         let unbound = self
             .claude_usage_authority_quarantine
@@ -247,7 +272,10 @@ impl ScanIndex {
 
     // Capture only changed no-body pairs, not an index clone. Used by every
     // restoration seam so a carried map revision cannot certify reverted facts.
-    fn claude_empty_map_advances(&self, previous: &ScanIndex) -> Vec<ClaudeEmptyMapAdvance> {
+    pub(in crate::snapshots) fn claude_empty_map_advances(
+        &self,
+        previous: &ScanIndex,
+    ) -> Vec<ClaudeEmptyMapAdvance> {
         if !self.claude_authority_proof_correction_pending() {
             return Vec::new();
         }
@@ -293,7 +321,10 @@ impl ScanIndex {
         advances
     }
 
-    fn restore_claude_empty_map_advances(&mut self, advances: Vec<ClaudeEmptyMapAdvance>) {
+    pub(in crate::snapshots) fn restore_claude_empty_map_advances(
+        &mut self,
+        advances: Vec<ClaudeEmptyMapAdvance>,
+    ) {
         for advance in advances {
             let carried = self.confirmed_empty_files.contains(&advance.key)
                 && self.files.get(&advance.key).is_some_and(|entry| {
