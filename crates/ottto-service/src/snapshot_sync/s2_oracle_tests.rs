@@ -421,7 +421,9 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
                 .cloned();
         }
         assert_eq!(
-            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds()),
+            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds(), |_| {
+                false
+            }),
             0
         );
         let mut settled = challenged.clone();

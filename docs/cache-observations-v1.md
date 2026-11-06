@@ -80,6 +80,16 @@ challenges never authorize a cache correction. Exact head ACKs and numeric cache
 existing destination-scoped atomic upload ledger across completed cycles and
 restarts. Legacy count-only responses cannot acknowledge cache evidence.
 
+When the hint also advertises `cache_full_replacement:v1` through
+`cache_full_replacement_contract`, a conflict answer for a session with no
+accepted local cache state marks its patch `full_replacement: true`. That patch
+already completes from empty, so the receiver replaces the session's cache state
+rather than merging onto a predecessor this collector never acknowledged. The
+marker is transport-only (outside the body witness and semantic revision),
+omitted when false, and dropped when it would exceed the patch bound. Only the
+exact stored ACK of a marked answer records cache state, from empty. A session
+with accepted local cache state, an ordinary upload and Pi stay unmarked.
+
 The body witness hashes canonical cumulative cache state plus declared existing
 curve/tool fields. Modern cache-only versions 15/16 normalize to public ACK
 versions 13/14; cache-plus-curve versions 19/20 normalize to 17/18. Cache remains

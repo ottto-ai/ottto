@@ -3127,7 +3127,10 @@ fn arms(c: &Corpus, warm: &E2ScanFixture, disk: &mut Disk, prior: &ScanIndex) ->
 fn answers(page: &Page, progress: &SnapshotUploadProgress, challenge: &str) {
     let mut sent = under_cas(&page.scan.snapshots, progress);
     let now = current_unix_seconds();
-    assert_eq!(attach_head_conflict_answers(&mut sent, progress, now), 1);
+    assert_eq!(
+        attach_head_conflict_answers(&mut sent, progress, now, |_| false),
+        1
+    );
     let root = sent.iter().find(|item| item.source_session_id == ROOT);
     let answer = root.and_then(|item| item.cache_conflict_answer.clone());
     assert_eq!(answer.map(|(c, _)| c), Some(challenge.to_owned()));

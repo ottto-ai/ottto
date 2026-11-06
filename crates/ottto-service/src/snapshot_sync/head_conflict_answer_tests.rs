@@ -148,7 +148,7 @@ pub(super) fn cycle_with_transport(
             .active_quarantine_retries
             .insert(item.snapshot_fingerprint.clone());
     }
-    let page = selected_page(progress, items, now, class, enforce, server);
+    let page = selected_page(progress, items, now, class, enforce, server, false);
     progress.active_quarantine_retries.clear();
     page
 }
@@ -162,6 +162,7 @@ fn selected_page(
     class: impl Fn(&SnapshotItem) -> u8,
     enforce: impl Fn(&[SnapshotItem]) -> bool,
     mut server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+    replacement: bool,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
     let path = root.join("progress.json");
@@ -177,7 +178,7 @@ fn selected_page(
             .get(&cache_session_key(&item.source_session_id))
             .cloned();
     }
-    attach_head_conflict_answers(&mut items, progress, now);
+    attach_head_conflict_answers(&mut items, progress, now, |_| replacement);
     let mut wires = Vec::new();
     let mut accepted_count = 0;
     let result = upload_resumable_batches_with_literal_families(
@@ -361,7 +362,10 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     // Recovered: the following upload uses the new base and no answer.
     let mut next = vec![item.clone()];
     next[0].cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
-    assert_eq!(attach_head_conflict_answers(&mut next, &progress, 1_002), 0);
+    assert_eq!(
+        attach_head_conflict_answers(&mut next, &progress, 1_002, |_| false),
+        0
+    );
     let next_wire = serde_json::to_value(request(next).wire_with_head_cas()).unwrap();
     assert_eq!(envelope(&next_wire)["base_head_etag"], "2".repeat(64));
     assert!(envelope(&next_wire)
@@ -627,6 +631,7 @@ fn a_named_witness_refusal_sets_aside_only_its_body_and_resends_the_owed_answer(
                 }
                 Ok(ack)
             },
+            false,
         );
         progress.active_quarantine_retries.clear();
         let carried = |wire: &Value| {
@@ -1024,10 +1029,15 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
             last_answer_unix: 0,
         },
     );
-    let reserved = identity_cache_wire_reserve(&item, &progress);
+    let reserved = identity_cache_wire_reserve(&item, &progress, false);
     let mut projected = item.clone();
     prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
-    attach_head_conflict_answers(std::slice::from_mut(&mut projected), &progress, u64::MAX);
+    attach_head_conflict_answers(
+        std::slice::from_mut(&mut projected),
+        &progress,
+        u64::MAX,
+        |_| false,
+    );
     assert!(projected.cache_conflict_answer.is_some());
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
@@ -1054,7 +1064,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     record.answer_attempts = 1;
     record.last_answer_unix = current_unix_seconds();
     assert_eq!(
-        identity_cache_wire_reserve(&item, &progress),
+        identity_cache_wire_reserve(&item, &progress, false),
         reserved,
         "pacing-boundary crossing cannot evade admission reserve"
     );
@@ -1063,14 +1073,14 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     withheld[0].cache_observations = None;
     withheld[0].cache_observations_state = None;
     assert_eq!(
-        attach_head_conflict_answers(&mut withheld, &progress, 1_000),
+        attach_head_conflict_answers(&mut withheld, &progress, 1_000, |_| true),
         0
     );
     assert!(withheld[0].cache_conflict_answer.is_none());
     let mut no_base = vec![item.clone()];
     no_base[0].cache_base_head_etag = None;
     assert_eq!(
-        attach_head_conflict_answers(&mut no_base, &progress, 1_000),
+        attach_head_conflict_answers(&mut no_base, &progress, 1_000, |_| true),
         0
     );
     assert!(no_base[0].cache_conflict_answer.is_none());
@@ -1395,4 +1405,328 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     assert_eq!(answers, 1);
     assert!(!mirrored(&restarted, &key), "settled");
     assert_eq!(restarted.accepted_cache_heads[&key], "4".repeat(64));
+}
+
+/// `cycle` with the cache full replacement negotiated and the session's
+/// native Full owed, as the main pass passes them to the answer owner.
+fn replacing_cycle(
+    progress: &mut SnapshotUploadProgress,
+    item: &SnapshotItem,
+    now: u64,
+    server: impl Fn(&SnapshotItem) -> Result<SnapshotBatchResponse>,
+) -> (Result<ResumableUploadResult>, Value) {
+    progress
+        .active_quarantine_retries
+        .insert(item.snapshot_fingerprint.clone());
+    let (result, mut wires) = selected_page(
+        progress,
+        std::slice::from_ref(item),
+        now,
+        |_| 0,
+        |_| true,
+        |request, _| server(&request.snapshots[0]),
+        true,
+    );
+    progress.active_quarantine_retries.clear();
+    (result, wires.pop().unwrap_or(Value::Null))
+}
+
+fn marker(wire: &Value) -> Option<&Value> {
+    wire["snapshots"][0]["cache_observations"].get("full_replacement")
+}
+
+fn owed(item: &SnapshotItem) -> SnapshotUploadProgress {
+    let mut progress = progress_with_stale_head(item);
+    let _ = cycle(&mut progress, item, 1_000, |item| {
+        conflict(item, &challenge(0xc))
+    });
+    assert!(progress.accepted_cache_states.is_empty(), "A is empty");
+    progress
+}
+
+fn hint(extra: Value) -> crate::snapshot_client::ActivityHintResponse {
+    let mut hint = serde_json::json!({"source":"codex","server_time":"2026-11-06T00:00:00Z",
+        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+        "local_usage_reconciliation_enabled":true,"backfill_window_days":30,
+        "recommended_scan_after":"2026-11-06T00:05:00Z"});
+    hint.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    crate::snapshot_client::decode_activity_hint(hint).unwrap()
+}
+
+/// [behaviour] Both exact contracts negotiate; either alone, an unknown
+/// token or Pi (no base cache contract) does not.
+#[test]
+fn full_replacement_needs_both_contracts_and_never_pi() {
+    let cache =
+        serde_json::json!({"session_cache_observations_contract":"session_cache_observations:v1"});
+    let both = serde_json::json!({"session_cache_observations_contract":"session_cache_observations:v1",
+        "cache_full_replacement_contract":"cache_full_replacement:v1"});
+    let only = serde_json::json!({"cache_full_replacement_contract":"cache_full_replacement:v1"});
+    let unknown = serde_json::json!({"session_cache_observations_contract":"session_cache_observations:v1",
+        "cache_full_replacement_contract":"cache_full_replacement:v2"});
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        assert!(cache_full_replacement_negotiated(
+            source,
+            &hint(both.clone())
+        ));
+        for off in [&cache, &only, &unknown] {
+            assert!(!cache_full_replacement_negotiated(
+                source,
+                &hint(off.clone())
+            ));
+        }
+    }
+    assert!(!cache_full_replacement_negotiated(
+        SnapshotSource::Pi,
+        &hint(both)
+    ));
+}
+
+/// [regress][money] The observed class: an owed answer with no local cache
+/// state. The marked answer is the unmarked one plus the marker; the witness,
+/// fingerprint and envelope are unchanged; the exact ACK records the cache
+/// state from empty; a restored checkpoint settles nothing twice.
+#[test]
+fn negotiated_answer_without_cache_state_marks_a_full_replacement() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let head = "2".repeat(64);
+
+    let mut control = owed(&item);
+    let (result, unmarked) = cycle(&mut control, &item, 1_001, |item| accepted(item, &head));
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(marker(&unmarked).is_none(), "unnegotiated: no marker");
+    // Unnegotiated bytes are today's: the answer alone, attached by hand.
+    let mut today = item.clone();
+    today.cache_base_head_etag = Some(stale_head());
+    today.cache_conflict_answer = Some((challenge(0xc), revision_v2(&item)));
+    let today = serde_json::to_value(request(vec![today]).wire_with_head_cas()).unwrap();
+    let bytes = serde_json::to_vec(&unmarked).unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&today).unwrap());
+    assert!(!String::from_utf8(bytes)
+        .unwrap()
+        .contains("full_replacement"));
+
+    let mut progress = owed(&item);
+    let (result, marked) = replacing_cycle(&mut progress, &item, 1_001, |sent| {
+        assert!(sent.cache_observations.as_ref().unwrap().full_replacement);
+        assert_eq!(
+            snapshot_upload_body_witness(sent),
+            snapshot_upload_body_witness(&item),
+            "transport-only marker"
+        );
+        Ok(accepted(sent, &head))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(marker(&marked), Some(&Value::Bool(true)));
+    assert_eq!(envelope(&marked)["forced_full_rescan"], true);
+    assert_eq!(envelope(&marked)["conflict_head_challenge"], challenge(0xc));
+    let mut stripped = marked.clone();
+    stripped["snapshots"][0]["cache_observations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("full_replacement");
+    assert_eq!(
+        stripped, unmarked,
+        "cache bytes unchanged apart from the marker"
+    );
+
+    let from_empty =
+        crate::snapshots::cache_state_from_patch(None, item.cache_observations.as_ref().unwrap())
+            .unwrap();
+    assert_eq!(progress.accepted_cache_states[&key], from_empty);
+    assert_eq!(
+        progress.accepted_cache_states,
+        control.accepted_cache_states
+    );
+    assert_eq!(
+        progress.accepted_body_witnesses,
+        control.accepted_body_witnesses
+    );
+    assert_eq!(progress.accepted_cache_heads[&key], head);
+    assert!(progress.head_conflict_challenges.is_empty());
+
+    // Checkpoint restore: the settled session owes nothing and a later
+    // ordinary upload is never marked and records the same state once.
+    let root = crate::test_scratch::ScratchDir::new("cache-replacement-restore");
+    let path = root.join("progress.json");
+    progress.generation = 0;
+    progress.save(&path).unwrap();
+    let mut restored = SnapshotUploadProgress::load(
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert_eq!(
+        restored.accepted_cache_states,
+        progress.accepted_cache_states
+    );
+    let mut revised = item.clone();
+    revised.avg_duration_ms = Some(revised.avg_duration_ms.unwrap_or_default() + 1);
+    revised.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &revised);
+    let (result, ordinary) = replacing_cycle(&mut restored, &revised, 1_002, |sent| {
+        Ok(accepted(sent, &"3".repeat(64)))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(marker(&ordinary).is_none(), "ordinary upload never marked");
+    assert!(envelope(&ordinary).get("conflict_head_challenge").is_none());
+    assert_eq!(restored.accepted_cache_states[&key], from_empty);
+    assert_eq!(restored.accepted_cache_states.len(), 1);
+}
+
+/// [behaviour] Only an owed answer with no local cache state that fits the
+/// patch bound is marked; every other body keeps today's unmarked wire.
+#[test]
+fn full_replacement_marks_only_the_owed_empty_state_answer() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let progress = owed(&item);
+    let attach = |progress: &SnapshotUploadProgress, item: &SnapshotItem, owed: bool| {
+        let mut sent = vec![item.clone()];
+        sent[0].cache_base_head_etag = Some(stale_head());
+        attach_head_conflict_answers(&mut sent, progress, 1_001, |_| owed);
+        sent.remove(0)
+    };
+    let marked = |item: &SnapshotItem| item.cache_observations.as_ref().unwrap().full_replacement;
+    assert!(marked(&attach(&progress, &item, true)));
+    // Not owed (no real native Full this pass, or not negotiated): unmarked.
+    let unowed = attach(&progress, &item, false);
+    assert!(unowed.cache_conflict_answer.is_some() && !marked(&unowed));
+    // A present: the answer stays unmarked, as today.
+    let mut present = progress.clone();
+    present.accepted_cache_states.insert(
+        key.clone(),
+        serde_json::json!({"schema_version":1,"observations":[],"coverage":"complete","omitted_observation_count":null}),
+    );
+    let kept = attach(&present, &item, true);
+    assert!(kept.cache_conflict_answer.is_some() && !marked(&kept));
+    // No challenge: an ordinary upload is never marked.
+    let mut healthy = progress.clone();
+    healthy.head_conflict_challenges.clear();
+    let plain = attach(&healthy, &item, true);
+    assert!(plain.cache_conflict_answer.is_none() && !marked(&plain));
+    // A re-attach resets a marker together with its answer.
+    let mut again = vec![attach(&progress, &item, true)];
+    attach_head_conflict_answers(&mut again, &healthy, 1_001, |_| true);
+    assert!(again[0].cache_conflict_answer.is_none() && !marked(&again[0]));
+
+    // Byte-limit edge: a patch one byte under the bound cannot carry the
+    // marker, so the answer stays unmarked rather than 422 the batch.
+    let mut edge = item.clone();
+    let patch = edge.cache_observations.as_mut().unwrap();
+    let size = |patch: &crate::snapshots::cache_observations::CacheObservations| {
+        crate::canonical_json::canonicalize(&serde_json::to_value(patch).unwrap())
+            .unwrap()
+            .len()
+    };
+    let pad = crate::snapshots::cache_observations::MAX_PATCH_BYTES - size(&*patch) - 1;
+    let crate::snapshots::cache_observations::Operation::Upsert { observation } =
+        &mut patch.operations[0]
+    else {
+        panic!("fixture carries an upsert");
+    };
+    observation.detector_version.push_str(&"x".repeat(pad));
+    assert!(patch.validate());
+    let at_edge = attach(&progress, &edge, true);
+    assert!(at_edge.cache_conflict_answer.is_some() && !marked(&at_edge));
+    assert!(at_edge.cache_observations.as_ref().unwrap().validate());
+
+    // The admission reserve counts the marker framing (Claude preflight).
+    let mut reserving = progress.clone();
+    reserving
+        .accepted_cache_heads
+        .insert(key.clone(), stale_head());
+    let reserved = identity_cache_wire_reserve(&item, &reserving, true);
+    let mut projected = item.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, &reserving, true, false, &BTreeSet::new());
+    attach_head_conflict_answers(
+        std::slice::from_mut(&mut projected),
+        &reserving,
+        u64::MAX,
+        |_| true,
+    );
+    assert!(marked(&projected));
+    assert_eq!(
+        crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
+        crate::snapshots::claude_request_identity::item_bytes(&projected)
+    );
+    assert!(reserved > identity_cache_wire_reserve(&item, &reserving, false));
+}
+
+/// [money] A refused, stale or mismatched ACK of a marked answer earns no
+/// replacement credit. A committed write whose response was lost keeps its
+/// debt; the replay records only on the exact stored unchanged proof.
+#[test]
+fn marked_answer_records_only_on_an_exact_stored_ack() {
+    let item = item();
+    let key = cache_session_key(&item.source_session_id);
+    let head = "2".repeat(64);
+
+    let mut stale = owed(&item);
+    let (_, wire) = replacing_cycle(&mut stale, &item, 1_001, |sent| {
+        Ok(conflict(sent, &challenge(0xd)))
+    });
+    assert_eq!(marker(&wire), Some(&Value::Bool(true)));
+    assert!(stale.accepted_cache_states.is_empty());
+    assert_eq!(stale.accepted_cache_heads[&key], stale_head());
+    assert_eq!(
+        stale.head_conflict_challenges[&key].challenge,
+        challenge(0xd)
+    );
+
+    let mut mismatched = owed(&item);
+    let _ = replacing_cycle(&mut mismatched, &item, 1_001, |sent| {
+        let mut ack = accepted(sent, &head);
+        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+        Ok(ack)
+    });
+    assert!(mismatched.accepted_cache_states.is_empty());
+    assert!(mismatched.accepted_body_witnesses.is_empty());
+
+    let mut basis = owed(&item);
+    let _ = replacing_cycle(&mut basis, &item, 1_001, |sent| {
+        let mut ack = accepted(sent, &head);
+        let mut entity = ack.accepted_entities.pop().unwrap();
+        entity.unchanged_basis = Some("usage_identical".into());
+        ack.unchanged_entities.push(entity);
+        Ok(ack)
+    });
+    assert!(basis.accepted_cache_states.is_empty());
+    assert!(basis.accepted_body_witnesses.is_empty());
+
+    // The server committed the replacement but the response was lost.
+    let mut lost = owed(&item);
+    let (result, wire) = replacing_cycle(&mut lost, &item, 1_001, |_| {
+        Err(anyhow!("synthetic lost response"))
+    });
+    assert!(result.is_err());
+    assert_eq!(marker(&wire), Some(&Value::Bool(true)));
+    assert!(lost.accepted_cache_states.is_empty(), "debt remains");
+    assert!(lost.accepted_body_witnesses.is_empty());
+    assert_eq!(
+        lost.head_conflict_challenges[&key].challenge,
+        challenge(0xc)
+    );
+    // The replay meets the stored head: exact unchanged proof, then record.
+    let (result, replay) = replacing_cycle(&mut lost, &item, 1_002, |sent| {
+        let mut ack = accepted(sent, &head);
+        let entity = ack.accepted_entities.pop().unwrap();
+        ack.unchanged_entities.push(entity);
+        Ok(ack)
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(marker(&replay), Some(&Value::Bool(true)));
+    assert_eq!(
+        lost.accepted_cache_states[&key],
+        crate::snapshots::cache_state_from_patch(None, item.cache_observations.as_ref().unwrap())
+            .unwrap()
+    );
+    assert_eq!(
+        lost.accepted_body_witnesses[&item.snapshot_fingerprint],
+        snapshot_upload_body_witness(&item)
+    );
 }
