@@ -10740,7 +10740,7 @@ where
                     }));
                 }
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
-                if identity_retry_at.is_some() {
+                if identity_retry_at.is_some() && status == Some(503) {
                     isolated_entities = isolated_entities.saturating_add(held.len());
                 }
                 crate::local_resource_diagnostics::traversal_point(

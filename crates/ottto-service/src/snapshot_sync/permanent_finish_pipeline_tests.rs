@@ -10,6 +10,7 @@ enum FinishOutcome {
     Accept,
     Retryable,
     Identity,
+    Identity429,
     Validation,
     Witness,
     ConflictValidation,
@@ -152,8 +153,15 @@ impl FinishServer {
                     let validation_index = items
                         .iter()
                         .position(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT);
-                    if matches!(outcome, FinishOutcome::Identity) {
-                        status = "503 Service Unavailable";
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Identity | FinishOutcome::Identity429
+                    ) {
+                        status = if matches!(outcome, FinishOutcome::Identity429) {
+                            "429 Too Many Requests"
+                        } else {
+                            "503 Service Unavailable"
+                        };
                         serde_json::json!({"code":"snapshot_original_identity_unavailable", "errors":(0..items.len()).map(|i| serde_json::json!({"loc":["body","snapshots",i]})).collect::<Vec<_>>()})
                     } else if let Some(index) = validation_index.filter(|_| {
                         matches!(
@@ -195,7 +203,11 @@ impl FinishServer {
                     }
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                if status == "503 Service Unavailable" && matches!(outcome, FinishOutcome::Identity)
+                if matches!(status, "503 Service Unavailable" | "429 Too Many Requests")
+                    && matches!(
+                        outcome,
+                        FinishOutcome::Identity | FinishOutcome::Identity429
+                    )
                 {
                     let body = response.to_string();
                     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -349,6 +361,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         }
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
+        let sent_at = current_unix_seconds();
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
             finish_sync_source(
                 preparation,
@@ -370,7 +383,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
             result.is_ok(),
             !matches!(
                 outcome,
-                FinishOutcome::Validation
+                FinishOutcome::Identity429
+                    | FinishOutcome::Validation
                     | FinishOutcome::Witness
                     | FinishOutcome::ConflictValidation
             ),
@@ -410,6 +424,25 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         )
         .unwrap();
         assert!(!progress.accepted_fingerprints.contains(fingerprint));
+        if matches!(
+            outcome,
+            FinishOutcome::Identity | FinishOutcome::Identity429
+        ) {
+            let record = &saved.quarantined_snapshot_fingerprints[fingerprint];
+            assert!(
+                (sent_at + 60..=current_unix_seconds() + 72)
+                    .contains(&record.retry_after_unix_seconds),
+                "both identity statuses retain the server Retry-After window"
+            );
+            assert_eq!(
+                record.upload_body_witness.as_ref(),
+                Some(&finish_wire_body_witness(&offered[0]))
+            );
+            assert!(
+                saved.bounded_sweep_had_unsettled_upload(),
+                "an OK verdict never settles held delivery"
+            );
+        }
         if matches!(outcome, FinishOutcome::ConflictValidation) {
             assert_eq!(saved.quarantined_snapshot_fingerprints.len(), 2);
             for item in offered.iter() {
@@ -452,6 +485,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
             FinishOutcome::Mixed
                 | FinishOutcome::Retryable
                 | FinishOutcome::Identity
+                | FinishOutcome::Identity429
                 | FinishOutcome::Validation
                 | FinishOutcome::Witness
                 | FinishOutcome::ConflictValidation
@@ -481,6 +515,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 FinishOutcome::Retryable
                 | FinishOutcome::Mixed
                 | FinishOutcome::Identity
+                | FinishOutcome::Identity429
                 | FinishOutcome::ConflictValidation => "server_error",
                 FinishOutcome::Validation | FinishOutcome::Witness => "server_error",
                 // The refused body is settled unproven-terminal residue; the
@@ -568,9 +603,15 @@ fn permanent_finish_real_pipeline_preserves_refusal_and_status_failures() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
-    for outcome in [FinishOutcome::Retryable, FinishOutcome::Mixed] {
+    for outcome in [
+        FinishOutcome::Retryable,
+        FinishOutcome::Mixed,
+        FinishOutcome::Identity,
+        FinishOutcome::Identity429,
+    ] {
         permanent_finish_pipeline(outcome);
     }
+    super::claude_money_e2_pipeline_tests::reject_isolation_tests::assert_mixed_retryable_holds();
 }
 
 /// A server identity deadline isolates the hold without claiming its bytes were ACKed.

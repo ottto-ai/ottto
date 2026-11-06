@@ -58,10 +58,18 @@ fn with_retry_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
 /// ref echoing another body witness naming the same item (each ended the
 /// whole pass), preserves money and lets exact-ACK siblings settle; its
 /// custody survives a restart and reaches a due retry. A validated mixed
-/// refusal follows the same custody and is counted as isolated.
+/// refusal and a validated per-entity conflict follow that custody. Named
+/// 503 identity holds are isolated; named 429 holds keep the same backoff and
+/// defer. Every arm uses the mixed page shape through the real packer.
 #[test]
 #[serial(client_report)]
 fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work() {
+    assert_mixed_retryable_holds();
+}
+
+// Shared with the finish regression row: the same accepted/held mixed page
+// exercises every source through the production packer and money oracle.
+pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
     use crate::snapshots::sampled_scan::transition_fixture::{
         self as oracle,
         money_oracle::{assert_equivalent, assert_held},
@@ -200,14 +208,26 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
         .flat_map(|source| {
             [
                 (source, "validation"),
-                (source, "identity"),
+                (source, "identity_deferred"),
+                (source, "identity_429"),
+                (source, "identity_deferred_capped"),
+                (source, "identity_429_capped"),
                 (source, "witness"),
                 (source, "mixed"),
                 (source, "conflict"),
             ]
         }) {
-            let identity = named == "identity";
-            let isolated = usize::from(matches!(named, "mixed" | "conflict" | "identity"));
+            let identity = named.starts_with("identity_");
+            let identity_status = if named.contains("429") { 429 } else { 503 };
+            let capped = named.ends_with("_capped");
+            let identity_wait = if capped {
+                crate::snapshot_client::MAX_HONOURED_RETRY_AFTER
+            } else {
+                Duration::from_secs(60)
+            };
+            let isolated = usize::from(
+                matches!(named, "mixed" | "conflict") || (identity && identity_status == 503),
+            );
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -378,8 +398,8 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                                 }
                                 if identity {
                                     return Err(anyhow::Error::new(UploadShed {
-                                        status: 503,
-                                        retry_after: Some(Duration::from_secs(60)),
+                                        status: identity_status,
+                                        retry_after: Some(identity_wait),
                                         code: Some(crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable),
                                     })
                                     .context(ShedSnapshotIndexes(vec![index])));
@@ -424,11 +444,11 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             let sent_at = current_unix_seconds();
             let ((result, accepted, emitted), records) =
                 crate::local_resource_diagnostics::capture(|| {
-                    send(&items, &mut progress, &mut backend, true)
+                    with_retry_clock(sent_at, || send(&items, &mut progress, &mut backend, true))
                 });
             let origin = match named {
                 "conflict" => Some("conflict"),
-                "identity" => Some("identity_retry"),
+                _ if identity => Some("identity_retry"),
                 _ => None,
             };
             if let Some(origin) = origin {
@@ -464,9 +484,22 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
             );
             if identity {
                 assert!(
-                    (sent_at + 60..=current_unix_seconds() + 72)
+                    (sent_at + identity_wait.as_secs()
+                        ..=sent_at + identity_wait.mul_f64(1.2).as_secs())
                         .contains(&record.retry_after_unix_seconds),
-                    "the identity hold waits the server's Retry-After window, not 6-12 h"
+                    "both identity statuses retain the server Retry-After window"
+                );
+                if capped {
+                    assert_eq!(
+                        record.retry_after_unix_seconds,
+                        sent_at + identity_wait.as_secs(),
+                        "503 isolated and 429 deferred have the identical capped retry delay"
+                    );
+                }
+            } else if named == "conflict" {
+                assert_eq!(
+                    record.retry_after_unix_seconds,
+                    conflict_probe_after(&fp, sent_at)
                 );
             }
             assert!(!progress.accepted_fingerprints.contains(&fp));
@@ -578,6 +611,10 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 let (_, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
                 assert_eq!(accepted, 0);
                 assert!(emitted.is_empty());
+                assert_eq!(
+                    progress.quarantined_fingerprints[&fp].retry_after_unix_seconds,
+                    deadline
+                );
             });
             items.push(fresh);
             with_retry_clock(deadline, || {
@@ -606,6 +643,12 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                     SnapshotQuarantineDisposition::RetryPending
                 );
                 assert_eq!(record.failed_reconstruction_count, 1);
+                if identity && capped {
+                    assert_eq!(
+                        record.retry_after_unix_seconds,
+                        deadline + identity_wait.as_secs()
+                    );
+                }
             });
             let next = progress.quarantined_fingerprints[&fp].retry_after_unix_seconds;
             assert!(next > deadline);
@@ -646,6 +689,9 @@ fn indexed_422_quarantines_entity_settles_siblings_and_retries_with_fresh_work()
                 &progress,
             );
             assert_equivalent(&cold, &caught_up);
+            writeln!(std::io::stderr().lock(),
+                "ISOLATED_RETRY_HOLD_ROW source={} kind={named} isolated={isolated} custody=retry_pending backoff=honoured exact_ack=settled money=equivalent VERIFIED",
+                source.api_slug()).unwrap();
         }
     });
     assert_eq!(
