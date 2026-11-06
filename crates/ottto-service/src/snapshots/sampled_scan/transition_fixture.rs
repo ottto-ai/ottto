@@ -10,6 +10,25 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Seed the real saved session-start binding for a Codex transition row.
+pub(crate) fn codex_start_binding(
+    index: &mut super::super::ScanIndex,
+    machine: &str,
+    session: &str,
+    account: String,
+    workspace: Option<String>,
+) -> String {
+    let key = super::super::sha256_hex(&["session_owner:v1", machine, session]);
+    index.session_account_bindings.insert(
+        key.clone(),
+        super::super::SessionAccountBinding {
+            account_identifier_hash: account,
+            workspace_identifier_hash: workspace,
+        },
+    );
+    key
+}
+
 /// Emitted-body comparison for native scan fixtures without a transport driver.
 pub(crate) fn scan_money(
     source: SnapshotSource,
@@ -193,6 +212,30 @@ pub(crate) fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let result = f();
     let bytes = CONSUMED.with(|c| c.get().unwrap());
     (result, bytes)
+}
+
+/// Observe the same independent byte-reading seams as the Codex archive
+/// transition driver: object samples, header/decoder construction and JSONL.
+/// Unknown/nonzero byte classes never become a fabricated zero receipt.
+pub(crate) fn observe_codex_quiet<T>(run: impl FnOnce() -> T) -> (T, IoBytes) {
+    use crate::snapshots::{codex_zst_refusal_tests, START_IDENTITY_SAMPLE_FOR_TEST};
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
+    let activity = codex_zst_refusal_tests::activity();
+    let (value, consumed) = observe_consumed(run);
+    let measured = (samples == START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get)
+        && activity == codex_zst_refusal_tests::activity()
+        && consumed == 0)
+        .then_some(0);
+    (
+        value,
+        IoBytes {
+            consumed,
+            cheap_checks: measured,
+            anchor_reads: measured,
+            other_reads: measured,
+            ..Default::default()
+        },
+    )
 }
 
 #[derive(Clone, Debug, Default)]

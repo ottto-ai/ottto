@@ -4884,6 +4884,7 @@ impl OwnedSourceScan {
                 // reach their lookups first and leave without the slot.
                 if let Some(context) = sampling.as_ref().filter(|context| {
                     boot.awaits_read()
+                        && !boot.independent()
                         && crate::heap_layout_bound::layout_supported()
                         && boot.expected_bytes()
                             > sampled_scan::codex_cursor::Limits::current().singleton()
@@ -4936,7 +4937,7 @@ impl OwnedSourceScan {
                 let outcome = boot.step_with_cache(
                     launch_lookup,
                     index,
-                    sampling.as_ref().map(|context| context.cache.as_ref()),
+                    sampling.as_ref().map(|context| &context.cache),
                 );
                 // Header and probe bytes are singleton-budget reads (§d.2).
                 let boot_input = boot.take_charge();
@@ -4955,7 +4956,9 @@ impl OwnedSourceScan {
                         }
                         semantic_noop_count += members;
                         census.note_codex_group(CodexSelection::GroupUnchanged, members);
-                        codex_join_completed.push(boot.group);
+                        if !boot.independent() {
+                            codex_join_completed.push(boot.group);
+                        }
                         pending!();
                     }
                     codex_file_join::Boot::Strict => {
@@ -5062,7 +5065,7 @@ impl OwnedSourceScan {
                         sampled_scan::codex_cursor::Limits::current(),
                         expected,
                         codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                        crate::heap_layout_bound::layout_supported(),
+                        crate::heap_layout_bound::layout_supported() && !boot.independent(),
                         &context.namespace,
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
@@ -5116,9 +5119,31 @@ impl OwnedSourceScan {
                 });
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
+                // First independent acquisitions share the existing counted
+                // six-hour Full pacing. Continuation of a running attempt
+                // never returns through boot and spends no second claim.
+                if boot.independent()
+                    && sampling
+                        .as_mut()
+                        .is_some_and(|context| !context.cap_candidate(&boot.acquisition_key()))
+                {
+                    for member in &group_members {
+                        sampled_audit::queue_cap_retry(index, member);
+                    }
+                    if let Some(context) = sampling.as_ref() {
+                        context.cache.group_attempted(
+                            &context.namespace,
+                            &boot_key,
+                            sampled_scan::codex_cursor::census_token(index).as_deref(),
+                        );
+                    }
+                    codex_file_join::disclose_strict(&group_members, targets!());
+                    pending!();
+                }
                 let job = boot.into_job(codex_file_join::JobInputs {
                     metadata: &codex_title_metadata,
                     traces: codex_turn_traces.clone(),
+                    cache: sampling.as_ref().map(|context| &context.cache),
                     index,
                 });
                 let Ok(mut job) = job else {
@@ -5421,6 +5446,9 @@ impl OwnedSourceScan {
                             metadata: &codex_title_metadata,
                             attribution: attribution_context,
                             live_scope: &live_scope,
+                            cache: sampling.as_ref().map(|context| &context.cache),
+                            collected_at: &collected_at,
+                            index,
                         },
                     ) {
                         codex_file_join::GroupStep::Read(result) => result,
@@ -6073,7 +6101,9 @@ impl OwnedSourceScan {
                     hold_offset: _,
                     group,
                 } = *active;
+                let mut independent_contributions = Vec::new();
                 let group_members = group.map_or(0, |mut group| {
+                    independent_contributions = std::mem::take(&mut group.contributions);
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     group.members.len()
                 });
@@ -6406,10 +6436,22 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                let parsed_file = match parsed_file {
+                let parsed_file = match parsed_file.and_then(|mut parsed| {
+                    if !independent_contributions.is_empty() {
+                        codex_file_join::fold_independent(
+                            &mut parsed.snapshots,
+                            independent_contributions,
+                        )?;
+                    }
+                    Ok(parsed)
+                }) {
                     Ok(parsed) => parsed,
 
                     Err(_error) => {
+                        if source == SnapshotSource::Codex && !aliases.is_empty() {
+                            codex_file_join::disclose_strict(&aliases, targets!());
+                            pending!();
+                        }
                         #[cfg(test)]
                         sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
@@ -6449,6 +6491,21 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 if !aliases.is_empty() {
+                    if aliases
+                        .iter()
+                        .any(|member| codex_archive_path(&member.path))
+                    {
+                        if codex_file_join::stage_independent_inventory(
+                            index,
+                            &aliases,
+                            joined_owner.as_deref().expect("joined owner"),
+                        )
+                        .is_err()
+                        {
+                            codex_file_join::disclose_strict(&aliases, targets!());
+                            pending!();
+                        }
+                    }
                     codex_join_completed.push(codex_file_join::Group {
                         owner: joined_owner
                             .expect("joined replay owner was bound before native finish"),
@@ -16412,9 +16469,39 @@ impl ScanIndex {
                 })
             })
             .collect::<BTreeMap<_, _>>();
+        let offered_markers = self
+            .files
+            .values()
+            .filter_map(|entry| {
+                by_source.get(&entry.source_file_fingerprint)?;
+                entry.codex_joined_member_set.clone()
+            })
+            .collect::<BTreeSet<_>>();
+        let joined_items = snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    resolve_codex_identity(&item.source_session_id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut by_owner = BTreeMap::<String, Vec<(String, ScanIndexEntry)>>::new();
         for (key, entry) in &self.files {
-            let Some(owner) = by_source.get(&entry.source_file_fingerprint) else {
+            let alias_owner = entry.codex_joined_member_set.as_ref().and_then(|marker| {
+                if !offered_markers.contains(marker) {
+                    return None;
+                }
+                let incidence = self.file_snapshot_fingerprints.get(key)?;
+                if incidence.len() != 1 {
+                    return None;
+                }
+                joined_items.get(incidence.iter().next()?)
+            });
+            let Some(owner) = by_source
+                .get(&entry.source_file_fingerprint)
+                .or(alias_owner)
+            else {
                 continue;
             };
             let receipt = entry.codex_applied_tier_receipt.as_ref();

@@ -1,10 +1,11 @@
 //! A Codex file group as one job (P2). A pre-job boot identifies the members,
 //! reads their headers (the parent's `read_header_bytes`, called as-is),
 //! plans the canonical order (§a.3) and, for legacy-shape groups, probes each
-//! member to its first native record. The job then replays every member in
-//! canonical order through ONE native parser and accumulator, swapping only
-//! the reader per member, while `StreamProof` checks the replay in the same
-//! pass. A group larger than the singleton page budget is a multi-member
+//! member to its first native record. Continuous groups replay through one
+//! parser, swapping readers. Independent revert groups finish one parser per
+//! member and retain contributions in memory until the full fold is built.
+//! `StreamProof` checks admission in that same pass. A continuous group larger
+//! than the singleton page budget is a multi-member
 //! cursor job (`codex_cursor`): sealed members are read to EOF with strict
 //! identity, the live (last) member through its frozen-extent certificate.
 //! Terminal proof refusals are settleable residue (outcome R); open/read
@@ -18,7 +19,7 @@ use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
 /// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder`.
 const PROBE_BYTES: usize = 1024 * 1024;
 
-/// The ONE accumulator creation point for group replay (§k.4): the group's
+/// The accumulator creation point for continuous group replay (§k.4): the group's
 /// counting state is configured here, once, from every member's evidence
 /// (#603 `configure_group_once`). Only the reader is swapped per member, so
 /// no member reconfigures it. The legacy tee (`legacy_tee`) stays
@@ -72,6 +73,13 @@ pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulat
     accumulator.codex_counting_v2()
 }
 
+fn independent_group(group: &Group) -> bool {
+    group.members.iter().any(|member| {
+        codex_archive_path(&member.path)
+            || codex_session_id_candidates_from_path(&member.path).len() > 1
+    })
+}
+
 /// The group job's logical key: home, owner and the sorted member keys. A
 /// new or vanished member is a different job (memo, fence and slot keys).
 pub(in crate::snapshots) fn job_key(group: &Group) -> String {
@@ -82,7 +90,12 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
         .collect::<Vec<_>>();
     keys.sort();
     let mut parts = vec![
-        "codex_group_job:v1".to_owned(),
+        if independent_group(group) {
+            "codex_independent_group_job:v1"
+        } else {
+            "codex_group_job:v1"
+        }
+        .to_owned(),
         local_index_key(&group.home),
         group.owner.clone(),
     ];
@@ -189,10 +202,11 @@ pub(in crate::snapshots) struct GroupBoot {
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
+    independent: bool,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
-    charge, previous_receipts, receipt_scope, legacy_expected, evidence);
+    charge, previous_receipts, receipt_scope, legacy_expected, evidence, independent);
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
@@ -218,7 +232,9 @@ impl GroupBoot {
             }
         }
         let evidence = codex_counting_version::members_evidence(&group.members, index);
+        let independent = independent_group(&group);
         Self {
+            independent,
             key: job_key(&group),
             group,
             identified: 0,
@@ -240,6 +256,15 @@ impl GroupBoot {
             legacy_expected,
             evidence,
         }
+    }
+
+    pub(in crate::snapshots) fn independent(&self) -> bool {
+        self.independent
+    }
+
+    pub(in crate::snapshots) fn acquisition_key(&self) -> String {
+        // Membership changes must not evade the existing per-key Full pace.
+        group_key(&self.group.home, &self.group.owner)
     }
 
     /// Header and probe bytes read since the last call.
@@ -286,11 +311,85 @@ impl GroupBoot {
         &mut self,
         launch_events: Option<&crate::launch_events::LaunchEventInventory>,
         index: &ScanIndex,
-        cache: Option<&sampled_scan::SharedCache>,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> Boot {
         let n = self.group.members.len();
+        if self.independent && self.identified == 0 {
+            let mut members = self.group.members.clone();
+            let quiet = members.iter_mut().all(|member| {
+                let key = local_index_key(&member.path);
+                let Some(entry) = index.files.get(&key) else {
+                    return false;
+                };
+                let Ok(stat) = fs::symlink_metadata(&member.path) else {
+                    return false;
+                };
+                if !stat.is_file()
+                    || stat.file_type().is_symlink()
+                    || !index.listing_unchanged(&member.path, &stat)
+                    || !codex_index_file_body_accepted(index, &key, entry)
+                {
+                    return false;
+                }
+                member.source_file_fingerprint = entry.source_file_fingerprint.clone();
+                true
+            });
+            if quiet {
+                let witness = member_set_witness(&members);
+                if members.iter().all(|member| {
+                    index
+                        .files
+                        .get(&local_index_key(&member.path))
+                        .is_some_and(|entry| {
+                            entry.codex_joined_member_set.as_deref() == Some(witness.as_str())
+                        })
+                }) {
+                    self.group.members = members;
+                    return if self
+                        .group
+                        .members
+                        .iter()
+                        .all(|member| index.candidate_decision(member) == CandidateDecision::Skip)
+                    {
+                        Boot::Unchanged
+                    } else {
+                        Boot::Strict
+                    };
+                }
+            }
+        }
+        // A settled independent fold has no durable admitted-key ledger.
+        // A changed member stays owed rather than rereading sealed accepted
+        // history or publishing a survivor-only replacement.
+        if self.independent
+            && self.group.members.iter().any(|member| {
+                let key = local_index_key(&member.path);
+                index.files.get(&key).is_some_and(|entry| {
+                    entry.codex_joined_member_set.is_some()
+                        && codex_index_file_body_accepted(index, &key, entry)
+                })
+            })
+        {
+            return Boot::Strict;
+        }
+        if self.independent && self.identified == 0 {
+            match state_v2::runtime_path(index) {
+                Ok(Some(_)) => {
+                    for member in &self.group.members {
+                        match state_v2::load_head(index, &local_index_key(&member.path),
+                        <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION) {
+                        Ok(Some(head)) if !head.metadata_only => return Boot::Strict,
+                        Err(_) => return Boot::Strict,
+                        _ => {}
+                    }
+                    }
+                }
+                Err(_) => return Boot::Strict,
+                _ => {}
+            }
+        }
         if self.identified < n {
-            return self.identify(launch_events, index, cache);
+            return self.identify(launch_events, index, cache.map(Arc::as_ref));
         }
         if !self.admitted {
             if self.unchanged_joined(index) {
@@ -302,9 +401,22 @@ impl GroupBoot {
             self.admitted = true;
             return Boot::Pending;
         }
+        if self.independent {
+            if self.plan.is_none() {
+                let mut order = (0..n).collect::<Vec<_>>();
+                order.sort_by_key(|i| local_index_key(&self.group.members[*i].path));
+                self.plan = Some(GroupPlan {
+                    order,
+                    plans: vec![MemberPlan::default(); n],
+                    ordinal: false,
+                });
+                self.ordered = true;
+            }
+            return Boot::Ready;
+        }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read, _)) = read_header_bytes(member, None, &mut 0) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member, cache, &mut 0) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -360,12 +472,13 @@ impl GroupBoot {
         // Group plans and the live-prefix certificate still use physical
         // extents/end_byte_offset. Decoded offsets cannot satisfy those facts.
         // Refuse before identification/probing can sample compressed bytes.
-        if refuse_compressed_codex(
-            Some(&self.group.members[self.identified].path),
-            None,
-            CodexZstCause::GroupReadUnsupported,
-        )
-        .is_err()
+        if !self.independent
+            && refuse_compressed_codex(
+                Some(&self.group.members[self.identified].path),
+                None,
+                CodexZstCause::GroupReadUnsupported,
+            )
+            .is_err()
         {
             return Boot::Strict;
         }
@@ -573,6 +686,7 @@ impl GroupBoot {
             receipt_scope,
             legacy_expected,
             evidence,
+            independent,
             ..
         } = self;
         let plan = plan.ok_or(GroupEnd::Strict)?;
@@ -606,17 +720,36 @@ impl GroupBoot {
         if opened.opened_object_identity != first.opened_object_identity {
             return Err(GroupEnd::Changed);
         }
-        let tee = legacy_tee(
-            &legacy_expected,
-            &first,
-            &file,
-            inputs.metadata,
-            inputs.traces.clone(),
-        )?;
-        let mut parser = new_group_parser(file, &first, inputs.metadata, inputs.traces, evidence)
-            .map_err(|_| GroupEnd::Strict)?;
+        let tee = if independent {
+            None
+        } else {
+            legacy_tee(
+                &legacy_expected,
+                &first,
+                &file,
+                inputs.metadata,
+                inputs.traces.clone(),
+            )?
+        };
+        let mut parser = if independent {
+            independent_fold::parser(
+                file,
+                &first,
+                inputs.metadata,
+                inputs.traces,
+                inputs.index,
+                inputs.cache,
+            )?
+        } else {
+            new_group_parser(file, &first, inputs.metadata, inputs.traces, evidence)
+                .map_err(|_| GroupEnd::Strict)?
+        };
         let v2 = group_counting_is_v2(&parser.accumulator);
-        let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
+        let mut join = Box::new(if independent {
+            StreamProof::independent(group.owner.clone(), members.len())
+        } else {
+            StreamProof::new(group.owner.clone(), v2, plan.plans)
+        });
         join.begin_member(0);
         let previous = previous_receipts
             .get(&local_index_key(&first.path))
@@ -672,6 +805,8 @@ impl GroupBoot {
                 memo_digest,
                 scope: cursor::group_scope(),
                 consumed_before: 0,
+                independent,
+                contributions: Vec::new(),
             })),
         }))
     }
@@ -682,6 +817,7 @@ pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) index: &'a ScanIndex,
+    pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
@@ -752,11 +888,13 @@ pub(in crate::snapshots) struct GroupJob {
     /// Bytes the completed members' readers consumed, plus each member
     /// swap's charge (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
+    pub(in crate::snapshots) independent: bool,
+    pub(in crate::snapshots) contributions: Vec<SnapshotItem>,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
-    consumed_before);
+    consumed_before, independent, contributions);
 
 impl GroupJob {
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
@@ -833,6 +971,9 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
     /// The live member's acquisition scope (cursor jobs), computed on demand.
+    pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
+    pub(in crate::snapshots) collected_at: &'a str,
+    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
 }
@@ -929,7 +1070,11 @@ fn member_eof(
     let member = group.members[position].clone();
     let key = local_index_key(&member.path);
     let last = position + 1 == group.members.len();
-    if let (Some(context), Some(tee)) = (inputs.attribution, group.tee.as_ref()) {
+    let lookup_parser = group
+        .tee
+        .as_deref()
+        .or_else(|| group.independent.then_some(active.parser.as_ref()));
+    if let (Some(context), Some(tee)) = (inputs.attribution, lookup_parser) {
         let workers = tee
             .accumulator
             .source_session_id
@@ -988,6 +1133,9 @@ fn member_eof(
         Some(0),
     ];
     active.applied_receipts.insert(key.clone(), receipt);
+    if active.group.as_ref().is_some_and(|group| group.independent) {
+        return independent_member_eof(active, join, inputs);
+    }
     let report = active.parser.reader.report;
     let group = active.group.as_deref_mut().expect("group job");
     if let Some(mut tee) = group.tee.take() {
@@ -1065,6 +1213,100 @@ fn member_eof(
         .saturating_add(cursor::swap_charge(&retained));
     group.current += 1;
     open_member(active, join, inputs)?;
+    Ok(false)
+}
+
+/// Independent files keep separate parser, selector and cache-detector boundaries.
+/// Completed contributions and admitted keys stay only in this attempt until its
+/// last EOF; a lost process has acquired no folded checkpoint or ACK credit.
+fn independent_member_eof(
+    active: &mut OwnedActiveFile,
+    mut join: Box<StreamProof>,
+    inputs: &StepInputs<'_>,
+) -> std::result::Result<bool, GroupEnd> {
+    if active.parser.accumulator.codex_counting_v2()
+        || active.parser.accumulator.codex_creator_evidence_conflicted
+    {
+        return Err(GroupEnd::Strict);
+    }
+    let group = active.group.as_mut().expect("group");
+    let report = active.parser.reader.report;
+    group.lines.0 += report.physical_line_count;
+    group.lines.1 += report.parsed_json_line_count;
+    if group.current + 1 == group.members.len() {
+        active.parser.reader.report.physical_line_count = group.lines.0;
+        active.parser.reader.report.parsed_json_line_count = group.lines.1;
+        group.finished = true;
+        return Ok(true);
+    }
+    let member = group.members[group.current].clone();
+    let next = group.members[group.current + 1].clone();
+    let mut opened = next.clone();
+    let file = open_member_file(&mut opened)?;
+    if opened.opened_object_identity != next.opened_object_identity {
+        return Err(GroupEnd::Changed);
+    }
+    let traces = active.parser.accumulator.codex_turn_traces.clone();
+    // Drop the completed decoder before funding the next one. Finish uses only
+    // its held descriptor's metadata after EOF, so an inert plain wrapper is safe.
+    let held = active
+        .parser
+        .reader
+        .reader
+        .get_ref()
+        .try_clone()
+        .map_err(|_| GroupEnd::Strict)?;
+    let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
+    input.close();
+    let parser = independent_fold::parser(
+        file,
+        &next,
+        inputs.metadata,
+        traces,
+        inputs.index,
+        inputs.cache,
+    )?;
+    let old = std::mem::replace(&mut active.parser, parser);
+    let end = old.reader.consumed_bytes();
+    let mut parsed = old
+        .finish_boxed_native(
+            FinishRequest {
+                expected_opened_object_identity: &member.opened_object_identity,
+                path: &member.path,
+                collected_at: inputs.collected_at,
+                source_file_fingerprint: member.source_file_fingerprint.clone(),
+                codex_title_metadata: Some(inputs.metadata),
+                claude_title_metadata: None,
+                attribution_context: inputs.attribution,
+                repository_identity: None,
+                money_context: None,
+            },
+            None,
+        )
+        .map_err(|_| GroupEnd::Strict)?;
+    if !parsed.progress_complete() {
+        return Err(GroupEnd::Strict);
+    }
+    for item in &mut parsed.snapshots {
+        apply_codex_state_evidence(item, inputs.metadata, &member.path);
+    }
+    group.contributions.extend(parsed.snapshots);
+    group.charge = group
+        .charge
+        .saturating_add(end.saturating_sub(active.charged_bytes));
+    group.consumed_before = group.consumed_before.saturating_add(end);
+    active.charged_bytes = 0;
+    group.current += 1;
+    join.begin_member(group.current);
+    let previous = group
+        .previous_receipts
+        .get(&local_index_key(&next.path))
+        .cloned()
+        .unwrap_or_default();
+    let mut replay = TierReplay::new(previous.0, previous.1, group.receipt_scope.clone());
+    replay.join = Some(join);
+    active.parser.accumulator.codex_tier_replay = Some(replay);
+    active.candidate = next;
     Ok(false)
 }
 
