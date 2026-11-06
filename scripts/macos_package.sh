@@ -274,7 +274,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     OTTTO_RELEASE_VERSION="$VERSION" \
       OTTTO_RELEASE_CHANNEL="$CHANNEL" \
       GIT_COMMIT="$COMMIT" \
-      cargo build --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
+      cargo build --locked --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
   )
   swift build -c release --package-path "$MAC_APP_ROOT" \
     -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \

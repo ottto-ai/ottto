@@ -29,7 +29,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
   inside the shared state-memory allowance; a refusal requeues the ordinary candidate with its
   census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
-  population/read-volume limit. Compressed rollouts keep their original modification time,
+  population/read-volume limit. A fresh-data page first fills up to half its slots with fresh
+  plain rollouts in queue order, so a hinted archive backlog cannot hold recent sessions back;
+  the rest of that page stays FIFO, archives included.
+  Compressed rollouts keep their original modification time,
   so they age as the plain file did. Legacy held archive member keys count as already seen
   for the ordinary first-read age gate; their values remain inert, and header/ownership
   admission still applies. A provider-written new plaintext object takes the existing
@@ -42,6 +45,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   prevents absence-based counting-evidence collection. Boundary validation covers surviving
   singleton sessions and joined groups across every registered home. A new file
   naming a page owner fails; unrelated new files defer to the next roster refresh.
+  New directories are recursively listed with the same helper and their rollouts
+  use the same owner check, including same-owner subagents. Empty directories defer.
+  Validation leaves the census unchanged so the next refresh queues new directories
+  for the existing bounded traversal.
   Every header ownership change and vanished census directory fails closed.
   Refresh and checkpoint share the stable `DirectoryCensus::relist` helper.
   Each boundary re-lists changed directories and re-reads new or changed headers.
@@ -53,7 +60,6 @@ file-system hint / periodic listing → select file → read new bytes from save
   fence: a page-owner candidate or missing filename proof fails the page.
   Unknown or unreadable headers remain conservative failures, including unrelated
   compressed rereads.
-  A new empty day directory still fails one page (about once per home per day).
   A symlink entry that refresh cannot certify can block pages across homes.
   A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
@@ -85,7 +91,16 @@ entity only. A body witness is not a stored body: missing body custody never
 triggers transcript reconstruction, and legacy owed entities never ride
 quarantine, re-offer, audit or revision-triggered reconstruction. Diagnostics add
 scalar owed/held counts to the existing refusal records; only a rising owed count
-raises the refusal alarm. Claude, Codex and Pi share this machinery.
+raises the refusal alarm. Claude, Codex and Pi share this machinery. A pass whose
+only holds are validated ordinary retryable refusals, validated ACK conflicts or
+named HTTP-503 identity deferrals with a server retry deadline finishes successfully
+while each exact body remains owed in RetryPending custody. Validation, body-witness
+and usage-decrease review holds and named HTTP-429 identity deferrals still defer
+the pass, including beside an isolated hold. Uploads, acknowledgements, custody,
+retry clocks, totals and placement are
+unchanged. Held cache-head probes and quarantine origins use structured diagnostics
+with fingerprint and body-witness hash8 values only, plus source and saved-head
+presence for probes.
 
 ## Stores
 
@@ -117,6 +132,9 @@ raises the refusal alarm. Claude, Codex and Pi share this machinery.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
   reconstructing them. No historical sessions are selected just to enrich metadata.
+- Claude's identity-incomplete request census keeps source verification through a complete,
+  loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
+  request identities, complete-negative evidence, Full audit credit or upload acceptance.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

@@ -11,6 +11,15 @@ allow_attributes_without_reason = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+# Raising rust-version to 1.95 turns on these MSRV-gated lints across
+# existing code (~190 `map_or(true|false, ..)` calls, plus `% n == 0`,
+# `repeat().take()` and the boolean forms they suggest). Migrating to
+# `is_none_or` / `is_some_and` / `is_multiple_of` / `repeat_n` is a separate
+# mechanical cleanup.
+manual_is_multiple_of = "allow"
+manual_repeat_n = "allow"
+nonminimal_bool = "allow"
+unnecessary_map_or = "allow"
 
 # Optimise dependencies (not workspace crates) in test builds; debug
 # assertions and overflow checks stay on.

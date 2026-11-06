@@ -272,6 +272,7 @@ fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem
 }
 
 fn apply_bootstrapped_cache_heads(
+    source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
 ) -> Result<usize> {
@@ -289,6 +290,13 @@ fn apply_bootstrapped_cache_heads(
                 // No cache patch or accepted head is invented. The normal
                 // uploader sees the exact held probe and keeps its quarantine;
                 // healthy siblings retain their own independent settlement.
+                crate::local_resource_diagnostics::traversal_point(
+                    "held_cache_head_probe",
+                    source,
+                    &serde_json::json!({"fingerprint_hash8": SessionHash::of(&probe.snapshot_fingerprint).to_string(),
+                        "body_witness_hash8": &snapshot_upload_body_witness(&probe)[..8],
+                        "saved_head_present": progress.accepted_cache_heads.contains_key(&cache_session_key(&probe.source_session_id))}),
+                );
                 *snapshot = probe;
                 held = held.saturating_add(1);
                 continue;
@@ -1278,6 +1286,17 @@ fn capture_deferred_cache_head_identities(
         .collect()
 }
 
+/// Both exact contracts, so Pi (no base cache contract) never marks a patch.
+fn cache_full_replacement_negotiated(
+    source: SnapshotSource,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+) -> bool {
+    source != SnapshotSource::Pi
+        && hint.session_cache_observations_contract.as_deref()
+            == Some("session_cache_observations:v1")
+        && hint.cache_full_replacement_contract.as_deref() == Some("cache_full_replacement:v1")
+}
+
 /// Pure projection shared by no-op/index witnesses and the network boundary.
 /// Local consumers retain the original cache patch and provisional state.
 fn prepare_snapshot_cache_for_upload(
@@ -1313,6 +1332,7 @@ fn prepare_snapshot_cache_for_upload(
 fn identity_cache_wire_reserve(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
+    full_replacement: bool,
 ) -> usize {
     if snapshot.cache_observations.is_none()
         && !progress
@@ -1325,7 +1345,12 @@ fn identity_cache_wire_reserve(
     prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
     // An owed answer can become eligible between admission and upload. Reserve
     // its framing even while paced, using the real attachment/size paths.
-    attach_head_conflict_answers(std::slice::from_mut(&mut projected), progress, u64::MAX);
+    attach_head_conflict_answers(
+        std::slice::from_mut(&mut projected),
+        progress,
+        u64::MAX,
+        |_| full_replacement,
+    );
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
@@ -1351,23 +1376,28 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
 /// probe (within one hour); a new revision answers at once. Only a body that
 /// sends the stale base under the head-CAS contract carries the answer; the
 /// body itself, its fingerprint and its witness are unchanged.
+/// `replacement_owed` (negotiated, real-Full session) may also mark the patch
+/// a full replacement when no local cache state exists: that patch already
+/// completes from empty, so only the receiver's predecessor changes.
 fn attach_head_conflict_answers(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
     now: u64,
+    replacement_owed: impl Fn(&str) -> bool,
 ) -> usize {
     let mut attached = 0usize;
     for snapshot in snapshots {
         snapshot.cache_conflict_answer = None;
+        if let Some(patch) = snapshot.cache_observations.as_mut() {
+            patch.full_replacement = false;
+        }
         // A withheld cache patch keeps its base but sends no CAS contract, so
         // the request and its ACK validation would not admit a handshake.
         if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
             continue;
         }
-        let Some(record) = progress
-            .head_conflict_challenges
-            .get(&cache_session_key(&snapshot.source_session_id))
-        else {
+        let key = cache_session_key(&snapshot.source_session_id);
+        let Some(record) = progress.head_conflict_challenges.get(&key) else {
             continue;
         };
         if record.last_answer_unix != 0
@@ -1382,6 +1412,18 @@ fn attach_head_conflict_answers(
             record.challenge.clone(),
             record.stale_revision_v2_hash.clone(),
         ));
+        if let Some(patch) = snapshot.cache_observations.as_mut().filter(|patch| {
+            replacement_owed(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && patch.operations.iter().all(|operation| {
+                    matches!(operation, crate::snapshots::cache_observations::Operation::Upsert { observation }
+                        if observation.status != "retracted")
+                })
+        }) {
+            // Over the patch bound the answer stays unmarked, as before.
+            patch.full_replacement = true;
+            patch.full_replacement = patch.validate();
+        }
         attached = attached.saturating_add(1);
     }
     attached
@@ -3525,11 +3567,55 @@ pub(crate) fn checkpoint_unselected_for_test(
     index_path: &Path,
     progress_path: &Path,
 ) -> Result<ScanIndex> {
+    checkpoint_page_for_test(index, committed, scan, index_path, progress_path, false)
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_page_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+    accept: bool,
+) -> Result<ScanIndex> {
     let mut progress = SnapshotUploadProgress::load(
         progress_path,
         &format!("{:064x}", 588),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )?;
+    if accept {
+        use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+        let mut index = index.clone();
+        let mut scan = scan.clone();
+        let holds = LocalHoldSettlement::classify(
+            scan.source,
+            &mut index,
+            &mut scan,
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        assert!(!holds.any(), "the completed fixture page has no holds");
+        let (result, _, _) = upload_source_under(
+            scan.source,
+            SnapshotUploadPolicy::default(),
+            &scan.snapshots,
+            &mut progress,
+            ack,
+        );
+        anyhow::ensure!(
+            result? == ResumableUploadResult::Completed,
+            "fixture exact ACK"
+        );
+        progress.save(progress_path)?;
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        index.save(index_path)?;
+        return Ok(index);
+    }
     progress.save(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
@@ -3696,8 +3782,8 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         locally_held,
         false,
     );
-    if correction_scan.is_some_and(|scan| scan.source == SnapshotSource::Codex) {
-        committable.keep_unacknowledged_codex_files_owed(index, locally_held);
+    if let Some(scan) = correction_scan {
+        committable.requeue_unkept_scanned_keys(scan.source, index, locally_held);
     }
     if let Some(scan) = correction_scan {
         // Settle no-body grants only against the file/empty/map facts
@@ -7255,6 +7341,7 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let cache_full_replacement = cache_full_replacement_negotiated(source, &activity_hint);
     // Telemetry retention keeps the sessions this page names, read before any
     // page filter drops a snapshot.
     let telemetry_named = claude_scan_roots
@@ -7355,7 +7442,7 @@ fn finish_sync_source(
         );
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
-                identity_cache_wire_reserve(item, &upload_progress)
+                identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
             } else {
                 0
             }
@@ -7844,15 +7931,19 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-                .inspect_err(log_bootstrap_failure("apply"))
-                .inspect_err(|_| {
-                    upload_progress.finish_reason_reoffers(
-                        &attempted_reason_reoffers,
-                        false,
-                        source.api_slug(),
-                    );
-                })?;
+            let held = apply_bootstrapped_cache_heads(
+                source.api_slug(),
+                &mut scan_result.snapshots,
+                &upload_progress,
+            )
+            .inspect_err(log_bootstrap_failure("apply"))
+            .inspect_err(|_| {
+                upload_progress.finish_reason_reoffers(
+                    &attempted_reason_reoffers,
+                    false,
+                    source.api_slug(),
+                );
+            })?;
             if held > 0 {
                 eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -7871,6 +7962,7 @@ fn finish_sync_source(
         &mut scan_result.snapshots,
         &upload_progress,
         current_unix_seconds(),
+        |key| cache_full_replacement && index.head_conflict_owed(key),
     );
     if head_conflict_answers > 0 {
         eprintln!(
@@ -10154,6 +10246,13 @@ where
                     &body_witness(item),
                     retry_after,
                 );
+                crate::local_resource_diagnostics::traversal_point(
+                    "quarantine_retry_body",
+                    poison_scope,
+                    &serde_json::json!({"origin": "conflict",
+                        "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
+                        "body_witness_hash8": body_witness(item).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+                );
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
@@ -10182,7 +10281,8 @@ where
             .rejected_entities
             .iter()
             .filter(|entity| !entity.permanent && entity.ordinary_retryable())
-            .count();
+            .count()
+            .saturating_add(response.conflict_entities.len());
         progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     } else {
         for index in indices {
@@ -10701,6 +10801,13 @@ where
                         identity_retry_at
                             .unwrap_or_else(|| quarantine_retry_after(item_fingerprint)),
                     );
+                    crate::local_resource_diagnostics::traversal_point(
+                        "quarantine_retry_body",
+                        poison_scope,
+                        &serde_json::json!({"origin": if identity_retry_at.is_some() { "identity_retry" } else { reason },
+                            "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
+                            "body_witness_hash8": body_witness(&items[*index]).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+                    );
                 }
                 if persist(progress).is_err() {
                     *progress = before;
@@ -10713,6 +10820,9 @@ where
                     }));
                 }
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
+                if identity_retry_at.is_some() && status == Some(503) {
+                    isolated_entities = isolated_entities.saturating_add(held.len());
+                }
                 crate::local_resource_diagnostics::traversal_point(
                     "quarantine_retry",
                     poison_scope,
@@ -12880,7 +12990,7 @@ mod tests {
             outcome,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
@@ -14683,6 +14793,7 @@ mod tests {
                 operations: Vec::new(),
                 coverage: "complete".into(),
                 omitted_observation_count: None,
+                full_replacement: false,
             });
         crate::snapshots::prepare_cache_observations(&mut corrected, Some(&prior));
         assert_eq!(corrected.snapshot_fingerprint, item.snapshot_fingerprint);
@@ -15248,7 +15359,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(accepted, 0);
@@ -15789,7 +15900,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
@@ -15893,7 +16004,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 3,
-                isolated: 0
+                isolated: 3
             }
         );
         assert_eq!(accepted, 0);
@@ -17690,7 +17801,7 @@ mod tests {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(observed_classes, vec![false, true]);
@@ -22635,6 +22746,7 @@ mod tests {
             operations: Vec::new(),
             coverage: "complete".into(),
             omitted_observation_count: None,
+            full_replacement: false,
         };
         let mut cold = BTreeMap::new();
         for (phase, bootstrap) in [
@@ -22825,7 +22937,7 @@ mod tests {
                 }
                 page[1].cache_base_head_etag = Some("d".repeat(64));
                 assert_eq!(
-                    apply_bootstrapped_cache_heads(&mut page, &f.progress).unwrap(),
+                    apply_bootstrapped_cache_heads("codex", &mut page, &f.progress).unwrap(),
                     0
                 );
                 assert_eq!(page[0].cache_base_head_etag, Some("e".repeat(64)));

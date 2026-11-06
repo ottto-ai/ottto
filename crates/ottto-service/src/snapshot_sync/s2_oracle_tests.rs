@@ -421,7 +421,9 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
                 .cloned();
         }
         assert_eq!(
-            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds()),
+            attach_head_conflict_answers(&mut items, &challenged, current_unix_seconds(), |_| {
+                false
+            }),
             0
         );
         let mut settled = challenged.clone();
@@ -910,7 +912,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             status.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);
@@ -1268,3 +1270,6 @@ fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hol
 mod pause_guard_oracle_tests;
 
 mod subagent_twin_tests;
+
+#[path = "unkept_requeue_oracle_tests.rs"]
+mod unkept_requeue_oracle_tests;

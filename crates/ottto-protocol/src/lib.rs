@@ -134,9 +134,11 @@ pub struct MachineIdentity {
     pub os: OperatingSystem,
     pub arch: String,
     pub local_platform_version: String,
-    /// Raw hardware identifier (e.g. macOS `IOPlatformUUID`). Populated when
-    /// available so the backend can dedup the same physical machine even if
-    /// `machine_id` differs across reinstalls (ioreg-fallback vs. canonical).
+    /// One-way hardware id: `oth_` + the first 32 hex characters of
+    /// `sha256("ottto-hardware:v1:" + <IOPlatformUUID>)`, never the raw
+    /// platform identifier. Populated when available so the backend can dedup
+    /// the same physical machine even if `machine_id` differs across
+    /// reinstalls (ioreg-fallback vs. canonical).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_uuid: Option<String>,
     /// Privacy-safe discriminator for the OS account this install runs under.

@@ -829,7 +829,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
                     complete: true,
                     lossy: false,
                     source_verified: true,
-                    unchanged_source: false,
+                    continued_source: false,
                     itemless_request_hashes: Vec::new(),
                     opened_birth: None,
                     modified_unix_seconds: 1,

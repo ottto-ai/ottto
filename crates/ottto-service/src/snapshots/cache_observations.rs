@@ -67,6 +67,10 @@ pub struct CacheObservations {
     pub operations: Vec<Operation>,
     pub coverage: String,
     pub omitted_observation_count: Option<u64>,
+    /// Transport-only: the receiver completes this patch from empty. Set only
+    /// on a negotiated head-CAS answer; false is omitted (legacy bytes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_replacement: bool,
 }
 
 impl CacheObservations {
@@ -77,6 +81,7 @@ impl CacheObservations {
             operations: Vec::new(),
             coverage: "partial".into(),
             omitted_observation_count,
+            full_replacement: false,
         }
     }
 
@@ -338,7 +343,7 @@ pub(crate) fn codex_slot(
 }
 
 // Closed owned-field inventory for optional scan overlap admission.
-crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count);
+crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count, full_replacement);
 crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
 crate::durable_tail_codec::durable_struct!(OwnedRequest {
     D slot: RequestSlot,

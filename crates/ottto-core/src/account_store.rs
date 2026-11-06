@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use ottto_protocol::{LocalAccountBinding, SourceHealth};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -227,10 +228,42 @@ pub struct PendingClaimCredentialCommit {
 pub struct LocalMachineBinding {
     pub machine_id: String,
     pub installation_id: String,
-    /// Raw hardware identifier (e.g. macOS `IOPlatformUUID`). Absent in
-    /// legacy `machine.json` files; the daemon backfills it on next boot.
+    /// One-way hardware id ([`hashed_hardware_id`]). Absent in legacy
+    /// `machine.json` files and raw in files written by older daemons; the
+    /// daemon backfills or hashes it on next boot.
     #[serde(default)]
     pub hardware_uuid: Option<String>,
+}
+
+/// `<prefix>_` + the first 32 hex characters of the seed's SHA-256 digest. The
+/// shared shape behind `machine_id` (`otm_`), `account_scope` (`otu_`) and the
+/// hardware id (`oth_`); each caller owns its own prefix so none can be
+/// confused for another or for the randomly minted `installation_id` (`oti_`).
+pub fn prefixed_sha256_id(prefix: &str, seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}_{}", &hex[..32])
+}
+
+/// One-way id for a raw platform hardware id (macOS `IOPlatformUUID`):
+/// `oth_` + the first 32 hex characters of
+/// `sha256("ottto-hardware:v1:" + raw.trim())`. The backend derives the same
+/// value, so this format must stay byte-identical.
+pub fn hashed_hardware_id(raw: &str) -> String {
+    prefixed_sha256_id("oth", &format!("ottto-hardware:v1:{}", raw.trim()))
+}
+
+/// Whether `value` already has the [`hashed_hardware_id`] shape
+/// (`^oth_[0-9a-f]{32}$`).
+pub fn is_hashed_hardware_id(value: &str) -> bool {
+    value.len() == 36
+        && value.starts_with("oth_")
+        && value[4..]
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Persisted daemon-side state for a single source. It carries the real
@@ -798,6 +831,19 @@ mod tests {
         assert_eq!(store.load().expect("load pending"), Some(pending.clone()));
         assert_eq!(store.reset().expect("reset pending"), Some(pending));
         assert_eq!(store.load().expect("load reset"), None);
+    }
+
+    /// Shared with the backend's tests:
+    /// `printf 'ottto-hardware:v1:%s' '00000000-0000-4000-8000-000000000000' | shasum -a 256`.
+    #[test]
+    fn hashed_hardware_id_matches_the_shared_vector() {
+        let raw = "00000000-0000-4000-8000-000000000000";
+        let hashed = "oth_275116a0382631a3808f5f844a12ecfa";
+        assert_eq!(hashed_hardware_id(raw), hashed);
+        assert_eq!(hashed_hardware_id(&format!(" {raw}\n")), hashed);
+        assert!(is_hashed_hardware_id(hashed));
+        assert!(!is_hashed_hardware_id(raw));
+        assert!(!is_hashed_hardware_id(&hashed.to_uppercase()));
     }
 
     #[test]

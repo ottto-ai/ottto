@@ -3266,10 +3266,13 @@ impl StateV2Probe {
 pub(crate) fn v2_growth_retained(bytes: u64) {
     claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
 }
-pub(crate) fn v2_growth_revalidate(uncertain: bool) {
-    claude_state_v2(
-        &serde_json::json!({"v2_growth_revalidate": {"stats": 1, "uncertain": u64::from(uncertain)}}),
-    );
+/// One row per revalidating loop: its (stats, uncertain) sums, when any.
+pub(crate) fn v2_growth_revalidate((stats, uncertain): (u64, u64)) {
+    if stats > 0 {
+        claude_state_v2(
+            &serde_json::json!({"v2_growth_revalidate": {"stats": stats, "uncertain": uncertain}}),
+        );
+    }
 }
 pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
     traversal_point(

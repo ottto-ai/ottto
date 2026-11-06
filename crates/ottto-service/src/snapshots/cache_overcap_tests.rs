@@ -262,6 +262,7 @@ fn partial(rows: Vec<cache_observations::Observation>) -> CacheObservations {
             .collect(),
         coverage: "partial".into(),
         omitted_observation_count: Some(1),
+        full_replacement: false,
     }
 }
 
@@ -404,6 +405,7 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
         operations: vec![],
         coverage: "partial".into(),
         omitted_observation_count: None,
+        full_replacement: false,
     });
     prepare_cache_observations(&mut item, Some(&exact));
     assert!(item.cache_observations.is_none());

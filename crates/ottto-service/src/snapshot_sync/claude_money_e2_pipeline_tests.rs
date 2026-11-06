@@ -844,7 +844,7 @@ fn upload_under(
         respond,
     )
 }
-fn upload_source_under(
+pub(in crate::snapshot_sync) fn upload_source_under(
     source: SnapshotSource,
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
@@ -887,7 +887,9 @@ fn upload_source_under(
     );
     (result, sent, order)
 }
-fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(in crate::snapshot_sync) fn ack(
+    batch: &[SnapshotItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
     // Head-CAS covers the whole request once any item carries cache
@@ -2233,7 +2235,7 @@ fn retry_case(conflict: bool) {
             result.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 1
             }
         );
         assert_eq!(

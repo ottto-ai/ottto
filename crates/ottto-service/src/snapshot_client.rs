@@ -764,6 +764,10 @@ pub struct ActivityHintResponse {
     /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
     #[serde(default)]
     pub session_cache_observations_contract: Option<String>,
+    /// Exact cache full-replacement capability; effective only beside the
+    /// cache contract above. Missing/null/unknown never marks a patch.
+    #[serde(default)]
+    pub cache_full_replacement_contract: Option<String>,
     /// Provisional class-N copy disclosure contract. Missing/null/unknown OFF.
     #[serde(default)]
     pub copy_unproven_contract: Option<String>,
@@ -1172,8 +1176,8 @@ impl SnapshotBatchResponse {
             }
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
-                .insert(key, proof.clone())
-                .is_some_and(|previous| previous != proof)
+                .insert(key, (proof.clone(), item))
+                .is_some_and(|(previous, _)| previous != proof)
             {
                 return Err(anyhow!(
                     "snapshot request contains conflicting snapshot evidence body witnesses"
@@ -1190,7 +1194,7 @@ impl SnapshotBatchResponse {
                 reference.source_session_id.clone(),
                 reference.snapshot_fingerprint.clone(),
             );
-            let Some((expected_version, expected_digest)) = expected.get(&key) else {
+            let Some(((expected_version, expected_digest), item)) = expected.get(&key) else {
                 continue;
             };
             let Some(reason) =
@@ -1212,10 +1216,11 @@ impl SnapshotBatchResponse {
                     reference,
                     *expected_version,
                     answered.contains(&key),
+                    *item,
                 ));
             }
         }
-        let Some((reason, class, reference, expected_version, answered)) = first else {
+        let Some((reason, class, reference, expected_version, answered, item)) = first else {
             return Ok(());
         };
         warn_body_witness_refusal(
@@ -1225,6 +1230,7 @@ impl SnapshotBatchResponse {
             expected_version,
             answered,
             bad_refs,
+            item,
         );
         Err(anyhow::Error::new(RefusedSnapshotIndexes(
             request
@@ -1349,7 +1355,7 @@ fn body_witness_refusal_reason(
 
 /// One line per refused body-witness ACK, naming the first failing reference
 /// and how many failed. An answered head-CAS challenge recovers through the
-/// next conflict. Session hash, fingerprint prefix and versions only.
+/// next conflict. Only hashes, digest prefixes and versions are logged.
 fn warn_body_witness_refusal(
     reason: &str,
     class: &str,
@@ -1357,16 +1363,34 @@ fn warn_body_witness_refusal(
     expected_version: u64,
     answered: bool,
     bad_refs: usize,
+    item: &crate::snapshots::SnapshotItem,
 ) {
+    use sha2::Digest;
+    let parts = [
+        json!(&item.session_account_evidence),
+        json!((&item.tool_usage, item.tool_usage_truncated)),
+        json!((&item.cache_observations, &item.cache_observations_state)),
+    ]
+    .map(|part| {
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).expect("witness part"))
+        )
+    });
     let line = format!(
         "warning: local snapshot ACK body witness refused: reason={reason} class={class} \
          session_hash={} fingerprint={} witness_version={expected_version} \
-         echoed_witness_version={} bad_refs={bad_refs} answered={answered}",
+         echoed_witness_version={} bad_refs={bad_refs} answered={answered} \
+         expected_digest={} account_part={} tool_part={} cache_part={}",
         crate::snapshot_sync::SessionHash::of(&reference.source_session_id),
         reference.snapshot_fingerprint.get(..8).unwrap_or_default(),
         reference
             .body_witness_version
             .map_or_else(|| "none".to_string(), |version| version.to_string()),
+        &snapshot_upload_body_witness(item)[..8],
+        &parts[0][..8],
+        &parts[1][..8],
+        &parts[2][..8],
     );
     eprintln!("{line}");
     #[cfg(test)]
@@ -4803,21 +4827,37 @@ mod tests {
             ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
             ack.unchanged_entities[0].body_witness_version = None;
         });
+        let parts = [
+            json!(&first.session_account_evidence),
+            json!((&first.tool_usage, first.tool_usage_truncated)),
+            json!((&first.cache_observations, &first.cache_observations_state)),
+        ]
+        .map(|part| {
+            use sha2::Digest;
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).unwrap())
+            )[..8]
+                .to_owned()
+        });
         assert_eq!(
             line,
             format!(
                 "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
                  class=accepted session_hash={} fingerprint={} witness_version={version} \
-                 echoed_witness_version={version} bad_refs=2 answered=false",
+                 echoed_witness_version={version} bad_refs=2 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
                 crate::snapshot_sync::SessionHash::of(&first.source_session_id),
                 &first.snapshot_fingerprint[..8],
+                &crate::snapshots::snapshot_upload_body_witness(first)[..8],
+                parts[0], parts[1], parts[2],
             )
         );
         let (digest, zeros) = (
             crate::snapshots::snapshot_upload_body_witness(first),
             "0".repeat(64),
         );
-        for secret in [&digest, &first.source_session_id, &zeros] {
+        assert!(line.contains(&format!("expected_digest={} ", &digest[..8])));
+        for secret in [&first.source_session_id, &zeros, &digest] {
             assert!(!line.contains(secret), "{line}");
         }
         // Both bad refs are named by request index on the typed refusal.
@@ -5398,7 +5438,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

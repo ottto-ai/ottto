@@ -61,7 +61,7 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 metadata_path="$tmp_dir/cargo-metadata.json"
-cargo metadata --format-version 1 --manifest-path "$ROOT/Cargo.toml" > "$metadata_path"
+cargo metadata --locked --format-version 1 --manifest-path "$ROOT/Cargo.toml" > "$metadata_path"
 
 generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 serial_hex="$(

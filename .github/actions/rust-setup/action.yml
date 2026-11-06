@@ -43,15 +43,16 @@ runs:
         ln -s private/var "$RUNNER_TEMP/var"
         echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
 
-    # The one place CI pins Rust. Layout-sensitive tests run only on compilers
-    # validated in crates/ottto-service/src/heap_layout_bound.rs.
+    # CI uses the toolchain pinned in rust-toolchain.toml. Layout-sensitive tests
+    # run only on compilers validated in crates/ottto-service/src/heap_layout_bound.rs.
     - name: Install pinned Rust toolchain
       shell: bash
       env:
         COMPONENTS: ${{ inputs.components }}
       run: |
         set -eo pipefail
-        toolchain=1.95.0
+        toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+        [ -n "$toolchain" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
         echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
         set --
         for component in $COMPONENTS; do set -- "$@" --component "$component"; done

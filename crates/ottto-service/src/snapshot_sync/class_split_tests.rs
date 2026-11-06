@@ -27,6 +27,7 @@ fn complete_empty() -> CacheObservations {
         operations: Vec::new(),
         coverage: "complete".into(),
         omitted_observation_count: None,
+        full_replacement: false,
     }
 }
 
@@ -264,7 +265,7 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert!(before
@@ -493,7 +494,7 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
 
         let mut items = vec![item.clone()];
         assert_eq!(
-            apply_bootstrapped_cache_heads(&mut items, &progress).unwrap(),
+            apply_bootstrapped_cache_heads("codex", &mut items, &progress).unwrap(),
             0
         );
         assert_eq!(
@@ -704,7 +705,7 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert!(wires[0]["head_cas_contract"].is_string());

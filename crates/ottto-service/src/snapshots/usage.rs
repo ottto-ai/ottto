@@ -3,11 +3,15 @@
 //!
 //! `cache_observations` prepares the cache-observation upload state of one
 //! item against its acknowledged predecessor.
+//!
+//! `UsageTotals` and `UsageCosts` are the token counters and exact cost picos
+//! a row accumulates, with their add, monotonic and delta rules.
 
 pub(super) mod cache_observations;
 
 use super::rfc3339_unix_seconds;
 use super::scan::limits::in_codex_forward_evidence_epoch;
+use super::{usd_picos_string, SnapshotCost, SnapshotItem, SnapshotModelUsage};
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -235,3 +239,285 @@ pub(crate) fn provider_context_bucket(
         "short"
     })
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct UsageTotals {
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_creation_5m_tokens: u64,
+    pub(super) cache_creation_1h_tokens: u64,
+    pub(super) reasoning_output_tokens: u64,
+    pub(super) unattributed_total_tokens: u64,
+    pub(super) request_count: u64,
+    pub(super) costs: UsageCosts,
+}
+
+pub(super) const USD_PICO_SCALE: u128 = 1_000_000_000_000;
+pub(super) const PI_COST_FIELD_CEILING_PICOS: u128 = 100_000 * USD_PICO_SCALE;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct UsageCosts {
+    pub(super) observed: bool,
+    pub(super) reported: bool,
+    pub(super) total: Option<u128>,
+    pub(super) input: Option<u128>,
+    pub(super) output: Option<u128>,
+    pub(super) cache_read: Option<u128>,
+    pub(super) cache_creation: Option<u128>,
+}
+
+impl UsageCosts {
+    pub(super) fn add(&mut self, other: &Self) {
+        if !other.observed {
+            return;
+        }
+        if !self.observed {
+            *self = other.clone();
+            return;
+        }
+        self.reported &= other.reported;
+        if !self.reported {
+            self.total = None;
+            self.input = None;
+            self.output = None;
+            self.cache_read = None;
+            self.cache_creation = None;
+            return;
+        }
+        self.total = add_complete_cost(self.total, other.total);
+        self.input = add_complete_cost(self.input, other.input);
+        self.output = add_complete_cost(self.output, other.output);
+        self.cache_read = add_complete_cost(self.cache_read, other.cache_read);
+        self.cache_creation = add_complete_cost(self.cache_creation, other.cache_creation);
+    }
+
+    pub(super) fn is_monotonic_after(&self, previous: &Self) -> bool {
+        (!previous.observed || self.observed)
+            && (!previous.reported || self.reported)
+            && cost_is_monotonic(self.total, previous.total)
+            && cost_is_monotonic(self.input, previous.input)
+            && cost_is_monotonic(self.output, previous.output)
+            && cost_is_monotonic(self.cache_read, previous.cache_read)
+            && cost_is_monotonic(self.cache_creation, previous.cache_creation)
+    }
+
+    fn delta_from(&self, previous: &Self) -> Self {
+        Self {
+            observed: self.observed,
+            reported: self.reported,
+            total: cost_delta(self.total, previous.total),
+            input: cost_delta(self.input, previous.input),
+            output: cost_delta(self.output, previous.output),
+            cache_read: cost_delta(self.cache_read, previous.cache_read),
+            cache_creation: cost_delta(self.cache_creation, previous.cache_creation),
+        }
+    }
+
+    pub(super) fn snapshot_cost(&self) -> Option<SnapshotCost> {
+        self.reported.then(|| SnapshotCost {
+            total_cost_usd: self.total.map(usd_picos_string),
+            input_cost_usd: self.input.map(usd_picos_string),
+            output_cost_usd: self.output.map(usd_picos_string),
+            cache_read_cost_usd: self.cache_read.map(usd_picos_string),
+            cache_creation_cost_usd: self.cache_creation.map(usd_picos_string),
+            evidence_source: "pi_usage_cost".to_string(),
+        })
+    }
+}
+
+fn add_complete_cost(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(left), Some(right)) => left.checked_add(right),
+        _ => None,
+    }
+}
+
+fn cost_is_monotonic(current: Option<u128>, previous: Option<u128>) -> bool {
+    match (current, previous) {
+        (Some(current), Some(previous)) => current >= previous,
+        (Some(_), None) | (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+fn cost_delta(current: Option<u128>, previous: Option<u128>) -> Option<u128> {
+    current.map(|current| current - previous.unwrap_or_default())
+}
+
+impl UsageTotals {
+    pub(super) fn is_zero(&self) -> bool {
+        self.total_tokens() == 0 && self.reasoning_output_tokens == 0
+    }
+
+    pub(super) fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
+            .saturating_add(self.unattributed_total_tokens)
+    }
+
+    /// Effective input context for one turn: the prompt size the model actually
+    /// saw — uncached input + cache reads + cache writes (5m + 1h TTL). Output
+    /// and reasoning tokens are excluded. Mirrors the backend cost projector's
+    /// `context_length` (input + cache_read + cache_creation). Drives the
+    /// `context_bucket` selector: a value above the 200K regular-context cap
+    /// could only have come from the 1M-context window.
+    pub(super) fn effective_input_context(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
+    }
+
+    /// Add wire-carried counters atomically. Derived totals may saturate for
+    /// thresholding, but a wire field cannot: callers must preserve the prior
+    /// exact aggregate and expose the rejected record as loss.
+    pub(super) fn add(&mut self, other: &UsageTotals) -> bool {
+        let Some(input_tokens) = self.input_tokens.checked_add(other.input_tokens) else {
+            return false;
+        };
+        let Some(output_tokens) = self.output_tokens.checked_add(other.output_tokens) else {
+            return false;
+        };
+        let Some(cache_read_tokens) = self.cache_read_tokens.checked_add(other.cache_read_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_5m_tokens) = self
+            .cache_creation_5m_tokens
+            .checked_add(other.cache_creation_5m_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_1h_tokens) = self
+            .cache_creation_1h_tokens
+            .checked_add(other.cache_creation_1h_tokens)
+        else {
+            return false;
+        };
+        let Some(reasoning_output_tokens) = self
+            .reasoning_output_tokens
+            .checked_add(other.reasoning_output_tokens)
+        else {
+            return false;
+        };
+        let Some(unattributed_total_tokens) = self
+            .unattributed_total_tokens
+            .checked_add(other.unattributed_total_tokens)
+        else {
+            return false;
+        };
+        let Some(request_count) = self.request_count.checked_add(other.request_count) else {
+            return false;
+        };
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_creation_5m_tokens = cache_creation_5m_tokens;
+        self.cache_creation_1h_tokens = cache_creation_1h_tokens;
+        self.reasoning_output_tokens = reasoning_output_tokens;
+        self.unattributed_total_tokens = unattributed_total_tokens;
+        self.request_count = request_count;
+        self.costs.add(&other.costs);
+        true
+    }
+
+    pub(super) fn is_monotonic_after(&self, previous: &UsageTotals) -> bool {
+        self.input_tokens >= previous.input_tokens
+            && self.output_tokens >= previous.output_tokens
+            && self.cache_read_tokens >= previous.cache_read_tokens
+            && self.cache_creation_5m_tokens >= previous.cache_creation_5m_tokens
+            && self.cache_creation_1h_tokens >= previous.cache_creation_1h_tokens
+            && self.reasoning_output_tokens >= previous.reasoning_output_tokens
+            && self.unattributed_total_tokens >= previous.unattributed_total_tokens
+            && self.request_count >= previous.request_count
+            && self.costs.is_monotonic_after(&previous.costs)
+    }
+
+    pub(super) fn delta_from(&self, previous: &UsageTotals) -> UsageTotals {
+        UsageTotals {
+            input_tokens: self.input_tokens - previous.input_tokens,
+            output_tokens: self.output_tokens - previous.output_tokens,
+            cache_read_tokens: self.cache_read_tokens - previous.cache_read_tokens,
+            cache_creation_5m_tokens: self.cache_creation_5m_tokens
+                - previous.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: self.cache_creation_1h_tokens
+                - previous.cache_creation_1h_tokens,
+            reasoning_output_tokens: self.reasoning_output_tokens
+                - previous.reasoning_output_tokens,
+            unattributed_total_tokens: self.unattributed_total_tokens
+                - previous.unattributed_total_tokens,
+            request_count: self.request_count - previous.request_count,
+            costs: self.costs.delta_from(&previous.costs),
+        }
+    }
+}
+
+pub(super) fn usage_totals_from_item(item: &SnapshotItem) -> UsageTotals {
+    UsageTotals {
+        input_tokens: item.input_tokens,
+        output_tokens: item.output_tokens,
+        cache_read_tokens: item.cache_read_tokens,
+        cache_creation_5m_tokens: item.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: item.cache_creation_1h_tokens,
+        reasoning_output_tokens: item.reasoning_output_tokens,
+        unattributed_total_tokens: item.unattributed_total_tokens,
+        request_count: item.request_count,
+        costs: UsageCosts::default(),
+    }
+}
+
+pub(super) fn usage_totals_from_model_usage(row: &SnapshotModelUsage) -> UsageTotals {
+    UsageTotals {
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_creation_5m_tokens: row.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: row.cache_creation_1h_tokens,
+        reasoning_output_tokens: row.reasoning_output_tokens,
+        unattributed_total_tokens: row.unattributed_total_tokens,
+        request_count: row.request_count,
+        costs: UsageCosts::default(),
+    }
+}
+
+pub(super) fn usage_totals_has_usage(totals: &UsageTotals) -> bool {
+    !totals.is_zero() || totals.request_count > 0
+}
+
+pub(super) fn usage_totals_equal(left: &UsageTotals, right: &UsageTotals) -> bool {
+    left.input_tokens == right.input_tokens
+        && left.output_tokens == right.output_tokens
+        && left.cache_read_tokens == right.cache_read_tokens
+        && left.cache_creation_5m_tokens == right.cache_creation_5m_tokens
+        && left.cache_creation_1h_tokens == right.cache_creation_1h_tokens
+        && left.reasoning_output_tokens == right.reasoning_output_tokens
+        && left.unattributed_total_tokens == right.unattributed_total_tokens
+        && left.request_count == right.request_count
+}
+
+crate::heap_layout_bound::fields!(UsageCosts; observed, reported, total, input, output, cache_read, cache_creation);
+crate::durable_tail_codec::durable_struct!(UsageCosts {
+    N observed: bool,
+    N reported: bool,
+    N total: Option<u128>,
+    N input: Option<u128>,
+    N output: Option<u128>,
+    N cache_read: Option<u128>,
+    N cache_creation: Option<u128>,
+});
+crate::heap_layout_bound::fields!(UsageTotals; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
+crate::durable_tail_codec::durable_struct!(UsageTotals {
+    N input_tokens: u64,
+    N output_tokens: u64,
+    N cache_read_tokens: u64,
+    N cache_creation_5m_tokens: u64,
+    N cache_creation_1h_tokens: u64,
+    N reasoning_output_tokens: u64,
+    N unattributed_total_tokens: u64,
+    N request_count: u64,
+    N costs: UsageCosts,
+});
