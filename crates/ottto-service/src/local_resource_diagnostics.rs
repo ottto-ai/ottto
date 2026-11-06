@@ -663,11 +663,12 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 6;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
-const UNSELECTED_REASONS: usize = USAGE_GAP_START + 4;
+const FORCED_SEED_START: usize = USAGE_GAP_START + 4;
+const UNSELECTED_REASONS: usize = FORCED_SEED_START + FORCED_SEEDS;
 process_static!(
     /// Claude, Codex, Pi x reason, drained by that source's page line.
     fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -715,18 +716,49 @@ pub(crate) enum PageSelection {
     Skipped,
     /// Claude roots put back at the queue front to wait for their family.
     DeferredRoots,
+    /// Distinct Claude roots forced by twin seeds, and family paths the
+    /// closure for forced roots names (those added and those on the page).
+    ForcedFamilyRoots,
+    ForcedFamilyMembersPulled,
 }
 pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
     source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
         slot.fetch_add(amount, Relaxed)
     });
 }
-const PAGE_SELECTION: [(&str, usize); 4] = [
+const PAGE_SELECTION: [(&str, usize); 6] = [
     ("selected", PAGE_SELECTION_START),
     ("owed_selected", PAGE_SELECTION_START + 1),
     ("skipped", PAGE_SELECTION_START + 2),
     ("deferred_roots", PAGE_SELECTION_START + 3),
+    ("forced_family_roots", PAGE_SELECTION_START + 4),
+    ("forced_family_members_pulled", PAGE_SELECTION_START + 5),
 ];
+/// Claude twins that force their family in (one seed each), by the twin's own
+/// `CandidateParseReason`, `other` for a Parse without one, or
+/// `identification_failed`; and the distinct roots they force. Never a gate.
+pub(crate) fn forced_family_seeds(
+    seeds: Vec<Option<Option<crate::snapshots::CandidateParseReason>>>,
+    roots: usize,
+) {
+    for seed in seeds {
+        let reason = seed.map_or(FORCED_SEEDS - 1, |reason| {
+            reason.map_or(FORCED_SEEDS - 2, |reason| reason as usize)
+        });
+        source_count("claude_code", FORCED_SEED_START + reason, |n| {
+            n.fetch_add(1, Relaxed)
+        });
+    }
+    page_selection(
+        "claude_code",
+        PageSelection::ForcedFamilyRoots,
+        roots as u64,
+    );
+}
+pub(crate) fn forced_family_member_pulled() {
+    page_selection("claude_code", PageSelection::ForcedFamilyMembersPulled, 1);
+}
+const FORCED_SEEDS: usize = crate::snapshots::CANDIDATE_PARSE_REASON_COUNT + 2;
 const UNACKED_LOST: [(&str, usize); 4] = [
     ("files", UNACKED_LOST_START),
     ("requests", UNACKED_LOST_START + 1),
@@ -1110,10 +1142,16 @@ impl Probe {
             hold_wake: BTreeMap<&'static str, u64>,
             #[serde(flatten)]
             usage_gaps: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            forced_family_seeds: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let jsonl = jsonl::take(source);
+        let reasons = crate::snapshots::CANDIDATE_PARSE_REASON_NAMES.into_iter();
+        let seeds = reasons.chain(["other", "identification_failed"]);
+        let seeds = seeds.zip(FORCED_SEED_START..).collect::<Vec<_>>();
         let counts = Counts {
+            forced_family_seeds: drain(source, &seeds),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())

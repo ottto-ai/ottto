@@ -3116,6 +3116,27 @@ mod tests {
                 .count(),
             1
         );
+        // Each fold step has one footprint record, closed in order after the
+        // read and before the fold window that contains it.
+        let fold_steps = [
+            "evidence_read",
+            "evidence_side_calls",
+            "evidence_identity_index",
+            "evidence_reported_usage",
+            "evidence_reconcile",
+            "evidence_finish_page",
+            "evidence_identity_tags",
+            "evidence_qualification",
+            "evidence_census_health",
+            "evidence_fold",
+            "claude_local_evidence",
+        ];
+        let stages = records
+            .iter()
+            .filter_map(|record| record["stage"].as_str())
+            .filter(|stage| fold_steps.contains(stage))
+            .collect::<Vec<_>>();
+        assert_eq!(stages, fold_steps);
         fs::remove_dir_all(dir).unwrap();
     }
 
