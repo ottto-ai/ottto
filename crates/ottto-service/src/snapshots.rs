@@ -9324,7 +9324,6 @@ use scan::lines::apply::{
     pi_prompt_content,
 };
 use sources::claude::line::claude_cache_request_slot;
-use sources::codex::line::codex_cache_request;
 #[cfg(test)]
 use usage::cache_observations::cache_state_within_limits;
 use usage::cache_observations::cache_wire;
@@ -9366,9 +9365,7 @@ use sources::claude::line::{
 use sources::claude::line::{extract_session_artifacts, parse_artifact_url};
 
 use sources::codex::line::{
-    codex_last_turn_input_context, codex_last_usage, codex_last_usage_root, codex_line_timestamp,
-    codex_model_context_window, codex_total_usage, codex_total_usage_has_request_count,
-    codex_usage_event_identity,
+    codex_last_usage, codex_last_usage_root, codex_total_usage, codex_usage_event_identity,
 };
 
 use sources::pi::{apply_pi_line, pi_message_usage, pi_usage_event, pi_usage_value};
@@ -9626,8 +9623,7 @@ fn usd_picos_string(value: u128) -> String {
 #[cfg(test)]
 use sources::claude::line::claude_code_cache_creation_split;
 use sources::claude::line::{
-    claude_code_delta_usage, claude_code_effective_input_context, claude_code_unknown_usage_keys,
-    claude_code_usage_dedup_key, claude_code_usage_iterations, claude_code_usage_root,
+    claude_code_delta_usage, claude_code_usage_dedup_key, claude_code_usage_root,
 };
 
 fn usage_object_has_numeric_field(root: &Value, fields: &[&str]) -> bool {
