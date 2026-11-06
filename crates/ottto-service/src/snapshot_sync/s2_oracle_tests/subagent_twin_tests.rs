@@ -373,7 +373,7 @@ fn forced_family_seed_counts() {
         assert_eq!(family, 7);
         for (step, grown, seeds, roots, pulled) in [
             (0, vec![member("a", 0)], 1, 1, family),
-            (1, vec![member("a", 0), member("z", 1)], 2, 1, family),
+            (1, vec![member("a", 0), member("a", 1)], 2, 1, family),
             (2, vec![member("a", 2)], 0, 0, 0),
         ] {
             let hints = grown.iter().map(|relative| c.root.join(relative));
