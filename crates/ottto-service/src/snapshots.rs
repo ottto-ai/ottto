@@ -9304,6 +9304,21 @@ impl OwnedSourceScan {
                     !due
                 });
             }
+            // A fresh page first gives up to half its slots to fresh plain
+            // rollouts in queue order, so a hinted compressed backlog cannot
+            // hold recent sessions back. The rest stays FIFO, archives included.
+            if freshness_page {
+                let reserve = (pending_paths.len() + limit / 2).min(limit);
+                traversal.pending_candidates.retain(|candidate| {
+                    let due = pending_paths.len() < reserve
+                        && !codex_archive_path(&candidate.path)
+                        && codex_fresh_data_pending(candidate, index);
+                    if due {
+                        pending_paths.push(candidate.clone());
+                    }
+                    !due
+                });
+            }
             // Rotate the original queue once without allocating another
             // backlog-sized container. Keep unselected paths in FIFO order.
             for _ in 0..traversal.pending_candidates.len() {
