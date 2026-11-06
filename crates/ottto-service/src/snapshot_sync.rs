@@ -7485,6 +7485,8 @@ fn finish_sync_source(
     // The history-upgrade emission seam: after the local evidence fold, before
     // every ordinary and correction upload path can see a held body.
     index.veto_claude_history_emission(source, &mut scan_result.snapshots);
+    // Diagnostics only: counted from the finished bodies, borrowed.
+    crate::local_resource_diagnostics::usage_gaps(source.api_slug(), &scan_result.snapshots);
 
     // Recheck after the potentially long scan, not only when status was
     // acquired. A cached login must not claim sessions created after a switch.
