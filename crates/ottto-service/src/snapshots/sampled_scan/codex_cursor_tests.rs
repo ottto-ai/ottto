@@ -2482,7 +2482,7 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         assert_eq!(flags(&processed), Some((!codex, true)), "{source:?}");
         assert_eq!(
             flags(&pending),
-            Some((true, codex)),
+            Some((true, true)),
             "{source:?}: the pending census member keeps membership and remembers the hint"
         );
         assert_eq!(flags(&unobserved), Some((true, true)), "{source:?}");
