@@ -156,7 +156,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     progress.generation += 1;
     let after = serde_json::to_vec(&progress).unwrap();
     recovery
-        .before_progress_save(Some(&before), &after)
+        .before_progress_save_bytes(Some(&before), &after)
         .unwrap();
     // Process loss after the exact receipt, before either progress/source save.
     recovery.recover(&progress_path).unwrap();

@@ -249,50 +249,6 @@ fn occurrence_boundary_counts_unusable_and_old_copies() {
     });
 }
 
-/// Body fields a multi-file session's carrier sets: the first page item
-/// carries the summed entity, and a Tail page lists its hinted file first, so
-/// the ended-at time (and the hashes over it) can follow the read route. This
-/// pre-existing difference has no money effect.
-const CARRIER_END: [&str; 6] = [
-    "source_ended_at",
-    "semantic_envelope/component_hashes/lifecycle_activity",
-    "semantic_envelope/content_hash",
-    "semantic_envelope/revision_hash",
-    "semantic_envelope/revision_v2_hash",
-    "snapshot_fingerprint",
-];
-
-/// Money, placement and removed fields exact; any other body difference is
-/// pinned to a changed ended-at time plus the hashes derived from it.
-fn assert_money_equivalent_but_carrier_end(expected: &RouteResult, other: &RouteResult) {
-    money_oracle::assert_placement_equivalent(expected, other);
-    let mut money = Vec::new();
-    money_oracle::entity_differences(expected, other, &mut money);
-    assert!(money.is_empty(), "{:?}:\n{}", other.mode, money.join("\n"));
-    let mut body = Vec::new();
-    money_oracle::diff(
-        "normalized_batch",
-        &expected.normalized,
-        &other.normalized,
-        &mut body,
-    );
-    let mut changed = std::collections::BTreeMap::<&str, bool>::new();
-    for line in &body {
-        let path = line.split(':').next().unwrap();
-        let (snapshot, field) = CARRIER_END
-            .iter()
-            .find_map(|field| Some((path.strip_suffix(field)?, *field)))
-            .unwrap_or_else(|| panic!("{:?}: body drift beyond the carrier: {line}", other.mode));
-        *changed.entry(snapshot).or_default() |= field == "source_ended_at";
-    }
-    assert!(
-        changed.values().all(|ended| *ended),
-        "{:?}: hashes changed without an ended-at change:\n{}",
-        other.mode,
-        body.join("\n")
-    );
-}
-
 /// [money] Append to either child, then opposite children, then only the
 /// main: the old shared prefix stays singular while distinct suffixes add.
 #[test]
@@ -329,19 +285,12 @@ fn growth_on_either_home_and_main_only() {
                 let expected = cold(&c);
                 // Save the prior before either scan takes its growth claim.
                 let restored_prior = session.save_reload(&mut prior);
-                // The main-only append moves the main session's carrier to the
-                // hinted file on Tail; children grow a carrier on both routes.
-                let check: fn(&RouteResult, &RouteResult) = if step == 4 {
-                    assert_money_equivalent_but_carrier_end
-                } else {
-                    money_oracle::assert_equivalent
-                };
                 let warm = hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&path));
                 assert_eq!(warm.modes.0, 0, "append/forced family use Tail");
                 assert!(warm.modes.1 > 0);
-                check(&expected, &result(&warm, Mode::Ram));
+                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
                 let restored = hinted(&c, restored_prior, 100, true, std::slice::from_ref(&path));
-                check(&expected, &result(&restored, Mode::DiskRestore));
+                money_oracle::assert_equivalent(&expected, &result(&restored, Mode::DiskRestore));
                 additions += 1;
                 let sum = expected
                     .snapshots
@@ -351,6 +300,67 @@ fn growth_on_either_home_and_main_only() {
                 assert_eq!(sum, 5 + additions, "each append adds exactly one request");
                 prior = commit(&session, warm);
             }
+        }
+    });
+}
+
+/// [regress] Growth on only one copy of a child, beside another child's
+/// growth, then on that copy alone at a new clock: whichever copy carries the
+/// summed body, cold, RAM, disk restore and restart emit the same full body
+/// (end time and hashes included), with no Full and only the appended bytes.
+#[test]
+fn later_copy_only_child_growth_matches_cold() {
+    with_e2(|| {
+        for reverse in [false, true] {
+            let c = twins(
+                &format!("subagent-twin-later-copy-{reverse}"),
+                reverse,
+                TURN,
+                false,
+                false,
+            );
+            let (session, index) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let mut prior = commit(&session, page(&c, index, 100, true));
+            for (step, grown, clock) in [
+                (0, vec![member("a", 0), member("z", 1)], GROW),
+                (1, vec![member("z", 1)], "2026-11-05T07:09:00Z"),
+            ] {
+                let hints = grown.iter().map(|relative| c.root.join(relative));
+                let hints = hints.collect::<Vec<_>>();
+                let mut suffix = 0;
+                for (n, path) in hints.iter().enumerate() {
+                    let text = line(ROOT, &format!("later-{step}-{n}"), clock, 8);
+                    suffix += text.len() as u64;
+                    append(path, &text);
+                }
+                let expected = cold(&c);
+                let restored_prior = session.save_reload(&mut prior);
+                let restart_prior =
+                    crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(
+                        &ScanIndex::load(session.path()).unwrap(),
+                        &c.base,
+                    );
+                let (warm, bytes) =
+                    fixture::observe_consumed(|| hinted(&c, prior.clone(), 100, true, &hints));
+                assert_eq!(warm.modes.0, 0, "step {step}: growth must not Full");
+                assert_eq!(bytes, suffix, "step {step}: only the appended suffix");
+                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+                let restored = hinted(&c, restored_prior, 100, true, &hints);
+                money_oracle::assert_equivalent(&expected, &result(&restored, Mode::DiskRestore));
+                let restarted = hinted(&c, restart_prior, 100, true, &hints);
+                money_oracle::assert_equivalent(&expected, &result(&restarted, Mode::Restart));
+                prior = commit(&session, warm);
+            }
+            let (quiet, bytes) = fixture::observe_consumed(|| page(&c, prior, 100, true));
+            assert_eq!(bytes, 0, "quiet settlement reads no transcript bytes");
+            assert!(
+                quiet.scan.snapshots.is_empty(),
+                "quiet settlement sends nothing"
+            );
         }
     });
 }
@@ -505,9 +515,9 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 );
                 assert_verified_incomplete(&warm.index, &key);
                 let actual = result(&warm, Mode::DiskRestore);
-                // Family refolding can also move an unchanged session's
-                // carrier. Money/placement and every other body field stay exact.
-                assert_money_equivalent_but_carrier_end(&expected, &actual);
+                // Family refolding can move an unchanged session's carrier;
+                // the full body still matches.
+                money_oracle::assert_equivalent(&expected, &actual);
                 assert!(actual.accepted_identity_buckets.is_some());
                 prior = commit(&session, warm);
                 assert_verified_incomplete(&prior, &key);

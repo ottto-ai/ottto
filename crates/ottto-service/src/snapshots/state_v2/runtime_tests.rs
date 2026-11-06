@@ -476,7 +476,7 @@ fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_h
             f.path.file_stem().unwrap().to_str().unwrap()
         ));
         let next = br#"{"generation":1,"accepted":"exact-body"}"#;
-        recovery.before_progress_save(None, next).unwrap();
+        recovery.before_progress_save_bytes(None, next).unwrap();
         assert!(!progress.exists());
         // Holds the same owner lock as the production load entry point; replay
         // must not recursively acquire it through the external side-effect guard.

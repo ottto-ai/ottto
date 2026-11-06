@@ -2025,7 +2025,7 @@ fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload()
         .ack_recovery
         .as_ref()
         .unwrap()
-        .before_progress_save(Some(&old), &new)
+        .before_progress_save_bytes(Some(&old), &new)
         .unwrap();
     // Crash before progress rename and before any v2 accepted-state commit.
     assert_eq!(std::fs::read(&path).unwrap(), old);
@@ -2096,7 +2096,7 @@ fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
         .ack_recovery
         .as_ref()
         .unwrap()
-        .before_progress_save(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
+        .before_progress_save_bytes(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
         .unwrap();
     let mut saved = ScanIndex::default();
     saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
@@ -2451,4 +2451,75 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             assert!(reloaded.accepted_fingerprints.is_empty());
         }
     }
+}
+
+/// Progress and receipt bytes (SHA-256) after each save in the test below, as
+/// written by the build before the save kept one copy of the progress.
+const ACK_SAVE_BYTES: [&str; 4] = [
+    "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
+    "cc1eb1267b5396a97fffc415e5fae8e98f54e7531d65438bc1f5c4b41e98d2fb",
+    "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
+    "806945e0918e87f43e490c5e0f48d14e07adab81d8beefc8d470507dce2a47e0",
+];
+/// [money] An ACK-bound save writes the same progress and receipt bytes as the
+/// build before it, through both compare-and-swap decode paths.
+#[test]
+fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-bytes");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let mut progress = bound_progress(&index_path, &path, &"a".repeat(64));
+    let mut hashes = Vec::new();
+    for round in 0..2_u8 {
+        let key = format!("{round:064x}");
+        progress.record_body(&key, &"b".repeat(64));
+        let text = "quote \" slash \\ newline \n tab \t é ☃ \u{1}";
+        let state = serde_json::json!({"text": text, "n": [round, 1.5, -2], "z": null});
+        progress.accepted_cache_states.insert(key.clone(), state);
+        progress.accepted_cache_heads.insert(key, "c".repeat(64));
+        let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
+        progress.save_with_read_limit(&path, limit).unwrap();
+        for file in [path.clone(), scratch.join("index.v2-ack-receipt")] {
+            let bytes = std::fs::read(file).unwrap();
+            hashes.push(crate::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
+                &bytes,
+            )));
+        }
+    }
+    assert_eq!(hashes, ACK_SAVE_BYTES);
+}
+
+/// Memory: allocator peak of one ACK-bound save of a ~5 MiB progress, per
+/// progress byte. Requested bytes with realloc overlap; not resident memory.
+#[test]
+fn ack_bound_save_allocation_peak_per_progress_byte() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-peak");
+    let index_path = scratch.join("index");
+    let path = scratch.join("progress");
+    let mut progress = bound_progress(&index_path, &path, &"a".repeat(64));
+    let text = "line\n\"quoted\" ".repeat(128);
+    for n in 0..2048 {
+        let state = serde_json::json!({ "text": &text });
+        progress
+            .accepted_cache_states
+            .insert(format!("{n:064x}"), state);
+        progress
+            .accepted_cache_heads
+            .insert(format!("{n:064x}"), "c".repeat(64));
+    }
+    progress.save(&path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as usize;
+    let (_, peak) = crate::retry_allocation_probe::measure(|| progress.save(&path).unwrap());
+    let requested = peak.requested_peak as f64 / size as f64;
+    let overlap = peak.requested_peak_with_overlap as f64 / size as f64;
+    eprintln!(
+        "progress_save_allocation bytes={size} requested_peak={} with_overlap={} \
+         ratio={requested:.2}/{overlap:.2}",
+        peak.requested_peak, peak.requested_peak_with_overlap
+    );
+    // Linux CI on this fixture: 6.39/7.24 before one-copy saves, 3.39/4.24 after.
+    assert!(
+        requested < 3.6 && overlap < 4.5,
+        "{requested:.2}/{overlap:.2}"
+    );
 }
