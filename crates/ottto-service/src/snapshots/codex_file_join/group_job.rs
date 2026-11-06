@@ -74,10 +74,20 @@ pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulat
 }
 
 pub(super) fn independent_group(group: &Group) -> bool {
-    group
-        .members
-        .iter()
-        .any(|member| codex_session_id_candidates_from_path(&member.path).len() > 1)
+    use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped;
+    group.members.iter().any(|member| {
+        codex_session_id_candidates_from_path(&member.path)
+            .iter()
+            .any(|identity| {
+                identity
+                    .split_once('_')
+                    .is_some_and(|(conversation, rollout)| {
+                        codex_identity_is_uuid_shaped(conversation)
+                            && codex_identity_is_uuid_shaped(rollout)
+                            && resolve_codex_identity(conversation) == group.owner
+                    })
+            })
+    })
 }
 
 /// The group job's logical key: home, owner and the sorted member keys. A
