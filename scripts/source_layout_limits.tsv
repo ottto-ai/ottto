@@ -1,5 +1,5 @@
 # path	max_lines
-crates/ottto-service/src/snapshots.rs	40163
+crates/ottto-service/src/snapshots.rs	38917
 crates/ottto-service/src/snapshots/claude_request_identity.rs	5459
 crates/ottto-service/src/snapshots/claude_request_identity_tests.rs	3928
 crates/ottto-service/src/snapshots/codex_compressed_input.rs	3859
