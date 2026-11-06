@@ -80,3 +80,74 @@ fn claude_cache_rows_keep_the_stored_body_ack() {
         control.accepted_identity_buckets
     );
 }
+
+/// [money] Claude arm: the exact stored ACK of a marked patch records the
+/// cache state from empty, whatever stale rows the ledger held; an unmarked
+/// patch still merges onto its predecessor. Identity buckets are unchanged
+/// and a replayed ACK settles nothing twice.
+#[test]
+fn claude_marked_patch_records_from_empty_on_the_stored_ack() {
+    let patch = crate::snapshots::cache_adapter_tests::cache_fixture_item()
+        .cache_observations
+        .unwrap();
+    let mut marked = patch.clone();
+    marked.full_replacement = true;
+    let witness = "c".repeat(64);
+    let entity = crate::snapshot_client::SnapshotEntityRef {
+        source_session_id: SESSION.into(),
+        snapshot_fingerprint: "b".repeat(64),
+        occurrence_count: 1,
+        body_witness_version: Some(
+            crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION,
+        ),
+        body_witness_digest: Some(witness.clone()),
+        head_etag: None,
+        head_challenge: None,
+        unchanged_basis: None,
+        retained_proof_missing: Vec::new(),
+    };
+    let key = cache_session_key(SESSION);
+    let mut stale_row =
+        crate::snapshots::cache_state_from_patch(None, &patch).unwrap()["observations"][0].clone();
+    stale_row["event_id"] = json!(format!("cache:{}", "d".repeat(64)));
+    let prior = json!({"schema_version":1,"observations":[stale_row],"coverage":"complete","omitted_observation_count":null});
+    let progress = || {
+        let mut progress = SnapshotUploadProgress::new(
+            "a".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        progress
+            .accepted_cache_states
+            .insert(key.clone(), prior.clone());
+        progress
+    };
+    let ack = |progress: &mut SnapshotUploadProgress, body: &Value| {
+        progress
+            .record_stored_state(body, false, Some((&entity, witness.as_str())))
+            .unwrap();
+    };
+    let mut control = progress();
+    ack(&mut control, &claude_body(Some(&patch)));
+    let from_empty = crate::snapshots::cache_state_from_patch(None, &patch).unwrap();
+    let rows = |state: &Value| state["observations"].as_array().unwrap().len();
+    assert_eq!(
+        rows(&control.accepted_cache_states[&key]),
+        rows(&from_empty) + 1,
+        "unmarked merges onto A"
+    );
+    let mut replaced = progress();
+    let body = claude_body(Some(&marked));
+    assert_eq!(body["cache_observations"]["full_replacement"], true);
+    ack(&mut replaced, &body);
+    assert_eq!(replaced.accepted_cache_states[&key], from_empty);
+    assert_eq!(
+        replaced.accepted_identity_buckets,
+        control.accepted_identity_buckets
+    );
+    ack(&mut replaced, &body);
+    assert_eq!(replaced.accepted_cache_states[&key], from_empty);
+    assert_eq!(replaced.accepted_cache_states.len(), 1);
+}

@@ -128,6 +128,7 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
         operations: vec![],
         coverage: "complete".into(),
         omitted_observation_count: Some(0),
+        full_replacement: false,
     });
     let before = item.cache_observations.clone();
     let mut progress = progress();
@@ -139,7 +140,7 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
             row
         }).collect::<Vec<_>>()}),
     );
-    let reserved = identity_cache_wire_reserve(&item, &progress);
+    let reserved = identity_cache_wire_reserve(&item, &progress, false);
     assert_eq!(item.cache_observations, before);
     let mut projected = item.clone();
     prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
@@ -167,7 +168,7 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     progress
         .accepted_cache_heads
         .insert(cache_session_key(&item.source_session_id), "a".repeat(64));
-    let reserved = identity_cache_wire_reserve(&item, &progress);
+    let reserved = identity_cache_wire_reserve(&item, &progress, false);
     assert!(reserved > 64);
     let mut projected = item.clone();
     prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());

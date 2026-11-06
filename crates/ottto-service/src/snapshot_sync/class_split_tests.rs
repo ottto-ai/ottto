@@ -27,6 +27,7 @@ fn complete_empty() -> CacheObservations {
         operations: Vec::new(),
         coverage: "complete".into(),
         omitted_observation_count: None,
+        full_replacement: false,
     }
 }
 

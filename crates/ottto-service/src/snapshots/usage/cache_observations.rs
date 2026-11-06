@@ -16,7 +16,8 @@ pub(crate) fn cache_state_from_patch(
     patch: &CacheObservations,
 ) -> Option<Value> {
     let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    if let Some(previous) = previous {
+    // A marked replacement completes from empty, on both sides of the wire.
+    if let Some(previous) = previous.filter(|_| !patch.full_replacement) {
         for row in previous.get("observations")?.as_array()? {
             let row =
                 serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
@@ -227,5 +228,6 @@ pub(in crate::snapshots) fn cache_wire<'a>(
             .collect(),
         coverage: "complete".into(),
         omitted_observation_count: None,
+        full_replacement: false,
     }
 }

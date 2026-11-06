@@ -728,6 +728,7 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
             operations: Vec::new(),
             coverage: "complete".into(),
             omitted_observation_count: None,
+            full_replacement: false,
         });
     }
     let mut ledger = progress();
@@ -833,6 +834,7 @@ fn with_cache(item: &SnapshotItem) -> SnapshotItem {
         operations: Vec::new(),
         coverage: "complete".into(),
         omitted_observation_count: None,
+        full_replacement: false,
     });
     item
 }

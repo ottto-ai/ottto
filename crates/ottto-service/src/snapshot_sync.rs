@@ -1286,6 +1286,17 @@ fn capture_deferred_cache_head_identities(
         .collect()
 }
 
+/// Both exact contracts, so Pi (no base cache contract) never marks a patch.
+fn cache_full_replacement_negotiated(
+    source: SnapshotSource,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+) -> bool {
+    source != SnapshotSource::Pi
+        && hint.session_cache_observations_contract.as_deref()
+            == Some("session_cache_observations:v1")
+        && hint.cache_full_replacement_contract.as_deref() == Some("cache_full_replacement:v1")
+}
+
 /// Pure projection shared by no-op/index witnesses and the network boundary.
 /// Local consumers retain the original cache patch and provisional state.
 fn prepare_snapshot_cache_for_upload(
@@ -1321,6 +1332,7 @@ fn prepare_snapshot_cache_for_upload(
 fn identity_cache_wire_reserve(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
+    full_replacement: bool,
 ) -> usize {
     if snapshot.cache_observations.is_none()
         && !progress
@@ -1333,7 +1345,12 @@ fn identity_cache_wire_reserve(
     prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
     // An owed answer can become eligible between admission and upload. Reserve
     // its framing even while paced, using the real attachment/size paths.
-    attach_head_conflict_answers(std::slice::from_mut(&mut projected), progress, u64::MAX);
+    attach_head_conflict_answers(
+        std::slice::from_mut(&mut projected),
+        progress,
+        u64::MAX,
+        |_| full_replacement,
+    );
     crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
         crate::snapshots::claude_request_identity::item_bytes(snapshot),
     )
@@ -1359,23 +1376,28 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
 /// probe (within one hour); a new revision answers at once. Only a body that
 /// sends the stale base under the head-CAS contract carries the answer; the
 /// body itself, its fingerprint and its witness are unchanged.
+/// `replacement_owed` (negotiated, real-Full session) may also mark the patch
+/// a full replacement when no local cache state exists: that patch already
+/// completes from empty, so only the receiver's predecessor changes.
 fn attach_head_conflict_answers(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
     now: u64,
+    replacement_owed: impl Fn(&str) -> bool,
 ) -> usize {
     let mut attached = 0usize;
     for snapshot in snapshots {
         snapshot.cache_conflict_answer = None;
+        if let Some(patch) = snapshot.cache_observations.as_mut() {
+            patch.full_replacement = false;
+        }
         // A withheld cache patch keeps its base but sends no CAS contract, so
         // the request and its ACK validation would not admit a handshake.
         if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
             continue;
         }
-        let Some(record) = progress
-            .head_conflict_challenges
-            .get(&cache_session_key(&snapshot.source_session_id))
-        else {
+        let key = cache_session_key(&snapshot.source_session_id);
+        let Some(record) = progress.head_conflict_challenges.get(&key) else {
             continue;
         };
         if record.last_answer_unix != 0
@@ -1390,6 +1412,18 @@ fn attach_head_conflict_answers(
             record.challenge.clone(),
             record.stale_revision_v2_hash.clone(),
         ));
+        if let Some(patch) = snapshot.cache_observations.as_mut().filter(|patch| {
+            replacement_owed(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && patch.operations.iter().all(|operation| {
+                    matches!(operation, crate::snapshots::cache_observations::Operation::Upsert { observation }
+                        if observation.status != "retracted")
+                })
+        }) {
+            // Over the patch bound the answer stays unmarked, as before.
+            patch.full_replacement = true;
+            patch.full_replacement = patch.validate();
+        }
         attached = attached.saturating_add(1);
     }
     attached
@@ -7307,6 +7341,7 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let cache_full_replacement = cache_full_replacement_negotiated(source, &activity_hint);
     // Telemetry retention keeps the sessions this page names, read before any
     // page filter drops a snapshot.
     let telemetry_named = claude_scan_roots
@@ -7407,7 +7442,7 @@ fn finish_sync_source(
         );
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
-                identity_cache_wire_reserve(item, &upload_progress)
+                identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
             } else {
                 0
             }
@@ -7927,6 +7962,7 @@ fn finish_sync_source(
         &mut scan_result.snapshots,
         &upload_progress,
         current_unix_seconds(),
+        |key| cache_full_replacement && index.head_conflict_owed(key),
     );
     if head_conflict_answers > 0 {
         eprintln!(
@@ -14757,6 +14793,7 @@ mod tests {
                 operations: Vec::new(),
                 coverage: "complete".into(),
                 omitted_observation_count: None,
+                full_replacement: false,
             });
         crate::snapshots::prepare_cache_observations(&mut corrected, Some(&prior));
         assert_eq!(corrected.snapshot_fingerprint, item.snapshot_fingerprint);
@@ -22709,6 +22746,7 @@ mod tests {
             operations: Vec::new(),
             coverage: "complete".into(),
             omitted_observation_count: None,
+            full_replacement: false,
         };
         let mut cold = BTreeMap::new();
         for (phase, bootstrap) in [

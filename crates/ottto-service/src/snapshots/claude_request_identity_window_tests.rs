@@ -466,6 +466,7 @@ fn sticky_budget_sheds_cache_before_stripping_any_tag() {
             .collect(),
         coverage: "complete".into(),
         omitted_observation_count: Some(0),
+        full_replacement: false,
     });
     assert!(
         identity::item_bytes(&padded) > identity::MAX_ITEM_BYTES,
@@ -1450,6 +1451,7 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
         operations: vec![],
         coverage: "complete".into(),
         omitted_observation_count: Some(0),
+        full_replacement: false,
     });
     let cache_fixture = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let observation = cache_fixture.cache_observations_state.unwrap()["observations"][0].clone();
