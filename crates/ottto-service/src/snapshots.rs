@@ -16214,9 +16214,9 @@ fn enqueue_watcher_hints(
         if let Some(&position) = pending.get(path) {
             let member = fresh_path_census_member(source, traversal, path);
             if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
-                if source == SnapshotSource::Codex {
-                    candidate.watcher_hint = true;
-                }
+                // Every source: the hint orders the queued path into the
+                // hinted turn, ahead of the census FIFO. Order only.
+                candidate.watcher_hint = true;
                 // Claude/Pi: the hint joins the census as it would if nothing
                 // were queued for it (a re-listed or re-read non-member).
                 if source != SnapshotSource::Codex {
@@ -24082,6 +24082,102 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// [regress] A hint for a transcript the census walk already queued moves
+    /// it into the hinted turn, ahead of the census FIFO, on Claude and Pi as
+    /// on Codex. It is read once, and the census closes on the same page in
+    /// the same generation as without the hint.
+    #[test]
+    fn hint_orders_an_already_queued_census_member_ahead_of_the_fifo() {
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+            let root = temp_dir("bounded-queued-member-hint");
+            let line = |session: &str, request: u64| {
+                if source == SnapshotSource::ClaudeCode {
+                    format!(
+                        "{{\"timestamp\":\"2026-07-22T08:00:0{request}.000Z\",\"sessionId\":\"{session}\",\"type\":\"assistant\",\"requestId\":\"req_{session}_{request}\",\"message\":{{\"id\":\"msg_{session}_{request}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":{request},\"output_tokens\":1}}}}}}\n"
+                    )
+                } else {
+                    format!(
+                        "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":{},\"usage\":{{\"input\":{request},\"output\":1}}}}}}\n",
+                        1784707201000 + request
+                    )
+                }
+            };
+            for file in 0..6 {
+                let session = format!("session-{file}");
+                fs::write(root.join(format!("{session}.jsonl")), line(&session, 1))
+                    .expect("write census fixture");
+            }
+            let page = |index: &mut ScanIndex, tick: u64, hints: &[PathBuf]| {
+                let mut scan = scan_source_roots_with_limit_and_attribution(
+                    source,
+                    std::slice::from_ref(&root),
+                    index,
+                    &format!("2026-07-31T00:0{tick}:00Z"),
+                    BACKFILL_WINDOW_DAYS,
+                    2,
+                    None,
+                    None,
+                    hints,
+                    false,
+                )
+                .expect("bounded census page");
+                if source == SnapshotSource::ClaudeCode {
+                    apply_claude_reported_usage_with_index(
+                        &mut scan.snapshots,
+                        &Default::default(),
+                        &Default::default(),
+                        index,
+                    );
+                }
+                finalize_scan_after_policy(source, &mut scan, index);
+                scan
+            };
+            let mut index = ScanIndex::default();
+
+            let first = page(&mut index, 0, &[]);
+            assert!(!first.census_complete);
+            assert_eq!(first.scanned_file_count, 2);
+            let pending = &index
+                .traversal
+                .as_ref()
+                .expect("census in progress")
+                .pending_candidates;
+            assert_eq!(pending.len(), 4);
+            let last_queued = pending.back().expect("queued census member");
+            assert!(last_queued.census_member && !last_queued.watcher_hint);
+            let queued = last_queued.path.clone();
+            let key = local_index_key(&queued);
+            assert!(!index.files.contains_key(&key));
+            let session = queued
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem")
+                .to_string();
+            let mut grown = fs::read_to_string(&queued).expect("read queued fixture");
+            grown.push_str(&line(&session, 2));
+            fs::write(&queued, grown).expect("grow queued fixture");
+
+            let hinted = page(&mut index, 1, std::slice::from_ref(&queued));
+            assert!(!hinted.census_complete);
+            assert_eq!(hinted.scanned_file_count, 2);
+            assert_eq!(
+                index.files.get(&key).map(|entry| entry.size_bytes),
+                Some(fs::metadata(&queued).expect("queued metadata").len()),
+                "{source:?}: the hinted member is read ahead of the census FIFO"
+            );
+
+            let last = page(&mut index, 2, &[]);
+            assert!(last.census_complete, "{source:?}: closure is not delayed");
+            assert_eq!(last.scanned_file_count, 2, "{source:?}: read once");
+            for scan in [&first, &hinted, &last] {
+                assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
+            }
+            assert!(index.traversal.is_none());
+            assert_eq!(index.files.len(), 6);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
