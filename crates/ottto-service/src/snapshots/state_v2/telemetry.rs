@@ -193,9 +193,11 @@ pub(super) fn hydrate_checkpoint(
         return;
     }
     initialize_pass();
+    let cpu = crate::local_resource_diagnostics::state_v2_cpu();
     let window = MemoryWindow {
         current: crate::local_resource_diagnostics::state_v2_memory(),
-        process_cpu_us: crate::local_resource_diagnostics::state_v2_cpu_us(),
+        process_cpu_us: cpu.and_then(|c| c.cpu_user_us.checked_add(c.cpu_sys_us)),
+        cpu,
         save_digests: Some(save_digests),
         // Hydrate-owned maps; no key/value walks or serialized size estimates.
         kind_cx_entries: cx.map(|cx| cx.presence.len() + cx.digests.len()),
@@ -430,6 +432,9 @@ struct MemoryWindow {
     peak: crate::local_resource_diagnostics::StateV2Memory,
     #[serde(skip_serializing_if = "Option::is_none")]
     process_cpu_us: Option<u64>,
+    /// Hydrate checkpoints only: cumulative user/system CPU and page faults.
+    #[serde(flatten)]
+    cpu: Option<crate::local_resource_diagnostics::StateV2Cpu>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_digests: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -579,6 +584,7 @@ mod ops_tests {
                     "hydrate_route_entry",
                     "hydrate_after_ack",
                     "hydrate_after_catalogue",
+                    "hydrate_after_misc",
                     "hydrate_after_files",
                     "hydrate_after_accounts",
                     "hydrate_after_decode",
@@ -595,6 +601,12 @@ mod ops_tests {
                 }
                 if cfg!(any(target_os = "macos", target_os = "linux")) {
                     assert!(sample["process_cpu_us"].is_u64());
+                    let split = ["cpu_user_us", "cpu_sys_us"].map(|f| sample[f].as_u64().unwrap());
+                    assert_eq!(
+                        split[0] + split[1],
+                        sample["process_cpu_us"].as_u64().unwrap()
+                    );
+                    assert!(sample["minor_faults"].is_u64() && sample["major_faults"].is_u64());
                 }
             }
             drop(loaded);

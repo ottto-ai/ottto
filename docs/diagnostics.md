@@ -102,6 +102,11 @@ Rust/platform layouts or unaccountable fields remain null. The existing 50 ms,
 16-slot bounded samplers include stage endpoints; short peaks may be missed.
 The plateau is sampled after finish returns and releases its inputs; it is an
 immediate observation, not a delayed stability proof.
+Hydrate checkpoints (`stage_memory.hydrate_route_entry` through `hydrate_exit`,
+including `hydrate_after_misc` between the misc and files kinds) carry
+cumulative process `process_cpu_us`, its `cpu_user_us`/`cpu_sys_us` split and
+`minor_faults`/`major_faults` from one getrusage read; subtract adjacent
+checkpoints for a segment. Shared hydrate code: Claude, Codex and Pi alike.
 The retained-history goal is a store heap of at most 56 MiB and a reduction over
 90% from the 630 MiB baseline, with finish peak below 164 MiB. Whole-process
 steady RSS is a gauge, not that retained-history acceptance criterion.
