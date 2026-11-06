@@ -3274,7 +3274,23 @@ fn spare_fresh_capacity_takes_census_fifo_and_preserves_deferred_flags() {
                 let flags = selected.codex_selected_flags.clone();
                 let ((mut next, first), consumed) = observe_consumed(|| finish_published(selected));
                 assert!(next.traversal.as_ref().unwrap().codex_freshness_yield);
-                if small {
+                if small && compressed {
+                    // Main's already-paid compressed stream continues after
+                    // resetting singleton accounting. Keep that policy; native
+                    // candidates below exercise selection-before-body deferral.
+                    assert_eq!(first.snapshots.len(), 4);
+                    assert_eq!(consumed, 4 * fs::metadata(&fresh).unwrap().len());
+                    assert_eq!(
+                        next.traversal
+                            .as_ref()
+                            .unwrap()
+                            .pending_candidates
+                            .iter()
+                            .map(|candidate| candidate.path.clone())
+                            .collect::<Vec<_>>(),
+                        cold[3..]
+                    );
+                } else if small {
                     assert_eq!(first.snapshots.len(), 1, "only primary fits");
                     assert_eq!(consumed, fs::metadata(&fresh).unwrap().len());
                     for path in &cold[..3] {
