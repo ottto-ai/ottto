@@ -2155,7 +2155,12 @@ that owe nothing by per-file evidence: a confirmed-empty file at its stamp,
 and a Claude subagent journal, which the snapshot rule excludes
 from upload. `deleted_unaccepted_files` is the cumulative count of files erased
 while still owed: a complete walk erases the debt of a file it no longer lists
-and whose index entry is gone. `last_complete_discovery_at` is the Unix time a
+and whose index entry is gone. `listed_history_held_files` counts owed Claude
+history this walk listed that the history gate holds for the re-emission list:
+its stamp matches, its revision is below the active one, the list is active and
+names its family, and no snapshot of it was refused. Such files stay in
+`outstanding_files` and `held_files` but leave `over_6h_files`, `oldest_age_s`
+and the unknown-age count. `last_complete_discovery_at` is the Unix time a
 walk that covered every root without a listing error or an unconfirmed missing
 directory last began. Members of an `UnprovenTerminal` Claude usage-authority
 family with debt are also reported apart, in `authority_terminal_files` and

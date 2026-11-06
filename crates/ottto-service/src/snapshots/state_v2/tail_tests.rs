@@ -933,7 +933,10 @@ fn debt_survives_reset_and_retire_until_settled() {
     settle.resolved.insert(0);
     settle.replaced.insert(1, b"r1x".to_vec());
     observe_tail(&f.path, FILE, settle).unwrap();
+    telemetry::take_thread_event_for_test("tail_apply");
     save_with(&f.path, &mut index).unwrap();
+    let partial = telemetry::take_thread_event_for_test("tail_apply").unwrap();
+    assert!(partial.get("debt_settled_heads").is_none(), "head kept");
     assert_eq!(
         revisions(&index, FILE),
         BTreeMap::from([(1, b"r1x".to_vec()), (2, b"r2".to_vec())])
@@ -952,6 +955,8 @@ fn debt_survives_reset_and_retire_until_settled() {
         load_head(&index, FILE, REVISION).unwrap().is_none(),
         "no reduction, no debt"
     );
+    let settled = telemetry::take_thread_event_for_test("tail_apply").unwrap();
+    assert_eq!(settled["debt_settled_heads"], 1);
 
     // An unknown revision id fails this file alone: set aside, nothing written.
     let mut unknown = observation(&[]);
