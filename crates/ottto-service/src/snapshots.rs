@@ -3266,11 +3266,13 @@ impl CodexTurnTraceMap {
     }
 }
 
+#[cfg(test)]
+use scan::accumulator::SELECTOR_CONTEXT_ALLOWED;
 use scan::accumulator::{
     build_row_identity, cached_repository_identity, claude_row_placement, merge_session_row,
     model_usage_from_row, row_key_from_model_usage, selector_hash, ActivityCallId,
     ActivityCallTool, BucketRowAccumulator, CodexOwnershipBoundary, RowKey, SelectorCapture,
-    SelectorHashes, UsageBucketState, CODEX_THREAD_TIER, SELECTOR_CONTEXT_ALLOWED,
+    SelectorHashes, UsageBucketState, CODEX_THREAD_TIER,
 };
 pub(crate) use scan::accumulator::{copy_unproven_selector_hash, PlacedClaudeUsage};
 
