@@ -23495,20 +23495,17 @@ mod tests {
             let rows = api.evidence.get_mut(&raw.source_session_id).unwrap();
             match case {
                 "creator_org_conflict" => {
-                    rows[0]
-                        .request_identity
-                        .as_mut()
-                        .unwrap()
+                    std::sync::Arc::make_mut(rows[0].request_identity.as_mut().unwrap())
                         .organization
                         .log_record_hash = Some("d".repeat(64))
                 }
                 "typed_conflict" => {
-                    rows[3].request_identity.as_mut().unwrap().disposition =
-                        ClaudeIdentityDisposition::Conflict
+                    std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap())
+                        .disposition = ClaudeIdentityDisposition::Conflict
                 }
                 "typed_invalid" => {
-                    rows[3].request_identity.as_mut().unwrap().disposition =
-                        ClaudeIdentityDisposition::Invalid
+                    std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap())
+                        .disposition = ClaudeIdentityDisposition::Invalid
                 }
                 "missing_api" => {
                     rows.pop();

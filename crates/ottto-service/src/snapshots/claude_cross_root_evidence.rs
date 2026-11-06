@@ -300,11 +300,11 @@ impl CrossRootEvidence {
 }
 
 fn api_row_ids(row: &ClaudeLocalOtelEvidence) -> (&str, &str) {
-    (row.session_id.as_str(), row.request_id.as_str())
+    (row.session_id.as_ref(), row.request_id.as_str())
 }
 
 fn trace_row_ids(row: &ClaudeTraceOwnershipEvidence) -> (&str, &str) {
-    (row.session_id.as_str(), row.request_id.as_str())
+    (row.session_id.as_ref(), row.request_id.as_str())
 }
 
 #[cfg(test)]

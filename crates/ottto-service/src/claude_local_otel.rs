@@ -17,11 +17,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[cfg(unix)]
@@ -45,9 +45,9 @@ const TRACE_OWNERSHIP_CAPTURE_REVISION: &str = "claude_llm_request_ownership:v1"
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeLocalOtelEvidence {
     #[serde(default)]
-    pub capture_revision: String,
+    pub capture_revision: Arc<str>,
     pub fingerprint: String,
-    pub session_id: String,
+    pub session_id: Arc<str>,
     /// Anthropic's per-request id (`req_...`), which the transcript repeats as
     /// `requestId` on every record of that response.
     ///
@@ -62,18 +62,18 @@ pub struct ClaudeLocalOtelEvidence {
     #[serde(default)]
     pub client_request_id: String,
     pub observed_at: String,
-    pub model: String,
-    pub effort: String,
+    pub model: Arc<str>,
+    pub effort: Arc<str>,
     #[serde(default)]
-    pub query_source: String,
+    pub query_source: Arc<str>,
     #[serde(default)]
-    pub speed: String,
+    pub speed: Arc<str>,
     #[serde(default)]
     pub cost_usd_micros: Option<u64>,
     #[serde(default)]
     pub event_sequence: Option<u64>,
     #[serde(default)]
-    pub app_version: String,
+    pub app_version: Arc<str>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -95,11 +95,11 @@ pub struct ClaudeLocalOtelEvidence {
     #[serde(default)]
     pub account_identity_checked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_identifier_hash: Option<String>,
+    pub account_identifier_hash: Option<Arc<str>>,
     /// Identity observed on this request, not a session creator or entitlement.
     /// Legacy rows have no evaluation; absence never fills an organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_identity: Option<ClaudeRequestIdentityEvidence>,
+    pub request_identity: Option<Arc<ClaudeRequestIdentityEvidence>>,
     /// The row's one fingerprint check, kept in memory only.
     #[serde(skip)]
     pub(crate) fingerprint_check: FingerprintCheck,
@@ -154,7 +154,7 @@ impl std::fmt::Debug for FingerprintCheck {
 
 crate::heap_layout_bound::no_heap!(true; FingerprintCheck);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClaudeRequestIdentityEvidence {
     pub identity_hash_scheme: String,
     pub account: ClaudeIdentityAttributeEvidence,
@@ -163,7 +163,7 @@ pub struct ClaudeRequestIdentityEvidence {
     pub disposition: ClaudeIdentityDisposition,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClaudeIdentityAttributeEvidence {
     pub origin: ClaudeIdentityAttributeOrigin,
     pub disposition: ClaudeIdentityDisposition,
@@ -173,7 +173,7 @@ pub struct ClaudeIdentityAttributeEvidence {
     pub log_record_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeIdentityAttributeOrigin {
     Missing,
@@ -182,7 +182,7 @@ pub enum ClaudeIdentityAttributeOrigin {
     ResourceAndLogRecord,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeIdentityDisposition {
     Missing,
@@ -312,9 +312,9 @@ pub struct ClaudeLocalOtelLoadReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeTraceOwnershipEvidence {
     #[serde(default)]
-    pub capture_revision: String,
+    pub capture_revision: Arc<str>,
     pub fingerprint: String,
-    pub session_id: String,
+    pub session_id: Arc<str>,
     #[serde(default)]
     pub request_id: String,
     #[serde(default)]
@@ -630,9 +630,9 @@ fn trace_evidence_from_attrs(
         return None;
     };
     let mut item = ClaudeTraceOwnershipEvidence {
-        capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.to_string(),
+        capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.into(),
         fingerprint: String::new(),
-        session_id,
+        session_id: session_id.into(),
         request_id: bounded_attr(attrs, &["request_id", "gen_ai.response.id"], 256),
         client_request_id: bounded_attr(attrs, &["client_request_id"], 256),
         agent_id: bounded_attr(attrs, &["agent.id", "agent_id"], 256),
@@ -651,8 +651,8 @@ fn identity_upgrade_replay(
     previous: &ClaudeLocalOtelEvidence,
     incoming: &ClaudeLocalOtelEvidence,
 ) -> bool {
-    if previous.capture_revision != API_REQUEST_CAPTURE_REVISION
-        || incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
+    if &*previous.capture_revision != API_REQUEST_CAPTURE_REVISION
+        || &*incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
         || previous.request_identity.is_none() == incoming.request_identity.is_none()
     {
         return false;
@@ -666,15 +666,61 @@ fn identity_upgrade_replay(
     previous == incoming
 }
 
+/// One root decode's pool of repeated row values (session, revision, model,
+/// identity...). Rows share one allocation per distinct value; values, bytes
+/// and fingerprints are unchanged. Dropped with its decoder.
+#[derive(Debug, Clone, Default)]
+struct SharedValues {
+    strs: HashSet<Arc<str>>,
+    identities: HashSet<Arc<ClaudeRequestIdentityEvidence>>,
+}
+
+fn share<T: Eq + std::hash::Hash + ?Sized>(pool: &mut HashSet<Arc<T>>, value: &mut Arc<T>) {
+    match pool.get(&*value) {
+        Some(shared) => *value = Arc::clone(shared),
+        None => {
+            pool.insert(Arc::clone(value));
+        }
+    }
+}
+
+impl SharedValues {
+    fn api(&mut self, row: &mut ClaudeLocalOtelEvidence) {
+        for value in [
+            &mut row.capture_revision,
+            &mut row.session_id,
+            &mut row.model,
+            &mut row.effort,
+            &mut row.query_source,
+            &mut row.speed,
+            &mut row.app_version,
+        ] {
+            share(&mut self.strs, value);
+        }
+        if let Some(value) = &mut row.account_identifier_hash {
+            share(&mut self.strs, value);
+        }
+        if let Some(identity) = &mut row.request_identity {
+            share(&mut self.identities, identity);
+        }
+    }
+
+    fn trace(&mut self, row: &mut ClaudeTraceOwnershipEvidence) {
+        share(&mut self.strs, &mut row.capture_revision);
+        share(&mut self.strs, &mut row.session_id);
+    }
+}
+
 /// Cumulative arrival-order API projection. Keep even suppressed fingerprints:
 /// rebuilding `seen_fingerprints` from surviving rows changes replay semantics.
-#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+#[cfg_attr(test, derive(Debug, Clone))]
 struct ApiSidecarDecoder<'a> {
     session_id: &'a str,
     rows: Vec<ClaudeLocalOtelEvidence>,
     seen_fingerprints: BTreeSet<String>,
     request_rows: BTreeMap<String, usize>,
     health: ClaudeLocalOtelLoadHealth,
+    shared: SharedValues,
 }
 
 impl<'a> ApiSidecarDecoder<'a> {
@@ -685,6 +731,7 @@ impl<'a> ApiSidecarDecoder<'a> {
             seen_fingerprints: BTreeSet::new(),
             request_rows: BTreeMap::new(),
             health: ClaudeLocalOtelLoadHealth::default(),
+            shared: SharedValues::default(),
         }
     }
 
@@ -1043,17 +1090,18 @@ impl ApiSidecarDecoder<'_> {
             self.health.unreadable_lines += 1;
             return;
         };
-        let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
+        let mut item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
             Ok(item) => item,
             Err(_) => {
                 self.health.malformed_lines += 1;
                 return;
             }
         };
-        if item.session_id != self.session_id {
+        if &*item.session_id != self.session_id {
             self.health.invalid_session_rows += 1;
             return;
         }
+        self.shared.api(&mut item);
         if item.request_id.is_empty() {
             self.health.missing_request_ids += 1;
         }
@@ -1193,13 +1241,14 @@ pub fn load_claude_trace_ownership_evidence(
 }
 
 /// Trace conflicts track the last export even when its fingerprint was seen.
-#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+#[cfg_attr(test, derive(Debug, Clone))]
 struct TraceSidecarDecoder<'a> {
     session_id: &'a str,
     rows: Vec<ClaudeTraceOwnershipEvidence>,
     seen_fingerprints: BTreeSet<String>,
     request_fingerprints: BTreeMap<String, String>,
     report: ClaudeTraceOwnershipLoadReport,
+    shared: SharedValues,
 }
 
 impl<'a> TraceSidecarDecoder<'a> {
@@ -1210,6 +1259,7 @@ impl<'a> TraceSidecarDecoder<'a> {
             seen_fingerprints: BTreeSet::new(),
             request_fingerprints: BTreeMap::new(),
             report: ClaudeTraceOwnershipLoadReport::default(),
+            shared: SharedValues::default(),
         }
     }
 
@@ -1233,17 +1283,18 @@ impl<'a> TraceSidecarDecoder<'a> {
             self.report.unreadable_lines += 1;
             return;
         };
-        let item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
+        let mut item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
             Ok(item) => item,
             Err(_) => {
                 self.report.malformed_lines += 1;
                 return;
             }
         };
-        if item.session_id != self.session_id {
+        if &*item.session_id != self.session_id {
             self.report.invalid_session_rows += 1;
             return;
         }
+        self.shared.trace(&mut item);
         if item.request_id.is_empty() {
             self.report.missing_request_ids += 1;
         } else if let Some(previous) = self
@@ -1336,15 +1387,17 @@ pub fn load_claude_effort_by_request(
             let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
-            if item.session_id != session_id
+            if *item.session_id != session_id
                 || item.request_id.is_empty()
-                || !VALID_EFFORTS.contains(&item.effort.as_str())
+                || !VALID_EFFORTS.contains(&item.effort.as_ref())
             {
                 continue;
             }
             // One request has exactly one applied tier; a repeated id is the
             // same observation re-exported, so first write wins.
-            index.entry(item.request_id).or_insert(item.effort);
+            index
+                .entry(item.request_id)
+                .or_insert(item.effort.to_string());
         }
     }
     index
@@ -1623,16 +1676,16 @@ fn api_evidence_from_attrs(
         .unwrap_or_default()
         .to_string();
     let mut item = ClaudeLocalOtelEvidence {
-        capture_revision: API_REQUEST_CAPTURE_REVISION.to_string(),
+        capture_revision: API_REQUEST_CAPTURE_REVISION.into(),
         fingerprint: String::new(),
-        session_id: session_id.to_string(),
+        session_id: session_id.into(),
         request_id,
         client_request_id: bounded_attr(attrs, &["client_request_id"], 256),
         observed_at,
-        model: model.to_string(),
-        effort,
-        query_source: bounded_attr(attrs, &["query_source"], 256),
-        speed: bounded_attr(attrs, &["speed", "service_tier"], 64),
+        model: model.into(),
+        effort: effort.into(),
+        query_source: bounded_attr(attrs, &["query_source"], 256).into(),
+        speed: bounded_attr(attrs, &["speed", "service_tier"], 64).into(),
         cost_usd_micros: first_u64_option(attrs, &["cost_usd_micros", "estimated_cost_usd_micros"])
             .or_else(|| first_decimal_usd_micros(attrs, &["cost_usd", "estimated_cost_usd"])),
         event_sequence: first_u64_option(attrs, &["event.sequence", "event_sequence", "sequence"]),
@@ -1640,7 +1693,8 @@ fn api_evidence_from_attrs(
             attrs,
             &["app.version", "service.version", "claude_code.version"],
             128,
-        ),
+        )
+        .into(),
         input_tokens: first_u64(
             attrs,
             &[
@@ -1695,8 +1749,8 @@ fn api_evidence_from_attrs(
         ),
         request_count: 1,
         account_identity_checked: true,
-        account_identifier_hash: request_identity.account.unambiguous_hash(),
-        request_identity: Some(request_identity),
+        account_identifier_hash: request_identity.account.unambiguous_hash().map(Arc::from),
+        request_identity: Some(Arc::new(request_identity)),
         fingerprint_check: FingerprintCheck::default(),
     };
     let bytes = serde_json::to_vec(&item).ok()?;
@@ -2252,7 +2306,7 @@ mod tests {
                 (input, output, Some(cost))
             );
             let expected = ottto_core::billing_identity_hash("anthropic", "account", account);
-            assert_eq!(row.account_identifier_hash, expected);
+            assert_eq!(row.account_identifier_hash.as_deref(), expected.as_deref());
             assert_eq!(
                 row.request_identity
                     .as_ref()
@@ -2417,8 +2471,8 @@ mod tests {
                 ottto_core::billing_identity_hash("anthropic", "organization", ORGANIZATION)
             );
             assert_eq!(
-                row.account_identifier_hash,
-                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT)
+                row.account_identifier_hash.as_deref(),
+                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT).as_deref()
             );
             assert_eq!(
                 (row.input_tokens, row.output_tokens, row.request_count),
@@ -2459,8 +2513,8 @@ mod tests {
             assert!(pair.organization.resource_hash.is_none());
             assert!(pair.organization.log_record_hash.is_none());
             assert_eq!(
-                row.account_identifier_hash,
-                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT)
+                row.account_identifier_hash.as_deref(),
+                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT).as_deref()
             );
             assert_eq!((row.input_tokens, row.output_tokens), (12, 3));
         }
@@ -2550,7 +2604,7 @@ mod tests {
         let mut old = richer.clone();
         old.request_identity = None;
         let old = with_canonical_fingerprint(old);
-        assert_eq!(old.capture_revision, "claude_api_request:v2");
+        assert_eq!(&*old.capture_revision, "claude_api_request:v2");
         assert_ne!(old.fingerprint, richer.fingerprint);
         assert!(!serde_json::to_string(&old)
             .unwrap()
@@ -2761,26 +2815,27 @@ mod tests {
         let loaded = load_claude_effort_evidence(&dir, ["sess-1".to_string()]).unwrap();
         assert_eq!(loaded["sess-1"].len(), 1);
         let row = &loaded["sess-1"][0];
-        assert_eq!(row.effort, "xhigh");
-        assert_eq!(row.capture_revision, API_REQUEST_CAPTURE_REVISION);
+        assert_eq!(&*row.effort, "xhigh");
+        assert_eq!(&*row.capture_revision, API_REQUEST_CAPTURE_REVISION);
         assert_eq!(row.client_request_id, "client-1");
-        assert_eq!(row.query_source, "main");
-        assert_eq!(row.speed, "fast");
+        assert_eq!(&*row.query_source, "main");
+        assert_eq!(&*row.speed, "fast");
         assert_eq!(row.cost_usd_micros, Some(1_234));
         assert_eq!(row.event_sequence, Some(17));
-        assert_eq!(row.app_version, "2.1.226");
+        assert_eq!(&*row.app_version, "2.1.226");
         assert_eq!(row.input_tokens, 12);
         assert_eq!(row.cache_creation_tokens, 2014);
         assert_eq!(row.cache_creation_5m_tokens, 0);
         assert_eq!(row.cache_creation_1h_tokens, 0);
         assert!(row.account_identity_checked);
         assert_eq!(
-            row.account_identifier_hash,
+            row.account_identifier_hash.as_deref(),
             ottto_core::billing_identity_hash(
                 "anthropic",
                 "account",
                 "123e4567-e89b-12d3-a456-426614174000"
             )
+            .as_deref()
         );
         let persisted = fs::read_to_string(evidence_path(&dir, "sess-1")).unwrap();
         assert!(!persisted.contains("must-not-persist"));
@@ -2802,7 +2857,7 @@ mod tests {
         assert!(report.health.is_complete(), "{:?}", report.health);
         let row = &report.evidence["sess-protobuf"][0];
         assert_eq!(row.request_id, "req-protobuf");
-        assert_eq!(row.model, "claude-opus-5");
+        assert_eq!(&*row.model, "claude-opus-5");
         assert_eq!((row.input_tokens, row.output_tokens), (12, 3));
         assert!(row.client_request_id.is_empty());
         assert!(row.cost_usd_micros.is_none());
@@ -2845,7 +2900,7 @@ mod tests {
         assert_eq!(by_request["req-nested"].parent_agent_id, "agent-a");
         assert_eq!(by_request["req-workflow"].workflow_run_id, "workflow-7");
         assert_eq!(
-            by_request["req-agent"].capture_revision,
+            &*by_request["req-agent"].capture_revision,
             TRACE_OWNERSHIP_CAPTURE_REVISION
         );
         let persisted = fs::read_to_string(trace_evidence_path(&dir, "sess-traces")).unwrap();

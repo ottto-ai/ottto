@@ -1029,14 +1029,14 @@ fn classify_follows_the_session_rulings() {
     let org_d = "d".repeat(64);
     let org_e = "e".repeat(64);
     let mut with_org = complete_api_row(ROOT, "req_org", 1, 10, 1, 0);
-    with_org.request_identity = Some(org_identity(&org_d));
+    with_org.request_identity = Some(std::sync::Arc::new(org_identity(&org_d)));
     let with_org = signed(with_org);
     let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
     let mut bad_org = complete_api_row(ROOT, "req_bad_org", 3, 10, 1, 0);
     let mut contradictory = org_identity(&org_d);
     contradictory.organization.disposition =
         crate::claude_local_otel::ClaudeIdentityDisposition::Conflict;
-    bad_org.request_identity = Some(contradictory);
+    bad_org.request_identity = Some(std::sync::Arc::new(contradictory));
     let bad_org = signed(bad_org);
     let dup = complete_api_row(ROOT, "req_dup", 4, 10, 1, 0);
     let trace = ["req_org", "req_login", "req_bad_org", "req_dup"]
@@ -1355,7 +1355,7 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
         .map(|n| {
             let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
             if n > 2 {
-                row.account_identifier_hash = Some("b".repeat(64));
+                row.account_identifier_hash = Some("b".repeat(64).into());
             }
             signed(row)
         })
@@ -1476,7 +1476,7 @@ fn family_reports(
     trace_rows.push(complete_trace_row(parent, "req_5", CHILD_AGENT));
     if aux {
         let mut haiku = complete_api_row(parent, "req_aux_haiku", 6, 7, 3, 0);
-        haiku.model = "claude-3-5-haiku-20241022".to_string();
+        haiku.model = "claude-3-5-haiku-20241022".into();
         haiku.observed_at = "2026-08-02T07:00:40Z".to_string();
         let mut cache = complete_api_row(parent, "req_prompt_suggestion", 7, 3, 2, 7);
         cache.observed_at = "2026-08-02T08:14:00Z".to_string();
@@ -1751,7 +1751,7 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
                     let output = if n == 5 { 1 } else { 10 };
                     let mut row = complete_api_row(&parent, &format!("req_{n}"), n, 10, output, 0);
                     if n % 2 == 0 {
-                        row.account_identifier_hash = Some("b".repeat(64));
+                        row.account_identifier_hash = Some("b".repeat(64).into());
                     }
                     signed(row)
                 })
@@ -1870,7 +1870,7 @@ fn transcript_bases_need_the_original_clock() {
 fn forged_rows_refuse_and_login_only_telemetry_stays_org_less() {
     let org = "d".repeat(64);
     let mut forged = complete_api_row(ROOT, "req_forged", 1, 10, 1, 0);
-    forged.request_identity = Some(org_identity(&org));
+    forged.request_identity = Some(std::sync::Arc::new(org_identity(&org)));
     // Not re-signed: its fingerprint no longer matches its content.
     let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
     let (api, trace) = reports(
@@ -1951,7 +1951,7 @@ fn bound_case(
         .map(|n| {
             let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
             if mixed && n > 2 {
-                row.account_identifier_hash = Some("b".repeat(64));
+                row.account_identifier_hash = Some("b".repeat(64).into());
             }
             signed(row)
         })
@@ -2175,7 +2175,7 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
             "unsupported_route" => item.model_usage[0].billing_channel = Some("api".into()),
             "multiple_logins" => {
                 let row = &mut api.evidence.get_mut(ROOT).unwrap()[0];
-                row.account_identifier_hash = Some(login_b.clone());
+                row.account_identifier_hash = Some(login_b.clone().into());
                 *row = signed(row.clone());
             }
             _ => unreachable!(),
@@ -2356,7 +2356,7 @@ fn copied_markers_are_withdrawn_on_both_paths() {
         ));
     }
     let mut paired = complete_api_row(ROOT, "req_3", 3, 30, 3, 0);
-    paired.request_identity = Some(org_identity(&org));
+    paired.request_identity = Some(std::sync::Arc::new(org_identity(&org)));
     let (api, mut trace) = reports(
         vec![
             signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
@@ -2605,7 +2605,7 @@ fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
     let (api, trace) = owned_session_reports();
     let (mut claimed_api, mut claimed_trace) = owned_session_reports();
     let mut error_row = complete_api_row(ROOT, "req_error", 4, 0, 0, 0);
-    error_row.account_identifier_hash = Some(other_login.clone());
+    error_row.account_identifier_hash = Some(other_login.clone().into());
     claimed_api
         .evidence
         .get_mut(ROOT)
@@ -2755,7 +2755,7 @@ fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let mut copied = complete_api_row(OTHER_ROOT, "req_copied", 1, 10, 10, 0);
-    copied.account_identifier_hash = Some(foreign_login.clone());
+    copied.account_identifier_hash = Some(foreign_login.clone().into());
     api_report
         .evidence
         .insert(OTHER_ROOT.to_string(), vec![signed(copied)]);
@@ -3050,10 +3050,10 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
         .enumerate()
         .map(|(i, (request, org))| {
             let mut row = complete_api_row(ROOT, request, i as u64 + 1, 10, 1, 0);
-            row.account_identifier_hash = Some(account.clone());
+            row.account_identifier_hash = Some(account.clone().into());
             let mut identity = org_identity(org);
             identity.account.log_record_hash = Some(account.clone());
-            row.request_identity = Some(identity);
+            row.request_identity = Some(std::sync::Arc::new(identity));
             signed(row)
         })
         .collect::<Vec<_>>();
@@ -3184,7 +3184,7 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
             row.account_identifier_hash = Some(if case == "account" {
                 D64.into()
             } else {
-                account.clone()
+                account.as_str().into()
             });
             api.evidence.insert(ROOT.into(), vec![signed(row)]);
             let owner = complete_trace_row(ROOT, "req_foreign", "");
@@ -3869,7 +3869,7 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
         .map(|n| {
             let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
             if n > 2 {
-                row.account_identifier_hash = Some("b".repeat(64));
+                row.account_identifier_hash = Some("b".repeat(64).into());
             }
             signed(row)
         })
@@ -4080,15 +4080,13 @@ fn spanless_first_request_own_login_classifier_table() {
             let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
             row.observed_at = at.into();
             if case != "login-only" {
-                row.request_identity = Some(org_identity(D64));
+                row.request_identity = Some(std::sync::Arc::new(org_identity(D64)));
             }
             if case == "empty-client-id" {
                 row.client_request_id.clear();
             }
             if case == "bad-org" {
-                row.request_identity
-                    .as_mut()
-                    .unwrap()
+                std::sync::Arc::make_mut(row.request_identity.as_mut().unwrap())
                     .organization
                     .disposition = crate::claude_local_otel::ClaudeIdentityDisposition::Conflict;
             }
@@ -4186,7 +4184,7 @@ fn spanless_first_request_desktop_fold_and_activity_agree() {
             };
             let mut row = complete_api_row(ROOT, "first", 1, 10, 1, 0);
             row.observed_at.clone_from(&at);
-            row.request_identity = Some(org_identity(&org_hash(ORG_1)));
+            row.request_identity = Some(std::sync::Arc::new(org_identity(&org_hash(ORG_1))));
             let (api, traces) = reports(vec![signed(row)], vec![]);
             let evidence = ScanEvidence::new(&api, &traces, BTreeSet::new());
             let mut items = vec![raw];

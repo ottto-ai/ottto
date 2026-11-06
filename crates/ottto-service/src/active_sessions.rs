@@ -2762,23 +2762,23 @@ mod tests {
             for (n, login) in (1_u64..).zip(logins) {
                 let Some(login) = login else { continue };
                 let mut row = ClaudeLocalOtelEvidence {
-                    capture_revision: "claude_api_request:v2".to_string(),
-                    session_id: parent.to_string(),
+                    capture_revision: "claude_api_request:v2".into(),
+                    session_id: parent.into(),
                     request_id: format!("req_{n}"),
                     client_request_id: format!("client-req_{n}"),
                     observed_at: format!("2026-08-02T07:00:0{n}Z"),
-                    model: "claude-haiku-4-5".to_string(),
-                    effort: "high".to_string(),
-                    query_source: "user".to_string(),
-                    speed: "fast".to_string(),
+                    model: "claude-haiku-4-5".into(),
+                    effort: "high".into(),
+                    query_source: "user".into(),
+                    speed: "fast".into(),
                     cost_usd_micros: Some(100),
                     event_sequence: Some(n),
-                    app_version: "2.1.226".to_string(),
+                    app_version: "2.1.226".into(),
                     input_tokens: 10,
                     output_tokens: 10,
                     request_count: 1,
                     account_identity_checked: true,
-                    account_identifier_hash: Some(login.to_string()),
+                    account_identifier_hash: Some(login.into()),
                     ..Default::default()
                 };
                 row.fingerprint = format!(
@@ -2786,8 +2786,8 @@ mod tests {
                     Sha256::digest(serde_json::to_vec(&row).unwrap())
                 );
                 let mut owner = ClaudeTraceOwnershipEvidence {
-                    capture_revision: "claude_llm_request_ownership:v1".to_string(),
-                    session_id: parent.to_string(),
+                    capture_revision: "claude_llm_request_ownership:v1".into(),
+                    session_id: parent.into(),
                     request_id: format!("req_{n}"),
                     client_request_id: format!("client-req_{n}"),
                     agent_id: agent.to_string(),

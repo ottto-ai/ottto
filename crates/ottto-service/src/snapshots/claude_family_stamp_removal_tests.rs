@@ -174,7 +174,7 @@ fn family_stamp_removal_money_table() {
     let mut call = side[&parent][0].clone();
     call.fingerprint = "family-side".into();
     call.request_id = "req_side".into();
-    call.account_identifier_hash = Some(b.clone());
+    call.account_identifier_hash = Some(b.clone().into());
     side.get_mut(&parent).unwrap().push(call);
     for (case, evidence) in [("switch", switch), ("side call", side)] {
         let mut page = items.clone();
@@ -197,7 +197,7 @@ fn family_stamp_removal_money_table() {
     }
     external.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &external);
     let mut own = complete_api_row(&owned_parent, "req_5", 5, 10, 1, 0);
-    own.account_identifier_hash = Some(b.clone());
+    own.account_identifier_hash = Some(b.clone().into());
     own.fingerprint.clear();
     own.fingerprint = format!(
         "sha256:{:x}",
