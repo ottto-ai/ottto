@@ -280,3 +280,149 @@ fn combined_codex_account_switch_holds_without_request_evidence() {
     );
     assert!(scan.ownership_incomplete_file_count >= 2);
 }
+
+/// [money] The production recovery capture over a bound Codex state store
+/// commits the re-armed group's markers while it holds the progress lock. It
+/// does not hold the group or leave the store needing a reload; a guard built
+/// before the capture refuses the adopted graph and a new one passes, and the
+/// group then uploads one summed body and restarts quietly.
+#[test]
+fn codex_group_capture_commits_on_its_state_store_after_first_load_rearm() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let mut c = Corpus::new("codex-group-capture-state-store");
+    c.base = c.base.canonicalize().unwrap();
+    c.root = c.base.join("projects");
+    c.support = c.base.join("support");
+    let paths = revert_archives(&c, "a");
+    let (session, previous) =
+        StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
+    // An earlier build finished and accepted both files as singletons.
+    let (mut legacy, mut old_scan) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, previous);
+    legacy.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut old_scan.snapshots, &[]);
+    apply_upload_policy(
+        SOURCE,
+        &mut old_scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(SOURCE, &mut old_scan, &mut legacy);
+    old_scan.finish_codex_capture_boundary(&mut legacy);
+    assert_eq!(old_scan.snapshots.len(), 2);
+    legacy.record_accepted_snapshot_fingerprints(
+        &old_scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    let mut committed = session.save_reload(&mut legacy);
+    assert!(
+        crate::snapshots::state_v2_growth_retention_active(&committed),
+        "the state store route"
+    );
+    // First source-aware load: the unsettled group re-arms.
+    fixture::codex_rearm_unsettled(&mut committed);
+    assert!(committed
+        .files
+        .values()
+        .all(|entry| entry.source_file_fingerprint.is_empty()));
+    let generation = committed.generation;
+    // The re-armed pass replays the group into one folded body.
+    let (mut index, mut scan, _) = page(&c, &E2ScanFixture::default(), committed.clone());
+    assert_eq!(scan.snapshots.len(), 1, "one upload body for both files");
+    assert_eq!(scan.snapshots[0].request_count, 96);
+    let before = fixture::scan_money(SOURCE, &index, &scan);
+    let incomplete = scan.ownership_incomplete_file_count;
+
+    // The finish boundary's guard, built before the capture as the pass does.
+    let stale_guard = crate::snapshots::state_v2_side_effect_guard(session.path(), &index);
+    stale_guard().expect("the pass starts on the current graph");
+    let progress_path = snapshot_upload_progress_path(session.path());
+    capture_codex_recovery_evidence(
+        &mut index,
+        &mut committed,
+        &mut scan,
+        session.path(),
+        &progress_path,
+        &stale_guard,
+    );
+    assert!(
+        scan.snapshots
+            .iter()
+            .any(|item| item.source_session_id == A),
+        "the recovery capture held the group"
+    );
+    assert_eq!(scan.ownership_incomplete_file_count, incomplete);
+    assert!(committed.generation > generation, "the capture committed");
+    assert_eq!(index.generation, committed.generation);
+    assert!(
+        stale_guard().is_err(),
+        "a guard built before the capture refuses the adopted graph"
+    );
+    let fresh_guard = crate::snapshots::state_v2_side_effect_guard(session.path(), &index);
+    fresh_guard().expect("the store needs no reload after the capture");
+    let reloaded = ScanIndex::load(session.path()).unwrap();
+    assert_eq!(reloaded.generation, committed.generation);
+    assert_eq!(
+        reloaded
+            .files
+            .values()
+            .filter(|entry| entry.codex_captured_joined_member_set.is_some())
+            .count(),
+        2
+    );
+    // The capture changes no body, account or placement.
+    let after = fixture::scan_money(SOURCE, &index, &scan);
+    fixture::money_oracle::assert_equivalent(&before, &after);
+
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(SOURCE));
+    let mut posted = Vec::new();
+    // Every upload boundary checks the store guard first, as the pass does.
+    let (outcome, batches, _) = upload_source_under(
+        SOURCE,
+        SnapshotUploadPolicy::default(),
+        &scan.snapshots,
+        &mut progress,
+        |batch| {
+            fresh_guard()?;
+            posted.extend(
+                batch
+                    .iter()
+                    .map(|item| (item.source_session_id.clone(), item.request_count)),
+            );
+            ack(batch)
+        },
+    );
+    assert_eq!(outcome.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(batches.len(), 1, "exactly one body");
+    assert_eq!(
+        posted,
+        [(A.to_string(), 96)],
+        "one summed body, no singleton"
+    );
+    assert!(progress
+        .accepted_fingerprints
+        .contains(&scan.snapshots[0].snapshot_fingerprint));
+    settle_index_after_upload(&mut index, &committed, &progress);
+    let mut prior = session.save_reload(&mut index);
+    fixture::codex_rearm_unsettled(&mut prior);
+    assert!(
+        prior
+            .files
+            .values()
+            .all(|entry| !entry.source_file_fingerprint.is_empty()),
+        "an acknowledged group never re-arms again"
+    );
+    for mode in [fixture::Mode::Restart, fixture::Mode::DiskRestore] {
+        let ((_, quiet, modes), io) =
+            fixture::observe_codex_quiet(|| page(&c, &E2ScanFixture::default(), prior.clone()));
+        let mut route = fixture::scan_money(SOURCE, &prior, &quiet);
+        route.mode = mode;
+        route.modes = modes;
+        route.io = io;
+        assert_eq!(quiet.semantic_noop_count, paths.len());
+        fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
+    }
+}
