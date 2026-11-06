@@ -1,6 +1,7 @@
 //! The native JSONL file parser: the per-source parse wrappers, the owned
-//! parser that steps one physical line at a time and finalizes the file, and
-//! the parsed file it yields.
+//! parser that steps one physical line at a time and finalizes the file, the
+//! parsed file it yields, the bounded physical-line reader beneath it, and the
+//! usage-shape checks it applies to each parsed line.
 
 use crate::snapshots::*;
 
@@ -974,3 +975,653 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_session_ref,
     source_session_id_seen);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth; optional pending);
+
+pub(in crate::snapshots) fn recognized_positive_usage_shape(
+    source: SnapshotSource,
+    value: &Value,
+) -> bool {
+    match source {
+        SnapshotSource::Codex => codex_total_usage(value)
+            .map(|usage| !usage.is_zero())
+            .unwrap_or(false),
+        SnapshotSource::ClaudeCode => claude_code_delta_usage(value)
+            .map(|usage| !usage.is_zero())
+            .unwrap_or(false),
+        SnapshotSource::Pi => {
+            pi_usage_event(value)
+                && pi_message_usage(value)
+                    .map(|usage| !usage.is_zero())
+                    .unwrap_or(false)
+        }
+    }
+}
+
+pub(in crate::snapshots) fn recognized_usage_shape_was_dropped(
+    source: SnapshotSource,
+    value: &Value,
+) -> bool {
+    match source {
+        SnapshotSource::Codex => {
+            let recognized = value
+                .pointer("/token_count/info/total_token_usage")
+                .is_some()
+                || value.pointer("/payload/info/total_token_usage").is_some()
+                || value.pointer("/payload/total_token_usage").is_some()
+                || value.pointer("/total_token_usage").is_some();
+            recognized && codex_total_usage(value).is_none()
+        }
+        SnapshotSource::ClaudeCode => {
+            let recognized = value.pointer("/message/usage").is_some()
+                || value.pointer("/usage").is_some()
+                || value.pointer("/payload/usage").is_some();
+            recognized && claude_code_delta_usage(value).is_none()
+        }
+        SnapshotSource::Pi => {
+            pi_usage_event(value)
+                && pi_usage_value(value).is_some()
+                && pi_message_usage(value).is_none()
+        }
+    }
+}
+
+fn json_has_positive_usage_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => {
+            let object_kind = json_usage_object_kind(values);
+            values.iter().any(|(name, value)| {
+                let normalized = normalized_usage_key(name);
+                if json_usage_child_is_opaque(&normalized, object_kind) {
+                    return false;
+                }
+                (is_recognized_usage_container(&normalized)
+                    && usage_container_has_positive_consumption(value, false))
+                    || json_has_positive_usage_evidence(value)
+            })
+        }
+        Value::Array(values) => values.iter().any(json_has_positive_usage_evidence),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonUsageObjectKind {
+    ProviderEnvelope,
+    AssistantMessage,
+    OpaqueAuthored,
+}
+
+fn json_usage_object_kind(values: &serde_json::Map<String, Value>) -> JsonUsageObjectKind {
+    let normalized = |key| {
+        values
+            .get(key)
+            .and_then(Value::as_str)
+            .map(normalized_usage_key)
+    };
+    if normalized("role").is_some_and(|role| matches!(role.as_str(), "assistant" | "model"))
+        || normalized("type")
+            .is_some_and(|kind| matches!(kind.as_str(), "assistantmessage" | "modelmessage"))
+    {
+        return JsonUsageObjectKind::AssistantMessage;
+    }
+    if normalized("role").is_some_and(|role| {
+        matches!(
+            role.as_str(),
+            "user" | "human" | "system" | "developer" | "tool"
+        )
+    }) || normalized("type").is_some_and(|kind| {
+        matches!(
+            kind.as_str(),
+            "user"
+                | "human"
+                | "system"
+                | "developer"
+                | "usermessage"
+                | "tool"
+                | "text"
+                | "inputtext"
+                | "outputtext"
+                | "thinking"
+                | "redactedthinking"
+                | "tooluse"
+                | "toolresult"
+                | "toolcall"
+                | "function"
+                | "functioncall"
+                | "functionresult"
+                | "image"
+                | "document"
+        )
+    }) {
+        return JsonUsageObjectKind::OpaqueAuthored;
+    }
+    JsonUsageObjectKind::ProviderEnvelope
+}
+
+fn json_usage_child_is_opaque(name: &str, object_kind: JsonUsageObjectKind) -> bool {
+    (object_kind == JsonUsageObjectKind::OpaqueAuthored && is_recognized_usage_container(name))
+        || (object_kind != JsonUsageObjectKind::ProviderEnvelope
+            && matches!(
+                name,
+                "content"
+                    | "contents"
+                    | "text"
+                    | "prompt"
+                    | "prompts"
+                    | "argument"
+                    | "arguments"
+                    | "args"
+                    | "toolinput"
+                    | "tooloutput"
+                    | "toolresult"
+                    | "message"
+                    | "payload"
+                    | "data"
+                    | "input"
+                    | "output"
+                    | "result"
+            ))
+}
+
+fn normalized_usage_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_recognized_usage_container(name: &str) -> bool {
+    matches!(
+        name,
+        "usage"
+            | "tokenusage"
+            | "totalusage"
+            | "totaltokenusage"
+            | "lasttokenusage"
+            | "billingusage"
+    )
+}
+
+fn is_consumption_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "input"
+            | "output"
+            | "inputtokens"
+            | "outputtokens"
+            | "prompttokens"
+            | "completiontokens"
+            | "cachedinputtokens"
+            | "cacheread"
+            | "cachereadtokens"
+            | "cachereadinputtokens"
+            | "cachewrite"
+            | "cachewritetokens"
+            | "cachecreationtokens"
+            | "cachecreationinputtokens"
+            | "reasoning"
+            | "reasoningtokens"
+            | "reasoningoutputtokens"
+            | "unattributedtotaltokens"
+            | "totaltokens"
+            | "requestcount"
+            | "requests"
+    )
+}
+
+fn is_cost_container(name: &str) -> bool {
+    matches!(
+        name,
+        "cost" | "costs" | "usagecost" | "usagecosts" | "billingcost" | "billingcosts"
+    )
+}
+
+fn is_cost_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "total"
+            | "amount"
+            | "usd"
+            | "totalcost"
+            | "inputcost"
+            | "outputcost"
+            | "cachereadcost"
+            | "cachewritecost"
+            | "reasoningcost"
+    )
+}
+
+fn is_nonconsumption_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "schemaversion"
+            | "usageversion"
+            | "limit"
+            | "limits"
+            | "usagelimit"
+            | "usagelimits"
+            | "ratelimit"
+            | "ratelimits"
+            | "budget"
+            | "budgets"
+            | "quota"
+            | "quotas"
+            | "reset"
+            | "resetsat"
+            | "timestamp"
+            | "createdat"
+            | "updatedat"
+            | "maxtokens"
+    )
+}
+
+fn usage_container_has_positive_consumption(value: &Value, inside_cost: bool) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            if is_nonconsumption_metadata(&normalized) {
+                return false;
+            }
+            if is_consumption_metric(&normalized) || (inside_cost && is_cost_metric(&normalized)) {
+                return json_is_positive_number(value);
+            }
+            let child_inside_cost = inside_cost || is_cost_container(&normalized);
+            usage_container_has_positive_consumption(value, child_inside_cost)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| usage_container_has_positive_consumption(value, inside_cost)),
+        _ => false,
+    }
+}
+
+fn json_is_positive_number(value: &Value) -> bool {
+    let Value::Number(value) = value else {
+        return false;
+    };
+    value.as_u64().is_some_and(|value| value > 0)
+        || value.as_i64().is_some_and(|value| value > 0)
+        || value.as_f64().is_some_and(|value| value > 0.0)
+}
+
+/// Existing parser report, including historical loss decoded from saved reductions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct JsonlReadReport {
+    pub(in crate::snapshots) physical_line_count: usize,
+    pub(in crate::snapshots) parsed_json_line_count: usize,
+    pub(in crate::snapshots) malformed_json_line_count: usize,
+    pub(in crate::snapshots) invalid_utf8_line_count: usize,
+    pub(in crate::snapshots) over_line_cap_count: usize,
+}
+
+impl JsonlReadReport {
+    pub(in crate::snapshots) fn complete(self) -> bool {
+        self.malformed_json_line_count == 0 && self.invalid_utf8_line_count == 0
+    }
+}
+
+pub(in crate::snapshots) fn read_bounded_jsonl_lines(
+    reader: impl BufRead,
+    on_value: impl FnMut(&Value),
+) -> std::io::Result<JsonlReadReport> {
+    read_bounded_jsonl_lines_impl(reader, on_value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::snapshots) enum JsonlReaderStep {
+    Line,
+    Complete(JsonlReadReport),
+}
+
+/// The line-buffer release point, and the former maximum line size. It is not
+/// an admission cap: a record of any size is read whole. Only the allocation of
+/// a completed record above it is freed; at or below it, capacity is retained.
+pub(crate) const LINE_BUFFER_RELEASE_BYTES: usize = 16 * 1024 * 1024;
+
+/// End one physical record's buffer, for every JSONL line reader.
+pub(crate) fn release_line_buffer(buf: &mut Vec<u8>) {
+    if buf.len() > LINE_BUFFER_RELEASE_BYTES {
+        *buf = Vec::new();
+    } else {
+        buf.clear();
+    }
+}
+
+// Own the existing reader/buffer/report so a caller can move work between
+// physical lines. No decoded row or transcript history crosses a step.
+// This bounds work units, not blocking I/O or individual JSON parsing time.
+pub(in crate::snapshots) struct BoundedJsonlReader<R> {
+    pub(in crate::snapshots) reader: R,
+    pub(in crate::snapshots) buf: Vec<u8>,
+    pub(in crate::snapshots) report: JsonlReadReport,
+    pub(in crate::snapshots) finished: bool,
+    pub(in crate::snapshots) failure: Option<std::io::ErrorKind>,
+    pub(in crate::snapshots) acquisition: Option<crate::transcript_acquisition::ReadPlan>,
+    /// Resumable reads and sampled in-page Claude Full/Tail reads: never
+    /// consume past this reader-relative frozen extent.
+    pub(in crate::snapshots) extent_limit: Option<u64>,
+    /// Physical bytes consumed from `reader`, including skipped bytes.
+    consumed: u64,
+    last_line_end: u64,
+    /// Unterminated bytes at the frozen extent, awaiting unchanged-EOF proof.
+    sealed_fragment: Option<()>,
+    /// Set by `finish_job` or the in-page grown route: the identity `finish` may
+    /// accept for a grown object. `Certified` after its prefix certificate
+    /// passed (S12); `LossySameObject` is not a sealed-prefix
+    /// certificate and permits only an uncertified publication.
+    pub(in crate::snapshots) sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
+}
+
+impl<R: BufRead> BoundedJsonlReader<R> {
+    pub(in crate::snapshots) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            report: JsonlReadReport::default(),
+            finished: false,
+            failure: None,
+            acquisition: None,
+            extent_limit: None,
+            consumed: 0,
+            last_line_end: 0,
+            sealed_fragment: None,
+            sealed_prefix: None,
+        }
+    }
+
+    /// Freeze the readable extent (sealed-live mode). Bytes appended after
+    /// the extent belong to a later read; an unterminated record at the
+    /// extent is withheld, never parsed or counted, whether or not bytes past
+    /// the extent are visible yet.
+    pub(in crate::snapshots) fn set_extent_limit(&mut self, limit: u64) {
+        self.extent_limit = Some(limit.max(self.consumed));
+    }
+
+    pub(in crate::snapshots) fn consumed_bytes(&self) -> u64 {
+        self.consumed
+    }
+
+    /// End offset of the last newline-terminated record consumed.
+    pub(in crate::snapshots) fn last_complete_line_end(&self) -> u64 {
+        self.last_line_end
+    }
+
+    pub(in crate::snapshots) fn sealed_fragment(&self) -> bool {
+        self.sealed_fragment.is_some()
+    }
+
+    /// Genuine unchanged EOF only (the caller proves it): apply the
+    /// withheld final record from the bytes already buffered, exactly as a
+    /// read without an extent applies its trailing line. No byte is read.
+    pub(in crate::snapshots) fn apply_sealed_fragment(
+        &mut self,
+        mut on_value: impl FnMut(&Value),
+    ) -> bool {
+        if self.sealed_fragment.is_none()
+            || !apply_physical_line(&self.buf, &mut self.report, None, &mut on_value, false)
+        {
+            return false;
+        }
+        self.sealed_fragment = None;
+        release_line_buffer(&mut self.buf);
+        true
+    }
+
+    pub(in crate::snapshots) fn step(
+        &mut self,
+        on_value: impl FnMut(&Value),
+    ) -> std::io::Result<JsonlReaderStep> {
+        self.step_lines(on_value, None)
+    }
+
+    pub(in crate::snapshots) fn step_lines(
+        &mut self,
+        on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
+        if let Some(kind) = self.failure {
+            return Err(std::io::Error::new(
+                kind,
+                "failed JSONL reader cannot resume",
+            ));
+        }
+        if self.finished {
+            return Ok(JsonlReaderStep::Complete(self.report));
+        }
+        self.buf.clear();
+        let result = self.read_step(on_value, on_line);
+        // Values have been consumed synchronously and dropped. Retain only the
+        // existing buffer capacity; no logical raw row survives this return.
+        // A withheld final record keeps its bytes until unchanged-EOF proof.
+        if self.sealed_fragment.is_none() {
+            release_line_buffer(&mut self.buf);
+        }
+        if let Err(error) = &result {
+            // A partial physical line may already have been consumed. Resuming
+            // after an I/O error would reinterpret its suffix or lose the row.
+            self.failure = Some(error.kind());
+        }
+        result
+    }
+
+    fn read_step(
+        &mut self,
+        mut on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
+        // Where this physical record started.
+        let line_start = self.last_line_end;
+        let reader = &mut self.reader;
+        let buf = &mut self.buf;
+        let report = &mut self.report;
+        // Finish a whole physical record. `line_complete`
+        // tracks whether we reached a newline (vs. EOF) so we can stop the
+        // outer loop on a trailing partial line.
+        let mut line_complete = false;
+        let reached_eof = loop {
+            let raw = reader.fill_buf()?;
+            let allowed = self.extent_limit.map_or(raw.len(), |limit| {
+                usize::try_from(limit.saturating_sub(self.consumed))
+                    .unwrap_or(usize::MAX)
+                    .min(raw.len())
+            });
+            if allowed == 0 {
+                break true;
+            }
+            let available = &raw[..allowed];
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(offset) => {
+                    buf.extend_from_slice(&available[..offset]);
+                    if let Some(acquisition) = self.acquisition.as_mut() {
+                        acquisition.observe_record_fragment(&available[..offset + 1], true)?;
+                    }
+                    reader.consume(offset + 1);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::transition_fixture::record_consumed((offset + 1) as u64);
+                    #[cfg(test)]
+                    sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
+                        if let Some(ranges) = v.borrow_mut().as_mut() {
+                            ranges.push(self.consumed..self.consumed + (offset + 1) as u64);
+                        }
+                    });
+                    self.consumed += (offset + 1) as u64;
+                    self.last_line_end = self.consumed;
+                    line_complete = true;
+                    break false;
+                }
+                None => {
+                    let len = available.len();
+                    buf.extend_from_slice(available);
+                    if let Some(acquisition) = self.acquisition.as_mut() {
+                        acquisition.observe_record_fragment(available, false)?;
+                    }
+                    reader.consume(len);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::transition_fixture::record_consumed(len as u64);
+                    #[cfg(test)]
+                    sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
+                        if let Some(ranges) = v.borrow_mut().as_mut() {
+                            ranges.push(self.consumed..self.consumed + len as u64);
+                        }
+                    });
+                    self.consumed += len as u64;
+                }
+            }
+        };
+        crate::local_resource_diagnostics::jsonl::line_buffer(buf.capacity());
+        if reached_eof && self.extent_limit.is_some() && !buf.is_empty() && !line_complete {
+            // Sealed cursor completion (S5): a record without its newline at
+            // or before the frozen extent is unfinished for this read, even if
+            // no byte beyond the extent is visible yet. It is never parsed,
+            // counted or certified. Reads without an extent keep the normal
+            // trailing-line behavior below, byte-identical to before.
+            self.sealed_fragment = Some(());
+            self.finished = true;
+            return Ok(JsonlReaderStep::Complete(*report));
+        }
+        if !line_complete && buf.is_empty() {
+            // Clean EOF with no pending bytes.
+            self.finished = true;
+            return Ok(JsonlReaderStep::Complete(*report));
+        }
+
+        if !apply_physical_line(
+            buf,
+            report,
+            // An unterminated trailing line reaches money only, never LD.
+            on_line.filter(|_| line_complete).map(|tap| {
+                (
+                    self.consumed - line_start,
+                    self.acquisition
+                        .as_ref()
+                        .map_or(0, |plan| plan.start_offset())
+                        .saturating_add(self.consumed),
+                    tap,
+                )
+            }),
+            &mut on_value,
+            line_complete,
+        ) {
+            // A paused compatibility writer has the same pending suffix as
+            // an extent-bound read. Valid JSON/blank EOF keeps its semantics.
+            self.sealed_fragment = Some(());
+        }
+        self.finished = reached_eof;
+        Ok(JsonlReaderStep::Line)
+    }
+}
+
+/// Count and apply one physical line held in `buf` (newline-terminated, or a
+/// trailing line at EOF). Shared by every read path; `deliver` is LD's tap.
+fn apply_physical_line(
+    buf: &[u8],
+    report: &mut JsonlReadReport,
+    deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
+    on_value: &mut impl FnMut(&Value),
+    terminal: bool,
+) -> bool {
+    #[cfg(test)]
+    codex_zst_refusal_tests::jsonl_parse_attempted();
+    let decoded = match jsonl_line_text(buf) {
+        JsonlLineText::Blank => Ok(None),
+        JsonlLineText::Text(line) => serde_json::from_str(line).map(Some).map_err(|_| false),
+        JsonlLineText::InvalidUtf8 => Err(true),
+    };
+    // Unchanged EOF proves no growth, not that a paused writer finished JSON.
+    if !terminal && decoded.is_err() {
+        return false;
+    }
+    report.physical_line_count += 1;
+    crate::local_resource_diagnostics::jsonl::line(buf.len());
+    let value = match decoded {
+        Ok(Some(value)) => {
+            report.parsed_json_line_count += 1;
+            Some(value)
+        }
+        Ok(None) => None,
+        Err(utf8) => {
+            report.invalid_utf8_line_count += usize::from(utf8);
+            report.malformed_json_line_count += usize::from(!utf8);
+            None
+        }
+    };
+    if let Some((length, end, tap)) = deliver {
+        let value = value.as_ref();
+        tap(length, &line_delivery::PhysicalLine { end, value });
+    }
+    if let Some(value) = value {
+        on_value(&value);
+    }
+    true
+}
+
+fn read_bounded_jsonl_lines_impl(
+    reader: impl BufRead,
+    mut on_value: impl FnMut(&Value),
+) -> std::io::Result<JsonlReadReport> {
+    let mut state = BoundedJsonlReader::new(reader);
+    loop {
+        match state.step(&mut on_value)? {
+            JsonlReaderStep::Line => {}
+            JsonlReaderStep::Complete(report) => return Ok(report),
+        }
+    }
+}
+
+// Content projection shared with growth-only durable replay. Keep native N/U
+// processing at its existing call sites; these helpers never publish usage.
+enum JsonlLineText<'a> {
+    Blank,
+    InvalidUtf8,
+    Text(&'a str),
+}
+fn jsonl_line_text(mut bytes: &[u8]) -> JsonlLineText<'_> {
+    if bytes.last() == Some(&b'\r') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => JsonlLineText::Blank,
+        Ok(line) => JsonlLineText::Text(line),
+        Err(_) => JsonlLineText::InvalidUtf8,
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInput> {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            reader,
+            buf,
+            report,
+            finished,
+            failure,
+            acquisition,
+            extent_limit,
+            consumed,
+            last_line_end,
+            sealed_fragment,
+            sealed_prefix,
+        } = self;
+        c.add(reader.capacity())?;
+        buf.heap_bound(c)?;
+        report.heap_bound(c)?;
+        finished.heap_bound(c)?;
+        // ErrorKind is inline; File holds the existing OS handle, no new Rust buffer.
+        let _ = failure;
+        extent_limit.heap_bound(c)?;
+        consumed.heap_bound(c)?;
+        last_line_end.heap_bound(c)?;
+        sealed_fragment.heap_bound(c)?;
+        sealed_prefix.heap_bound(c)?;
+        acquisition.heap_bound(c)
+    }
+}
+
+crate::heap_layout_bound::fields!(JsonlReadReport; physical_line_count, parsed_json_line_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count);
+crate::durable_tail_codec::durable_struct!(JsonlReadReport {
+    N physical_line_count: usize,
+    N parsed_json_line_count: usize,
+    N malformed_json_line_count: usize,
+    N invalid_utf8_line_count: usize,
+    N over_line_cap_count: usize,
+});
