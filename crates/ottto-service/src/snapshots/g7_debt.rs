@@ -271,6 +271,7 @@ struct FileDebt {
     lower_bound: bool,
     held: bool,
     unread_bytes: u64,
+    listed: bool,
 }
 impl FileDebt {
     /// A head this build cannot read: owed, age unknown. Never written over.
@@ -280,6 +281,7 @@ impl FileDebt {
         lower_bound: true,
         held: false,
         unread_bytes: 0,
+        listed: false,
     };
     fn of(owed: &[Revision]) -> Self {
         let summary = summary(owed, None);
@@ -289,6 +291,7 @@ impl FileDebt {
             lower_bound: summary.lower_bound,
             held: summary.reason_bits & !UNREAD != 0,
             unread_bytes: unread_bytes(owed.iter()),
+            listed: false,
         }
     }
     /// A committed head the walk did not list: its stored summary, with the
@@ -317,6 +320,7 @@ impl FileDebt {
             lower_bound: debt.lower_bound,
             held: debt.reason_bits & !UNREAD != 0,
             unread_bytes: unread,
+            listed: false,
         }
     }
 }
@@ -363,6 +367,8 @@ pub(super) struct Report {
     never_indexed_files: u64,
     no_upload_required_files: u64,
     deleted_unaccepted_files: u64,
+    /// Owed Listed history the gate holds: counted, but out of the age alarm.
+    listed_history_held_files: u64,
     last_complete_discovery_at: Option<u64>,
 }
 impl Report {
@@ -378,6 +384,7 @@ impl Report {
         never_indexed_files: 0,
         no_upload_required_files: 0,
         deleted_unaccepted_files: 0,
+        listed_history_held_files: 0,
         last_complete_discovery_at: None,
     };
     fn add(&mut self, debt: FileDebt, now_ms: u64) {
@@ -387,6 +394,10 @@ impl Report {
         self.outstanding_files += 1;
         self.held_files += u64::from(debt.held);
         self.unread_bytes += debt.unread_bytes;
+        if debt.listed {
+            self.listed_history_held_files += 1;
+            return;
+        }
         let Some(at) = debt.earliest else {
             self.unknown_age_files += 1;
             return;
@@ -426,6 +437,7 @@ impl Report {
             "never_indexed_files": self.never_indexed_files,
             "no_upload_required_files": self.no_upload_required_files,
             "deleted_unaccepted_files": self.deleted_unaccepted_files,
+            "listed_history_held_files": self.listed_history_held_files,
             "last_complete_discovery_at": self.last_complete_discovery_at.map(|at| at / 1000),
             "alarm": self.alarm(now_ms),
         })
@@ -747,7 +759,8 @@ impl<'a> Page<'a> {
             self.staged.push((key.clone(), observation));
         }
         if head.is_some() || !plan.owed.is_empty() || live.evidence.is_some() {
-            let debt = FileDebt::of(&plan.owed);
+            let mut debt = FileDebt::of(&plan.owed);
+            debt.listed = debt.owed && listed_history_held(index, &key, &listing);
             self.count(index, listing.path, key, debt, live.evidence.is_some());
         }
     }
@@ -801,6 +814,20 @@ impl<'a> Page<'a> {
             None => None,
         }
     }
+}
+
+/// Claude history the gate holds as Listed (`decide` or stricter), not refused.
+/// No source guard: the list loads only for Claude, so it is empty elsewhere.
+fn listed_history_held(index: &ScanIndex, key: &str, listing: &Listing<'_>) -> bool {
+    let refused = &index.quarantined_snapshot_fingerprints;
+    let owned = index.file_snapshot_fingerprints.get(key);
+    claude_history_upgrade::revision_policy(index.active_effective_upload_body_witness_revision)
+        .is_some()
+        && index.listing_stamp_matches(listing.path, listing.metadata)
+        && index.effective_upload_body_witness_revision_requires_adoption(key)
+        && !index.claude_reemission_exclusions.pauses_adoption()
+        && index.claude_family_listed(listing.path)
+        && !owned.is_some_and(|owned| owned.iter().any(|fp| refused.contains_key(fp)))
 }
 
 fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> Report {

@@ -303,6 +303,43 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
         f.close();
     }
 }
+/// [regress] Listed Claude history the gate holds kept the alarm on for good.
+/// It stays owed and counted, out of the age alarm; a refused snapshot keeps it in.
+#[test]
+fn listed_history_held_leaves_the_age_alarm_unless_refused() {
+    for refused in [false, true] {
+        let mut f = Fixture::new(Source::Claude, "g7-listed");
+        let file = f.file("listed.jsonl", 100);
+        age(&file, 7 * HOUR);
+        let key = local_index_key(&file);
+        f.index.files.insert(key.clone(), entry(&file));
+        f.index.activate_effective_upload_body_witness_revision(3);
+        f.index.claude_reemission_exclusions =
+            claude_reemission_exclusions::ReemissionExclusions::listing_every_family_for_test();
+        if refused {
+            let fingerprint = "e".repeat(64);
+            let record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+            let owned = BTreeSet::from([fingerprint.clone()]);
+            f.index.file_snapshot_fingerprints.insert(key, owned);
+            f.index
+                .quarantined_snapshot_fingerprints
+                .insert(fingerprint, record);
+        }
+        let row = f.walk();
+        let debt = &row["debt"];
+        assert_eq!(
+            debt["listed_history_held_files"],
+            u64::from(!refused),
+            "{refused}"
+        );
+        assert_eq!(debt["over_6h_files"], u64::from(refused));
+        assert_eq!(debt["outstanding_files"], 1);
+        assert!(debt["last_complete_discovery_at"].is_u64());
+        assert_eq!(debt["alarm"], refused);
+        assert_eq!(row["alarm"], refused);
+        f.close();
+    }
+}
 /// [money] Positive control, persisted: after a newer suffix, the exact
 /// receipt of the stored prefix retires that prefix and nothing more; the
 /// suffix keeps its own first change and bytes.
