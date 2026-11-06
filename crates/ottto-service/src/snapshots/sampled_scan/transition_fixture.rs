@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Apply the source-aware loader's existing Codex owed-group hook after a
+/// fixture restores custody, without exposing the private join module.
+pub(crate) fn codex_rearm_unsettled(index: &mut super::super::ScanIndex) {
+    super::super::codex_file_join::rearm_unsettled(index);
+}
+
 /// Seed the real saved session-start binding for a Codex transition row.
 pub(crate) fn codex_start_binding(
     index: &mut super::super::ScanIndex,

@@ -69,7 +69,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         .all(|entry| !entry.source_file_fingerprint.is_empty()));
     // Same existing first-load re-arm used by the source-aware install/restart
     // loader. It changes only owed source state and the observed-file queue.
-    crate::snapshots::codex_file_join::rearm_unsettled(&mut legacy);
+    fixture::codex_rearm_unsettled(&mut legacy);
     assert!(legacy
         .files
         .values()
@@ -139,7 +139,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     let recovered: SnapshotUploadProgress = serde_json::from_slice(&after).unwrap();
     settle_index_after_upload(&mut index, &captured, &recovered);
     let mut prior = session.save_reload(&mut index);
-    crate::snapshots::codex_file_join::rearm_unsettled(&mut prior);
+    fixture::codex_rearm_unsettled(&mut prior);
     assert!(
         prior
             .files
