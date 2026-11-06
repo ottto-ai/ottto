@@ -4094,7 +4094,7 @@ pub(crate) fn finish_page(
         };
         // apply refuses before mutating, so a withheld item is unchanged:
         // its fold gets its own entity back (moved out above).
-        let emitted = super::emit::apply(item, &entity);
+        let emitted = super::emit::apply(item, &entity, first_original.is_some());
         if emitted {
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
