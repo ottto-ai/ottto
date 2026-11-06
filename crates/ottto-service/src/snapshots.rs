@@ -16215,8 +16215,10 @@ fn enqueue_watcher_hints(
             let member = fresh_path_census_member(source, traversal, path);
             if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
                 // Every source: the hint orders the queued path into the
-                // hinted turn, ahead of the census FIFO. Order only.
-                candidate.watcher_hint = true;
+                // hinted turn, ahead of the census FIFO. Order only. A
+                // Claude/Pi path already gone keeps its member removal route.
+                candidate.watcher_hint |=
+                    source == SnapshotSource::Codex || fs::symlink_metadata(path).is_ok();
                 // Claude/Pi: the hint joins the census as it would if nothing
                 // were queued for it (a re-listed or re-read non-member).
                 if source != SnapshotSource::Codex {
