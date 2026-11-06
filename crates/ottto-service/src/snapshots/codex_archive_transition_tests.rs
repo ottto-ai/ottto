@@ -112,13 +112,14 @@ fn page_observed_on(
     cache: Arc<sampled_scan::SharedCache>,
     observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
-    page_observed_with_limit(roots, index, cache, 100, observe)
+    page_observed_with_limit(roots, index, cache, 100, &[], observe)
 }
 fn page_observed_with_limit(
     roots: &[PathBuf],
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
     file_limit: usize,
+    codex_slots: &[(String, String, usize)],
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -149,11 +150,13 @@ fn page_observed_with_limit(
                         mut scan,
                         ..
                     } => {
-                        index.bind_session_accounts(
+                        index.bind_session_accounts_with_mixed(
                             SnapshotSource::Codex,
                             "synthetic-machine",
                             &mut scan.snapshots,
                             &[],
+                            (codex_slots, &mut [0; 9]),
+                            &claude_request_accounts::MixedUploads::default(),
                         );
                         apply_upload_policy(
                             SnapshotSource::Codex,
@@ -1632,6 +1635,20 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    // Codex creator conflicts are a negative control, not request windows.
+    // Reuse the shared supported switch/side-call/gap and accepted-share
+    // positive control; the native route below proves Codex slot row tags.
+    let placement = money_oracle::placement_tests::placement_fixture();
+    let mut placement_route = placement.clone();
+    placement_route.mode = Mode::Ram;
+    money_oracle::assert_equivalent(&placement, &placement_route);
+    let mut moved = placement_route.clone();
+    moved.snapshots.get_mut("main").unwrap()["model_usage"][0]["identity_parts"][0]
+        ["account_identifier_hash"] = json!("b".repeat(64));
+    assert!(
+        std::panic::catch_unwind(|| money_oracle::assert_placement_equivalent(&placement, &moved))
+            .is_err()
+    );
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1648,7 +1665,30 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
             Some(if n == 1 { "a" } else { "b" }),
         );
     }
-    let (cold_index, cold_scan, ..) = page(&c, ScanIndex::default(), Arc::default());
+    let hash = |kind: &str, account: &str| {
+        let prefix = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{prefix}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
+    let (cold_index, cold_scan, ..) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        Arc::default(),
+        100,
+        &slots,
+        |_| {},
+    );
     assert_eq!(cold_scan.snapshots.len(), 7);
     let (session, mut index) = StateV2ColdSession::publish(
         Source::Codex,
@@ -1677,7 +1717,7 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
     for fresh in [true, false] {
         let before = index.clone();
         let (working, scan, ..) =
-            page_observed_with_limit(&c.roots(), index, cache.clone(), 4, |selected| {
+            page_observed_with_limit(&c.roots(), index, cache.clone(), 4, &slots, |selected| {
                 if !selected.codex_join_prepared {
                     assert_eq!(
                         selected
@@ -1736,14 +1776,49 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
         "two tagged accounts"
     );
     assert!(cold.snapshots[GAP]["session_account_evidence"].is_null());
+    for route in [&cold_scan, &drained] {
+        for item in &route.snapshots {
+            let expected = match item.source_session_id.as_str() {
+                MAIN | GAP => None,
+                id if id == account_a => Some(hash("account", "a")),
+                _ => Some(hash("account", "b")),
+            };
+            assert!(!item.model_usage.is_empty());
+            for row in item.model_usage.iter().chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter()),
+            ) {
+                assert_eq!(
+                    row.account_identifier_hash, expected,
+                    "native Codex row placement"
+                );
+            }
+        }
+    }
+    // Codex uses saved per-session bindings; the request-share ledger in
+    // the shared switch control is Claude-specific. Compare the real Codex
+    // bindings and exact accepted fingerprints instead of fabricating shares.
+    let bindings = serde_json::to_value(&index.session_account_bindings).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::to_value(&cold_index.session_account_bindings).unwrap()
+    );
+    assert!(drained.snapshots.iter().all(|item| index
+        .accepted_snapshot_fingerprints
+        .contains(&item.snapshot_fingerprint)));
     money_oracle::assert_equivalent(&cold, &paged);
     let mut wrong = paged.clone();
-    wrong.snapshots.get_mut(OTHER).unwrap()["session_account_evidence"] =
-        cold.snapshots[MAIN]["session_account_evidence"].clone();
+    wrong.snapshots.get_mut(OTHER).unwrap()["model_usage"][0]["account_identifier_hash"] =
+        json!(hash("account", "a"));
     assert!(
         std::panic::catch_unwind(|| money_oracle::assert_placement_equivalent(&cold, &wrong))
             .is_err()
     );
     let index = ScanIndex::load(session.path()).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::to_value(&index.session_account_bindings).unwrap()
+    );
     assert_quiet(&c, index, &paged);
 }
