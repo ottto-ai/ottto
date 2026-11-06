@@ -1276,7 +1276,12 @@ pub(super) fn retain_candidate_growth(
 /// Metadata only, through the acquisition path's configured-root/no-follow open.
 /// A failed open is never negative growth evidence. Positive absence keeps the
 /// existing independent absence rules (including unreadable/missing roots).
-pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathBuf]) -> bool {
+pub(super) fn revalidate_growth(
+    index: &mut ScanIndex,
+    key: &str,
+    roots: &[PathBuf],
+    tally: &mut (u64, u64),
+) -> bool {
     if !growth_active(index) || !index.files.contains_key(key) {
         return false;
     }
@@ -1309,7 +1314,8 @@ pub(super) fn revalidate_growth(index: &mut ScanIndex, key: &str, roots: &[PathB
             .map(|stat| stat.len())
     });
     let uncertain = len.is_none() && !proven_absent(path, roots);
-    crate::local_resource_diagnostics::v2_growth_revalidate(uncertain);
+    tally.0 += 1;
+    tally.1 += u64::from(uncertain);
     let retained = uncertain
         || index
             .v2()
@@ -1968,6 +1974,28 @@ mod growth_tests {
         }
     }
 
+    /// [regress] Revalidation printed one row per file; a page prints one sum.
+    #[test]
+    fn reconcile_page_prints_one_revalidate_row() {
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        // Beneath no configured root: neither readable nor proven absent.
+        let outside = crate::test_scratch::unique_path("ottto-v2-growth-outside");
+        let outside = local_index_key(&outside.join("session.jsonl"));
+        let entry = index.files[&fixture.key].clone();
+        index.files.insert(outside.clone(), entry);
+        index.traversal.as_mut().unwrap().reconciliation_upper_bound =
+            Some(outside.clone().max(fixture.key.clone()));
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            reconcile_missing_index_entries_with_limit(&mut index, 2)
+        });
+        let sums = rows
+            .iter()
+            .filter_map(|row| row["counts"].get("v2_growth_revalidate"))
+            .collect::<Vec<_>>();
+        assert_eq!(sums, [&serde_json::json!({"stats": 2, "uncertain": 1})]);
+    }
+
     /// [money] Growth settlement keeps a progress restart's audit debt.
     #[test]
     fn f2_progress_restart_growth_settlement_keeps_audit_debt() {
@@ -1977,7 +2005,8 @@ mod growth_tests {
         assert!(revalidate_growth(
             &mut index,
             &fixture.key,
-            std::slice::from_ref(&fixture.root)
+            std::slice::from_ref(&fixture.root),
+            &mut (0, 0)
         ));
         // A progress checkpoint can advance working bytes before settlement.
         index.files.get_mut(&fixture.key).unwrap().size_bytes = 11;
@@ -2015,7 +2044,8 @@ mod growth_tests {
         assert!(!revalidate_growth(
             &mut index,
             &fixture.key,
-            std::slice::from_ref(&fixture.root)
+            std::slice::from_ref(&fixture.root),
+            &mut (0, 0)
         ));
         assert_eq!(serde_json::to_vec(&index).unwrap(), before);
         assert!(!serde_json::from_slice::<serde_json::Value>(&before)
@@ -2055,13 +2085,15 @@ mod growth_tests {
                 assert!(revalidate_growth(
                     &mut index,
                     &fixture.key,
-                    std::slice::from_ref(&missing_root)
+                    std::slice::from_ref(&missing_root),
+                    &mut (0, 0)
                 ));
                 // Repeat in the same pass must not spend another uncertainty.
                 assert!(revalidate_growth(
                     &mut index,
                     &fixture.key,
-                    std::slice::from_ref(&missing_root)
+                    std::slice::from_ref(&missing_root),
+                    &mut (0, 0)
                 ));
             });
             assert_eq!(
@@ -2080,6 +2112,7 @@ mod growth_tests {
             &mut index,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         assert_eq!(
             index.v2().growth_retention[&fixture.key].uncertain_passes,
@@ -2095,11 +2128,21 @@ mod growth_tests {
         // A debt row records its checked status once, not every generation.
         fixture.grow();
         let roots = std::slice::from_ref(&fixture.root);
-        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        assert!(revalidate_growth(
+            &mut index,
+            &fixture.key,
+            roots,
+            &mut (0, 0)
+        ));
         let checked = index.v2().growth_retention[&fixture.key].checked_generation;
         assert!(checked.is_some());
         index.generation += 1;
-        assert!(revalidate_growth(&mut index, &fixture.key, roots));
+        assert!(revalidate_growth(
+            &mut index,
+            &fixture.key,
+            roots,
+            &mut (0, 0)
+        ));
         assert_eq!(
             index.v2().growth_retention[&fixture.key].checked_generation,
             checked
@@ -2117,6 +2160,7 @@ mod growth_tests {
             &mut index,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         let mut census = ScanCensus::default();
         let candidate = candidate_from_traversal_path(
@@ -2175,6 +2219,7 @@ mod growth_tests {
             &mut previous,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         let mut working = previous.clone();
         settle_growth(&mut working, &fixture.key);
@@ -2302,6 +2347,7 @@ mod growth_tests {
                 &mut initial,
                 &fixture.key,
                 std::slice::from_ref(&fixture.root),
+                &mut (0, 0),
             );
             fixture.persist(&initial);
             let previous = ScanIndex::load(&path).unwrap();
@@ -2400,6 +2446,7 @@ mod growth_tests {
             &mut index,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         let candidate = identified(&fixture, &index);
         // A graph without a load-lineage receipt cannot authorize acquisition.
@@ -2494,6 +2541,7 @@ mod growth_tests {
             &mut index,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         fixture.persist(&index);
         let mut stale = ScanIndex::load(&path).unwrap();
@@ -2528,6 +2576,7 @@ mod growth_tests {
             &mut initial,
             &fixture.key,
             std::slice::from_ref(&fixture.root),
+            &mut (0, 0),
         );
         fixture.persist(&initial);
         let mut working = ScanIndex::load(&path).unwrap();

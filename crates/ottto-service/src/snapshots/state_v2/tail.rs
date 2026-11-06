@@ -989,6 +989,9 @@ struct Applied {
     kept_debt: u64,
     revisions_added: u64,
     erased: u64,
+    /// Heads deleted because a debt-only apply settled their last revisions.
+    #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
+    debt_settled_heads: u64,
 }
 impl Applied {
     fn absorb(&mut self, one: Self) {
@@ -998,6 +1001,7 @@ impl Applied {
         self.dirty_pages += one.dirty_pages;
         self.old_page_touches += one.old_page_touches;
         self.revisions_added += one.revisions_added;
+        self.debt_settled_heads += one.debt_settled_heads;
     }
 }
 fn member(table: &mut MembershipTable, collection: Collection) -> Result<&mut Membership> {
@@ -1175,6 +1179,8 @@ fn write_file(
         && !table.contains_key(&Collection::Revisions)
         && common.inventory.is_none()
     {
+        applied.debt_settled_heads =
+            u64::from(staged.is_none() && debt.is_some_and(|debt| !debt.resolved.is_empty()));
         delete_rows(tx, file, false)?;
         return Ok(applied);
     }

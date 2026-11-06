@@ -8190,10 +8190,11 @@ impl OwnedSourceScan {
                 }
                 let account_members = index.observed_account_members();
                 let unacked = index.unacked_bodies(census.removed_index_keys.iter());
+                let mut tally = (0, 0);
                 for index_key in census.removed_index_keys.iter() {
                     if source == SnapshotSource::ClaudeCode
                         && !census.claude_vanished_index_keys.contains(index_key)
-                        && sampled_audit::revalidate_growth(index, index_key, &roots)
+                        && sampled_audit::revalidate_growth(index, index_key, &roots, &mut tally)
                     {
                         continue;
                     }
@@ -8256,6 +8257,7 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                crate::local_resource_diagnostics::v2_growth_revalidate(tally);
                 index.count_unacked_retired(source, unacked);
                 // G1: only census members hold discovery. A pending re-read
                 // (growth after this generation processed its path) is
@@ -17669,13 +17671,14 @@ fn reconcile_missing_index_entries_with_side(
     let mut growth_queued = false;
     let account_members = index.observed_account_members();
     let unacked = index.unacked_bodies(&page);
+    let mut tally = (0, 0);
     for key in &page {
         let observed = index
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
         if let Some(roots) = growth_roots.as_ref() {
-            if sampled_audit::revalidate_growth(index, key, roots) {
+            if sampled_audit::revalidate_growth(index, key, roots, &mut tally) {
                 growth_queued = true;
                 continue;
             }
@@ -17731,6 +17734,7 @@ fn reconcile_missing_index_entries_with_side(
             index.file_snapshot_fingerprints.remove(key);
         }
     }
+    crate::local_resource_diagnostics::v2_growth_revalidate(tally);
     index.count_unacked_retired(source, unacked);
     let done = regular_done && residue_count < limit;
     if let Some(traversal) = index.traversal.as_mut() {
