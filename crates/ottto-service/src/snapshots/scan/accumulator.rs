@@ -1,7 +1,281 @@
-//! Snapshot accumulator methods for Codex ownership, activity and Claude
-//! response records.
+//! The snapshot accumulator: its methods, the usage row key and selector
+//! capture, the row builders, and their layout rows.
 
 use crate::snapshots::*;
+
+pub(in crate::snapshots) fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
+    row_key_with_selector_hash(row, selector_hash(&row.selector_context))
+}
+
+pub(in crate::snapshots) fn selector_hash(selector_context: &BTreeMap<String, String>) -> String {
+    if selector_context.is_empty() {
+        "base".to_string()
+    } else {
+        let payload = serde_json::to_string(selector_context).unwrap_or_else(|_| "{}".to_string());
+        sha256_hex(&[payload.as_str()])[..16].to_string()
+    }
+}
+
+/// Call-local memo for one row rebuild: a session's rows share a handful of
+/// selector contexts, so each distinct context is serialized and hashed once.
+/// Bounded; dropped with the caller.
+#[derive(Default)]
+pub(in crate::snapshots) struct SelectorHashes(Vec<(BTreeMap<String, String>, String)>);
+
+impl SelectorHashes {
+    const CAP: usize = 16;
+
+    pub(in crate::snapshots) fn row_key(&mut self, row: &SnapshotModelUsage) -> RowKey {
+        let context = &row.selector_context;
+        let hash = match self.0.iter().find(|(known, _)| known == context) {
+            Some((_, hash)) => hash.clone(),
+            None => {
+                let hash = selector_hash(context);
+                if self.0.len() < Self::CAP {
+                    self.0.push((context.clone(), hash.clone()));
+                }
+                hash
+            }
+        };
+        row_key_with_selector_hash(row, hash)
+    }
+}
+
+// Preserve every legacy key when false. The existing opaque local partition
+// also distinguishes the new boolean money dimension; no wire selector or
+// persisted RowKey codec field is introduced. The prefix cannot collide with
+// a native selector hash ("base" or hexadecimal).
+const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
+fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
+    let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
+    RowKey {
+        model: row.model.clone(),
+        selector_hash,
+        reasoning_effort: row.reasoning_effort.clone(),
+        auth_mode: row.auth_mode.clone(),
+        billing_channel: row.billing_channel.clone(),
+        billing_provider: row.billing_provider.clone(),
+        gateway_provider: row.gateway_provider.clone(),
+        model_provider: row.model_provider.clone(),
+        subscription_product: row.subscription_product.clone(),
+    }
+}
+
+/// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
+/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
+/// #944 proved rows), must partition through here so a marked row and an
+/// unmarked twin never share a key.
+pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
+    if copy_unproven {
+        format!("{COPY_UNPROVEN_PARTITION}{selector_hash}")
+    } else {
+        selector_hash
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::snapshots) struct SelectorCapture {
+    pub(in crate::snapshots) context: BTreeMap<String, String>,
+    pub(in crate::snapshots) sources: BTreeMap<String, String>,
+}
+
+impl SelectorCapture {
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
+        self.context.is_empty()
+    }
+
+    pub(in crate::snapshots) fn insert(&mut self, field: &str, value: String, source: &str) {
+        self.context.insert(field.to_string(), value);
+        self.sources.insert(field.to_string(), source.to_string());
+    }
+
+    pub(in crate::snapshots) fn merge(&mut self, other: SelectorCapture) {
+        for (field, value) in other.context {
+            self.context.insert(field, value);
+        }
+        for (field, source) in other.sources {
+            self.sources.insert(field, source);
+        }
+    }
+}
+
+/// True when `dir` (a Claude Code session's `workflows/` sibling directory)
+/// contains at least one `wf_*.json` orchestration manifest. The Workflow tool
+/// writes one manifest per run; manifest filenames are truncated
+/// (e.g. `wf_60f3dab6-4fa.json`), so match on the `wf_`/`.json` affixes rather
+/// than an exact name. Best-effort: a missing directory or any read error
+/// yields `false` and never disrupts collection.
+fn claude_workflows_dir_has_manifest(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("wf_") && name.ends_with(".json"))
+    })
+}
+
+// v6 row identity. Mirrors the backend's `_usage_row_key`
+// (model, selector_hash, billing_hash) tuple so daemon-side aggregation
+// dedupes the same rows the backend would have deduped on receipt. Without
+// this, two rows that differ only in plan_window_bucket would distinct on
+// the daemon, then collide on the backend (which strips plan_window_bucket
+// during normalization) and trip "duplicate model selector rows".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::snapshots) struct RowKey {
+    pub(in crate::snapshots) model: String,
+    pub(in crate::snapshots) selector_hash: String,
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+    pub(in crate::snapshots) auth_mode: Option<String>,
+    pub(in crate::snapshots) billing_channel: Option<String>,
+    pub(in crate::snapshots) billing_provider: Option<String>,
+    pub(in crate::snapshots) gateway_provider: Option<String>,
+    pub(in crate::snapshots) model_provider: Option<String>,
+    pub(in crate::snapshots) subscription_product: Option<String>,
+}
+
+impl RowKey {
+    /// The hoisted billing fields by their selector names.
+    pub(in crate::snapshots) fn billing_fields(&self) -> [(&'static str, Option<&str>); 6] {
+        [
+            ("auth_mode", self.auth_mode.as_deref()),
+            ("billing_channel", self.billing_channel.as_deref()),
+            ("billing_provider", self.billing_provider.as_deref()),
+            ("gateway_provider", self.gateway_provider.as_deref()),
+            ("model_provider", self.model_provider.as_deref()),
+            ("subscription_product", self.subscription_product.as_deref()),
+        ]
+    }
+}
+
+pub(crate) struct ClaudeRowPlacement {
+    pub(in crate::snapshots) bucket: String,
+    pub(in crate::snapshots) normalized_timestamp: String,
+    pub(in crate::snapshots) row_key: RowKey,
+    pub(in crate::snapshots) reduced_context: BTreeMap<String, String>,
+    pub(in crate::snapshots) reduced_sources: BTreeMap<String, String>,
+}
+/// One native usage placement: the resolved model (`fell_back`: from the
+/// running model, the response named none) and its row, None when unplaceable.
+pub(crate) struct PlacedClaudeUsage {
+    pub(in crate::snapshots) model: String,
+    pub(in crate::snapshots) fell_back: bool,
+    pub(in crate::snapshots) placement: Option<ClaudeRowPlacement>,
+}
+/// One owner for the native bucket/key and reduced selector, including fallback time.
+pub(in crate::snapshots) fn claude_row_placement(
+    model: &str,
+    base: &SelectorCapture,
+    selector: SelectorCapture,
+    effort: Option<&str>,
+    timestamp: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<ClaudeRowPlacement> {
+    let (bucket, normalized_timestamp) = activity_bucket_from_timestamp(timestamp.or(fallback)?)?;
+    let mut merged = base.clone();
+    merged.merge(selector);
+    let (row_key, reduced_context, reduced_sources) = build_row_identity(model, &merged, effort);
+    Some(ClaudeRowPlacement {
+        bucket,
+        normalized_timestamp,
+        row_key,
+        reduced_context,
+        reduced_sources,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::snapshots) struct BucketRowAccumulator {
+    pub(in crate::snapshots) selector_context: BTreeMap<String, String>,
+    pub(in crate::snapshots) selector_sources: BTreeMap<String, String>,
+    pub(in crate::snapshots) usage: UsageTotals,
+    // Per-turn reasoning effort tier (Codex transcript or Claude local OTLP).
+    // Also present in RowKey so mixed-effort buckets never collapse.
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::snapshots) struct UsageBucketState {
+    pub(in crate::snapshots) rows: BTreeMap<RowKey, BucketRowAccumulator>,
+    pub(in crate::snapshots) first_activity_at: Option<String>,
+    pub(in crate::snapshots) last_activity_at: Option<String>,
+}
+
+impl UsageBucketState {
+    pub(in crate::snapshots) fn note_activity_at(&mut self, timestamp: &str) {
+        match self.first_activity_at.as_ref() {
+            Some(current) if timestamp_is_before(timestamp, current) => {
+                self.first_activity_at = Some(timestamp.to_string())
+            }
+            None => self.first_activity_at = Some(timestamp.to_string()),
+            _ => {}
+        }
+        match self.last_activity_at.as_ref() {
+            Some(current) if timestamp_is_after(timestamp, current) => {
+                self.last_activity_at = Some(timestamp.to_string())
+            }
+            None => self.last_activity_at = Some(timestamp.to_string()),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::snapshots) enum CodexOwnershipBoundary {
+    /// No authoritative session header has been observed yet. Records cannot
+    /// be admitted until the header proves whether a physical prefix exists.
+    #[default]
+    Undetermined,
+    /// The rollout has no inherited physical prefix, or uses a paginated
+    /// history_base whose referenced records are not local child records.
+    AllLocal,
+    /// Legacy subagent fork: records are inherited until the first provider
+    /// trigger-turn marker.
+    AwaitingLegacyTrigger,
+    /// Decode-only tombstone for a retired ownership boundary; always held.
+    AwaitingParentPrefix,
+    /// Native Codex boundary: ordinals below `start` are inherited context.
+    Ordinal { start: u64 },
+    /// Provider-created physical child whose own creation envelope starts at
+    /// ordinal zero. Every record remains tentatively local while the complete
+    /// native ordinal/timestamp stream and first-turn binding are validated;
+    /// any later structural break suppresses the whole file at finalization.
+    NativeCreatedThread,
+    /// A fork was observed but its inherited prefix cannot be proven locally.
+    /// Usage must fail closed rather than publish an inclusive total.
+    AmbiguousFork,
+}
+crate::durable_tail_codec::durable_enum!(CodexOwnershipBoundary {
+    0 => Undetermined,
+    1 => AllLocal,
+    2 => AwaitingLegacyTrigger,
+    3 => AwaitingParentPrefix [decode_only],
+    4 => Ordinal { N start: u64 },
+    5 => NativeCreatedThread,
+    6 => AmbiguousFork,
+});
+
+/// An open Codex call's provider call id, apart from its tool name, so a
+/// durable record's `L` span is the id alone.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::snapshots) struct ActivityCallId {
+    pub(in crate::snapshots) id: String,
+}
+
+impl std::borrow::Borrow<str> for ActivityCallId {
+    fn borrow(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The tool name an open Codex call was counted under (`U`: the activity
+/// tool counts upload it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct ActivityCallTool {
+    pub(in crate::snapshots) name: String,
+}
 
 impl SnapshotAccumulator {
     pub(in crate::snapshots) fn new(source: SnapshotSource) -> Self {
@@ -2497,3 +2771,289 @@ impl SnapshotAccumulator {
         vec![item]
     }
 }
+
+type RepositoryIdentityCache =
+    BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
+
+fn repository_identity_cache() -> &'static Mutex<RepositoryIdentityCache> {
+    static CACHE: OnceLock<Mutex<RepositoryIdentityCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn fresh_repository_identity(
+    cache: &RepositoryIdentityCache,
+    workspace: &Path,
+    now: SystemTime,
+) -> Option<crate::context_footprint::RepositoryIdentity> {
+    let (captured_at, identity) = cache.get(workspace)?;
+    now.duration_since(*captured_at)
+        .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
+        .unwrap_or(false)
+        .then(|| identity.clone())
+}
+
+pub(in crate::snapshots) fn cached_repository_identity(
+    workspace: &Path,
+) -> crate::context_footprint::RepositoryIdentity {
+    // A cached path observation cannot locate a session whose cwd has gone.
+    // The shared resolver classifies this failure without spawning Git.
+    if fs::read_dir(workspace).is_err() {
+        return crate::context_footprint::resolve_repository_identity(workspace, true);
+    }
+    let cache = repository_identity_cache();
+    let now = SystemTime::now();
+    if let Ok(guard) = cache.lock() {
+        if let Some(identity) = fresh_repository_identity(&guard, workspace, now) {
+            return identity;
+        }
+    }
+
+    let identity = crate::context_footprint::resolve_repository_identity(workspace, true);
+    // Negative observations must not delay a later git init or repaired lookup.
+    if identity.is_repository() {
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
+                guard.clear();
+            }
+            guard.insert(workspace.to_path_buf(), (now, identity.clone()));
+        }
+    }
+    identity
+}
+
+pub(in crate::snapshots) fn merge_session_row(
+    session_rows: &mut BTreeMap<RowKey, BucketRowAccumulator>,
+    row_key: RowKey,
+    row: BucketRowAccumulator,
+) {
+    match session_rows.get_mut(&row_key) {
+        Some(existing) => {
+            for (field, source) in row.selector_sources {
+                existing.selector_sources.insert(field, source);
+            }
+            let row_added = existing.usage.add(&row.usage);
+            debug_assert!(row_added);
+            debug_assert_eq!(existing.reasoning_effort, row.reasoning_effort);
+        }
+        None => {
+            session_rows.insert(row_key, row);
+        }
+    }
+}
+
+pub(in crate::snapshots) fn model_usage_from_row(
+    row_key: &RowKey,
+    row: &BucketRowAccumulator,
+) -> SnapshotModelUsage {
+    SnapshotModelUsage {
+        copy_unproven: row_key.selector_hash.starts_with(COPY_UNPROVEN_PARTITION),
+        evidence_ref: None,
+        identity_parts: None,
+        identity_retained: false,
+        copy_invalidated: false,
+        model: row_key.model.clone(),
+        input_tokens: row.usage.input_tokens,
+        output_tokens: row.usage.output_tokens,
+        cache_read_tokens: row.usage.cache_read_tokens,
+        cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
+        reasoning_output_tokens: row.usage.reasoning_output_tokens,
+        reasoning_effort: row.reasoning_effort.clone(),
+        unattributed_total_tokens: row.usage.unattributed_total_tokens,
+        request_count: row.usage.request_count,
+        selector_context: row.selector_context.clone(),
+        selector_sources: row.selector_sources.clone(),
+        auth_mode: row_key.auth_mode.clone(),
+        billing_channel: row_key.billing_channel.clone(),
+        billing_provider: row_key.billing_provider.clone(),
+        gateway_provider: row_key.gateway_provider.clone(),
+        model_provider: row_key.model_provider.clone(),
+        subscription_product: row_key.subscription_product.clone(),
+        account_identifier_hash: None,
+        cost_usd: row.usage.costs.total.map(usd_picos_string),
+        input_cost_usd: row.usage.costs.input.map(usd_picos_string),
+        output_cost_usd: row.usage.costs.output.map(usd_picos_string),
+        cache_read_cost_usd: row.usage.costs.cache_read.map(usd_picos_string),
+        cache_creation_cost_usd: row.usage.costs.cache_creation.map(usd_picos_string),
+    }
+}
+
+// Hoist the six billing fields out of selector_context into a RowKey, and
+// drop any non-allowlist keys (plan_window_bucket, agent_quota_*, etc.) that
+// the backend's normalize_selector_context would strip anyway. The remaining
+// reduced selector_context drives the row's selector_hash dimension.
+pub(in crate::snapshots) fn build_row_identity(
+    model: &str,
+    merged: &SelectorCapture,
+    reasoning_effort: Option<&str>,
+) -> (RowKey, BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut hoisted: BTreeMap<&'static str, Option<String>> = BTreeMap::new();
+    let mut reduced_context = BTreeMap::new();
+    let mut reduced_sources = BTreeMap::new();
+    for field in ROW_BILLING_FIELDS {
+        hoisted.insert(
+            *field,
+            merged
+                .context
+                .get(*field)
+                .filter(|value| !value.is_empty())
+                .cloned(),
+        );
+    }
+    for (key, value) in &merged.context {
+        if ROW_BILLING_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        if !SELECTOR_CONTEXT_ALLOWED.contains(&key.as_str()) {
+            continue;
+        }
+        reduced_context.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &merged.sources {
+        if ROW_BILLING_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        if !SELECTOR_CONTEXT_ALLOWED.contains(&key.as_str()) {
+            continue;
+        }
+        reduced_sources.insert(key.clone(), value.clone());
+    }
+    let selector_hash = if reduced_context.is_empty() {
+        "base".to_string()
+    } else {
+        let payload = serde_json::to_string(&reduced_context).unwrap_or_else(|_| "{}".to_string());
+        sha256_hex(&[payload.as_str()])[..16].to_string()
+    };
+    let row_key = RowKey {
+        model: model.to_string(),
+        selector_hash,
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        auth_mode: hoisted.get("auth_mode").cloned().unwrap_or(None),
+        billing_channel: hoisted.get("billing_channel").cloned().unwrap_or(None),
+        billing_provider: hoisted.get("billing_provider").cloned().unwrap_or(None),
+        gateway_provider: hoisted.get("gateway_provider").cloned().unwrap_or(None),
+        model_provider: hoisted.get("model_provider").cloned().unwrap_or(None),
+        subscription_product: hoisted.get("subscription_product").cloned().unwrap_or(None),
+    };
+    (row_key, reduced_context, reduced_sources)
+}
+
+/// `current_selector` key of the running Codex requested tier: reducer state
+/// that survives Tail and restore in the record. Not in
+/// `SELECTOR_CONTEXT_ALLOWED`, so it never reaches a row or the wire.
+pub(in crate::snapshots) const CODEX_THREAD_TIER: &str = "codex_thread_tier";
+
+// Mirror of backend SELECTOR_FIELDS (selector_context.py). Daemon-side
+// reduction matches the backend's normalize_selector_context so two rows
+// that differ only in a key the backend would strip aren't emitted as
+// distinct rows here (which would trip "duplicate model selector rows" on
+// the backend bucket validator).
+pub(in crate::snapshots) const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
+    "service_tier",
+    "speed_mode",
+    "batch_mode",
+    "cache_ttl",
+    "region_mode",
+    "platform",
+    "context_bucket",
+    "mode",
+    "billing_channel",
+    "auth_mode",
+    "gateway_provider",
+    "subscription_product",
+    "attribution_subagent",
+    "attribution_skill",
+    "attribution_plugin",
+    "attribution_mcp_server",
+    "attribution_mcp_tool",
+];
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
+crate::durable_tail_codec::durable_struct!(BucketRowAccumulator {
+    U selector_context: BTreeMap<String, String>,
+    U selector_sources: BTreeMap<String, String>,
+    N usage: UsageTotals,
+    U reasoning_effort: Option<String>,
+});
+crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
+crate::durable_tail_codec::durable_struct!(key RowKey {
+    U model: String,
+    // "base" or a 16-hex prefix of SHA-256 over `selector_context`, which
+    // the upload carries (U): not a 32-byte digest, so not H.
+    U selector_hash: String,
+    U reasoning_effort: Option<String>,
+    U auth_mode: Option<String>,
+    U billing_channel: Option<String>,
+    U billing_provider: Option<String>,
+    U gateway_provider: Option<String>,
+    U model_provider: Option<String>,
+    U subscription_product: Option<String>,
+});
+crate::heap_layout_bound::fields!(ActivityCallId; id);
+crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
+crate::heap_layout_bound::fields!(ActivityCallTool; name);
+crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
+crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
+// The retired Claude attribution capture put raw skill, plugin,
+// MCP and subagent names into `context`; no source emits them now, but the
+// shape below is bound into the pinned allowlist digest, so it stays. A context
+// holding any attribution key is class `E`: the record is refused (counted as
+// `not_persisted{SelectorCapture.context.attribution}`) and the entry reads
+// Full after a restart, so raw names never reach the store. Any other
+// context is `U`. Hand-written for that one conditional refusal; the shape
+// names both rules, so the allowlist binds them.
+impl crate::durable_tail_codec::Durable for SelectorCapture {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        let Self { context, sources } = self;
+        if context
+            .keys()
+            .any(|key| CLAUDE_ATTRIBUTION_SELECTOR_KEYS.contains(&key.as_str()))
+        {
+            return Err(crate::durable_tail_codec::Refuse::NonEmpty(
+                "SelectorCapture.context.attribution",
+            ));
+        }
+        context.put(e)?;
+        sources.put(e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        type Map = BTreeMap<String, String>;
+        Ok(Self {
+            context: <Map as crate::durable_tail_codec::Durable>::take(d)?,
+            sources: <Map as crate::durable_tail_codec::Durable>::take(d)?,
+        })
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        type Map = BTreeMap<String, String>;
+        <Map as crate::durable_tail_codec::Durable>::verify(d)?;
+        <Map as crate::durable_tail_codec::Durable>::verify(d)
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        type Map = BTreeMap<String, String>;
+        if s.enter("SelectorCapture") {
+            s.push("U context");
+            <Map as crate::durable_tail_codec::Durable>::shape(s);
+            s.push("E context.attribution");
+            for key in CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
+                s.push(key);
+            }
+            s.push("U sources");
+            <Map as crate::durable_tail_codec::Durable>::shape(s);
+            s.leave();
+        }
+    }
+}
+crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, last_activity_at);
+crate::durable_tail_codec::durable_struct!(UsageBucketState {
+    D rows: BTreeMap<RowKey, BucketRowAccumulator>,
+    N first_activity_at: Option<String>,
+    N last_activity_at: Option<String>,
+});
