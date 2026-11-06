@@ -8,6 +8,9 @@ use std::time::Duration;
 const INTERVAL: Duration = Duration::from_millis(50);
 const SLOTS: usize = 16;
 const UNKNOWN: u64 = u64::MAX;
+/// Memory reporting line (400 MiB). Reporting only, never a cap: nothing reads
+/// it to change behavior. Samples above it times `INTERVAL` measure time above.
+const REPORTING_LINE_BYTES: u64 = 400 * 1024 * 1024;
 type Slots = [Option<Arc<Counters>>; SLOTS];
 
 #[derive(Debug, Default, Serialize)]
@@ -20,6 +23,8 @@ pub(super) struct Observation {
     stage_end_footprint_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     footprint_samples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    footprint_samples_over_400: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     footprint_sample_failures: Option<u64>,
     #[serde(skip)]
@@ -34,6 +39,7 @@ struct Metric {
     end: AtomicU64,
     peak: AtomicU64,
     samples: AtomicU64,
+    over_line: AtomicU64,
     failures: AtomicU64,
 }
 impl Metric {
@@ -43,6 +49,7 @@ impl Metric {
             end: AtomicU64::new(UNKNOWN),
             peak: AtomicU64::new(0),
             samples: AtomicU64::new(0),
+            over_line: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         };
         counters.record(start);
@@ -52,6 +59,9 @@ impl Metric {
         if let Some(bytes) = sample {
             self.peak.fetch_max(bytes, Relaxed);
             self.samples.fetch_add(1, Relaxed);
+            if bytes > REPORTING_LINE_BYTES {
+                self.over_line.fetch_add(1, Relaxed);
+            }
         } else {
             self.failures.fetch_add(1, Relaxed);
         }
@@ -59,11 +69,13 @@ impl Metric {
     fn observation(&self) -> Observation {
         let samples = self.samples.load(Relaxed);
         let end = self.end.load(Relaxed);
+        let over_line = self.over_line.load(Relaxed);
         Observation {
             stage_peak_footprint_bytes: (samples > 0).then(|| self.peak.load(Relaxed)),
             stage_start_footprint_bytes: self.start,
             stage_end_footprint_bytes: (end != UNKNOWN).then_some(end),
             footprint_samples: (samples > 0).then_some(samples),
+            footprint_samples_over_400: (over_line > 0).then_some(over_line),
             footprint_sample_failures: Some(self.failures.load(Relaxed)),
             ..Default::default()
         }
@@ -472,6 +484,25 @@ mod tests {
         assert_eq!(row.stage_end_footprint_bytes, Some(10));
         assert_eq!(row.footprint_samples, Some(3));
         assert_eq!(row.footprint_sample_failures, Some(1));
+        assert!(row.footprint_samples_over_400.is_none());
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("footprint_samples_over_400").is_none());
+    }
+
+    #[test]
+    fn samples_above_the_reporting_line_are_counted() {
+        let sampler = Arc::new(Sampler::new(|| sample(Some(REPORTING_LINE_BYTES))));
+        let stage = sampler.begin().unwrap();
+        for bytes in [REPORTING_LINE_BYTES + 1, REPORTING_LINE_BYTES, 2 << 30] {
+            stage.counters.record(sample(Some(bytes)));
+        }
+        stage.counters.record(sample(None));
+        let row = stage.finish();
+        // Start and end sit exactly on the line, so only two samples are above.
+        assert_eq!(row.footprint_samples, Some(5));
+        assert_eq!(row.footprint_samples_over_400, Some(2));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["footprint_samples_over_400"], 2);
     }
 
     #[test]

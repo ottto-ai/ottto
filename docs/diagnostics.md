@@ -378,6 +378,12 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
+
+`footprint_samples_over_400` counts the successful samples in that same measure
+above 400 MiB (419,430,400 bytes), a reporting line only: nothing reads it to
+change behavior. Time above the line is about this count × 50 ms (the start
+and end reads count as samples too). It is absent when no sample was above.
+
 Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
