@@ -9,6 +9,11 @@ enum FinishOutcome {
     /// The backend accepts every body.
     Accept,
     Retryable,
+    Identity,
+    Identity429,
+    Validation,
+    Witness,
+    ConflictValidation,
     /// Every body is refused as ordinary non-permanent mixed usage.
     Mixed,
     PermanentStatusFailure,
@@ -27,6 +32,28 @@ impl FinishOutcome {
     fn retains_refusal_across_quiet_cycles(self) -> bool {
         matches!(self, FinishOutcome::Dominated { .. })
     }
+}
+
+// Reuse the loopback receiver's witness calculation for offered-body custody checks.
+fn finish_wire_body_witness(item: &serde_json::Value) -> String {
+    assert!(item.get("cache_observations").is_none());
+    assert!(item.get("context_curve").is_none());
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    )
 }
 
 struct FinishServer {
@@ -92,7 +119,10 @@ impl FinishServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
-                    let retryable = matches!(outcome, FinishOutcome::Retryable);
+                    let retryable = matches!(
+                        outcome,
+                        FinishOutcome::Retryable | FinishOutcome::ConflictValidation
+                    );
                     let references = items
                         .iter()
                         .map(|item| {
@@ -120,23 +150,37 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
-                    if matches!(outcome, FinishOutcome::Accept) {
+                    let validation_index = items
+                        .iter()
+                        .position(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT);
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Identity | FinishOutcome::Identity429
+                    ) {
+                        status = if matches!(outcome, FinishOutcome::Identity429) {
+                            "429 Too Many Requests"
+                        } else {
+                            "503 Service Unavailable"
+                        };
+                        serde_json::json!({"code":"snapshot_original_identity_unavailable", "errors":(0..items.len()).map(|i| serde_json::json!({"loc":["body","snapshots",i]})).collect::<Vec<_>>()})
+                    } else if let Some(index) = validation_index.filter(|_| {
+                        matches!(
+                            outcome,
+                            FinishOutcome::Validation | FinishOutcome::ConflictValidation
+                        )
+                    }) {
+                        status = "422 Unprocessable Entity";
+                        serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
+                    } else if matches!(outcome, FinishOutcome::Accept | FinishOutcome::Witness) {
                         let entities = items.iter().map(|item| {
-                            assert!(item.get("cache_observations").is_none());
-                            assert!(item.get("context_curve").is_none());
-                            let mut payload = serde_json::Map::new();
-                            for key in ["session_account_evidence", "tool_usage", "tool_usage_truncated"] {
-                                if let Some(value) = item.get(key) { payload.insert(key.into(), value.clone()); }
-                            }
                             let exclusive = item.get("usage_accounting_contract").and_then(|v| v.as_str())
                                 == Some("session_exclusive_reported_usage:v1");
                             let version = item.get("session_account_evidence").is_some()
                                 .then_some(if exclusive { 8u64 } else { 7u64 });
-                            let digest = format!("{:x}", Sha256::digest(
-                                crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()));
+                            let digest = finish_wire_body_witness(item);
                             serde_json::json!({"source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
-                                "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
+                                "body_witness_version":version,"body_witness_digest":version.map(|_| if matches!(outcome, FinishOutcome::Witness) { "0".repeat(64) } else { digest })})
                         }).collect::<Vec<_>>();
                         serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
                             "session_ids":[],"disabled":false,"disabled_reason":null,
@@ -159,7 +203,17 @@ impl FinishServer {
                     }
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                bounded_native_response(&mut stream, status, &response.to_string());
+                if matches!(status, "503 Service Unavailable" | "429 Too Many Requests")
+                    && matches!(
+                        outcome,
+                        FinishOutcome::Identity | FinishOutcome::Identity429
+                    )
+                {
+                    let body = response.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                } else {
+                    bounded_native_response(&mut stream, status, &response.to_string());
+                }
             }
         });
         Self {
@@ -197,6 +251,20 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         return;
     }
     let fixture = IdentityPipelineHome::new();
+    if matches!(outcome, FinishOutcome::ConflictValidation) {
+        let project = fixture.home.join(".claude/projects/-synthetic-repo");
+        let original =
+            std::fs::read_to_string(project.join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl")))
+                .unwrap();
+        let sibling = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        std::fs::write(
+            project.join(format!("{sibling}.jsonl")),
+            original
+                .replace(IDENTITY_PIPELINE_ROOT, sibling)
+                .replace("req_", "sibling_req_"),
+        )
+        .unwrap();
+    }
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("permanent-finish-support");
     let secrets = fixture.base.join("permanent-finish-secrets");
@@ -274,14 +342,26 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         ];
         assert_eq!(
             scan.scanned_file_count,
-            if unclean { 2 } else { usize::from(cycle < 2) },
+            if unclean || matches!(outcome, FinishOutcome::ConflictValidation) {
+                2
+            } else {
+                usize::from(cycle < 2)
+            },
             "actual native read, then ordinary quiet page"
         );
         if cycle == 0 {
-            assert_eq!(scan.snapshots.len(), 1);
+            assert_eq!(
+                scan.snapshots.len(),
+                if matches!(outcome, FinishOutcome::ConflictValidation) {
+                    2
+                } else {
+                    1
+                }
+            );
         }
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
+        let sent_at = current_unix_seconds();
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
             finish_sync_source(
                 preparation,
@@ -301,7 +381,13 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         });
         assert_eq!(
             result.is_ok(),
-            !matches!(outcome, FinishOutcome::Retryable),
+            !matches!(
+                outcome,
+                FinishOutcome::Identity429
+                    | FinishOutcome::Validation
+                    | FinishOutcome::Witness
+                    | FinishOutcome::ConflictValidation
+            ),
             "{outcome:?}: {result:?}"
         );
         // A held entity has its own quarantine clock: no finished cycle,
@@ -315,7 +401,14 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         let saved = ScanIndex::load(&index_path).unwrap();
         assert!(saved.generation > 0, "real selected save");
         let offered = server.offered.lock().unwrap();
-        assert_eq!(offered.len(), 1);
+        assert_eq!(
+            offered.len(),
+            if matches!(outcome, FinishOutcome::ConflictValidation) {
+                3
+            } else {
+                1
+            }
+        );
         let fingerprint = offered[0]["snapshot_fingerprint"].as_str().unwrap();
         assert!(
             !saved.accepted_snapshot_fingerprint_recorded(fingerprint),
@@ -331,6 +424,42 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         )
         .unwrap();
         assert!(!progress.accepted_fingerprints.contains(fingerprint));
+        if matches!(
+            outcome,
+            FinishOutcome::Identity | FinishOutcome::Identity429
+        ) {
+            let record = &saved.quarantined_snapshot_fingerprints[fingerprint];
+            assert!(
+                (sent_at + 60..=current_unix_seconds() + 72)
+                    .contains(&record.retry_after_unix_seconds),
+                "both identity statuses retain the server Retry-After window"
+            );
+            assert_eq!(
+                record.upload_body_witness.as_ref(),
+                Some(&finish_wire_body_witness(&offered[0]))
+            );
+            assert!(
+                saved.bounded_sweep_had_unsettled_upload(),
+                "an OK verdict never settles held delivery"
+            );
+        }
+        if matches!(outcome, FinishOutcome::ConflictValidation) {
+            assert_eq!(saved.quarantined_snapshot_fingerprints.len(), 2);
+            for item in offered.iter() {
+                let fp = item["snapshot_fingerprint"].as_str().unwrap();
+                let record = &saved.quarantined_snapshot_fingerprints[fp];
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert!(record.upload_body_witness.is_some());
+                assert_eq!(
+                    record.upload_body_witness.as_ref(),
+                    Some(&finish_wire_body_witness(item))
+                );
+                assert!(!saved.accepted_snapshot_fingerprint_recorded(fp));
+            }
+        }
         if let FinishOutcome::Dominated {
             reason: "accepted_log_stale_older_upload",
             ..
@@ -351,7 +480,16 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
             );
             assert_eq!(refusals.exposure.owed_entities, 0);
         }
-        if matches!(outcome, FinishOutcome::Mixed) {
+        if matches!(
+            outcome,
+            FinishOutcome::Mixed
+                | FinishOutcome::Retryable
+                | FinishOutcome::Identity
+                | FinishOutcome::Identity429
+                | FinishOutcome::Validation
+                | FinishOutcome::Witness
+                | FinishOutcome::ConflictValidation
+        ) {
             assert!(!progress.permanent_rejections.contains_key(fingerprint));
             assert_eq!(
                 saved.quarantined_snapshot_fingerprints[fingerprint].disposition,
@@ -374,7 +512,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
             terminal[cycle]["last_error_code"],
             match outcome {
                 // The held body stays disclosed even when the pass finishes.
-                FinishOutcome::Retryable | FinishOutcome::Mixed => "server_error",
+                FinishOutcome::Retryable
+                | FinishOutcome::Mixed
+                | FinishOutcome::Identity
+                | FinishOutcome::Identity429
+                | FinishOutcome::ConflictValidation => "server_error",
+                FinishOutcome::Validation | FinishOutcome::Witness => "server_error",
                 // The refused body is settled unproven-terminal residue; the
                 // server already owns a better or newer record for it.
                 FinishOutcome::Dominated {
@@ -460,9 +603,41 @@ fn permanent_finish_real_pipeline_preserves_refusal_and_status_failures() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn entity_conflict_finish_keeps_the_ordinary_source_cadence() {
-    for outcome in [FinishOutcome::Retryable, FinishOutcome::Mixed] {
+    for outcome in [
+        FinishOutcome::Retryable,
+        FinishOutcome::Mixed,
+        FinishOutcome::Identity,
+        FinishOutcome::Identity429,
+    ] {
         permanent_finish_pipeline(outcome);
     }
+    super::claude_money_e2_pipeline_tests::reject_isolation_tests::assert_mixed_retryable_holds();
+}
+
+/// A server identity deadline isolates the hold without claiming its bytes were ACKed.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn identity_backoff_finish_keeps_retry_custody_and_returns_ok() {
+    permanent_finish_pipeline(FinishOutcome::Identity);
+}
+
+/// Neither validation nor witness review becomes an isolated success.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn validation_and_witness_finish_still_defer() {
+    for outcome in [FinishOutcome::Validation, FinishOutcome::Witness] {
+        permanent_finish_pipeline(outcome);
+    }
+}
+
+/// An isolated conflict cannot hide a validation hold in the same pass.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn mixed_conflict_and_validation_finish_still_defer() {
+    permanent_finish_pipeline(FinishOutcome::ConflictValidation);
 }
 
 /// F1: body A is refused as dominated, then a newer body B of the same entity

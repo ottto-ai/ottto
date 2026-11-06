@@ -277,7 +277,7 @@ fn e2_partial_entity_ack_settles_only_acknowledged_members() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 1
         }
     );
     assert!(progress.accepted_fingerprints.contains(&root));
