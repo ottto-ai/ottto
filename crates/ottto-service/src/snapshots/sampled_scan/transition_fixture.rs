@@ -16,6 +16,49 @@ pub(crate) fn codex_rearm_unsettled(index: &mut super::super::ScanIndex) {
     super::super::codex_file_join::rearm_unsettled(index);
 }
 
+/// Seed the prior archive-singleton path through native parsers and per-file
+/// finalization. Only combined-group construction is bypassed: headers still
+/// prove each file's owner, and every source revision remains independent.
+pub(crate) fn codex_legacy_singletons(
+    roots: &[std::path::PathBuf],
+    support: &std::path::Path,
+    index: super::super::ScanIndex,
+) -> (super::super::ScanIndex, super::super::SourceScanResult) {
+    use super::super::*;
+    let cache = std::sync::Arc::new(super::SharedCache::default());
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        roots,
+        index,
+        "2026-10-27T08:00:00Z",
+        183,
+        100,
+        Some(support),
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(
+        cache.clone(),
+        crate::transcript_acquisition::Scope("money-equivalence".into()),
+    );
+    if let Some(inventory) = scan.codex_join_inventory.as_mut() {
+        while !inventory.step_selected(
+            &scan.codex_title_metadata,
+            &mut scan.index,
+            &scan.codex_selected_flags,
+            Some(&cache),
+        ) {}
+    }
+    scan.codex_join_prepared = true;
+    for _ in 0..100_000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+        }
+    }
+    panic!("native legacy singleton seed did not finish");
+}
+
 /// Seed the real saved session-start binding for a Codex transition row.
 pub(crate) fn codex_start_binding(
     index: &mut super::super::ScanIndex,

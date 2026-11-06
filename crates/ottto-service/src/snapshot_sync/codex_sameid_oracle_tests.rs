@@ -46,9 +46,40 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     let paths = revert_archives(&c, "a");
     let (session, previous) =
         StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
-    // Model the prior binary's accepted unchanged singleton state: no joined
-    // marker exists yet, but all physical revisions and acceptance remain.
-    let (mut legacy, old_scan, _) = page(&c, &E2ScanFixture::default(), previous.clone());
+    // The prior binary independently finished and uploaded 8 and 88 requests.
+    // Its last accepted server body was the revert's 88, never the folded 96.
+    let (mut legacy, mut old_scan) = fixture::codex_legacy_singletons(
+        std::slice::from_ref(&c.root),
+        &c.support,
+        previous.clone(),
+    );
+    legacy.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut old_scan.snapshots, &[]);
+    apply_upload_policy(
+        SOURCE,
+        &mut old_scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(SOURCE, &mut old_scan, &mut legacy);
+    old_scan.finish_codex_capture_boundary(&mut legacy);
+    old_scan.snapshots.sort_by_key(|item| item.request_count);
+    assert_eq!(
+        old_scan
+            .snapshots
+            .iter()
+            .map(|item| item.request_count)
+            .collect::<Vec<_>>(),
+        [8, 88]
+    );
+    assert_eq!(old_scan.snapshots.last().unwrap().request_count, 88);
+    assert_eq!(legacy.files.len(), 2);
+    assert!(legacy
+        .files
+        .values()
+        .all(|entry| entry.codex_joined_member_set.is_none()));
+    assert_ne!(
+        old_scan.snapshots[0].source_file_fingerprint,
+        old_scan.snapshots[1].source_file_fingerprint
+    );
     legacy.record_accepted_snapshot_fingerprints(
         &old_scan
             .snapshots
@@ -56,12 +87,6 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect(),
     );
-    for entry in legacy.files.values_mut() {
-        entry.codex_joined_member_set = None;
-        entry.codex_captured_joined_member_set = None;
-        entry.codex_captured_uncommitted = false;
-        entry.codex_captured_tier_receipt_required = false;
-    }
     let mut legacy = session.save_reload(&mut legacy);
     assert!(legacy
         .files
