@@ -1,9 +1,10 @@
 //! Codex runtime defaults read from `~/.codex/config.toml`.
 
+use serde_json::Value;
 use std::collections::BTreeMap;
 use toml_edit::{DocumentMut, Item};
 
-use crate::snapshots::codex_config_selector;
+use crate::snapshots::{insert_selector_raw, SelectorCapture};
 
 /// Display-safe Codex runtime defaults parsed from `~/.codex/config.toml`.
 ///
@@ -105,4 +106,64 @@ pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaul
         selector_context: selector.context,
         selector_sources: selector.sources,
     })
+}
+
+fn codex_config_selector(document: &DocumentMut) -> SelectorCapture {
+    let mut selector = SelectorCapture::default();
+    if let Some(service_tier) = document
+        .get("service_tier")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str())
+    {
+        let value = Value::String(service_tier.to_string());
+        insert_selector_raw(
+            &mut selector,
+            "service_tier",
+            "codex.config.service_tier",
+            &value,
+        );
+    }
+    if let Some(fast_mode) = document
+        .get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("fast_mode"))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_bool())
+    {
+        let value = Value::Bool(fast_mode);
+        insert_selector_raw(
+            &mut selector,
+            "mode",
+            "codex.config.features.fast_mode",
+            &value,
+        );
+    }
+    let top_level_fast_default_opt_out = document
+        .get("fast_default_opt_out")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let notice_fast_default_opt_out = document
+        .get("notice")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("fast_default_opt_out"))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let fast_default_opt_out_source = if top_level_fast_default_opt_out {
+        Some("codex.config.fast_default_opt_out")
+    } else if notice_fast_default_opt_out {
+        Some("codex.config.notice.fast_default_opt_out")
+    } else {
+        None
+    };
+    if selector.is_empty() {
+        let Some(source) = fast_default_opt_out_source else {
+            return selector;
+        };
+        let standard = Value::String("standard".to_string());
+        insert_selector_raw(&mut selector, "service_tier", source, &standard);
+        insert_selector_raw(&mut selector, "mode", source, &standard);
+    }
+    selector
 }

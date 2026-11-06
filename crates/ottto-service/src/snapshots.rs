@@ -31,7 +31,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use toml_edit::{DocumentMut, Item};
 
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
@@ -9334,29 +9333,6 @@ use sources::codex::line::{
     codex_plan_window_bucket, codex_transcript_title,
 };
 
-fn text_from_array(value: Option<&Value>) -> Option<String> {
-    let Value::Array(items) = value? else {
-        return None;
-    };
-    let mut parts = Vec::new();
-    for item in items {
-        match item {
-            Value::String(text) => parts.push(text.as_str()),
-            Value::Object(_) => {
-                if let Some(text) = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("input_text").and_then(Value::as_str))
-                {
-                    parts.push(text);
-                }
-            }
-            _ => {}
-        }
-    }
-    normalize_title(parts.join("\n"))
-}
-
 use sources::claude::line::{
     apply_claude_code_line, claude_first_user_prompt, claude_fork_line_provenance,
     claude_response_tool_uses, ClaudeForkLineProvenance,
@@ -9368,7 +9344,14 @@ use sources::codex::line::{
     codex_last_usage, codex_last_usage_root, codex_total_usage, codex_usage_event_identity,
 };
 
+#[cfg(test)]
+pub(crate) use sources::pi::PiFork;
 use sources::pi::{apply_pi_line, pi_message_usage, pi_usage_event, pi_usage_value};
+#[cfg(test)]
+use sources::pi::{
+    parse_pi_usd_picos, pi_usage_costs_with_observations, usd_picos_at, PiCostParseError,
+};
+pub(crate) use sources::pi::{PiLedger, PiUsageDedupState};
 
 fn timestamp_is_before(candidate: &str, current: &str) -> bool {
     match (
@@ -9392,33 +9375,6 @@ fn timestamp_is_after(candidate: &str, current: &str) -> bool {
         (Err(_), Ok(_)) => false,
         (Err(_), Err(_)) => candidate > current,
     }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct PiUsageDedupState {
-    message: BTreeMap<String, usize>,
-    message_end: BTreeMap<String, usize>,
-    paired_digests: BTreeSet<String>,
-}
-
-/// The accumulator's Pi-only state: the usage dedup ledger and the fork
-/// state. Claude and Codex leave it empty and never store it.
-#[derive(Clone, Default)]
-pub(crate) struct PiLedger {
-    usage_keys: BTreeMap<String, PiUsageDedupState>,
-    /// Set only for a file whose header names a parent; boxed so other
-    /// accumulators pay one pointer.
-    fork: Option<Box<PiFork>>,
-}
-
-/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
-/// their ids and timestamps, after a header that names `parentSession` at the
-/// fork time. The fork owns only what happened at or after its header time.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct PiFork {
-    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
-    /// time is missing or invalid, which counts every entry.
-    header_nanos: Option<i128>,
 }
 
 fn bounded_rfc3339_millis(ms: i64) -> Option<String> {
@@ -9453,158 +9409,6 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
         .ok()?;
     let normalized_timestamp = utc.format(&Rfc3339).ok()?;
     Some((bucket_start, normalized_timestamp))
-}
-
-#[derive(Default)]
-struct PiCostObservations {
-    refused: u64,
-    rounded: u64,
-}
-
-fn pi_usage_costs_with_observations(usage: &Value) -> (UsageCosts, PiCostObservations) {
-    let mut observations = PiCostObservations::default();
-    let Some(cost) = usage.get("cost") else {
-        return (
-            UsageCosts {
-                observed: true,
-                ..UsageCosts::default()
-            },
-            observations,
-        );
-    };
-    let mut parse = |keys: &[&str]| match usd_picos_at(cost, keys) {
-        Ok((picos, rounded)) => {
-            observations.rounded += u64::from(rounded);
-            Some(picos)
-        }
-        Err(PiCostParseError::Overflow) => {
-            observations.refused += 1;
-            None
-        }
-        Err(PiCostParseError::Invalid) => None,
-    };
-    let total = parse(&["total"]);
-    let input = parse(&["input"]);
-    let output = parse(&["output"]);
-    let cache_read = parse(&["cacheRead", "cache_read"]);
-    let cache_creation = parse(&["cacheWrite", "cache_write"]);
-    let reported = [total, input, output, cache_read, cache_creation]
-        .iter()
-        .any(Option::is_some);
-    (
-        UsageCosts {
-            observed: true,
-            reported,
-            total,
-            input,
-            output,
-            cache_read,
-            cache_creation,
-        },
-        observations,
-    )
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PiCostParseError {
-    Invalid,
-    Overflow,
-}
-
-fn usd_picos_at(value: &Value, keys: &[&str]) -> Result<(u128, bool), PiCostParseError> {
-    let raw = keys.iter().find_map(|key| value.get(*key));
-    match raw {
-        // serde_json has no arbitrary_precision feature here; integers remain exact.
-        // The number form is exact only to f64's shortest round-trip representation; the string form is exact to its lexeme.
-        Some(Value::Number(number)) => parse_pi_usd_picos(&number.to_string()),
-        Some(Value::String(text)) => parse_pi_usd_picos(text),
-        _ => Err(PiCostParseError::Invalid),
-    }
-}
-
-/// Checked decimal dollars to picos; the bool records sub-pico precision.
-fn parse_pi_usd_picos(text: &str) -> Result<(u128, bool), PiCostParseError> {
-    use PiCostParseError::{Invalid, Overflow};
-    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
-    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (whole.is_empty() && fraction.is_empty())
-        || !whole
-            .bytes()
-            .chain(fraction.bytes())
-            .all(|b| b.is_ascii_digit())
-    {
-        return Err(Invalid);
-    }
-    let (negative_exponent, exponent_digits) = if let Some(digits) = exponent.strip_prefix('-') {
-        (true, digits)
-    } else {
-        (false, exponent.strip_prefix('+').unwrap_or(exponent))
-    };
-    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Invalid);
-    }
-    let coefficient = whole
-        .bytes()
-        .chain(fraction.bytes())
-        .try_fold(0u128, |n, b| {
-            n.checked_mul(10)?.checked_add(u128::from(b - b'0'))
-        })
-        .ok_or(Overflow)?;
-    let exponent = exponent_digits
-        .bytes()
-        .try_fold(0i128, |n, b| {
-            n.checked_mul(10)?.checked_add(i128::from(b - b'0'))
-        })
-        .ok_or(Overflow)?;
-    let exponent = if negative_exponent {
-        -exponent
-    } else {
-        exponent
-    };
-    let shift = exponent
-        .checked_sub(i128::try_from(fraction.len()).map_err(|_| Overflow)?)
-        .and_then(|n| n.checked_add(12))
-        .ok_or(Overflow)?;
-    let (picos, rounded) = if shift >= 0 {
-        let picos = if coefficient == 0 {
-            0
-        } else {
-            let power = u32::try_from(shift).map_err(|_| Overflow)?;
-            coefficient
-                .checked_mul(10u128.checked_pow(power).ok_or(Overflow)?)
-                .ok_or(Overflow)?
-        };
-        (picos, false)
-    } else {
-        // 10^39 exceeds u128::MAX, so every representable coefficient is
-        // strictly below its halfway point (and rounds to zero).
-        let Some(power) = shift
-            .checked_neg()
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|n| *n <= 38)
-        else {
-            return Ok((0, true));
-        };
-        let divisor = 10u128.checked_pow(power).ok_or(Overflow)?;
-        let floor = coefficient / divisor;
-        let remainder = coefficient % divisor;
-        // Refuse even a sub-pico excess above the dollar ceiling, before rounding.
-        if floor > PI_COST_FIELD_CEILING_PICOS
-            || (floor == PI_COST_FIELD_CEILING_PICOS && remainder != 0)
-        {
-            return Err(Overflow);
-        }
-        let round_up = remainder > divisor / 2 || (remainder == divisor / 2 && floor % 2 != 0);
-        (
-            floor.checked_add(u128::from(round_up)).ok_or(Overflow)?,
-            true,
-        )
-    };
-    if picos > PI_COST_FIELD_CEILING_PICOS {
-        return Err(Overflow);
-    }
-    Ok((picos, rounded))
 }
 
 fn usd_picos_string(value: u128) -> String {
@@ -9947,66 +9751,6 @@ impl BoundedCandidateSelection {
 
 /// How long a sidecar census statement waits on a lock Codex holds.
 const CODEX_SIDECAR_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn codex_config_selector(document: &DocumentMut) -> SelectorCapture {
-    let mut selector = SelectorCapture::default();
-    if let Some(service_tier) = document
-        .get("service_tier")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_str())
-    {
-        let value = Value::String(service_tier.to_string());
-        insert_selector_raw(
-            &mut selector,
-            "service_tier",
-            "codex.config.service_tier",
-            &value,
-        );
-    }
-    if let Some(fast_mode) = document
-        .get("features")
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("fast_mode"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool())
-    {
-        let value = Value::Bool(fast_mode);
-        insert_selector_raw(
-            &mut selector,
-            "mode",
-            "codex.config.features.fast_mode",
-            &value,
-        );
-    }
-    let top_level_fast_default_opt_out = document
-        .get("fast_default_opt_out")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let notice_fast_default_opt_out = document
-        .get("notice")
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("fast_default_opt_out"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let fast_default_opt_out_source = if top_level_fast_default_opt_out {
-        Some("codex.config.fast_default_opt_out")
-    } else if notice_fast_default_opt_out {
-        Some("codex.config.notice.fast_default_opt_out")
-    } else {
-        None
-    };
-    if selector.is_empty() {
-        let Some(source) = fast_default_opt_out_source else {
-            return selector;
-        };
-        let standard = Value::String("standard".to_string());
-        insert_selector_raw(&mut selector, "service_tier", source, &standard);
-        insert_selector_raw(&mut selector, "mode", source, &standard);
-    }
-    selector
-}
 
 pub(crate) use sources::claude::settings_defaults::{
     load_claude_settings_defaults, read_claude_settings_document, ClaudeConfigDefaultsOutcome,
@@ -38338,37 +38082,6 @@ crate::durable_tail_codec::durable_struct!(ClaudeCompactionObservation {
 });
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
-crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
-// Hand-written so an absent fork costs no visit: every Claude and Codex
-// accumulator carries an empty ledger, and their frames must keep the visit
-// count they had before the ledger gained its fork. A present fork is charged
-// exactly as `Option<Box<PiFork>>`, including the box's allocation.
-impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
-    fn stable_heap(&self) -> bool {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::stable_heap(usage_keys) && fork.as_ref().map_or(true, B::stable_heap)
-    }
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::heap_bound(usage_keys, c)?;
-        match fork {
-            Some(_) => B::heap_bound(fork, c),
-            None => Some(()),
-        }
-    }
-    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::HeapLayoutBound as B;
-        let Self { usage_keys, fork } = self;
-        B::completed_heap_bound(usage_keys, c)?;
-        match fork {
-            Some(_) => B::completed_heap_bound(fork, c),
-            None => Some(()),
-        }
-    }
-}
-crate::heap_layout_bound::fields!(PiFork; header_nanos);
 crate::heap_layout_bound::fields!(ScanCensus; causes, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count, growth_deferred);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
