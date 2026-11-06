@@ -2827,9 +2827,26 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         assert_eq!(fresh.census_window_end, window);
         assert!(!fresh.census_complete);
         assert!(index.traversal.as_ref().unwrap().codex_freshness_yield);
+        let unread = ids
+            .iter()
+            .filter_map(|id| {
+                let key = local_index_key(&fixture.file(id));
+                index.files[&key]
+                    .source_file_fingerprint
+                    .is_empty()
+                    .then_some(key)
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            index.traversal.as_ref().unwrap().pending_candidates.len(),
-            old_pending
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .map(|candidate| local_index_key(&candidate.path))
+                .collect::<BTreeSet<_>>(),
+            unread
         );
 
         // Restart preserves the owed ordinary turn. Another real append
@@ -3026,12 +3043,12 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             let (index, _) = finish_published_within(selected, 10_000, || {
                 format!("page {page}, selected {flags:?}")
             });
-            let kind = if flags.keys().eq([&session_key]) {
+            let kind = if index.traversal.as_ref().unwrap().codex_freshness_yield {
+                assert!(flags.contains_key(&session_key));
                 'F'
-            } else if !flags.is_empty()
-                && !flags.contains_key(&session_key)
-                && flags.values().all(|(member, _)| *member)
-            {
+            } else if codex_census_turn_was_last(&index.traversal.as_ref().unwrap().scan_roots) {
+                assert!(!flags.contains_key(&session_key));
+                assert!(flags.values().all(|(member, _)| *member));
                 'C'
             } else {
                 'O'
@@ -3095,11 +3112,11 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
             reread_read.push(!index.files[&reread_key].source_file_fingerprint.is_empty());
         }
         assert_eq!(kinds, ['F', 'O', 'F', 'C']);
-        // The ordinary turn selects only its own work, so the census backlog
-        // cannot spend its budget: the owed re-read is read on page 6.
+        // Ordinary primary work keeps its prefix and reads on page 6;
+        // spare slots now select cold census members behind it.
         assert_eq!(pages[1].get(&reread_key), Some(&(false, false)));
         assert_eq!(pages[1].get(&archive_key), Some(&(false, true)));
-        assert!(pages[1].values().all(|(member, _)| !member));
+        assert!(pages[1].values().any(|(member, _)| *member));
         assert_eq!(reread_read, [false, true, true, true]);
         assert!(ids
             .iter()
@@ -3210,6 +3227,161 @@ fn keys<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> BTreeSet<String> {
         .into_iter()
         .map(|path| local_index_key(path.as_path()))
         .collect()
+}
+
+/// [regress] Sparse fresh pages use spare slots for cold census FIFO work.
+/// Fitting pages consume disjoint sets; a smaller byte budget returns every
+/// unread selection once with its original flags, without committing its body.
+#[test]
+fn spare_fresh_capacity_takes_census_fifo_and_preserves_deferred_flags() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for compressed in [false, true] {
+        for small in [false, true] {
+            let (fixture, archives, plains, mut index) = if compressed {
+                fresh_backlog(6, 1)
+            } else {
+                fresh_backlog(0, 7)
+            };
+            let (cold, fresh) = if compressed {
+                (archives, plains[0].clone())
+            } else {
+                (plains[..6].to_vec(), plains[6].clone())
+            };
+            for candidate in &mut index.traversal.as_mut().unwrap().pending_candidates {
+                candidate.watcher_hint = candidate.path == fresh;
+            }
+            let cache = Arc::new(SharedCache::default());
+            let budget = if small {
+                fs::metadata(&fresh).unwrap().len()
+            } else {
+                1 << 20
+            };
+            with_test_limits(2048, budget, 64, || {
+                let selected = four_path_page(&fixture, index, 0)
+                    .with_sampled_acquisition(cache.clone(), Scope("cursor-fixture".into()));
+                let order = selected
+                    .identified_candidates
+                    .iter()
+                    .map(|candidate| candidate.path.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(order, [vec![fresh.clone()], cold[..3].to_vec()].concat());
+                assert_eq!(order.len(), order.iter().collect::<BTreeSet<_>>().len());
+                let flags = selected.codex_selected_flags.clone();
+                let ((mut next, first), consumed) = observe_consumed(|| finish_published(selected));
+                assert!(next.traversal.as_ref().unwrap().codex_freshness_yield);
+                if small {
+                    assert_eq!(first.snapshots.len(), 1, "only primary fits");
+                    assert_eq!(consumed, fs::metadata(&fresh).unwrap().len());
+                    for path in &cold[..3] {
+                        let pending = next
+                            .traversal
+                            .as_ref()
+                            .unwrap()
+                            .pending_candidates
+                            .iter()
+                            .filter(|candidate| candidate.path == *path)
+                            .collect::<Vec<_>>();
+                        assert_eq!(pending.len(), 1);
+                        assert_eq!(
+                            (pending[0].census_member, pending[0].watcher_hint),
+                            flags[&local_index_key(path)]
+                        );
+                        assert!(
+                            !next.files.contains_key(&local_index_key(path))
+                                || next.files[&local_index_key(path)]
+                                    .source_file_fingerprint
+                                    .is_empty()
+                        );
+                    }
+                } else {
+                    assert_eq!(first.snapshots.len(), 4);
+                    // Persist/reload the actual owed non-fresh turn, without the
+                    // helper that forces every page to be fresh.
+                    next = serde_json::from_slice(&serde_json::to_vec(&next).unwrap()).unwrap();
+                    let selected = OwnedSourceScan::new(
+                        SnapshotSource::Codex,
+                        std::slice::from_ref(&fixture.root),
+                        next,
+                        NOW,
+                        BACKFILL_WINDOW_DAYS,
+                        4,
+                        None,
+                        &[],
+                        false,
+                    )
+                    .with_sampled_acquisition(cache.clone(), Scope("cursor-fixture".into()));
+                    assert_eq!(
+                        selected
+                            .identified_candidates
+                            .iter()
+                            .map(|candidate| candidate.path.clone())
+                            .collect::<Vec<_>>(),
+                        cold[3..]
+                    );
+                    assert!(selected_keys(&selected).is_disjoint(&flags.keys().cloned().collect()));
+                    let (next, second) = finish_published(selected);
+                    assert!(!next
+                        .traversal
+                        .as_ref()
+                        .is_some_and(|t| t.codex_freshness_yield));
+                    assert_eq!(second.snapshots.len(), 3);
+                    assert!(published_ids(&first).is_disjoint(&published_ids(&second)));
+                }
+            });
+        }
+    }
+}
+
+/// [regress] A partial metadata relist has the same membership certificate
+/// as no walk. Initial census directories, including mixed queues, still block.
+#[test]
+fn non_census_relist_selects_and_certifies_queued_files() {
+    let (fixture, _, _, index) = fresh_backlog(0, 6);
+    for members in [vec![], vec![false, false], vec![true], vec![false, true]] {
+        let cache = Arc::new(SharedCache::default());
+        let mut index = index.clone();
+        let traversal = index.traversal.as_mut().unwrap();
+        for census_member in &members {
+            traversal.pending_directories.push_back(ScanTraversalPath {
+                scan_root: fixture.root.clone(),
+                path: fixture.root.clone(),
+                census_member: *census_member,
+                watcher_hint: false,
+            });
+        }
+        crate::snapshots::with_test_directory_entries(0, || {
+            let mut selected = four_path_page(&fixture, index, 0)
+                .with_sampled_acquisition(cache.clone(), Scope("cursor-fixture".into()));
+            let blocked = members.contains(&true);
+            assert_eq!(
+                selected.codex_selected_flags.len(),
+                if blocked { 0 } else { 4 }
+            );
+            assert_eq!(
+                codex_frozen_census_valid(selected.index.traversal.as_ref().unwrap()),
+                !blocked
+            );
+            if !blocked {
+                let inventory = selected.codex_join_inventory.as_mut().unwrap();
+                while !inventory.step_selected(
+                    &selected.codex_title_metadata,
+                    &mut selected.index,
+                    &selected.codex_selected_flags,
+                    Some(&cache),
+                ) {}
+                let affected = inventory.affected_owners();
+                assert!(inventory.membership_complete(&backlog_id(false, 0), affected.as_ref()));
+            }
+            let ((_, scan), consumed) = observe_consumed(|| finish_published(selected));
+            assert_eq!(scan.scanned_file_count, if blocked { 0 } else { 4 });
+            assert_eq!(consumed > 0, !blocked);
+        });
+    }
 }
 
 /// [regress] Recent plain sessions waited hours behind thousands of hinted
