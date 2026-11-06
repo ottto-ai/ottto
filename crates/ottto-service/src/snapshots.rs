@@ -6494,17 +6494,15 @@ impl OwnedSourceScan {
                     if aliases
                         .iter()
                         .any(|member| codex_archive_path(&member.path))
-                    {
-                        if codex_file_join::stage_independent_inventory(
+                        && codex_file_join::stage_independent_inventory(
                             index,
                             &aliases,
                             joined_owner.as_deref().expect("joined owner"),
                         )
                         .is_err()
-                        {
-                            codex_file_join::disclose_strict(&aliases, targets!());
-                            pending!();
-                        }
+                    {
+                        codex_file_join::disclose_strict(&aliases, targets!());
+                        pending!();
                     }
                     codex_join_completed.push(codex_file_join::Group {
                         owner: joined_owner

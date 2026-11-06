@@ -6,6 +6,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::StateV2ColdSession;
+use serde_json::Value;
 
 const SOURCE: SnapshotSource = SnapshotSource::Codex;
 const A: &str = "019e5a00-0000-7000-8000-00000000000a";
