@@ -42,7 +42,7 @@ pub(crate) struct ProgressRecovery {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Receipt {
+struct Receipt<P = String> {
     version: u16,
     scope: Scope,
     previous_generation: u64,
@@ -51,7 +51,38 @@ struct Receipt {
     digest: [u8; 32],
     // Exact unchanged progress bytes, including cache heads and refusals. Body
     // hashes alone cannot reconstruct those independent settlement outcomes.
-    progress: String,
+    progress: P,
+}
+/// Exact progress bytes as the receipt check reads them. The generation error
+/// stays unraised until the digest matches, as with an owned string.
+pub(crate) struct ProgressSeal {
+    digest: [u8; 32],
+    generation: serde_json::Result<u64>,
+}
+impl ProgressSeal {
+    /// `generation`: what the progress CAS already decoded from `bytes`.
+    pub(crate) fn new(bytes: &[u8], generation: Option<u64>) -> Self {
+        let generation = generation.map_or_else(|| progress_generation(bytes), Ok);
+        let digest = digest(bytes);
+        Self { digest, generation }
+    }
+}
+// Seals the old receipt's progress string while parsing, without keeping it.
+impl<'de> Deserialize<'de> for ProgressSeal {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de;
+        struct Seal;
+        impl de::Visitor<'_> for Seal {
+            type Value = ProgressSeal;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<ProgressSeal, E> {
+                Ok(ProgressSeal::new(s.as_bytes(), None))
+            }
+        }
+        d.deserialize_str(Seal)
+    }
 }
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -85,7 +116,7 @@ fn read_owned_file(path: &Path, original: bool) -> Result<Option<Vec<u8>>> {
     (&file).read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
-fn progress_generation(bytes: &[u8]) -> Result<u64> {
+fn progress_generation(bytes: &[u8]) -> serde_json::Result<u64> {
     #[derive(Deserialize)]
     struct Generation {
         #[serde(default)]
@@ -424,23 +455,33 @@ impl ProgressRecovery {
         self.receipt_at(&self.current_scope()?)
     }
     fn receipt_at(&self, scope: &Scope) -> Result<Receipt> {
+        self.checked(scope, |progress: &mut String| {
+            ProgressSeal::new(progress.as_bytes(), None)
+        })
+    }
+    fn checked<P: serde::de::DeserializeOwned>(
+        &self,
+        scope: &Scope,
+        seal: impl FnOnce(&mut P) -> ProgressSeal,
+    ) -> Result<Receipt<P>> {
         let bytes = read(&self.path)?;
         require(bytes.is_some(), "unbound")?;
-        let parsed = serde_json::from_slice::<Receipt>(bytes.as_ref().unwrap());
+        let parsed = serde_json::from_slice::<Receipt<P>>(bytes.as_ref().unwrap());
         require(parsed.is_ok(), "receipt")?;
-        let receipt = parsed?;
+        let mut receipt = parsed?;
         require(receipt.version == 1, "version")?;
         receipt.scope.check(scope)?;
+        let seal = seal(&mut receipt.progress);
         require(
-            receipt.digest == digest(receipt.progress.as_bytes())
-                && progress_generation(receipt.progress.as_bytes())? == receipt.generation
+            receipt.digest == seal.digest
+                && seal.generation? == receipt.generation
                 && (receipt.previous_generation == receipt.generation
                     || receipt.previous_generation.checked_add(1) == Some(receipt.generation)),
             "receipt",
         )?;
         Ok(receipt)
     }
-    fn write(&self, receipt: Receipt) -> Result<()> {
+    fn write<P: Serialize>(&self, receipt: Receipt<P>) -> Result<()> {
         let bytes = serde_json::to_vec(&receipt)?;
         ottto_core::write_owner_only_file_atomic(&self.path, &bytes)?;
         super::super::sync_checkpoint_parent(&self.path)?;
@@ -482,18 +523,29 @@ impl ProgressRecovery {
 
     /// Called inside the existing progress CAS lock, after the exact response
     /// has been validated. Failure creates no index acceptance/retirement.
-    pub(crate) fn before_progress_save(&self, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+    /// `next` is built after the old receipt is checked and the new receipt
+    /// borrows it: one copy of the progress at a time.
+    pub(crate) fn before_progress_save(
+        &self,
+        previous: Option<ProgressSeal>,
+        next: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
         let scope = self.current_scope()?;
-        let receipt = self.receipt_at(&scope)?;
+        let receipt = self.checked(&scope, |seal: &mut ProgressSeal| {
+            std::mem::replace(seal, ProgressSeal::new(&[], Some(0)))
+        })?;
+        let previous_digest = previous.as_ref().map(|seal| seal.digest);
         require(
-            previous.map(digest) == Some(receipt.digest)
+            previous_digest == Some(receipt.digest)
                 || (receipt.generation == 0
                     && receipt.previous_digest.is_none()
                     && previous.is_none()),
             "progress",
         )?;
-        let previous_generation = previous.map(progress_generation).transpose()?.unwrap_or(0);
-        let generation = progress_generation(next)?;
+        let previous_generation = previous.map(|seal| seal.generation);
+        let previous_generation = previous_generation.transpose()?.unwrap_or(0);
+        let next = next()?;
+        let generation = progress_generation(&next)?;
         require(
             previous_generation.checked_add(1) == Some(generation),
             "progress_generation",
@@ -502,11 +554,12 @@ impl ProgressRecovery {
             version: 1,
             scope,
             previous_generation,
-            previous_digest: previous.map(digest),
+            previous_digest,
             generation,
-            digest: digest(next),
-            progress: String::from_utf8(next.to_vec())?,
-        })
+            digest: digest(&next),
+            progress: std::str::from_utf8(&next)?,
+        })?;
+        Ok(next)
     }
 }
 
@@ -550,6 +603,16 @@ impl ProgressRecovery {
     }
     pub(crate) fn adopt_synthetic(&self, progress: Option<&[u8]>) {
         self.adopt(progress).unwrap();
+    }
+    /// The save's receipt step over whole predecessor bytes.
+    pub(crate) fn before_progress_save_bytes(
+        &self,
+        previous: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<()> {
+        let previous = previous.map(|bytes| ProgressSeal::new(bytes, None));
+        self.before_progress_save(previous, || Ok(next.to_vec()))
+            .map(drop)
     }
 }
 

@@ -1663,6 +1663,17 @@ struct SnapshotUploadProgress {
     #[serde(skip)]
     context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
 }
+/// What a save's compare-and-swap reads from the on-disk progress: the writer
+/// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
+#[derive(Deserialize)]
+struct SnapshotUploadProgressCas {
+    schema_version: u16,
+    #[serde(default)]
+    generation: u64,
+    destination_namespace_hash: String,
+    #[serde(default)]
+    quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+}
 
 impl SnapshotUploadProgress {
     /// A server-attested record of an earlier upload to this destination: an
@@ -2962,12 +2973,16 @@ impl SnapshotUploadProgress {
     fn save(&mut self, path: &Path) -> Result<()> {
         self.save_with_read_limit(path, None)
     }
-    /// The concurrent-writer stamp of every progress write: `on_disk` is this
-    /// owner's last save and nobody has saved since.
-    fn same_writer(&self, on_disk: &Self) -> bool {
-        on_disk.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-            && on_disk.generation == self.generation
-            && on_disk.destination_namespace_hash == self.destination_namespace_hash
+    /// The concurrent-writer stamp of every progress write: the on-disk stamp
+    /// is this owner's last save and nobody has saved since.
+    fn same_writer(&self, (schema_version, generation, namespace): (u16, u64, &str)) -> bool {
+        schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && generation == self.generation
+            && namespace == self.destination_namespace_hash
+    }
+    fn stamp(&self) -> (u16, u64, &str) {
+        let namespace = self.destination_namespace_hash.as_str();
+        (self.schema_version, self.generation, namespace)
     }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
@@ -2976,25 +2991,31 @@ impl SnapshotUploadProgress {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
         let _lock = SnapshotProgressLock::acquire(path)?;
+        let mut previous = None;
         if path.exists() {
             let bytes = match read_limit {
                 Some(cap) => crate::snapshot_retry::read_state(path, cap),
                 None => std::fs::read(path),
             }
             .context("read current snapshot upload progress")?;
-            let current: Self = if read_limit.is_some() {
+            let current: SnapshotUploadProgressCas = if read_limit.is_some() {
                 crate::snapshot_retry::decode_state(&bytes)
             } else {
                 serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
             }
             .context("parse current snapshot upload progress for compare-and-swap")?;
-            if !self.same_writer(&current) {
+            let namespace = current.destination_namespace_hash.as_str();
+            if !self.same_writer((current.schema_version, current.generation, namespace)) {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));
             }
             crate::snapshots::terminal_contract_retry::merge_maps(
                 &mut self.quarantined_fingerprints,
                 &current.quarantined_fingerprints,
             );
+            if self.ack_recovery.is_some() {
+                let seal = crate::snapshots::ProgressSeal::new(&bytes, Some(current.generation));
+                previous = Some(seal);
+            }
         } else if self.generation != 0 {
             return Err(anyhow!("snapshot upload progress disappeared concurrently"));
         }
@@ -3007,13 +3028,8 @@ impl SnapshotUploadProgress {
         // second write fails, startup replays this receipt before DB handoffs.
         if let Some(recovery) = &self.ack_recovery {
             let result = (|| -> Result<()> {
-                let previous = match std::fs::read(path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) if e.kind() == ErrorKind::NotFound => None,
-                    Err(e) => return Err(e.into()),
-                };
-                let next = serde_json::to_vec_pretty(&*self)?;
-                recovery.before_progress_save(previous.as_deref(), &next)?;
+                let next = recovery
+                    .before_progress_save(previous, || Ok(serde_json::to_vec_pretty(&*self)?))?;
                 ottto_core::write_owner_only_file_atomic(path, &next)?;
                 sync_progress_parent(path)?;
                 Ok(())
@@ -3338,7 +3354,7 @@ impl SnapshotUploadProgress {
             }
             Err(error) => return Err(error).context("read snapshot upload progress before clear"),
         };
-        if !self.same_writer(&current) {
+        if !self.same_writer(current.stamp()) {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
         let tombstone = unique_progress_sibling(path, "cleared");
@@ -3739,7 +3755,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     };
     // Refuse only a real concurrent writer, as `save()` does. The accepted
     // and quarantined sets and the upload-context stamp read `durable`.
-    if !progress.same_writer(&durable) {
+    if !progress.same_writer(durable.stamp()) {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
         ));

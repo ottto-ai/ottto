@@ -2025,7 +2025,7 @@ fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload()
         .ack_recovery
         .as_ref()
         .unwrap()
-        .before_progress_save(Some(&old), &new)
+        .before_progress_save_bytes(Some(&old), &new)
         .unwrap();
     // Crash before progress rename and before any v2 accepted-state commit.
     assert_eq!(std::fs::read(&path).unwrap(), old);
@@ -2096,7 +2096,7 @@ fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
         .ack_recovery
         .as_ref()
         .unwrap()
-        .before_progress_save(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
+        .before_progress_save_bytes(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
         .unwrap();
     let mut saved = ScanIndex::default();
     saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
@@ -2515,5 +2515,6 @@ fn ack_bound_save_allocation_peak_per_progress_byte() {
         "progress_save_allocation bytes={size} requested_peak={} with_overlap={} ratio={ratio:.2}",
         peak.requested_peak, peak.requested_peak_with_overlap
     );
-    assert!(ratio < 100.0);
+    // The build before one-copy saves measured 7.24 on this fixture (Linux CI).
+    assert!(ratio < 6.0, "{ratio:.2}");
 }

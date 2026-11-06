@@ -544,7 +544,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
     let recovery =
         super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None).unwrap();
     let next = br#"{"generation":1,"accepted":"exact-body"}"#;
-    recovery.before_progress_save(None, next).unwrap();
+    recovery.before_progress_save_bytes(None, next).unwrap();
     let progress = f.path.with_file_name(format!(
         "{}-upload-progress.json",
         f.path.file_stem().unwrap().to_str().unwrap()
@@ -599,7 +599,7 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
     let index = load_with(&f.path, false).unwrap().unwrap();
     let recovery =
         super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None).unwrap();
-    recovery.before_progress_save(None, next).unwrap();
+    recovery.before_progress_save_bytes(None, next).unwrap();
     fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
     stage_tail(
         &f.path,

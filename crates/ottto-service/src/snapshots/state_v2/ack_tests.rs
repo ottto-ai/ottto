@@ -19,7 +19,7 @@ fn receipt_first_case(source: Source, old: &[u8], new: &[u8], links: usize) -> u
     binding.scope.identity.binding.source = source;
     write(&path, old);
     binding.adopt(Some(old)).unwrap();
-    binding.before_progress_save(Some(old), new).unwrap();
+    binding.before_progress_save_bytes(Some(old), new).unwrap();
     let receipt = std::fs::metadata(&binding.path).unwrap().len();
     // Crash: exact receipt durable, neither progress replacement nor DB save.
     let namespace = &mut binding.scope.identity.binding.namespace_hash;
@@ -128,7 +128,7 @@ fn absent_initial_progress_is_only_a_binding_marker_and_next_receipt_can_recover
     binding.recover(&path).unwrap();
     assert!(!path.exists());
     let next = progress(1, "accepted");
-    binding.before_progress_save(None, &next).unwrap();
+    binding.before_progress_save_bytes(None, &next).unwrap();
     binding.recover(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), next);
 }
@@ -147,6 +147,50 @@ fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
     write(&binding.path, &serde_json::to_vec(&receipt).unwrap());
     assert!(binding.recover(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), old);
+}
+/// [money] The save's receipt check, which seals the old receipt's progress
+/// without keeping it, fails exactly as the owned check does: a tampered
+/// progress string holds; a matching digest over non-JSON progress raises the
+/// parse error without a hold. Nothing is written.
+#[test]
+fn progress_save_receipt_check_fails_as_the_owned_check_does() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-tamper");
+    let path = scratch.join("progress");
+    let binding = ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 10);
+    let old = progress(4, "old");
+    write(&path, &old);
+    binding.adopt(Some(&old)).unwrap();
+    let mut receipt = binding.receipt().unwrap();
+    let tampered = String::from_utf8(progress(4, "tampered")).unwrap();
+    for (text, hold) in [(tampered, Some("receipt")), ("not json".into(), None)] {
+        receipt.progress = text;
+        if hold.is_none() {
+            receipt.digest = digest(receipt.progress.as_bytes());
+        }
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        write(&binding.path, &bytes);
+        let hold = hold.map(|reason| serde_json::json!(reason));
+        let _ = telemetry::take_thread_event_for_test("ack_recovery_hold");
+        let owned = binding.receipt().map(drop).unwrap_err().to_string();
+        assert_eq!(
+            telemetry::take_thread_event_for_test("ack_recovery_hold"),
+            hold
+        );
+        let sealed = binding
+            .before_progress_save(Some(ProgressSeal::new(&old, None)), || {
+                Ok(progress(5, "new"))
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            telemetry::take_thread_event_for_test("ack_recovery_hold"),
+            hold
+        );
+        assert_eq!(sealed, owned);
+        assert_eq!(owned == "state_v2_ack_recovery_hold", hold.is_some());
+        assert_eq!(std::fs::read(&binding.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
 }
 
 /// [money] import sealing is idempotent but never rebinds a different db or progress.
@@ -192,7 +236,7 @@ fn post_commit_cleanup_receipt_binds_latest_db_generation_and_refuses_rollback()
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
     let cleaned = progress(2, "ACK-retired-by-source-generation-1");
     binding
-        .before_progress_save(Some(&before), &cleaned)
+        .before_progress_save_bytes(Some(&before), &cleaned)
         .unwrap();
     write(&path, &cleaned);
     assert_eq!(binding.receipt().unwrap().scope.generation, 1);
