@@ -43,8 +43,9 @@ pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 /// The gap between metadata-only re-listing passes of one kept generation
-/// (the cold cadence tier). Two passes fit in the freshness alarm window, so a
-/// complete walk refreshes the discovery stamp before it can alarm.
+/// (the cold cadence tier). At the observed page cadence a complete walk
+/// still lands well inside the unchanged freshness alarm window; backstop-only
+/// discovery and paced recovery take longer than at the old 30 minutes.
 pub(crate) const LISTING_INTERVAL_SECONDS: u64 = 3 * 60 * 60;
 /// A re-listing pass queues an owed file whose stamp is unchanged at most
 /// once per this interval.
