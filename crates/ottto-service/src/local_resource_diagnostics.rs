@@ -666,7 +666,8 @@ const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
 const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 4;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
-const UNSELECTED_REASONS: usize = HOLD_WAKE_START + 2;
+const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
+const UNSELECTED_REASONS: usize = USAGE_GAP_START + 4;
 process_static!(
     /// Claude, Codex, Pi x reason, drained by that source's page line.
     fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -1107,6 +1108,8 @@ impl Probe {
             file_reads: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             hold_wake: BTreeMap<&'static str, u64>,
+            #[serde(flatten)]
+            usage_gaps: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let jsonl = jsonl::take(source);
@@ -1152,6 +1155,7 @@ impl Probe {
                     ("oldest_expired_secs", HOLD_WAKE_START + 1),
                 ],
             ),
+            usage_gaps: drain(source, &USAGE_GAPS),
             reread: if claude {
                 self.page_events.with_current()
             } else {
@@ -1455,6 +1459,51 @@ pub(crate) fn hold_wake(source: &str, keys: u64, oldest_expired_secs: u64) {
     source_count(source, HOLD_WAKE_START + 1, |n| {
         n.fetch_max(oldest_expired_secs, Relaxed)
     });
+}
+const USAGE_GAPS: [(&str, usize); 4] = [
+    ("usage_rows_missing_model_rows", USAGE_GAP_START),
+    ("usage_rows_missing_model_sessions", USAGE_GAP_START + 1),
+    ("zero_request_body_with_tokens_bodies", USAGE_GAP_START + 2),
+    (
+        "zero_request_body_with_tokens_sessions",
+        USAGE_GAP_START + 3,
+    ),
+];
+/// Gaps in one source's finished bodies (Claude after its local evidence
+/// fold): requests on rows with tokens whose model is the parsers' implicit
+/// one, and bodies with tokens but no request, each with its sessions.
+/// Borrowed and counted once the bodies are final; never a gate. The sync
+/// finish runs after the scan's page line, so these land on the next one.
+pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]) {
+    let mut sessions = [std::collections::BTreeSet::new(), Default::default()];
+    let (mut rows, mut zero_request_bodies) = (0_u64, 0_u64);
+    for body in bodies {
+        let implicit = body
+            .model_usage
+            .iter()
+            .filter(|row| {
+                row.model == crate::snapshots::IMPLICIT_USAGE_MODEL
+                    && crate::detected_uses::row_total_tokens(row) > 0
+            })
+            .fold(0_u64, |sum, row| sum.saturating_add(row.request_count));
+        if implicit > 0 {
+            rows = rows.saturating_add(implicit);
+            sessions[0].insert(body.source_session_id.as_str());
+        }
+        if body.request_count == 0
+            && crate::snapshots::claude_request_census::claude_conserved_tokens(body) > 0
+        {
+            zero_request_bodies += 1;
+            sessions[1].insert(body.source_session_id.as_str());
+        }
+    }
+    let [missing, zero] = sessions.map(|ids| ids.len() as u64);
+    for ((_, slot), amount) in USAGE_GAPS
+        .iter()
+        .zip([rows, missing, zero_request_bodies, zero])
+    {
+        source_count(source, *slot, |n| n.fetch_add(amount, Relaxed));
+    }
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
@@ -2714,6 +2763,92 @@ mod tests {
             &original
         ));
         assert!(records.is_empty());
+    }
+
+    /// [behaviour] A model-less Codex or Pi response gets the parsers'
+    /// implicit model and counts, beside a body with tokens and no request,
+    /// on its own source's next page line; a named-model body adds nothing.
+    #[test]
+    fn usage_gaps_count_implicit_model_rows_and_token_only_bodies() {
+        use crate::snapshots::{SnapshotItem, IMPLICIT_USAGE_MODEL};
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("ottto-usage-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parse = |id: &str, lines: [serde_json::Value; 2]| -> SnapshotItem {
+            let path = dir.join(format!("{id}.jsonl"));
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            std::fs::write(&path, text).unwrap();
+            type Parse = fn(&std::path::Path, &str, String) -> anyhow::Result<Vec<SnapshotItem>>;
+            let parse: Parse = if id.starts_with("pi") {
+                crate::snapshots::parse_pi_jsonl_file
+            } else {
+                crate::snapshots::parse_codex_jsonl_file
+            };
+            parse(&path, "2026-10-05T00:00:00Z", id.to_string())
+                .unwrap()
+                .remove(0)
+        };
+        let codex = |id: &str, model: Option<&str>| {
+            let mut info = json!({"total_token_usage": {"input_tokens": 10, "output_tokens": 5},
+                "last_token_usage": {"input_tokens": 10, "output_tokens": 5}});
+            if let Some(model) = model {
+                info["model"] = json!(model);
+            }
+            parse(
+                id,
+                [
+                    json!({"timestamp": "2026-10-04T10:00:00Z", "type": "session_meta", "payload": {"id": id}}),
+                    json!({"timestamp": "2026-10-04T10:00:01Z", "type": "event_msg",
+                    "payload": {"type": "token_count", "info": info}}),
+                ],
+            )
+        };
+        let missing = codex("gap-missing", None);
+        let mut token_only = codex("gap-token-only", Some("gpt-6"));
+        token_only.request_count = 0;
+        let normal = codex("gap-normal", Some("gpt-6"));
+        let pi = parse(
+            "pi-gap",
+            [
+                json!({"type": "session", "id": "pi-gap", "timestamp": "2026-10-04T10:00:00Z"}),
+                json!({"type": "message_end", "message": {"timestamp": 1_791_108_001_000_u64,
+                "usage": {"input": 10, "output": 5}}}),
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        for body in [&missing, &pi] {
+            assert_eq!(body.model_usage[0].model, IMPLICIT_USAGE_MODEL);
+        }
+        let page = |source: &str| {
+            let (_, rows) = capture(|| {
+                Probe::start().collection(
+                    source,
+                    CollectionCounts {
+                        scanned_files: 1,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                        full_causes: Default::default(),
+                    },
+                )
+            });
+            rows.into_iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap()["counts"]
+                .clone()
+        };
+        usage_gaps("codex", &[missing, token_only, normal]);
+        usage_gaps("pi", &[pi]);
+        let (codex_page, pi_page) = (page("codex"), page("pi"));
+        for (key, _) in USAGE_GAPS {
+            assert_eq!(codex_page[key], 1, "{key}");
+            let pi_count = u64::from(key.starts_with("usage_rows"));
+            assert_eq!(
+                pi_page.get(key).map_or(0, |n| n.as_u64().unwrap()),
+                pi_count,
+                "{key}"
+            );
+            assert!(page("codex").get(key).is_none(), "{key} not drained");
+        }
     }
 
     /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.

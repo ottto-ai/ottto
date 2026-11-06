@@ -46,6 +46,9 @@ impl SelectorHashes {
 // persisted RowKey codec field is introduced. The prefix cannot collide with
 // a native selector hash ("base" or hexadecimal).
 const COPY_UNPROVEN_PARTITION: &str = "copy_unproven:";
+/// The model a usage row gets when its record and every earlier record
+/// named none (Claude Code and Pi `place_usage`, Codex admission).
+pub(crate) const IMPLICIT_USAGE_MODEL: &str = "unknown";
 fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
     let selector_hash = copy_unproven_selector_hash(row.copy_unproven, selector_hash);
     RowKey {
@@ -2250,7 +2253,7 @@ impl SnapshotAccumulator {
         let fell_back = model.is_none();
         let model = model
             .or_else(|| self.latest_model.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| IMPLICIT_USAGE_MODEL.to_string());
         self.latest_model = Some(model.clone());
 
         let fallback = timestamp
@@ -2388,7 +2391,7 @@ impl SnapshotAccumulator {
     ) -> Option<(String, Option<UsageTotals>, bool)> {
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| IMPLICIT_USAGE_MODEL.to_string());
         self.latest_model = Some(resolved_model.clone());
         // Only an exact repeated physical usage event is a duplicate. Equal
         // cumulative totals are not an occurrence identity: after a restart,

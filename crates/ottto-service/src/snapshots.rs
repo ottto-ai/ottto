@@ -2525,7 +2525,9 @@ use scan::accumulator::{
     ActivityCallTool, BucketRowAccumulator, CodexOwnershipBoundary, RowKey, SelectorCapture,
     SelectorHashes, SnapshotAccumulator, UsageBucketState, CODEX_THREAD_TIER,
 };
-pub(crate) use scan::accumulator::{copy_unproven_selector_hash, PlacedClaudeUsage};
+pub(crate) use scan::accumulator::{
+    copy_unproven_selector_hash, PlacedClaudeUsage, IMPLICIT_USAGE_MODEL,
+};
 
 #[cfg(test)]
 pub fn scan_source_roots(
