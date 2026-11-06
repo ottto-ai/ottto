@@ -33,9 +33,7 @@ fn org_line_governs_from_t_and_a_restarted_tail_matches_cold() {
                 + "\n"
         };
         let mut side = api_login(ROOT, "side", 4, 'a', Some('b'));
-        side.request_identity
-            .as_mut()
-            .unwrap()
+        std::sync::Arc::make_mut(side.request_identity.as_mut().unwrap())
             .organization
             .log_record_hash = Some(org_1.clone());
         side.fingerprint.clear();

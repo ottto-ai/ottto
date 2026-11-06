@@ -1489,15 +1489,15 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
     let rows = (0..4)
         .map(|n| crate::claude_local_otel::ClaudeLocalOtelEvidence {
             fingerprint: format!("root-{n}"),
-            session_id: ROOT.to_string(),
+            session_id: ROOT.into(),
             request_id: format!("req_{n}"),
             observed_at: format!("2026-08-02T07:00:0{n}Z"),
-            model: "claude-haiku-4-5".to_string(),
+            model: "claude-haiku-4-5".into(),
             input_tokens: 10,
             output_tokens: 10,
             request_count: 1,
             account_identity_checked: true,
-            account_identifier_hash: Some("a".repeat(64)),
+            account_identifier_hash: Some("a".repeat(64).into()),
             ..Default::default()
         })
         .collect();

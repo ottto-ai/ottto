@@ -605,7 +605,7 @@ mod tests {
         sign_api(&mut unknown);
         let mut negative = api("negative");
         negative.account_identity_checked = true;
-        negative.request_identity = Some(ClaudeRequestIdentityEvidence {
+        negative.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),
             account: ClaudeIdentityAttributeEvidence {
                 origin: ClaudeIdentityAttributeOrigin::Missing,
@@ -620,7 +620,7 @@ mod tests {
                 log_record_hash: None,
             },
             disposition: ClaudeIdentityDisposition::Missing,
-        });
+        }));
         sign_api(&mut negative);
         let mut bytes = Vec::new();
         for n in 0..PAGE_LINES {
@@ -735,7 +735,7 @@ mod tests {
             fs::read(evidence_path(&dir, &row.session_id)).unwrap(),
             before
         );
-        let strict = load_claude_api_request_evidence_report(&dir, [row.session_id.clone()]);
+        let strict = load_claude_api_request_evidence_report(&dir, [row.session_id.to_string()]);
         assert!(strict.health.is_complete());
         let file = evidence_path(&dir, &row.session_id);
         fs::remove_file(&file).unwrap();
@@ -811,9 +811,9 @@ mod tests {
             }
             _ => panic!(),
         }
-        let strict = load_claude_api_request_evidence_report(&dir, [row.session_id.clone()]);
+        let strict = load_claude_api_request_evidence_report(&dir, [row.session_id.to_string()]);
         assert_eq!(strict.health.oversized_files, 1);
-        assert_eq!(strict.evidence[&row.session_id], vec![row.clone()]);
+        assert_eq!(strict.evidence[&*row.session_id], vec![row.clone()]);
         assert!(strict.health.malformed_lines > 0);
         assert!(!strict.health.is_complete());
         assert_eq!(
@@ -826,7 +826,7 @@ mod tests {
         );
         for n in 0..MAX_FILES_PER_STORE + 2 {
             let mut row = api(&format!("req{n}"));
-            row.session_id = format!("root{n}");
+            row.session_id = format!("root{n}").into();
             sign_api(&mut row);
             append_evidence(&dir, &row).unwrap();
         }

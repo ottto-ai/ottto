@@ -162,3 +162,221 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
     let _ = fs::remove_dir_all(&alone.dir);
     let _ = fs::remove_dir_all(&crowded.dir);
 }
+
+/// How an idle (unread) family member's census record and index entry stand.
+/// Every case but `none` stores an unverified record at revision `e`.
+const IDLE_CASES: [&str; 5] = ["none", "verified", "unverified", "mismatch", "missing"];
+
+/// Stage an idle member of `root`'s family: it is not in the page, so only
+/// its own index entry can bind its unverified census record.
+fn stage_idle_member(index: &mut ScanIndex, dir: &Path, root: &str, case: &str) {
+    use crate::snapshots::claude_request_census::{
+        claude_request_hash, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    let key = local_index_key(&dir.join(root).join("subagents/agent-idle.jsonl"));
+    if case != "missing" {
+        let mut entry = manifest_index_entry(None);
+        entry.source_file_fingerprint = hex64(if case == "mismatch" { 'f' } else { 'e' });
+        if case == "unverified" {
+            entry.set_unverified_deadline(1);
+        }
+        assert_eq!(entry.has_unverified_source(), case == "unverified");
+        index.files.insert(key.clone(), entry);
+    }
+    if case != "none" {
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &hex64('e'),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![claude_request_hash("req_idle")],
+        )
+        .with_unverified_for_test(true);
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record);
+    }
+}
+
+fn context_posture(item: &SnapshotItem) -> [Option<u64>; 4] {
+    [
+        item.first_turn_context_tokens,
+        item.peak_context_fill_tokens,
+        item.last_turn_context_tokens,
+        item.compaction_count,
+    ]
+}
+
+/// The page as the strict (pre-binding) gate leaves it: posture cleared and
+/// withheld as unknown birth. Everything else must already be equal.
+fn posture_withheld(items: &[SnapshotItem]) -> serde_json::Value {
+    let items = items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            clear_claude_context_posture(&mut item);
+            item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::UnknownBirth);
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+            item
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_value(items).unwrap()
+}
+
+/// [money] An idle subagent whose own index entry is verified at its census
+/// revision no longer clears its family's context posture. An unverified
+/// entry, a fingerprint mismatch or no entry still clears it, and the cache
+/// rows stay on the strict in-batch rule.
+#[test]
+fn idle_verified_member_keeps_family_context_posture() {
+    let mut withheld = BTreeMap::new();
+    for case in IDLE_CASES {
+        let (dir, parent, mut items) = claude_account_family_fixture(true);
+        let child_agent = "a4d1585d310070d0f";
+        let api_rows = (1..=5)
+            .map(|n| {
+                complete_api_row(
+                    &parent,
+                    &format!("req_{n}"),
+                    n,
+                    10,
+                    if n == 5 { 1 } else { 10 },
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let trace_rows = (1..=5)
+            .map(|n| {
+                complete_trace_row(
+                    &parent,
+                    &format!("req_{n}"),
+                    if n == 5 { child_agent } else { "" },
+                )
+            })
+            .collect::<Vec<_>>();
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index =
+            crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
+        for path in [
+            dir.join(format!("{parent}.jsonl")),
+            dir.join(&parent)
+                .join(format!("subagents/agent-{child_agent}.jsonl")),
+        ] {
+            index
+                .files
+                .insert(local_index_key(&path), manifest_index_entry(None));
+        }
+        stage_idle_member(&mut index, &dir, &parent, case);
+
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+        );
+
+        let child = &items[1];
+        let kept = matches!(case, "none" | "verified");
+        assert_eq!(
+            context_posture(child),
+            if kept {
+                [Some(10), Some(10), Some(10), Some(0)]
+            } else {
+                [None; 4]
+            },
+            "{case}"
+        );
+        assert_eq!(
+            child.claude_file_birth_verdict(),
+            Some(if kept {
+                ClaudeFileBirthVerdict::Admitted
+            } else {
+                ClaudeFileBirthVerdict::UnknownBirth
+            }),
+            "{case}"
+        );
+        // Cache rows keep the strict rule: only the unpoisoned family ships them.
+        assert_eq!(child.cache_observations.is_some(), case == "none", "{case}");
+        assert!(
+            disposition.quarantined_source_session_ids.is_empty(),
+            "{case}"
+        );
+        if matches!(case, "verified" | "unverified") {
+            withheld.insert(case, posture_withheld(&items));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+    // Same index fingerprints, only the entry's verification differs: the
+    // bodies are equal except the posture fields.
+    assert_eq!(withheld["verified"], withheld["unverified"]);
+}
+
+/// [money] On an ordinary-money (excluded) witnessed family, the posture
+/// binding alone never releases the reported-usage rebuild or the demotion
+/// hold: usage, quarantine and bodies match the strict gate exactly.
+#[test]
+fn idle_verified_member_leaves_usage_rebuild_and_hold_strict() {
+    let mut outcomes = BTreeMap::new();
+    for case in ["none", "verified", "unverified"] {
+        let families = witnessed_families(&format!("census-posture-usage-{case}"), 1);
+        let root = family_root(0);
+        let mut index = families.index.clone();
+        stage_idle_member(&mut index, &families.dir, &root, case);
+        let mut page = vec![families.raw[0].clone()];
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut page,
+            &families.api,
+            &families.trace,
+            &mut index,
+        );
+        let rebuilt = case == "none";
+        assert_eq!(
+            page[0].usage_accounting_contract.as_deref(),
+            rebuilt.then_some("session_exclusive_reported_usage:v1"),
+            "{case}"
+        );
+        assert_eq!(
+            disposition
+                .quarantined_source_session_ids
+                .contains(&page[0].source_session_id),
+            !rebuilt,
+            "{case}"
+        );
+        assert_eq!(
+            index.claude_usage_authority_quarantine.contains_key(&root),
+            !rebuilt,
+            "{case}"
+        );
+        let quarantine = index
+            .claude_usage_authority_quarantine
+            .iter()
+            .map(|(root, record)| {
+                (
+                    root.clone(),
+                    (
+                        record.proven_witness_fingerprint.clone(),
+                        record.member_source_file_fingerprints.clone(),
+                        record.failed_reconstruction_count,
+                        record.disposition,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        outcomes.insert(
+            case,
+            (
+                posture_withheld(&page),
+                disposition.quarantined_source_session_ids,
+                quarantine,
+            ),
+        );
+        let _ = fs::remove_dir_all(&families.dir);
+    }
+    assert_eq!(outcomes["verified"], outcomes["unverified"]);
+}

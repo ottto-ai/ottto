@@ -3701,9 +3701,9 @@ pub(crate) fn side_calls_page(
                 match at {
                     Some(at) => keys
                         .entry((
-                            row.model.as_str(),
-                            row.speed.as_str(),
-                            row.effort.as_str(),
+                            row.model.as_ref(),
+                            row.speed.as_ref(),
+                            row.effort.as_ref(),
                             at.div_euclid(HOUR_NANOS),
                         ))
                         .or_insert_with(build)
@@ -3862,8 +3862,8 @@ fn trace_owners<'a>(
         }) else {
             continue;
         };
-        if row.capture_revision == "claude_llm_request_ownership:v1"
-            && row.session_id == root
+        if &*row.capture_revision == "claude_llm_request_ownership:v1"
+            && &*row.session_id == root
             && timed("side.trace_fingerprint", || {
                 claude_trace_evidence_fingerprint_is_valid(row)
             })

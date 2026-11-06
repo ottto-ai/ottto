@@ -269,7 +269,7 @@ fn row_plan_fingerprint(row: &SnapshotModelUsage) -> Option<String> {
 
 /// Reasoning tokens are a part of `output_tokens` for Codex and Claude, so
 /// they are not added again.
-fn row_total_tokens(row: &SnapshotModelUsage) -> u64 {
+pub(crate) fn row_total_tokens(row: &SnapshotModelUsage) -> u64 {
     row.input_tokens
         .saturating_add(row.output_tokens)
         .saturating_add(row.cache_read_tokens)

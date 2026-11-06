@@ -378,7 +378,7 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
-Claude Code's local-evidence stage adds three such footprint records (none on
+Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
@@ -387,7 +387,12 @@ final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
 step) and no footprint fields. `evidence_cross_root` counts carry
 `demanded_requests`: the page's demanded request ids each root is joined against.
-Of the three footprint records, only `evidence_read` has counts: one
+Inside `evidence_fold`, one footprint record per step, in order and without
+counts: `evidence_side_calls` (side calls and the read holds),
+`evidence_identity_index`, `evidence_reported_usage`, `evidence_reconcile`
+(request accounts and activity staging), `evidence_finish_page`,
+`evidence_identity_tags`, `evidence_qualification` and `evidence_census_health`.
+Of the three outer footprint records, only `evidence_read` has counts: one
 `evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
 bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
 after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
@@ -938,6 +943,22 @@ gate, cap and upload nothing.
   cannot see: money-only reveals and late external evidence.
 
 Upload counts land on the line after the source's next page line.
+
+## Usage Gap Counters
+
+Each source's `native_collection_page` line can carry four counts of gaps in
+the session bodies that source finished (Claude Code after its local evidence
+fold, before upload). One shared count covers Claude Code, Codex and Pi. Keys
+are nonzero only; an absent key is zero. They are computed from the finished
+bodies without reading or parsing anything again, and they change no body,
+fingerprint or upload. The sync finish runs after the scan's page line, so
+they land on the source's next page line.
+
+- `usage_rows_missing_model_rows` / `_sessions`: requests on usage rows with
+  tokens whose model is `unknown`, the model a parser assigns when the
+  transcript has named none so far.
+- `zero_request_body_with_tokens_bodies` / `_sessions`: bodies with any token
+  count above zero and zero requests.
 
 ## Context Footprint Discovery
 
@@ -1694,6 +1715,18 @@ counted. A non-zero value means a new numeric usage field is not reaching money.
 Counts are per parsed usage line, not per unique request; rereads count again. It
 is a cumulative saturating process total with no key name, path or session id,
 and it never affects money.
+
+## Claude forced-family seeds
+
+The Claude `native_collection_page` line carries, nonzero only,
+`forced_family_seeds` (path twins whose own candidate decision pulled their
+family in, one per twin, keyed by that `CandidateParseReason` label, `other`
+for a Parse without one, or `identification_failed`), and in `page_selection`
+`forced_family_roots` (distinct roots those twins forced) and
+`forced_family_members_pulled` (family paths the closure for every forced root
+names: the ones it adds and the ones already on the page). Counted after
+selection since the previous Claude page; counts only, no ids or paths; they
+never affect selection or money.
 
 ## Claude OTLP spans and relay requests not stored
 

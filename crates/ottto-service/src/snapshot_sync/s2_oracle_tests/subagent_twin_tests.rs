@@ -365,6 +365,75 @@ fn later_copy_only_child_growth_matches_cold() {
     });
 }
 
+/// [diagnostic] The page line says why twins forced their family in: one seed
+/// per read twin by its own parse reason, the distinct roots, and the family
+/// paths the closure names. Counts only; money still matches the cold oracle.
+#[test]
+fn forced_family_seed_counts() {
+    with_e2(|| {
+        let c = twins("subagent-twin-seed-counts", false, TURN, false, false);
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let mut prior = commit(&session, page(&c, index, 100, true));
+        // Two mains, two child pairs and the untwinned child share one root.
+        let family = c.births.len() as u64;
+        assert_eq!(family, 7);
+        for (step, grown, seeds, roots, pulled) in [
+            (0, vec![member("a", 0)], 1, 1, family),
+            (1, vec![member("a", 0), member("a", 1)], 2, 1, family),
+            (2, vec![member("a", 2)], 0, 0, 0),
+        ] {
+            let hints = grown.iter().map(|relative| c.root.join(relative));
+            let hints = hints.collect::<Vec<_>>();
+            for (n, path) in hints.iter().enumerate() {
+                append(path, &line(ROOT, &format!("seed-{step}-{n}"), GROW, 8));
+            }
+            let expected = cold(&c);
+            let (warm, rows) = crate::local_resource_diagnostics::capture(|| {
+                hinted(&c, prior.clone(), 100, true, &hints)
+            });
+            let pages = rows
+                .iter()
+                .filter(|row| row["stage"] == "native_collection_page")
+                .map(|row| &row["counts"])
+                .collect::<Vec<_>>();
+            assert!(!pages.is_empty(), "step {step}");
+            let mut by_reason = BTreeMap::<String, u64>::new();
+            for (reason, n) in pages
+                .iter()
+                .filter_map(|counts| counts["forced_family_seeds"].as_object())
+                .flatten()
+            {
+                *by_reason.entry(reason.clone()).or_default() += n.as_u64().unwrap();
+            }
+            let expected_seeds = (seeds > 0).then_some(("transcript_changed".to_string(), seeds));
+            let expected_seeds = expected_seeds.into_iter().collect::<BTreeMap<_, _>>();
+            assert_eq!(by_reason, expected_seeds, "step {step}");
+            let selection = |key: &str| {
+                pages
+                    .iter()
+                    .map(|counts| counts["page_selection"][key].as_u64().unwrap_or(0))
+                    .sum::<u64>()
+            };
+            assert_eq!(selection("forced_family_roots"), roots, "step {step}");
+            assert_eq!(
+                selection("forced_family_members_pulled"),
+                pulled,
+                "step {step}"
+            );
+            // A page without a seed re-emits only the grown child; the whole
+            // family cold oracle applies to the forced pages.
+            if seeds > 0 {
+                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+            }
+            prior = commit(&session, warm);
+        }
+    });
+}
+
 fn assert_verified_incomplete(index: &ScanIndex, key: &str) {
     use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
     let record = index.claude_request_census_for_test().get(key).unwrap();

@@ -138,7 +138,7 @@ fn claude_report_borrows_rows_and_keeps_reader_health_without_rereading() {
     std::fs::create_dir_all(&store).unwrap();
     let path = |root: &str| store.join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
     let row = |root: &str, request: &str, fingerprint: &str, cost| ClaudeLocalOtelEvidence {
-        session_id: root.to_string(),
+        session_id: root.into(),
         request_id: request.to_string(),
         fingerprint: fingerprint.to_string(),
         cost_usd_micros: cost,

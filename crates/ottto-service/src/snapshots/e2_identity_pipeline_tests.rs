@@ -343,7 +343,7 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
     let (dir, root, _) = claude_account_family_fixture(false);
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
-    api[4].account_identifier_hash = Some("b".repeat(64));
+    api[4].account_identifier_hash = Some("b".repeat(64).into());
     e2_resign(&mut api[4]);
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
     e2_write_rows(
@@ -382,7 +382,7 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
         let support = dir.join("support");
         let (mut api, trace) = e2_family_evidence(&root);
         for row in &mut api[2..4] {
-            row.account_identifier_hash = Some("b".repeat(64));
+            row.account_identifier_hash = Some("b".repeat(64).into());
             e2_resign(row);
         }
         if partial {
@@ -462,7 +462,7 @@ fn e2_carry_pages(
             let native = fs::read_to_string(&path).unwrap();
             fs::write(path, format!("{native}{zero}\n")).unwrap();
             let mut side = complete_api_row(&root, "req_side", 7, 3, 2, 0);
-            side.request_identity = Some(
+            side.request_identity = Some(std::sync::Arc::new(
                 serde_json::from_value(json!({
                     "identity_hash_scheme": "provider-sha256:v1", "disposition": "complete",
                     "account": {"origin": "log_record", "disposition": "complete",
@@ -471,13 +471,13 @@ fn e2_carry_pages(
                         "log_record_hash": "1".repeat(64)}
                 }))
                 .unwrap(),
-            );
+            ));
             e2_resign(&mut side);
             api.push(side);
             trace.push(complete_trace_row(&root, "req_side", ""));
         }
         for row in &mut api[2..4] {
-            row.account_identifier_hash = Some("b".repeat(64));
+            row.account_identifier_hash = Some("b".repeat(64).into());
             e2_resign(row);
         }
         for row in &mut api {
@@ -486,7 +486,7 @@ fn e2_carry_pages(
             {
                 row.account_identifier_hash = None;
                 if *contradictory {
-                    row.request_identity = Some(
+                    row.request_identity = Some(std::sync::Arc::new(
                         serde_json::from_value(json!({
                             "identity_hash_scheme": "provider-sha256:v1",
                             "disposition": "invalid",
@@ -494,7 +494,7 @@ fn e2_carry_pages(
                             "organization": {"origin": "missing", "disposition": "missing"}
                         }))
                         .unwrap(),
-                    );
+                    ));
                 }
                 e2_resign(row);
             }
@@ -770,7 +770,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
             "message": {"id": format!("msg_{n}"), "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 10}}
         })));
         let mut row = complete_api_row(root, &request, n, 10, 10, 0);
-        row.account_identifier_hash = Some(format!("{n:064x}"));
+        row.account_identifier_hash = Some(format!("{n:064x}").into());
         e2_resign(&mut row);
         api.push(row);
         trace.push(complete_trace_row(root, &request, ""));
@@ -943,7 +943,7 @@ fn e2_pipeline_discarded_trace_read_leaves_requests_unbound_never_another_accoun
         let (dir, root, _) = claude_account_family_fixture(false);
         let support = dir.join("support");
         let (mut api, trace) = e2_family_evidence(&root);
-        api[4].account_identifier_hash = Some("b".repeat(64));
+        api[4].account_identifier_hash = Some("b".repeat(64).into());
         e2_resign(&mut api[4]);
         e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
         e2_write_rows(
@@ -1225,11 +1225,11 @@ fn e2_bound_trace_case(
     // uploads and only #947's clear would hold.
     let own = if billing == "mixed" { "a" } else { "b" };
     for row in &mut api {
-        row.account_identifier_hash = Some(own.repeat(64));
+        row.account_identifier_hash = Some(own.repeat(64).into());
         e2_resign(row);
     }
     if split_logins {
-        api[4].account_identifier_hash = Some("c".repeat(64));
+        api[4].account_identifier_hash = Some("c".repeat(64).into());
         e2_resign(&mut api[4]);
     }
     e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);

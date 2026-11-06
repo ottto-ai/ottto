@@ -1052,23 +1052,23 @@ mod tests {
         let api = (1..=5_u64)
             .map(|i| {
                 let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
-                    capture_revision: "claude_api_request:v2".to_string(),
-                    session_id: root.to_string(),
+                    capture_revision: "claude_api_request:v2".into(),
+                    session_id: root.into(),
                     request_id: format!("req_{i}"),
                     client_request_id: format!("client-req_{i}"),
                     observed_at: format!("2026-08-02T07:00:{i:02}Z"),
-                    model: "claude-haiku-4-5".to_string(),
-                    effort: "high".to_string(),
-                    query_source: "user".to_string(),
-                    speed: "fast".to_string(),
+                    model: "claude-haiku-4-5".into(),
+                    effort: "high".into(),
+                    query_source: "user".into(),
+                    speed: "fast".into(),
                     cost_usd_micros: Some(100),
                     event_sequence: Some(i),
-                    app_version: "2.1.226".to_string(),
+                    app_version: "2.1.226".into(),
                     input_tokens: 10,
                     output_tokens: if i == 5 { 1 } else { 10 },
                     request_count: 1,
                     account_identity_checked: true,
-                    account_identifier_hash: Some("a".repeat(64)),
+                    account_identifier_hash: Some("a".repeat(64).into()),
                     ..Default::default()
                 };
                 row.fingerprint = sidecar_fingerprint(&row);
@@ -1078,8 +1078,8 @@ mod tests {
         let trace = (1..=5_u64)
             .map(|i| {
                 let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
-                    capture_revision: "claude_llm_request_ownership:v1".to_string(),
-                    session_id: root.to_string(),
+                    capture_revision: "claude_llm_request_ownership:v1".into(),
+                    session_id: root.into(),
                     request_id: format!("req_{i}"),
                     client_request_id: format!("client-req_{i}"),
                     agent_id: if i == 5 { agent } else { "" }.to_string(),

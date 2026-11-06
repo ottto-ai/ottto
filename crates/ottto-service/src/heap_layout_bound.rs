@@ -150,6 +150,15 @@ impl HeapLayoutBound for Box<str> {
         c.add(self.len())
     }
 }
+// Shared strings: two counts plus the bytes, padded to the counts' alignment.
+// Each holder charges the whole allocation, which over-counts sharing.
+impl HeapLayoutBound for Arc<str> {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        let unpadded = self.len().checked_add(2 * size_of::<usize>())?;
+        c.add(unpadded.checked_next_multiple_of(align_of::<usize>())?)
+    }
+}
 impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
     fn stable_heap(&self) -> bool {
         self.as_ref().map_or(true, HeapLayoutBound::stable_heap)
@@ -698,6 +707,23 @@ mod sampled_scalar_buffer_tests {
             bound(&deque, 128 * 1024),
             Some(size_of_val(&deque) + deque.capacity() * size_of::<u64>())
         );
+    }
+    #[test]
+    fn sampled_shared_strings_charge_padded_allocations() {
+        if !layout_supported() {
+            return;
+        }
+        // 4 ("high") and 21 (a capture revision) bytes need trailing padding.
+        for len in [0, 4, 8, 21, 64] {
+            let text = "x".repeat(len);
+            let (shared, allocations) =
+                crate::retry_allocation_probe::measure(|| Arc::<str>::from(text.as_str()));
+            let requested = usize::try_from(allocations.requested_live).unwrap();
+            let charged = bound(&shared, usize::MAX).unwrap() - size_of_val(&shared);
+            assert_eq!(charged, requested, "len={len}");
+            assert_eq!(charged % align_of::<usize>(), 0, "len={len}");
+            assert!(completed_bound(&vec![shared], usize::MAX).is_some());
+        }
     }
     #[test]
     fn sampled_unknown_elements_keep_recursive_visit_and_heap_checks() {

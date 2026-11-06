@@ -311,8 +311,8 @@ pub(crate) fn validate_claude_api_row(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     root_session_id: &str,
 ) -> bool {
-    row.capture_revision == "claude_api_request:v2"
-        && row.session_id == root_session_id
+    &*row.capture_revision == "claude_api_request:v2"
+        && &*row.session_id == root_session_id
         && !row.request_id.is_empty()
         && !row.model.is_empty()
         && row.request_count == 1
@@ -355,8 +355,8 @@ fn classify_claude_usage_ledger_with_rows<'a, R>(
     }
     let mut trace_by_request = BTreeMap::new();
     for row in trace_rows {
-        if row.capture_revision != "claude_llm_request_ownership:v1"
-            || row.session_id != root_session_id
+        if &*row.capture_revision != "claude_llm_request_ownership:v1"
+            || &*row.session_id != root_session_id
             || row.request_id.is_empty()
             || !claude_trace_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
@@ -625,15 +625,15 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
         .cache_creation_5m_tokens
         .checked_add(occurrence.cache_creation_1h_tokens);
     let reported_speed = (!row.speed.trim().is_empty())
-        .then(|| normalize_selector_raw("speed_mode", &Value::String(row.speed.clone())))
+        .then(|| normalize_selector_raw("speed_mode", &Value::String(row.speed.to_string())))
         .flatten();
     let speed_matches = occurrence
         .speed_mode
         .zip(reported_speed.as_deref())
         .map_or(true, |(transcript, reported)| transcript == reported);
     let reported_effort = CLAUDE_EFFORT_TIERS
-        .contains(&row.effort.as_str())
-        .then_some(row.effort.as_str());
+        .contains(&row.effort.as_ref())
+        .then_some(row.effort.as_ref());
     let effort_matches = occurrence
         .reasoning_effort
         .zip(reported_effort)
@@ -646,7 +646,7 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
             occurrence.reasoning_output_tokens,
         )
         && Some(api_cache_creation) == transcript_cache_creation
-        && occurrence.model.map_or(true, |model| model == row.model)
+        && occurrence.model.map_or(true, |model| model == &*row.model)
         && speed_matches
         && effort_matches
 }
@@ -846,7 +846,7 @@ fn prepare_claude_reported_usage<
             .unwrap_or_default();
         if !row.speed.trim().is_empty() {
             let normalized_speed =
-                normalize_selector_raw("speed_mode", &Value::String(row.speed.clone()));
+                normalize_selector_raw("speed_mode", &Value::String(row.speed.to_string()));
             if normalized_speed.as_ref().is_some_and(|speed| {
                 selector
                     .context
@@ -859,12 +859,12 @@ fn prepare_claude_reported_usage<
                 &mut selector,
                 "speed_mode",
                 "claude_code.api_request.speed",
-                &Value::String(row.speed.clone()),
+                &Value::String(row.speed.to_string()),
             );
         }
         let reported_effort = CLAUDE_EFFORT_TIERS
-            .contains(&row.effort.as_str())
-            .then(|| row.effort.clone());
+            .contains(&row.effort.as_ref())
+            .then(|| row.effort.to_string());
         if occurrence
             .and_then(|occurrence| occurrence.reasoning_effort.as_deref())
             .zip(reported_effort.as_deref())
@@ -891,7 +891,7 @@ fn prepare_claude_reported_usage<
                 || occurrence
                     .model
                     .as_deref()
-                    .is_some_and(|model| model != row.model)
+                    .is_some_and(|model| model != &*row.model)
             {
                 return None;
             }
@@ -900,7 +900,7 @@ fn prepare_claude_reported_usage<
                 occurrence
                     .model
                     .clone()
-                    .unwrap_or_else(|| row.model.clone()),
+                    .unwrap_or_else(|| row.model.to_string()),
                 occurrence
                     .timestamp
                     .clone()
@@ -920,7 +920,7 @@ fn prepare_claude_reported_usage<
                     request_count: 1,
                     costs: UsageCosts::default(),
                 },
-                row.model.clone(),
+                row.model.to_string(),
                 row.observed_at.clone(),
             )
         };

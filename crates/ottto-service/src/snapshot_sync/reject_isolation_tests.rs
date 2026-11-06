@@ -15,8 +15,8 @@ fn tagged_api(
     };
     let mut row = api(request, tokens, tokens * 10);
     row.account_identity_checked = true;
-    row.account_identifier_hash = account.map(str::to_owned);
-    row.request_identity = Some(ClaudeRequestIdentityEvidence {
+    row.account_identifier_hash = account.map(Into::into);
+    row.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
         identity_hash_scheme: "provider-sha256:v1".into(),
         account: Attribute {
             // None models a present but invalid login attribute.
@@ -40,7 +40,7 @@ fn tagged_api(
         } else {
             Disposition::Invalid
         },
-    });
+    }));
     row.fingerprint.clear();
     row.fingerprint = format!(
         "sha256:{:x}",
@@ -107,7 +107,7 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
             };
             let mut row = tagged_api(request, tokens, Some(&account.repeat(64)));
-            let identity = row.request_identity.as_mut().unwrap();
+            let identity = std::sync::Arc::make_mut(row.request_identity.as_mut().unwrap());
             identity.organization.origin = ClaudeIdentityAttributeOrigin::LogRecord;
             identity.organization.disposition = ClaudeIdentityDisposition::Complete;
             identity.organization.log_record_hash =
