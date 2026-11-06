@@ -164,6 +164,83 @@ fn claude_unknown_numeric_usage_keys_are_counted_without_changing_items() {
     assert_eq!(parse(&line), (known, 0));
 }
 
+/// Claude-only usage-shape gaps on the Claude page line: a cache write with
+/// no 5m/1h split (read as 5m) and thinking stated only on `iterations[]`.
+/// A response counts once per key; sessions are distinct; the Codex and Pi
+/// page lines never carry the keys.
+#[test]
+fn claude_usage_gaps_count_once_per_response_on_the_claude_page_line() {
+    use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+    let at = "2026-11-02T10:00:00Z";
+    let page = |files: &[&[(&str, usize, &Value, &[Value])]]| {
+        crate::local_resource_diagnostics::take_claude_usage_gaps();
+        for lines in files {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            for (session, n, top, iterations) in lines.iter() {
+                let line = response(session, *n, top, iterations, at);
+                apply_claude_code_line(&line, &mut accumulator);
+            }
+        }
+        let ((), rows) = capture(|| {
+            for source in ["codex", "pi", "claude_code"] {
+                let counts = CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                };
+                Probe::start().collection(source, counts);
+            }
+        });
+        let pages = rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page");
+        let gaps = pages.map(|row| {
+            let counts = row["counts"].as_object().unwrap().iter();
+            counts
+                .filter(|(key, _)| {
+                    key.starts_with("cache_write_missing_ttl_split_")
+                        || key.starts_with("thinking_tokens_iteration_only_")
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>()
+        });
+        let gaps = gaps.collect::<Vec<_>>();
+        assert_eq!(gaps.len(), 3);
+        assert!(gaps[0].is_empty() && gaps[1].is_empty(), "{gaps:?}");
+        Value::Object(gaps[2].clone())
+    };
+    let flat = json!({"input_tokens": 3, "output_tokens": 50, "cache_read_input_tokens": 1_000,
+        "cache_creation_input_tokens": 200});
+    let split = billed(3, 50, 1_000, 200, 0);
+    let mut thought = split.clone();
+    thought["output_tokens_details"] = json!({"thinking_tokens": 20});
+    let none: &[Value] = &[];
+    let split_calls = std::slice::from_ref(&split);
+    let thought_calls = std::slice::from_ref(&thought);
+    let (s1, s2) = (SESSION_EQUAL, SESSION_PARTIAL);
+    // Read as 5m: the money reading the counter reports on.
+    let usage = claude_code_delta_usage(&response(s1, 0, &flat, none, at)).unwrap();
+    assert_eq!(counted(&usage), [3, 50, 1_000, 200, 0]);
+    let missing = |rows: u64, sessions: u64| {
+        json!({"cache_write_missing_ttl_split_rows": rows,
+            "cache_write_missing_ttl_split_sessions": sessions})
+    };
+    assert_eq!(page(&[&[(s1, 0, &flat, none)]]), missing(1, 1));
+    assert_eq!(page(&[&[(s1, 0, &split, split_calls)]]), json!({}));
+    // A later record of the same response (same key) is not counted again.
+    let duplicate = [(s1, 0, &flat, none), (s1, 0, &flat, none)];
+    assert_eq!(page(&[&duplicate]), missing(1, 1));
+    let two = [(s1, 0, &flat, none), (s1, 1, &flat, none)];
+    assert_eq!(page(&[&two, &[(s2, 0, &flat, none)]]), missing(3, 2));
+    assert_eq!(
+        page(&[&[(s1, 0, &split, thought_calls)]]),
+        json!({"thinking_tokens_iteration_only_rows": 1,
+            "thinking_tokens_iteration_only_sessions": 1})
+    );
+    assert_eq!(page(&[&[(s1, 0, &thought, thought_calls)]]), json!({}));
+}
+
 /// [money] Emitted money and placement equal a transcript whose top level
 /// already states every call, so the fold adds exactly the iterations-only
 /// usage.

@@ -1,9 +1,10 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
 use serde::{ser::SerializeMap, Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod jsonl;
@@ -446,6 +447,52 @@ pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
         return;
     }
     cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
+}
+
+/// Claude responses since the last Claude page with a cache write but no
+/// 5m/1h split (read as 5m), and with thinking tokens only on `iterations[]`
+/// entries: rows and distinct sessions, nonzero only. Sessions are tallied as
+/// hashes, never logged.
+const USAGE_GAPS: [[&str; 2]; 2] = [
+    [
+        "cache_write_missing_ttl_split_rows",
+        "cache_write_missing_ttl_split_sessions",
+    ],
+    [
+        "thinking_tokens_iteration_only_rows",
+        "thinking_tokens_iteration_only_sessions",
+    ],
+];
+type UsageGapTally = Mutex<[(u64, BTreeSet<u64>); 2]>;
+process_static!(fn with_claude_usage_gaps: UsageGapTally = Mutex::new(
+    [(0, BTreeSet::new()), (0, BTreeSet::new())]
+));
+/// One counted Claude response's gaps, in `USAGE_GAPS` order.
+pub(crate) fn claude_usage_gaps(gaps: [bool; 2], session: Option<&str>) {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    if gaps.contains(&true) {
+        let session = BuildHasherDefault::<DefaultHasher>::default().hash_one(session);
+        with_claude_usage_gaps(|tally| {
+            let mut tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
+            for ((rows, sessions), _) in tally.iter_mut().zip(gaps).filter(|(_, gap)| *gap) {
+                *rows = rows.saturating_add(1);
+                sessions.insert(session);
+            }
+        });
+    }
+}
+pub(crate) fn take_claude_usage_gaps() -> BTreeMap<&'static str, u64> {
+    let tally = with_claude_usage_gaps(|tally| {
+        std::mem::take(&mut *tally.lock().unwrap_or_else(PoisonError::into_inner))
+    });
+    let counts = tally
+        .into_iter()
+        .map(|(rows, sessions)| [rows, sessions.len() as u64]);
+    let keyed = USAGE_GAPS
+        .into_iter()
+        .zip(counts)
+        .flat_map(|(k, n)| k.into_iter().zip(n));
+    keyed.filter(|(_, n)| *n > 0).collect()
 }
 
 /// Sidecar read attempts and actual input bytes since the last Claude page.
@@ -1072,6 +1119,8 @@ impl Probe {
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
             #[serde(flatten)]
+            usage_gaps: Option<BTreeMap<&'static str, u64>>,
+            #[serde(flatten)]
             sidecar_reparse: Option<ClaudeSidecarReparse>,
             #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
@@ -1165,6 +1214,7 @@ impl Probe {
                 Default::default()
             },
             sidecar_reparse: claude.then(take_claude_sidecar_reparse),
+            usage_gaps: claude.then(take_claude_usage_gaps),
             caps: if claude {
                 take_claude_record_caps()
             } else {
@@ -2248,7 +2298,7 @@ mod tests {
             "\"decoder_refused_header_occupancy\""
         )
         .is_err());
-        let mut labels = std::collections::BTreeSet::new();
+        let mut labels = BTreeSet::new();
 
         for (index, cause) in ALL
             .iter()

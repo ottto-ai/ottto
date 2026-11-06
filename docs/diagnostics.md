@@ -1695,6 +1695,18 @@ Counts are per parsed usage line, not per unique request; rereads count again. I
 is a cumulative saturating process total with no key name, path or session id,
 and it never affects money.
 
+## Claude usage-shape gaps
+
+The Claude `native_collection_page` line carries, nonzero only,
+`cache_write_missing_ttl_split_rows` / `_sessions` (a response with cache-write
+tokens but no `usage.cache_creation` 5m/1h split, at the top level or in an
+`iterations[]` entry; such writes are read as 5m) and
+`thinking_tokens_iteration_only_rows` / `_sessions` (a response whose
+`output_tokens_details.thinking_tokens` appears only on `usage.iterations[]`
+entries). A response counts once, on its first record in the parsed file; rows
+and distinct sessions reset at each page. Absent keys mean zero; other sources
+never carry them. Counts only, no session id; they never affect money.
+
 ## Claude OTLP spans and relay requests not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude

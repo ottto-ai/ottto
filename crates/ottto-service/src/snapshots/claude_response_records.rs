@@ -63,6 +63,10 @@ impl ClaudeResponseBook {
         self.responses.get_mut(slot as usize)
     }
 
+    pub(super) fn contains_key(&self, key: &str) -> bool {
+        self.index.contains_key(key)
+    }
+
     /// Adds a response under a key that is not yet present. Returns false,
     /// retaining nothing, if its slot cannot be indexed.
     pub(super) fn insert(&mut self, key: String, response: ClaudeResponseObservation) -> bool {

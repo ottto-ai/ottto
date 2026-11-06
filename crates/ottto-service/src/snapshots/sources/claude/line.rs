@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use crate::snapshots::cache_observations::RequestSlot;
-use crate::snapshots::claude_request_money;
+use crate::snapshots::claude_request_money::{self, CacheCreation};
 use crate::snapshots::scan::json_fields::{string_at, u64_at};
 use crate::snapshots::{usage_object_has_numeric_field, UsageCosts, UsageTotals};
 
@@ -176,7 +176,17 @@ fn claude_code_usage_fields(root: &Value) -> UsageTotals {
 // the flat `cache_creation_input_tokens` is present (older transcripts), default to the
 // 5m bucket which is Anthropic's default TTL.
 pub(in crate::snapshots) fn claude_code_cache_creation_split(root: &Value) -> (u64, u64) {
-    use claude_request_money::CacheCreation;
+    let (cache_5m, cache_1h, cache_creation) = claude_code_cache_creation(root);
+    match cache_creation {
+        CacheCreation::Split { five_m, one_h } => (five_m, one_h),
+        CacheCreation::Unattributed(flat) => (flat, 0),
+        CacheCreation::Contradictory => (cache_5m, cache_1h),
+    }
+}
+
+/// One usage object's stated 5m and 1h writes and their reading against the
+/// flat write total.
+fn claude_code_cache_creation(root: &Value) -> (u64, u64, CacheCreation) {
     let (cache_5m, cache_1h) = root
         .get("cache_creation")
         .or_else(|| root.get("cacheCreation"))
@@ -196,11 +206,50 @@ pub(in crate::snapshots) fn claude_code_cache_creation_split(root: &Value) -> (u
         .unwrap_or_default();
     // The transcript reading: a stated split wins over the flat total even
     // when they disagree; a flat-only write is the default (5m) TTL.
-    match claude_request_money::claude_cache_creation(flat, cache_5m, cache_1h) {
-        CacheCreation::Split { five_m, one_h } => (five_m, one_h),
-        CacheCreation::Unattributed(flat) => (flat, 0),
-        CacheCreation::Contradictory => (cache_5m, cache_1h),
+    let reading = claude_request_money::claude_cache_creation(flat, cache_5m, cache_1h);
+    (cache_5m, cache_1h, reading)
+}
+
+/// Content-free counts for one usage record. Per record: an `iterations[]`
+/// call naming another model than the record's, and numeric keys the parser
+/// does not read. Once per response (`first_record`): a cache write with no
+/// 5m/1h split (read as 5m), and thinking tokens stated only on
+/// `iterations[]` entries.
+pub(in crate::snapshots) fn claude_code_usage_diagnostics(
+    root: &Value,
+    model: Option<&str>,
+    first_record: bool,
+    session: Option<&str>,
+) {
+    let iterations = claude_code_usage_iterations(root);
+    // A refusal fallback's declined first attempt is billed at the record's model.
+    if iterations.iter().any(|iteration| {
+        let other = iteration.get("model").and_then(Value::as_str);
+        other.is_some_and(|other| Some(other) != model)
+    }) {
+        crate::local_resource_diagnostics::claude_usage_iteration_model_differs();
     }
+    // A new numeric field would leave money unseen.
+    crate::local_resource_diagnostics::claude_usage_unknown_numeric_keys(
+        claude_code_unknown_usage_keys(root),
+    );
+    if !first_record {
+        return;
+    }
+    let unsplit = |usage: &Value| {
+        let reading = claude_code_cache_creation(usage).2;
+        matches!(reading, CacheCreation::Unattributed(flat) if flat > 0)
+    };
+    let thinking = |usage: &Value| {
+        u64_at(usage, &["output_tokens_details", "thinking_tokens"]).is_some_and(|n| n > 0)
+    };
+    crate::local_resource_diagnostics::claude_usage_gaps(
+        [
+            std::iter::once(root).chain(iterations).any(unsplit),
+            !thinking(root) && iterations.iter().any(thinking),
+        ],
+        session,
+    );
 }
 
 /// This response's effective input context — the largest single prompt the model

@@ -12863,20 +12863,12 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         let model = string_at(value, &["message", "model"])
             .or_else(|| string_at(value, &["model"]))
             .or_else(|| string_at(value, &["payload", "model"]));
-        // A call naming another model (a refusal fallback's declined first
-        // attempt) is billed here at the response's model; count it.
-        if claude_code_usage_iterations(root).iter().any(|iteration| {
-            iteration
-                .get("model")
-                .and_then(Value::as_str)
-                .is_some_and(|other| Some(other) != model.as_deref())
-        }) {
-            crate::local_resource_diagnostics::claude_usage_iteration_model_differs();
-        }
-        // A new numeric field would leave money unseen; count it.
-        crate::local_resource_diagnostics::claude_usage_unknown_numeric_keys(
-            claude_code_unknown_usage_keys(root),
-        );
+        // Usage-shape counts; a response's later records (same key) are not
+        // its first.
+        let key = claude_response_key(value, accumulator.claude_response_sequence);
+        let first_record = !accumulator.claude_responses.contains_key(&key);
+        let session = accumulator.source_session_id.as_deref();
+        claude_code_usage_diagnostics(root, model.as_deref(), first_record, session);
         // The derived context bucket is attached only after all content-block
         // records for this response are canonically resolved. Early progressive
         // records may still have zero input/cache counters; classifying those
@@ -13474,8 +13466,8 @@ fn usd_picos_string(value: u128) -> String {
 #[cfg(test)]
 use sources::claude::line::claude_code_cache_creation_split;
 use sources::claude::line::{
-    claude_code_delta_usage, claude_code_effective_input_context, claude_code_unknown_usage_keys,
-    claude_code_usage_dedup_key, claude_code_usage_iterations, claude_code_usage_root,
+    claude_code_delta_usage, claude_code_effective_input_context, claude_code_usage_dedup_key,
+    claude_code_usage_diagnostics, claude_code_usage_iterations, claude_code_usage_root,
 };
 
 fn usage_object_has_numeric_field(root: &Value, fields: &[&str]) -> bool {
