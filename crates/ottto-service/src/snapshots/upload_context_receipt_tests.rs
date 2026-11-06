@@ -2005,15 +2005,27 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     f.index.traversal = None;
     f.cache = Arc::default();
     let previous = f.index.clone();
+    // Select both groups on an ordinary page; the byte cap still fits only
+    // the changed unit. Fewer slots would exercise freshness/fill admission.
     let ((scan, _), order) =
-        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3, false));
+        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 4, false));
     assert!(
         order
             .first()
             .is_some_and(|path| path.ends_with("c.jsonl") || path.ends_with("d.jsonl")),
         "changed group reads; the lexically earlier context-only group does not"
     );
-    assert_eq!(scan.scanned_file_count, 2);
+    assert_eq!(order.len(), 2, "only the changed group's bodies are read");
+    assert_eq!(
+        order.iter().cloned().collect::<BTreeSet<_>>(),
+        [f.root.join("c.jsonl"), f.root.join("d.jsonl")]
+            .into_iter()
+            .collect()
+    );
+    // Both selected groups count as scanned; the context group is a
+    // body-free unchanged decision, not an additional transcript read.
+    assert_eq!(scan.scanned_file_count, 4);
+    assert_eq!(scan.semantic_noop_count, 2);
     assert_eq!(f.send_ordering_page(&previous, &scan).0, 2);
     f.cache = Arc::default();
     // The context-only group never reads for its context.

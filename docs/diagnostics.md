@@ -939,6 +939,22 @@ gate, cap and upload nothing.
 
 Upload counts land on the line after the source's next page line.
 
+## Usage Gap Counters
+
+Each source's `native_collection_page` line can carry four counts of gaps in
+the session bodies that source finished (Claude Code after its local evidence
+fold, before upload). One shared count covers Claude Code, Codex and Pi. Keys
+are nonzero only; an absent key is zero. They are computed from the finished
+bodies without reading or parsing anything again, and they change no body,
+fingerprint or upload. The sync finish runs after the scan's page line, so
+they land on the source's next page line.
+
+- `usage_rows_missing_model_rows` / `_sessions`: requests on usage rows with
+  tokens whose model is `unknown`, the model a parser assigns when the
+  transcript has named none so far.
+- `zero_request_body_with_tokens_bodies` / `_sessions`: bodies with any token
+  count above zero and zero requests.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of

@@ -2525,7 +2525,9 @@ use scan::accumulator::{
     ActivityCallTool, BucketRowAccumulator, CodexOwnershipBoundary, RowKey, SelectorCapture,
     SelectorHashes, SnapshotAccumulator, UsageBucketState, CODEX_THREAD_TIER,
 };
-pub(crate) use scan::accumulator::{copy_unproven_selector_hash, PlacedClaudeUsage};
+pub(crate) use scan::accumulator::{
+    copy_unproven_selector_hash, PlacedClaudeUsage, IMPLICIT_USAGE_MODEL,
+};
 
 #[cfg(test)]
 pub fn scan_source_roots(
@@ -2746,10 +2748,17 @@ crate::durable_tail_codec::durable_enum!(CodexParentUnresolvable {
 });
 crate::heap_layout_bound::no_heap!(true; CodexParentUnresolvable);
 
-/// The frozen-census validity filter: every directory visited, nothing
+fn codex_census_walk_pending(traversal: &ScanTraversalCheckpoint) -> bool {
+    traversal
+        .pending_directories
+        .iter()
+        .any(|d| d.census_member)
+}
+
+/// The frozen-census validity filter: every census-member directory visited, nothing
 /// capped, rejected, unreadable or vanished.
 fn codex_frozen_census_valid(traversal: &ScanTraversalCheckpoint) -> bool {
-    traversal.pending_directories.is_empty()
+    !codex_census_walk_pending(traversal)
         && traversal.counts.directory_entry_cap_exceeded_count == 0
         && traversal.counts.symlink_rejected_count == 0
         && traversal.counts.unreadable_path_count == 0
@@ -3553,7 +3562,7 @@ impl OwnedSourceScan {
             .iter()
             .any(|candidate| candidate.census_member && !candidate.watcher_hint);
         let selection_limit =
-            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
+            if source == SnapshotSource::Codex && codex_census_walk_pending(traversal) {
                 0
             } else {
                 file_limit
@@ -3674,14 +3683,18 @@ impl OwnedSourceScan {
                     traversal.pending_candidates.push_back(candidate);
                 }
             }
-            // If every remaining member has fresh bytes, service those
-            // members in FIFO order rather than wasting their census turn.
-            if census_page && pending_paths.is_empty() {
+            // Fill spare freshness/ordinary slots with cold census members, FIFO
+            // after primary selection. An empty census turn may take fresh members.
+            let census_fill = freshness_page || ordinary_turn;
+            if census_fill || (census_page && pending_paths.is_empty()) {
                 for _ in 0..traversal.pending_candidates.len() {
                     let Some(candidate) = traversal.pending_candidates.pop_front() else {
                         break;
                     };
-                    if pending_paths.len() < limit && candidate.census_member {
+                    if pending_paths.len() < limit
+                        && candidate.census_member
+                        && !(census_fill && codex_fresh_data_pending(&candidate, index))
+                    {
                         pending_paths.push(candidate);
                     } else {
                         traversal.pending_candidates.push_back(candidate);
@@ -3689,9 +3702,8 @@ impl OwnedSourceScan {
                 }
             }
         }
-        // Dedicated turns select only their own work, plus any retry riders:
-        // new hinted members, audits or old groups cannot consume the other
-        // turn's allowance.
+        // Freeze dedicated primary work, retry riders and census fill here;
+        // later hints and audits cannot displace the selected prefix.
         let selection_limit = if freshness_page || census_page || ordinary_turn {
             pending_paths.len()
         } else {
@@ -4152,7 +4164,7 @@ impl OwnedSourceScan {
                     .pending
                     .retain(|path| !carry_deferred.contains(&local_index_key(path)));
                 inventory.held_owners = carry_held_owners;
-                inventory.complete &= traversal.pending_directories.is_empty();
+                inventory.complete &= !codex_census_walk_pending(traversal);
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());
@@ -15538,7 +15550,7 @@ fn refresh_retained_codex_directories(
     index: &ScanIndex,
     growth: Option<&discovery_growth::Page>,
 ) {
-    if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
+    if source != SnapshotSource::Codex || codex_census_walk_pending(traversal) {
         return;
     }
     let recovery = DiscoveryRecovery::from(&index.files);
@@ -15740,14 +15752,15 @@ fn record_codex_inventory_hold(
         .filter(|key| !traversal.codex_rollout_paths.contains(*key))
         .map(|key| (key.clone(), codex_file_join::path_witness(Path::new(key))))
         .collect::<Vec<_>>();
+    let census_walk_pending = codex_census_walk_pending(traversal);
     let hold = traversal
         .residue
         .codex_inventory_hold
         .get_or_insert_with(CodexInventoryHold::default);
     // Without a refused record or an unlisted candidate, the walk's open
     // directories were what kept the roster from proving the page.
-    hold.awaiting_directories |= !traversal.pending_directories.is_empty()
-        || (inventory.refused.is_empty() && outside_roster.is_empty());
+    hold.awaiting_directories |=
+        census_walk_pending || (inventory.refused.is_empty() && outside_roster.is_empty());
     hold.owed.extend(held.iter().cloned());
     // The newest witness is the one a later tick has to see move.
     hold.refused_headers.extend(
@@ -15770,7 +15783,7 @@ fn record_codex_inventory_hold(
 /// capture, send and checkpoint gates as any candidate. If the evidence still
 /// does not prove the page, it is held and recorded again.
 fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTraversalCheckpoint) {
-    if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
+    if source != SnapshotSource::Codex || codex_census_walk_pending(traversal) {
         return;
     }
     let Some(hold) = traversal.residue.codex_inventory_hold.as_ref() else {

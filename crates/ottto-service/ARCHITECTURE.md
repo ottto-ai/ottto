@@ -31,7 +31,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   census and watcher flags. There is no separate archive queue, reservation, pacing or inventory
   population/read-volume limit. A fresh-data page first fills up to half its slots with fresh
   plain rollouts in queue order, so a hinted archive backlog cannot hold recent sessions back;
-  the rest of that page stays FIFO, archives included.
+  the remaining fresh work stays FIFO, archives included. Freshness and ordinary pages
+  then fill spare slots with non-fresh census members in queue order, using the same read
+  budget and deferred-path requeue. Fill does not count as a census turn. A periodic relist
+  can select files and certify their membership from the retained census while only
+  non-census directories remain pending; pending census-member directories still block.
   Compressed rollouts keep their original modification time,
   so they age as the plain file did. Legacy held archive member keys count as already seen
   for the ordinary first-read age gate; their values remain inert, and header/ownership

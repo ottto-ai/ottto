@@ -110,6 +110,16 @@ fn page_observed_on(
     roots: &[PathBuf],
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_with_limit(roots, index, cache, 100, &[], observe)
+}
+fn page_observed_with_limit(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -121,7 +131,7 @@ fn page_observed_on(
                 index,
                 NOW,
                 BACKFILL_WINDOW_DAYS,
-                100,
+                file_limit,
                 None,
                 &[],
                 false,
@@ -140,11 +150,13 @@ fn page_observed_on(
                         mut scan,
                         ..
                     } => {
-                        index.bind_session_accounts(
+                        index.bind_session_accounts_with_mixed(
                             SnapshotSource::Codex,
                             "synthetic-machine",
                             &mut scan.snapshots,
                             &[],
+                            (codex_slots, &mut [0; 9]),
+                            &claude_request_accounts::MixedUploads::default(),
                         );
                         apply_upload_policy(
                             SnapshotSource::Codex,
@@ -1614,4 +1626,199 @@ fn shed_save_commits_heads_only_for_kept_entries() {
         );
         money_oracle::assert_equivalent(&cold, &route(&index, &owed, posts));
     }
+}
+
+/// [money] A paged fresh-plus-fill route equals cold Full across accounts,
+/// a switch, a spawned side call and an evidence gap; restart reads no body.
+#[test]
+fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Codex creator conflicts are a negative control, not request windows.
+    // Reuse the shared supported switch/side-call/gap and accepted-share
+    // positive control; the native route below proves Codex slot row tags.
+    let placement = money_oracle::placement_tests::placement_fixture();
+    let mut placement_route = placement.clone();
+    placement_route.mode = Mode::Ram;
+    money_oracle::assert_equivalent(&placement, &placement_route);
+    let mut moved = placement_route.clone();
+    moved.snapshots.get_mut("main").unwrap()["model_usage"][0]["identity_parts"][0]
+        ["account_identifier_hash"] = json!("b".repeat(64));
+    assert!(
+        std::panic::catch_unwind(|| money_oracle::assert_placement_equivalent(&placement, &moved))
+            .is_err()
+    );
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    append(&c.path(MAIN), &header(MAIN, Some("switched")));
+    append(&c.path(MAIN), &turn(3));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("b"));
+    c.write(GAP, None);
+    for n in 1..=3 {
+        c.write(
+            &format!("019e5a00-0000-7000-8000-00000000000{n}"),
+            Some(if n == 1 { "a" } else { "b" }),
+        );
+    }
+    let hash = |kind: &str, account: &str| {
+        let prefix = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{prefix}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
+    let (cold_index, cold_scan, ..) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        Arc::default(),
+        100,
+        &slots,
+        |_| {},
+    );
+    assert_eq!(cold_scan.snapshots.len(), 7);
+    let (session, mut index) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &c.roots(),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
+    for candidate in &mut index.traversal.as_mut().unwrap().pending_candidates {
+        candidate.watcher_hint = candidate.path == c.path(MAIN);
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut scans = Vec::new();
+    let mut consumed_sets = Vec::new();
+    for fresh in [true, false] {
+        let before = index.clone();
+        let (working, scan, ..) =
+            page_observed_with_limit(&c.roots(), index, cache.clone(), 4, &slots, |selected| {
+                if !selected.codex_join_prepared {
+                    assert_eq!(
+                        selected
+                            .index
+                            .traversal
+                            .as_ref()
+                            .unwrap()
+                            .codex_freshness_yield,
+                        fresh
+                    );
+                    assert_eq!(
+                        selected.codex_selected_flags.len(),
+                        if fresh { 4 } else { 3 }
+                    );
+                    if fresh {
+                        assert_eq!(
+                            selected.identified_candidates.front().unwrap().path,
+                            c.path(MAIN)
+                        );
+                    }
+                }
+            });
+        consumed_sets.push(
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect::<BTreeSet<_>>(),
+        );
+        index = working
+            .checkpoint_with_captured_posts(&scan, &before, "accept")
+            .0;
+        scans.push(scan);
+    }
+    assert!(consumed_sets[0].is_disjoint(&consumed_sets[1]));
+    let mut drained = scans.remove(0);
+    drained.snapshots.extend(scans.remove(0).snapshots);
+    drained.snapshots.sort_by_key(|item| {
+        cold_scan
+            .snapshots
+            .iter()
+            .position(|cold| cold.source_session_id == item.source_session_id)
+            .unwrap()
+    });
+    let cold = emitted(&cold_index, &cold_scan);
+    let paged = emitted(&index, &drained);
+    assert_ne!(
+        cold.snapshots[MAIN]["session_account_evidence"],
+        cold.snapshots[OTHER]["session_account_evidence"]
+    );
+    let account_a = "019e5a00-0000-7000-8000-000000000001";
+    assert!(cold.snapshots[account_a]["session_account_evidence"].is_object());
+    assert!(cold.snapshots[OTHER]["session_account_evidence"].is_object());
+    assert_ne!(
+        cold.snapshots[account_a]["session_account_evidence"],
+        cold.snapshots[OTHER]["session_account_evidence"],
+        "two tagged accounts"
+    );
+    assert!(cold.snapshots[GAP]["session_account_evidence"].is_null());
+    for route in [&cold_scan, &drained] {
+        for item in &route.snapshots {
+            let expected = match item.source_session_id.as_str() {
+                MAIN | GAP => None,
+                id if id == account_a => Some(hash("account", "a")),
+                _ => Some(hash("account", "b")),
+            };
+            assert!(!item.model_usage.is_empty());
+            for row in item.model_usage.iter().chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter()),
+            ) {
+                assert_eq!(
+                    row.account_identifier_hash, expected,
+                    "native Codex row placement"
+                );
+            }
+        }
+    }
+    // Codex uses saved per-session bindings; the request-share ledger in
+    // the shared switch control is Claude-specific. Compare the real Codex
+    // bindings and exact accepted fingerprints instead of fabricating shares.
+    let bindings = serde_json::to_value(&index.session_account_bindings).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::to_value(&cold_index.session_account_bindings).unwrap()
+    );
+    assert!(drained.snapshots.iter().all(|item| index
+        .accepted_snapshot_fingerprints
+        .contains(&item.snapshot_fingerprint)));
+    money_oracle::assert_equivalent(&cold, &paged);
+    let mut wrong = paged.clone();
+    wrong.snapshots.get_mut(OTHER).unwrap()["model_usage"][0]["account_identifier_hash"] =
+        json!(hash("account", "a"));
+    assert!(
+        std::panic::catch_unwind(|| money_oracle::assert_placement_equivalent(&cold, &wrong))
+            .is_err()
+    );
+    let index = ScanIndex::load(session.path()).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::to_value(&index.session_account_bindings).unwrap()
+    );
+    assert_quiet(&c, index, &paged);
 }
