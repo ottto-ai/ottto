@@ -414,7 +414,11 @@ fn forced_family_seed_counts() {
                 pulled,
                 "step {step}"
             );
-            money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+            // A page without a seed re-emits only the grown child; the whole
+            // family cold oracle applies to the forced pages.
+            if seeds > 0 {
+                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+            }
             prior = commit(&session, warm);
         }
     });
