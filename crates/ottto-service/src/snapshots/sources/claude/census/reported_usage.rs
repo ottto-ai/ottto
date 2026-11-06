@@ -317,6 +317,8 @@ fn apply_claude_reported_usage_with_index_and_rows(
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
     }
+    // The rebuild above was the only reader of the cloned family rows.
+    drop(reconstructed);
 
     // Every certified item keeps its own-only scalars by the file birth rule.
     // Loaded telemetry only vetoes them.
