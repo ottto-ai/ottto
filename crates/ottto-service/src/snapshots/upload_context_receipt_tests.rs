@@ -2005,8 +2005,10 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     f.index.traversal = None;
     f.cache = Arc::default();
     let previous = f.index.clone();
+    // Select both groups on an ordinary page; the byte cap still fits only
+    // the changed unit. Fewer slots would exercise freshness/fill admission.
     let ((scan, _), order) =
-        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3, false));
+        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 4, false));
     assert!(
         order
             .first()
