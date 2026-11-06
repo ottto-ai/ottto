@@ -378,7 +378,7 @@ are `null`. Unix observation time and process id support comparison with an
 independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
-Claude Code's local-evidence stage adds three such footprint records (none on
+Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
@@ -387,7 +387,12 @@ final sort) are summed over roots into one record each per pass, with
 `wall_elapsed_us` and `shared_process_cpu_delta_us` (two CPU samples per root
 step) and no footprint fields. `evidence_cross_root` counts carry
 `demanded_requests`: the page's demanded request ids each root is joined against.
-Of the three footprint records, only `evidence_read` has counts: one
+Inside `evidence_fold`, one footprint record per step, in order and without
+counts: `evidence_side_calls` (side calls and the read holds),
+`evidence_identity_index`, `evidence_reported_usage`, `evidence_reconcile`
+(request accounts and activity staging), `evidence_finish_page`,
+`evidence_identity_tags`, `evidence_qualification` and `evidence_census_health`.
+Of the three outer footprint records, only `evidence_read` has counts: one
 `evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
 bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
 after the cross-root finish; `null` off macOS), `footprint_bytes` (physical

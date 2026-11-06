@@ -9311,6 +9311,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     drop(read_window);
     let fold_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_fold");
+    // Nested footprint windows, one per fold step. Counts only.
+    let step = |stage: &'static str| {
+        crate::local_resource_diagnostics::StageWindow::begin("claude_code", stage)
+    };
+    let window = step("evidence_side_calls");
     // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
@@ -9336,6 +9341,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         stats.trace_discard_deferred_items = deferred;
         unfolded
     };
+    drop(window);
+    let window = step("evidence_identity_index");
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
     let identity_evidence = builds_evidence.then(|| {
@@ -9354,6 +9361,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
     });
+    drop(window);
+    let window = step("evidence_reported_usage");
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_rows(
         scan_result,
         &api_report,
@@ -9366,6 +9375,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         },
     );
     drop(whole_corpus);
+    drop(window);
+    let window = step("evidence_reconcile");
     if let Some(evidence) = &identity_evidence {
         crate::snapshots::claude_request_identity::reconcile_request_accounts(
             &mut scan_result.snapshots,
@@ -9380,6 +9391,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &request_owned_originals,
         )
     });
+    drop(window);
+    let window = step("evidence_finish_page");
     // `e2` bodies are final before any identity owner runs: contract 5, transcript ownership and
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
@@ -9422,6 +9435,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         // upload tuple, and it stays owed for a later page.
         index.hold_claude_history_for_unread_telemetry();
     }
+    drop(window);
+    let window = step("evidence_identity_tags");
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: the ownership step below leaves new-collector items untouched.
         let request_identity = crate::snapshots::claude_request_identity::apply_scan_page(
@@ -9440,6 +9455,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             );
         }
     }
+    drop(window);
+    let window = step("evidence_qualification");
     let qualification = match &identity_evidence {
         Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
             &mut scan_result.snapshots,
@@ -9455,8 +9472,12 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &originals,
         ),
     };
+    drop(window);
     drop(identity_evidence);
     drop(cross);
+    // Qualification above was the last row reader.
+    drop(api_report);
+    drop(trace_report);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9504,7 +9525,9 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         .count();
     stats.request_census = scan_result.claude_request_census_shadow;
     stats.context_file_birth = disposition.context_file_birth.clone();
+    let window = step("evidence_census_health");
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    drop(window);
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
