@@ -2,6 +2,7 @@
 //! readers, the source session id a transcript resolves to, and the epoch
 //! gates and listing/retry limits.
 
+pub(super) mod accumulator;
 pub(super) mod json_fields;
 pub(super) mod limits;
 pub(super) mod lines;
