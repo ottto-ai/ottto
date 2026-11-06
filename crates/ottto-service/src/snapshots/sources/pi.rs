@@ -10,10 +10,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::snapshots::scan::json_fields::{string_at, string_eq_at, u64_at};
 use crate::snapshots::scan_index::file_set_digest::update_length_prefixed;
 use crate::snapshots::{
-    bounded_rfc3339_millis, pi_prompt_content, pi_selector_from_custom,
-    pi_selector_from_usage_message, pi_usage_costs_with_observations, text_from_array,
-    usage_object_has_numeric_field, PiFork, PiLedger, PiUsageDedupState, SelectorCapture,
-    SnapshotAccumulator, UsageTotals,
+    bounded_rfc3339_millis, normalize_title, pi_prompt_content, pi_selector_from_custom,
+    pi_selector_from_usage_message, usage_object_has_numeric_field, SelectorCapture,
+    SnapshotAccumulator, UsageCosts, UsageTotals, PI_COST_FIELD_CEILING_PICOS,
 };
 
 pub(in crate::snapshots) fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
@@ -548,3 +547,244 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
         .min(flat);
     (flat.saturating_sub(cache_1h), cache_1h)
 }
+
+fn text_from_array(value: Option<&Value>) -> Option<String> {
+    let Value::Array(items) = value? else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    for item in items {
+        match item {
+            Value::String(text) => parts.push(text.as_str()),
+            Value::Object(_) => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("input_text").and_then(Value::as_str))
+                {
+                    parts.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    normalize_title(parts.join("\n"))
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PiUsageDedupState {
+    pub(in crate::snapshots) message: BTreeMap<String, usize>,
+    pub(in crate::snapshots) message_end: BTreeMap<String, usize>,
+    pub(in crate::snapshots) paired_digests: BTreeSet<String>,
+}
+
+/// The accumulator's Pi-only state: the usage dedup ledger and the fork
+/// state. Claude and Codex leave it empty and never store it.
+#[derive(Clone, Default)]
+pub(crate) struct PiLedger {
+    usage_keys: BTreeMap<String, PiUsageDedupState>,
+    /// Set only for a file whose header names a parent; boxed so other
+    /// accumulators pay one pointer.
+    fork: Option<Box<PiFork>>,
+}
+
+/// Pi fork copies: Pi `--fork` and `/fork` copy the parent's entries, with
+/// their ids and timestamps, after a header that names `parentSession` at the
+/// fork time. The fork owns only what happened at or after its header time.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct PiFork {
+    /// Persisted (L): the local-only header time, unix nanos; `None` when the header
+    /// time is missing or invalid, which counts every entry.
+    header_nanos: Option<i128>,
+}
+
+#[derive(Default)]
+pub(in crate::snapshots) struct PiCostObservations {
+    pub(in crate::snapshots) refused: u64,
+    pub(in crate::snapshots) rounded: u64,
+}
+
+pub(in crate::snapshots) fn pi_usage_costs_with_observations(
+    usage: &Value,
+) -> (UsageCosts, PiCostObservations) {
+    let mut observations = PiCostObservations::default();
+    let Some(cost) = usage.get("cost") else {
+        return (
+            UsageCosts {
+                observed: true,
+                ..UsageCosts::default()
+            },
+            observations,
+        );
+    };
+    let mut parse = |keys: &[&str]| match usd_picos_at(cost, keys) {
+        Ok((picos, rounded)) => {
+            observations.rounded += u64::from(rounded);
+            Some(picos)
+        }
+        Err(PiCostParseError::Overflow) => {
+            observations.refused += 1;
+            None
+        }
+        Err(PiCostParseError::Invalid) => None,
+    };
+    let total = parse(&["total"]);
+    let input = parse(&["input"]);
+    let output = parse(&["output"]);
+    let cache_read = parse(&["cacheRead", "cache_read"]);
+    let cache_creation = parse(&["cacheWrite", "cache_write"]);
+    let reported = [total, input, output, cache_read, cache_creation]
+        .iter()
+        .any(Option::is_some);
+    (
+        UsageCosts {
+            observed: true,
+            reported,
+            total,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        },
+        observations,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum PiCostParseError {
+    Invalid,
+    Overflow,
+}
+
+pub(in crate::snapshots) fn usd_picos_at(
+    value: &Value,
+    keys: &[&str],
+) -> Result<(u128, bool), PiCostParseError> {
+    let raw = keys.iter().find_map(|key| value.get(*key));
+    match raw {
+        // serde_json has no arbitrary_precision feature here; integers remain exact.
+        // The number form is exact only to f64's shortest round-trip representation; the string form is exact to its lexeme.
+        Some(Value::Number(number)) => parse_pi_usd_picos(&number.to_string()),
+        Some(Value::String(text)) => parse_pi_usd_picos(text),
+        _ => Err(PiCostParseError::Invalid),
+    }
+}
+
+/// Checked decimal dollars to picos; the bool records sub-pico precision.
+pub(in crate::snapshots) fn parse_pi_usd_picos(
+    text: &str,
+) -> Result<(u128, bool), PiCostParseError> {
+    use PiCostParseError::{Invalid, Overflow};
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(Invalid);
+    }
+    let (negative_exponent, exponent_digits) = if let Some(digits) = exponent.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, exponent.strip_prefix('+').unwrap_or(exponent))
+    };
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Invalid);
+    }
+    let coefficient = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .try_fold(0u128, |n, b| {
+            n.checked_mul(10)?.checked_add(u128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = exponent_digits
+        .bytes()
+        .try_fold(0i128, |n, b| {
+            n.checked_mul(10)?.checked_add(i128::from(b - b'0'))
+        })
+        .ok_or(Overflow)?;
+    let exponent = if negative_exponent {
+        -exponent
+    } else {
+        exponent
+    };
+    let shift = exponent
+        .checked_sub(i128::try_from(fraction.len()).map_err(|_| Overflow)?)
+        .and_then(|n| n.checked_add(12))
+        .ok_or(Overflow)?;
+    let (picos, rounded) = if shift >= 0 {
+        let picos = if coefficient == 0 {
+            0
+        } else {
+            let power = u32::try_from(shift).map_err(|_| Overflow)?;
+            coefficient
+                .checked_mul(10u128.checked_pow(power).ok_or(Overflow)?)
+                .ok_or(Overflow)?
+        };
+        (picos, false)
+    } else {
+        // 10^39 exceeds u128::MAX, so every representable coefficient is
+        // strictly below its halfway point (and rounds to zero).
+        let Some(power) = shift
+            .checked_neg()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= 38)
+        else {
+            return Ok((0, true));
+        };
+        let divisor = 10u128.checked_pow(power).ok_or(Overflow)?;
+        let floor = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        // Refuse even a sub-pico excess above the dollar ceiling, before rounding.
+        if floor > PI_COST_FIELD_CEILING_PICOS
+            || (floor == PI_COST_FIELD_CEILING_PICOS && remainder != 0)
+        {
+            return Err(Overflow);
+        }
+        let round_up = remainder > divisor / 2 || (remainder == divisor / 2 && floor % 2 != 0);
+        (
+            floor.checked_add(u128::from(round_up)).ok_or(Overflow)?,
+            true,
+        )
+    };
+    if picos > PI_COST_FIELD_CEILING_PICOS {
+        return Err(Overflow);
+    }
+    Ok((picos, rounded))
+}
+
+crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
+// Hand-written so an absent fork costs no visit: every Claude and Codex
+// accumulator carries an empty ledger, and their frames must keep the visit
+// count they had before the ledger gained its fork. A present fork is charged
+// exactly as `Option<Box<PiFork>>`, including the box's allocation.
+impl crate::heap_layout_bound::HeapLayoutBound for PiLedger {
+    fn stable_heap(&self) -> bool {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::stable_heap(usage_keys) && fork.as_ref().map_or(true, B::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        use crate::heap_layout_bound::HeapLayoutBound as B;
+        let Self { usage_keys, fork } = self;
+        B::completed_heap_bound(usage_keys, c)?;
+        match fork {
+            Some(_) => B::completed_heap_bound(fork, c),
+            None => Some(()),
+        }
+    }
+}
+crate::heap_layout_bound::fields!(PiFork; header_nanos);
