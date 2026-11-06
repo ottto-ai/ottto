@@ -370,10 +370,20 @@ pub(crate) fn prepare(
     let nonce = request.nonce.clone();
     let spent = nonce.is_some() && nonce == index.copy_prefix_last_accepted_nonce;
     match prepare_request(index, request, roots, collected_at, window_days) {
-        // Re-read first: a concurrent `--replace` is new intent, never removed.
-        Err(_) if spent && bounded_json::<Request>(&path).is_ok_and(|r| r.nonce == nonce) => {
-            fs::remove_file(&path)?;
+        Err(error) if spent => {
+            // Take the file atomically, then check it: a concurrent
+            // `--replace` is new intent, put back and never removed.
+            let taken = path.with_file_name(format!(".copy-prefix-retired-{}", std::process::id()));
+            fs::rename(&path, &taken)?;
+            let retired = bounded_json::<Request>(&taken).is_ok_and(|r| r.nonce == nonce);
+            if !retired {
+                if let Err(e) = fs::hard_link(&taken, &path) {
+                    ensure!(e.kind() == std::io::ErrorKind::AlreadyExists, e);
+                }
+            }
+            fs::remove_file(&taken)?;
             sync_checkpoint_parent(&path)?;
+            ensure!(retired, error);
             eprintln!("local Claude copy-prefix re-read: request_retired=1");
             Ok(Vec::new())
         }

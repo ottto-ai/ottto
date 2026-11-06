@@ -470,6 +470,7 @@ fn refused_spent_request_is_retired_without_touching_debt() {
         .unwrap();
     assert!(prepare(&mut index, &support, roots).unwrap().is_empty());
     assert!(!file.exists(), "spent request retired");
+    assert_eq!(fs::read_dir(file.parent().unwrap()).unwrap().count(), 0);
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
     assert_eq!(index.copy_prefix_last_accepted_nonce, accepted);
     assert!(prepare(&mut index, &support, roots).unwrap().is_empty());
