@@ -188,8 +188,9 @@ pub(super) struct Active {
     /// This read is a protected-tier replay: a non-Full read found protected
     /// tiers and re-reads the file from its start (D168 `tier_prefix_replay`).
     pub(super) tier_prefix_replay: bool,
+    pub(super) census_base_bound: bool,
 }
-crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay);
+crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound);
 
 impl Context {
     #[inline(never)]

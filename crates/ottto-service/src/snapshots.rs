@@ -12235,16 +12235,19 @@ impl OwnedSourceScan {
                             complete: parse_complete,
                             lossy: terminal_loss.is_some(),
                             source_verified,
-                            // Unchanged already checked physical identity and
-                            // acquisition scope against the prior checkpoint.
-                            // Keep census authority separate from Full credit.
-                            unchanged_source: cursor_fragment.is_none()
+                            // The loader bound the predecessor; completion must
+                            // seal the whole loss-free suffix. This is not Full credit.
+                            continued_source: cursor_fragment.is_none()
                                 && file_sampling.as_ref().is_some_and(|active| {
-                                    active.mode
-                                        == crate::transcript_acquisition::ReadMode::Unchanged
+                                    active.census_base_bound
+                                        && matches!(
+                                            active.mode,
+                                            crate::transcript_acquisition::ReadMode::Unchanged
+                                                | crate::transcript_acquisition::ReadMode::Tail
+                                        )
                                 })
                                 && completed_acquisition.as_ref().is_some_and(|completed| {
-                                    completed.checkpoint.audit_debt().is_none()
+                                    completed.checkpoint.sealed_offset() == candidate.size_bytes
                                 })
                                 && sampled_jsonl::loss_free_source_report(
                                     &report,
@@ -14264,6 +14267,33 @@ impl OwnedSourceScan {
                         }
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
+                        let census_base_bound = retained
+                            .as_ref()
+                            .zip(index.files.get(&key))
+                            .is_some_and(|(old, entry)| {
+                                old.checkpoint
+                                    .durable_certificate(candidate.fingerprint_birth_nanos)
+                                    .is_some_and(|cert| {
+                                        cert.length == cert.sealed_offset
+                                            && entry.size_bytes == cert.sealed_offset
+                                            && entry.modified_unix_nanos.is_some_and(|nanos| {
+                                                cert.modified
+                                                    == (
+                                                        (nanos / 1_000_000_000) as i64,
+                                                        (nanos % 1_000_000_000) as i64,
+                                                    )
+                                            })
+                                            && entry.opened_birth_nanos == cert.birth_nanos
+                                            && index.claude_request_census.get(&key).is_some_and(
+                                                |record| {
+                                                    claude_request_census::fingerprint_matches(
+                                                        record,
+                                                        &entry.source_file_fingerprint,
+                                                    )
+                                                },
+                                            )
+                                    })
+                            });
                         let mode = match parser.prepare_acquisition(
                             retained,
                             &scope,
@@ -14345,6 +14375,7 @@ impl OwnedSourceScan {
                             mode,
                             audit_due,
                             tier_prefix_replay: false,
+                            census_base_bound,
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -14408,6 +14439,7 @@ impl OwnedSourceScan {
                             mode,
                             audit_due: None,
                             tier_prefix_replay: false,
+                            census_base_bound: false,
                         });
                     }
                 }

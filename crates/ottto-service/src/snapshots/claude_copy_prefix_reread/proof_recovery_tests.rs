@@ -355,7 +355,7 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
                 complete: true,
                 lossy: false,
                 source_verified: false,
-                unchanged_source: false,
+                continued_source: false,
                 itemless_request_hashes: vec![census::claude_request_hash("request-0")],
                 opened_birth: None,
                 modified_unix_seconds: rfc3339_unix_seconds("2026-06-15T00:00:00Z").unwrap(),

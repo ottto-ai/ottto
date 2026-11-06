@@ -446,7 +446,28 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     let unanswered = refusals();
     assert_eq!(unanswered.len(), 1);
     assert!(unanswered[0].contains("reason=digest_mismatch class=accepted "));
-    assert!(unanswered[0].ends_with(" bad_refs=1 answered=false"));
+    let parts = [
+        serde_json::json!(&item.session_account_evidence),
+        serde_json::json!((&item.tool_usage, item.tool_usage_truncated)),
+        serde_json::json!((&item.cache_observations, &item.cache_observations_state)),
+    ]
+    .map(|part| {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).unwrap())
+        )[..8]
+            .to_owned()
+    });
+    assert!(unanswered[0].ends_with(&format!(
+        " bad_refs=1 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
+        &snapshot_upload_body_witness(&item)[..8],
+        parts[0],
+        parts[1],
+        parts[2],
+    )));
+    assert!(!unanswered[0].contains(&item.source_session_id));
+    assert!(!unanswered[0].contains(&"0".repeat(64)));
 
     // That predecessor is now stale on the server: conflict with challenge.
     let (result, _) = cycle(&mut progress, &item, 1_001, |item| {
@@ -488,10 +509,12 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         [format!(
             "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
              class=accepted session_hash={} fingerprint={} witness_version={version} \
-             echoed_witness_version={version} bad_refs=1 answered=true",
+             echoed_witness_version={version} bad_refs=1 answered=true expected_digest={} account_part={} tool_part={} cache_part={}",
             &key[..8],
-            &item.snapshot_fingerprint[..8]
-        )]
+            &item.snapshot_fingerprint[..8],
+                &crate::snapshots::snapshot_upload_body_witness(&item)[..8],
+                parts[0], parts[1], parts[2],
+            )]
     );
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
     assert_eq!(

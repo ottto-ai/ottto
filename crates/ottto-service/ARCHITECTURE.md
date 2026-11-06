@@ -123,6 +123,9 @@ raises the refusal alarm. Claude, Codex and Pi share this machinery.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
   reconstructing them. No historical sessions are selected just to enrich metadata.
+- Claude's identity-incomplete request census keeps source verification through a complete,
+  loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
+  request identities, complete-negative evidence, Full audit credit or upload acceptance.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

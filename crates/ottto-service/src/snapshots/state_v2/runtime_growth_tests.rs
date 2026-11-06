@@ -698,7 +698,7 @@ fn growth_never_suppresses_lossy_records_or_failed_validation() {
                     complete: case != "incomplete",
                     lossy: case != "no_record",
                     source_verified: true,
-                    unchanged_source: false,
+                    continued_source: false,
                     itemless_request_hashes: vec![8, 9],
                     opened_birth: None,
                     modified_unix_seconds: 1,

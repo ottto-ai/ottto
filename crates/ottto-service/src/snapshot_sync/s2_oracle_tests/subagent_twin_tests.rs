@@ -355,6 +355,146 @@ fn growth_on_either_home_and_main_only() {
     });
 }
 
+fn assert_verified_incomplete(index: &ScanIndex, key: &str) {
+    use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
+    let record = index.claude_request_census_for_test().get(key).unwrap();
+    assert_eq!(
+        record.shape_for_test(),
+        ClaudeRequestCensusShape::IdentityIncomplete
+    );
+    assert!(!record.unverified_for_test());
+    assert!(
+        !record.current_for(&index.files[key].source_file_fingerprint),
+        "source proof is not complete-negative authority"
+    );
+}
+
+/// [money] A verified identity gap survives ordinary Tail, forced growth
+/// and forced Unchanged in either discovery order, with exact placement ACKs.
+#[test]
+fn identity_incomplete_continuation_keeps_native_source_proof() {
+    with_e2(|| {
+        let mut idless: serde_json::Value =
+            serde_json::from_str(&line(ROOT, "main-gap", TURN, 4)).unwrap();
+        idless.as_object_mut().unwrap().remove("requestId");
+        idless["message"].as_object_mut().unwrap().remove("id");
+        let gap = idless.to_string() + "\n";
+        for reverse in [false, true] {
+            let c = twins(
+                &format!("census-continuation-{reverse}"),
+                reverse,
+                TURN,
+                false,
+                true,
+            );
+            let home = if reverse { "a" } else { "z" };
+            let main = c.root.join(format!("{home}/{ROOT}.jsonl"));
+            append(&main, &gap);
+            let key = main.to_string_lossy().into_owned();
+            let (session, index) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let first = page(&c, index, 100, true);
+            let initial = result(&first, Mode::ColdFull);
+            assert!(accounts(&initial).len() >= 2);
+            assert!(initial
+                .accepted_identity_buckets
+                .as_ref()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|v| !v.is_null()));
+            let mut prior = commit(&session, first);
+            assert_verified_incomplete(&prior, &key);
+            for (step, path) in [
+                main.clone(),
+                c.root.join(member(home, 1)),
+                main.clone(),
+                c.root.join(member(if reverse { "z" } else { "a" }, 1)),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let suffix = line(ROOT, &format!("proof-growth-{step}"), GROW, 8);
+                append(path, &suffix);
+                let expected = cold(&c);
+                let (warm, bytes) = fixture::observe_consumed(|| {
+                    hinted(&c, prior.clone(), 100, true, std::slice::from_ref(path))
+                });
+                assert_eq!(
+                    warm.modes.0, 0,
+                    "verified base must not Full on cycle {step}"
+                );
+                assert!(warm.modes.1 > 0);
+                assert_eq!(
+                    bytes,
+                    suffix.len() as u64,
+                    "body I/O is only the appended suffix"
+                );
+                assert_verified_incomplete(&warm.index, &key);
+                let actual = result(&warm, Mode::DiskRestore);
+                // Family refolding can also move an unchanged session's
+                // carrier. Money/placement and every other body field stay exact.
+                assert_money_equivalent_but_carrier_end(&expected, &actual);
+                assert!(actual.accepted_identity_buckets.is_some());
+                prior = commit(&session, warm);
+                assert_verified_incomplete(&prior, &key);
+                assert!(
+                    crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+                        SOURCE,
+                        &E2ScanFixture::capturing_identity().cache,
+                        &prior,
+                        &key
+                    )
+                    .unwrap()
+                    .audit_debt()
+                    .is_some(),
+                    "Tail keeps its Full-audit debt"
+                );
+            }
+        }
+        // The family cycle above exercises both homes. A single-source legacy
+        // store isolates exactly one missing head instead of bootstrapping all
+        // seven physical family members at once.
+        let mut c = corpus("census-continuation-upgrade");
+        let main = c.root(ROOT, &(line(ROOT, "upgrade-base", TURN, 10) + &gap));
+        let key = main.to_string_lossy().into_owned();
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let prior = commit(&session, page(&c, index, 100, true));
+        assert_verified_incomplete(&prior, &key);
+        let upgraded = fixture::upgrade_from_legacy_store(&prior, &c.base.join("legacy.json"));
+        assert_verified_incomplete(&upgraded, &key);
+        append(&main, &line(ROOT, "upgrade-proof", GROW, 8));
+        let expected = cold(&c);
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut restored = c.raw(&scanner, upgraded, 100, true, std::slice::from_ref(&main));
+        restored.enrich(&c);
+        assert_eq!(restored.modes.0, 1, "the legacy store has no Tail custody");
+        assert_verified_incomplete(&restored.index, &key);
+        money_oracle::assert_equivalent(&expected, &result(&restored, Mode::Restart));
+        restored.finish();
+        let prior = c.reload(&mut restored.index);
+        append(&main, &line(ROOT, "after-upgrade-proof", GROW, 8));
+        let expected = cold(&c);
+        let mut continued = c.raw(&scanner, prior, 100, true, &[main]);
+        continued.enrich(&c);
+        assert_eq!(
+            continued.modes.0, 0,
+            "the saved upgrade Full now permits Tail"
+        );
+        assert!(continued.modes.1 > 0);
+        assert_verified_incomplete(&continued.index, &key);
+        money_oracle::assert_equivalent(&expected, &result(&continued, Mode::Restart));
+    });
+}
+
 /// [money] Two accounts, a mid-child switch, a priced side call, an
 /// estimated evidence gap and a tagged row match one-home placement.
 #[test]

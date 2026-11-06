@@ -163,8 +163,8 @@ pub(crate) struct ClaudeRequestCensusRecord {
     shape: ClaudeRequestCensusShape,
     /// The parsed content (root, member) differs from the path-derived pair.
     twin: bool,
-    /// Not source-verified (a tail parse that still owes
-    /// its sampled audit, or a read that cannot certify its source). The census
+    /// Not source-verified (a read without a proven complete predecessor
+    /// and loss-free continuation, or a native read that lost source data). The census
     /// produces it as for a verified parse and only notes it here.
     unverified: bool,
     /// Sorted, strictly ascending `claude_request_hash` of every request id
@@ -1752,10 +1752,9 @@ pub(crate) struct ClaudeRequestCensusParse<'a> {
     pub(crate) complete: bool,
     pub(crate) lossy: bool,
     pub(crate) source_verified: bool,
-    /// Successful, loss-free, debt-free Unchanged acquisition. Its checkpoint
-    /// binds the same physical object and interpretation scope; this is not
-    /// Full credit and cannot promote an unverified census record.
-    pub(crate) unchanged_source: bool,
+    /// Complete, loss-free continuation of the bound predecessor. This is
+    /// not Full credit and cannot promote an unverified census record.
+    pub(crate) continued_source: bool,
     pub(crate) itemless_request_hashes: Vec<u64>,
     /// Creation time and identity of the object this parse opened, when the
     /// parse opened one and the file system reports a creation time.
@@ -1791,8 +1790,8 @@ pub(super) fn claude_buffered_request_hashes(parser: &super::OwnedJsonlParser) -
 /// Every Claude family-member parse that reaches `finish` replaces the key's
 /// record with one bound to the candidate fingerprint and this window: a
 /// complete parse by its shape, an incomplete or residue parse as `Lossy`
-/// with the ids it saw. Only an identical, debt-free Unchanged completion
-/// carries forward an existing record's verification.
+/// with the ids it saw. A bound continuation preserves source verification
+/// for identity-incomplete results; complete negative evidence stays strict.
 pub(crate) fn record_claude_request_census(
     index: &mut ScanIndex,
     parse: ClaudeRequestCensusParse<'_>,
@@ -1843,14 +1842,15 @@ pub(crate) fn record_claude_request_census(
                     ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
                 )
         };
-        if parse.unchanged_source
+        if parse.continued_source
             && parse.complete
             && !parse.lossy
             && comparable(old)
             && old.derivation == record.derivation
-            && old.source_file_fingerprint == record.source_file_fingerprint
-            && old.shape == record.shape
-            && old.request_hashes == record.request_hashes
+            && (record.shape == ClaudeRequestCensusShape::IdentityIncomplete
+                || (old.source_file_fingerprint == record.source_file_fingerprint
+                    && old.shape == record.shape
+                    && old.request_hashes == record.request_hashes))
             && old.twin == record.twin
         {
             record.unverified = false;
