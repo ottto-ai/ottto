@@ -1387,6 +1387,8 @@ impl SnapshotAccumulator {
             .extend(std::mem::take(&mut other.activity_changed_file_hashes));
         self.activity_skills
             .extend(std::mem::take(&mut other.activity_skills));
+        self.provider_skills
+            .extend(std::mem::take(&mut other.provider_skills));
         self.skill_detector_incomplete |= other.skill_detector_incomplete;
         self.tool_usage_truncated |= other.tool_usage_truncated;
         self.add_artifacts(std::mem::take(&mut other.artifacts));

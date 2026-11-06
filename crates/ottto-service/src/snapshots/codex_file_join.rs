@@ -6,9 +6,9 @@ use crate::transcript_acquisition::FileStamp;
 mod group_job;
 mod independent_fold;
 pub(super) use group_job::{
-    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key,
-    refusal_disclosure, step_group, take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob,
-    GroupStep, JobInputs, StepInputs,
+    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key, rearm_unsettled,
+    refusal_disclosure, refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot,
+    GroupEnd, GroupJob, GroupStep, JobInputs, StepInputs,
 };
 pub(super) use independent_fold::fold as fold_independent;
 
@@ -494,7 +494,7 @@ impl HeaderInventory {
                 .map(PathBuf::from)
                 .collect(),
             headers: Vec::new(),
-            held_owners: BTreeSet::new(),
+            held_owners: group_job::unsealed_owners(paths),
             directories: directories.cloned().unwrap_or_default(),
             complete: directories.is_some_and(|value| value.stable),
             read_bytes: 0,
@@ -572,6 +572,12 @@ impl HeaderInventory {
         let Some(path) = self.pending.pop_front() else {
             return true;
         };
+        if codex_session_id_candidates_from_path(&path)
+            .iter()
+            .any(|owner| self.held_owners.contains(owner))
+        {
+            return false;
+        }
         let Some(scan_root) = self.scan_root(&path) else {
             self.complete = false;
             self.refused

@@ -66,6 +66,9 @@ impl ScanIndex {
         index.settle_loaded_index(path);
         let first_load_in_process = index.note_first_index_load(path);
         if first_load_in_process {
+            if source == SnapshotSource::Codex {
+                codex_file_join::rearm_unsettled(&mut index);
+            }
             requeue_unindexed_observed(source, &mut index);
         }
         if source == SnapshotSource::ClaudeCode

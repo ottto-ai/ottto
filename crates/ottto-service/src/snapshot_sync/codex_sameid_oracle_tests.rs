@@ -46,6 +46,35 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     let paths = revert_archives(&c, "a");
     let (session, previous) =
         StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
+    // Model the prior binary's accepted unchanged singleton state: no joined
+    // marker exists yet, but all physical revisions and acceptance remain.
+    let (mut legacy, old_scan, _) = page(&c, &E2ScanFixture::default(), previous.clone());
+    legacy.record_accepted_snapshot_fingerprints(
+        &old_scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    for entry in legacy.files.values_mut() {
+        entry.codex_joined_member_set = None;
+        entry.codex_captured_joined_member_set = None;
+        entry.codex_captured_uncommitted = false;
+        entry.codex_captured_tier_receipt_required = false;
+    }
+    let mut legacy = session.save_reload(&mut legacy);
+    assert!(legacy
+        .files
+        .values()
+        .all(|entry| !entry.source_file_fingerprint.is_empty()));
+    // Same existing first-load re-arm used by the source-aware install/restart
+    // loader. It changes only owed source state and the observed-file queue.
+    crate::snapshots::codex_file_join::rearm_unsettled(&mut legacy);
+    assert!(legacy
+        .files
+        .values()
+        .all(|entry| entry.source_file_fingerprint.is_empty()));
+    let previous = legacy;
     let (mut index, scan, _) = page(&c, &E2ScanFixture::default(), previous.clone());
     assert_eq!(scan.snapshots.len(), 1, "one upload body for both files");
     assert_eq!(scan.snapshots[0].request_count, 96);
@@ -109,7 +138,15 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     assert_eq!(std::fs::read(&progress_path).unwrap(), after);
     let recovered: SnapshotUploadProgress = serde_json::from_slice(&after).unwrap();
     settle_index_after_upload(&mut index, &captured, &recovered);
-    let prior = session.save_reload(&mut index);
+    let mut prior = session.save_reload(&mut index);
+    crate::snapshots::codex_file_join::rearm_unsettled(&mut prior);
+    assert!(
+        prior
+            .files
+            .values()
+            .all(|entry| !entry.source_file_fingerprint.is_empty()),
+        "a settled group never re-arms on install/restart"
+    );
     assert!(prior
         .files
         .values()

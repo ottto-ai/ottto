@@ -73,21 +73,113 @@ pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulat
     accumulator.codex_counting_v2()
 }
 
+fn filename_owner(path: &Path) -> Option<(String, bool)> {
+    use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped as uuid;
+    codex_session_id_candidates_from_path(path)
+        .into_iter()
+        .find_map(|id| {
+            if uuid(&id) {
+                return Some((resolve_codex_identity(&id), false));
+            }
+            let (conversation, rollout) = id.split_once('_')?;
+            (uuid(conversation) && uuid(rollout))
+                .then(|| (resolve_codex_identity(conversation), true))
+        })
+}
+
+fn independent_path(path: &Path, owner: &str) -> bool {
+    filename_owner(path).is_some_and(|(native, revert)| revert && native == owner)
+}
+
+/// Filename evidence can hold a group before any header is read; it cannot
+/// admit a body. Use the inventory's existing owner hold for live members.
+pub(super) fn unsealed_owners(paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut groups = BTreeMap::<(PathBuf, String), (Vec<&String>, bool, bool)>::new();
+    for key in paths {
+        let path = Path::new(key);
+        if shadowed_compressed_path(path, paths) {
+            continue;
+        }
+        let Some((owner, revert)) = filename_owner(path) else {
+            continue;
+        };
+        let home = member_home(path.parent().unwrap_or(path));
+        let group = groups.entry((home, owner)).or_default();
+        group.0.push(key);
+        group.1 |= revert;
+        group.2 |= !codex_archive_path(path);
+    }
+    groups
+        .into_values()
+        .filter(|(keys, revert, live)| keys.len() > 1 && *revert && *live)
+        .flat_map(|(keys, _, _)| {
+            keys.into_iter()
+                .flat_map(|key| codex_session_id_candidates_from_path(Path::new(key)))
+        })
+        .collect()
+}
+
 pub(super) fn independent_group(group: &Group) -> bool {
-    use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped;
-    group.members.iter().any(|member| {
-        codex_session_id_candidates_from_path(&member.path)
-            .iter()
-            .any(|identity| {
-                identity
-                    .split_once('_')
-                    .is_some_and(|(conversation, rollout)| {
-                        codex_identity_is_uuid_shaped(conversation)
-                            && codex_identity_is_uuid_shaped(rollout)
-                            && resolve_codex_identity(conversation) == group.owner
-                    })
+    group
+        .members
+        .iter()
+        .any(|member| independent_path(&member.path, &group.owner))
+}
+
+/// At the existing first-load hook, make indexed, sealed, not-yet-folded
+/// groups owed through the existing cleared-source witness and observed queue.
+/// Saved owner hashes qualify filenames; only the normal secure inventory can
+/// admit the body. Captured and settled folds never re-arm.
+pub(in crate::snapshots) fn rearm_unsettled(index: &mut ScanIndex) {
+    let mut groups = BTreeMap::<(PathBuf, String), (Vec<String>, bool)>::new();
+    for (key, entry) in &index.files {
+        let Some(owner) = entry
+            .codex_counting_owner
+            .as_deref()
+            .or(entry.codex_protected_owner.as_deref())
+        else {
+            continue;
+        };
+        let path = Path::new(key);
+        let Some((native, _)) =
+            filename_owner(path).filter(|(native, _)| codex_protected_owner(native) == owner)
+        else {
+            continue;
+        };
+        let group = groups
+            .entry((member_home(path.parent().unwrap_or(path)), owner.to_owned()))
+            .or_default();
+        group.0.push(key.clone());
+        group.1 |= independent_path(path, &native);
+    }
+    let mut owed = Vec::new();
+    for (keys, independent) in groups.into_values() {
+        if !independent
+            || keys.len() < 2
+            || keys.iter().any(|key| {
+                let entry = &index.files[key];
+                !codex_archive_path(Path::new(key))
+                    || entry.codex_joined_member_set.is_some()
+                    || entry.codex_captured_joined_member_set.is_some()
             })
-    })
+        {
+            continue;
+        }
+        for key in keys {
+            // Existing re-arm debt survives partial saves without changing
+            // accepted entity/body witnesses or the starting account binding.
+            index
+                .files
+                .get_mut(&key)
+                .expect("indexed member")
+                .source_file_fingerprint
+                .clear();
+            owed.push(key);
+        }
+    }
+    if let Some(traversal) = index.traversal.as_mut() {
+        requeue_observed_keys(SnapshotSource::Codex, traversal, owed, "load");
+    }
 }
 
 /// The group job's logical key: home, owner and the sorted member keys. A
@@ -369,6 +461,17 @@ impl GroupBoot {
                         && codex_index_file_body_accepted(index, &key, entry)
                 })
             })
+        {
+            return Boot::Strict;
+        }
+        // Settled contributions have no durable occurrence proof for a later
+        // tail. The first independent offer must wait for sealed members.
+        if self.independent
+            && self
+                .group
+                .members
+                .iter()
+                .any(|member| !codex_archive_path(&member.path))
         {
             return Boot::Strict;
         }
@@ -1441,6 +1544,43 @@ pub(in crate::snapshots) struct EndInputs<'a> {
     pub(in crate::snapshots) targets: DisclosureTargets<'a>,
 }
 
+/// Reuse the existing refusal memo and attempt fence for sealed independent
+/// inputs. No refusal grants delivery or acceptance credit to a member.
+pub(in crate::snapshots) fn refuse_independent(
+    group: &GroupJob,
+    sampling: Option<&sampled_scan::Context>,
+    index: &mut ScanIndex,
+    mut targets: DisclosureTargets<'_>,
+) {
+    let disclosure = refusal_disclosure();
+    if let Some(context) = sampling {
+        if let (Some(digest), Some(stamp), Some(last)) = (
+            group.memo_digest.as_ref(),
+            group.stamps.last(),
+            group.members.last(),
+        ) {
+            context.cache.memo_record(
+                cursor::memo_key(&context.namespace, &group.key),
+                cursor::MemoEntry::new_group(
+                    digest.clone(),
+                    None,
+                    context.cache.retained_stamp(&last.path, stamp.clone()),
+                    None,
+                    disclosure.clone(),
+                )
+                .growth_may_cure(true),
+            );
+        }
+        context.cache.group_attempted(
+            &context.namespace,
+            &group.key,
+            cursor::census_token(index).as_deref(),
+        );
+    }
+    disclose_members(&disclosure, &group.members, index, targets.reborrow());
+    cursor::dequeue_members(index, &group.members);
+}
+
 /// End a group job that did not complete. Terminal proof debt is disclosed
 /// through the one writer for every member (outcome R) and memoized; an
 /// append-curable refusal in the live member only while that member's stamp
@@ -1473,6 +1613,12 @@ pub(in crate::snapshots) fn end_group(
         );
     }
     match end {
+        GroupEnd::Strict if group.independent => {
+            if let Some(lease) = lease {
+                cursor::end_group_lease(lease, &active);
+            }
+            refuse_independent(group, sampling, index, targets.reborrow());
+        }
         // The chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
         // never settleable or memoized, named for S11. Per-member reasons

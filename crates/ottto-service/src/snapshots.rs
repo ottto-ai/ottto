@@ -6107,11 +6107,11 @@ impl OwnedSourceScan {
                     cursor: _,
                     charged_bytes: _,
                     hold_offset: _,
-                    group,
+                    mut group,
                 } = *active;
                 let mut independent_contributions = Vec::new();
                 let mut independent_group = false;
-                let group_members = group.map_or(0, |mut group| {
+                let group_members = group.as_deref_mut().map_or(0, |group| {
                     independent_group = group.independent;
                     independent_contributions = std::mem::take(&mut group.contributions);
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
@@ -6126,6 +6126,16 @@ impl OwnedSourceScan {
                         }
 
                         Err(_) => {
+                            if let Some(group) = group.as_deref().filter(|group| group.independent)
+                            {
+                                codex_file_join::refuse_independent(
+                                    group,
+                                    sampling.as_ref(),
+                                    index,
+                                    targets!(),
+                                );
+                                pending!();
+                            }
                             if let Some((context, publication)) =
                                 sampling.as_ref().zip(cursor_publication.take())
                             {
@@ -6458,6 +6468,15 @@ impl OwnedSourceScan {
                     Ok(parsed) => parsed,
 
                     Err(_error) => {
+                        if let Some(group) = group.as_deref().filter(|group| group.independent) {
+                            codex_file_join::refuse_independent(
+                                group,
+                                sampling.as_ref(),
+                                index,
+                                targets!(),
+                            );
+                            pending!();
+                        }
                         if source == SnapshotSource::Codex && !aliases.is_empty() {
                             codex_file_join::disclose_strict(&aliases, targets!());
                             pending!();

@@ -74,17 +74,23 @@ file-system hint / periodic listing → select file → read new bytes from save
   publish one whole-session body when their independently admitted usage keys are
   disjoint. Each member keeps its own parser, cumulative counters and cache detector;
   original billed turns after a revert's history boundary remain in the sum.
-  Compressed members use the ordinary decoder. Different member accounts, incomplete
+  The first offer waits until every member is a compressed sealed archive; live
+  groups hold before any header/decoder read. Compressed members use the ordinary
+  decoder. Different member accounts, incomplete
   members, overlap or missing proof hold the complete group without singleton output.
   A first acquisition without saved reductions keeps every contribution and its key
   proof in memory until the full offer is built. It uses the existing counted Full
   counters; an interrupted process discards the attempt and the next one reads the group
-  again. Exact acknowledgement settles only the captured member revisions through
+  again. Deterministic failed attempts reuse the existing per-group refusal memo
+  and attempt fence, so an unchanged next pass does not replay the transcripts.
+  On the first source-aware load, indexed unsettled sealed groups with saved owner
+  proof reuse the existing cleared-source re-arm debt and observed-file queue.
+  Captured or settled groups never re-arm. Exact acknowledgement settles only the captured member revisions through
   the existing entity incidence and member-set witness. Accepted unchanged members
   reuse their existing inventory stamps and read no transcript bytes after restart.
   Changed or missing accepted members remain owed when the saved state cannot prove
-  a complete replacement without rereading sealed history. Member activity/tool facts
-  merge before their existing projection; changed files stay distinct and artifacts
+  a complete replacement without rereading sealed history. Member activity/tool and
+  provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It

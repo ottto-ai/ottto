@@ -319,6 +319,8 @@ fn independent_members_keep_tools_distinct_activity_and_artifacts() {
         for _ in 0..=member {
             acc.note_activity_tool("exec_command");
         }
+        acc.provider_skills.insert(format!("provider-{member}"));
+        acc.activity_skills.insert(format!("PROVIDER-{member}"));
         acc.activity_patch_operations += 1;
         acc.activity_lines_added += (member + 1) as u64;
         acc.activity_changed_file_hashes
@@ -391,5 +393,99 @@ fn independent_members_keep_tools_distinct_activity_and_artifacts() {
     assert_eq!(item.session_artifacts, expected.artifacts);
     assert_eq!(item.activity_summary.as_ref().unwrap().changed_files, 3);
     assert_eq!(item.request_count, 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [money] Live revert members hold the entire group before header/decoder IO.
+#[test]
+fn independent_live_member_holds_zero_bytes_then_seals_and_folds() {
+    let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+    let (root, decoded) = independent_fixture("independent-live", &[8, 88]);
+    let mut paths = fs::read_dir(root.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let archive = paths.last().unwrap();
+    let encoded = fs::read(archive).unwrap();
+    let plain = archive.with_extension("");
+    fs::write(
+        &plain,
+        zstd::stream::decode_all(encoded.as_slice()).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(archive).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let ((index, held), io) = sampled_scan::transition_fixture::observe_codex_quiet(|| {
+        sampled(&root, ScanIndex::default(), 10, &cache)
+    });
+    assert!(
+        held.snapshots.is_empty(),
+        "no singleton replaces the accepted body"
+    );
+    assert!(held.ownership_incomplete_file_count >= 2);
+    assert_eq!(io.consumed, 0);
+    assert_eq!(
+        io.cheap_checks,
+        Some(0),
+        "no header or decoder read while live"
+    );
+    fs::write(archive, encoded).unwrap();
+    fs::remove_file(plain).unwrap();
+    let ((_, folded), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    assert_eq!(bytes, decoded.iter().sum::<u64>());
+    assert_eq!(folded.snapshots.len(), 1);
+    assert_eq!(folded.snapshots[0].request_count, 96);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [money] A native-complete but incompatible fold uses existing group refusal
+/// custody. An unchanged second generation must not acquire its members again.
+#[test]
+fn independent_fold_failure_is_memoized_after_one_read_per_member() {
+    let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+    let (root, decoded) = independent_fixture("independent-fold-failure", &[8, 88]);
+    let cache = Arc::new(SharedCache::default());
+    let mut owned = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[root.join("sessions")],
+        ScanIndex::default(),
+        "2026-10-06T23:00:00Z",
+        7,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("group-fixture".into()));
+    let mut injected = false;
+    let ((index, held), bytes) = observe_consumed(|| {
+        for _ in 0..100_000 {
+            if let Some(active) = owned.active_file.as_mut() {
+                if let Some(group) = active.group.as_mut() {
+                    if !injected && !group.contributions.is_empty() {
+                        group.contributions[0].model_usage[0]
+                            .selector_sources
+                            .insert("model".into(), "synthetic-conflicting-provenance".into());
+                        injected = true;
+                    }
+                }
+            }
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("failed fold never completed");
+    });
+    assert!(injected);
+    assert_eq!(bytes, decoded.iter().sum::<u64>());
+    assert!(held.snapshots.is_empty());
+    assert!(held.ownership_incomplete_file_count >= 2);
+    assert_eq!(counters(&cache).memo_records, 1);
+    let ((_, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));
+    assert_eq!(bytes, 0, "memoized failure reads no transcript bytes");
+    assert!(again.snapshots.is_empty());
+    assert_eq!(counters(&cache).memo_records, 1);
     fs::remove_dir_all(root).unwrap();
 }
