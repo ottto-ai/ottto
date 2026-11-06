@@ -2883,92 +2883,10 @@ fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTota
         && current.costs.is_monotonic_after(&previous.costs)
 }
 
-#[derive(Debug, Clone, Default)]
-struct CodexTitleMetadata {
-    local_diagnostics: CodexScanDiagnostics,
-    titles: BTreeMap<String, CodexTitleCandidate>,
-    /// Merged maximum for state-only fallback; never use for file binding.
-    /// Registered files must use `thread_extent_for_path` and their own home.
-    state_threads: BTreeMap<String, CodexStateThread>,
-    /// Merged maximum for metadata summaries; never use for file binding.
-    rollout_extents: BTreeMap<String, CodexRolloutExtent>,
-    /// File-binding evidence stays with the home that supplied it. A merged
-    /// usage high-water mark must never seed another copy's creation proof.
-    root_sidecars: BTreeMap<PathBuf, codex_root_copies::RootSidecar>,
-    /// Canonical session ids whose trusted Codex state row declares
-    /// `thread_source=agent_created_thread`. This is deliberately separate
-    /// from generic spawn edges: the state declaration is an ownership
-    /// classification input, while an edge alone is only lineage evidence.
-    state_created_threads: BTreeSet<String>,
-    spawn_parents: BTreeMap<String, String>,
-    spawn_parent_conflicts: BTreeSet<String>,
-    /// Resolved identity keys for which distinct raw sidecar ids collapsed to
-    /// the same UUID key. These scoped conflicts directly block their own
-    /// rollout. If a conflicted key is named as a parent, only its direct
-    /// children lose lineage evidence; each such child remains separately
-    /// visible through the ordinary ownership/drop health counters.
-    identity_conflicts: BTreeSet<String>,
-    /// True only when an existing state DB could not be read completely. A
-    /// missing DB means there is no state-only source and is complete-empty.
-    state_census_incomplete: bool,
-    sidecar_census_incomplete: bool,
-    /// An unreadable or structurally incomplete detail source has no
-    /// trustworthy key scope. It blocks already-classified created identities;
-    /// the separate classification flag below determines source-wide scope.
-    state_census_unscoped_incomplete: bool,
-    sidecar_census_unscoped_incomplete: bool,
-    /// Homes whose created-thread classification query failed before it
-    /// could identify a trustworthy key scope. Any rollout whose proof could
-    /// depend on such a home could be an omitted created row, so it is held;
-    /// see `created_thread_census_incomplete_for`.
-    created_thread_census_failed_homes: BTreeSet<PathBuf>,
-    /// While a home failed: identity -> rollout path whose created-thread
-    /// proof comes from exactly one other, complete home that locates it
-    /// exactly, with every spawn ancestor scoped too
-    /// (`scope_created_thread_census`).
-    created_thread_scoped: BTreeMap<String, PathBuf>,
-    legacy_sidecar_fingerprint: String,
-    /// The old index retained only config file stats, not content or affected
-    /// session ids. Presence therefore requires one conservative corrective
-    /// reconciliation; absence plus a matching legacy identity is provable.
-    legacy_config_file_present: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CodexPathSidecarCandidate {
-    identity: String,
-    recorded_evidence: bool,
-    created_thread: bool,
-    identity_conflict: bool,
-    detail_incomplete: bool,
-    rollout_file_matches: bool,
-    parent: Option<String>,
-    child_created_at_nanos: Option<i128>,
-    projected_next_ordinal: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct CodexTitleCandidate {
-    title: String,
-    source: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct CodexStateThread {
-    title: Option<String>,
-    tokens_used: u64,
-    archived: bool,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    model: Option<String>,
-    rollout_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CodexRolloutExtent {
-    next_byte_offset: u64,
-    next_ordinal: u64,
-}
+use sources::codex::sidecar::{
+    CodexPathSidecarCandidate, CodexRolloutExtent, CodexStateThread, CodexTitleCandidate,
+    CodexTitleMetadata, CodexTurnTraceMap,
+};
 
 #[cfg(test)]
 use sources::claude::desktop_titles::{
@@ -2981,35 +2899,6 @@ use sources::claude::desktop_titles::{
     claude_desktop_store_inventory_is_legacy, ClaudeDesktopSpawnLineage,
     ClaudeDesktopTitleIndexEntry, ClaudeTitleMetadata,
 };
-
-/// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
-/// debug DB.
-///
-/// Existing requested-priority signal from recent `logs_2.sqlite` request rows.
-/// The turn id links the tracing span to rollout turn_context. This turn-wide
-/// association is inherited application evidence: mixed requests within one
-/// turn lack a durable response-level selector join. Absence is not positive
-/// proof of standard pricing. File-owned receipts preserve previously applied
-/// decisions after traces expire without extending them to new contributions.
-#[derive(Debug, Clone, Default)]
-struct CodexTurnTraceMap {
-    since_epoch: i64,
-    priority_turns: BTreeSet<String>,
-    /// A present trace DB failed to load, or its row cap was reached: absent
-    /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
-    /// decision under such a map as unavailable evidence, never a change.
-    incomplete: bool,
-}
-
-impl CodexTurnTraceMap {
-    fn is_priority_turn(&self, turn_id: &str) -> bool {
-        self.priority_turns.contains(turn_id)
-    }
-
-    fn is_incomplete(&self) -> bool {
-        self.incomplete
-    }
-}
 
 #[cfg(test)]
 use scan::accumulator::SELECTOR_CONTEXT_ALLOWED;
@@ -43867,23 +43756,6 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N rule_epoch: u8,
 });
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached);
-crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);
-crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
-    U identity: String,
-    N recorded_evidence: bool,
-    N created_thread: bool,
-    N identity_conflict: bool,
-    N detail_incomplete: bool,
-    N rollout_file_matches: bool,
-    U parent: Option<String>,
-    N child_created_at_nanos: Option<i128>,
-    N projected_next_ordinal: Option<u64>,
-});
-crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
-crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
-crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     codex_parent_session_ref,

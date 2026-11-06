@@ -1,6 +1,7 @@
-//! Codex: runtime config defaults, rollout and creator identity helpers and
-//! the usage readers of one rollout line.
+//! Codex: runtime config defaults, rollout and creator identity helpers, the
+//! usage readers of one rollout line and the sidecar title metadata rows.
 
 pub(in crate::snapshots) mod config_defaults;
 pub(in crate::snapshots) mod identity;
 pub(in crate::snapshots) mod line;
+pub(in crate::snapshots) mod sidecar;
