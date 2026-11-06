@@ -915,6 +915,20 @@ struct ProcessSample {
 }
 
 fn process_sample() -> Option<ProcessSample> {
+    process_usage().map(|(sample, _)| sample)
+}
+
+/// Cumulative user/system CPU and page faults; readers subtract samples.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct StateV2Cpu {
+    pub(crate) cpu_user_us: u64,
+    pub(crate) cpu_sys_us: u64,
+    pub(crate) minor_faults: u64,
+    pub(crate) major_faults: u64,
+}
+
+/// One getrusage read shared by the process sample and its CPU/fault split.
+fn process_usage() -> Option<(ProcessSample, StateV2Cpu)> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
@@ -930,14 +944,23 @@ fn process_sample() -> Option<ProcessSample> {
                 .checked_add(u64::try_from(time.tv_usec).ok()?)
         };
         let raw_rss = u64::try_from(usage.ru_maxrss).ok()?;
-        Some(ProcessSample {
-            cpu_us: micros(usage.ru_utime)?.checked_add(micros(usage.ru_stime)?)?,
-            lifetime_max_rss_bytes: if cfg!(target_os = "macos") {
-                raw_rss
-            } else {
-                raw_rss.checked_mul(1024)?
+        let split = StateV2Cpu {
+            cpu_user_us: micros(usage.ru_utime)?,
+            cpu_sys_us: micros(usage.ru_stime)?,
+            minor_faults: u64::try_from(usage.ru_minflt).ok()?,
+            major_faults: u64::try_from(usage.ru_majflt).ok()?,
+        };
+        Some((
+            ProcessSample {
+                cpu_us: split.cpu_user_us.checked_add(split.cpu_sys_us)?,
+                lifetime_max_rss_bytes: if cfg!(target_os = "macos") {
+                    raw_rss
+                } else {
+                    raw_rss.checked_mul(1024)?
+                },
             },
-        })
+            split,
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     None
@@ -3293,6 +3316,9 @@ pub(crate) fn state_v2_memory() -> StateV2Memory {
 }
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
+}
+pub(crate) fn state_v2_cpu() -> Option<StateV2Cpu> {
+    process_usage().map(|(_, split)| split)
 }
 
 crate::heap_layout_bound::no_heap!(true; CodexZstCause);

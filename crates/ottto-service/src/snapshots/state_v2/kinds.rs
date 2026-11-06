@@ -194,6 +194,7 @@ pub(super) fn hydrate_txn(
         ..Default::default()
     };
     kinds_misc::hydrate_txn(tx, &mut index, &mut cx)?;
+    super::telemetry::hydrate_checkpoint("hydrate_after_misc", 0, None);
     kinds_files::hydrate_txn(tx, &mut index, &mut cx)?;
     super::telemetry::hydrate_checkpoint("hydrate_after_files", 0, None);
     kinds_accounts::hydrate_txn(tx, &mut index, &mut cx)?;
