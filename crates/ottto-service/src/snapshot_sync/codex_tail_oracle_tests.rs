@@ -6,6 +6,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture as fixture;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::snapshots::StateV2ColdSession;
+use serde_json::Value;
 
 const SOURCE: SnapshotSource = SnapshotSource::Codex;
 const A: &str = "019e5a00-0000-7000-8000-00000000000a";
@@ -93,4 +94,9 @@ fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
         scan.snapshots.is_empty(),
         "quiet restart emitted a new body"
     );
+}
+
+mod independent {
+    use super::*;
+    include!("codex_sameid_oracle_tests.rs");
 }

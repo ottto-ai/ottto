@@ -209,19 +209,10 @@ fn assert_quiet_on(
     expected: &RouteResult,
     cache: Arc<sampled_scan::SharedCache>,
 ) -> (ScanIndex, RouteResult) {
-    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-    let activity = codex_zst_refusal_tests::activity();
-    let (mut index, scan, delivery, consumed, logs) = page(c, prior, cache);
-    assert_eq!(
-        samples,
-        START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
-        "no identity sample"
-    );
-    assert_eq!(
-        activity,
-        codex_zst_refusal_tests::activity(),
-        "no header parse or decoder construction"
-    );
+    let ((mut index, scan, delivery, logs), io) = oracle::observe_codex_quiet_with_bytes(|| {
+        let (index, scan, delivery, consumed, logs) = page(c, prior, cache);
+        ((index, scan, delivery, logs), consumed)
+    });
     assert_eq!(full_decodes(&logs), 0);
     assert!(delivery.0.lock().unwrap().is_empty());
     let previous = index.clone();
@@ -234,19 +225,7 @@ fn assert_quiet_on(
     let mut quiet = route(&index, &scan, posts);
     quiet.accepted = expected.accepted.clone();
     quiet.mode = Mode::Restart;
-    // Metadata-only secure opens are permitted. All byte-reading seams are
-    // observed independently: identity samples, header parses, decoder and JSONL.
-    let measured = (samples == START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get)
-        && activity == codex_zst_refusal_tests::activity()
-        && consumed == 0)
-        .then_some(0);
-    quiet.io = oracle::IoBytes {
-        consumed,
-        cheap_checks: measured,
-        anchor_reads: measured,
-        other_reads: measured,
-        ..Default::default()
-    };
+    quiet.io = io;
     money_oracle::assert_quiet_restart_zero_bytes(&quiet);
     (index, quiet)
 }

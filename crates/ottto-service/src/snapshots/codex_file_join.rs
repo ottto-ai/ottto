@@ -3,12 +3,16 @@
 use super::*;
 use crate::transcript_acquisition::FileStamp;
 
+mod custody;
 mod group_job;
+mod independent_fold;
+pub(super) use custody::fan_out_body_witnesses;
 pub(super) use group_job::{
-    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key,
-    refusal_disclosure, step_group, take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob,
-    GroupStep, JobInputs, StepInputs,
+    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key, rearm_unsettled,
+    refusal_disclosure, refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot,
+    GroupEnd, GroupJob, GroupStep, JobInputs, StepInputs,
 };
+pub(super) use independent_fold::fold as fold_independent;
 
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
@@ -492,7 +496,7 @@ impl HeaderInventory {
                 .map(PathBuf::from)
                 .collect(),
             headers: Vec::new(),
-            held_owners: BTreeSet::new(),
+            held_owners: group_job::unsealed_owners(paths),
             directories: directories.cloned().unwrap_or_default(),
             complete: directories.is_some_and(|value| value.stable),
             read_bytes: 0,
@@ -570,6 +574,12 @@ impl HeaderInventory {
         let Some(path) = self.pending.pop_front() else {
             return true;
         };
+        if codex_session_id_candidates_from_path(&path)
+            .iter()
+            .any(|owner| self.held_owners.contains(owner))
+        {
+            return false;
+        }
         let Some(scan_root) = self.scan_root(&path) else {
             self.complete = false;
             self.refused
@@ -606,7 +616,31 @@ impl HeaderInventory {
             let current = open_candidate_beneath_root(&candidate)?.metadata()?;
             let stamp = FileStamp::capture(current.clone())?;
             // One securely acquired physical witness for both durable and RAM facts.
-            let durable = index
+            let joined_archive = if codex_archive_path(&candidate.path)
+                && index.files.get(&key).is_some_and(|entry| {
+                    entry.codex_joined_member_set.is_some()
+                        && codex_index_file_body_accepted(index, &key, entry)
+                }) {
+                state_v2::load_head(index, &key, 1)?
+                    .filter(|head| {
+                        head.common
+                            .inventory
+                            .as_ref()
+                            .is_some_and(|facts| facts.stamp.matches_acquisition(&stamp))
+                    })
+                    .and_then(|head| {
+                        let facts = head.common.inventory?;
+                        Some(CachedHeader {
+                            stamp: stamp.clone(),
+                            owner: facts.owner,
+                            created_unix_ms: facts.created_unix_ms,
+                            read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
+                        })
+                    })
+            } else {
+                None
+            };
+            let durable = joined_archive.or(index
                 .codex_physical_matches(&key, &current)?
                 .filter(|(matched, _)| *matched)
                 .and_then(|(_, head)| {
@@ -624,7 +658,7 @@ impl HeaderInventory {
                             usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
                         }),
                     })
-                });
+                }));
             let reused = durable
                 .or_else(|| {
                     let cached = cache?
@@ -703,11 +737,7 @@ impl HeaderInventory {
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
-        for header in self
-            .headers
-            .iter()
-            .filter(|header| !codex_archive_path(&header.candidate.path))
-        {
+        for header in &self.headers {
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
@@ -720,6 +750,16 @@ impl HeaderInventory {
                 .members
                 .push(header.candidate.clone());
         }
+        // Ordinary replacement/carry archives retain main's singleton path.
+        // Revert groups alone acquire their compressed independent members.
+        for group in groups.values_mut() {
+            if !group_job::independent_group(group) {
+                group
+                    .members
+                    .retain(|member| !codex_archive_path(&member.path));
+            }
+        }
+        groups.retain(|_, group| !group.members.is_empty());
         groups
     }
     /// Header uncertainty remains a wildcard; complete current headers name
@@ -940,6 +980,45 @@ impl Validation {
 }
 crate::heap_layout_bound::fields!(Group; owner, home, members, live);
 crate::heap_layout_bound::fields!(Validation; inventory, groups, owners, paths);
+
+/// Reuse existing per-file inventory facts for settled archive members. This
+/// stages no reduction, delivery credit or admitted-key projection.
+pub(super) fn stage_independent_inventory(
+    index: &ScanIndex,
+    members: &[CandidateFile],
+    owner: &str,
+) -> Result<()> {
+    let Some(route) = state_v2::runtime_path(index)? else {
+        return Ok(());
+    };
+    let mut observations = Vec::new();
+    for member in members {
+        let key = local_index_key(&member.path);
+        let file = open_candidate_beneath_root(member)?;
+        let stamp = sampled_scan::codex_cursor::OpenStamp::capture(&file)?.content_stamp();
+        let prior = state_v2::load_head(index, &key, 1)?;
+        let (representation, summary) = prior.map_or(
+            (
+                state_v2::Representation::Archive,
+                state_v2::DebtSummary::default(),
+            ),
+            |prior| (prior.common.representation, prior.common.debt),
+        );
+        let observation = state_v2::Observation {
+            representation,
+            summary,
+            inventory: Some(state_v2::InventoryFacts {
+                owner: owner.to_owned(),
+                created_unix_ms: None,
+                read_bytes: MAX_HEADER_BYTES as u64,
+                stamp,
+            }),
+            ..state_v2::Observation::default()
+        };
+        observations.push((key, observation));
+    }
+    state_v2::observe_tails(&route, observations)
+}
 
 pub(super) fn captured_join(witness: &str) -> String {
     format!("codex_captured_join:v1:{witness}")
@@ -1330,6 +1409,9 @@ struct MemberState {
 pub(super) struct StreamProof {
     owner: String,
     v2: bool,
+    independent: bool,
+    independent_placement: Option<Option<(String, String)>>,
+    independent_classification: Option<(Option<String>, Option<String>)>,
     plans: Vec<MemberPlan>,
     seen: Vec<MemberSeen>,
     position: usize,
@@ -1366,6 +1448,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
     // group stays within one walk's visit limit and its bytes are counted.
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         self.owner.heap_bound(c)?;
+        self.independent_placement.heap_bound(c)?;
+        self.independent_classification.heap_bound(c)?;
         self.plans.heap_bound(c)?;
         self.seen.heap_bound(c)?;
         self.member.starts.heap_bound(c)?;
@@ -1390,6 +1474,9 @@ impl StreamProof {
         Self {
             owner,
             v2,
+            independent: false,
+            independent_placement: None,
+            independent_classification: None,
             plans,
             seen: Vec::new(),
             position: 0,
@@ -1404,6 +1491,12 @@ impl StreamProof {
             ui_turns: BTreeSet::new(),
             unbound_ui: false,
         }
+    }
+
+    fn independent(owner: String, members: usize) -> Self {
+        let mut proof = Self::new(owner, false, vec![MemberPlan::default(); members]);
+        proof.independent = true;
+        proof
     }
 
     /// The first refusal and the canonical position of its failing member.
@@ -1467,9 +1560,42 @@ impl StreamProof {
                 if owner.as_deref() != Some(self.owner.as_str()) {
                     return Err(JoinRefusal::Overlap);
                 }
+                if self.independent {
+                    if meta.get("forked_from_id").is_some_and(|v| !v.is_null())
+                        || meta
+                            .get("subagent_history_start_ordinal")
+                            .is_some_and(|v| !v.is_null())
+                        || string_eq_at(meta, &["thread_source"], "agent_created_thread")
+                    {
+                        return Err(JoinRefusal::ForkedFromOtherSession);
+                    }
+                    let placement = codex_creator_header_evidence(value, meta).and_then(|e| {
+                        Some((e.account_identifier_hash?, e.provider_workspace_hash?))
+                    });
+                    let classification = (
+                        string_at(meta, &["thread_source"]),
+                        meta.get("source").map(Value::to_string),
+                    );
+                    if self
+                        .independent_placement
+                        .as_ref()
+                        .is_some_and(|prior| prior != &placement)
+                        || self
+                            .independent_classification
+                            .as_ref()
+                            .is_some_and(|prior| prior != &classification)
+                    {
+                        return Err(JoinRefusal::Overlap);
+                    }
+                    self.independent_placement = Some(placement);
+                    self.independent_classification = Some(classification);
+                }
             }
             None if first => return Err(JoinRefusal::Corrupt),
             None => {}
+        }
+        if self.independent {
+            return Ok(());
         }
         let ordinal_member = self
             .plans
@@ -1604,6 +1730,13 @@ impl StreamProof {
         if !self.ui.insert(compact(b"u:", identity)) {
             return Err(JoinRefusal::Overlap);
         }
+        if self.independent {
+            return if self.v2 {
+                Err(JoinRefusal::V2UnboundUi)
+            } else {
+                Ok(())
+            };
+        }
         let tokens = codex_last_usage_root(value)
             .and_then(Tokens::read)
             .ok_or(JoinRefusal::UiShape)?;
@@ -1636,6 +1769,9 @@ impl StreamProof {
     /// neutral, and every UI admission must be backed by a native of the
     /// same tuple in the same member (Legacy).
     pub(super) fn end_member(&mut self, end: u64) {
+        if self.independent {
+            return;
+        }
         if self.refusal.is_some() {
             return;
         }
@@ -2017,7 +2153,7 @@ pub(super) mod tests {
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
-
+            cache: None,
             index,
         })?;
         let no_scope = |_: &CandidateFile| None;
@@ -2025,6 +2161,9 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: None,
             live_scope: &no_scope,
+            cache: None,
+            collected_at: "2026-10-01T12:00:00Z",
+            index,
         };
         for _ in 0..10_000 {
             match step_group(&mut job, &inputs) {
@@ -2126,6 +2265,7 @@ pub(super) mod tests {
 
     #[test]
     fn ordinary_compressed_header_retains_pending_on_funding_refusal_and_plain_sibling_wins() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
         let (root, fixture) = fixture();
         let sessions = root.join("sessions");
         let plain = fixture.headers[0].candidate.path.clone();
@@ -2163,7 +2303,13 @@ pub(super) mod tests {
         let mut inventory =
             HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
         while !inventory.step_encoded(&metadata, Some(&cache)) {}
-        assert!(inventory.complete);
+        assert!(
+            inventory.complete,
+            "funded recognition: read={}, refusals={}, causes={}",
+            inventory.read_bytes,
+            inventory.refused.len(),
+            serde_json::to_string(&inventory.unreadable_causes).unwrap()
+        );
         assert_eq!(inventory.headers.len(), 1);
         assert_eq!(inventory.headers[0].owner, fixture.headers[0].owner);
         assert_eq!(inventory.headers[0].candidate.path, compressed);
@@ -4844,7 +4990,7 @@ pub(super) mod tests {
             .into_job(JobInputs {
                 metadata: &metadata,
                 traces: None,
-
+                cache: None,
                 index: &previous,
             })
             .unwrap();
@@ -4853,6 +4999,9 @@ pub(super) mod tests {
             metadata: &metadata,
             attribution: Some(&context),
             live_scope: &no_scope,
+            cache: None,
+            collected_at: "2026-10-01T12:00:00Z",
+            index: &previous,
         };
         let (mut steps, mut yields) = (0, 0);
         loop {

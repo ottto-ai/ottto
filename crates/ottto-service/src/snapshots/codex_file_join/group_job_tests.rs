@@ -1987,6 +1987,7 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .into_job(JobInputs {
             metadata: &metadata,
             traces: None,
+            cache: None,
             index: &index,
         })
         .unwrap();
@@ -1999,4 +2000,9 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         ));
     });
     fs::remove_dir_all(root).unwrap();
+}
+
+mod independent {
+    use super::*;
+    include!("independent_tests.rs");
 }

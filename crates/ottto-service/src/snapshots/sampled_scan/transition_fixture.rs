@@ -10,6 +10,74 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Apply the source-aware loader's existing Codex owed-group hook after a
+/// fixture restores custody, without exposing the private join module.
+pub(crate) fn codex_rearm_unsettled(index: &mut super::super::ScanIndex) {
+    super::super::codex_file_join::rearm_unsettled(index);
+}
+
+/// Seed the prior archive-singleton path through native parsers and per-file
+/// finalization. Only combined-group construction is bypassed: headers still
+/// prove each file's owner, and every source revision remains independent.
+pub(crate) fn codex_legacy_singletons(
+    roots: &[std::path::PathBuf],
+    support: &std::path::Path,
+    index: super::super::ScanIndex,
+) -> (super::super::ScanIndex, super::super::SourceScanResult) {
+    use super::super::*;
+    let cache = std::sync::Arc::new(super::SharedCache::default());
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        roots,
+        index,
+        "2026-10-27T08:00:00Z",
+        183,
+        100,
+        Some(support),
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(
+        cache.clone(),
+        crate::transcript_acquisition::Scope("money-equivalence".into()),
+    );
+    if let Some(inventory) = scan.codex_join_inventory.as_mut() {
+        while !inventory.step_selected(
+            &scan.codex_title_metadata,
+            &mut scan.index,
+            &scan.codex_selected_flags,
+            Some(&cache),
+        ) {}
+    }
+    scan.codex_join_prepared = true;
+    for _ in 0..100_000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+        }
+    }
+    panic!("native legacy singleton seed did not finish");
+}
+
+/// Seed the real saved session-start binding for a Codex transition row.
+pub(crate) fn codex_start_binding(
+    index: &mut super::super::ScanIndex,
+    machine: &str,
+    session: &str,
+    account: String,
+    workspace: Option<String>,
+) -> String {
+    let key = super::super::sha256_hex(&["session_owner:v1", machine, session]);
+    index.session_account_bindings.insert(
+        key.clone(),
+        super::super::SessionAccountBinding {
+            account_identifier_hash: account,
+            workspace_identifier_hash: workspace,
+        },
+    );
+    key
+}
+
 /// Emitted-body comparison for native scan fixtures without a transport driver.
 pub(crate) fn scan_money(
     source: SnapshotSource,
@@ -193,6 +261,42 @@ pub(crate) fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let result = f();
     let bytes = CONSUMED.with(|c| c.get().unwrap());
     (result, bytes)
+}
+
+/// Serialize fixtures that require the process-wide paid decoder owner.
+pub(crate) fn codex_decoder_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    super::super::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Observe the same independent byte-reading seams as the Codex archive
+/// transition driver: object samples, header/decoder construction and JSONL.
+/// Unknown/nonzero byte classes never become a fabricated zero receipt.
+pub(crate) fn observe_codex_quiet<T>(run: impl FnOnce() -> T) -> (T, IoBytes) {
+    observe_codex_quiet_with_bytes(|| observe_consumed(run))
+}
+
+/// Same observer for a driver whose page already measures consumption.
+pub(crate) fn observe_codex_quiet_with_bytes<T>(run: impl FnOnce() -> (T, u64)) -> (T, IoBytes) {
+    use crate::snapshots::{codex_zst_refusal_tests, START_IDENTITY_SAMPLE_FOR_TEST};
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
+    let activity = codex_zst_refusal_tests::activity();
+    let (value, consumed) = run();
+    let measured = (samples == START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get)
+        && activity == codex_zst_refusal_tests::activity()
+        && consumed == 0)
+        .then_some(0);
+    (
+        value,
+        IoBytes {
+            consumed,
+            cheap_checks: measured,
+            anchor_reads: measured,
+            other_reads: measured,
+            ..Default::default()
+        },
+    )
 }
 
 #[derive(Clone, Debug, Default)]

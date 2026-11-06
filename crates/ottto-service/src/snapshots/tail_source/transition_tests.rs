@@ -918,3 +918,8 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     assert!(evidence(&cold, GAP).is_null());
     money_oracle::assert_equivalent(&cold, &resumed);
 }
+
+mod independent {
+    use super::*;
+    include!("sameid_transition_tests.rs");
+}
