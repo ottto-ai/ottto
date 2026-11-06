@@ -277,6 +277,296 @@ pub(in crate::snapshots) struct ActivityCallTool {
     pub(in crate::snapshots) name: String,
 }
 
+#[derive(Clone)]
+pub(in crate::snapshots) struct SnapshotAccumulator {
+    pub(in crate::snapshots) source: SnapshotSource,
+    pub(in crate::snapshots) cache_configuration_witness: Option<String>,
+    pub(in crate::snapshots) cache_task_complete_at: Option<String>,
+    pub(in crate::snapshots) cache_pending_idle: Option<u64>,
+    // Raw turn ids (class L): never uploaded except where the upload contract
+    // already carries it; persisted only in the local durable-tail store.
+    pub(in crate::snapshots) cache_active_turns: BTreeSet<String>,
+    /// Retired with full context-curve upload; always false. Kept, like the
+    /// three `codex_context_curve_*` slots, so the pinned durable-tail
+    /// allowlist digest and records already on disk stay valid.
+    pub(in crate::snapshots) context_curve_enabled: bool,
+    pub(in crate::snapshots) source_session_id: Option<String>,
+    pub(in crate::snapshots) account_identifier_hash: Option<String>,
+    pub(in crate::snapshots) title: Option<String>,
+    pub(in crate::snapshots) title_source: Option<String>,
+    pub(in crate::snapshots) first_prompt_title: Option<String>,
+    // In-memory only: bounded first-user text used to derive opaque template,
+    // schedule, and explicit slash-skill facts. The source text is never copied
+    // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
+    pub(in crate::snapshots) first_prompt_material: Option<String>,
+    // Private local state: provider-native skill names. HMACed before facts
+    // are produced; an allowlisted short name may also become a private display
+    // label, which upload policy strips unless title consent is active.
+    pub(in crate::snapshots) provider_skills: BTreeSet<String>,
+    pub(in crate::snapshots) started_at: Option<String>,
+    pub(in crate::snapshots) ended_at: Option<String>,
+    pub(in crate::snapshots) last_activity_at: Option<String>,
+    pub(in crate::snapshots) workspace_hash: Option<String>,
+    // Local Workspace fact used to derive privacy-safe repository identity.
+    // The raw path is never copied into SnapshotItem or uploaded.
+    pub(in crate::snapshots) workspace_path: Option<PathBuf>,
+    // Session-owned observation, retained independently of the path cache.
+    pub(in crate::snapshots) repository_binding:
+        Option<crate::context_footprint::RepositoryIdentity>,
+    pub(in crate::snapshots) latest_model: Option<String>,
+    // Most-recently-observed Codex per-turn reasoning effort tier. Updated as
+    // lines stream past so the next usage row picks up the effort co-located
+    // with that turn's token_count.
+    pub(in crate::snapshots) latest_reasoning_effort: Option<String>,
+    // Most-recently-observed Codex turn id (from `turn_context.payload.turn_id`).
+    // The token_count event carries no turn id, so the running turn id is what
+    // joins each usage row to its `logs_2` fast-mode signal. Raw id (class L):
+    // never uploaded except where the upload contract already carries it;
+    // persisted only in the local durable-tail store.
+    pub(in crate::snapshots) latest_turn_id: Option<String>,
+    // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
+    // read-only across every session file in the cycle via `Arc`.
+    pub(in crate::snapshots) codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    // Keyed by raw turn id (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
+    pub(in crate::snapshots) codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
+    /// A paged cursor job keeps every turn witness, charged by bytes in its
+    /// slot; every other reader keeps the cache-only witness caps.
+    pub(in crate::snapshots) codex_priority_witnesses_uncapped: bool,
+    pub(in crate::snapshots) codex_tier_replay: Option<codex_file_join::TierReplay>,
+    // Usage-counting V2 state. `None` (unconfigured) and a Legacy decision
+    // keep today's counting byte for byte.
+    pub(in crate::snapshots) codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
+    pub(in crate::snapshots) current_selector: SelectorCapture,
+    pub(in crate::snapshots) session_cumulative_usage: Option<UsageTotals>,
+    pub(in crate::snapshots) codex_session_meta_seen: bool,
+    pub(in crate::snapshots) codex_record_seen: bool,
+    pub(in crate::snapshots) codex_creator_header_id: Option<String>,
+    pub(in crate::snapshots) codex_creator_evidence: Option<SessionAccountEvidence>,
+    pub(in crate::snapshots) codex_creator_evidence_conflicted: bool,
+    pub(in crate::snapshots) claude_desktop_identity: Option<SessionAccountEvidence>,
+    /// The session that started this one from the Claude desktop app.
+    pub(in crate::snapshots) claude_desktop_spawn_lineage: Option<ClaudeDesktopSpawnLineage>,
+    pub(in crate::snapshots) claude_owned_session_id_observed: bool,
+    pub(in crate::snapshots) claude_owned_session_id_conflicted: bool,
+    pub(in crate::snapshots) codex_ownership_boundary: CodexOwnershipBoundary,
+    pub(in crate::snapshots) codex_legacy_trigger_seen: bool,
+    pub(in crate::snapshots) codex_legacy_bootstrap_valid: bool,
+    // Trusted state-row created-thread classification bound to this opened
+    // rollout by its provider session id. Generic spawn edges cannot set it.
+    pub(in crate::snapshots) codex_sidecar_created_thread: bool,
+    // A timestamp-shaped rollout name has two valid provider grammars. Keep
+    // both byte-preserving identities until trusted state/census evidence or
+    // the first authoritative header selects exactly one.
+    pub(in crate::snapshots) codex_path_sidecar_candidates: Vec<CodexPathSidecarCandidate>,
+    pub(in crate::snapshots) codex_resolved_path_identity: Option<String>,
+    // The rollout-path identity is collision-ambiguous, or a required census
+    // failed without a key scope. It must never enter a generic ownership arm.
+    pub(in crate::snapshots) codex_sidecar_identity_ambiguous: bool,
+    // Trusted, content-free child -> parent edge loaded from Codex's local
+    // state DB before the rollout is parsed. It is lineage evidence for the
+    // native witness, distinct from the classification bit above.
+    pub(in crate::snapshots) codex_sidecar_parent: Option<(String, String)>,
+    // Provider state-row creation time for the trusted child edge. Fresh-file
+    // timestamps must not precede this physical spawn witness.
+    pub(in crate::snapshots) codex_sidecar_child_created_at_nanos: Option<i128>,
+    /// L-6: the file length the sidecar bind saw (`seed_codex_sidecar_parent`).
+    /// A curable hold is memoized only at exactly this length.
+    pub(in crate::snapshots) codex_bind_seed_len: Option<u64>,
+    // Codex's independently projected EOF ordinal, when thread_history_1 is
+    // available. The native stream must end at the same ordinal boundary.
+    pub(in crate::snapshots) codex_sidecar_projected_next_ordinal: Option<u64>,
+    pub(in crate::snapshots) codex_parent_session_ref: Option<String>,
+    // Fresh provider-created rollouts use a native creation envelope and one
+    // gap-free ordinal stream. These fields bind the first task/turn to that
+    // envelope and reject retrograde timestamps anywhere in the opened file.
+    pub(in crate::snapshots) codex_native_created_thread_valid: bool,
+    pub(in crate::snapshots) codex_created_thread_native_only: bool,
+    pub(in crate::snapshots) codex_native_created_thread_header_nanos: Option<i128>,
+    pub(in crate::snapshots) codex_native_created_thread_last_nanos: Option<i128>,
+    // Raw turn id (class L): never uploaded except where the upload contract
+    // already carries it; persisted only in the local durable-tail store.
+    pub(in crate::snapshots) codex_native_created_thread_task_turn_id: Option<String>,
+    pub(in crate::snapshots) codex_native_created_thread_first_turn_bound: bool,
+    pub(in crate::snapshots) codex_ordinal_expected: Option<u64>,
+    pub(in crate::snapshots) codex_ordinal_sequence_valid: bool,
+    pub(in crate::snapshots) codex_owned_record_seen: bool,
+    pub(in crate::snapshots) codex_is_fork: bool,
+    pub(in crate::snapshots) codex_inherited_usage_records_skipped: u64,
+    pub(in crate::snapshots) codex_duplicate_usage_records_skipped: u64,
+    pub(in crate::snapshots) codex_cumulative_reset_count: u64,
+    // Retired durable-tail slots (see `context_curve_enabled`): always empty.
+    pub(in crate::snapshots) codex_context_curve_candidates:
+        crate::owned_heap::OwnedVec<ContextCurveCandidatePoint>,
+    pub(in crate::snapshots) codex_context_curve_boundaries:
+        crate::owned_heap::OwnedVec<ContextCurveCandidateBoundary>,
+    pub(in crate::snapshots) codex_context_curve_exact_supported: bool,
+    // Identity of the last provider usage event, used only to collapse an
+    // exact repeated physical checkpoint. Cumulative totals alone are not an
+    // occurrence key: a restarted epoch can legitimately reach the same total.
+    pub(in crate::snapshots) codex_last_usage_event_identity: Option<String>,
+    // Legacy child initialization records are written immediately before the
+    // trigger marker. Keep only the bounded, usage-free suffix beginning at
+    // the last task_started so its turn model/tier/title state can be replayed
+    // as child-owned once the marker proves the boundary.
+    pub(in crate::snapshots) codex_legacy_bootstrap_buffer: Vec<Value>,
+    // Exact sum of every usage record admitted to the wire projection. A
+    // provider record that would overflow any u64 wire field is refused before
+    // bucket mutation and counted as dropped, keeping the file retryable.
+    pub(in crate::snapshots) accepted_usage_totals: UsageTotals,
+    pub(in crate::snapshots) usage_buckets: BTreeMap<String, UsageBucketState>,
+    pub(in crate::snapshots) origin: SnapshotOrigin,
+    pub(in crate::snapshots) codex_root_session_ref: Option<String>,
+    pub(in crate::snapshots) codex_spawn_depth: Option<u64>,
+    // In-memory only: a sanitized, humanized leaf from Codex's content-free
+    // `/root/<task_name>` agent path. The raw path never enters SnapshotItem.
+    pub(in crate::snapshots) codex_agent_label: Option<String>,
+    pub(in crate::snapshots) activity_tool_counts: BTreeMap<String, u64>,
+    // Keyed by raw call id (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store, apart from the tool name (U).
+    pub(in crate::snapshots) activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
+    pub(in crate::snapshots) activity_mcp_tool_counts: BTreeMap<String, u64>,
+    // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
+    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map,
+    // and by `function_call`s that name their server in `payload.namespace`.
+    pub(in crate::snapshots) activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    // Open call ids already counted as MCP, so a call is counted once whichever
+    // of its namespaced `function_call` and `mcp_tool_call_end` comes first.
+    // The value records whether the completion event (and its capability) was
+    // seen. Like `activity_call_tools`, entries end at `function_call_output`.
+    // Raw MCP call ids (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
+    pub(in crate::snapshots) activity_mcp_call_ids: BTreeMap<String, bool>,
+    pub(in crate::snapshots) activity_capability_buckets: BTreeMap<(String, String, String), u64>,
+    // Claude-only summary: the seen-tool-use walk does not grow with history.
+    // Raw tool-use ids (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
+    pub(in crate::snapshots) seen_claude_capability_tool_uses:
+        crate::owned_heap::OwnedMap<String, ()>,
+    pub(in crate::snapshots) activity_skills: BTreeSet<String>,
+    // A SKILL.md reference whose skill could not be named (`cat SKILL.md`,
+    // `skills/*/SKILL.md`). The session then keeps the v1 capability marker:
+    // its skill list may be incomplete, so it cannot prove "no skill used".
+    pub(in crate::snapshots) skill_detector_incomplete: bool,
+    pub(in crate::snapshots) activity_changed_file_hashes: BTreeSet<String>,
+    pub(in crate::snapshots) activity_patch_operations: u64,
+    pub(in crate::snapshots) activity_lines_added: u64,
+    pub(in crate::snapshots) activity_lines_deleted: u64,
+    pub(in crate::snapshots) activity_web_searches: u64,
+    pub(in crate::snapshots) activity_mcp_calls: u64,
+    pub(in crate::snapshots) activity_subagent_spawns: u64,
+    pub(in crate::snapshots) artifacts: Vec<SessionArtifact>,
+    /// Retired: links are always scraped and filtered only at upload. Kept
+    /// because the durable record shape carries this byte.
+    pub(in crate::snapshots) artifacts_enabled: bool,
+    // Codex per-session latency accumulators, summed from rollout
+    // `task_complete` events (`duration_ms` + `time_to_first_token_ms`) and
+    // averaged in `into_items`. Zero counts mean no latency was observed.
+    pub(in crate::snapshots) latency_duration_ms_sum: u64,
+    pub(in crate::snapshots) latency_duration_ms_count: u64,
+    pub(in crate::snapshots) latency_ttft_ms_sum: u64,
+    pub(in crate::snapshots) latency_ttft_ms_count: u64,
+    // Max (slowest single turn) alongside the avg — the tail the average hides.
+    pub(in crate::snapshots) latency_duration_ms_max: u64,
+    pub(in crate::snapshots) latency_ttft_ms_max: u64,
+    // Claude Code persists one assistant record per content block. Sidechain
+    // writers update output_tokens progressively across those records, so a
+    // response must be resolved in full before any tokens, selectors, latency,
+    // posture, or request count enter the session projection. The map is local
+    // to one complete transcript parse; its key format also provides the seam
+    // for a future scan-level legacy-fork ownership ledger.
+    pub(in crate::snapshots) claude_responses: ClaudeResponseBook,
+    pub(in crate::snapshots) claude_response_sequence: u64,
+    pub(in crate::snapshots) claude_response_record_count: usize,
+    // Exact provider response ids for the once-per-response Claude usage rows
+    // above. Local-only; copied into SnapshotItem solely for account-evidence
+    // coverage and never serialized.
+    pub(in crate::snapshots) claude_usage_request_ids: BTreeSet<String>,
+    pub(in crate::snapshots) claude_usage_occurrences:
+        BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    /// Capture transcript markers: the scan's cycle holds a contract-5 permit.
+    pub(in crate::snapshots) claude_request_identity_capture: bool,
+    pub(in crate::snapshots) claude_org_markers: Option<Box<claude_request_identity::OrgMarkers>>,
+    pub(in crate::snapshots) cache_observations: Option<CacheObservations>,
+    pub(crate) cache_requests: crate::owned_heap::OwnedVec<OwnedRequest>,
+    pub(in crate::snapshots) cache_requests_complete: bool,
+    pub(in crate::snapshots) claude_context_curve_identity_complete: bool,
+    pub(in crate::snapshots) claude_context_curve_request_index_complete: bool,
+    pub(in crate::snapshots) claude_context_curve_owned_start_proven: bool,
+    pub(in crate::snapshots) claude_file_birth: ClaudeFileBirth,
+    /// The original a `/branch` copy names (`fork-context-ref`); empty when
+    /// the file names two or an invalid one. `e2` copy proof only.
+    pub(in crate::snapshots) claude_fork_parent: Option<String>,
+    pub(in crate::snapshots) claude_money: Option<Box<claude_request_money::e2::FileFold>>,
+    pub(in crate::snapshots) tool_usage_counts: BTreeMap<String, u64>,
+    pub(in crate::snapshots) tool_usage_truncated: bool,
+    // Current Pi transcripts carry usage on `type=message` assistant records;
+    // older exporters used `type=message_end`. When both representations are
+    // present, their response id is the exact occurrence key that prevents a
+    // compatibility parser from charging the same response twice.
+    // Each response id retains the unmatched digest multiset for both record
+    // shapes. A later opposite-shape exact match consumes one occurrence;
+    // repeated same-shape occurrences remain distinct. Keeping the multiset is
+    // required because transitional writers may reuse one response id for more
+    // than one paired occurrence.
+    pub(in crate::snapshots) seen_pi_usage_keys: PiLedger,
+    // Positive usage observations deliberately refused because their activity
+    // timestamp could not produce a truthful hourly bucket.
+    pub(in crate::snapshots) dropped_usage_record_count: u64,
+    // Timestamp of the most recent Claude Code `type=user` record (a real user
+    // prompt OR a tool_result — both are "model input available" moments). Each
+    // assistant API response's first content-block record subtracts this to
+    // derive that turn's wall-clock duration, feeding the shared
+    // `latency_duration_ms_*` accumulators. Claude Code stamps every record with
+    // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
+    // turn duration is derivable this way, never TTFT.
+    pub(in crate::snapshots) claude_last_user_ts: Option<String>,
+    // Desktop-lineage clocks (L04): the earliest and latest top-level
+    // `timestamp` over every whole Claude line, copied history included, in
+    // unix nanoseconds. Stored in the first head format so the lineage window
+    // can come from the head; not read yet.
+    pub(in crate::snapshots) claude_line_clocks: Option<(i128, i128)>,
+    // Context posture (see the SnapshotItem field docs). Running max /
+    // first-seen watermarks over each counted API response's effective input
+    // context, plus a count of compaction records. The Claude Code and Codex
+    // line parsers each feed these from their own records — the per-source
+    // input-scope difference is resolved before it reaches here, so both write
+    // the same window-comparable measure. Pi leaves them at their zero values
+    // and emits None.
+    pub(in crate::snapshots) peak_context_fill_tokens: u64,
+    pub(in crate::snapshots) first_turn_context_tokens: Option<u64>,
+    pub(in crate::snapshots) last_turn_context_tokens: Option<u64>,
+    // Codex only: the `model_context_window` of the record that set each
+    // watermark above (see the SnapshotItem field docs). Set in the same
+    // owned-record step as the watermarks, so a retained Tail continuation
+    // carries them exactly as a full read would.
+    pub(in crate::snapshots) first_turn_context_window_tokens: Option<u64>,
+    pub(in crate::snapshots) peak_context_fill_window_tokens: Option<u64>,
+    pub(in crate::snapshots) last_turn_context_window_tokens: Option<u64>,
+    pub(in crate::snapshots) compaction_count: u64,
+    pub(in crate::snapshots) compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    // Codex only: sizes index-aligned with `compaction_timestamps`.
+    pub(in crate::snapshots) codex_compaction_sizes: CodexCompactionSizes,
+    // Codex only: bounded points for the local Sessions graph.
+    pub(in crate::snapshots) local_context_points: LocalContextPoints,
+    pub(in crate::snapshots) claude_compaction_observations:
+        crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
+    // Pair key of the latest boundary still waiting for its legacy summary and
+    // the uuid at the tip of its `attachment` chain. One slot suffices: the
+    // provider writes boundary, attachments, then summary as a linear chain.
+    pub(in crate::snapshots) claude_compaction_link_tip: Option<(u64, String)>,
+    pub(in crate::snapshots) session_start: Box<session_start::SessionStartState>,
+    /// Codex: each dictionary key's stable Tail page slot. Never set for
+    /// another source, and never stored as a whole (the pages rebuild it).
+    pub(in crate::snapshots) codex_dictionary_slots: codex_dictionary_slots::CodexDictionarySlots,
+    /// The existing ownership-affecting sidecar dependency, independent of upload scope.
+    pub(in crate::snapshots) codex_sidecar_binding: Option<String>,
+}
+
 impl SnapshotAccumulator {
     pub(in crate::snapshots) fn new(source: SnapshotSource) -> Self {
         Self {
@@ -3051,6 +3341,7 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
         }
     }
 }
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, repository_binding, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, codex_dictionary_slots, codex_sidecar_binding);
 crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, last_activity_at);
 crate::durable_tail_codec::durable_struct!(UsageBucketState {
     D rows: BTreeMap<RowKey, BucketRowAccumulator>,
