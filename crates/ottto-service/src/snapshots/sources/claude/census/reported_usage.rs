@@ -195,46 +195,60 @@ fn apply_claude_reported_usage_with_index_and_rows(
         .map(|entry| entry.source_file_fingerprint.as_str())
         .filter(|revision| !revision.is_empty())
         .collect::<BTreeSet<_>>();
-    let mut uncertified_roots = index
-        .claude_request_census
-        .records()
-        .filter(|(_, record)| {
-            record.unverified_or_twin()
-                && !(record.can_bind_recomposed_body()
-                    && snapshots.iter().any(|item| {
-                        item.source_file_fingerprint
-                            .as_deref()
-                            .is_some_and(|revision| {
-                                !uncertified_revisions.contains(revision)
-                                    && claude_request_census::fingerprint_matches(record, revision)
-                            })
-                    }))
-        })
-        .map(|(key, _)| key)
-        .chain(
-            index
-                .files
-                .iter()
-                .filter(|(_, entry)| entry.has_prefix_provenance())
-                .map(|(key, _)| key),
-        )
-        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
-        .map(|(root, _)| root)
-        .collect::<BTreeSet<_>>();
-    let mut prefix_excluded_bodies = 0u64;
-    uncertified_roots.extend(
-        snapshots
-            .iter()
-            .filter(|item| {
-                let prefix = item
-                    .source_file_fingerprint
-                    .as_deref()
-                    .is_some_and(|revision| uncertified_revisions.contains(revision));
-                prefix_excluded_bodies = prefix_excluded_bodies.saturating_add(u64::from(prefix));
-                prefix
+    // `own_entry` gates context posture only (display): a record also binds
+    // to its own index entry when that entry is verified at the record's
+    // revision, so an idle member outside this batch keeps its family's
+    // posture. A quiet retire counts as verified here: the fingerprint must
+    // still match. Usage rebuild, demotion holds and cache rows keep the
+    // in-batch rule.
+    let census_roots = |own_entry: bool| {
+        index
+            .claude_request_census
+            .records()
+            .filter(|(key, record)| {
+                let bound = |revision: &str| {
+                    !uncertified_revisions.contains(revision)
+                        && claude_request_census::fingerprint_matches(record, revision)
+                };
+                record.unverified_or_twin()
+                    && !(record.can_bind_recomposed_body()
+                        && (snapshots.iter().any(|item| {
+                            item.source_file_fingerprint.as_deref().is_some_and(bound)
+                        }) || own_entry
+                            && index.files.get(key.as_str()).is_some_and(|entry| {
+                                !entry.has_unverified_source()
+                                    && bound(entry.source_file_fingerprint.as_str())
+                            })))
             })
-            .map(claude_snapshot_family_root),
-    );
+            .map(|(key, _)| key)
+            .chain(
+                index
+                    .files
+                    .iter()
+                    .filter(|(_, entry)| entry.has_prefix_provenance())
+                    .map(|(key, _)| key),
+            )
+            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+            .map(|(root, _)| root)
+            .collect::<BTreeSet<_>>()
+    };
+    let mut uncertified_roots = census_roots(false);
+    let mut posture_uncertified_roots = census_roots(true);
+    let mut prefix_excluded_bodies = 0u64;
+    let prefix_roots = snapshots
+        .iter()
+        .filter(|item| {
+            let prefix = item
+                .source_file_fingerprint
+                .as_deref()
+                .is_some_and(|revision| uncertified_revisions.contains(revision));
+            prefix_excluded_bodies = prefix_excluded_bodies.saturating_add(u64::from(prefix));
+            prefix
+        })
+        .map(claude_snapshot_family_root)
+        .collect::<Vec<_>>();
+    posture_uncertified_roots.extend(prefix_roots.iter().cloned());
+    uncertified_roots.extend(prefix_roots);
     crate::local_resource_diagnostics::cache_lifecycle::add(
         crate::local_resource_diagnostics::cache_lifecycle::Event::PrefixExcludedBody,
         prefix_excluded_bodies,
@@ -342,7 +356,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
     let cache_births = claude_context_file_birth::cache_content_births(snapshots);
     for (item, cache_birth) in snapshots.iter_mut().zip(cache_births) {
         let root_session_id = claude_snapshot_family_root(item);
-        if uncertified_roots.contains(&root_session_id) {
+        if posture_uncertified_roots.contains(&root_session_id) {
             clear_claude_context_posture(item);
             item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::UnknownBirth);
         } else {
@@ -368,7 +382,10 @@ fn apply_claude_reported_usage_with_index_and_rows(
         // before its content birth. No content birth (no timed own response)
         // ships nothing.
         item.cache_observations = cache_birth
-            .filter(|_| item.claude_file_birth_verdict == Some(ClaudeFileBirthVerdict::Admitted))
+            .filter(|_| {
+                item.claude_file_birth_verdict == Some(ClaudeFileBirthVerdict::Admitted)
+                    && !uncertified_roots.contains(&root_session_id)
+            })
             .map(|birth| {
                 cache_wire(
                     &item.source_session_id,
