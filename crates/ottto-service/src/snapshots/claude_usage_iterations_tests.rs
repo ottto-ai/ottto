@@ -172,7 +172,9 @@ fn claude_unknown_numeric_usage_keys_are_counted_without_changing_items() {
 fn claude_usage_gaps_count_once_per_response_on_the_claude_page_line() {
     use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
     let at = "2026-11-02T10:00:00Z";
-    let page = |files: &[&[(&str, usize, &Value, &[Value])]]| {
+    // One record: session, response number, top level, iterations.
+    type Record<'a> = (&'a str, usize, &'a Value, &'a [Value]);
+    let page = |files: &[&[Record]]| {
         crate::local_resource_diagnostics::take_claude_usage_gaps();
         for lines in files {
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
