@@ -1645,7 +1645,7 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
     for n in 1..=3 {
         c.write(
             &format!("019e5a00-0000-7000-8000-00000000000{n}"),
-            Some("b"),
+            Some(if n == 1 { "a" } else { "b" }),
         );
     }
     let (cold_index, cold_scan, ..) = page(&c, ScanIndex::default(), Arc::default());
@@ -1727,7 +1727,14 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
         cold.snapshots[MAIN]["session_account_evidence"],
         cold.snapshots[OTHER]["session_account_evidence"]
     );
+    let account_a = "019e5a00-0000-7000-8000-000000000001";
+    assert!(cold.snapshots[account_a]["session_account_evidence"].is_object());
     assert!(cold.snapshots[OTHER]["session_account_evidence"].is_object());
+    assert_ne!(
+        cold.snapshots[account_a]["session_account_evidence"],
+        cold.snapshots[OTHER]["session_account_evidence"],
+        "two tagged accounts"
+    );
     assert!(cold.snapshots[GAP]["session_account_evidence"].is_null());
     money_oracle::assert_equivalent(&cold, &paged);
     let mut wrong = paged.clone();

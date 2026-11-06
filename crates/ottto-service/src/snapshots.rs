@@ -16135,14 +16135,15 @@ fn record_codex_inventory_hold(
         .filter(|key| !traversal.codex_rollout_paths.contains(*key))
         .map(|key| (key.clone(), codex_file_join::path_witness(Path::new(key))))
         .collect::<Vec<_>>();
+    let census_walk_pending = codex_census_walk_pending(traversal);
     let hold = traversal
         .residue
         .codex_inventory_hold
         .get_or_insert_with(CodexInventoryHold::default);
     // Without a refused record or an unlisted candidate, the walk's open
     // directories were what kept the roster from proving the page.
-    hold.awaiting_directories |= codex_census_walk_pending(traversal)
-        || (inventory.refused.is_empty() && outside_roster.is_empty());
+    hold.awaiting_directories |=
+        census_walk_pending || (inventory.refused.is_empty() && outside_roster.is_empty());
     hold.owed.extend(held.iter().cloned());
     // The newest witness is the one a later tick has to see move.
     hold.refused_headers.extend(
