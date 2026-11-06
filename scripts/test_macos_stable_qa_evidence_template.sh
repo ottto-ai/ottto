@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$ROOT/scripts/macos_stable_qa_evidence_template.sh"
 CLOSEOUT_GATE="$ROOT/scripts/macos_stable_closeout_gate.sh"
@@ -45,7 +47,7 @@ write_manifest() {
         },
         {
           kind: "git_subtree",
-          repository: "ottto-ai/coding-agents-observability",
+          repository: "example-org/example-app",
           commit: "123456abcdef123456abcdef123456abcdef1234",
           path: "tools/ottto-macos-app",
           tree: "fedcba654321fedcba654321fedcba654321fedc",

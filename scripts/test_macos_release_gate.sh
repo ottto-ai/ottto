@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/macos_release_gate.sh"
 SCHEMA="$ROOT/release/manifest.schema.json"
@@ -125,7 +127,7 @@ write_manifest() {
           },
           {
             kind: "git_subtree",
-            repository: "ottto-ai/coding-agents-observability",
+            repository: "example-org/example-app",
             commit: "123456abcdef123456abcdef123456abcdef1234",
             path: "tools/ottto-macos-app",
             tree: "fedcba654321fedcba654321fedcba654321fedc",
@@ -191,6 +193,33 @@ dev_manifest="$TMP_DIR/dev-manifest.json"
 write_manifest "dev" "$sha" "false" "false" "false" "$dev_manifest"
 "$GATE" --manifest "$dev_manifest" >/dev/null
 
+# The expected identity comes from trusted caller input, not the manifest.
+for repository in "" "evil.invalid/example-org/example-app"; do
+  if OTTTO_MACOS_APP_SOURCE_REPOSITORY="$repository" \
+    "$GATE" --manifest "$dev_manifest" >"$TMP_DIR/repository-error.out" 2>&1; then
+    echo "Expected release gate to reject missing or malformed repository input" >&2
+    exit 1
+  fi
+  if ! grep -Fq "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" "$TMP_DIR/repository-error.out"; then
+    echo "Release gate did not report the repository input error" >&2
+    exit 1
+  fi
+done
+
+other_repository_manifest="$TMP_DIR/other-repository-manifest.json"
+jq '.supply_chain.materials[1].repository = "other-org/other-app"' \
+  "$dev_manifest" > "$other_repository_manifest"
+OTTTO_MACOS_APP_SOURCE_REPOSITORY="other-org/other-app" \
+  "$GATE" --manifest "$other_repository_manifest" >/dev/null
+if "$GATE" --manifest "$other_repository_manifest" >"$TMP_DIR/repository-mismatch.out" 2>&1; then
+  echo "Expected release gate to reject a different valid repository identity" >&2
+  exit 1
+fi
+if ! grep -Fq "app source material is invalid" "$TMP_DIR/repository-mismatch.out"; then
+  echo "Release gate did not report the repository mismatch" >&2
+  exit 1
+fi
+
 stable_candidate_manifest="$TMP_DIR/stable-candidate-manifest.json"
 jq '.channel = "stable-candidate" | .version = "0.1.0-stable-candidate.1"' \
   "$dev_manifest" > "$stable_candidate_manifest"
@@ -225,7 +254,7 @@ if "$GATE" --manifest "$missing_materials_manifest" >/dev/null 2>&1; then
 fi
 
 spoofed_app_material_manifest="$TMP_DIR/spoofed-app-material-manifest.json"
-jq '.supply_chain.materials[1].repository = "evil.invalid/ottto-ai/coding-agents-observability"' \
+jq '.supply_chain.materials[1].repository = "evil.invalid/example-org/example-app"' \
   "$dev_manifest" > "$spoofed_app_material_manifest"
 if "$GATE" --manifest "$spoofed_app_material_manifest" >/dev/null 2>&1; then
   echo "Expected manifest with spoofed private app source material to fail" >&2
@@ -375,7 +404,7 @@ PLIST
           },
           {
             kind: "git_subtree",
-            repository: "ottto-ai/coding-agents-observability",
+            repository: "example-org/example-app",
             commit: "123456abcdef123456abcdef123456abcdef1234",
             path: "tools/ottto-macos-app",
             tree: "fedcba654321fedcba654321fedcba654321fedc",

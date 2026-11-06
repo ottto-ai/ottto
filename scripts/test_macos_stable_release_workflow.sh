@@ -61,6 +61,9 @@ require_grep 'scripts/macos_package\.sh' 'packaging step'
 require_grep '--app-root "\$\{OTTTO_MACOS_APP_ROOT:\?\}"' 'app root passed into macos_package from the runner'
 # shellcheck disable=SC2016
 require_grep '--app-source-commit "\$OTTTO_MACOS_APP_SOURCE_COMMIT"' 'release-tag app source commit passed into macos_package'
+# shellcheck disable=SC2016 # This assertion matches the literal secret expression.
+require_grep '^      OTTTO_MACOS_APP_SOURCE_REPOSITORY: \$\{\{ secrets\.OTTTO_MACOS_APP_SOURCE_REPOSITORY \}\}' 'job-wide app source repository from the release secret'
+require_grep 'OTTTO_MACOS_APP_SOURCE_REPOSITORY must be configured in owner/name form' 'required app source repository validation'
 require_grep 'scripts/macos_notarize\.sh' 'notarization step'
 require_grep 'scripts/macos_attestation_bind\.sh' 'attestation binding step'
 require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature step'
@@ -139,9 +142,10 @@ for line in lines[run + 1 :]:
 Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
 PY
 
-# run_policy <ref> <channel> <version>
+# run_policy <ref> <channel> <version> [repository]
 run_policy() {
   env -i PATH="$PATH" \
+    OTTTO_MACOS_APP_SOURCE_REPOSITORY="${4-example-org/example-app}" \
     GITHUB_EVENT_NAME=workflow_dispatch \
     GITHUB_REF="$1" \
     CHANNEL="$2" \
@@ -177,6 +181,9 @@ expect_policy_reject() {
 }
 
 expect_policy_accept refs/tags/v0.1.2 stable 0.1.2
+expect_policy_accept refs/tags/v0.1.2 stable 0.1.2 other-org/other-app
+expect_policy_reject "must be configured in owner/name form" refs/tags/v0.1.2 stable 0.1.2 ""
+expect_policy_reject "must be configured in owner/name form" refs/tags/v0.1.2 stable 0.1.2 evil.invalid/example-org/example-app
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc1
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc12
 expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/heads/main stable 0.1.2

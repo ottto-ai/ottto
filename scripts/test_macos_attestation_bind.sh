@@ -129,7 +129,7 @@ jq -n \
         },
         {
           kind: "git_subtree",
-          repository: "ottto-ai/coding-agents-observability",
+          repository: "example-org/example-app",
           commit: "123456abcdef123456abcdef123456abcdef1234",
           path: "tools/ottto-macos-app",
           tree: "fedcba654321fedcba654321fedcba654321fedc",
@@ -214,7 +214,7 @@ jq -e '
   and .supply_chain.slsa_build.source_ref == "refs/tags/v0.1.0"
   and .supply_chain.slsa_build.source_digest == "abcdef123456"
   and (.supply_chain.slsa_build.subjects | index("release-manifest.json") != null)
-  and .supply_chain.materials[1].repository == "ottto-ai/coding-agents-observability"
+  and .supply_chain.materials[1].repository == "example-org/example-app"
   and .supply_chain.materials[1].path == "tools/ottto-macos-app"
   and .supply_chain.materials[1].tree == "fedcba654321fedcba654321fedcba654321fedc"
   and .supply_chain.sbom.attested == true

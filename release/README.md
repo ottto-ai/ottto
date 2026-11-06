@@ -42,6 +42,7 @@ requires Developer ID signing.
 From this directory's parent:
 
 ```bash
+export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
 ./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
   --version 0.1.0 --channel dev
 ./scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
@@ -51,6 +52,24 @@ From this directory's parent:
 `--app-root` names the `tools/ottto-macos-app` Swift package inside its clean
 Git checkout. Stable-candidate and stable builds also take
 `--app-source-commit`, the 40-hex commit that checkout must be at.
+
+Export `OTTTO_MACOS_APP_SOURCE_REPOSITORY` with the app source repository
+identity in `owner/name` form before packaging or running release gates,
+preflight, closeout, or the dev installer. The packager records it unchanged in
+`supply_chain.materials[1].repository`; the release gate compares that field
+against the expected value from the same environment variable. Supply the gate
+value from trusted release configuration, never from the manifest being checked.
+The caller validates the checkout ownership before invoking the packager; the
+packager checks the identity shape and the clean, pinned app subtree.
+
+For `macos-stable-release.yml`, configure the
+`OTTTO_MACOS_APP_SOURCE_REPOSITORY` secret in the `macos-stable-release`
+environment (or at repository scope). The workflow exports it for packaging and
+all downstream gates, and rejects missing or malformed values before building.
+Local release tooling must export the same expected identity for its gate calls.
+This changes only the value source; the manifest field and schema version remain
+unchanged, and already shipped manifests remain valid with their expected
+repository supplied.
 
 The package manifest uses URL-safe artifact names such as
 `Ottto-macos-arm64.dmg`, `ottto-macos-arm64.zip`, and

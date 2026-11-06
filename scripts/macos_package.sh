@@ -14,6 +14,7 @@ if [[ -z "$ROOT" ]]; then
 fi
 MAC_APP_ROOT=""
 MAC_APP_SOURCE_PIN=""
+MAC_APP_SOURCE_REPOSITORY="${OTTTO_MACOS_APP_SOURCE_REPOSITORY:-}"
 
 VERSION="0.1.0-dev"
 CHANNEL="dev"
@@ -44,6 +45,11 @@ Options:
   --notarized               Mark artifacts notarized after external notarization.
   --skip-build              Reuse existing release build outputs.
   -h, --help                Show help.
+
+Environment:
+  OTTTO_MACOS_APP_SOURCE_REPOSITORY
+                             Required app source identity in owner/name form.
+                             Recorded as given; the caller validates the source.
 USAGE
 }
 
@@ -118,6 +124,11 @@ if [[ -n "$MAC_APP_SOURCE_PIN" && ! "$MAC_APP_SOURCE_PIN" =~ ^[0-9a-f]{40}$ ]]; 
 fi
 if [[ ( "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ) && -z "$MAC_APP_SOURCE_PIN" ]]; then
   echo "--app-source-commit is required for stable-candidate and stable channels" >&2
+  exit 2
+fi
+
+if [[ ! "$MAC_APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" >&2
   exit 2
 fi
 
@@ -210,19 +221,7 @@ if [[ "$MAC_APP_SOURCE_PATH" != "tools/ottto-macos-app" ]]; then
   echo "macOS app root must be the tracked tools/ottto-macos-app subtree" >&2
   exit 2
 fi
-MAC_APP_SOURCE_REMOTE="$(git -C "$MAC_APP_GIT_ROOT" config --get remote.origin.url 2>/dev/null || true)"
-case "$MAC_APP_SOURCE_REMOTE" in
-  git@github.com:ottto-ai/coding-agents-observability | \
-  git@github.com:ottto-ai/coding-agents-observability.git | \
-  ssh://git@github.com/ottto-ai/coding-agents-observability | \
-  ssh://git@github.com/ottto-ai/coding-agents-observability.git | \
-  https://github.com/ottto-ai/coding-agents-observability | \
-  https://github.com/ottto-ai/coding-agents-observability.git) ;;
-  *)
-    echo "macOS app source must come from ottto-ai/coding-agents-observability" >&2
-    exit 2
-    ;;
-esac
+# The caller validates source ownership before handing off the app checkout.
 if ! git -C "$MAC_APP_GIT_ROOT" diff --quiet HEAD -- "$MAC_APP_SOURCE_PATH"; then
   echo "macOS app source subtree has tracked changes; freeze a clean private commit before packaging" >&2
   exit 2
@@ -231,7 +230,6 @@ if [[ -n "$(git -C "$MAC_APP_GIT_ROOT" ls-files --others --exclude-standard -- "
   echo "macOS app source subtree has untracked files; freeze a clean private commit before packaging" >&2
   exit 2
 fi
-MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 MAC_APP_SOURCE_COMMIT="$(git -C "$MAC_APP_GIT_ROOT" rev-parse HEAD)"
 # Stable channels pin the app source commit (the release workflow takes it
 # from the release tag); dev and preview builds default to the checkout HEAD.

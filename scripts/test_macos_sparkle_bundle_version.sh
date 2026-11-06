@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/macos_sparkle_bundle_version.sh
 source "$ROOT/scripts/macos_sparkle_bundle_version.sh"
@@ -191,7 +193,7 @@ app_root="$private_repo/tools/ottto-macos-app"
 git -C "$private_repo" init -q
 git -C "$private_repo" config user.email "sparkle-version-test@example.invalid"
 git -C "$private_repo" config user.name "Sparkle Version Test"
-git -C "$private_repo" remote add origin git@github.com:ottto-ai/coding-agents-observability.git
+# No origin remote is needed: the caller supplies the repository identity.
 git -C "$private_repo" add .
 git -C "$private_repo" commit -qm "app fixture"
 private_commit="$(git -C "$private_repo" rev-parse HEAD)"
@@ -236,6 +238,13 @@ package_expect_failure invalid-pin "--app-source-commit must be a 40-hex" \
   --app-root "$app_root" --app-source-commit "${private_commit:0:12}"
 package_expect_failure pin-mismatch "not --app-source-commit" \
   --app-root "$app_root" --app-source-commit "$(printf '0%.0s' {1..40})"
+
+# [behaviour] Repository identity is explicit and accepts only owner/name form.
+for repository in "" "https://github.com/example-org/example-app" "evil.invalid/example-org/example-app"; do
+  OTTTO_MACOS_APP_SOURCE_REPOSITORY="$repository" \
+    package_expect_failure invalid-repository "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" \
+      --app-root "$app_root" --app-source-commit "$private_commit"
+done
 
 PATH="$mock_bin:$PATH" \
 bash "$repo/scripts/macos_package.sh" \
@@ -315,7 +324,7 @@ if ! jq -e \
     }
     and .supply_chain.materials[1] == {
       kind: "git_subtree",
-      repository: "ottto-ai/coding-agents-observability",
+      repository: "example-org/example-app",
       commit: $private_commit,
       path: "tools/ottto-macos-app",
       tree: $private_tree,

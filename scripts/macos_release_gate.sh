@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MANIFEST=""
+APP_SOURCE_REPOSITORY="${OTTTO_MACOS_APP_SOURCE_REPOSITORY:-}"
 
 usage() {
   cat <<'USAGE'
@@ -9,6 +10,11 @@ Usage: macos_release_gate.sh --manifest <release-manifest.json>
 
 Validates artifact presence, SHA-256 integrity, and stable-channel signing /
 notarization requirements for the clean-slate Ottto local platform.
+
+Environment:
+  OTTTO_MACOS_APP_SOURCE_REPOSITORY
+    Required expected app source identity in owner/name form. Supply it from
+    trusted release configuration, independently of the manifest being checked.
 USAGE
 }
 
@@ -32,6 +38,11 @@ done
 
 if [[ -z "$MANIFEST" ]]; then
   usage >&2
+  exit 2
+fi
+
+if [[ ! "$APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" >&2
   exit 2
 fi
 
@@ -210,7 +221,7 @@ if [[ ! "$public_material_commit" =~ ^[0-9a-f]{40}$ || "${public_material_commit
   echo "Release manifest public source material commit does not match manifest commit" >&2
   exit 1
 fi
-if [[ "$app_material_kind" != "git_subtree" || "$app_material_repository" != "ottto-ai/coding-agents-observability" ]]; then
+if [[ "$app_material_kind" != "git_subtree" || "$app_material_repository" != "$APP_SOURCE_REPOSITORY" ]]; then
   echo "Release manifest private app source material is invalid" >&2
   exit 1
 fi
