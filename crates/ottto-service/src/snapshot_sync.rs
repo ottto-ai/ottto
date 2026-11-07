@@ -23968,6 +23968,10 @@ mod head_conflict_answer_tests;
 mod change_reason_tests;
 
 #[cfg(test)]
+#[path = "snapshot_sync/progress_unchanged_save_tests.rs"]
+mod progress_unchanged_save_tests;
+
+#[cfg(test)]
 #[path = "snapshot_sync/head_conflict_released_progress_fixture.rs"]
 mod head_conflict_released_progress_fixture;
 
