@@ -748,8 +748,18 @@ impl OwnedJsonlParser {
         {
             accumulator.codex_creator_evidence_conflicted = true;
         }
-        let codex_ownership_incomplete =
-            source == SnapshotSource::Codex && !accumulator.codex_usage_accounting_complete();
+        // A closed archive whose whole exact stream is inherited parent prefix
+        // owns provably zero usage: confirmed-empty, and its inherited usage is
+        // no evidence. A plain file may still be live, so it keeps the hold.
+        let codex_prefix_only_closed = source == SnapshotSource::Codex
+            && codex_archive_path(path)
+            && report.complete()
+            && report.over_line_cap_count == 0
+            && !sealed_fragment
+            && accumulator.codex_ordinal_prefix_only(report.parsed_json_line_count);
+        let codex_ownership_incomplete = source == SnapshotSource::Codex
+            && !accumulator.codex_usage_accounting_complete()
+            && !codex_prefix_only_closed;
         if codex_ownership_incomplete {
             // Keep the candidate retryable even when the ambiguous/incomplete
             // rollout contains no recognized positive usage. Otherwise it could be
@@ -820,8 +830,9 @@ impl OwnedJsonlParser {
         // entity is still loss. Typical causes are an absent/unparseable activity
         // timestamp or an identity shape the accumulator cannot settle. Treat the
         // whole file as retryable instead of persisting it as confirmed-empty.
-        let zero_snapshot_usage_evidence = snapshots.is_empty() && positive_usage_evidence;
-        if snapshots.is_empty() {
+        let zero_snapshot_usage_evidence =
+            snapshots.is_empty() && positive_usage_evidence && !codex_prefix_only_closed;
+        if snapshots.is_empty() && !codex_prefix_only_closed {
             recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(
                 positive_recognized_usage_count
                     .saturating_sub(accumulator_dropped_usage_record_count),

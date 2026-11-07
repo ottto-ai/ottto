@@ -1338,6 +1338,20 @@ impl SnapshotAccumulator {
         }
     }
 
+    /// An exact ordinal fork whose every parsed record is inherited prefix:
+    /// the contiguous stream ends at its declared start with nothing owned.
+    /// Only a closed stream proves zero owned usage; the caller owns that.
+    pub(in crate::snapshots) fn codex_ordinal_prefix_only(&self, parsed_records: usize) -> bool {
+        matches!(
+            self.codex_ownership_boundary,
+            CodexOwnershipBoundary::Ordinal { start }
+                if self.codex_ordinal_sequence_valid
+                    && !self.codex_owned_record_seen
+                    && self.codex_ordinal_expected == Some(start)
+                    && u64::try_from(parsed_records).ok() == Some(start)
+        )
+    }
+
     /// Merge newly scraped artifacts, deduping and capping at
     /// ``MAX_SESSION_ARTIFACTS``. Encounter order is preserved; ``into_items``
     /// sorts for a deterministic fingerprint.

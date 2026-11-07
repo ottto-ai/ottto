@@ -2207,6 +2207,137 @@ pub(in crate::snapshots) mod tests {
             assert!(index.accepted_snapshot_fingerprints.is_empty());
             assert_eq!(scan.zero_snapshot_usage_evidence_count > 0, evidence);
         }
+        archive_prefix_only_subagent_is_empty_and_any_doubt_holds();
+    }
+    /// [money] A closed subagent archive whose exact ordinals end at its
+    /// declared start holds only inherited parent usage: confirmed-empty with
+    /// no snapshot, and the next unchanged pass reads 0 bytes. A gap, an owned
+    /// record or a truncated tail keeps the main behaviour.
+    fn archive_prefix_only_subagent_is_empty_and_any_doubt_holds() {
+        for case in ["prefix-only", "gap", "owned", "truncated"] {
+            let mut rows: Vec<Value> = String::from_utf8(synthetic_rollout())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            rows[0]["timestamp"] = json!("2026-10-07T09:59:00Z");
+            rows[0]["payload"]["thread_source"] = json!("subagent");
+            rows[0]["payload"]["source"] =
+                json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}});
+            rows[0]["payload"]["history_mode"] = json!("paginated");
+            let start = if case == "owned" { 3 } else { 4 };
+            rows[0]["payload"]["subagent_history_start_ordinal"] = json!(start);
+            for (ordinal, row) in rows.iter_mut().enumerate() {
+                row["ordinal"] = json!(ordinal);
+            }
+            if case == "gap" {
+                rows.remove(2);
+            }
+            let mut bytes = rows
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>();
+            if case == "truncated" {
+                bytes.push_str(r#"{"ordinal":4,"type":"event_msg","payload":{"type":"tok"#);
+            }
+            let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+            let mut file = File::open(&f.0).unwrap();
+            let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+            let input = OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap())
+                .unwrap();
+            let mut parser = codex_parser(input, &f.0);
+            while !parser.step().unwrap() {}
+            let parsed = parser
+                .finish(
+                    &expected,
+                    &f.0,
+                    NOW,
+                    "fixture".into(),
+                    Some(&CodexTitleMetadata::default()),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let empty = case == "prefix-only";
+            assert_eq!(
+                parsed.snapshots.len(),
+                usize::from(case == "owned"),
+                "{case}"
+            );
+            assert_eq!(
+                parsed.progress_complete(),
+                empty || case == "owned",
+                "{case}"
+            );
+            let held = !empty && case != "owned";
+            assert_eq!(parsed.ownership_incomplete_file_count, usize::from(held));
+            // Inherited usage is evidence only while the archive is held.
+            assert_eq!(parsed.zero_snapshot_usage_evidence, held, "{case}");
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let (index, scan, _) = run_archive(&f, ScanIndex::default(), cache.clone());
+            let key = local_index_key(&f.0);
+            assert_eq!(index.confirmed_empty_files.contains(&key), empty, "{case}");
+            assert_eq!(scan.snapshots.len(), usize::from(case == "owned"), "{case}");
+            if empty {
+                assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+                let ((index, quiet, _), consumed) =
+                    sampled_scan::transition_fixture::observe_consumed(|| {
+                        run_archive(&f, saved(&index), cache)
+                    });
+                assert!(quiet.snapshots.is_empty());
+                assert_eq!(consumed, 0, "unchanged confirmed-empty archive is quiet");
+                assert!(index.confirmed_empty_files.contains(&key));
+            }
+        }
+        archive_confirmed_empty_walk_owes_nothing();
+    }
+    /// [regress] Unindexed parser residue is unread debt on every walk; the
+    /// same archive indexed unchanged as confirmed-empty owes nothing, counts
+    /// as no upload required and its committed debt resolves.
+    fn archive_confirmed_empty_walk_owes_nothing() {
+        use crate::snapshots::g7_debt::tests::{entry, walk, Fixture};
+        let mut g7 = Fixture::new(
+            crate::snapshots::scan_index_persistence::Source::Codex,
+            "codex-prefix-only-walk",
+        );
+        let path = g7.root.join("rollout-prefix-only.jsonl.zst");
+        fs::write(&path, b"archive").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600))
+            .unwrap();
+        let roots = [g7.root.clone()];
+        let key = local_index_key(&path);
+        let debt =
+            |index: &mut ScanIndex| walk(SnapshotSource::Codex, &roots, index)["debt"].clone();
+        let revisions = |index: &ScanIndex| {
+            let mut count = 0;
+            if let Some(head) = state_v2::load_head(index, &key, u32::MAX).unwrap() {
+                state_v2::load_revisions(index, &key, &head, |_, _| {
+                    count += 1;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            count
+        };
+        let residue = debt(&mut g7.index);
+        assert_eq!(residue["never_indexed_files"], 1);
+        assert_eq!(residue["outstanding_files"], 1);
+        assert_eq!(residue["alarm"], true);
+        g7.save();
+        assert_eq!(revisions(&g7.index), 1);
+        g7.index.files.insert(key.clone(), entry(&path));
+        g7.index.confirmed_empty_files.insert(key.clone());
+        let empty = debt(&mut g7.index);
+        assert_eq!(empty["outstanding_files"], 0);
+        assert_eq!(empty["never_indexed_files"], 0);
+        assert_eq!(empty["no_upload_required_files"], 1);
+        g7.save();
+        assert_eq!(revisions(&g7.index), 0);
+        g7.close();
     }
     mod archive_transitions {
         use super::*;
