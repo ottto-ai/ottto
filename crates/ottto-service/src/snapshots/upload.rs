@@ -3,4 +3,5 @@
 //! decides what the next pass offers again.
 
 mod committable_subset;
+pub(super) mod finalize;
 mod reoffer_quarantine;
