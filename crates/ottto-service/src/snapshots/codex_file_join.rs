@@ -2371,7 +2371,7 @@ pub(super) mod tests {
                 HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
             assert_eq!(
                 inventory.pending,
-                [plain.clone()],
+                std::slice::from_ref(&plain),
                 "the roster shadows the archive"
             );
             // Codex replaces the plaintext between the roster and its open.
@@ -2416,9 +2416,7 @@ pub(super) mod tests {
             fs::write(&outside, zstd::stream::encode_all(plain, 1).unwrap()).unwrap();
             std::os::unix::fs::symlink(&outside, archive).unwrap();
         };
-        let no_archive = |_: &Path, _: &Path, _: &[u8]| {};
-        let cases: [&dyn Fn(&Path, &Path, &[u8]); 2] = [&no_archive, &symlink_out];
-        for write_archive in cases {
+        let unchanged = |write_archive: &dyn Fn(&Path, &Path, &[u8])| {
             let (root, plain, _, _, inventory) = swapped(write_archive);
             assert!(!inventory.complete);
             assert!(inventory.headers.is_empty());
@@ -2428,7 +2426,9 @@ pub(super) mod tests {
             expected[UnreadableCause::OpenRead as usize] = 1;
             assert_eq!(causes(&inventory), expected);
             fs::remove_dir_all(root).unwrap();
-        }
+        };
+        unchanged(&|_, _, _| {});
+        unchanged(&symlink_out);
     }
 
     #[test]
