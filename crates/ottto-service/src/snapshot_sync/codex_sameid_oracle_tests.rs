@@ -504,11 +504,23 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     let _secrets = EnvVarGuard::set_path(ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
     let _manifests = SourceManifestTestGuard::new();
+    // The receiver ACKs the wire body: this pass sends no cache observations.
+    let mut wire = expected.snapshots.clone();
+    let ledger = SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(SOURCE));
+    for item in &mut wire {
+        prepare_snapshot_cache_for_upload(
+            item,
+            &ledger,
+            false,
+            false,
+            &std::collections::BTreeSet::new(),
+        );
+    }
     let captured = Arc::new(Mutex::new(Vec::new()));
     let url = snapshot_status_server_with_hint_extras_and_batch(
         captured.clone(),
         vec![(183, "")],
-        Some(expected.snapshots.clone()),
+        Some(wire),
     );
     let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &url);
     let client = SnapshotApiClient::new(url);
