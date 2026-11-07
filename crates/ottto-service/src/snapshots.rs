@@ -1978,7 +1978,7 @@ impl OwnedSourceScan {
         let mut codex_page = sampled_scan::codex_cursor::PageBudget::default();
         codex_page.set_continuation(ordinary_equivalent);
         Self {
-            resource_probe: crate::local_resource_diagnostics::Probe::start(),
+            resource_probe: crate::local_resource_diagnostics::Probe::page(),
             sampling: None,
             source: SnapshotSource::Codex,
             roots: roots.to_vec(),
@@ -2091,7 +2091,7 @@ impl OwnedSourceScan {
         let audit_now = sampled_scan::now_seconds();
         // Every source: a non-Claude page emits only its retained-cache events.
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let mut resource_probe = crate::local_resource_diagnostics::Probe::start()
+        let mut resource_probe = crate::local_resource_diagnostics::Probe::page()
             .with_withheld_memo(owned_index.withheld_memo.clone());
         resource_probe.refusal_exposure = (owned_index.refusal_exposure != Default::default())
             .then_some(owned_index.refusal_exposure);
