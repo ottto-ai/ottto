@@ -42,6 +42,24 @@ pub(crate) fn cache_state_from_patch(
         json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
     )
 }
+/// A server-echoed completed state (`cache_state_ack:v1`) rebuilt through the
+/// patch path: the echo's coverage must pass `validate`, its rows must parse,
+/// and the result must stay within the state bounds. A repeated row or a
+/// malformed omitted count changes the rebuilt state, so its witness cannot
+/// match the server's digest.
+pub(crate) fn cache_state_from_echo(echo: &Value) -> Option<Value> {
+    let empty = CacheObservations {
+        schema_version: u16::try_from(echo.get("schema_version")?.as_u64()?).ok()?,
+        operations: Vec::new(),
+        coverage: echo.get("coverage")?.as_str()?.into(),
+        omitted_observation_count: echo
+            .get("omitted_observation_count")
+            .and_then(Value::as_u64),
+        full_replacement: false,
+    };
+    let state = cache_state_from_patch(Some(echo), &empty).filter(|_| empty.validate())?;
+    cache_state_within_limits(&state).then_some(state)
+}
 /// Preflight the exact wire and its completion against the ACKed predecessor.
 /// Partial coverage never authorizes deletion, including after budget trimming.
 pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {
@@ -70,13 +88,22 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
             };
             a.cmp(b)
         });
+        // Retract only a correction: a row on a request this read saw that the
+        // detector no longer reports. A row on a request it never saw (one
+        // adopted from the server's echoed state) is kept, not retracted.
+        let seen = item
+            .cache_requests
+            .iter()
+            .map(|request| request.slot.request_ref.as_str())
+            .collect::<BTreeSet<_>>();
         for row in prior
             .and_then(|p| p["observations"].as_array())
             .into_iter()
             .flatten()
         {
             if let Some(id) = row["event_id"].as_str() {
-                if !ids.contains(id) {
+                let request = row["affected_request_ref"].as_str();
+                if !ids.contains(id) && request.is_some_and(|r| seen.contains(r)) {
                     wire.operations
                         .push(cache_observations::Operation::Retract {
                             event_id: id.into(),

@@ -290,6 +290,9 @@ pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
 /// Backend money-decrease holds: a held request-owned literal body is
 /// refused as retryable (`permanent=false`) instead of being applied.
 pub const USAGE_DECREASE_HOLD_ACK_CONTRACT: &str = "usage_decrease_hold_ack:v1";
+/// Cache-bearing batches ask the server to echo the completed cache state
+/// behind each stored ref's body witness. Older servers ignore the field.
+pub const CACHE_STATE_ACK_CONTRACT: &str = "cache_state_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -368,7 +371,7 @@ use wire::content_hash::{
 pub(crate) use wire::content_hash::{
     snapshot_fingerprint, snapshot_fingerprint_from_component_hashes,
     snapshot_semantic_component_hashes, snapshot_semantic_envelope, snapshot_upload_body_witness,
-    snapshot_upload_body_witness_version,
+    snapshot_upload_body_witness_version, snapshot_upload_body_witness_with_cache_state,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION,
 };
@@ -6109,7 +6112,9 @@ use sources::claude::line::claude_cache_request_slot;
 #[cfg(test)]
 use usage::cache_observations::cache_state_within_limits;
 use usage::cache_observations::cache_wire;
-pub(crate) use usage::cache_observations::{cache_state_from_patch, prepare_cache_observations};
+pub(crate) use usage::cache_observations::{
+    cache_state_from_echo, cache_state_from_patch, prepare_cache_observations,
+};
 
 use sources::codex::line::{
     apply_codex_line, codex_extract_quota_window_selectors, codex_first_user_prompt,
@@ -17786,24 +17791,21 @@ mod tests {
                 2,
                 "the skipped owned response is absent"
             );
-            // Without the read-completeness fence, the unchanged detector calls
-            // these two surviving warm requests complete and retracts the
-            // previously accepted loss anchored on the missing cold request.
-            let mut unfenced = item.clone();
-            unfenced.cache_observations = Some(cache_wire(id, &item.cache_requests, true));
-            prepare_cache_observations(&mut unfenced, Some(&prior));
-            assert!(matches!(
-                unfenced
-                    .cache_observations
-                    .as_ref()
-                    .unwrap()
-                    .operations
-                    .as_slice(),
-                [cache_observations::Operation::Retract { .. }]
-            ));
+            // A complete patch whose book lacks the row's request keeps the
+            // row: only a request still read can correct it.
+            let mut keeps_row_when_request_missing_from_book = item.clone();
+            let book = &mut keeps_row_when_request_missing_from_book;
+            book.cache_observations = Some(cache_wire(id, &item.cache_requests, true));
+            prepare_cache_observations(book, Some(&prior));
+            assert!(book
+                .cache_observations
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty());
             assert_eq!(
-                unfenced.cache_observations_state.unwrap()["observations"],
-                json!([])
+                book.cache_observations_state.as_ref().unwrap()["observations"],
+                prior["observations"]
             );
             assert!(
                 !item.cache_requests_complete,
@@ -17997,6 +17999,7 @@ mod tests {
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
+                            cache_observations_state: None,
                         };
                         crate::snapshot_client::SnapshotBatchResponse {
                             conflict_rescans: Default::default(),
@@ -19497,6 +19500,7 @@ mod tests {
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
+                            cache_observations_state: None,
                         };
                         crate::snapshot_client::SnapshotBatchResponse {
                             conflict_rescans: Default::default(),
@@ -27601,6 +27605,7 @@ mod tests {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             }],
             unchanged_entities: vec![],
             rejected_entities: vec![],

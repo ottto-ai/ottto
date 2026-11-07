@@ -3160,12 +3160,25 @@ fn mixed_route(
     progress: &SnapshotUploadProgress,
     mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
 ) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    mixed_route_acked(page, progress, mode, ack).0
+}
+
+/// `mixed_route` against the receiver `respond`; also returns the ledger.
+fn mixed_route_acked(
+    page: &Page,
+    progress: &SnapshotUploadProgress,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    SnapshotUploadProgress,
+) {
     let sent = under_required_cas(&page.scan.snapshots, progress);
     let mut progress = progress.clone();
     progress
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
-    let (status, batches, _) = upload(&sent, &mut progress, ack);
+    let (status, batches, _) = upload(&sent, &mut progress, respond);
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     let mut result = crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
         mode,
@@ -3189,7 +3202,30 @@ fn mixed_route(
         )
         .unwrap(),
     );
-    result
+    (result, progress)
+}
+
+/// A `cache_state_ack:v1` receiver whose stored cache state for each patched
+/// session also holds a row the daemon never learned (it stored bodies whose
+/// ACKs the daemon refused): each digest covers that union, and the ref
+/// echoes it.
+fn stray_row_echo_ack(
+    batch: &[SnapshotItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let asked =
+        serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
+    let mut response = ack(batch)?;
+    for (reference, item) in response.accepted_entities.iter_mut().zip(batch) {
+        let Some(state) = item.cache_observations_state.as_ref() else {
+            continue;
+        };
+        let stored = crate::snapshot_sync::head_conflict_answer_tests::with_stray_cache_row(state);
+        let mut hashed = item.clone();
+        hashed.cache_observations_state = Some(stored.clone());
+        reference.body_witness_digest = Some(snapshot_upload_body_witness(&hashed));
+        reference.cache_observations_state = asked.then_some(stored);
+    }
+    Ok(response)
 }
 
 /// [money] A mixed page (a patched forked session beside an
@@ -3322,6 +3358,28 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
             "two organizations"
         );
         println!("MIXED_CLASS_PAGE_ORACLE VERIFIED arms=ram_tail,cold_full,restored_tail requests_per_route=2");
+        // `cache_state_ack:v1`: the server's stored cache state for ROOT also
+        // holds a row this daemon never learned, so its digest covers that
+        // row. The echo settles the body; the sent bytes, money, placement
+        // and post-ACK ledger equal the cold route's, and the cache ledger
+        // holds the server's state.
+        let (_, cold_ledger) = mixed_route_acked(full, &progress, Mode::ColdFull, ack);
+        let (echoed, echoed_ledger) =
+            mixed_route_acked(full, &progress, Mode::Restart, stray_row_echo_ack);
+        money_oracle::assert_equivalent(&routes[1], &echoed);
+        let key = cache_session_key(ROOT);
+        assert_eq!(
+            echoed_ledger.accepted_cache_states[&key],
+            crate::snapshot_sync::head_conflict_answer_tests::with_stray_cache_row(
+                &cold_ledger.accepted_cache_states[&key]
+            )
+        );
+        // The same bodies settled; ROOT's witness is the server's digest.
+        assert!(echoed_ledger
+            .accepted_body_witnesses
+            .keys()
+            .eq(cold_ledger.accepted_body_witnesses.keys()));
+        println!("MIXED_CLASS_PAGE_ORACLE VERIFIED arm=cache_state_echo");
     });
 }
 

@@ -414,12 +414,17 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
 
 #[test]
 fn complete_patch_over_operation_budget_falls_back_without_partial_deletions() {
+    // Rows on requests outside this read are kept, so the patch's own rows
+    // exceed the operation budget.
     let (_, prior) = upload(&session("old_", 10), None);
-    let (wire, state) = upload(&session("", 60), Some(&prior));
+    let (wire, state) = upload(&session("", MAX_OPERATIONS + 1), Some(&prior));
     assert_eq!(wire.coverage, "partial");
     assert_eq!(wire.omitted_observation_count, None);
     assert_eq!(retracted(&wire), 0);
-    assert_eq!(state["observations"].as_array().unwrap().len(), 70);
+    assert_eq!(
+        state["observations"].as_array().unwrap().len(),
+        10 + MAX_OPERATIONS
+    );
 }
 
 #[test]

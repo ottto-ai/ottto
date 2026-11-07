@@ -65,6 +65,7 @@ pub(super) fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_challenge: None,
         unchanged_basis: None,
         retained_proof_missing: Vec::new(),
+        cache_observations_state: None,
     }
 }
 
@@ -513,7 +514,7 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         [format!(
             "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
              class=accepted session_hash={} fingerprint={} witness_version={version} \
-             echoed_witness_version={version} bad_refs=1 answered=true expected_digest={} account_part={} tool_part={} cache_part={}",
+             echoed_digest=00000000 echoed_witness_version={version} bad_refs=1 answered=true expected_digest={} account_part={} tool_part={} cache_part={}",
             &key[..8],
             &item.snapshot_fingerprint[..8],
                 &crate::snapshots::snapshot_upload_body_witness(&item)[..8],
@@ -1729,4 +1730,222 @@ fn marked_answer_records_only_on_an_exact_stored_ack() {
         lost.accepted_body_witnesses[&item.snapshot_fingerprint],
         snapshot_upload_body_witness(&item)
     );
+}
+
+fn stray_cache_event() -> String {
+    format!("cache:{}", "d".repeat(64))
+}
+
+/// `state` with one more accepted row, a copy of the fixture's first row
+/// under a new event id and on a request this daemon never read: a row a
+/// server can hold that this daemon never learned.
+pub(crate) fn with_stray_cache_row(state: &Value) -> Value {
+    let fixture = item().cache_observations_state.unwrap();
+    let mut stray = fixture["observations"][0].clone();
+    assert!(stray.is_object(), "fixture state holds a cache row");
+    stray["event_id"] = Value::from(stray_cache_event());
+    stray["affected_request_ref"] = Value::from("synthetic-server-only-request");
+    let mut state = state.clone();
+    let rows = state["observations"].as_array_mut().unwrap();
+    rows.push(stray);
+    rows.sort_by(|a, b| a["event_id"].as_str().cmp(&b["event_id"].as_str()));
+    state
+}
+
+/// A server that completes each cache patch onto its stored state, as the
+/// receiver does, stores that state even when the daemon later refuses the
+/// ACK, and hashes the ACK witness over it. When `echo` is set and the request
+/// asks for `cache_state_ack:v1`, a completed state that differs from the
+/// patch applied to an empty state rides the ref.
+fn storing_server(
+    stored: &std::cell::RefCell<Value>,
+    echo: bool,
+    request: &SnapshotBatchRequest,
+    wire: &Value,
+) -> Result<SnapshotBatchResponse> {
+    let item = &request.snapshots[0];
+    let patch = item.cache_observations.as_ref().unwrap();
+    let prior = stored.borrow().clone();
+    let completed = crate::snapshots::cache_state_from_patch(Some(&prior), patch).unwrap();
+    let from_empty = crate::snapshots::cache_state_from_patch(None, patch).unwrap();
+    let mut hashed = item.clone();
+    hashed.cache_observations_state = Some(completed.clone());
+    let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+    let mut entity = serde_json::json!({
+        "source_session_id": item.source_session_id,
+        "snapshot_fingerprint": item.snapshot_fingerprint,
+        "occurrence_count": 1,
+        "body_witness_version": version,
+        "body_witness_digest": snapshot_upload_body_witness(&hashed),
+        "head_etag": "2".repeat(64),
+    });
+    if echo && wire["cache_state_ack_contract"] == "cache_state_ack:v1" && completed != from_empty {
+        entity["cache_observations_state"] = completed.clone();
+    }
+    *stored.borrow_mut() = completed;
+    Ok(serde_json::from_value(serde_json::json!({
+        "accepted": 1, "sessions_reconciled": 1, "session_ids": [],
+        "disabled": false, "disabled_reason": null,
+        "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+        "accepted_entities": [entity],
+    }))?)
+}
+
+/// [money] `cache_state_ack:v1` on the stored-state divergence: the server's
+/// stored cache state holds a row this daemon never learned (it stored earlier
+/// bodies whose ACKs the daemon refused), so the daemon's completed state, and
+/// with it the body witness, differs from the server's. An old server sends
+/// no echo and the body is refused as before. An echoing server settles it:
+/// the ledger adopts the echoed state, an unchanged body then posts nothing,
+/// including after a restart. The next changed body keeps the server-only
+/// row (a complete patch retracts only rows on requests it read; a partial
+/// one retracts nothing), so the stored rows never shrink. The stored bodies
+/// carry the same usage and account fields on every arm.
+#[test]
+fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
+    let raw = item();
+    assert_eq!(
+        raw.cache_observations.as_ref().unwrap().coverage,
+        "complete"
+    );
+    let key = cache_session_key(&raw.source_session_id);
+    let mut progress = progress_with_stale_head(&raw);
+    let local =
+        crate::snapshots::cache_state_from_patch(None, raw.cache_observations.as_ref().unwrap())
+            .unwrap();
+    progress
+        .accepted_cache_states
+        .insert(key.clone(), local.clone());
+    let server_state = with_stray_cache_row(&local);
+    let stored = std::cell::RefCell::new(server_state.clone());
+    let project = |progress: &SnapshotUploadProgress, item: &SnapshotItem| {
+        let mut sent = item.clone();
+        prepare_snapshot_cache_for_upload(&mut sent, progress, true, true, &BTreeSet::new());
+        sent
+    };
+    let refusals = || {
+        crate::snapshot_client::BODY_WITNESS_REFUSALS
+            .with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    };
+    let usage = |wire: &Value| {
+        let mut body = wire["snapshots"][0].clone();
+        let body = body.as_object_mut().unwrap();
+        for field in [
+            "semantic_envelope",
+            "cache_observations",
+            "snapshot_fingerprint",
+        ] {
+            body.remove(field);
+        }
+        Value::Object(body.clone())
+    };
+
+    // An old server: the request asks for the echo, none comes, and the ACK
+    // is refused exactly as before. The server stored the body anyway.
+    let sent = project(&progress, &raw);
+    assert_eq!(sent.cache_observations_state.as_ref(), Some(&local));
+    let (result, wires) = cycle_with_transport(
+        &mut progress,
+        std::slice::from_ref(&sent),
+        1_000,
+        |_| 0,
+        |_| true,
+        |request, wire| storing_server(&stored, false, request, wire),
+    );
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred {
+            count: 1,
+            isolated: 0
+        }
+    );
+    assert_eq!(wires[0]["cache_state_ack_contract"], "cache_state_ack:v1");
+    let old_server_usage = usage(&wires[0]);
+    let refused = refusals();
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0].contains("reason=digest_mismatch class=accepted "));
+    assert!(progress.accepted_body_witnesses.is_empty());
+    assert_eq!(progress.accepted_cache_states[&key], local);
+    assert_eq!(progress.accepted_cache_heads[&key], stale_head());
+    assert_eq!(*stored.borrow(), server_state);
+
+    // An echoing server: the echo reproduces its digest, so the body settles
+    // and the ledger holds the server's stored state, stray row included.
+    let (result, wires) = cycle_with_transport(
+        &mut progress,
+        std::slice::from_ref(&sent),
+        1_001,
+        |_| 0,
+        |_| true,
+        |request, wire| storing_server(&stored, true, request, wire),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(refusals().is_empty());
+    assert_eq!(usage(&wires[0]), old_server_usage, "usage and accounts");
+    assert_eq!(progress.accepted_cache_states[&key], server_state);
+    assert_eq!(progress.accepted_cache_heads[&key], "2".repeat(64));
+    let mut settled = sent.clone();
+    settled.cache_observations_state = Some(server_state.clone());
+    let settled = snapshot_upload_body_witness(&settled);
+    assert_eq!(
+        progress.accepted_body_witnesses[&sent.snapshot_fingerprint],
+        settled
+    );
+
+    // Quiet, and quiet after a restart: the re-projected body has the
+    // settled witness, so nothing is posted.
+    let root = crate::test_scratch::ScratchDir::new("cache-state-echo-restart");
+    let path = root.join("upload-progress.json");
+    progress.generation = 0;
+    progress.save(&path).unwrap();
+    let mut restored = SnapshotUploadProgress::load(
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert_eq!(restored.accepted_cache_states[&key], server_state);
+    let quiet = project(&restored, &raw);
+    assert_eq!(snapshot_upload_body_witness(&quiet), settled);
+    // No retry lease: the selection a normal pass makes.
+    let (result, wires) = selected_page(
+        &mut restored,
+        std::slice::from_ref(&quiet),
+        1_002,
+        |_| 0,
+        |_| true,
+        |_, _| panic!("a settled body is not posted again"),
+        false,
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(wires.is_empty(), "zero bytes");
+
+    // The next changed body keeps the server-only row: no retraction, the
+    // prediction matches the server's union, and the stored rows stay.
+    let mut grown = raw.clone();
+    grown.snapshot_fingerprint = "c".repeat(64);
+    let grown = project(&restored, &grown);
+    assert_eq!(grown.cache_observations_state.as_ref(), Some(&server_state));
+    // A partial local read keeps it too, with an unknown omitted count.
+    let mut partial = raw.clone();
+    let patch = partial.cache_observations.as_mut().unwrap();
+    (patch.coverage, patch.omitted_observation_count) = ("partial".into(), Some(3));
+    let partial = project(&restored, &partial)
+        .cache_observations_state
+        .unwrap();
+    assert_eq!(partial["observations"], server_state["observations"]);
+    assert!(partial["omitted_observation_count"].is_null());
+    let (result, wires) = cycle_with_transport(
+        &mut restored,
+        std::slice::from_ref(&grown),
+        1_003,
+        |_| 0,
+        |_| true,
+        |request, wire| storing_server(&stored, true, request, wire),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(refusals().is_empty());
+    assert_eq!(usage(&wires[0]), old_server_usage, "usage and accounts");
+    assert_eq!(*stored.borrow(), server_state);
+    assert_eq!(restored.accepted_cache_states[&key], server_state);
 }

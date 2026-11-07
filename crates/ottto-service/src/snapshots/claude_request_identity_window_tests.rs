@@ -1454,6 +1454,8 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
         full_replacement: false,
     });
     let cache_fixture = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    // A correction retracts only rows on requests this read saw.
+    item.cache_requests = cache_fixture.cache_requests.clone();
     let observation = cache_fixture.cache_observations_state.unwrap()["observations"][0].clone();
     let prior = json!({"observations":(0..32).map(|n| {
         let mut row = observation.clone();

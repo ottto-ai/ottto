@@ -88,6 +88,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
                     head_challenge: None,
                     unchanged_basis: (!stored).then(|| "usage_identical".into()),
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
                     conflict_rescans: Default::default(),
@@ -255,6 +256,7 @@ fn retained_ack(
                 head_challenge: None,
                 unchanged_basis: (!stored).then(|| "usage_identical".into()),
                 retained_proof_missing: missing.clone(),
+                cache_observations_state: None,
             };
             Ok(crate::snapshot_client::SnapshotBatchResponse {
                 conflict_rescans: Default::default(),
@@ -366,6 +368,48 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
     }))
     .unwrap();
     assert!(decoded.retained_proof_missing.is_empty());
+}
+/// `cache_state_ack:v1`: a stored ref whose digest is not this body's local
+/// witness proves retained rows only when it carries the echoed cache state
+/// that ACK validation matched to that digest; the ledger then holds the echo.
+#[test]
+fn retained_proof_follows_a_validated_cache_state_echo() {
+    let patch = crate::snapshots::cache_adapter_tests::cache_fixture_item()
+        .cache_observations
+        .unwrap();
+    let state = crate::snapshots::cache_state_from_patch(None, &patch).unwrap();
+    let mut item = witnessed_body();
+    item["cache_observations"] = serde_json::to_value(&patch).unwrap();
+    let entity = |echo: Option<&Value>| crate::snapshot_client::SnapshotEntityRef {
+        source_session_id: "synthetic-sticky-session".into(),
+        snapshot_fingerprint: "b".repeat(64),
+        occurrence_count: 1,
+        body_witness_version: Some(15),
+        body_witness_digest: Some("e".repeat(64)),
+        head_etag: None,
+        head_challenge: None,
+        unchanged_basis: None,
+        retained_proof_missing: Vec::new(),
+        cache_observations_state: echo.cloned(),
+    };
+    let local_witness = "d".repeat(64);
+    let mut echoed = retained_progress();
+    echoed
+        .record_stored_state(
+            &item,
+            false,
+            Some((&entity(Some(&state)), local_witness.as_str())),
+        )
+        .unwrap();
+    assert_eq!(retained_rows(&echoed), Some((1, 0)));
+    assert_eq!(
+        echoed.accepted_cache_states[&cache_session_key("synthetic-sticky-session")],
+        state
+    );
+    let mut bare = retained_progress();
+    bare.record_stored_state(&item, false, Some((&entity(None), local_witness.as_str())))
+        .unwrap();
+    assert_eq!(retained_rows(&bare), Some((0, 0)));
 }
 #[test]
 fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
