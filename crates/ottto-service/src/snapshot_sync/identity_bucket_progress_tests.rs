@@ -390,7 +390,7 @@ fn retained_proof_follows_a_validated_cache_state_echo() {
         head_challenge: None,
         unchanged_basis: None,
         retained_proof_missing: Vec::new(),
-        cache_observations_state: echo.cloned().map(crate::snapshot_client::CacheStateEcho),
+        cache_observations_state: echo.cloned(),
     };
     let local_witness = "d".repeat(64);
     let mut echoed = retained_progress();

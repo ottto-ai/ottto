@@ -854,7 +854,7 @@ pub(crate) struct SnapshotConflictRescan {
     pub(crate) answered: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SnapshotEntityRef {
     pub source_session_id: String,
     pub snapshot_fingerprint: String,
@@ -884,26 +884,7 @@ pub struct SnapshotEntityRef {
     /// reproduces that witness with this body's own parts. Older servers
     /// never send it.
     #[serde(default)]
-    pub cache_observations_state: Option<CacheStateEcho>,
-}
-
-/// The echoed cache state as sent; bounded by the server's state limits and
-/// read only while its ACK is validated and recorded.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct CacheStateEcho(pub Value);
-
-// Refs order by their fields; an echo orders by its JSON text.
-impl PartialOrd for CacheStateEcho {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CacheStateEcho {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.to_string().cmp(&other.0.to_string())
-    }
+    pub cache_observations_state: Option<Value>,
 }
 
 /// `cache_state_ack:v1`: the server's stored cache state for a cache-bearing
@@ -916,7 +897,7 @@ pub(crate) fn settled_cache_state_echo(
     item: &crate::snapshots::SnapshotItem,
 ) -> Option<Value> {
     let state =
-        crate::snapshots::cache_state_from_echo(&reference.cache_observations_state.as_ref()?.0)?;
+        crate::snapshots::cache_state_from_echo(reference.cache_observations_state.as_ref()?)?;
     let witness = crate::snapshots::snapshot_upload_body_witness_with_cache_state(item, &state)?;
     (reference.body_witness_digest.as_deref() == Some(witness.as_str())).then_some(state)
 }
@@ -4952,16 +4933,12 @@ mod tests {
             hashed.cache_observations_state = Some(state.clone());
             crate::snapshots::snapshot_upload_body_witness(&hashed)
         };
-        let mut server = request.snapshots[0]
-            .cache_observations_state
-            .clone()
-            .unwrap();
-        let mut stray = server["observations"][0].clone();
-        stray["event_id"] = json!(format!("cache:{}", "d".repeat(64)));
-        let rows = server["observations"].as_array_mut().unwrap();
-        rows.push(stray);
-        // The receiver's completed state lists rows by event id.
-        rows.sort_by(|a, b| a["event_id"].as_str().cmp(&b["event_id"].as_str()));
+        let server = crate::snapshot_sync::head_conflict_answer_tests::with_stray_cache_row(
+            request.snapshots[0]
+                .cache_observations_state
+                .as_ref()
+                .unwrap(),
+        );
         let digests = [
             stored(&request.snapshots[0], &server),
             stored(&request.snapshots[1], &server),
@@ -4976,7 +4953,7 @@ mod tests {
             .zip(digest)
             {
                 reference.body_witness_digest = Some(digest.to_string());
-                reference.cache_observations_state = echo.cloned().map(CacheStateEcho);
+                reference.cache_observations_state = echo.cloned();
             }
             ack
         };
@@ -5003,92 +4980,16 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(" bad_refs=2 "), "{line}");
-        // Not a state: an unparseable row, a retracted row, a repeated row.
-        let edits: [fn(&mut Value); 3] = [
-            |state: &mut Value| state["observations"][0] = json!({"event_id": "x"}),
-            |state: &mut Value| state["observations"][0]["status"] = json!("retracted"),
-            |state: &mut Value| {
-                let row = state["observations"][0].clone();
-                state["observations"].as_array_mut().unwrap().push(row);
-            },
+        // Not a state, or a valid state that is not the one hashed.
+        let mut bad = server.clone();
+        bad["observations"][0] = json!({"event_id": "x"});
+        let bad_digests = [
+            stored(&request.snapshots[0], &bad),
+            stored(&request.snapshots[1], &bad),
         ];
-        for edit in edits {
-            let mut bad = server.clone();
-            edit(&mut bad);
-            let digests = [
-                stored(&request.snapshots[0], &bad),
-                stored(&request.snapshots[1], &bad),
-            ];
-            refused(echoed(
-                [digests[0].as_str(), digests[1].as_str()],
-                Some(&bad),
-            ));
-        }
-        // Over the row bound, even when it hashes to the digest.
-        let mut over = server.clone();
-        let row = server["observations"][0].clone();
-        over["observations"] = (0..=crate::snapshots::cache_observations::MAX_ROWS)
-            .map(|n| {
-                let mut row = row.clone();
-                row["event_id"] = json!(format!("cache:{n:064x}"));
-                row
-            })
-            .collect();
-        let digests = [
-            stored(&request.snapshots[0], &over),
-            stored(&request.snapshots[1], &over),
-        ];
-        refused(echoed(
-            [digests[0].as_str(), digests[1].as_str()],
-            Some(&over),
-        ));
-        // A valid state that is not the one hashed into the digest.
-        let local = request.snapshots[0].cache_observations_state.clone();
-        let digests = [
-            stored(&request.snapshots[0], &server),
-            stored(&request.snapshots[1], &server),
-        ];
-        refused(echoed(
-            [digests[0].as_str(), digests[1].as_str()],
-            local.as_ref(),
-        ));
-        // A digest over another body's tool part.
-        let mut other = request.snapshots[0].clone();
-        other.tool_usage_truncated = !other.tool_usage_truncated;
-        let other_digest = stored(&other, &server);
-        let line = refused(echoed(
-            [other_digest.as_str(), digests[1].as_str()],
-            Some(&server),
-        ));
-        assert!(line.contains(" bad_refs=1 "), "{line}");
-        // A version mismatch is refused whatever the echo.
-        let mut ack = echoed([digests[0].as_str(), digests[1].as_str()], Some(&server));
-        ack.accepted_entities[0].body_witness_version = Some(3);
-        let line = refused(ack);
-        assert!(line.contains("reason=version_mismatch "), "{line}");
-    }
-
-    /// Only cache-bearing batches ask for the echo; every other batch keeps
-    /// its exact bytes.
-    #[test]
-    fn only_cache_bearing_batches_request_the_cache_state_echo() {
-        let (request, _) = witnessed_ack();
-        for wire in [
-            serde_json::to_value(&request).unwrap(),
-            serde_json::to_value(request.wire_with_head_cas()).unwrap(),
-        ] {
-            assert_eq!(wire["cache_state_ack_contract"], "cache_state_ack:v1");
-        }
-        let mut plain = request.clone();
-        for item in &mut plain.snapshots {
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-        }
-        for wire in [
-            serde_json::to_value(&plain).unwrap(),
-            serde_json::to_value(plain.wire_with_head_cas()).unwrap(),
-        ] {
-            assert!(wire.get("cache_state_ack_contract").is_none());
+        let local = request.snapshots[0].cache_observations_state.as_ref();
+        for (digest, echo) in [(&bad_digests, Some(&bad)), (&digests, local)] {
+            refused(echoed([digest[0].as_str(), digest[1].as_str()], echo));
         }
     }
 

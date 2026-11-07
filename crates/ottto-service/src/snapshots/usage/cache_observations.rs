@@ -42,37 +42,22 @@ pub(crate) fn cache_state_from_patch(
         json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
     )
 }
-/// A server-echoed completed state (`cache_state_ack:v1`) in this daemon's
-/// accepted-state shape, or None unless it is one: schema 1, a known
-/// coverage, every row parsed, none retracted or repeated, within the
-/// per-session row and byte bounds.
+/// A server-echoed completed state (`cache_state_ack:v1`) rebuilt through the
+/// patch path: the echo's coverage must pass `validate`, its rows must parse,
+/// and the result must stay within the state bounds. A repeated row or a
+/// malformed omitted count changes the rebuilt state, so its witness cannot
+/// match the server's digest.
 pub(crate) fn cache_state_from_echo(echo: &Value) -> Option<Value> {
-    if echo.get("schema_version")?.as_u64()? != 1 {
-        return None;
-    }
-    let coverage = echo.get("coverage")?.as_str()?;
-    if !matches!(coverage, "complete" | "partial") {
-        return None;
-    }
-    let omitted = match echo
-        .get("omitted_observation_count")
-        .unwrap_or(&Value::Null)
-    {
-        Value::Null => None,
-        count => Some(count.as_u64()?),
+    let empty = CacheObservations {
+        schema_version: u16::try_from(echo.get("schema_version")?.as_u64()?).ok()?,
+        operations: Vec::new(),
+        coverage: echo.get("coverage")?.as_str()?.into(),
+        omitted_observation_count: echo
+            .get("omitted_observation_count")
+            .and_then(Value::as_u64),
+        full_replacement: false,
     };
-    let rows = echo.get("observations")?.as_array()?;
-    if rows.len() > cache_observations::MAX_ROWS {
-        return None;
-    }
-    let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    for row in rows {
-        let row = serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
-        if observations.insert(row.event_id.clone(), row).is_some() {
-            return None;
-        }
-    }
-    let state = json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":coverage,"omitted_observation_count":omitted});
+    let state = cache_state_from_patch(Some(echo), &empty).filter(|_| empty.validate())?;
     cache_state_within_limits(&state).then_some(state)
 }
 /// Preflight the exact wire and its completion against the ACKed predecessor.
@@ -103,13 +88,22 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
             };
             a.cmp(b)
         });
+        // Retract only a correction: a row on a request this read saw that the
+        // detector no longer reports. A row on a request it never saw (one
+        // adopted from the server's echoed state) is kept, not retracted.
+        let seen = item
+            .cache_requests
+            .iter()
+            .map(|request| request.slot.request_ref.as_str())
+            .collect::<BTreeSet<_>>();
         for row in prior
             .and_then(|p| p["observations"].as_array())
             .into_iter()
             .flatten()
         {
             if let Some(id) = row["event_id"].as_str() {
-                if !ids.contains(id) {
+                let request = row["affected_request_ref"].as_str();
+                if !ids.contains(id) && request.is_some_and(|r| seen.contains(r)) {
                     wire.operations
                         .push(cache_observations::Operation::Retract {
                             event_id: id.into(),

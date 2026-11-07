@@ -2653,7 +2653,15 @@ impl SnapshotUploadProgress {
                     && entity.body_witness_digest.as_deref() != Some(*local_witness)
             })
             .and_then(|(entity, _)| entity.cache_observations_state.as_ref())
-            .and_then(|echo| crate::snapshots::cache_state_from_echo(&echo.0));
+            .and_then(crate::snapshots::cache_state_from_echo);
+        // The re-projected body keeps the echoed rows, so its witness is the
+        // server's digest: record that, and an unchanged body stays quiet.
+        if let Some((entity, _)) = stored.filter(|_| echoed_cache_state.is_some()) {
+            if let Some(digest) = &entity.body_witness_digest {
+                self.accepted_body_witnesses
+                    .insert(entity.snapshot_fingerprint.clone(), digest.clone());
+            }
+        }
         if let Some((entity, local_witness)) = stored {
             // Mirrors `snapshot_ack_body_witness_version`'s public domains.
             let versioned_body = ["session_account_evidence", "cache_observations"]
@@ -13568,16 +13576,18 @@ mod tests {
             } else if enabled {
                 let projected = &wire_scan.snapshots[0];
                 assert_eq!(projected.cache_base_head_etag, Some("e".repeat(64)));
+                // The prior row's request is not in this read: kept, not
+                // retracted, at the real preparation boundary.
                 assert_eq!(
-                    projected.cache_observations_state.as_ref().unwrap()["observations"]
-                        .as_array()
-                        .unwrap()
-                        .len(),
-                    0
+                    projected.cache_observations_state.as_ref().unwrap()["observations"],
+                    accepted_prior[&key]["observations"]
                 );
-                assert!(projected.cache_observations.as_ref().unwrap().operations.iter().any(|operation|
-                    matches!(operation, crate::snapshots::cache_observations::Operation::Retract { .. })),
-                    "complete current source retracts prior ACK-owned observations at real preparation boundary");
+                assert!(projected
+                    .cache_observations
+                    .as_ref()
+                    .unwrap()
+                    .operations
+                    .is_empty());
             } else {
                 assert!(wire_scan.snapshots[0].cache_observations.is_none());
             }
@@ -24044,7 +24054,7 @@ mod usage_decrease_hold_tests;
 
 #[cfg(test)]
 #[path = "snapshot_sync/head_conflict_answer_tests.rs"]
-mod head_conflict_answer_tests;
+pub(crate) mod head_conflict_answer_tests;
 
 #[cfg(test)]
 #[path = "snapshot_sync/change_reason_tests.rs"]

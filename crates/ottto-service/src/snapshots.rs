@@ -17791,24 +17791,21 @@ mod tests {
                 2,
                 "the skipped owned response is absent"
             );
-            // Without the read-completeness fence, the unchanged detector calls
-            // these two surviving warm requests complete and retracts the
-            // previously accepted loss anchored on the missing cold request.
-            let mut unfenced = item.clone();
-            unfenced.cache_observations = Some(cache_wire(id, &item.cache_requests, true));
-            prepare_cache_observations(&mut unfenced, Some(&prior));
-            assert!(matches!(
-                unfenced
-                    .cache_observations
-                    .as_ref()
-                    .unwrap()
-                    .operations
-                    .as_slice(),
-                [cache_observations::Operation::Retract { .. }]
-            ));
+            // A complete patch whose book lacks the row's request keeps the
+            // row: only a request still read can correct it.
+            let mut keeps_row_when_request_missing_from_book = item.clone();
+            let book = &mut keeps_row_when_request_missing_from_book;
+            book.cache_observations = Some(cache_wire(id, &item.cache_requests, true));
+            prepare_cache_observations(book, Some(&prior));
+            assert!(book
+                .cache_observations
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty());
             assert_eq!(
-                unfenced.cache_observations_state.unwrap()["observations"],
-                json!([])
+                book.cache_observations_state.as_ref().unwrap()["observations"],
+                prior["observations"]
             );
             assert!(
                 !item.cache_requests_complete,

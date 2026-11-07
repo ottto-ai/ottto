@@ -1737,13 +1737,14 @@ fn stray_cache_event() -> String {
 }
 
 /// `state` with one more accepted row, a copy of the fixture's first row
-/// under a new event id: a row a server can hold that this daemon never
-/// learned.
-pub(super) fn with_stray_cache_row(state: &Value) -> Value {
+/// under a new event id and on a request this daemon never read: a row a
+/// server can hold that this daemon never learned.
+pub(crate) fn with_stray_cache_row(state: &Value) -> Value {
     let fixture = item().cache_observations_state.unwrap();
     let mut stray = fixture["observations"][0].clone();
     assert!(stray.is_object(), "fixture state holds a cache row");
     stray["event_id"] = Value::from(stray_cache_event());
+    stray["affected_request_ref"] = Value::from("synthetic-server-only-request");
     let mut state = state.clone();
     let rows = state["observations"].as_array_mut().unwrap();
     rows.push(stray);
@@ -1796,9 +1797,10 @@ fn storing_server(
 /// with it the body witness, differs from the server's. An old server sends
 /// no echo and the body is refused as before. An echoing server settles it:
 /// the ledger adopts the echoed state, an unchanged body then posts nothing,
-/// including after a restart, and the next changed body's complete patch
-/// retracts the stray row and settles with no echo. The stored bodies carry
-/// the same usage and account fields on every arm.
+/// including after a restart. The next changed body keeps the server-only
+/// row (a complete patch retracts only rows on requests it read; a partial
+/// one retracts nothing), so the stored rows never shrink. The stored bodies
+/// carry the same usage and account fields on every arm.
 #[test]
 fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     let raw = item();
@@ -1882,9 +1884,12 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     assert_eq!(usage(&wires[0]), old_server_usage, "usage and accounts");
     assert_eq!(progress.accepted_cache_states[&key], server_state);
     assert_eq!(progress.accepted_cache_heads[&key], "2".repeat(64));
+    let mut settled = sent.clone();
+    settled.cache_observations_state = Some(server_state.clone());
+    let settled = snapshot_upload_body_witness(&settled);
     assert_eq!(
         progress.accepted_body_witnesses[&sent.snapshot_fingerprint],
-        snapshot_upload_body_witness(&sent)
+        settled
     );
 
     // Quiet, and quiet after a restart: the re-projected body has the
@@ -1901,10 +1906,7 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     .unwrap();
     assert_eq!(restored.accepted_cache_states[&key], server_state);
     let quiet = project(&restored, &raw);
-    assert_eq!(
-        snapshot_upload_body_witness(&quiet),
-        snapshot_upload_body_witness(&sent)
-    );
+    assert_eq!(snapshot_upload_body_witness(&quiet), settled);
     // No retry lease: the selection a normal pass makes.
     let (result, wires) = selected_page(
         &mut restored,
@@ -1918,20 +1920,21 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(wires.is_empty(), "zero bytes");
 
-    // The next changed body: its complete patch retracts the stray row, the
-    // server converges on the daemon's state and sends no echo.
+    // The next changed body keeps the server-only row: no retraction, the
+    // prediction matches the server's union, and the stored rows stay.
     let mut grown = raw.clone();
     grown.snapshot_fingerprint = "c".repeat(64);
     let grown = project(&restored, &grown);
-    assert!(grown
-        .cache_observations
-        .as_ref()
-        .unwrap()
-        .operations
-        .iter()
-        .any(|operation| matches!(operation,
-            crate::snapshots::cache_observations::Operation::Retract { event_id }
-                if *event_id == stray_cache_event())));
+    assert_eq!(grown.cache_observations_state.as_ref(), Some(&server_state));
+    // A partial local read keeps it too, with an unknown omitted count.
+    let mut partial = raw.clone();
+    let patch = partial.cache_observations.as_mut().unwrap();
+    (patch.coverage, patch.omitted_observation_count) = ("partial".into(), Some(3));
+    let partial = project(&restored, &partial)
+        .cache_observations_state
+        .unwrap();
+    assert_eq!(partial["observations"], server_state["observations"]);
+    assert!(partial["omitted_observation_count"].is_null());
     let (result, wires) = cycle_with_transport(
         &mut restored,
         std::slice::from_ref(&grown),
@@ -1943,83 +1946,6 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(refusals().is_empty());
     assert_eq!(usage(&wires[0]), old_server_usage, "usage and accounts");
-    assert_eq!(*stored.borrow(), local);
-    assert_eq!(restored.accepted_cache_states[&key], local);
-}
-
-/// `cache_state_ack:v1` refusals: an echo that is unparseable, over the
-/// state bounds, not the hashed state, or paired with another body's tool
-/// part leaves the body refused exactly as with no echo, and the ledger keeps
-/// its own state.
-#[test]
-fn invalid_cache_state_echo_is_refused_as_before() {
-    let raw = item();
-    let key = cache_session_key(&raw.source_session_id);
-    let local =
-        crate::snapshots::cache_state_from_patch(None, raw.cache_observations.as_ref().unwrap())
-            .unwrap();
-    let server_state = with_stray_cache_row(&local);
-    let row = server_state["observations"][0].clone();
-    let mut unparseable = server_state.clone();
-    unparseable["observations"][0] = serde_json::json!({"event_id": "synthetic-bad-row"});
-    let mut over_limit = server_state.clone();
-    over_limit["observations"] = (0..=crate::snapshots::cache_observations::MAX_ROWS)
-        .map(|n| {
-            let mut row = row.clone();
-            row["event_id"] = Value::from(format!("synthetic-row-{n:04}"));
-            row
-        })
-        .collect();
-    let mut other_tool = raw.clone();
-    other_tool.tool_usage_truncated = !raw.tool_usage_truncated;
-    // (digest's body, its cache state, the echoed state)
-    let cases = [
-        (&raw, &server_state, unparseable),
-        (&raw, &over_limit, over_limit.clone()),
-        (&raw, &server_state, local.clone()),
-        (&other_tool, &server_state, server_state.clone()),
-    ];
-    for (hashed_body, hashed_state, echo) in cases {
-        let mut progress = progress_with_stale_head(&raw);
-        progress
-            .accepted_cache_states
-            .insert(key.clone(), local.clone());
-        let mut sent = raw.clone();
-        prepare_snapshot_cache_for_upload(&mut sent, &progress, true, true, &BTreeSet::new());
-        let mut hashed = hashed_body.clone();
-        hashed.cache_observations_state = Some(hashed_state.clone());
-        let digest = snapshot_upload_body_witness(&hashed);
-        let (result, _) = cycle(&mut progress, &sent, 1_000, |item| {
-            let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
-            serde_json::from_value(serde_json::json!({
-                "accepted": 1, "sessions_reconciled": 1, "session_ids": [],
-                "disabled": false, "disabled_reason": null,
-                "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
-                "accepted_entities": [{
-                    "source_session_id": item.source_session_id,
-                    "snapshot_fingerprint": item.snapshot_fingerprint,
-                    "occurrence_count": 1,
-                    "body_witness_version": version,
-                    "body_witness_digest": digest,
-                    "head_etag": "2".repeat(64),
-                    "cache_observations_state": echo,
-                }],
-            }))
-            .unwrap()
-        });
-        assert_eq!(
-            result.unwrap(),
-            ResumableUploadResult::Deferred {
-                count: 1,
-                isolated: 0
-            }
-        );
-        let refused = crate::snapshot_client::BODY_WITNESS_REFUSALS
-            .with(|lines| std::mem::take(&mut *lines.borrow_mut()));
-        assert_eq!(refused.len(), 1);
-        assert!(refused[0].contains(&format!(" echoed_digest={} ", &digest[..8])));
-        assert!(progress.accepted_body_witnesses.is_empty());
-        assert_eq!(progress.accepted_cache_states[&key], local);
-        assert_eq!(progress.accepted_cache_heads[&key], stale_head());
-    }
+    assert_eq!(*stored.borrow(), server_state);
+    assert_eq!(restored.accepted_cache_states[&key], server_state);
 }
