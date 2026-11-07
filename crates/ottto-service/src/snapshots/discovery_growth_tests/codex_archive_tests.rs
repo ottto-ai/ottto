@@ -154,3 +154,119 @@ fn relisted_known_member_keeps_discovered_count() {
         );
     }
 }
+
+/// `count` synthetic sessions in `day/`, below the root a short walk lists.
+fn hinted_day_files(f: &Fixture, source: SnapshotSource, count: usize) -> Vec<PathBuf> {
+    let day = f.root.join("day");
+    fs::create_dir_all(&day).unwrap();
+    (0..count)
+        .map(|n| {
+            let session = format!("{n:08x}-0000-4000-8000-00000000000f");
+            let path = day.join(format!("{session}.jsonl"));
+            append_records(&path, &usage_records(source, &session, 1, true));
+            path
+        })
+        .collect()
+}
+
+/// [regress] A fresh walk's first page queued watcher hints as census
+/// members without discovering them, so pending exceeded discovered and the
+/// status report broke `skipped <= discovered` and was rejected whole. A
+/// hinted member the walk has not observed yet is discovered by the hint.
+#[test]
+fn fresh_walk_hint_members_count_as_discovered() {
+    const HINTED: usize = 3;
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let hints = hinted_day_files(&f, source, HINTED);
+        let mut index = ScanIndex::default();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7);
+        // A second hint for a path already pending adds nothing.
+        for pass in 0..2 {
+            enqueue_watcher_hints(source, index.traversal.as_mut().unwrap(), &hints, false);
+            let skipped = claude_family_census_shadow::skipped_view(&index).count();
+            let discovered = index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .counts
+                .discovered_file_count;
+            assert_eq!(skipped, HINTED, "{source:?} pass {pass}");
+            assert_eq!(discovered, HINTED, "{source:?} pass {pass}");
+        }
+        advance_bounded_directory_traversal(source, &mut index, 7, None);
+        let skipped = claude_family_census_shadow::skipped_view(&index).count();
+        let discovered = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .discovered_file_count;
+        assert_eq!(skipped, HINTED, "{source:?}: the walk keeps the members");
+        assert!(
+            skipped <= discovered,
+            "{source:?}: {skipped} > {discovered}"
+        );
+    }
+}
+
+/// [behaviour] Positive control: a hint for a file the walk already
+/// observed (and counted) is not counted again. Claude/Pi re-admit it as a
+/// member; on Codex it is next-generation evidence.
+#[test]
+fn hint_for_walked_file_keeps_discovered_count() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let walked = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .discovered_file_count;
+        let grown = f.root.join(format!("{GROWN}.jsonl"));
+        let traversal = index.traversal.as_mut().unwrap();
+        let next_generation =
+            enqueue_watcher_hints(source, traversal, std::slice::from_ref(&grown), false);
+        assert_eq!(next_generation, u64::from(source == SnapshotSource::Codex));
+        assert_eq!(traversal.counts.discovered_file_count, walked, "{source:?}");
+        let skipped = claude_family_census_shadow::skipped_view(&index).count();
+        assert_eq!(skipped, usize::from(source != SnapshotSource::Codex));
+        assert!(skipped <= walked, "{source:?}");
+    }
+}
+
+/// [regress] The page-level status counters of a fresh walk whose short
+/// first listing leaves hinted members queued. The status wire copies these
+/// fields as-is, and the server rejects `skipped > discovered` and a
+/// positive skipped count without `scan_cap_hit`.
+#[test]
+fn fresh_walk_hinted_page_reports_skipped_within_discovered() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let hints = hinted_day_files(&f, source, 24);
+        let (_, scan, _, _) =
+            with_test_directory_entries(1, || f.page_hinted(source, ScanIndex::default(), &hints));
+        let skipped = scan.skipped_file_count_due_to_limit;
+        let discovered = scan.discovered_file_count;
+        assert!(skipped > 0, "{source:?}: hinted members stay queued");
+        assert!(
+            skipped <= discovered,
+            "{source:?}: {skipped} > {discovered}"
+        );
+        assert!(scan.scan_cap_hit, "{source:?}");
+    }
+}
