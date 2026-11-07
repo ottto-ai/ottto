@@ -109,3 +109,50 @@ where
     let value = Value::deserialize(deserializer)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
+
+/// A malformed stored Claude history cutoff decodes as this; the load drops
+/// it with the gate marker (`drop_malformed_claude_history_cutoff`). A real
+/// cutoff is clamped to the clock, so it never reaches this value.
+pub(in crate::snapshots) const MALFORMED_CLAUDE_HISTORY_CUTOFF: u64 = u64::MAX;
+
+/// Lenient decode: a non-number cutoff never fails the
+/// whole index decode.
+pub(in crate::snapshots) fn deserialize_lenient_claude_history_cutoff<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Null => None,
+        value => Some(value.as_u64().unwrap_or(MALFORMED_CLAUDE_HISTORY_CUTOFF)),
+    })
+}
+
+/// Lenient decode: any stored value but `true` is `false`,
+/// never a failed index decode.
+pub(in crate::snapshots) fn deserialize_lenient_true<'de, D>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(matches!(
+        Value::deserialize(deserializer)?,
+        Value::Bool(true)
+    ))
+}
+
+/// K4: a malformed move hold must not release history after bootstrap.
+/// Missing fields keep the legacy default; explicit booleans keep their value.
+pub(in crate::snapshots) fn deserialize_lenient_move_hold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(!matches!(
+        Value::deserialize(deserializer)?,
+        Value::Bool(false)
+    ))
+}

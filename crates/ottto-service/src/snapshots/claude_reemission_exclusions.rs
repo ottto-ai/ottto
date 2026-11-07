@@ -35,11 +35,14 @@
 //!
 //! Only adoption is gated; changed and new files are never held here.
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use super::ClaudeContextFileBirthCounts;
 
 const FILE_NAME: &str = "claude_code-reemission-exclusions.txt";
 const SEEN_FILE_NAME: &str = "claude_code-reemission-exclusions.seen";
@@ -472,6 +475,180 @@ pub(crate) fn with_no_list_cutoff<T>(cutoff: u64, f: impl FnOnce() -> T) -> T {
     }
     let _reset = Reset(NO_LIST_CUTOFF.with(|value| value.replace(Some(cutoff))));
     f()
+}
+
+// The stop latch of the one-time Claude re-read.
+// The first Claude fold whose counts report `resource_withheld()` (a family
+// over its evidence bound, or a full remembered-veto table) latches the stop:
+// Claude adoption then takes no adoption-only file (budget 0, reason
+// `evidence_bound_withheld`) until the daemon restarts. A later clean fold
+// does not clear it; a restart is the human reset. In memory only, process-wide
+// across Claude destinations. One local alarm when it sets, at most one
+// reminder an hour while it holds.
+// An empty generation-0 index loaded while the exclusion seen-marker exists
+// also latches it, including a quarantined index or a new pairing destination.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ClaudeReemissionStopCause {
+    EvidenceBound,
+    IndexRebuild,
+}
+
+impl ClaudeReemissionStopCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound",
+            Self::IndexRebuild => "index_rebuild",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound_withheld",
+            Self::IndexRebuild => "index_rebuild_withheld",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeReemissionStop {
+    latched: bool,
+    cause: ClaudeReemissionStopCause,
+    /// Folds in this process that withheld for a resource limit.
+    withheld_folds: u64,
+    last_alarm: Option<std::time::Instant>,
+}
+
+impl ClaudeReemissionStop {
+    const fn new() -> Self {
+        Self {
+            latched: false,
+            cause: ClaudeReemissionStopCause::EvidenceBound,
+            withheld_folds: 0,
+            last_alarm: None,
+        }
+    }
+}
+
+const CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+/// At most this many hashed root refs per alarm line; the count is exact.
+const CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS: usize = 16;
+
+#[derive(Serialize)]
+struct ClaudeReemissionStopAlarm {
+    cause: &'static str,
+    withheld_evidence_bound_session_count: usize,
+    remembered_veto_overflowed: bool,
+    withheld_folds: u64,
+    over_bound_root_count: usize,
+    /// First 16 hex of the SHA-256 of each root id, the list's digest form.
+    over_bound_root_refs: Vec<String>,
+}
+
+process_state! {
+    fn with_claude_reemission_stop: ClaudeReemissionStop = ClaudeReemissionStop::new();
+    clear_poison: false
+}
+
+/// Called after every Claude fold with that fold's counts.
+pub(super) fn note_claude_reemission_stop(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+) {
+    note_claude_reemission_stop_at(counts, over_bound_roots, std::time::Instant::now());
+}
+
+fn note_claude_reemission_stop_at(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+    now: std::time::Instant,
+) {
+    note_claude_reemission_stop_with_cause_at(
+        counts,
+        over_bound_roots,
+        counts
+            .resource_withheld()
+            .then_some(ClaudeReemissionStopCause::EvidenceBound),
+        now,
+    );
+}
+
+pub(super) fn note_claude_reemission_stop_with_cause_at(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+    cause: Option<ClaudeReemissionStopCause>,
+    now: std::time::Instant,
+) {
+    let withheld = counts.resource_withheld();
+    let alarm = with_claude_reemission_stop(|stop| {
+        if withheld {
+            stop.withheld_folds = stop.withheld_folds.saturating_add(1);
+        }
+        let reminder = if stop.latched {
+            let due = match stop.last_alarm {
+                Some(last) => {
+                    now.saturating_duration_since(last) >= CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL
+                }
+                None => true,
+            };
+            if !due {
+                return None;
+            }
+            true
+        } else if let Some(cause) = cause {
+            stop.latched = true;
+            stop.cause = cause;
+            false
+        } else {
+            return None;
+        };
+        stop.last_alarm = Some(now);
+        Some((reminder, stop.withheld_folds, stop.cause))
+    });
+    let Some((reminder, withheld_folds, cause)) = alarm else {
+        return;
+    };
+    crate::local_resource_diagnostics::claude_reemission_stop_latched(
+        reminder,
+        &ClaudeReemissionStopAlarm {
+            cause: cause.as_str(),
+            withheld_evidence_bound_session_count: counts
+                .total
+                .withheld_evidence_bound_session_count,
+            remembered_veto_overflowed: counts.remembered_veto_overflowed,
+            withheld_folds,
+            over_bound_root_count: over_bound_roots.len(),
+            over_bound_root_refs: over_bound_roots
+                .iter()
+                .take(CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS)
+                .map(|root| format!("{:x}", Sha256::digest(root.as_bytes()))[..16].to_string())
+                .collect(),
+        },
+    );
+}
+
+pub(super) fn claude_reemission_stop_latched() -> bool {
+    with_claude_reemission_stop(|stop| stop.latched)
+}
+
+pub(super) fn claude_reemission_stop_reason() -> &'static str {
+    with_claude_reemission_stop(|stop| {
+        if stop.latched {
+            stop.cause.reason()
+        } else {
+            "none"
+        }
+    })
+}
+
+pub(super) fn claude_reemission_stop_withheld_folds() -> u64 {
+    with_claude_reemission_stop(|stop| stop.withheld_folds)
+}
+
+/// Test seam: a daemon restart, the only reset of the latch.
+#[cfg(test)]
+pub(crate) fn restart_claude_reemission_stop_for_test() {
+    with_claude_reemission_stop(|stop| *stop = ClaudeReemissionStop::new());
 }
 
 #[cfg(test)]
