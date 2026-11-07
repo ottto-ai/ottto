@@ -56,7 +56,7 @@ mod codex_last_known;
 mod codex_saved_quota;
 mod codex_setup_gate;
 
-use codex_saved_quota::AuthWitness;
+use codex_saved_quota::{path_stamp, PathStamp};
 
 #[cfg(test)]
 pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
@@ -1544,11 +1544,11 @@ struct ClaudeDesktopAgentModeSessionMetadata {
     plan: Option<String>,
 }
 
-type ClaudeDesktopMetadataEntries<T> = BTreeMap<PathBuf, (AuthWitness, Option<T>)>;
+type ClaudeDesktopMetadataEntries<T> = BTreeMap<PathBuf, (PathStamp, Option<T>)>;
 
 /// Parsed Claude Desktop session metadata by file, kept in memory between
-/// status passes so a file whose size and modification time are unchanged is
-/// not read again. Never persisted or uploaded.
+/// status passes so a file whose stamp is unchanged is not read again. Never
+/// persisted or uploaded.
 #[derive(Default)]
 pub(crate) struct ClaudeDesktopMetadataCache {
     code: ClaudeDesktopMetadataEntries<ClaudeDesktopCodeSessionMetadata>,
@@ -11051,27 +11051,24 @@ type ClaudeDesktopMetadataPass<'a, T> = (
     &'a mut ClaudeDesktopMetadataEntries<T>,
 );
 
-/// One Desktop session file's metadata: the previous pass's parse while the
-/// file's size and modification time are unchanged, else a fresh read. A parse
-/// failure is kept as `None` under its witness; a failed `stat` or read keeps
-/// nothing, so the next pass reads the file again.
+/// One Desktop session file's metadata: the previous pass's parse, failures
+/// included, while the file's stamp is unchanged, else a fresh read. A file
+/// written too recently for a rewrite to change its stamp is not kept.
 fn claude_desktop_session_metadata<T: for<'de> Deserialize<'de> + Clone>(
     path: PathBuf,
     previous: &mut ClaudeDesktopMetadataEntries<T>,
     current: &mut ClaudeDesktopMetadataEntries<T>,
 ) -> Option<T> {
-    let kept = previous.remove(&path);
-    let Some(witness) = fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| AuthWitness::from_metadata(&metadata))
-    else {
-        return read_json_file(&path).ok().flatten();
+    let Some(stamp) = path_stamp(&path) else {
+        return read_json_file(&path);
     };
-    let metadata = match kept {
-        Some((kept_witness, metadata)) if kept_witness == witness => metadata,
-        _ => read_json_file(&path).ok()?,
+    let metadata = match previous.remove(&path) {
+        Some((kept, metadata)) if kept == stamp => metadata,
+        _ => read_json_file(&path),
     };
-    current.insert(path, (witness, metadata.clone()));
+    if stamp.settled() {
+        current.insert(path, (stamp, metadata.clone()));
+    }
     metadata
 }
 
@@ -11082,21 +11079,19 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
-/// `Err` when the file cannot be read; `Ok(None)` when it is not the expected
-/// JSON.
-fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<Option<T>> {
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     #[cfg(test)]
     CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| {
         let (attempts, bytes) = receipt.get();
         receipt.set((attempts + 1, bytes));
     });
-    let body = fs::read_to_string(path)?;
+    let body = fs::read_to_string(path).ok()?;
     #[cfg(test)]
     CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| {
         let (attempts, bytes) = receipt.get();
         receipt.set((attempts, bytes + body.len() as u64));
     });
-    Ok(serde_json::from_str(&body).ok())
+    serde_json::from_str(&body).ok()
 }
 
 fn looks_like_local_json_file(path: &Path) -> bool {
@@ -28372,11 +28367,22 @@ for line in sys.stdin:
         );
     }
 
-    #[test]
-    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
-        let root =
-            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    /// Writes `body` to `path` with an explicit modification time.
+    fn write_desktop_file(path: &Path, body: &str, modified_secs: u64) {
+        std::fs::write(path, body).expect("write metadata");
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs))
+            })
+            .expect("set modified time");
+    }
+
+    /// Desktop session folders with exact, imported, tied, copied and
+    /// non-UUID cases and agent-mode labels; every file long settled.
+    fn write_claude_desktop_pairs_fixture(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
         let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
         let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
         let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
@@ -28390,7 +28396,7 @@ for line in sys.stdin:
         let write = |store: &str, account: &str, org: &str, file: &str, body: String| {
             let directory = root.join(store).join(account).join(org);
             std::fs::create_dir_all(&directory).expect("create bucket");
-            std::fs::write(directory.join(file), body).expect("write metadata");
+            write_desktop_file(&directory.join(file), &body, 1_780_000_000);
         };
         let session = |id: &str, activity: i64| {
             format!(r#"{{"cliSessionId":"{id}","lastActivityAt":{activity}}}"#)
@@ -28475,7 +28481,16 @@ for line in sys.stdin:
             "local_k.json",
             session("agent-copied", 500),
         );
+    }
 
+    #[test]
+    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
+        write_claude_desktop_pairs_fixture(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (current, other) = (uuid(1), uuid(2));
+        let (org_x, org_y, org_z) = (uuid(11), uuid(12), uuid(13));
         let scan = claude_desktop_scan_from_root(
             &root,
             "2026-08-12T08:00:00Z",
@@ -28534,66 +28549,11 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Desktop session files of both kinds: a native session, a labelled
-    /// agent-mode session, an imported copy of a session and malformed JSON.
-    fn write_claude_desktop_cache_fixture(root: &Path) -> BTreeMap<&'static str, PathBuf> {
-        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
-        let _ = std::fs::remove_dir_all(root);
-        std::fs::create_dir_all(root).expect("create root");
-        std::fs::write(
-            root.join("config.json"),
-            format!(r#"{{"lastKnownAccountUuid":"{}"}}"#, uuid(1)),
-        )
-        .expect("write config");
-        let files = [
-            (
-                "native",
-                "claude-code-sessions",
-                1,
-                11,
-                r#"{"cliSessionId":"native","lastActivityAt":300}"#,
-            ),
-            (
-                "other",
-                "claude-code-sessions",
-                2,
-                12,
-                r#"{"cliSessionId":"other","lastActivityAt":200}"#,
-            ),
-            (
-                "imported",
-                "claude-code-sessions",
-                3,
-                13,
-                r#"{"cliSessionId":"other","lastActivityAt":250,"importedFrom":null}"#,
-            ),
-            ("malformed", "claude-code-sessions", 2, 14, "{not json"),
-            (
-                "label",
-                "local-agent-mode-sessions",
-                2,
-                12,
-                r#"{"cliSessionId":"agent","lastActivityAt":100,"emailAddress":"other@example.com","organizationName":"Org Y","subscriptionType":"team"}"#,
-            ),
-        ];
-        files
-            .into_iter()
-            .map(|(name, store, account, org, body)| {
-                let directory = root.join(store).join(uuid(account)).join(uuid(org));
-                std::fs::create_dir_all(&directory).expect("create bucket");
-                let path = directory.join(format!("local_{name}.json"));
-                std::fs::write(&path, body).expect("write metadata");
-                (name, path)
-            })
-            .collect()
-    }
-
     /// Scans `root` through `cache`, asserts the result equals a scan with an
     /// empty cache, and returns the cached scan's (read attempts, bytes read).
     fn claude_desktop_cached_scan_reads(
         root: &Path,
         cache: &mut ClaudeDesktopMetadataCache,
-        saved_only: bool,
     ) -> (usize, u64) {
         let outputs = |scan: ClaudeDesktopScan| {
             let pairs = |pairs: Vec<ClaudeDesktopPairObservation>| {
@@ -28610,9 +28570,7 @@ for line in sys.stdin:
         };
         let observed_at = "2026-08-12T08:00:00Z";
         CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| receipt.set((0, 0)));
-        let cached = with_claude_pass(saved_only, 0, || {
-            claude_desktop_scan_from_root(root, observed_at, cache)
-        });
+        let cached = claude_desktop_scan_from_root(root, observed_at, cache);
         let reads = CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(std::cell::Cell::get);
         let fresh = claude_desktop_scan_from_root(
             root,
@@ -28623,114 +28581,72 @@ for line in sys.stdin:
         reads
     }
 
-    /// [regress] Every status pass re-read every Desktop session file whole.
+    /// [regress] Every Claude status pass read every Desktop session file whole.
     #[test]
-    fn claude_desktop_metadata_cache_unchanged_saved_only_reads_zero_bytes() {
+    fn claude_desktop_metadata_cache_unchanged_pass_reads_zero_bytes() {
         let root = std::env::temp_dir().join(format!(
             "ottto-claude-desktop-cache-unchanged-{}",
             std::process::id()
         ));
-        write_claude_desktop_cache_fixture(&root);
+        write_claude_desktop_pairs_fixture(&root);
         let mut cache = ClaudeDesktopMetadataCache::default();
 
-        let (attempts, bytes) = claude_desktop_cached_scan_reads(&root, &mut cache, false);
-        assert_eq!(attempts, 5);
-        assert!(bytes > 0);
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, true),
-            (0, 0),
-            "an unchanged saved-only pass reads no Desktop JSON"
-        );
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, false),
-            (0, 0),
-            "an unchanged full pass reads no Desktop JSON"
-        );
+        let (attempts, bytes) = claude_desktop_cached_scan_reads(&root, &mut cache);
+        assert!(attempts > 0 && bytes > 0);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache), (0, 0));
 
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// [behaviour] Only new or changed Desktop session files are read again,
-    /// and deleted ones leave the cache.
+    /// [behaviour] Only new or changed Desktop session files are read again;
+    /// deleted files and files written too recently to compare are not kept.
     #[test]
     fn claude_desktop_metadata_cache_rereads_only_changed_files() {
         let root = std::env::temp_dir().join(format!(
             "ottto-claude-desktop-cache-changed-{}",
             std::process::id()
         ));
-        let files = write_claude_desktop_cache_fixture(&root);
-        let set_modified = |path: &Path, secs: u64| {
-            File::options()
-                .write(true)
-                .open(path)
-                .and_then(|file| {
-                    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
-                })
-                .expect("set modified time");
+        write_claude_desktop_pairs_fixture(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let file = |account: u32, org: u32, name: &str| {
+            let bucket = root.join("claude-code-sessions").join(uuid(account));
+            bucket.join(uuid(org)).join(name)
         };
-        set_modified(&files["other"], 1_780_000_000);
+        let settled = 1_780_000_000;
+        let malformed = file(2, 13, "local_m.json");
+        write_desktop_file(&malformed, "{not json", settled);
         let mut cache = ClaudeDesktopMetadataCache::default();
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, false).0,
-            5
-        );
+        claude_desktop_cached_scan_reads(&root, &mut cache);
 
         // A changed size, then the same size with a later modification time.
-        std::fs::write(
-            &files["native"],
-            r#"{"cliSessionId":"native","lastActivityAt":3000}"#,
-        )
-        .expect("grow native");
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, true).0,
-            1
-        );
-        std::fs::write(
-            &files["other"],
-            r#"{"cliSessionId":"other","lastActivityAt":260}"#,
-        )
-        .expect("rewrite other");
-        set_modified(&files["other"], 1_780_000_060);
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, true).0,
-            1
-        );
+        let current = r#"{"cliSessionId":"current-x","lastActivityAt":3000}"#;
+        write_desktop_file(&file(1, 11, "local_a.json"), current, settled);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        let other = r#"{"cliSessionId":"other-y","lastActivityAt":260}"#;
+        write_desktop_file(&file(2, 12, "local_b.json"), other, settled + 60);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
 
         // A new file is read; a deleted one leaves the cache.
-        let new_file = files["native"].with_file_name("local_new.json");
-        std::fs::write(&new_file, r#"{"cliSessionId":"new","lastActivityAt":400}"#)
-            .expect("write new");
-        std::fs::remove_file(&files["imported"]).expect("delete imported");
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, false).0,
-            1
-        );
+        let new_file = file(1, 11, "local_n.json");
+        let new = r#"{"cliSessionId":"new","lastActivityAt":400}"#;
+        write_desktop_file(&new_file, new, settled);
+        std::fs::remove_file(file(3, 14, "local_d.json")).expect("delete imported");
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
         assert!(cache.code.contains_key(&new_file));
-        assert!(!cache.code.contains_key(&files["imported"]));
-        assert_eq!(cache.code.len(), 4);
+        assert!(!cache.code.contains_key(&file(3, 14, "local_d.json")));
 
         // Malformed JSON stays unread until it changes.
-        assert!(cache.code[&files["malformed"]].1.is_none());
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, true),
-            (0, 0)
-        );
-        std::fs::write(
-            &files["malformed"],
-            r#"{"cliSessionId":"repaired","lastActivityAt":500}"#,
-        )
-        .expect("repair malformed");
-        assert_eq!(
-            claude_desktop_cached_scan_reads(&root, &mut cache, true).0,
-            1
-        );
-        assert_eq!(
-            cache.code[&files["malformed"]]
-                .1
-                .as_ref()
-                .and_then(|metadata| metadata.cli_session_id.as_deref()),
-            Some("repaired")
-        );
+        assert!(cache.code[&malformed].1.is_none());
+        let repaired = r#"{"cliSessionId":"repaired","lastActivityAt":500}"#;
+        write_desktop_file(&malformed, repaired, settled);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert!(cache.code[&malformed].1.is_some());
+
+        // A file modified "now" is read on every pass until it settles.
+        write_desktop_file(&new_file, new, current_unix_seconds() + 3_600);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert!(!cache.code.contains_key(&new_file));
 
         let _ = std::fs::remove_dir_all(root);
     }
