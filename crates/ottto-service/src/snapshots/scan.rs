@@ -4,6 +4,7 @@
 
 pub(super) mod accumulator;
 pub(super) mod entry;
+pub(super) mod identity;
 pub(super) mod json_fields;
 pub(super) mod launch_demand;
 pub(super) mod limits;

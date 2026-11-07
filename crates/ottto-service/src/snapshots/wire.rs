@@ -12,14 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    claude_history_upgrade, claude_request_identity, claude_request_money, is_false, is_zero_u64,
+    claude_history_upgrade, claude_request_identity, claude_request_money,
     snapshot_source_from_api_slug, CacheObservations, ClaudeCompactionObservation, ClaudeFileBirth,
     ClaudeFileBirthVerdict, ClaudeTranscriptUsageOccurrence, LocalContextPoint, OwnedRequest,
     SnapshotCompactionEvent, SnapshotContextCurve, SnapshotSessionStart, SnapshotUploadPolicy,
     CLAUDE_CODE_SCAN_IDENTITY_VERSION, CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-    CODEX_SCAN_IDENTITY_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, MAX_SEMANTIC_ENVELOPE_BYTES,
-    PI_SCAN_IDENTITY_VERSION, PI_SNAPSHOT_PARSER_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
-    SNAPSHOT_HEAD_CAS_CONTRACT, USAGE_DECREASE_HOLD_ACK_CONTRACT,
+    CODEX_SCAN_IDENTITY_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SCAN_IDENTITY_VERSION,
+    PI_SNAPSHOT_PARSER_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT, SNAPSHOT_HEAD_CAS_CONTRACT,
+    USAGE_DECREASE_HOLD_ACK_CONTRACT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,3 +901,114 @@ crate::durable_tail_codec::durable_struct!(SnapshotOrigin {
 });
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
+
+pub(super) const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
+pub(super) const FILE_CONTENT_SAMPLE_BYTES: usize = 4 * 1024;
+pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
+pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
+pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
+pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
+/// Receiver request cap: one largest advertised item plus the batch envelope.
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
+pub(super) const MAX_TOOL_USAGE_NAMES: usize = 200;
+/// Retired attribution selector keys, kept only for the pinned
+/// `SelectorCapture` shape and its refusal.
+pub(super) const CLAUDE_ATTRIBUTION_SELECTOR_KEYS: [&str; 5] = [
+    "attribution_subagent",
+    "attribution_skill",
+    "attribution_plugin",
+    "attribution_mcp_server",
+    "attribution_mcp_tool",
+];
+/// The backend's admission bound on `model_usage` rows per item and per bucket.
+pub(super) const MAX_MODEL_USAGE_ROWS: usize = 100;
+
+/// Hash epoch of the policy-neutral `content_hash`.
+///
+/// It is deliberately independent of `SNAPSHOT_SCHEMA_VERSION` and of the
+/// parser versions: a new wire field, a parser fix, or a new semantic component
+/// is invisible to `content_hash` until this epoch moves. Moving it re-mints
+/// every session's content identity fleet-wide, so it moves only as a
+/// deliberate, announced change — never as a side effect of shipping a field.
+pub const SNAPSHOT_CONTENT_HASH_EPOCH: u16 = 1;
+
+/// The semantic components that survive every upload policy and every org
+/// display toggle. `content_hash` is computed over exactly these, which is what
+/// makes a privacy flip (titles, workspace labels, artifacts, attribution) a
+/// change in *content* rather than a change in *identity*.
+pub(crate) const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
+    "usage_accounting",
+    "lifecycle_activity",
+    "latency",
+    "context_posture",
+];
+
+/// Contract label folded into the scan-index manifest hash. It names both the
+/// fold and the entity grain, so a change to either changes the hash instead of
+/// silently changing its meaning.
+pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v2";
+pub const SNAPSHOT_QUARANTINE_CONTRACT_VERSION: &str = "snapshot_quarantine:v1";
+pub const SNAPSHOT_QUARANTINE_RETRY_SECONDS: u64 = 6 * 60 * 60;
+pub(super) const CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION: &str =
+    "claude_usage_authority_quarantine:v1";
+pub(super) const CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION: &str =
+    "claude_usage_authority_quarantine:v2";
+pub(super) const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
+/// One initial failed reconstruction plus three deterministic 6-12 hour
+/// retries. This gives transient sidecar lag three recovery windows while
+/// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
+pub(super) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
+pub(super) const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
+pub(super) const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 2;
+/// Ledger version 1 was written by the first legacy-settlement migration, which
+/// had a fast path that declared every currently indexed revision accepted
+/// whenever the local index merely looked clean. That inference is unsound: the
+/// silent retry-loss path this migration exists to repair ends in a clean index.
+/// The ledger records no witness distinguishing a v1 ledger sealed by that fast
+/// path from one drained by the bounded sweep, so every v1 ledger is re-opened
+/// once and re-proved through the server, which is the authority on acceptance.
+pub(super) const SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION: u8 = 1;
+/// Ledger version 0 is the pre-ledger shape: an index written before the
+/// version field existed, so serde defaults it to 0 on load. Its accepted
+/// entries are real entity ACKs - `record_accepted_snapshot_fingerprints` is
+/// their only writer - but the revisions the silent retry-loss dropped are
+/// absent from the index entirely, so `current - accepted` cannot see them and
+/// only the bounded sweep's forced re-parse of their owning files recovers
+/// them. A pre-ledger ledger that has never armed a page therefore carries no
+/// settlement proof either, exactly like the v1 ledger above.
+pub(super) const SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION: u8 = 0;
+pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
+
+/// What the manifest counts, declared on the wire rather than assumed.
+///
+/// The live scan index only ever holds transcripts inside the authorized scan
+/// window. The one-time historical bootstrap uploads older sessions from a
+/// throwaway index that is never persisted, so those entities are on the server
+/// and permanently absent from this manifest. A consumer that compared this
+/// count against its whole stored set would therefore report a mismatch on a
+/// perfectly healthy machine — so the scope and the window travel with the
+/// count, and the comparison is the consumer's to scope.
+pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
+
+pub(super) fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+pub(super) fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+pub(super) fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
+pub(super) fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+pub(super) fn default_true() -> bool {
+    true
+}
