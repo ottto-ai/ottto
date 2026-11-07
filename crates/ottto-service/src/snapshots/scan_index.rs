@@ -973,3 +973,67 @@ crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
+
+impl ScanIndex {
+    /// Mark the sweep unsettled by a path that does not name itself.
+    pub fn mark_bounded_sweep_unsettled(&mut self) {
+        self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Unattributed);
+    }
+
+    /// Mark the sweep unsettled and record which path did it, for transition
+    /// diagnostics and retry scheduling. A flag with no recorded cause stays
+    /// `Unattributed` beside this one.
+    pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
+        self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
+        self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    /// The flag is authoritative: no cause without it, and
+    /// `Unattributed` for a flag with no recorded cause.
+    pub(in crate::snapshots) fn unsettled_cause_bits(&self) -> u16 {
+        match (
+            self.bounded_sweep_had_unsettled_upload,
+            self.bounded_sweep_unsettled_causes,
+        ) {
+            (false, _) => 0,
+            (true, 0) => UnsettledUploadCause::Unattributed.bit(),
+            (true, causes) => causes,
+        }
+    }
+
+    /// The newest valid activity clock among this index's accepted entities,
+    /// in unix seconds: the last moment the index records this destination
+    /// receiving history (StateMissing N1). `None` when it records none.
+    pub(in crate::snapshots) fn last_received_activity_unix_seconds(&self) -> Option<u64> {
+        self.accepted_snapshot_fingerprints
+            .iter()
+            .filter_map(|fingerprint| self.snapshot_activity_at.get(fingerprint)?.as_deref())
+            .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+            .filter_map(|at| u64::try_from(at.unix_timestamp()).ok())
+            .max()
+    }
+
+    /// Record the contract-5 contract a prepared Claude cycle builds bodies
+    /// under. A contract change re-owes no history (card G): a record that
+    /// never captured waits for real content change or already-authorized
+    /// debt.
+    pub(crate) fn observe_claude_request_identity_contract(&mut self, captured: bool) {
+        let contract = claude_request_identity::cycle_contract(captured);
+        if self.claude_request_identity_contract.as_deref() == Some(contract) {
+            return;
+        }
+        use claude_request_identity::{COLLECTOR, E2_GROUPING};
+        claude_contract::note(|counts| {
+            let prior = self.claude_request_identity_contract.as_deref();
+            let transitions = &mut counts.identity_contract_transition;
+            transitions.from_empty += u64::from(prior == Some("") && !contract.is_empty());
+            transitions.to_empty +=
+                u64::from(matches!(prior, Some(COLLECTOR | E2_GROUPING)) && contract.is_empty());
+            transitions.collector_e2_grouping += u64::from(matches!(
+                (prior, contract),
+                (Some(COLLECTOR), E2_GROUPING) | (Some(E2_GROUPING), COLLECTOR)
+            ));
+        });
+        self.claude_request_identity_contract = Some(contract.to_owned());
+    }
+}
