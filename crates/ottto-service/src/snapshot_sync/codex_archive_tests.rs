@@ -80,7 +80,7 @@ impl ScanIndex {
         )
         .unwrap();
         progress.context_receipt_candidates =
-            index.file_upload_context_ack_candidates(&scan.snapshots);
+            index.file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
         progress.save(&progress_path).unwrap();
         if outcome != "partial" {
             let result = upload_resumable_batches_with_body_witness(

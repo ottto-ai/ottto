@@ -587,7 +587,9 @@ fn folded_members_retire_held_debt_only_on_the_exact_ack_of_their_body() {
         f.save();
         f.index
             .activate_file_upload_context(f.source, CONTEXT.into());
-        let candidates = f.index.file_upload_context_ack_candidates(&items);
+        let candidates = f
+            .index
+            .file_upload_context_ack_candidates(&items, &BTreeMap::new());
         let mut acks = bodies.clone();
         match ack {
             FoldAck::Exact => {}
@@ -605,7 +607,9 @@ fn folded_members_retire_held_debt_only_on_the_exact_ack_of_their_body() {
             }
         }
         let exact = matches!(ack, FoldAck::Exact);
-        let counts = f.index.accept_file_upload_context_acks(&candidates, &acks);
+        let counts = f
+            .index
+            .accept_file_upload_context_acks(&candidates, &acks, &BTreeMap::new());
         let earned = if exact { members } else { 0 };
         assert_eq!(counts.files, earned as u64, "{ack:?} {members}");
         let after = f.walk();
@@ -729,7 +733,7 @@ fn pre_fix_accepted_fold_members_clear_through_the_carrier_receipt() {
     // The next finish, with no candidate and no ACK in this pass.
     let counts = f
         .index
-        .accept_file_upload_context_acks(&[], &BTreeMap::new());
+        .accept_file_upload_context_acks(&[], &BTreeMap::new(), &BTreeMap::new());
     assert_eq!((counts.files, counts.bytes), (3, 0));
     let after = f.walk();
     assert_eq!(after["debt"]["outstanding_files"], 5);
@@ -762,5 +766,53 @@ fn pre_fix_accepted_fold_members_clear_through_the_carrier_receipt() {
             _ => assert!(!receipted && held, "{group}-{n}: stays held"),
         }
     }
+    f.close();
+}
+
+/// Assert receipt settlement against the existing persisted freshness fixture.
+pub(crate) fn assert_file_receipt_retires_debt(
+    items: &[SnapshotItem],
+    delivered: bool,
+    accept_receipt: impl FnOnce(&mut ScanIndex),
+) {
+    let mut f = Fixture::new(Source::Claude, "stale-file-receipt");
+    let path = f.file("session.jsonl", 100);
+    age(&path, 9 * HOUR);
+    let key = local_index_key(&path);
+    let mut stored = entry(&path);
+    stored.last_upload_body_witness = Some(snapshot_file_upload_body_set_hex(
+        items
+            .iter()
+            .map(snapshot_upload_body_witness)
+            .collect::<BTreeSet<_>>(),
+    ));
+    f.index.files.insert(key.clone(), stored);
+    f.index.file_snapshot_fingerprints.insert(
+        key.clone(),
+        items
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    f.index
+        .activate_file_upload_context(f.source, CONTEXT.into());
+    assert_eq!(f.walk()["debt"]["over_6h_files"], 1);
+    f.save();
+    f.index
+        .activate_file_upload_context(f.source, CONTEXT.into());
+    accept_receipt(&mut f.index);
+    assert_eq!(
+        f.index.files[&key].upload_context_receipt.is_some(),
+        delivered
+    );
+    let after = f.walk();
+    assert_eq!(after["debt"]["over_6h_files"], u64::from(!delivered));
+    assert_eq!(after["debt"]["outstanding_files"], u64::from(!delivered));
+    f.save();
+    assert_eq!(committed(&f.index, &path).is_empty(), delivered);
+    assert_eq!(
+        f.index.files[&key].upload_context_receipt.is_some(),
+        delivered
+    );
     f.close();
 }

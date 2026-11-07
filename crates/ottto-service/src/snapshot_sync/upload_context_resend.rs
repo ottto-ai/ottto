@@ -182,7 +182,8 @@ impl SnapshotUploadProgress {
     ) {
         self.context_resend.counts.files = index.context_read_counts.files;
         self.context_resend.counts.local_bytes = index.context_read_counts.local_bytes;
-        self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
+        self.context_receipt_candidates =
+            index.file_upload_context_ack_candidates(items, &self.covered_stale_bodies());
         self.context_resend
             .retain_candidates(&self.context_receipt_candidates);
         // A retired ACK still proves THIS entity's exact body under this

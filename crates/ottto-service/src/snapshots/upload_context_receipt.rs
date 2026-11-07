@@ -573,6 +573,7 @@ impl ScanIndex {
     pub(crate) fn file_upload_context_ack_candidates(
         &self,
         items: &[SnapshotItem],
+        covered: &BTreeMap<String, String>,
     ) -> Vec<Candidate> {
         if self.active_upload_context_fingerprint.is_none() {
             return Vec::new();
@@ -634,7 +635,12 @@ impl ScanIndex {
                 {
                     return None;
                 }
-                let bodies = by_source.get(source_witness)?;
+                let mut bodies = by_source.get(source_witness).cloned().unwrap_or_default();
+                for fp in entities {
+                    if let Some(body) = covered.get(fp) {
+                        bodies.entry(fp.clone()).or_insert_with(|| body.clone());
+                    }
+                }
                 if bodies.len() != entities.len()
                     || !entities.iter().all(|fp| bodies.contains_key(fp))
                 {
@@ -658,7 +664,7 @@ impl ScanIndex {
                         body_witness,
                     },
                     historical_replay_generation: self.historical_replay_generation.clone(),
-                    bodies: bodies.clone(),
+                    bodies,
                     wire_bytes: by_source_bytes
                         .get(source_witness)
                         .cloned()
@@ -682,6 +688,7 @@ impl ScanIndex {
         &mut self,
         candidates: &[Candidate],
         fresh_acks: &BTreeMap<String, String>,
+        covered: &BTreeMap<String, String>,
     ) -> RearmCounts {
         let mut counts = RearmCounts {
             local_bytes: self.context_read_counts.local_bytes,
@@ -710,8 +717,10 @@ impl ScanIndex {
                         != Some(marker)
                 })
                 || candidate.bodies.iter().any(|(entity, body)| {
-                    (fresh_acks.get(entity) != Some(body) && !candidate.prior_acks.contains(entity))
-                        || self.quarantined_snapshot_fingerprints.contains_key(entity)
+                    covered.get(entity) != Some(body)
+                        && ((fresh_acks.get(entity) != Some(body)
+                            && !candidate.prior_acks.contains(entity))
+                            || self.quarantined_snapshot_fingerprints.contains_key(entity))
                 })
                 || self
                     .file_snapshot_fingerprints
