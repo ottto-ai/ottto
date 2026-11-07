@@ -496,7 +496,12 @@ source, an owner-only `<index>.v2-ack-receipt` companion durably records the exa
 next upload-progress bytes before replacing the existing progress file. It binds
 the DB identity (including source and destination namespace), source generation,
 progress generation, and both predecessor and replacement digests. The progress
-file's format remains unchanged. OFF/v1 and Codex/Pi do not create companions.
+file's fields remain unchanged; it is written as compact JSON, older daemons wrote
+it pretty-printed, and every reader accepts either, since a receipt binds whichever
+exact bytes were written. A save whose serialized ledger equals the bytes already
+on disk writes neither file and claims no generation: under the progress lock, the
+current receipt must still seal those bytes, and only the directory sync is
+retried. OFF/v1 and Codex/Pi do not create companions.
 The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
 recovery or substitute for a missing exact receipt.
 

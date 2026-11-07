@@ -2992,6 +2992,7 @@ impl SnapshotUploadProgress {
         }
         let _lock = SnapshotProgressLock::acquire(path)?;
         let mut previous = None;
+        let mut unchanged = false;
         if path.exists() {
             let bytes = match read_limit {
                 Some(cap) => crate::snapshot_retry::read_state(path, cap),
@@ -3012,11 +3013,23 @@ impl SnapshotUploadProgress {
                 &mut self.quarantined_fingerprints,
                 &current.quarantined_fingerprints,
             );
+            unchanged = serializes_to(&*self, &bytes);
             if self.ack_recovery.is_some() {
                 previous = Some(crate::snapshots::ProgressSeal::new(&bytes));
             }
         } else if self.generation != 0 {
             return Err(anyhow!("snapshot upload progress disappeared concurrently"));
+        }
+        if unchanged {
+            // The durable ledger already holds these exact bytes at this
+            // generation: write nothing and claim no generation, so the next
+            // writer's compare-and-swap still matches. The current receipt must
+            // still seal them, as a save requires. Retry only the durability
+            // barrier: an earlier rename may be visible but not yet synced.
+            if let (Some(recovery), Some(previous)) = (&self.ack_recovery, previous) {
+                recovery.progress_unchanged(previous)?;
+            }
+            return sync_progress_parent(path);
         }
         let previous_generation = self.generation;
         self.generation = self
@@ -3027,8 +3040,8 @@ impl SnapshotUploadProgress {
         // second write fails, startup replays this receipt before DB handoffs.
         if let Some(recovery) = &self.ack_recovery {
             let result = (|| -> Result<()> {
-                let next = recovery
-                    .before_progress_save(previous, || Ok(serde_json::to_vec_pretty(&*self)?))?;
+                let next =
+                    recovery.before_progress_save(previous, || Ok(serde_json::to_vec(&*self)?))?;
                 ottto_core::write_owner_only_file_atomic(path, &next)?;
                 sync_progress_parent(path)?;
                 Ok(())
@@ -3042,7 +3055,7 @@ impl SnapshotUploadProgress {
         let mut file =
             std::fs::File::create(&temp_path).context("create snapshot upload progress temp")?;
         let result = (|| -> Result<()> {
-            serde_json::to_writer_pretty(&mut file, &*self)
+            serde_json::to_writer(&mut file, &*self)
                 .context("write snapshot upload progress temp")?;
             file.sync_all()
                 .context("sync snapshot upload progress temp")?;
@@ -3415,6 +3428,23 @@ fn unique_progress_sibling(path: &Path, kind: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
+}
+
+/// Whether `value` serializes to exactly `bytes` (compact JSON). Streams into
+/// the comparison and stops at the first differing byte; nothing is buffered.
+fn serializes_to(value: &impl Serialize, bytes: &[u8]) -> bool {
+    struct Same<'a>(&'a [u8]);
+    impl Write for Same<'_> {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.strip_prefix(chunk).ok_or(ErrorKind::InvalidData)?;
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut same = Same(bytes);
+    serde_json::to_writer(&mut same, value).is_ok() && same.0.is_empty()
 }
 
 fn sync_progress_parent(path: &Path) -> Result<()> {
