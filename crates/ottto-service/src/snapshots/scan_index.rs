@@ -4,6 +4,7 @@
 
 mod accounts;
 mod candidate_decision;
+pub(super) mod checkpoint_lock;
 pub(super) mod entry;
 mod entry_retirement;
 pub(super) mod file_set_digest;
