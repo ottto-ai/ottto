@@ -1401,6 +1401,21 @@ struct MemberState {
     starts: Vec<(u64, u64)>,
 }
 
+/// One independent member's header placement: its raw creator pair. A revert
+/// header with a positive ordinal and no fork id certifies no creator yet names
+/// its account, so members fold only under one raw pair; a pair missing on one
+/// member or a different pair holds the group. The pair only gates the fold and
+/// never becomes creator evidence. A certified creator must name its own pair.
+fn independent_member_placement(
+    certified: Option<(String, String)>,
+    raw: Option<(String, String)>,
+) -> std::result::Result<Option<(String, String)>, JoinRefusal> {
+    if certified.is_some_and(|certified| Some(&certified) != raw.as_ref()) {
+        return Err(JoinRefusal::Overlap);
+    }
+    Ok(raw)
+}
+
 /// The group proof, fed inside the one native replay: the native side in
 /// `TierReplay::observe`, the UI side by the parser admission tap (S10)
 /// after actual admission. It moves from member to member with the replay.
@@ -1569,9 +1584,12 @@ impl StreamProof {
                     {
                         return Err(JoinRefusal::ForkedFromOtherSession);
                     }
-                    let placement = codex_creator_header_evidence(value, meta).and_then(|e| {
-                        Some((e.account_identifier_hash?, e.provider_workspace_hash?))
-                    });
+                    let placement = independent_member_placement(
+                        codex_creator_header_evidence(value, meta).and_then(|e| {
+                            Some((e.account_identifier_hash?, e.provider_workspace_hash?))
+                        }),
+                        codex_raw_creator_pair(meta),
+                    )?;
                     let classification = (
                         string_at(meta, &["thread_source"]),
                         meta.get("source").map(Value::to_string),

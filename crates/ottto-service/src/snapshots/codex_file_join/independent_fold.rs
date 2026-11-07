@@ -155,6 +155,23 @@ pub(in crate::snapshots) fn fold(
     earlier.sort_by(|a, b| a.source_started_at.cmp(&b.source_started_at));
     let mut iter = earlier.into_iter();
     let mut item = iter.next().expect("original member");
+    // The account binder chooses its path by the body's row auth modes (all
+    // oauth/chatgpt, all unrecorded, or mixed). Members of different classes
+    // would change each other's row tags, so they hold; a member without rows
+    // is neutral.
+    let modes = |item: &SnapshotItem| {
+        let mut rows = item.model_usage.iter().chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        );
+        rows.next().map(|_| {
+            (
+                codex_rows_all(item, |mode| matches!(mode, Some("oauth" | "chatgpt"))),
+                codex_rows_all(item, |mode| mode.is_none()),
+            )
+        })
+    };
     for next in iter {
         anyhow::ensure!(
             resolve_codex_identity(&item.source_session_id)
@@ -175,6 +192,29 @@ pub(in crate::snapshots) fn fold(
                 .map(|row| row.account_identifier_hash.clone())
                 .collect::<BTreeSet<_>>()
         };
+        // Creator evidence stays the original's own certified evidence. The raw
+        // header pair that admitted an uncertified revert never becomes
+        // evidence, and a certified later member under an uncertified
+        // original holds rather than leaving the folded body unbound.
+        anyhow::ensure!(
+            match (
+                &item.session_account_evidence,
+                &next.session_account_evidence
+            ) {
+                (_, None) => true,
+                (Some(own), Some(next)) => {
+                    own.account_identifier_hash == next.account_identifier_hash
+                        && own.provider_workspace_hash == next.provider_workspace_hash
+                }
+                (None, Some(_)) => false,
+            },
+            "folded creator evidence differs"
+        );
+        let (own, other) = (modes(&item), modes(&next));
+        anyhow::ensure!(
+            own.is_none() || other.is_none() || own == other,
+            "folded auth modes differ"
+        );
         let own_placement = placement(&item);
         anyhow::ensure!(
             own_placement.len() <= 1

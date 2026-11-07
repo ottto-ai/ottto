@@ -489,3 +489,203 @@ fn independent_fold_failure_is_memoized_after_one_read_per_member() {
     assert_eq!(counters(&cache).memo_records, 1);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// [money] Independent members fold only under one raw creator pair. A revert
+/// header with a positive ordinal and no fork id certifies no creator yet names
+/// its pair; a missing, partial or different pair holds the group, and a
+/// certified creator must name its own raw pair.
+#[test]
+fn independent_header_gate_compares_raw_creator_pairs() {
+    let pair = |user: &str, workspace: &str| {
+        json!({"creator_user_id": format!("synthetic-user-{user}"),
+            "creator_account_id": format!("synthetic-workspace-{workspace}")})
+    };
+    let original = meta(OWNER, "2026-10-01T09:00:00Z", pair("a", "a"));
+    let revert = |creator: Value| {
+        let mut extra = json!({"history_base": {"thread_id": OWNER,
+            "end_ordinal_exclusive": 1, "end_byte_offset": 1}});
+        extra
+            .as_object_mut()
+            .unwrap()
+            .extend(creator.as_object().unwrap().clone());
+        let mut header = meta(OWNER, "2026-10-01T09:01:00Z", extra);
+        header["ordinal"] = json!(1);
+        header
+    };
+    let gate = |first: &Value, second: &Value| {
+        let mut proof = StreamProof::independent(OWNER.into(), 2);
+        for (position, header) in [first, second].into_iter().enumerate() {
+            proof.begin_member(position);
+            feed(&mut proof, std::slice::from_ref(header), [0]);
+            proof.end_member(1);
+        }
+        proof.refusal()
+    };
+    let same = revert(pair("a", "a"));
+    assert!(codex_creator_header_evidence(&original, &original["payload"]).is_some());
+    assert!(
+        codex_creator_header_evidence(&same, &same["payload"]).is_none(),
+        "the revert header certifies no creator"
+    );
+    assert_eq!(gate(&original, &same), None, "one raw pair folds");
+    let held = Some((JoinRefusal::Overlap, 1));
+    assert_eq!(gate(&original, &revert(json!({}))), held, "missing pair");
+    let partial = json!({"creator_user_id": "synthetic-user-a"});
+    assert_eq!(gate(&original, &revert(partial)), held, "partial pair");
+    assert_eq!(gate(&original, &revert(pair("b", "a"))), held, "account");
+    assert_eq!(gate(&original, &revert(pair("a", "b"))), held, "workspace");
+    // Uncertified members alone: one pair, or no pair on any member as before.
+    assert_eq!(gate(&revert(pair("a", "a")), &same), None);
+    assert_eq!(gate(&revert(json!({})), &revert(json!({}))), None);
+    assert_eq!(gate(&revert(json!({})), &same), held, "pair on one only");
+    assert_eq!(
+        gate(&revert(pair("b", "b")), &same),
+        held,
+        "different pairs"
+    );
+    // A certified member's own raw pair must equal its certified evidence.
+    let raw = |user: &str, workspace: &str| codex_raw_creator_pair(&pair(user, workspace));
+    assert_eq!(
+        independent_member_placement(raw("a", "a"), raw("a", "a")),
+        Ok(raw("a", "a"))
+    );
+    assert_eq!(
+        independent_member_placement(None, raw("a", "a")),
+        Ok(raw("a", "a"))
+    );
+    assert_eq!(
+        independent_member_placement(raw("a", "a"), raw("b", "a")),
+        Err(JoinRefusal::Overlap)
+    );
+    assert_eq!(
+        independent_member_placement(raw("a", "a"), None),
+        Err(JoinRefusal::Overlap)
+    );
+}
+
+/// [money] The folded creator evidence is the original member's own certified
+/// evidence, byte-identical. A certified later member under an uncertified
+/// original holds instead of leaving the folded body without its creator.
+#[test]
+fn independent_fold_keeps_the_original_certified_evidence() {
+    let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+    let (root, _) = independent_fixture("independent-evidence", &[8, 88]);
+    let index = ScanIndex::default();
+    let cache = Arc::new(SharedCache::default());
+    let metadata = CodexTitleMetadata::default();
+    let boot = independent_boot(&root, 0, &index, &cache);
+    let mut job = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            index: &index,
+            cache: Some(&cache),
+        })
+        .unwrap();
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        live_scope: &no_scope,
+        cache: Some(&cache),
+        collected_at: "2026-10-06T23:00:00Z",
+        index: &index,
+    };
+    loop {
+        match step_group(&mut job, &inputs) {
+            GroupStep::Read(Ok(true)) => break,
+            GroupStep::Read(Ok(false)) => {}
+            _ => panic!("independent replay held"),
+        }
+    }
+    let contributions = std::mem::take(&mut job.group.as_mut().unwrap().contributions);
+    let parsed = job
+        .parser
+        .finish_boxed_native(
+            FinishRequest {
+                expected_opened_object_identity: &job.candidate.opened_object_identity,
+                path: &job.candidate.path,
+                collected_at: "2026-10-06T23:00:00Z",
+                source_file_fingerprint: job.source_file_fingerprint,
+                codex_title_metadata: Some(&CodexTitleMetadata::default()),
+                claude_title_metadata: None,
+                attribution_context: None,
+                repository_identity: None,
+                money_context: None,
+            },
+            None,
+        )
+        .unwrap();
+    assert!(parsed.progress_complete());
+    let evidence = SessionAccountEvidence {
+        provider: "openai",
+        account_identifier_hash: Some("a".repeat(64)),
+        provider_workspace_hash: Some("b".repeat(64)),
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "codex_creator_header:v1",
+        identity_disposition: None,
+        source_created_at: Some("2026-10-01T09:00:00Z".into()),
+    };
+    let fold = |certified_original: bool| {
+        let mut last = parsed.snapshots.clone();
+        let mut earlier = contributions.clone();
+        assert!(last.len() == 1 && earlier.len() == 1);
+        assert!(
+            earlier[0].session_account_evidence.is_none()
+                && last[0].session_account_evidence.is_none()
+        );
+        // `fold` orders by start; equal starts keep the earlier member first.
+        let original_is_last = last[0].source_started_at < earlier[0].source_started_at;
+        let (original, later) = if original_is_last {
+            (&mut last[0], &mut earlier[0])
+        } else {
+            (&mut earlier[0], &mut last[0])
+        };
+        if certified_original {
+            original.session_account_evidence = Some(evidence.clone());
+        } else {
+            later.session_account_evidence = Some(evidence.clone());
+        }
+        fold_independent(&mut last, earlier).map(|()| last)
+    };
+    let folded = fold(true).unwrap();
+    assert_eq!(folded.len(), 1);
+    assert_eq!(folded[0].request_count, 96);
+    assert_eq!(
+        serde_json::to_value(&folded[0].session_account_evidence).unwrap(),
+        serde_json::to_value(Some(&evidence)).unwrap(),
+        "byte-identical original creator evidence"
+    );
+    assert!(fold(false).is_err(), "a later creator never binds the fold");
+    // Members whose rows take different binder paths hold: a fold never
+    // changes which path tags either member's rows.
+    let fold_modes = |first: Option<&'static str>, second: Option<&'static str>| {
+        let mut last = parsed.snapshots.clone();
+        let mut earlier = contributions.clone();
+        for (item, mode) in [(&mut earlier[0], first), (&mut last[0], second)] {
+            for row in item.model_usage.iter_mut().chain(
+                item.usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                row.auth_mode = mode.map(str::to_string);
+            }
+        }
+        fold_independent(&mut last, earlier).map(|()| last)
+    };
+    assert!(fold_modes(None, None).is_ok());
+    assert!(fold_modes(Some("chatgpt"), Some("oauth")).is_ok());
+    assert!(
+        fold_modes(None, Some("chatgpt")).is_err(),
+        "unrecorded vs oauth"
+    );
+    assert!(
+        fold_modes(Some("oauth"), None).is_err(),
+        "oauth vs unrecorded"
+    );
+    assert!(
+        fold_modes(Some("apikey"), Some("chatgpt")).is_err(),
+        "mixed vs oauth"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
