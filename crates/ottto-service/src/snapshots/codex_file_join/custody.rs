@@ -33,6 +33,37 @@ pub(in crate::snapshots) fn fan_out_body_witnesses(
     }
 }
 
+/// The ACK-time twin of `fan_out_body_witnesses`: every joined member of a
+/// group whose body this page offers is offered that same body under its own
+/// source revision. The caller still requires the member's own entity set and
+/// body witness to equal the offered ones, and an exact ACK of every body.
+pub(in crate::snapshots) fn fan_out_offered_to_aliases<'a, V: Clone>(
+    index: &'a ScanIndex,
+    offered: &mut BTreeMap<&'a str, V>,
+) {
+    let carriers = index
+        .files
+        .values()
+        .filter_map(|entry| {
+            let marker = entry.codex_joined_member_set.as_ref()?;
+            let value = offered.get(entry.source_file_fingerprint.as_str())?;
+            Some((marker, value.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for entry in index.files.values() {
+        if let Some(value) = entry
+            .codex_joined_member_set
+            .as_ref()
+            .and_then(|marker| carriers.get(marker))
+            .filter(|_| !entry.source_file_fingerprint.is_empty())
+        {
+            offered
+                .entry(entry.source_file_fingerprint.as_str())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
 impl ScanIndex {
     /// Stage bounded selector and joined-membership recovery facts without changing any committed
     /// file/body/ACK field. The caller persists this by the existing index CAS

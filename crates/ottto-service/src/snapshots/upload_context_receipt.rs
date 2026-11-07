@@ -597,6 +597,11 @@ impl ScanIndex {
                 );
             }
         }
+        // A folded Codex body carries one member's source revision; each other
+        // joined member owes its own receipt for that exact body. Its wire
+        // bytes are counted once below.
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source);
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source_bytes);
         self.files
             .iter()
             .filter_map(|(key, entry)| {

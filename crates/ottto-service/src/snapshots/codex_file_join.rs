@@ -6,7 +6,7 @@ use crate::transcript_acquisition::FileStamp;
 mod custody;
 mod group_job;
 mod independent_fold;
-pub(super) use custody::fan_out_body_witnesses;
+pub(super) use custody::{fan_out_body_witnesses, fan_out_offered_to_aliases};
 pub(super) use group_job::{
     disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key, rearm_unsettled,
     refusal_disclosure, refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot,
