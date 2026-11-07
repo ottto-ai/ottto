@@ -880,7 +880,11 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         // Handed-off ACKs no longer grant slots: one past the 4096 headroom stops.
         assert!(progress.admit_ack_batch(4096 - ENTITIES).is_err());
         if failure == "progress_cas" {
+            // A concurrent writer saves a changed ledger first.
             let mut concurrent = progress.clone();
+            concurrent
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
             concurrent.save(&progress_path).unwrap();
             assert!(progress
                 .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
@@ -928,6 +932,9 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
             // Cleanup is already visible, but proof consumption still needs a
             // successful progress save. A stale generation must keep authority.
             let mut concurrent = progress.clone();
+            concurrent
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
             concurrent.save(&progress_path).unwrap();
             assert!(progress
                 .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path,)
@@ -2250,7 +2257,12 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
         );
         assert!(!f.load().1.quarantined_fingerprints.contains_key(&merged));
         if concurrent_writer {
-            f.load().1.save(&f.progress_path).unwrap();
+            // Another writer saves a changed ledger first.
+            let mut writer = f.load().1;
+            writer
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
+            writer.save(&f.progress_path).unwrap();
         }
         let index_before = std::fs::read(&f.index_path).unwrap();
         let progress_before = std::fs::read(&f.progress_path).unwrap();
@@ -2453,16 +2465,24 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
     }
 }
 
-/// Progress and receipt bytes (SHA-256) after each save in the test below, as
-/// written by the build before the save kept one copy of the progress.
+/// Progress and receipt bytes (SHA-256) after each save in the test below,
+/// written as compact JSON.
 const ACK_SAVE_BYTES: [&str; 4] = [
-    "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
-    "cc1eb1267b5396a97fffc415e5fae8e98f54e7531d65438bc1f5c4b41e98d2fb",
-    "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
-    "806945e0918e87f43e490c5e0f48d14e07adab81d8beefc8d470507dce2a47e0",
+    "3cb0d1c2f50044d3f7c741074b0e157bc06fe1717de0c5e4e09ed42e14d67728",
+    "56be4e6c2e107513748b85d79c209550a2e495c6515e7c9faa68b66f41c9c152",
+    "0ad339132c749dcc24faf3cdc23ba5804ab6503e27cbc37d953bbd15aab199fc",
+    "aac690e0dde83355a31294447aeb1f209fe2e0561ebd866ba1b36e416a3296ee",
 ];
-/// [money] An ACK-bound save writes the same progress and receipt bytes as the
-/// build before it, through both compare-and-swap decode paths.
+/// The same two progress saves (SHA-256) as the earlier pretty-printed build
+/// wrote them, before the save kept one copy of the progress.
+const PRETTY_PROGRESS_BYTES: [&str; 2] = [
+    "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
+    "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
+];
+/// [money] An ACK-bound save writes stable progress and receipt bytes through
+/// both compare-and-swap decode paths, the receipt seals exactly the saved
+/// progress, and the compact progress holds the same ledger the pretty build
+/// wrote: printed pretty again, it is byte-identical.
 #[test]
 fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-bytes");
@@ -2470,6 +2490,8 @@ fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
     let path = scratch.join("progress");
     let mut progress = bound_progress(&index_path, &path, &"a".repeat(64));
     let mut hashes = Vec::new();
+    let mut pretty = Vec::new();
+    let sha = |bytes: &[u8]| crate::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
     for round in 0..2_u8 {
         let key = format!("{round:064x}");
         progress.record_body(&key, &"b".repeat(64));
@@ -2479,14 +2501,17 @@ fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
         progress.accepted_cache_heads.insert(key, "c".repeat(64));
         let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
         progress.save_with_read_limit(&path, limit).unwrap();
-        for file in [path.clone(), scratch.join("index.v2-ack-receipt")] {
-            let bytes = std::fs::read(file).unwrap();
-            hashes.push(crate::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
-                &bytes,
-            )));
-        }
+        let saved = std::fs::read(&path).unwrap();
+        let receipt = std::fs::read(scratch.join("index.v2-ack-receipt")).unwrap();
+        let sealed: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(sealed["progress"].as_str().unwrap().as_bytes(), saved);
+        let ledger: SnapshotUploadProgress = serde_json::from_slice(&saved).unwrap();
+        pretty.push(sha(&serde_json::to_vec_pretty(&ledger).unwrap()));
+        hashes.push(sha(&saved));
+        hashes.push(sha(&receipt));
     }
     assert_eq!(hashes, ACK_SAVE_BYTES);
+    assert_eq!(pretty, PRETTY_PROGRESS_BYTES);
 }
 
 /// Memory: allocator peak of one ACK-bound save of a ~5 MiB progress, per

@@ -520,6 +520,31 @@ impl ProgressRecovery {
         Ok(())
     }
 
+    /// The current receipt seals exactly the progress bytes read under the
+    /// lock, or the adopted missing-ledger marker when there are none.
+    fn sealed(&self, previous: Option<&ProgressSeal>) -> Result<Scope> {
+        let scope = self.current_scope()?;
+        let receipt = self.checked(&scope, |seal: &mut ProgressSeal| {
+            std::mem::replace(seal, ProgressSeal::new(&[]))
+        })?;
+        require(
+            previous.map(|seal| seal.digest) == Some(receipt.digest)
+                || (receipt.generation == 0
+                    && receipt.previous_digest.is_none()
+                    && previous.is_none()),
+            "progress",
+        )?;
+        Ok(scope)
+    }
+
+    /// Called inside the progress CAS lock instead of a save that would write
+    /// the same ledger bytes. The current receipt already seals those durable
+    /// bytes, so none is written; its durability barrier is retried.
+    pub(crate) fn progress_unchanged(&self, previous: ProgressSeal) -> Result<()> {
+        self.sealed(Some(&previous))?;
+        super::super::sync_checkpoint_parent(&self.path)
+    }
+
     /// Called inside the existing progress CAS lock, after the exact response
     /// has been validated. Failure creates no index acceptance/retirement.
     /// `next` is built after the old receipt is checked and the new receipt
@@ -529,18 +554,8 @@ impl ProgressRecovery {
         previous: Option<ProgressSeal>,
         next: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let scope = self.current_scope()?;
-        let receipt = self.checked(&scope, |seal: &mut ProgressSeal| {
-            std::mem::replace(seal, ProgressSeal::new(&[]))
-        })?;
+        let scope = self.sealed(previous.as_ref())?;
         let previous_digest = previous.as_ref().map(|seal| seal.digest);
-        require(
-            previous_digest == Some(receipt.digest)
-                || (receipt.generation == 0
-                    && receipt.previous_digest.is_none()
-                    && previous.is_none()),
-            "progress",
-        )?;
         let previous_generation = previous.map(|seal| seal.generation);
         let previous_generation = previous_generation.transpose()?.unwrap_or(0);
         let next = next()?;
