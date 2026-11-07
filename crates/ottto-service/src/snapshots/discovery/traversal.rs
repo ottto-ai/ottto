@@ -597,6 +597,13 @@ pub(in crate::snapshots) fn enqueue_watcher_hints(
             continue;
         }
 
+        // A path that joins this generation's census pending set before the
+        // walk observed it was discovered by the hint, as a re-listed member
+        // is, so pending never exceeds discovered (the status wire rejects
+        // skipped > discovered), also on a fresh walk's first page.
+        let unobserved = !traversal
+            .observed_index_keys
+            .contains(&local_index_key(path));
         if let Some(&position) = pending.get(path) {
             let member = fresh_path_census_member(source, traversal, path);
             if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
@@ -606,7 +613,9 @@ pub(in crate::snapshots) fn enqueue_watcher_hints(
                 // Claude/Pi: the hint joins the census as it would if nothing
                 // were queued for it (a re-listed or re-read non-member).
                 if source != SnapshotSource::Codex {
+                    let joined = member && !candidate.census_member;
                     candidate.census_member |= member;
+                    traversal.counts.discovered_file_count += usize::from(joined && unobserved);
                 }
             }
             continue;
@@ -626,6 +635,7 @@ pub(in crate::snapshots) fn enqueue_watcher_hints(
         // walk re-reads it if it is stale.
         let census_member = fresh_path_census_member(source, traversal, path);
         next_generation += u64::from(source == SnapshotSource::Codex && !census_member);
+        traversal.counts.discovered_file_count += usize::from(census_member && unobserved);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
         pending.insert(path.clone(), traversal.pending_candidates.len());
