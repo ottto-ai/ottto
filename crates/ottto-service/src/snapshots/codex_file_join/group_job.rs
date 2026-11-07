@@ -1546,6 +1546,8 @@ pub(in crate::snapshots) struct EndInputs<'a> {
 
 /// Reuse the existing refusal memo and attempt fence for sealed independent
 /// inputs. No refusal grants delivery or acceptance credit to a member.
+/// Every member is sealed, so the entry needs no live witness (a compressed
+/// member has none) and wakes on any change of the last member's stamp.
 pub(in crate::snapshots) fn refuse_independent(
     group: &GroupJob,
     sampling: Option<&sampled_scan::Context>,
@@ -1613,7 +1615,10 @@ pub(in crate::snapshots) fn end_group(
         );
     }
     match end {
-        GroupEnd::Strict if group.independent => {
+        // A proof refusal in a sealed independent group (even in its last
+        // member) is memoized like a strict end, so an unchanged group is not
+        // re-read whole at every discovery generation.
+        GroupEnd::Strict | GroupEnd::Refused { .. } if group.independent => {
             if let Some(lease) = lease {
                 cursor::end_group_lease(lease, &active);
             }

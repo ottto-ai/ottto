@@ -490,6 +490,73 @@ fn independent_fold_failure_is_memoized_after_one_read_per_member() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [money] A proof refusal in the last sealed member (a repeated admitted
+/// occurrence: `Overlap`) is memoized like a strict end. Unchanged, the group
+/// stays held and disclosed at zero transcript bytes in every new discovery
+/// generation; a member change, or a restart, reads it again.
+#[test]
+fn independent_last_member_refusal_is_not_reread_each_generation() {
+    let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+    let (root, _) = independent_fixture("independent-last-refusal", &[1, 1]);
+    let mut paths = fs::read_dir(root.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let rows = |p: &Path| {
+        zstd::stream::decode_all(File::open(p).unwrap())
+            .unwrap()
+            .split(|b| *b == b'\n')
+            .filter(|b| !b.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let write = |p: &Path, rows: &[Value]| {
+        let bytes = rows
+            .iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>();
+        fs::write(p, zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap()).unwrap();
+    };
+    let mut last = rows(&paths[1]);
+    last[3] = rows(&paths[0])[3].clone();
+    write(&paths[1], &last);
+    let held = |scan: &SourceScanResult| {
+        assert!(scan.snapshots.is_empty(), "no singleton, no fold");
+        assert!(scan.ownership_incomplete_file_count >= 2, "still disclosed");
+    };
+    let cache = Arc::new(SharedCache::default());
+    let ((mut index, first), bytes) =
+        observe_consumed(|| sampled(&root, ScanIndex::default(), 10, &cache));
+    held(&first);
+    assert!(bytes > 0, "the first attempt reads the group");
+    for n in 1..=3 {
+        let ((next, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, n));
+        index = next;
+        held(&again);
+        assert_eq!(bytes, 0, "generation {n} re-reads no transcript bytes");
+    }
+    assert_eq!(counters(&cache).memo_records, 1, "the refusal is memoized");
+    // A changed last member is read again at once (and refused again).
+    last.push(turn("t-appended"));
+    write(&paths[1], &last);
+    let ((next, grown), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 4));
+    index = next;
+    held(&grown);
+    assert!(bytes > 0, "a changed member is re-read");
+    assert_eq!(counters(&cache).memo_records, 2);
+    let ((next, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 5));
+    index = next;
+    held(&again);
+    assert_eq!(bytes, 0);
+    // A restart (empty cache) reads the group once more, as before.
+    let restarted = Arc::new(SharedCache::default());
+    let ((_, again), bytes) = observe_consumed(|| next_generation(&root, index, &restarted, 6));
+    held(&again);
+    assert!(bytes > 0, "a restart reads the held group again");
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// [money] Independent members fold only under one raw creator pair. A revert
 /// header with a positive ordinal and no fork id certifies no creator yet names
 /// its pair; a missing, partial or different pair holds the group, and a
