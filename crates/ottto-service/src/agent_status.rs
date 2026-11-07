@@ -28387,7 +28387,7 @@ for line in sys.stdin:
         let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
         let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
         let (contested, agent_copied) = (uuid(5), uuid(6));
-        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(root).expect("create root");
         std::fs::write(
             root.join("config.json"),
             format!(r#"{{"lastKnownAccountUuid":"{current}"}}"#),
