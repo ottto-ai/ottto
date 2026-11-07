@@ -7,9 +7,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::snapshots::local_context_points::{local_context_points_recent, LocalContextPoints};
 use crate::snapshots::wire::SnapshotItem;
 use crate::snapshots::{
-    bounded_compaction_timestamps, compaction_events, ClaudeCompactionObservation,
-    ClaudeTranscriptUsageOccurrence, CompactionMetrics,
-    CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS,
+    compaction_events, ClaudeCompactionTrigger, ClaudeTranscriptUsageOccurrence,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,3 +264,73 @@ where
         };
     (id_less, points_refused)
 }
+
+pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
+
+pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
+    timestamps.sort();
+    timestamps.dedup();
+    if timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
+        timestamps.split_off(timestamps.len() - MAX_COMPACTION_TIMESTAMPS)
+    } else {
+        timestamps
+    }
+}
+
+// Fallback only: a legacy summary normally pairs through its `parentUuid`
+// chain. Since mid-October 2026 the two records land up to ~1.2 s apart, so an
+// unlinked pair still needs a window wider than that spread.
+const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 2_000;
+#[derive(Debug, Clone, Default)]
+pub(in crate::snapshots) struct CompactionMetrics {
+    pub(in crate::snapshots) total_pre_tokens: u64,
+    pub(in crate::snapshots) total_post_tokens: u64,
+    pub(in crate::snapshots) total_cumulative_dropped_tokens: u64,
+    pub(in crate::snapshots) total_duration_ms: u64,
+    pub(in crate::snapshots) metrics_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeCompactionObservation {
+    pub(in crate::snapshots) kind: ClaudeCompactionKind,
+    pub(in crate::snapshots) timestamp: Option<String>,
+    pub(in crate::snapshots) pre_tokens: Option<u64>,
+    pub(in crate::snapshots) post_tokens: Option<u64>,
+    pub(in crate::snapshots) cumulative_dropped_tokens: Option<u64>,
+    pub(in crate::snapshots) duration_ms: Option<u64>,
+    /// Number of provider responses first observed before this boundary. This
+    /// stays local and lets the post-census ownership pass attach the boundary
+    /// to exact owned request ordinals without uploading provider identities.
+    pub(in crate::snapshots) response_count_before: u64,
+    /// Local parse-order key of a current boundary. A legacy summary carries
+    /// its boundary's key when its `parentUuid` chain (through `attachment`
+    /// records) leads to that boundary, and `None` otherwise.
+    pub(in crate::snapshots) pair_key: Option<u64>,
+    /// Whether the record named a `parentUuid`. Read only for a legacy summary:
+    /// one that names a parent outside its boundary's chain is its own event,
+    /// so only a summary without any link may pair by time.
+    pub(in crate::snapshots) has_parent_link: bool,
+    /// `compactMetadata.trigger` of a current boundary; `None` for a legacy
+    /// summary or an unknown value. Fits the struct's existing padding.
+    pub(in crate::snapshots) trigger: Option<ClaudeCompactionTrigger>,
+    /// The response just before / just after this compaction had no request
+    /// id, so it is never its size. Set when responses are resolved; read only
+    /// by the fold's local id-less counters, never uploaded. Padding too.
+    pub(in crate::snapshots) id_less_before: bool,
+    pub(in crate::snapshots) id_less_after: bool,
+}
+crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger, id_less_before, id_less_after);
+crate::durable_tail_codec::durable_struct!(ClaudeCompactionObservation {
+    N kind: ClaudeCompactionKind,
+    N timestamp: Option<String>,
+    N pre_tokens: Option<u64>,
+    N post_tokens: Option<u64>,
+    N cumulative_dropped_tokens: Option<u64>,
+    N duration_ms: Option<u64>,
+    N response_count_before: u64,
+    N pair_key: Option<u64>,
+    N has_parent_link: bool,
+    N trigger: Option<ClaudeCompactionTrigger>,
+    N id_less_before: bool,
+    N id_less_after: bool,
+});
