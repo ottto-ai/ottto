@@ -636,16 +636,8 @@ impl HeaderInventory {
             retry_candidate = Some(candidate.clone());
             let current = open_candidate_beneath_root(&candidate)?.metadata()?;
             let stamp = FileStamp::capture(current.clone())?;
-            // One securely acquired physical witness for both durable and RAM
-            // facts. Exact-stamp RAM facts first: a hit loads no durable head.
-            let ram = cache
-                .and_then(|cache| cache.with_cursor(|cursor| cursor.headers.get(&key)))
-                .flatten()
-                .filter(|cached| {
-                    cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp)
-                });
-            let joined_archive = if ram.is_none()
-                && codex_archive_path(&candidate.path)
+            // One securely acquired physical witness for both durable and RAM facts.
+            let joined_archive = if codex_archive_path(&candidate.path)
                 && index.files.get(&key).is_some_and(|entry| {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
@@ -669,12 +661,10 @@ impl HeaderInventory {
             } else {
                 None
             };
-            let physical = match (&ram, &joined_archive) {
-                (None, None) => index.codex_physical_matches(&key, &current)?,
-                _ => None,
-            };
-            let durable = joined_archive.or(physical.filter(|(matched, _)| *matched).and_then(
-                |(_, head)| {
+            let durable = joined_archive.or(index
+                .codex_physical_matches(&key, &current)?
+                .filter(|(matched, _)| *matched)
+                .and_then(|(_, head)| {
                     let facts = head.common.inventory.as_ref();
                     let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
                         tail_source::codex::header_facts(head.revision, &head.body)
@@ -689,14 +679,21 @@ impl HeaderInventory {
                             usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
                         }),
                     })
-                },
-            ));
-            let reused = ram.or(durable).map(|facts| {
-                self.reuse_hits += 1;
-                self.reuse_misses -= 1;
-                self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
-                (facts, metadata_witness(&current))
-            });
+                }));
+            let reused = durable
+                .or_else(|| {
+                    let cached = cache?
+                        .with_cursor(|cursor| cursor.headers.get(&key))
+                        .flatten()?;
+                    (cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp))
+                        .then_some(cached)
+                })
+                .map(|facts| {
+                    self.reuse_hits += 1;
+                    self.reuse_misses -= 1;
+                    self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
+                    (facts, metadata_witness(&current))
+                });
             let (facts, witness) = match reused {
                 Some(header) => header,
                 None => {
