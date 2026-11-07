@@ -8294,8 +8294,9 @@ use scan::lines::selectors::{
 use sources::codex::rollout_header::{
     codex_creator_header_evidence, codex_header_declares_no_parent, codex_is_task_started,
     codex_legacy_trigger_turn, codex_native_created_thread_header,
-    codex_paginated_fork_creation_header, codex_session_id_is_native_parent,
-    codex_session_meta_payload, codex_sidecar_rollout_file_matches, creator_time_precedes_start,
+    codex_paginated_fork_creation_header, codex_raw_creator_pair,
+    codex_session_id_is_native_parent, codex_session_meta_payload,
+    codex_sidecar_rollout_file_matches, creator_time_precedes_start,
 };
 
 /// Provider token fields only. `request_count` is a parser default when

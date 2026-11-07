@@ -175,6 +175,24 @@ pub(in crate::snapshots) fn fold(
                 .map(|row| row.account_identifier_hash.clone())
                 .collect::<BTreeSet<_>>()
         };
+        // Creator evidence stays the original's own certified evidence. The raw
+        // header pair that admitted an uncertified revert never becomes
+        // evidence, and a certified later member under an uncertified
+        // original holds rather than leaving the folded body unbound.
+        anyhow::ensure!(
+            match (
+                &item.session_account_evidence,
+                &next.session_account_evidence
+            ) {
+                (_, None) => true,
+                (Some(own), Some(next)) => {
+                    own.account_identifier_hash == next.account_identifier_hash
+                        && own.provider_workspace_hash == next.provider_workspace_hash
+                }
+                (None, Some(_)) => false,
+            },
+            "folded creator evidence differs"
+        );
         let own_placement = placement(&item);
         anyhow::ensure!(
             own_placement.len() <= 1
