@@ -608,7 +608,7 @@ page events, not gauges, and are never summed across observers:
   page ending or being dropped mid-file. A file the observer skipped is not
   counted. A later page can count the same file again.
 
-**Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
+**Owed-key discovery retention.** `DiscoveryRetention` (`snapshots/discovery/retention.rs`) is the
 one shared exemption from the discovery window, used by every age gate: the
 Claude/Pi walk, candidate revalidation and open, and the Codex roster. A key owed by a registered source stays
 discoverable and observed whatever its age while it is owed, so reconciliation
