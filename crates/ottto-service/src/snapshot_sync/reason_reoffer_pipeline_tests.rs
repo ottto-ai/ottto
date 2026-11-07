@@ -2364,6 +2364,16 @@ thread_local! {
     static FINALIZED_PROBE_ITEMS: std::cell::RefCell<Option<Vec<SnapshotItem>>> = const { std::cell::RefCell::new(None) };
 }
 
+// Supply the producer patch before real finalization, only for these scoped
+// probe cycles. The ordinary synthetic Claude session has no cache evidence.
+pub(in crate::snapshot_sync) fn prepare_probe_for_test(items: &mut [SnapshotItem]) {
+    if FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow().is_some()) {
+        for item in items {
+            item.cache_observations = pending_head_index_item().1.cache_observations;
+        }
+    }
+}
+
 pub(super) fn observe_finalized_probe_items(items: &[SnapshotItem]) {
     FINALIZED_PROBE_ITEMS.with(|slot| {
         if let Some(captured) = slot.borrow_mut().as_mut() {
@@ -2599,7 +2609,10 @@ fn held_probe_cache_observations_never_offered() {
     );
     let (mut quiet, _) = held_probe_cycle(&mut pipeline, now + 60);
     force_held_file_parse(&mut quiet);
+    FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     let (parsed, reads, _) = pipeline.measured_cycle(now + 120, false);
+    let reparsed = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(reparsed[0].cache_observations.is_some());
     assert!(parsed.result.is_ok(), "{:?}", parsed.result);
     assert_eq!(reads, 1, "the unchanged file was explicitly parsed again");
     assert_eq!(

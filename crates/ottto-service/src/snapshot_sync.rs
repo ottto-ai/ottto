@@ -7725,6 +7725,10 @@ fn finish_sync_source(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
+        &mut scan_result.snapshots,
+    );
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
