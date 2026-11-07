@@ -610,6 +610,338 @@ impl Memo {
     }
 }
 
+impl ScanIndex {
+    /// Keys whose scanned entity set or head names a held revision.
+    fn locally_held_keys(&self, held: &BTreeSet<String>) -> BTreeSet<String> {
+        self.files
+            .iter()
+            .filter(|(key, entry)| {
+                self.file_snapshot_fingerprints
+                    .get(*key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(held))
+                    || entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| held.contains(fingerprint))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Held keys with no committed entry that still name a present member of
+    /// a committed Claude family whose terminal authority quarantine is bound
+    /// to the retained witness and records exactly this scanned revision. Such
+    /// a member cannot progress within the traversal, and its family's root
+    /// entry is committed, so the revert keeps a delivery-free membership
+    /// entry for it instead of dropping it: the family census then sees every
+    /// present member, and the candidate gate skips the unchanged member at
+    /// the quarantine gate instead of reparsing it as a new file. The root
+    /// itself, a family whose root entry is not committed (as after a
+    /// historical replay reset), and account deferrals are never included.
+    fn claude_terminal_member_placeholder_keys(
+        &self,
+        previous: &ScanIndex,
+        held_keys: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut committed_roots = None;
+        held_keys
+            .iter()
+            .filter(|key| !previous.files.contains_key(*key))
+            .filter(|key| {
+                let Some((root_session_id, member)) =
+                    claude_index_path_family_member(Path::new(key.as_str()))
+                else {
+                    return false;
+                };
+                let Some(entry) = self.files.get(*key) else {
+                    return false;
+                };
+                let account_held = self
+                    .file_snapshot_fingerprints
+                    .get(*key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    || entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| reparse_held.contains(fingerprint));
+                if member == root_session_id
+                    || account_held
+                    || entry.source_file_fingerprint.is_empty()
+                {
+                    return false;
+                }
+                let bound = self
+                    .claude_usage_authority_quarantine
+                    .get(&root_session_id)
+                    .zip(self.claude_usage_family_witnesses.get(&root_session_id))
+                    .is_some_and(|(record, witness)| {
+                        record.disposition
+                            == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                            && claude_usage_authority_preserves_pending(record, witness)
+                            && record.member_source_file_fingerprints.get(&member)
+                                == Some(&entry.source_file_fingerprint)
+                    });
+                bound
+                    && committed_roots
+                        .get_or_insert_with(|| {
+                            previous
+                                .files
+                                .keys()
+                                .filter_map(|index_key| {
+                                    claude_index_path_family_member(Path::new(index_key))
+                                })
+                                .filter(|(root, member)| root == member)
+                                .map(|(root, _)| root)
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .contains(&root_session_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `with_locally_held_keys_reverted` keeps every held Claude
+    /// family that still carries authority evidence in the census. The revert
+    /// drops a held key that has no committed entry, and a later complete page
+    /// of the same traversal would then read its still-present family as
+    /// vanished or incomplete: it drops the retained witness, resolves the
+    /// quarantine against partial membership, and omits the family from the
+    /// manifest. A historical replay reset clears ordinary committed entries
+    /// but keeps that evidence, so such a hold must stay progress-blocking
+    /// instead. A bound terminal member of a committed family is the one
+    /// exception: the revert keeps its delivery-free membership entry.
+    pub(crate) fn locally_held_keys_restorable(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> bool {
+        let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        held_keys.iter().all(|key| {
+            if previous.files.contains_key(key) || placeholders.contains(key) {
+                return true;
+            }
+            let Some((root_session_id, _)) = claude_index_path_family_member(Path::new(key)) else {
+                return true;
+            };
+            [self, previous].iter().all(|index| {
+                !index
+                    .claude_usage_family_witnesses
+                    .contains_key(&root_session_id)
+                    && !index
+                        .claude_usage_authority_quarantine
+                        .contains_key(&root_session_id)
+            })
+        })
+    }
+
+    /// The commit for a `Completed` upload whose only unsettled entities are
+    /// locally held, non-progressing revisions. Every uploaded entity was
+    /// accepted or unchanged, so each key without a held entity commits
+    /// exactly as the no-hold save would, including complete-census pruning
+    /// and the adopted upload context. A held key keeps its committed revision
+    /// instead: entry, exact entity set, empty marker, terminal disposition,
+    /// and the activity and accepted ledger for those
+    /// restored entities. A held body therefore never enters the committed
+    /// entity set, the manifest, or the accepted ledger, and a held key that
+    /// was never committed stays absent; `locally_held_keys_restorable` says
+    /// whether that absence is safe to settle. The one exception is a bound
+    /// terminal member of a committed family
+    /// (`claude_terminal_member_placeholder_keys`): it keeps only its scanned
+    /// file identity, with no entity, body witness, activity, or acceptance.
+    ///
+    /// `reparse_held` names held entities whose key every later generation
+    /// must retry (account deferrals). A recorded account hold preserves the
+    /// committed fingerprint: its RAM content memo controls ordinary retry.
+    /// A genuine external rearm (explicitly empty scanned or committed
+    /// fingerprint), or an unrecorded account hold, keeps the reparse debt.
+    #[cfg(test)]
+    pub(crate) fn with_locally_held_keys_reverted(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        self.clone()
+            .into_locally_held_keys_reverted(previous, held, reparse_held)
+    }
+
+    /// The caller already owns the scanned graph. Restore only held keys in
+    /// that allocation.
+    pub(crate) fn into_locally_held_keys_reverted(
+        mut self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        self.claude_money_birth_store
+            .preserve_missing_from(&previous.claude_money_birth_store);
+        let empty_advances = self.claude_empty_map_advances(previous);
+        let held_keys = self.locally_held_keys(held);
+        self.note_claude_history_not_accepted(previous, &held_keys);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        for key in &held_keys {
+            let reparse = self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    && !self.claude_account_deferred_holds.contains_key(key);
+            match previous.files.get(key) {
+                Some(committed) => {
+                    let mut committed = committed.clone();
+                    // Account retry preserves its sampled audit obligation;
+                    // authority/family-only holds keep their existing restore
+                    // semantics (#870 owns that separate composition).
+                    if let Some(working) = self.files.get(key).filter(|_| {
+                        self.claude_account_deferred_holds.contains_key(key)
+                            || self
+                                .file_snapshot_fingerprints
+                                .get(key)
+                                .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    }) {
+                        committed.carry_sampled_audit(working);
+                    }
+                    // A cleared working entry keeps its re-arm debt.
+                    if reparse
+                        || self
+                            .files
+                            .get(key)
+                            .is_some_and(|working| working.source_file_fingerprint.is_empty())
+                    {
+                        committed.source_file_fingerprint.clear();
+                    }
+                    self.files.insert(key.clone(), committed);
+                }
+                None if placeholders.contains(key) => {
+                    if let Some(entry) = self.files.get_mut(key) {
+                        entry.last_snapshot_fingerprint = None;
+                        entry.last_upload_body_witness = None;
+                    }
+                    self.re_owe_effective_upload_body_witness_revision(key, 0);
+                }
+                None => {
+                    self.files.remove(key);
+                }
+            }
+            if let Some(carried) = previous.accepted_rebuild_incidence.get(key) {
+                self.accepted_rebuild_incidence
+                    .insert(key.clone(), carried.clone());
+                self.preserve_carried_ack_clock(previous);
+            }
+            match previous.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    self.file_snapshot_fingerprints
+                        .insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    self.file_snapshot_fingerprints.remove(key);
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                self.confirmed_empty_files.insert(key.clone());
+            } else {
+                self.confirmed_empty_files.remove(key);
+            }
+            match previous.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    self.terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    self.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+        }
+        let mut restored = BTreeSet::new();
+        for key in &held_keys {
+            match self.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
+                None => restored.extend(
+                    self.files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
+                ),
+            }
+        }
+        for fingerprint in &restored {
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                self.snapshot_activity_at
+                    .insert_if_absent(fingerprint.clone(), || activity_at.clone());
+            }
+            if previous
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)
+            {
+                self.accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
+        self.restore_claude_empty_map_advances(empty_advances);
+        let current = self.current_snapshot_fingerprints();
+        self.snapshot_activity_at
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        self
+    }
+
+    /// A partial checkpoint keeps the traversal after scanned keys were
+    /// dequeued. Requeue new or source-changed revisions this save did not
+    /// keep; restored audit-due entries wait for the next walk so their
+    /// selection priority cannot starve the remaining census.
+    pub(crate) fn requeue_unkept_scanned_keys(
+        &mut self,
+        source: SnapshotSource,
+        working: &ScanIndex,
+        locally_held: &BTreeSet<String>,
+    ) {
+        let audit_now = sampled_scan::now_seconds();
+        let unkept = working
+            .files
+            .iter()
+            .filter(|(key, entry)| {
+                self.files.get(*key).map_or(true, |kept| {
+                    kept.source_file_fingerprint != entry.source_file_fingerprint
+                        && !kept.audit_requires_full(audit_now)
+                }) && !working.file_is_held(key, entry, locally_held)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if let Some(traversal) = self.traversal.as_mut() {
+            requeue_observed_keys(source, traversal, unkept, "unkept");
+        }
+    }
+
+    /// One hold test for every source: the file is decode-held, or one of its
+    /// entities is locally held or decode-held.
+    pub(in crate::snapshots) fn file_is_held(
+        &self,
+        key: &str,
+        entry: &ScanIndexEntry,
+        locally_held: &BTreeSet<String>,
+    ) -> bool {
+        self.decode_holds_file(key)
+            || entry
+                .last_snapshot_fingerprint
+                .iter()
+                .chain(
+                    self.file_snapshot_fingerprints
+                        .get(key)
+                        .into_iter()
+                        .flatten(),
+                )
+                .any(|fingerprint| {
+                    locally_held.contains(fingerprint) || self.decode_holds_entity(fingerprint)
+                })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod support {
     use super::*;

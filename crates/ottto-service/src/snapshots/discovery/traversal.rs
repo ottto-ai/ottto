@@ -972,3 +972,74 @@ pub(in crate::snapshots) fn release_codex_inventory_hold(
         traversal.residue.codex_inventory_hold = Some(unlisted);
     }
 }
+
+impl ScanIndex {
+    /// A re-listing pass leaves a file alone when its stamp is unchanged
+    /// since the last read and nothing is owed on it (empty fingerprint or an
+    /// unverified sampled generation). Other reasons to read an unchanged file
+    /// were weighed by this generation's walk; their owners and the next walk
+    /// re-offer them, as on main, rather than every pass. Stat-only.
+    pub(in crate::snapshots) fn listing_stamp_matches(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> bool {
+        let key = local_index_key(path);
+        let entry = self.files.get(&key);
+        if entry.is_some_and(|entry| {
+            entry.codex_counting_owner.is_some() || entry.codex_protected_owner.is_some()
+        }) {
+            if let Ok(Some((unchanged, _))) = self.codex_physical_matches(&key, metadata) {
+                return unchanged;
+            }
+        }
+        entry.is_some_and(|entry| entry.same_listing_stamp_as(metadata))
+    }
+
+    pub(in crate::snapshots) fn listing_unchanged(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> bool {
+        self.listing_stamp_matches(path, metadata)
+            && !sampled_audit::path_requires_verification(&self.files, path)
+    }
+
+    /// A member of a terminal authority family: a Skip before any growth
+    /// handling, and a hold revert that keeps the pre-growth stamp.
+    pub(in crate::snapshots) fn authority_terminal_member(&self, path: &Path) -> bool {
+        claude_index_path_member_ref(path)
+            .and_then(|member| self.claude_usage_authority_quarantine.get(member.root))
+            .is_some_and(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            })
+    }
+
+    /// A watcher hint needs no read: the file is unchanged and not owed, and
+    /// the ordinary candidate gate skips it at that stamp. An account-held
+    /// key keeps its hint: its gate needs the content stamp, so the gate is
+    /// never consulted (or its withheld memo cleared) here. Stat-only.
+    fn hint_settled(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        let key = local_index_key(path);
+        let Some(entry) = self.files.get(&key) else {
+            return false;
+        };
+        self.listing_unchanged(path, metadata)
+            && !self.claude_account_deferred_holds.contains_key(&key)
+            && self.candidate_decision(&CandidateFile {
+                physical_identity: None,
+                scan_root: PathBuf::new(),
+                path: path.to_path_buf(),
+                size_bytes: metadata.len(),
+                modified_unix_seconds: entry.modified_unix_seconds,
+                modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+                source_file_fingerprint: entry.source_file_fingerprint.clone(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: entry.opened_birth_nanos,
+                withheld_content_stamp: None,
+            }) == CandidateDecision::Skip
+    }
+}
