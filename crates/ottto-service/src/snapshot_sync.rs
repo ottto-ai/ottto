@@ -23447,6 +23447,9 @@ mod tests {
         let disk_index = std::fs::read(&f.index_path).unwrap();
         let before = f.baseline.generation;
         let mut newer = f.progress.clone();
+        newer
+            .accepted_cache_heads
+            .insert(cache_session_key("newer"), "e".repeat(64));
         newer.save(&f.progress_path).unwrap();
         assert!(f.checkpoint_boundary(|| Ok(())).is_err());
         assert_eq!(f.baseline.generation, before);

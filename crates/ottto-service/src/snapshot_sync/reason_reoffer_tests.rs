@@ -422,8 +422,12 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     let (mut progress, index) = refused(&[(1, original_pair(0))]);
     progress.save(&path).unwrap();
 
-    // A concurrent writer wins the CAS: the claim save fails.
+    // A concurrent writer saves a changed ledger and wins the CAS: the claim
+    // save fails.
     let mut competitor = progress.clone();
+    competitor
+        .accepted_cache_heads
+        .insert(cache_session_key("competitor"), "c".repeat(64));
     competitor.save(&path).unwrap();
     let mut stale = progress.clone();
     assert!(select(&mut stale, &index, NOW));
