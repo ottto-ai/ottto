@@ -482,6 +482,25 @@ pub(super) fn shadowed_compressed_path(path: &Path, paths: &BTreeSet<String>) ->
         && paths.contains(&local_index_key(&path.with_extension("")))
 }
 
+/// The archive Codex wrote in place of a plaintext rollout that vanished
+/// between the roster and its open: the sibling `shadowed_compressed_path`
+/// kept out of the roster, a regular file in the same directory. It is read
+/// under the same open and header gates and refused under its own path.
+fn swapped_archive_sibling(error: &anyhow::Error, path: &Path) -> Option<PathBuf> {
+    let not_found = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+    let archive = path.with_extension("jsonl.zst");
+    (error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(not_found)
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        && fs::symlink_metadata(path).is_err_and(|error| not_found(&error))
+        && fs::symlink_metadata(&archive)
+            .is_ok_and(|stat| stat.is_file() && !stat.file_type().is_symlink()))
+    .then_some(archive)
+}
+
 impl HeaderInventory {
     pub(super) fn new(
         roots: &[PathBuf],
@@ -720,6 +739,17 @@ impl HeaderInventory {
                 }
                 if let Some(cache) = cache {
                     cache.refresh_header(key.clone(), None);
+                }
+                if let Some(archive) = swapped_archive_sibling(&error, Path::new(&key)) {
+                    // Pending keeps its whole-string path order (see
+                    // `owner_for_path`), so headers stay sorted.
+                    if let Err(at) = self
+                        .pending
+                        .binary_search_by(|pending| pending.as_os_str().cmp(archive.as_os_str()))
+                    {
+                        self.pending.insert(at, archive);
+                    }
+                    return false;
                 }
                 self.complete = false;
                 let cause = if error.downcast_ref::<std::io::Error>().is_some() {
@@ -2319,6 +2349,86 @@ pub(super) mod tests {
             .unwrap()
             .is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [regress] Codex compressing a rollout after the roster listed both
+    /// copies reads the shadowed archive instead of refusing the plaintext.
+    #[cfg(unix)]
+    #[test]
+    fn header_inventory_reads_the_archive_codex_swapped_in_after_listing() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+        let metadata = CodexTitleMetadata::default();
+        let swapped = |write_archive: &dyn Fn(&Path, &Path, &[u8])| {
+            let (root, fixture) = fixture();
+            let sessions = root.join("sessions");
+            let plain = fixture.headers[0].candidate.path.clone();
+            let archive = plain.with_extension("jsonl.zst");
+            write_archive(&root, &archive, &fs::read(&plain).unwrap()[..]);
+            let mut directories = DirectoryCensus::new();
+            directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
+            let paths = BTreeSet::from([local_index_key(&plain), local_index_key(&archive)]);
+            let mut inventory =
+                HeaderInventory::new(std::slice::from_ref(&sessions), &paths, Some(&directories));
+            assert_eq!(
+                inventory.pending,
+                [plain.clone()],
+                "the roster shadows the archive"
+            );
+            // Codex replaces the plaintext between the roster and its open.
+            fs::remove_file(&plain).unwrap();
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            while !inventory.step_encoded(&metadata, Some(&cache)) {}
+            let owner = fixture.headers[0].owner.clone();
+            (root, plain, archive, owner, inventory)
+        };
+        let causes = |inventory: &HeaderInventory| {
+            let causes = serde_json::to_value(inventory.unreadable_causes).unwrap();
+            serde_json::from_value::<Vec<u64>>(causes["counts"].clone()).unwrap()
+        };
+        let refused =
+            |inventory: &HeaderInventory| inventory.refused.keys().cloned().collect::<Vec<_>>();
+
+        let (root, _, archive, owner, inventory) = swapped(&|_, archive, plain| {
+            fs::write(archive, zstd::stream::encode_all(plain, 1).unwrap()).unwrap();
+        });
+        assert!(inventory.complete);
+        assert!(inventory.refused.is_empty());
+        assert_eq!(causes(&inventory), [0; 8]);
+        assert_eq!(inventory.headers.len(), 1);
+        assert_eq!(inventory.headers[0].candidate.path, archive);
+        assert_eq!(inventory.owner_for_path(&archive), Some(owner.as_str()));
+        fs::remove_dir_all(root).unwrap();
+
+        // An unreadable archive is refused and counted under its own path.
+        let (root, _, archive, _, inventory) = swapped(&|_, archive, _| {
+            fs::write(archive, b"not a zstd frame").unwrap();
+        });
+        assert!(!inventory.complete);
+        assert!(inventory.headers.is_empty());
+        assert_eq!(refused(&inventory), [local_index_key(&archive)]);
+        assert_eq!(causes(&inventory).iter().sum::<u64>(), 1);
+        fs::remove_dir_all(root).unwrap();
+
+        // No archive, or one that is a symlink (here to a file outside the
+        // root): the plaintext stays refused as OpenRead, nothing else read.
+        let symlink_out = |root: &Path, archive: &Path, plain: &[u8]| {
+            let outside = root.join("outside.jsonl.zst");
+            fs::write(&outside, zstd::stream::encode_all(plain, 1).unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, archive).unwrap();
+        };
+        let no_archive = |_: &Path, _: &Path, _: &[u8]| {};
+        let cases: [&dyn Fn(&Path, &Path, &[u8]); 2] = [&no_archive, &symlink_out];
+        for write_archive in cases {
+            let (root, plain, _, _, inventory) = swapped(write_archive);
+            assert!(!inventory.complete);
+            assert!(inventory.headers.is_empty());
+            assert_eq!(inventory.read_bytes, 0);
+            assert_eq!(refused(&inventory), [local_index_key(&plain)]);
+            let mut expected = [0; 8];
+            expected[UnreadableCause::OpenRead as usize] = 1;
+            assert_eq!(causes(&inventory), expected);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
