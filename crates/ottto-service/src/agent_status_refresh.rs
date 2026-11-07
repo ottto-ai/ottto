@@ -1,7 +1,8 @@
 //! One collection/upload owner per source, independent of transcript scans.
 //! Provider adapters still own acquisition budgets and observation timestamps.
 use crate::agent_status::{
-    claude_next_reset_read_at, collect_agent_status_collection, AgentStatusCollection,
+    claude_next_reset_read_at, collect_agent_status_collection,
+    collect_agent_status_collection_reusing, AgentStatusCollection, ClaudeDesktopMetadataCache,
     CodexHomeBinding,
 };
 use crate::{LocalApiError, LocalDaemon};
@@ -89,6 +90,9 @@ struct StatusLane {
     app_passes_saved_only: bool,
     state: Mutex<LaneState>,
     changed: Condvar,
+    /// Shared by the lane's full and saved-only passes, which never overlap;
+    /// only the collector locks it.
+    desktop_metadata: Mutex<ClaudeDesktopMetadataCache>,
 }
 impl StatusLane {
     fn new() -> Self {
@@ -97,6 +101,7 @@ impl StatusLane {
             app_passes_saved_only: false,
             state: Mutex::new(LaneState::default()),
             changed: Condvar::new(),
+            desktop_metadata: Mutex::default(),
         }
     }
     fn for_source(source: &SourceKind) -> Self {
@@ -465,9 +470,10 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
         lane.pass(lane.origin.elapsed(), enabled,
             || {
                 let captured = OffsetDateTime::now_utc();
-                let collection = collect_agent_status_collection(&source,
+                let collection = collect_agent_status_collection_reusing(&source,
                     captured.format(&Rfc3339).unwrap_or_default(),
-                    (captured + TimeDuration::minutes(15)).format(&Rfc3339).unwrap_or_default());
+                    (captured + TimeDuration::minutes(15)).format(&Rfc3339).unwrap_or_default(),
+                    &mut lane.desktop_metadata.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                 let _ = daemon.record_agent_status_health(collection.source_health_snapshot.clone());
                 collection
             },

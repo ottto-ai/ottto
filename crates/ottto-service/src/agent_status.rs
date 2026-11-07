@@ -56,6 +56,8 @@ mod codex_last_known;
 mod codex_saved_quota;
 mod codex_setup_gate;
 
+use codex_saved_quota::{path_stamp, PathStamp};
+
 #[cfg(test)]
 pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
@@ -1542,6 +1544,17 @@ struct ClaudeDesktopAgentModeSessionMetadata {
     plan: Option<String>,
 }
 
+type ClaudeDesktopMetadataEntries<T> = BTreeMap<PathBuf, (PathStamp, Option<T>)>;
+
+/// Parsed Claude Desktop session metadata by file, kept in memory between
+/// status passes so a file whose stamp is unchanged is not read again. Never
+/// persisted or uploaded.
+#[derive(Default)]
+pub(crate) struct ClaudeDesktopMetadataCache {
+    code: ClaudeDesktopMetadataEntries<ClaudeDesktopCodeSessionMetadata>,
+    agent_mode: ClaudeDesktopMetadataEntries<ClaudeDesktopAgentModeSessionMetadata>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ClaudeDesktopProfileBuilder {
     account_uuid: String,
@@ -1674,9 +1687,27 @@ pub(crate) fn collect_agent_status_collection(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusCollection {
+    collect_agent_status_collection_reusing(
+        source,
+        captured_at,
+        expires_at,
+        &mut ClaudeDesktopMetadataCache::default(),
+    )
+}
+
+/// [`collect_agent_status_collection`] for a caller that keeps Claude Desktop
+/// session metadata between its passes.
+pub(crate) fn collect_agent_status_collection_reusing(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+    desktop_metadata: &mut ClaudeDesktopMetadataCache,
+) -> AgentStatusCollection {
     match source {
         SourceKind::Codex => collect_codex_status_snapshots(captured_at, expires_at),
-        SourceKind::ClaudeCode => collect_claude_status_snapshots(captured_at, expires_at),
+        SourceKind::ClaudeCode => {
+            collect_claude_status_snapshots(captured_at, expires_at, desktop_metadata)
+        }
         SourceKind::Pi => {
             single_agent_status_collection(collect_pi_status(captured_at, expires_at))
         }
@@ -4207,6 +4238,7 @@ fn collect_claude_status(
     slot_owned_bindings: &BTreeSet<ClaudeStrongBinding>,
     keep_signed_in: bool,
     known_identities: &[ClaudeCliOauthAccount],
+    desktop_metadata: &mut ClaudeDesktopMetadataCache,
 ) -> (
     AgentStatusSnapshot,
     ClaudeDesktopPairs,
@@ -4473,7 +4505,11 @@ fn collect_claude_status(
     let ClaudeDesktopScan {
         observations: desktop_plan_observations,
         pairs: desktop_pairs,
-    } = claude_desktop_scan_from_root(&claude_desktop_root, &snapshot.captured_at);
+    } = claude_desktop_scan_from_root(
+        &claude_desktop_root,
+        &snapshot.captured_at,
+        desktop_metadata,
+    );
     let observable_account_identifier_hashes =
         claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
     let apply_statusline_quota = |snapshot: &mut AgentStatusSnapshot,
@@ -4784,6 +4820,7 @@ fn claude_settings_failure_bound_exceeded(failed: bool) -> bool {
 fn collect_claude_status_snapshots(
     captured_at: String,
     expires_at: String,
+    desktop_metadata: &mut ClaudeDesktopMetadataCache,
 ) -> AgentStatusCollection {
     // Every caller that does not reach the usage collector during this pass
     // has its passive sign-in run ended when the pass ends, whatever made it
@@ -4850,6 +4887,7 @@ fn collect_claude_status_snapshots(
         &slot_owned_bindings,
         upkeep_consent,
         &known_identities,
+        desktop_metadata,
     );
     let mut candidates = Vec::new();
     let mut descriptors = settings
@@ -10162,10 +10200,19 @@ fn claude_desktop_plan_observations_from_root(
     root: &Path,
     observed_at: &str,
 ) -> Vec<AgentStatusPlanObservation> {
-    claude_desktop_scan_from_root(root, observed_at).observations
+    claude_desktop_scan_from_root(
+        root,
+        observed_at,
+        &mut ClaudeDesktopMetadataCache::default(),
+    )
+    .observations
 }
 
-fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDesktopScan {
+fn claude_desktop_scan_from_root(
+    root: &Path,
+    observed_at: &str,
+    metadata_cache: &mut ClaudeDesktopMetadataCache,
+) -> ClaudeDesktopScan {
     let config = read_claude_desktop_config(root);
     let last_known_account_uuid = config
         .last_known_account_uuid
@@ -10176,16 +10223,21 @@ fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDeskto
     let mut pair_builders: BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder> =
         BTreeMap::new();
 
+    // Entries move from the previous pass into this one as files are read,
+    // so files no longer selected drop out.
+    let mut previous = std::mem::take(metadata_cache);
     collect_claude_desktop_code_sessions(
         &root.join("claude-code-sessions"),
         last_known_account_uuid.as_deref(),
         &mut builders,
         &mut pair_builders,
+        (&mut previous.code, &mut metadata_cache.code),
     );
     collect_claude_desktop_agent_mode_sessions(
         &root.join("local-agent-mode-sessions"),
         &mut builders,
         &mut pair_builders,
+        (&mut previous.agent_mode, &mut metadata_cache.agent_mode),
     );
     let pairs = claude_desktop_qualified_pairs(pair_builders);
 
@@ -10327,6 +10379,7 @@ fn collect_claude_desktop_code_sessions(
     last_known_account_uuid: Option<&str>,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
     pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+    (previous, current): ClaudeDesktopMetadataPass<'_, ClaudeDesktopCodeSessionMetadata>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -10379,7 +10432,7 @@ fn collect_claude_desktop_code_sessions(
                 .filter(|entry| looks_like_local_json_file(entry.path().as_path()))
                 .take(CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG)
             {
-                let metadata = read_json_file::<ClaudeDesktopCodeSessionMetadata>(&file.path());
+                let metadata = claude_desktop_session_metadata(file.path(), previous, current);
                 let metadata_activity = metadata.as_ref().and_then(|metadata| {
                     timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
                         .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
@@ -10410,6 +10463,7 @@ fn collect_claude_desktop_agent_mode_sessions(
     root: &Path,
     builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
     pair_builders: &mut BTreeMap<ClaudeDesktopPairKey, ClaudeDesktopPairBuilder>,
+    (previous, current): ClaudeDesktopMetadataPass<'_, ClaudeDesktopAgentModeSessionMetadata>,
 ) {
     let Ok(accounts) = fs::read_dir(root) else {
         return;
@@ -10463,7 +10517,7 @@ fn collect_claude_desktop_agent_mode_sessions(
                 .take(CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG)
             {
                 let Some(metadata) =
-                    read_json_file::<ClaudeDesktopAgentModeSessionMetadata>(&file.path())
+                    claude_desktop_session_metadata(file.path(), previous, current)
                 else {
                     continue;
                 };
@@ -10991,8 +11045,52 @@ impl ClaudeDesktopProfileBuilder {
     }
 }
 
+/// The previous pass's entries and this pass's, for one Desktop file kind.
+type ClaudeDesktopMetadataPass<'a, T> = (
+    &'a mut ClaudeDesktopMetadataEntries<T>,
+    &'a mut ClaudeDesktopMetadataEntries<T>,
+);
+
+/// One Desktop session file's metadata: the previous pass's parse, failures
+/// included, while the file's stamp is unchanged, else a fresh read. A file
+/// written too recently for a rewrite to change its stamp is not kept.
+fn claude_desktop_session_metadata<T: for<'de> Deserialize<'de> + Clone>(
+    path: PathBuf,
+    previous: &mut ClaudeDesktopMetadataEntries<T>,
+    current: &mut ClaudeDesktopMetadataEntries<T>,
+) -> Option<T> {
+    let Some(stamp) = path_stamp(&path) else {
+        return read_json_file(&path);
+    };
+    let metadata = match previous.remove(&path) {
+        Some((kept, metadata)) if kept == stamp => metadata,
+        _ => read_json_file(&path),
+    };
+    if stamp.settled() {
+        current.insert(path, (stamp, metadata.clone()));
+    }
+    metadata
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Desktop session JSON reads on this thread: (attempts, bytes read).
+    static CLAUDE_DESKTOP_JSON_READ_RECEIPT: std::cell::Cell<(usize, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    #[cfg(test)]
+    CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| {
+        let (attempts, bytes) = receipt.get();
+        receipt.set((attempts + 1, bytes));
+    });
     let body = fs::read_to_string(path).ok()?;
+    #[cfg(test)]
+    CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| {
+        let (attempts, bytes) = receipt.get();
+        receipt.set((attempts, bytes + body.len() as u64));
+    });
     serde_json::from_str(&body).ok()
 }
 
@@ -28269,16 +28367,27 @@ for line in sys.stdin:
         );
     }
 
-    #[test]
-    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
-        let root =
-            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    /// Writes `body` to `path` with an explicit modification time.
+    fn write_desktop_file(path: &Path, body: &str, modified_secs: u64) {
+        std::fs::write(path, body).expect("write metadata");
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs))
+            })
+            .expect("set modified time");
+    }
+
+    /// Desktop session folders with exact, imported, tied, copied and
+    /// non-UUID cases and agent-mode labels; every file long settled.
+    fn write_claude_desktop_pairs_fixture(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
         let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
         let (current, other, imported, tied) = (uuid(1), uuid(2), uuid(3), uuid(4));
         let (org_x, org_y, org_z, org_w) = (uuid(11), uuid(12), uuid(13), uuid(14));
         let (contested, agent_copied) = (uuid(5), uuid(6));
-        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(root).expect("create root");
         std::fs::write(
             root.join("config.json"),
             format!(r#"{{"lastKnownAccountUuid":"{current}"}}"#),
@@ -28287,7 +28396,7 @@ for line in sys.stdin:
         let write = |store: &str, account: &str, org: &str, file: &str, body: String| {
             let directory = root.join(store).join(account).join(org);
             std::fs::create_dir_all(&directory).expect("create bucket");
-            std::fs::write(directory.join(file), body).expect("write metadata");
+            write_desktop_file(&directory.join(file), &body, 1_780_000_000);
         };
         let session = |id: &str, activity: i64| {
             format!(r#"{{"cliSessionId":"{id}","lastActivityAt":{activity}}}"#)
@@ -28372,8 +28481,21 @@ for line in sys.stdin:
             "local_k.json",
             session("agent-copied", 500),
         );
+    }
 
-        let scan = claude_desktop_scan_from_root(&root, "2026-08-12T08:00:00Z");
+    #[test]
+    fn claude_desktop_pairs_are_exact_native_uuid_folders() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-desktop-pairs-{}", std::process::id()));
+        write_claude_desktop_pairs_fixture(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (current, other) = (uuid(1), uuid(2));
+        let (org_x, org_y, org_z) = (uuid(11), uuid(12), uuid(13));
+        let scan = claude_desktop_scan_from_root(
+            &root,
+            "2026-08-12T08:00:00Z",
+            &mut ClaudeDesktopMetadataCache::default(),
+        );
         let pairs = scan
             .pairs
             .pairs
@@ -28423,6 +28545,108 @@ for line in sys.stdin:
             .observations
             .iter()
             .any(|observation| observation.account_id.as_deref() == Some("legacy-account")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Scans `root` through `cache`, asserts the result equals a scan with an
+    /// empty cache, and returns the cached scan's (read attempts, bytes read).
+    fn claude_desktop_cached_scan_reads(
+        root: &Path,
+        cache: &mut ClaudeDesktopMetadataCache,
+    ) -> (usize, u64) {
+        let outputs = |scan: ClaudeDesktopScan| {
+            let pairs = |pairs: Vec<ClaudeDesktopPairObservation>| {
+                pairs
+                    .into_iter()
+                    .map(|pair| (pair.binding, pair.observation))
+                    .collect::<Vec<_>>()
+            };
+            (
+                scan.observations,
+                pairs(scan.pairs.pairs),
+                pairs(scan.pairs.duplicate_sessions),
+            )
+        };
+        let observed_at = "2026-08-12T08:00:00Z";
+        CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(|receipt| receipt.set((0, 0)));
+        let cached = claude_desktop_scan_from_root(root, observed_at, cache);
+        let reads = CLAUDE_DESKTOP_JSON_READ_RECEIPT.with(std::cell::Cell::get);
+        let fresh = claude_desktop_scan_from_root(
+            root,
+            observed_at,
+            &mut ClaudeDesktopMetadataCache::default(),
+        );
+        assert_eq!(outputs(cached), outputs(fresh));
+        reads
+    }
+
+    /// [regress] Every Claude status pass read every Desktop session file whole.
+    #[test]
+    fn claude_desktop_metadata_cache_unchanged_pass_reads_zero_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-cache-unchanged-{}",
+            std::process::id()
+        ));
+        write_claude_desktop_pairs_fixture(&root);
+        let mut cache = ClaudeDesktopMetadataCache::default();
+
+        let (attempts, bytes) = claude_desktop_cached_scan_reads(&root, &mut cache);
+        assert!(attempts > 0 && bytes > 0);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache), (0, 0));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// [behaviour] Only new or changed Desktop session files are read again;
+    /// deleted files and files written too recently to compare are not kept.
+    #[test]
+    fn claude_desktop_metadata_cache_rereads_only_changed_files() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-cache-changed-{}",
+            std::process::id()
+        ));
+        write_claude_desktop_pairs_fixture(&root);
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let file = |account: u32, org: u32, name: &str| {
+            let bucket = root.join("claude-code-sessions").join(uuid(account));
+            bucket.join(uuid(org)).join(name)
+        };
+        let settled = 1_780_000_000;
+        let malformed = file(2, 13, "local_m.json");
+        write_desktop_file(&malformed, "{not json", settled);
+        let mut cache = ClaudeDesktopMetadataCache::default();
+        claude_desktop_cached_scan_reads(&root, &mut cache);
+
+        // A changed size, then the same size with a later modification time.
+        let current = r#"{"cliSessionId":"current-x","lastActivityAt":3000}"#;
+        write_desktop_file(&file(1, 11, "local_a.json"), current, settled);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        let other = r#"{"cliSessionId":"other-y","lastActivityAt":260}"#;
+        write_desktop_file(&file(2, 12, "local_b.json"), other, settled + 60);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+
+        // A new file is read; a deleted one leaves the cache.
+        let new_file = file(1, 11, "local_n.json");
+        let new = r#"{"cliSessionId":"new","lastActivityAt":400}"#;
+        write_desktop_file(&new_file, new, settled);
+        std::fs::remove_file(file(3, 14, "local_d.json")).expect("delete imported");
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert!(cache.code.contains_key(&new_file));
+        assert!(!cache.code.contains_key(&file(3, 14, "local_d.json")));
+
+        // Malformed JSON stays unread until it changes.
+        assert!(cache.code[&malformed].1.is_none());
+        let repaired = r#"{"cliSessionId":"repaired","lastActivityAt":500}"#;
+        write_desktop_file(&malformed, repaired, settled);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert!(cache.code[&malformed].1.is_some());
+
+        // A file modified "now" is read on every pass until it settles.
+        write_desktop_file(&new_file, new, current_unix_seconds() + 3_600);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert_eq!(claude_desktop_cached_scan_reads(&root, &mut cache).0, 1);
+        assert!(!cache.code.contains_key(&new_file));
 
         let _ = std::fs::remove_dir_all(root);
     }

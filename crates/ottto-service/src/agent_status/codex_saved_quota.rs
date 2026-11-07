@@ -284,7 +284,7 @@ enum Lasts {
 /// owner change shows in the mode or owner. A directory's times change with
 /// its entries, so only its identity, owner and mode count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PathStamp {
+pub(super) struct PathStamp {
     dev: u64,
     ino: u64,
     uid: u32,
@@ -297,7 +297,7 @@ struct PathStamp {
 
 /// `None` for a path that does not exist (or cannot be looked at). Never
 /// follows a final symlink.
-fn path_stamp(path: &Path) -> Option<PathStamp> {
+pub(super) fn path_stamp(path: &Path) -> Option<PathStamp> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path).ok()?;
     let file = !metadata.is_dir();
@@ -326,7 +326,7 @@ impl PathStamp {
     /// Last written long enough ago that a rewrite now gets another
     /// modification time, however coarse the file-system clock (Git's
     /// "racily clean" rule).
-    fn settled(&self) -> bool {
+    pub(super) fn settled(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |now| now.as_nanos() as i128);
