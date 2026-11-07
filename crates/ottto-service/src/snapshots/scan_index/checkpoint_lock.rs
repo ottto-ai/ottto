@@ -7,7 +7,7 @@ pub(in crate::snapshots) struct CheckpointLock {
     file: File,
     priority_path: Option<PathBuf>,
     maintenance: bool,
-    custody: bool,
+    pub(in crate::snapshots) custody: bool,
 }
 
 impl CheckpointLock {
