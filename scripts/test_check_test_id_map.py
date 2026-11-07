@@ -23,7 +23,8 @@ GIT_ENV = {
     'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.invalid',
     'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',
 }
-RUNNER = SCRIPT.with_name('ci_runtime_tests.py').read_text(encoding='utf-8')
+# The demo crate reuses the name `snapshots`; drop the real crate's never-retry entry.
+RUNNER = SCRIPT.with_name('ci_runtime_tests.py').read_text(encoding='utf-8').replace('    "snapshots",\n', '', 1)
 HEADER = 'target\told_test\tnew_test\n'
 LIB = 'crates/demo/src/lib.rs'
 
