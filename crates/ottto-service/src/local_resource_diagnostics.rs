@@ -1023,6 +1023,9 @@ pub(crate) struct Probe {
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
     pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
+    /// Page window only (`Probe::page`): `Some(None)` is a refused sampler
+    /// slot, reported as one sample failure. Other probes carry `None`.
+    footprint: Option<Option<footprint::Stage>>,
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -1082,7 +1085,16 @@ impl Probe {
             full_causes: Default::default(),
             line_delivery: None,
             discovery_growth: Default::default(),
+            footprint: None,
         }
+    }
+    /// A native collection page probe. Its `native_collection_page` row
+    /// carries the same footprint fields as a `StageWindow` row, from the
+    /// shared bounded sampler. Diagnostics only; nothing reads them.
+    pub(crate) fn page() -> Self {
+        let mut probe = Self::start();
+        probe.footprint = Some(footprint::Stage::begin());
+        probe
     }
     fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
         let mut observation = self.observation();
@@ -1092,6 +1104,12 @@ impl Probe {
     }
     fn observation(&self) -> Observation {
         Observation::between(wall_us(self.started), self.process, process_sample())
+    }
+    fn page_observation(&self) -> Observation {
+        match &self.footprint {
+            Some(window) => self.stage_observation(window.as_ref()),
+            None => self.observation(),
+        }
     }
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
         #[derive(Serialize)]
@@ -1223,7 +1241,7 @@ impl Probe {
             process_id: std::process::id(),
             stage: "native_collection_page",
             source: Source::from_slug(source),
-            observation: self.observation(),
+            observation: self.page_observation(),
             counts,
         });
         // Own records, so the page line stays under its size bound (§13).
@@ -1251,7 +1269,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for Probe {
             &self.full_causes.restore_outcome.miss,
             c,
         )?;
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }
 
@@ -2726,6 +2745,59 @@ mod tests {
     }
 
     #[test]
+    fn page_window_row_carries_stage_footprint_fields_for_all_native_sources() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                let probe = Probe::page();
+                probe.collection(source, collection());
+                // A second drop-time close must not reopen or re-emit.
+                drop(probe);
+                Probe::start().collection(source, collection());
+            });
+            assert_eq!(records.len(), 2);
+            let (page, plain) = (&records[0], &records[1]);
+            for record in [page, plain] {
+                assert_eq!(record["stage"], "native_collection_page");
+                assert_eq!(record["source"], source);
+            }
+            // The page window reports like a StageWindow row: a refused
+            // sampler slot is one failure, never zeros or a missing record.
+            let row = &page["observation"];
+            assert!(row["footprint_sample_failures"].is_u64());
+            if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                    if let Some(bytes) = row[endpoint].as_u64() {
+                        assert!(peak >= bytes);
+                    }
+                }
+                assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                if let Some(over) = row["footprint_samples_over_400"].as_u64() {
+                    assert!(over >= 1);
+                    assert!(peak > 400 * 1024 * 1024);
+                }
+            } else {
+                assert!(row["footprint_sample_failures"].as_u64().unwrap() >= 1);
+            }
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_samples_over_400",
+                "footprint_sample_failures",
+            ] {
+                assert!(plain["observation"].get(field).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn resource_finish_success_preserves_value_and_contains_batch_window() {
         let value = Box::new(17);
         let original = std::ptr::from_ref(value.as_ref());
@@ -3177,7 +3249,7 @@ mod tests {
     #[test]
     fn resource_attempts_count_fallback_and_presend_refusal_without_content() {
         let (_, records) = capture(|| {
-            Probe::start().collection(
+            Probe::page().collection(
                 "secret/path/provider",
                 CollectionCounts {
                     scanned_files: usize::MAX,

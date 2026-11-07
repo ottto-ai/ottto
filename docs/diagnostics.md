@@ -384,6 +384,11 @@ above 400 MiB (419,430,400 bytes), a reporting line only: nothing reads it to
 change behavior. Time above the line is about this count × 50 ms (the start
 and end reads count as samples too). It is absent when no sample was above.
 
+Each source's `native_collection_page` record carries the same footprint
+fields, from the same sampler, for its page window: from page start (which can
+fall inside `source_prepare`) to the page record. The window overlaps prepare
+and finish, so compare its peak with theirs but never subtract or sum them.
+
 Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
 sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
