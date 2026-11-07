@@ -3,7 +3,7 @@ use super::*;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct RootSidecar {
-    pub threads: BTreeMap<String, CodexStateThread>,
+    pub threads: BTreeMap<String, Shared<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
 }
 
@@ -84,7 +84,7 @@ fn compatible_copy(
 pub(super) fn merge_threads(
     metadata: &mut CodexTitleMetadata,
     root: &Path,
-    incoming: &BTreeMap<String, CodexStateThread>,
+    incoming: &BTreeMap<String, Shared<CodexStateThread>>,
 ) {
     for (id, row) in incoming {
         if metadata.identity_conflicts.contains(id) {

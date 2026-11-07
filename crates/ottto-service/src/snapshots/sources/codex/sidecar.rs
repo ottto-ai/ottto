@@ -10,7 +10,8 @@ pub(in crate::snapshots) struct CodexTitleMetadata {
     pub(in crate::snapshots) titles: BTreeMap<String, CodexTitleCandidate>,
     /// Merged maximum for state-only fallback; never use for file binding.
     /// Registered files must use `thread_extent_for_path` and their own home.
-    pub(in crate::snapshots) state_threads: BTreeMap<String, CodexStateThread>,
+    /// Rows share their allocation with the home row they were selected from.
+    pub(in crate::snapshots) state_threads: BTreeMap<String, Shared<CodexStateThread>>,
     /// Merged maximum for metadata summaries; never use for file binding.
     pub(in crate::snapshots) rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
@@ -303,12 +304,12 @@ impl CodexTitleMetadata {
             .max_by_key(|(root, _)| root.components().count())
         {
             return (
-                sidecar.threads.get(identity),
+                sidecar.threads.get(identity).map(|row| &**row),
                 sidecar.extents.get(identity).copied(),
             );
         }
         (
-            self.state_threads.get(identity),
+            self.state_threads.get(identity).map(|row| &**row),
             self.rollout_extents.get(identity).copied(),
         )
     }
@@ -326,7 +327,9 @@ impl CodexTitleMetadata {
         let (thread, extent) = path.map_or_else(
             || {
                 (
-                    self.state_threads.get(source_session_id.as_str()),
+                    self.state_threads
+                        .get(source_session_id.as_str())
+                        .map(|row| &**row),
                     self.rollout_extents
                         .get(source_session_id.as_str())
                         .copied(),
@@ -950,7 +953,7 @@ fn load_codex_sqlite_titles(
 fn load_codex_sqlite_state_threads(
     path: &Path,
     open: &mut SidecarOpenCounts,
-    state_threads: &mut BTreeMap<String, CodexStateThread>,
+    state_threads: &mut BTreeMap<String, Shared<CodexStateThread>>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
 ) -> Result<()> {
@@ -1004,6 +1007,8 @@ fn load_codex_sqlite_state_threads(
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, thread) in rows {
+        // One allocation per row; every later map holds a handle to it.
+        let thread = Shared::from(thread);
         let conflicts_before = identity_conflicts.len();
         let id =
             record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());

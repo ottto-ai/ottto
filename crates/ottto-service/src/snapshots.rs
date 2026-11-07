@@ -8802,6 +8802,7 @@ mod tests {
             .state_threads
             .get_mut(all_local_child)
             .expect("all-local child state row")
+            .make_mut()
             .created_at = Some("2026-08-26T15:02:00Z".to_string());
         // File binding reads the home's row; keep this fixture override in sync
         // with its merged row without changing the expected ownership proof.
@@ -8812,6 +8813,7 @@ mod tests {
             .threads
             .get_mut(all_local_child)
             .expect("all-local child home row")
+            .make_mut()
             .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert!(metadata.state_created_threads.contains(child));
@@ -24636,7 +24638,8 @@ mod tests {
                         .or_else(|| string_at(value, &["timestamp"]))
                 }),
                 ..CodexStateThread::default()
-            },
+            }
+            .into(),
         );
         if let Some(next_ordinal) = projected_next_ordinal {
             metadata.rollout_extents.insert(
@@ -25040,7 +25043,8 @@ mod tests {
                 tokens_used: 1,
                 created_at: Some("2026-08-02T08:20:00Z".to_string()),
                 ..CodexStateThread::default()
-            },
+            }
+            .into(),
         );
         let parsed = parse_codex_test_with_metadata(&path, &metadata);
         assert!(parsed.report.complete());
@@ -26318,7 +26322,8 @@ mod tests {
                 created_at: Some(clock.at(0)),
                 rollout_path: Some(path.to_string_lossy().into_owned()),
                 ..CodexStateThread::default()
-            },
+            }
+            .into(),
         );
         metadata.rollout_extents.insert(
             key,

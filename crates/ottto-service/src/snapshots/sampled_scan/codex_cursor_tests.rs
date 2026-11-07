@@ -5996,7 +5996,7 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
             final_page
                 .codex_title_metadata
                 .state_threads
-                .insert(id.into(), healthy_thread.clone());
+                .insert(id.into(), healthy_thread.clone().into());
         }
         if removal_hint {
             final_page
