@@ -174,7 +174,7 @@ impl Fixture {
         );
         let candidates = self
             .index
-            .file_upload_context_ack_candidates(&scan.snapshots);
+            .file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
         assert_eq!(candidates.len(), 1);
         (candidates, scan.snapshots)
     }
@@ -349,7 +349,7 @@ fn upload_context_receipt_quarantine_refused() {
     );
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -366,7 +366,7 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -386,7 +386,7 @@ fn unaffected_base_receipt_still_refuses_ack_from_previous_retry_mode() {
     );
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -534,7 +534,7 @@ fn upload_context_receipt_stale_source_witness_refused() {
     f.index.files.get_mut(&key).unwrap().source_file_fingerprint = "e".repeat(64);
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -552,7 +552,7 @@ fn upload_context_receipt_stale_body_witness_refused() {
         .last_upload_body_witness = Some("e".repeat(64));
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -563,7 +563,7 @@ fn upload_context_receipt_partial_entity_ack_refused() {
     let (candidates, _) = f.pending();
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &BTreeMap::new())
+            .accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &BTreeMap::new())
             .files,
         0
     );
@@ -842,7 +842,7 @@ fn forced_reparse_receipt_keys_the_parsed_revision() {
     let mut moved = f.index.clone();
     moved.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
     assert!(moved
-        .file_upload_context_ack_candidates(&sent.snapshots)
+        .file_upload_context_ack_candidates(&sent.snapshots, &BTreeMap::new())
         .is_empty());
     f.index
         .files
@@ -999,7 +999,7 @@ fn upload_context_receipt_wrong_ack_body_refused() {
     exact.insert(items[0].snapshot_fingerprint.clone(), "e".repeat(64));
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -1017,7 +1017,7 @@ fn upload_context_receipt_withheld_after_capture_refused() {
             .clone()]));
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         0
     );
@@ -1038,12 +1038,14 @@ fn upload_context_receipt_destination_policy_precedes_admission() {
     );
     assert!(scan.snapshots[0].session_display_name.is_none());
     finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
-    let candidates = f.index.file_upload_context_ack_candidates(&scan.snapshots);
+    let candidates = f
+        .index
+        .file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
     let exact =
         crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &scan.snapshots);
     assert_eq!(
         f.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
             .files,
         1
     );
@@ -2702,9 +2704,9 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
         index
     };
     let items = vec![item];
-    let unjoined = build(false).file_upload_context_ack_candidates(&items);
+    let unjoined = build(false).file_upload_context_ack_candidates(&items, &BTreeMap::new());
     assert_eq!(unjoined.len(), 1, "without a join only the carrier");
-    let candidates = build(true).file_upload_context_ack_candidates(&items);
+    let candidates = build(true).file_upload_context_ack_candidates(&items, &BTreeMap::new());
     assert_eq!(candidates.len(), 3, "one per joined member");
     assert!(
         candidates.contains(&unjoined[0]),
@@ -2712,7 +2714,8 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
     );
 
     let mut not_stored = build(true);
-    let counts = not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new());
+    let counts =
+        not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &BTreeMap::new());
     assert_eq!((counts.files, counts.bytes), (0, 0));
     for n in [1, 2, 3, 9] {
         assert!(not_stored.file_upload_context_requires_adoption(&key(n)));
@@ -2720,7 +2723,7 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
 
     let mut index = build(true);
     let exact = BTreeMap::from([(entity.clone(), body.clone())]);
-    let counts = index.accept_file_upload_context_acks(&candidates, &exact);
+    let counts = index.accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new());
     let wire = crate::snapshot_sync::snapshot_packing_json_length(&items[0]).unwrap() as u64;
     assert_eq!(
         (counts.files, counts.bytes),
@@ -2747,7 +2750,7 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
         .get_mut(&key(2))
         .unwrap()
         .codex_joined_member_set = Some("rejoined".into());
-    let counts = remarked.accept_file_upload_context_acks(&candidates, &exact);
+    let counts = remarked.accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new());
     assert_eq!(counts.files, 2);
     assert_eq!(remarked.files[&key(2)].upload_context_receipt, None);
     assert!(remarked.file_upload_context_requires_adoption(&key(2)));

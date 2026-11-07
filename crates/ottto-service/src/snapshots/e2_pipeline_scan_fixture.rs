@@ -2,6 +2,8 @@
 use super::*;
 use crate::transcript_acquisition::Scope;
 
+pub(crate) use super::g7_debt::tests::assert_file_receipt_retires_debt;
+
 /// The sampled scope and identity-capture mode this fixture's scans bind.
 fn scan_binding(source: SnapshotSource) -> (Scope, bool) {
     match source {
@@ -728,8 +730,8 @@ pub(crate) fn accept_upload_context_acks_for_test(
     items: &[SnapshotItem],
     acks: &BTreeMap<String, String>,
 ) {
-    let candidates = index.file_upload_context_ack_candidates(items);
-    index.accept_file_upload_context_acks(&candidates, acks);
+    let candidates = index.file_upload_context_ack_candidates(items, &BTreeMap::new());
+    index.accept_file_upload_context_acks(&candidates, acks, &BTreeMap::new());
     let contexts = index
         .active_upload_context_fingerprint
         .as_ref()

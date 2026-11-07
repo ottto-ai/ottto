@@ -106,7 +106,9 @@ non-permanent reasons hold their entity without invalidating sibling ACKs.
 
 **Refusal custody.** A fresh permanent `accepted_log_stale_older_upload` refusal
 follows the existing dominated, terminal residue path and never becomes an
-accepted-body ACK. An optional per-record `exposure` observation, written only
+accepted-body ACK. Its exact covered body can earn its file's upload-context
+receipt, retiring that file revision's freshness debt while the refusal stays recorded.
+An optional per-record `exposure` observation, written only
 when a fresh permanent refusal is recorded, separates those records from legacy
 ones; a missing or malformed observation keeps a stale record owed, and legacy
 dispositions never change. The refusal owner keeps exact body witnesses for owed

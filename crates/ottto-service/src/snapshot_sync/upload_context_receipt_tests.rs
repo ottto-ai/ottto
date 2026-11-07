@@ -178,7 +178,8 @@ pub(crate) fn partial_context_checkpoint(
         "a".repeat(64),
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &"d".repeat(64)),
     );
-    progress.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
+    progress.context_receipt_candidates =
+        index.file_upload_context_ack_candidates(items, &BTreeMap::new());
     let exact = exact_acks(source, items);
     for (entity, body) in &exact {
         progress.record_body(entity, body);
@@ -548,6 +549,7 @@ impl Uploader {
         let counts = index.accept_file_upload_context_acks(
             &self.progress.split_context_receipt_candidates(),
             &self.progress.fresh_context_body_acks,
+            &BTreeMap::new(),
         );
         // As the service finish: durable stamps before any ACK can retire.
         index.stamp_entity_upload_context_acks(

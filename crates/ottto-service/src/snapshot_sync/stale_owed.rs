@@ -56,6 +56,24 @@ impl SnapshotUploadProgress {
                     .is_some_and(PermanentSnapshotRejection::owed)
         })
     }
+    pub(super) fn covered_stale_body(&self, fp: &str, body: &str) -> bool {
+        self.permanent_rejections.get(fp).is_some_and(|r| {
+            std::iter::once(r)
+                .chain(r.revisions.values())
+                .any(|r| r.body_witness == body && r.is_stale() && !r.owed())
+        })
+    }
+    pub(super) fn covered_stale_bodies(&self) -> BTreeMap<String, String> {
+        self.permanent_rejections
+            .iter()
+            .flat_map(|(fp, r)| {
+                std::iter::once(r)
+                    .chain(r.revisions.values())
+                    .filter(|r| self.covered_stale_body(fp, &r.body_witness))
+                    .map(|r| (fp.clone(), r.body_witness.clone()))
+            })
+            .collect()
+    }
     pub(super) fn retained_revisions(
         &mut self,
         fp: &str,

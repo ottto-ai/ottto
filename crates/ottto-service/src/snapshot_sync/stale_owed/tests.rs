@@ -281,3 +281,95 @@ fn unchanged_stale_debt_never_reads_on_automatic_retry_passes() {
         0
     );
 }
+
+/// [regress] Server-covered stale bytes earn the file receipt and retire its
+/// freshness debt, even when terminal custody omits them from this page.
+/// Retryable, other, legacy and changed-body refusals keep the same file owed.
+#[test]
+#[serial_test::serial(client_report)]
+fn covered_stale_receipt_retires_only_the_current_proven_file_body() {
+    use crate::snapshots::e2_pipeline_scan_fixture::assert_file_receipt_retires_debt;
+
+    for (reason, legacy, grown, delivered) in [
+        (STALE, false, false, true),
+        (MIXED, false, false, false),
+        ("body_exceeds_max_bytes", false, false, false),
+        (STALE, true, false, false),
+        (STALE, false, true, false),
+    ] {
+        for omitted in [false, true] {
+            let source = SnapshotSource::ClaudeCode;
+            let mut items = vec![crate::snapshots::cache_adapter_tests::cache_fixture_item(); 2];
+            for (n, item) in items.iter_mut().enumerate() {
+                item.snapshot_fingerprint = fp(n as u64 + 1);
+                item.source_session_id = format!("session-{n}");
+                item.source_file_fingerprint = Some("a".repeat(64));
+            }
+            let mut progress = ledger(source);
+            assert_eq!(offer(&items[0], source, reason, &mut progress), 1);
+            let refused = items[0].snapshot_fingerprint.clone();
+            let old_body = snapshot_upload_body_witness(&items[0]);
+            if legacy {
+                progress
+                    .permanent_rejections
+                    .get_mut(&refused)
+                    .unwrap()
+                    .exposure = None;
+            }
+            assert_eq!(
+                progress.covered_stale_body(&refused, &old_body),
+                reason == STALE && !legacy
+            );
+            if grown {
+                items[0].request_count += 1;
+            }
+            let current_items = items.clone();
+            let acks = BTreeMap::from([(
+                items[1].snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(&items[1]),
+            )]);
+            if omitted {
+                items.remove(0);
+            }
+            let covered = progress.covered_stale_bodies();
+            assert_file_receipt_retires_debt(&current_items, delivered, |index| {
+                index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+                let candidates = index.file_upload_context_ack_candidates(&items, &covered);
+                index.accept_file_upload_context_acks(&candidates, &acks, &covered);
+            });
+            assert_eq!(
+                progress.permanent_rejections.len(),
+                usize::from(reason != MIXED)
+            );
+            assert!(progress.accepted_fingerprints.is_empty());
+        }
+    }
+}
+
+/// [behaviour] Coverage follows the exact retained refusal revision only.
+#[test]
+#[serial_test::serial(client_report)]
+fn covered_stale_body_matches_retained_revision() {
+    let source = SnapshotSource::ClaudeCode;
+    let mut progress = ledger(source);
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    offer(&item, source, STALE, &mut progress);
+    let body = snapshot_upload_body_witness(&item);
+    let mut covered = progress.permanent_rejections[&item.snapshot_fingerprint].clone();
+    let revision = covered.clone();
+    covered.body_witness = fp(99);
+    covered.exposure = None;
+    covered.revisions.insert(body.clone(), revision);
+    progress
+        .permanent_rejections
+        .insert(item.snapshot_fingerprint.clone(), covered);
+    assert!(progress.covered_stale_body(&item.snapshot_fingerprint, &body));
+    assert!(!progress.covered_stale_body(&item.snapshot_fingerprint, &fp(99)));
+    assert!(!progress.covered_stale_body(&fp(100), &body));
+    assert_eq!(
+        progress
+            .covered_stale_bodies()
+            .get(&item.snapshot_fingerprint),
+        Some(&body)
+    );
+}

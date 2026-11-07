@@ -101,7 +101,7 @@ fn mode_changes_read_and_upload_zero_unaffected_files() {
         assert_eq!(scan.scanned_file_count, 0);
         assert!(scan.snapshots.is_empty(), "nothing can reach the uploader");
         assert!(index
-            .file_upload_context_ack_candidates(&scan.snapshots)
+            .file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new())
             .is_empty());
         assert_eq!(
             index

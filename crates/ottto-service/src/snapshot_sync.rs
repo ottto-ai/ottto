@@ -3835,6 +3835,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     let context_rearms = committable.accept_file_upload_context_acks(
         &progress.split_context_receipt_candidates(),
         &progress.fresh_context_body_acks,
+        &progress.covered_stale_bodies(),
     );
     committable.stamp_entity_upload_context_acks(
         &durable.destination_namespace_hash,
@@ -7870,8 +7871,10 @@ fn finish_sync_source(
     {
         upload_progress.save(&upload_progress_path)?;
     }
-    upload_progress.context_receipt_candidates =
-        index.file_upload_context_ack_candidates(&scan_result.snapshots);
+    upload_progress.context_receipt_candidates = index.file_upload_context_ack_candidates(
+        &scan_result.snapshots,
+        &upload_progress.covered_stale_bodies(),
+    );
     upload_progress
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
@@ -8528,6 +8531,7 @@ fn finish_sync_source(
     let context_rearm_counts = index.accept_file_upload_context_acks(
         &upload_progress.split_context_receipt_candidates(),
         &upload_progress.fresh_context_body_acks,
+        &upload_progress.covered_stale_bodies(),
     );
     index.stamp_entity_upload_context_acks(
         &upload_progress.destination_namespace_hash,
@@ -22566,7 +22570,7 @@ mod tests {
             // The page's receipt candidates, taken after preparation and before
             // upload as the source pass does; each checkpoint accepts them.
             progress.context_receipt_candidates =
-                working.file_upload_context_ack_candidates(&items);
+                working.file_upload_context_ack_candidates(&items, &BTreeMap::new());
             let keys = items
                 .iter()
                 .map(|item| {
@@ -22738,8 +22742,9 @@ mod tests {
             self.items = std::mem::take(&mut scan.snapshots);
             self.items
                 .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
-            self.progress.context_receipt_candidates =
-                self.working.file_upload_context_ack_candidates(&self.items);
+            self.progress.context_receipt_candidates = self
+                .working
+                .file_upload_context_ack_candidates(&self.items, &BTreeMap::new());
             scan
         }
         /// A cold Full of this root: a fresh index, scanned as `new` scans it.

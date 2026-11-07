@@ -166,10 +166,11 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     // Every member, not only the carrier, earns its own receipt from the one
     // exact ACK of the folded body; a not-stored answer earns none.
     index.activate_file_upload_context(SOURCE, "d".repeat(64));
-    let candidates = index.file_upload_context_ack_candidates(&scan.snapshots);
+    let candidates = index.file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
     assert_eq!(candidates.len(), paths.len(), "one candidate per member");
     let mut not_stored = index.clone();
-    let none = not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new());
+    let none =
+        not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &BTreeMap::new());
     assert_eq!(none.files, 0);
     assert_eq!(
         crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
@@ -181,7 +182,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         scan.snapshots[0].snapshot_fingerprint.clone(),
         snapshot_upload_body_witness(&scan.snapshots[0]),
     )]);
-    let earned = index.accept_file_upload_context_acks(&candidates, &exact);
+    let earned = index.accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new());
     assert_eq!(
         earned.files,
         paths.len() as u64,
@@ -250,7 +251,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     let unproven =
         crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test;
     assert_eq!(unproven(&prior), 1);
-    let reconciled = prior.accept_file_upload_context_acks(&[], &BTreeMap::new());
+    let reconciled = prior.accept_file_upload_context_acks(&[], &BTreeMap::new(), &BTreeMap::new());
     assert_eq!((reconciled.files, reconciled.bytes), (1, 0));
     assert_eq!(unproven(&prior), 0);
 
