@@ -690,7 +690,7 @@ impl SharedCache {
             }
             let charge = crate::heap_layout_bound::tree_node_bytes::<String, (WakeIdentity, u64)>()
                 .and_then(|node| node.checked_add(key.capacity()));
-            if charge.is_some_and(|charge| admit_locked(cursor, charge)) {
+            if charge.is_some_and(|charge| admission_feasible(cursor, charge)) {
                 cursor.wake.0.insert(key, (witness, used));
             }
         });
@@ -1018,17 +1018,6 @@ fn free_room(cursor: &CursorState, charge: usize) -> bool {
     crate::heap_layout_bound::bound(cursor, state_bytes())
         .and_then(|state| state_budget().checked_sub(state)?.checked_sub(charge))
         .is_some()
-}
-
-/// A decoder's claim, under the cursor lock. An owed archive decode is
-/// mandatory work, so it may displace recomputable header facts. It never
-/// drops durable owed state. If the claim cannot fit, nothing is evicted.
-fn admit_decoder(cursor: &mut CursorState, charge: usize) -> bool {
-    if free_room(cursor, charge) {
-        return true;
-    }
-    reclaim_headers(cursor, true, |cursor| free_room(cursor, charge));
-    free_room(cursor, charge)
 }
 
 /// Declares `Counters`: the logged events (`codex_cursor_events!`, in log key
@@ -1568,7 +1557,8 @@ impl Default for CursorState {
 impl HeapLayoutBound for CursorState {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
-            headers,
+            // Accounted on their own (`header_room`), so no claim yields them.
+            headers: _,
             slot,
             slot_key,
             slot_members,
@@ -1594,7 +1584,6 @@ impl HeapLayoutBound for CursorState {
             Slot::Empty | Slot::ActiveElsewhere { .. } => c.add(0)?,
             Slot::Paused(_) => c.add(*slot_charge)?,
         }
-        headers.charge(c)?;
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
         // Outstanding claims count as resident until settled.
@@ -2123,9 +2112,8 @@ impl CursorLease {
     }
 
     /// Charge the job (live source-wide inputs excluded; the resuming scan
-    /// reinstalls them) and fit it in the state budget (K6), reclaiming
-    /// optional header facts if needed. A job that does not fit ends as
-    /// strict `JoinStateBound` debt.
+    /// reinstalls them) and fit it in the state budget (K6). A job that does
+    /// not fit ends as strict `JoinStateBound` debt.
     fn suspend(self, mut job: Box<OwnedActiveFile>, count: fn(&mut Counters)) -> PauseEnd {
         // The slot charge walks the reader buffer's capacity (S3); shrink it
         // first so one overlong record cannot pin `max_line_bytes`.
@@ -2899,8 +2887,8 @@ impl Drop for CursorCredit {
 
 // Reserve under the cursor lock BEFORE taking durable Stores; carry only the
 // owner across I/O. Drop Stores before release, including unwind/early exits.
-// Never account from encode/write. May reclaim headers when the claim fits
-// (`admit_decoder`): no primary floor or owed-state eviction.
+// Never account from encode/write. Header facts are accounted on their own and
+// never yield to a claim: no primary floor or owed-state eviction.
 static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
@@ -2974,43 +2962,14 @@ fn admission_feasible(cursor: &CursorState, charge: usize) -> bool {
         .is_some()
 }
 
-/// K6 admission of `charge` more cursor bytes, under the cursor lock: measure
-/// the cursor state (outstanding claims included) and fit `charge` beside it
-/// inside `state_budget`, reclaiming optional header facts only where that
-/// makes it fit. Unsupported accounting, overflow or no room: false, nothing
-/// admitted.
-fn admit_locked(cursor: &mut CursorState, charge: usize) -> bool {
-    let needed = !cursor.headers.is_empty() && !free_room(cursor, charge);
-    reclaim_headers(cursor, needed, |cursor| admission_feasible(cursor, charge));
-    admission_feasible(cursor, charge)
-}
-
-// The cursor lock is held. Never discard optional facts for a hopeless
-// claim; clearing preserves the pending eviction count.
-fn reclaim_headers(
-    cursor: &mut CursorState,
-    needed: bool,
-    feasible: impl FnOnce(&CursorState) -> bool,
-) -> bool {
-    if !needed || cursor.headers.is_empty() {
-        return false;
-    }
-    let headers = std::mem::take(&mut cursor.headers);
-    let fits = feasible(cursor);
-    cursor.headers = headers;
-    if fits {
-        cursor.headers.clear();
-    }
-    fits
-}
-
-// Header facts are only scalar/string graphs. Use the shared field walker
-// and budget on portable builds too; native cursor admission keeps its existing
-// layout-supported gate. Opaque or over-visit resident graphs refuse caching.
-fn header_room(cursor: &CursorState, charge: usize) -> bool {
+// Header facts are only scalar/string graphs, one per roster file. They are
+// accounted on their own, against the same `state_budget`, and never compete
+// with cursor claims, so no claim evicts them. Over that budget a fact is not
+// cached, and that header is only read again.
+fn header_room(headers: &codex_file_join::HeaderCache, charge: usize) -> bool {
     let mut c = Counter::new(state_budget());
-    c.add(std::mem::size_of_val(cursor))
-        .and_then(|()| cursor.heap_bound(&mut c))
+    headers
+        .charge(&mut c)
         .and_then(|()| c.add(charge))
         .is_some()
 }
@@ -3025,7 +2984,7 @@ impl SharedCache {
             cursor.headers.refresh(key.clone(), None);
             if let Some(header) = header {
                 if codex_file_join::HeaderCache::admission_charge(key.capacity(), &header)
-                    .is_some_and(|charge| header_room(cursor, charge))
+                    .is_some_and(|charge| header_room(&cursor.headers, charge))
                 {
                     cursor.headers.refresh(key, Some(header));
                 }
@@ -3048,7 +3007,7 @@ impl SharedCache {
     }
 
     /// K6 reservation for a paused job (mandatory). In one cursor critical
-    /// section: admit `charge` (`admit_locked`) and claim it in the cursor
+    /// section: admit `charge` (`admission_feasible`) and claim it in the cursor
     /// state, where every later measurement (`cursor_resident`, another
     /// admission) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
@@ -3061,9 +3020,9 @@ impl SharedCache {
                     // The real primary tail floor stays free beside the decoder.
                     charge
                         .checked_add(crate::transcript_cache::ENTRY_BYTES)
-                        .is_some_and(|with_floor| admit_decoder(cursor, with_floor))
+                        .is_some_and(|with_floor| free_room(cursor, with_floor))
                 } else {
-                    admit_locked(cursor, charge)
+                    admission_feasible(cursor, charge)
                 };
                 if !admitted {
                     return None;
@@ -5022,63 +4981,50 @@ mod header_admission_tests {
             .with_cursor(|cursor| state_for_main(cursor))
             .flatten()
             .is_some());
-        // Real cursor reservations still succeed by dropping optional facts.
+        // Real cursor reservations never see the facts, so both keep going.
         let credit = cache
             .cursor_reserve(8 * 1024 * 1024)
             .expect("native progress wins");
         assert!(cache
-            .with_cursor(|cursor| cursor.headers.is_empty())
-            .unwrap());
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .is_some());
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     }
+    /// Header facts are accounted on their own: facts over the whole state
+    /// budget neither starve a claim nor are evicted by one.
     #[test]
-    fn over_budget_facts_yield_for_native_admission_but_hopeless_claims_keep_them() {
+    fn claims_never_see_or_evict_header_facts() {
         let (root, cache, key) = populated();
         assert!(with_test_state_budget(0, || cache.cursor_reserve(1024)).is_none());
-        assert!(cache
-            .with_cursor(|cursor| cursor.headers.get(&key))
-            .flatten()
-            .is_some());
+        let kept = |cache: &SharedCache| {
+            cache
+                .with_cursor(|cursor| cursor.headers.get(&key))
+                .flatten()
+                .is_some()
+        };
+        assert!(kept(&cache));
         cache
             .with_cursor(|cursor| {
                 let facts = cursor.headers.get(&key).unwrap();
-                // Model a resident graph that became full after caching headers.
                 for number in 0..8 {
                     let mut key = format!("header-{number}");
                     key.reserve_exact(state_bytes() / 8);
                     cursor.headers.refresh(key, Some(facts.clone()));
                 }
-                assert!(state_for_main(cursor).is_none(), "starvation precondition");
+                assert!(state_for_main(cursor).is_some(), "facts never starve");
+                assert!(free_room(cursor, 1024));
+                assert!(admission_feasible(cursor, 1024));
             })
             .unwrap();
         let credit = cache
             .cursor_reserve(1024)
             .expect("headers cannot strand a cursor");
-        assert!(cache
-            .with_cursor(|cursor| cursor.headers.is_empty())
-            .unwrap());
+        assert!(kept(&cache));
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn optional_admission_can_reclaim_header_room() {
-        let (root, cache, key) = populated();
-        cache
-            .with_cursor(|cursor| {
-                let facts = cursor.headers.get(&key).unwrap();
-                for number in 0..8 {
-                    let mut key = format!("header-{number}");
-                    key.reserve_exact(state_bytes() / 8);
-                    cursor.headers.refresh(key, Some(facts.clone()));
-                }
-                assert!(!free_room(cursor, 1024));
-                assert!(admit_locked(cursor, 1024));
-                assert!(cursor.headers.is_empty());
-            })
-            .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

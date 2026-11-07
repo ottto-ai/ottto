@@ -5891,17 +5891,6 @@ fn memo_hit_a_week_later_is_the_same_hit() {
 
 // #641 cursor resource: claims, admission and credit settlement.
 
-/// Boundary requests must use the least cursor state admission can reach.
-/// Real scan pages also warm optional header facts; those can yield before
-/// provenance, and are not a mandatory floor.
-/// Keep `cursor_resident` whole so no-eviction assertions still include them.
-fn cursor_without_header_facts(cache: &SharedCache) -> usize {
-    let headers = cache
-        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
-        .unwrap();
-    cache.cursor_resident().checked_sub(headers).unwrap()
-}
-
 /// [money] R3: the residue no longer vetoes retirement. A vanished file
 /// whose filename owner sits in the residue (a plain ownership refusal,
 /// checkpointed and reloaded) retires exactly like an unrelated vanished
@@ -6091,21 +6080,20 @@ fn hopeless_admission_evicts_nothing() {
     with_test_limits(2048, 8192, 64, || {
         let cache = Arc::new(SharedCache::default());
         certified_cursor_job(&cache);
-        // Measured without header facts: the least an admission can reach.
-        let empty = cursor_without_header_facts(&cache);
-        let resident = cache.cursor_resident();
-        // One byte past the state without header facts, then a charge the
-        // state alone cannot hold.
+        // Header facts are accounted on their own, so this is the least an
+        // admission can reach.
+        let empty = cache.cursor_resident();
+        let resident = empty;
+        // One byte past the state, then a charge the state alone cannot hold.
         for hopeless in [state_bytes() - empty + 1, state_bytes()] {
             assert!(cache.cursor_reserve(hopeless).is_none(), "{hopeless}");
             assert_eq!(cache.cursor_reserved(), 0);
             assert_eq!(cache.cursor_resident(), resident);
         }
-        // Control: a reserve that fits once header facts yield still goes
-        // on (baseline progress), now that it is feasible.
+        // Control: a reserve that fits still goes on (baseline progress).
         let credit = cache
             .cursor_reserve(state_bytes() - empty)
-            .expect("feasible after reclaiming header facts");
+            .expect("feasible beside the state");
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -7935,11 +7923,11 @@ fn decoder_floor_preserves_a_real_primary_tail() {
     });
 }
 
-/// The state budget at which a decoder claim just fits once every header fact
-/// is gone: the whole cursor state without headers, D, and the primary
-/// ENTRY_BYTES floor.
+/// The state budget at which a decoder claim just fits: the cursor state
+/// (header facts are accounted on their own), D, and the primary ENTRY_BYTES
+/// floor.
 fn decoder_least_budget(cache: &SharedCache) -> usize {
-    cursor_without_header_facts(cache)
+    cache.cursor_resident()
         + codex_compressed_input::compressed_input_credit().unwrap()
         + ENTRY_BYTES
 }
@@ -7982,14 +7970,14 @@ fn assert_decoder_refused_evicting_nothing(
     assert_eq!(cache.cursor_reserved(), reserved);
 }
 
-/// A busy cache admits: free room first, then header facts. The primary
-/// tail floor stays free.
+/// [regress] A decoder that fits only beside the cursor state is admitted
+/// and evicts no header facts. The primary tail floor stays free.
 #[test]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     ignore = "needs validated heap layout"
 )]
-fn decoder_reclaims_headers_only_as_needed() {
+fn decoder_admission_keeps_header_facts() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7998,30 +7986,31 @@ fn decoder_reclaims_headers_only_as_needed() {
     with_test_limits(2048, 8192, 64, || {
         let cache = warm_decoder_cache();
         let resident = cache.cursor_resident();
-        let cursor = cursor_without_header_facts(&cache);
-        let headers = resident - cursor;
-        let credit = codex_compressed_input::compressed_input_credit().unwrap();
-        // Without facts the free-room bar is T; with them it is T + H.
-        let budget = cursor + credit + ENTRY_BYTES;
-        let archive = synthetic_archive("decoder-reclaim");
-        let admit = |limit: usize| {
-            let input = with_test_state_budget(limit, || {
-                OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                    .unwrap()
-                    .expect("a claim that can fit is admitted")
-            });
-            assert_eq!(cache.cursor_reserved(), credit);
-            let used = cache.cursor_resident();
-            assert!(limit - used >= ENTRY_BYTES, "the primary floor stays free");
-            input.close();
-            assert_eq!(cache.cursor_reserved(), 0);
+        let facts = || {
+            cache
+                .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+                .unwrap()
         };
-        // Free room: nothing is reclaimed.
-        admit(budget + headers);
+        let headers = facts();
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let budget = decoder_least_budget(&cache);
+        let archive = synthetic_archive("decoder-keeps-facts");
+        assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
+        let input = with_test_state_budget(budget, || {
+            OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .expect("a claim that fits is admitted")
+        });
+        assert_eq!(cache.cursor_reserved(), credit);
+        assert!(
+            budget - cache.cursor_resident() >= ENTRY_BYTES,
+            "the primary floor stays free"
+        );
+        assert_eq!(facts(), headers, "header facts kept");
+        input.close();
+        assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(cache.cursor_resident(), resident);
-        // Short by the facts: only they go.
-        admit(budget);
-        assert_eq!(cache.cursor_resident(), cursor);
+        assert_eq!(facts(), headers);
     });
 }
 
@@ -8060,33 +8049,6 @@ fn decoder_under_a_job_over_the_room_refuses_and_evicts_nothing() {
         owner.release();
         job.refund();
         assert_eq!(cache.cursor_reserved(), 0);
-    });
-}
-
-/// [behaviour] A real archive decoder makes its room from header facts.
-#[test]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    ignore = "needs validated heap layout"
-)]
-fn decoder_eviction_reclaims_header_facts() {
-    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let cache = warm_decoder_cache();
-        let budget = decoder_least_budget(&cache);
-        let archive = synthetic_archive("decoder-proof-kept");
-        // One byte below the decoder floor: nothing is evicted.
-        assert_decoder_refused_evicting_nothing(&cache, budget - 1, &archive);
-        with_test_state_budget(budget, || {
-            OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
-                .unwrap()
-                .expect("header facts make the room")
-                .close();
-        });
     });
 }
 
