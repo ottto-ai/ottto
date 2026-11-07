@@ -176,14 +176,20 @@ pub(super) struct AuthWitness {
     len: u64,
 }
 
+impl AuthWitness {
+    /// A file's size and modification time from one `stat`; no file bytes.
+    pub(super) fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+            len: metadata.len(),
+        })
+    }
+}
+
 fn auth_witness(home: &Path) -> Option<AuthWitness> {
-    let metadata = std::fs::metadata(home.join("auth.json")).ok()?;
-    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    Some(AuthWitness {
-        modified_secs: modified.as_secs(),
-        modified_nanos: modified.subsec_nanos(),
-        len: metadata.len(),
-    })
+    AuthWitness::from_metadata(&std::fs::metadata(home.join("auth.json")).ok()?)
 }
 
 /// A home's local login: the account and workspace binding its credential
