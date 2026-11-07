@@ -385,6 +385,7 @@ impl HeaderCache {
             keep
         });
     }
+    #[cfg(test)]
     pub(in crate::snapshots) fn clear(&mut self) {
         self.evictions = self.evictions.saturating_add(self.entries.len());
         self.entries.clear();
@@ -393,6 +394,7 @@ impl HeaderCache {
     fn take_evictions(&mut self) -> usize {
         std::mem::take(&mut self.evictions)
     }
+    #[cfg(test)]
     pub(in crate::snapshots) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -427,7 +429,7 @@ impl HeaderCache {
             .and_then(|()| header.heap_bound(&mut c))
             .map_or(usize::MAX, |()| c.bytes)
     }
-    /// The header facts' resident bytes (tests: the yieldable share).
+    /// The header facts' own resident bytes (tests).
     #[cfg(test)]
     pub(in crate::snapshots) fn optional_bytes(&self) -> Option<usize> {
         crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
@@ -5465,6 +5467,83 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert_eq!(cleared.reuse_misses, paths.len());
         assert_eq!(cleared.reuse_evictions, paths.len());
         READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// [regress] A mandatory decoder claim that cannot fit beside the header
+    /// facts in the shared state budget no longer clears them: the next
+    /// unchanged archive walk reads 0 header bytes and opens no decoder, with
+    /// the facts of a cold read. A replaced archive is read again, alone.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        ignore = "needs validated heap layout"
+    )]
+    fn unchanged_archives_reuse_header_facts_after_decoder_pressure() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+        let (root, fixture) = tests::fixture();
+        let archives = paths(&fixture)
+            .into_iter()
+            .map(|plain| {
+                let plain = PathBuf::from(plain);
+                let archive = plain.with_extension("jsonl.zst");
+                let bytes = zstd::stream::encode_all(&fs::read(&plain).unwrap()[..], 1).unwrap();
+                fs::write(&archive, bytes).unwrap();
+                fs::remove_file(&plain).unwrap();
+                local_index_key(&archive)
+            })
+            .collect::<BTreeSet<_>>();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let first = page(&root, &archives, &cache);
+        assert!(first.complete);
+        assert_eq!(first.reuse_misses, archives.len());
+        assert!(first.read_bytes > 0);
+        // Pressure: facts heavy enough that no decoder fits beside them.
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(archives.first().unwrap()).unwrap();
+                for number in 0..2 {
+                    let mut key = format!("pressure-{number}");
+                    key.reserve_exact(crate::transcript_cache::CACHE_BYTES / 8);
+                    cursor.headers.refresh(key, Some(facts.clone()));
+                }
+            })
+            .unwrap();
+        let other = root.join("other.jsonl.zst");
+        fs::write(&other, zstd::stream::encode_all(&b"{}\n"[..], 1).unwrap()).unwrap();
+        crate::snapshots::codex_compressed_input::OpenedInput::funded(
+            fs::File::open(&other).unwrap(),
+            &cache,
+        )
+        .unwrap()
+        .expect("the mandatory decoder is admitted")
+        .close();
+        READ_CALLS.with(|calls| calls.set(0));
+        let second = page(&root, &archives, &cache);
+        assert!(second.complete);
+        assert_eq!(second.reuse_hits, archives.len());
+        assert_eq!(second.reuse_misses, 0);
+        assert_eq!(
+            second.read_bytes, 0,
+            "no header bytes after admission pressure"
+        );
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no decoder opened"));
+        let cold = page(
+            &root,
+            &archives,
+            &Arc::new(sampled_scan::SharedCache::default()),
+        );
+        assert_eq!(facts(&second), facts(&cold));
+        assert_eq!(facts(&first), facts(&cold));
+        let replaced = PathBuf::from(archives.first().unwrap());
+        let replacement = root.join("replacement");
+        fs::write(&replacement, fs::read(&replaced).unwrap()).unwrap();
+        fs::rename(&replacement, &replaced).unwrap();
+        READ_CALLS.with(|calls| calls.set(0));
+        let reread = page(&root, &archives, &cache);
+        assert_eq!(reread.reuse_misses, 1, "a replaced object reads again");
+        assert_eq!(reread.reuse_hits, archives.len() - 1);
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(facts(&reread), facts(&cold));
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]
