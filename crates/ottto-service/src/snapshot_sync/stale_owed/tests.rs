@@ -321,7 +321,8 @@ fn covered_stale_receipt_retires_only_the_current_proven_file_body() {
                 reason == STALE && !legacy
             );
             if grown {
-                items[0].request_count += 1;
+                items[0].tool_usage_truncated = !items[0].tool_usage_truncated;
+                assert_ne!(snapshot_upload_body_witness(&items[0]), old_body);
             }
             let current_items = items.clone();
             let acks = BTreeMap::from([(
