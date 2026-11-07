@@ -244,6 +244,23 @@ pub(in crate::snapshots) fn creator_time_precedes_start(
     }
 }
 
+/// The header's raw creator pair, hashed exactly as creator evidence hashes it,
+/// whether or not this header certifies a session creator.
+pub(in crate::snapshots) fn codex_raw_creator_pair(meta: &Value) -> Option<(String, String)> {
+    Some((
+        ottto_core::billing_identity_hash(
+            "openai",
+            "account",
+            meta.get("creator_user_id")?.as_str()?,
+        )?,
+        ottto_core::billing_identity_hash(
+            "openai",
+            "workspace",
+            meta.get("creator_account_id")?.as_str()?,
+        )?,
+    ))
+}
+
 /// Capture the first physical header before applying the ownership boundary.
 /// Raw creator fields are accepted only as a complete provider pair/time.
 /// The caller separately proves first physical record and logical-session ownership.
@@ -266,16 +283,7 @@ pub(in crate::snapshots) fn codex_creator_header_evidence(
     {
         return None;
     }
-    let account_identifier_hash = ottto_core::billing_identity_hash(
-        "openai",
-        "account",
-        meta.get("creator_user_id")?.as_str()?,
-    )?;
-    let provider_workspace_hash = ottto_core::billing_identity_hash(
-        "openai",
-        "workspace",
-        meta.get("creator_account_id")?.as_str()?,
-    )?;
+    let (account_identifier_hash, provider_workspace_hash) = codex_raw_creator_pair(meta)?;
     let envelope_time = OffsetDateTime::parse(value.get("timestamp")?.as_str()?, &Rfc3339).ok()?;
     let created = match meta.get("timestamp") {
         Some(timestamp) => OffsetDateTime::parse(timestamp.as_str()?, &Rfc3339).ok()?,

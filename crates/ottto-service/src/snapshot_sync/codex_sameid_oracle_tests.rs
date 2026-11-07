@@ -665,3 +665,355 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     }
     crate::snapshot_sync::forget_carried_namespaces_for_test(&[DEVICE]);
 }
+
+/// Rewrite the revert archive's session header in place, at the same path.
+fn edit_revert_header(path: &std::path::Path, edit: impl FnOnce(&mut Value)) {
+    let decoded = zstd::stream::decode_all(std::fs::File::open(path).unwrap()).unwrap();
+    let mut rows = String::from_utf8(decoded)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    edit(&mut rows[0]);
+    let body = rows
+        .iter()
+        .map(|row| row.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(path, zstd::stream::encode_all(body.as_bytes(), 1).unwrap()).unwrap();
+}
+
+/// The synthetic original creator's account and workspace hashes.
+fn original_pair() -> (String, String) {
+    (
+        ottto_core::billing_identity_hash("openai", "account", "synthetic-user-a").unwrap(),
+        ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace-a").unwrap(),
+    )
+}
+
+/// [money] A revert header with a positive ordinal and no fork id certifies no
+/// creator but names the original's raw creator pair. The group folds into the
+/// same one summed body, with the same placement, as the certified-header
+/// revert: every count is the member sum, cost presence is kept, and creator
+/// evidence is the original's own, byte-identical. Alone, the uncertified
+/// revert's rows are untagged; folded under the original's evidence they carry
+/// the saved session binding, as the certified-header fold already does. The
+/// acknowledged group never re-arms and restarts read zero bytes.
+#[test]
+fn uncertified_revert_header_with_the_original_pair_folds_one_body() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let mut c = Corpus::new("codex-uncertified-revert-fold");
+    c.base = c.base.canonicalize().unwrap();
+    c.root = c.base.join("projects");
+    c.support = c.base.join("support");
+    let paths = revert_archives(&c, "a");
+    let (account, workspace) = original_pair();
+    let mut prior = ScanIndex::default();
+    let key = fixture::codex_start_binding(
+        &mut prior,
+        "e2-synthetic-machine",
+        A,
+        account.clone(),
+        Some(workspace.clone()),
+    );
+    let saved = serde_json::to_value(&prior).unwrap()["session_account_bindings"][&key].clone();
+    // Reference: the certified-header revert, which main already folds.
+    let (index, certified, _) = page(&c, &E2ScanFixture::default(), prior.clone());
+    assert_eq!(certified.snapshots.len(), 1);
+    let reference = fixture::scan_money(SOURCE, &index, &certified);
+
+    edit_revert_header(&paths[1], |header| header["ordinal"] = json!(1));
+    // Per-member reference: each file finished alone under the same binding.
+    let (mut alone, mut members) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, prior.clone());
+    alone.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut members.snapshots, &[]);
+    members.snapshots.sort_by_key(|item| item.request_count);
+    assert_eq!(
+        members
+            .snapshots
+            .iter()
+            .map(|item| item.request_count)
+            .collect::<Vec<_>>(),
+        [8, 88]
+    );
+    let (index, folded, _) = page(&c, &E2ScanFixture::default(), prior.clone());
+    assert_eq!(folded.snapshots.len(), 1, "one summed body, no singleton");
+    let item = &folded.snapshots[0];
+    assert_eq!(item.source_session_id, A);
+    let body = serde_json::to_value(item).unwrap();
+    let alone = members
+        .snapshots
+        .iter()
+        .map(|member| serde_json::to_value(member).unwrap())
+        .collect::<Vec<_>>();
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+    ] {
+        let sum = alone
+            .iter()
+            .map(|member| member[field].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        assert_eq!(body[field].as_u64().unwrap_or(0), sum, "{field}");
+    }
+    assert_eq!(item.request_count, 96);
+    let present = |value: &Value, field: &str| value.get(field).is_some_and(|v| !v.is_null());
+    let costs = |value: &Value| {
+        [
+            "cost_usd",
+            "input_cost_usd",
+            "output_cost_usd",
+            "cache_read_cost_usd",
+            "cache_creation_cost_usd",
+        ]
+        .map(|field| {
+            value["model_usage"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| present(row, field))
+        })
+    };
+    let expected = alone
+        .iter()
+        .map(&costs)
+        .fold([false; 5], |sum: [bool; 5], member: [bool; 5]| {
+            std::array::from_fn(|i| sum[i] || member[i])
+        });
+    assert_eq!(costs(&body), expected, "row cost presence");
+    assert_eq!(
+        present(&body, "cost"),
+        alone.iter().any(|member| present(member, "cost")),
+        "session cost presence"
+    );
+    // Placement: the original's certified evidence, byte-identical, and every
+    // row under the saved binding. Alone, the uncertified revert is untagged.
+    let tags = |item: &SnapshotItem| {
+        item.model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .map(|row| row.account_identifier_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let bound = std::collections::BTreeSet::from([Some(account.clone())]);
+    assert_eq!(tags(&members.snapshots[0]), bound, "the original alone");
+    assert_eq!(
+        tags(&members.snapshots[1]),
+        std::collections::BTreeSet::from([None::<String>]),
+        "the uncertified revert alone"
+    );
+    assert_eq!(tags(item), bound, "the folded body");
+    assert_eq!(
+        serde_json::to_value(&index).unwrap()["session_account_bindings"][&key],
+        saved,
+        "the session binding is unchanged"
+    );
+    assert!(members.snapshots[0].session_account_evidence.is_some());
+    assert!(members.snapshots[1].session_account_evidence.is_none());
+    assert_eq!(
+        serde_json::to_value(&item.session_account_evidence).unwrap(),
+        serde_json::to_value(&members.snapshots[0].session_account_evidence).unwrap(),
+        "the original's own certified evidence"
+    );
+    fixture::money_oracle::assert_equivalent(
+        &reference,
+        &fixture::scan_money(SOURCE, &index, &folded),
+    );
+
+    // The held machine's state store: both files were accepted as singletons,
+    // the group re-arms on load, folds, captures, is ACKed and stays quiet.
+    let (session, mut published) =
+        StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
+    fixture::codex_start_binding(
+        &mut published,
+        "e2-synthetic-machine",
+        A,
+        account.clone(),
+        Some(workspace),
+    );
+    let (mut legacy, mut old_scan) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, published);
+    legacy.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut old_scan.snapshots, &[]);
+    apply_upload_policy(
+        SOURCE,
+        &mut old_scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(SOURCE, &mut old_scan, &mut legacy);
+    old_scan.finish_codex_capture_boundary(&mut legacy);
+    assert_eq!(old_scan.snapshots.len(), 2);
+    legacy.record_accepted_snapshot_fingerprints(
+        &old_scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    let mut stored = session.save_reload(&mut legacy);
+    fixture::codex_rearm_unsettled(&mut stored);
+    let (mut index, scan, _) = page(&c, &E2ScanFixture::default(), stored.clone());
+    assert_eq!(scan.snapshots.len(), 1, "one upload body for both files");
+    assert_eq!(scan.snapshots[0].request_count, 96);
+    let (mut captured, changed) = index.stage_codex_recovery_capture(&stored, &scan.snapshots);
+    assert!(changed.contains(A));
+    let captured = session.save_reload(&mut captured);
+    index.generation = captured.generation;
+    index.retain_persistence_baseline_from(&captured);
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(SOURCE));
+    let (outcome, batches, _) = upload_source_under(
+        SOURCE,
+        SnapshotUploadPolicy::default(),
+        &scan.snapshots,
+        &mut progress,
+        ack,
+    );
+    assert_eq!(outcome.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(batches.len(), 1, "exactly one body");
+    assert!(progress
+        .accepted_fingerprints
+        .contains(&scan.snapshots[0].snapshot_fingerprint));
+    settle_index_after_upload(&mut index, &captured, &progress);
+    let mut prior = session.save_reload(&mut index);
+    fixture::codex_rearm_unsettled(&mut prior);
+    assert!(
+        prior
+            .files
+            .values()
+            .all(|entry| !entry.source_file_fingerprint.is_empty()),
+        "an acknowledged group never re-arms"
+    );
+    for mode in [fixture::Mode::Restart, fixture::Mode::DiskRestore] {
+        let ((_, quiet, modes), io) =
+            fixture::observe_codex_quiet(|| page(&c, &E2ScanFixture::default(), prior.clone()));
+        let mut route = fixture::scan_money(SOURCE, &prior, &quiet);
+        route.mode = mode;
+        route.modes = modes;
+        route.io = io;
+        assert_eq!(quiet.semantic_noop_count, paths.len());
+        fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
+    }
+}
+
+/// [money] An uncertified revert header naming another raw pair, or none,
+/// holds the group: no singleton, and the saved starting binding survives.
+#[test]
+fn uncertified_revert_header_without_the_original_pair_holds() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let (account, workspace) = original_pair();
+    for (tag, second, strip) in [("different", "b", false), ("missing", "a", true)] {
+        let c = Corpus::new(&format!("codex-uncertified-revert-{tag}"));
+        let paths = revert_archives(&c, second);
+        edit_revert_header(&paths[1], |header| {
+            header["ordinal"] = json!(1);
+            if strip {
+                let payload = header["payload"].as_object_mut().unwrap();
+                payload.remove("creator_user_id");
+                payload.remove("creator_account_id");
+            }
+        });
+        let mut prior = ScanIndex::default();
+        let key = fixture::codex_start_binding(
+            &mut prior,
+            "e2-synthetic-machine",
+            A,
+            account.clone(),
+            Some(workspace.clone()),
+        );
+        let saved = serde_json::to_value(&prior).unwrap()["session_account_bindings"][&key].clone();
+        let (after, scan, _) = page(&c, &E2ScanFixture::default(), prior);
+        assert_eq!(
+            serde_json::to_value(&after).unwrap()["session_account_bindings"][&key],
+            saved,
+            "{tag}: the saved starting binding survives"
+        );
+        assert!(
+            scan.snapshots
+                .iter()
+                .all(|item| item.source_session_id != A),
+            "{tag}: no singleton"
+        );
+        assert!(scan.ownership_incomplete_file_count >= 2, "{tag}");
+    }
+}
+
+/// [money] The revert's rows take the session account only on a full match.
+/// Here both headers name one pair and the original certifies it, but the
+/// saved session account is another: the group folds into one body whose rows
+/// stay untagged, exactly like each member alone, and the binding is unchanged.
+#[test]
+fn uncertified_revert_folds_untagged_when_the_saved_account_differs() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let c = Corpus::new("codex-uncertified-revert-other-binding");
+    let paths = revert_archives(&c, "a");
+    edit_revert_header(&paths[1], |header| header["ordinal"] = json!(1));
+    let (account, _) = original_pair();
+    let saved_account =
+        ottto_core::billing_identity_hash("openai", "account", "synthetic-user-c").unwrap();
+    let saved_workspace =
+        ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace-c").unwrap();
+    assert_ne!(saved_account, account);
+    let mut prior = ScanIndex::default();
+    let key = fixture::codex_start_binding(
+        &mut prior,
+        "e2-synthetic-machine",
+        A,
+        saved_account,
+        Some(saved_workspace),
+    );
+    let saved = serde_json::to_value(&prior).unwrap()["session_account_bindings"][&key].clone();
+    let tags = |item: &SnapshotItem| {
+        item.model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .map(|row| row.account_identifier_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let untagged = std::collections::BTreeSet::from([None::<String>]);
+    let (mut alone, mut members) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, prior.clone());
+    alone.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut members.snapshots, &[]);
+    assert_eq!(members.snapshots.len(), 2);
+    for member in &members.snapshots {
+        assert_eq!(tags(member), untagged, "each member alone");
+    }
+    let (after, scan, _) = page(&c, &E2ScanFixture::default(), prior);
+    assert_eq!(scan.snapshots.len(), 1, "one summed body, no singleton");
+    assert_eq!(scan.snapshots[0].request_count, 96);
+    assert_eq!(
+        tags(&scan.snapshots[0]),
+        untagged,
+        "never the saved account"
+    );
+    let original = members
+        .snapshots
+        .iter()
+        .find(|member| member.request_count == 8)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&scan.snapshots[0].session_account_evidence).unwrap(),
+        serde_json::to_value(&original.session_account_evidence).unwrap(),
+        "the original's own certified evidence"
+    );
+    assert_eq!(
+        serde_json::to_value(&after).unwrap()["session_account_bindings"][&key],
+        saved,
+        "the session binding is unchanged"
+    );
+}
