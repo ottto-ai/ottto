@@ -201,6 +201,15 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(receipts.len(), paths.len(), "distinct member revisions");
+    // As a build that receipted only the carrier left the same accepted group.
+    let carrier = scan.snapshots[0].source_file_fingerprint.clone().unwrap();
+    let member = index
+        .files
+        .iter()
+        .find(|(_, entry)| entry.source_file_fingerprint != carrier)
+        .map(|(key, _)| key.clone())
+        .unwrap();
+    index.files.get_mut(&member).unwrap().upload_context_receipt = None;
     let mut prior = session.save_reload(&mut index);
     fixture::codex_rearm_unsettled(&mut prior);
     assert!(
@@ -234,6 +243,16 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         assert_eq!(quiet.semantic_noop_count, paths.len());
         fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
     }
+    // After the load, the next finish reconciles the member through the
+    // carrier's exact receipt: no candidate, no ACK, and the quiet pages above
+    // read no transcript byte.
+    prior.activate_file_upload_context(SOURCE, "d".repeat(64));
+    let unproven =
+        crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test;
+    assert_eq!(unproven(&prior), 1);
+    let reconciled = prior.accept_file_upload_context_acks(&[], &BTreeMap::new());
+    assert_eq!((reconciled.files, reconciled.bytes), (1, 0));
+    assert_eq!(unproven(&prior), 0);
 
     let mut accepted_route = fixture::scan_money(SOURCE, &prior, &scan);
     accepted_route.accepted.insert(

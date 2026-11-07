@@ -1029,15 +1029,19 @@ pub(super) fn valid_captured_join(value: &str) -> bool {
         .is_some_and(valid_codex_protected_owner)
 }
 pub(super) fn member_set_witness(members: &[CandidateFile]) -> String {
-    let sorted = members
-        .iter()
-        .map(|member| {
-            (
-                local_index_key(&member.path),
-                member.source_file_fingerprint.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    member_set_witness_of(members.iter().map(|member| {
+        (
+            local_index_key(&member.path),
+            member.source_file_fingerprint.as_str(),
+        )
+    }))
+}
+/// The same digest over (index key, source revision) pairs, as the saved
+/// member entries record them.
+pub(super) fn member_set_witness_of<'a>(
+    members: impl IntoIterator<Item = (String, &'a str)>,
+) -> String {
+    let sorted = members.into_iter().collect::<BTreeMap<_, _>>();
     let mut digest = Sha256::new();
     digest.update(b"codex_joined_member_set:v1\0");
     for (path, fingerprint) in sorted {

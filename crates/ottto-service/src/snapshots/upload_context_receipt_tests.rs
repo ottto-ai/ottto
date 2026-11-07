@@ -2738,4 +2738,17 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
     }
     assert_eq!(index.files[&key(9)].upload_context_receipt, None);
     assert!(index.file_upload_context_requires_adoption(&key(9)));
+
+    // A member whose join marker changed after the candidates were taken
+    // earns nothing from them.
+    let mut remarked = build(true);
+    remarked
+        .files
+        .get_mut(&key(2))
+        .unwrap()
+        .codex_joined_member_set = Some("rejoined".into());
+    let counts = remarked.accept_file_upload_context_acks(&candidates, &exact);
+    assert_eq!(counts.files, 2);
+    assert_eq!(remarked.files[&key(2)].upload_context_receipt, None);
+    assert!(remarked.file_upload_context_requires_adoption(&key(2)));
 }
