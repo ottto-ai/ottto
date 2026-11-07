@@ -657,5 +657,35 @@ fn independent_fold_keeps_the_original_certified_evidence() {
         "byte-identical original creator evidence"
     );
     assert!(fold(false).is_err(), "a later creator never binds the fold");
+    // Members whose rows take different binder paths hold: a fold never
+    // changes which path tags either member's rows.
+    let fold_modes = |first: Option<&'static str>, second: Option<&'static str>| {
+        let mut last = parsed.snapshots.clone();
+        let mut earlier = contributions.clone();
+        for (item, mode) in [(&mut earlier[0], first), (&mut last[0], second)] {
+            for row in item.model_usage.iter_mut().chain(
+                item.usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                row.auth_mode = mode.map(str::to_string);
+            }
+        }
+        fold_independent(&mut last, earlier).map(|()| last)
+    };
+    assert!(fold_modes(None, None).is_ok());
+    assert!(fold_modes(Some("chatgpt"), Some("oauth")).is_ok());
+    assert!(
+        fold_modes(None, Some("chatgpt")).is_err(),
+        "unrecorded vs oauth"
+    );
+    assert!(
+        fold_modes(Some("oauth"), None).is_err(),
+        "oauth vs unrecorded"
+    );
+    assert!(
+        fold_modes(Some("apikey"), Some("chatgpt")).is_err(),
+        "mixed vs oauth"
+    );
     fs::remove_dir_all(root).unwrap();
 }
