@@ -426,3 +426,230 @@ fn codex_group_capture_commits_on_its_state_store_after_first_load_rearm() {
         fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
     }
 }
+
+/// [money] The production finish over a bound Codex state store, after the
+/// first-load re-arm: its recovery capture commits, every later upload
+/// boundary passes the store guard, and the group uploads one summed body
+/// that is acknowledged, settles and restarts quietly.
+#[test]
+#[serial_test::serial]
+#[serial_test::serial(source_cadences, source_manifests, client_report)]
+fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
+    use crate::snapshot_sync::tests::{
+        http_request_json, snapshot_status_server_with_hint_extras_and_batch, test_daemon,
+        ContinuationFixture, EnvVarGuard, SourceManifestTestGuard,
+    };
+    use std::sync::{Arc, Mutex};
+    const DEVICE: &str = "codex-finish-guard-device";
+    const SECRET: &str = "device-secret";
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    crate::snapshot_sync::forget_carried_namespaces_for_test(&[DEVICE]);
+    let mut c = Corpus::new("codex-group-finish-state-store");
+    c.base = c.base.canonicalize().unwrap();
+    c.root = c.base.join("projects");
+    c.support = c.base.join("support");
+    let paths = revert_archives(&c, "a");
+    let (session, previous) =
+        StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
+    // An earlier build finished and accepted both files as singletons.
+    let (mut legacy, mut old_scan) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, previous);
+    legacy.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut old_scan.snapshots, &[]);
+    apply_upload_policy(
+        SOURCE,
+        &mut old_scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(SOURCE, &mut old_scan, &mut legacy);
+    old_scan.finish_codex_capture_boundary(&mut legacy);
+    assert_eq!(old_scan.snapshots.len(), 2);
+    legacy.record_accepted_snapshot_fingerprints(
+        &old_scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    let mut committed = session.save_reload(&mut legacy);
+    assert!(
+        crate::snapshots::state_v2_growth_retention_active(&committed),
+        "the state store route"
+    );
+    // First source-aware load: the unsettled group re-arms.
+    fixture::codex_rearm_unsettled(&mut committed);
+    let generation = committed.generation;
+    // The body the pass will fold, for the receiver's exact ACK.
+    let (_, expected, _) = page(&c, &E2ScanFixture::default(), committed.clone());
+    assert_eq!(
+        expected.snapshots.len(),
+        1,
+        "one upload body for both files"
+    );
+    assert_eq!(expected.snapshots[0].request_count, 96);
+    // The collected page, before the finish binds, filters and captures it.
+    let (index, scan, _) = E2ScanFixture::default().scan_other(
+        SOURCE,
+        std::slice::from_ref(&c.root),
+        &c.support,
+        committed.clone(),
+        true,
+    );
+
+    // Relay credentials whose destination is this store's namespace.
+    let support = c.base.join("service-support");
+    let secrets = c.base.join("secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let _manifests = SourceManifestTestGuard::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let url = snapshot_status_server_with_hint_extras_and_batch(
+        captured.clone(),
+        vec![(183, "")],
+        Some(expected.snapshots.clone()),
+    );
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &url);
+    let client = SnapshotApiClient::new(url);
+    let device = ottto_core::LocalDeviceBinding {
+        device_id: DEVICE.into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["codex".into()],
+    };
+    let namespace = "a".repeat(64);
+    ottto_core::FileDeviceStore::default()
+        .save_with_credential_generation(&ottto_core::LocalDeviceCredentialBinding {
+            device: device.clone(),
+            credential_generation: 1,
+            continuity: ottto_core::DeviceCredentialContinuity {
+                owner: None,
+                snapshot_namespace: Some(ottto_core::SnapshotNamespaceAlias {
+                    namespace: namespace.clone(),
+                    secret_commitment_sha256: crate::control::secret_sha256(SECRET),
+                }),
+            },
+        })
+        .unwrap();
+    std::fs::write(
+        secrets.join(ottto_core::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        SECRET,
+    )
+    .unwrap();
+    let (loaded, secret) = crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+    assert_eq!(loaded, device);
+    assert_eq!(
+        crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &secret),
+        namespace
+    );
+    let daemon = test_daemon("otm_test");
+    let progress_path = snapshot_upload_progress_path(session.path());
+    let recovery =
+        crate::snapshots::ProgressRecovery::for_index(&committed, session.path()).unwrap();
+    let progress = SnapshotUploadProgress::load_with_recovery(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SOURCE),
+        recovery,
+    )
+    .unwrap();
+    let home = c.base.join("home");
+    let destination = ContinuationFixture {
+        home: home.clone(),
+        support_dir: support.clone(),
+        index_path: session.path().to_path_buf(),
+        upload_progress_path: progress_path.clone(),
+    };
+    let preparation = SourcePreparation {
+        account_witness: daemon.snapshot_scan_account_witness().unwrap(),
+        scan_started_at: scan.census_window_end.clone(),
+        activity_hint: serde_json::from_value(json!({"source":"codex",
+            "server_time":"2026-10-27T08:00:00Z","last_data_at":null,
+            "record_count_15m":0,"record_count_24h":0,
+            "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+            "recommended_scan_after":"2026-10-27T08:05:00Z"}))
+        .unwrap(),
+        receipt_window_days: 183,
+        upload_destination_namespace: namespace.clone(),
+        receipt_client: client.clone(),
+        upload_progress: progress,
+        committed_index: committed,
+        ..destination.preparation(false)
+    };
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = crate::snapshot_sync::live_snapshot_retry::LiveRetryOwner::closed();
+    // The capture moves the store to a new generation inside this call; every
+    // later boundary (relay token, upload, checkpoint, final save) checks the
+    // store guard, so a guard built before the capture fails the pass here.
+    finish_sync_source(
+        preparation,
+        index,
+        scan,
+        &client,
+        &device,
+        &secret,
+        SOURCE,
+        "e2-synthetic-machine",
+        &home,
+        &support,
+        &daemon,
+        &mut transport,
+        &mut retry,
+    )
+    .unwrap_or_else(|error| panic!("the finish refused a boundary after the capture: {error:#}"));
+
+    let batches = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.contains("/agent-session-snapshots/batches"))
+        .map(|request| http_request_json(request.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(batches.len(), 1, "exactly one body");
+    let posted = batches[0]["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["source_session_id"].as_str().unwrap().to_string(),
+                item["request_count"].as_u64().unwrap(),
+                item["snapshot_fingerprint"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        posted,
+        [(
+            A.to_string(),
+            96,
+            expected.snapshots[0].snapshot_fingerprint.clone()
+        )],
+        "one summed body, no singleton, not held"
+    );
+    let mut prior = ScanIndex::load(session.path()).unwrap();
+    assert!(prior.generation > generation, "the pass committed");
+    assert!(
+        prior.accepted_snapshot_fingerprint_recorded(&expected.snapshots[0].snapshot_fingerprint),
+        "the accepted ACK settled"
+    );
+    fixture::codex_rearm_unsettled(&mut prior);
+    assert!(
+        prior
+            .files
+            .values()
+            .all(|entry| !entry.source_file_fingerprint.is_empty()),
+        "an acknowledged group never re-arms again"
+    );
+    for mode in [fixture::Mode::Restart, fixture::Mode::DiskRestore] {
+        let ((_, quiet, modes), io) =
+            fixture::observe_codex_quiet(|| page(&c, &E2ScanFixture::default(), prior.clone()));
+        let mut route = fixture::scan_money(SOURCE, &prior, &quiet);
+        route.mode = mode;
+        route.modes = modes;
+        route.io = io;
+        assert_eq!(quiet.semantic_noop_count, paths.len());
+        fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
+    }
+    crate::snapshot_sync::forget_carried_namespaces_for_test(&[DEVICE]);
+}
