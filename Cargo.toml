@@ -35,12 +35,12 @@ unnecessary_map_or = "allow"
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 cc = "1"
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
-getrandom = "0.3"
-hmac = "0.12"
+getrandom = "0.4"
+hmac = "0.13"
 libc = "0.2"
 # Compile debug/trace records out of every crate in any build that links
 # ottto-service. Pinned ureq logs each request prelude at debug level and
@@ -49,25 +49,25 @@ libc = "0.2"
 # release_* features take precedence in release builds.
 log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
 notify = "8"
-notify-debouncer-full = "0.6"
+notify-debouncer-full = "0.7"
 plist = "1"
-prost = "0.13"
+prost = "0.14"
 security-framework = "3.7"
 security-framework-sys = "2.17"
 # 0.39.0 is the first rusqlite release bundling SQLite 3.51.3 (WAL-reset fix).
-rusqlite = { version = "=0.39.0", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23.19", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-serial_test = "3"
-sha2 = "0.10"
+serial_test = "4"
+sha2 = "0.11"
 ring = "0.17.14"
-thiserror = "1"
+thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
-toml_edit = "0.22"
+toml_edit = "0.25"
 unicode-normalization = "0.1"
-unicode-general-category = "0.6"
-ureq = { version = "2", default-features = false, features = ["gzip", "json"] }
+unicode-general-category = "1.1"
+ureq = { version = "3", default-features = false, features = ["gzip", "json"] }
 webpki-roots = "1.0.10"
 zeroize = { version = "1", features = ["alloc"] }
 zstd = { version = "0.14.3", default-features = false, features = ["experimental"] }
