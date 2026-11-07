@@ -679,6 +679,36 @@ impl ScanIndex {
             .collect()
     }
 
+    /// Align only candidates for the finalized body set with actual held-probe swaps.
+    pub(crate) fn substitute_file_upload_context_bodies(
+        &mut self,
+        candidates: &mut [Candidate],
+        swaps: &[(String, String, String)],
+    ) {
+        for candidate in candidates {
+            let Some(entry) = self.files.get_mut(&candidate.key) else {
+                continue;
+            };
+            if entry.last_upload_body_witness.as_ref() != Some(&candidate.receipt.body_witness) {
+                continue;
+            }
+            let mut changed = false;
+            for (fp, old, probe) in swaps {
+                if candidate.bodies.get(fp) == Some(old) {
+                    candidate.bodies.insert(fp.clone(), probe.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                let digest = snapshot_file_upload_body_set_hex(
+                    candidate.bodies.values().collect::<BTreeSet<_>>(),
+                );
+                candidate.receipt.body_witness = digest.clone();
+                entry.last_upload_body_witness = Some(digest);
+            }
+        }
+    }
+
     /// Called on the final selected index, using only exact ACKs of the active
     /// context: this cycle's, or an earlier pass's by its durable stamp of the
     /// same body. Stamps are cleared on every replay-generation

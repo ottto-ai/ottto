@@ -811,6 +811,7 @@ thread_local! {
 /// The cache producer's ownership proof is covered separately. Supply a
 /// synthetic cache patch after that fold to isolate finish's bootstrap exit.
 pub(in crate::snapshot_sync) fn ack_cache_probe_for_test(items: &mut [SnapshotItem]) {
+    reason_reoffer_pipeline_tests::observe_finalized_probe_items(items);
     if ACK_CACHE_PROBE.with(|slot| slot.replace(false)) {
         items
             .first_mut()

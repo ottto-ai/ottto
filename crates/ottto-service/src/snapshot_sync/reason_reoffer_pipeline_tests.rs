@@ -40,6 +40,7 @@ impl Drop for ClockGuard {
 enum Answer {
     /// Permanent refusal with this wire reason.
     Refuse(&'static str),
+    Retryable(&'static str),
     Accept,
     /// `unchanged` with an `unchanged_basis`: the server did not store it.
     Unstored,
@@ -159,8 +160,9 @@ impl ReofferServer {
                         "session_ids":[],"disabled":false,"disabled_reason":null,
                         "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
                         "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]});
-                    match *current.lock().unwrap() {
-                        Answer::Refuse(reason) => {
+                    let answer = *current.lock().unwrap();
+                    match answer {
+                        Answer::Refuse(reason) | Answer::Retryable(reason) => {
                             outcome["rejected_entities"] = items
                                 .iter()
                                 .map(|item| {
@@ -168,7 +170,7 @@ impl ReofferServer {
                                         "source_session_id":item["source_session_id"],
                                         "snapshot_fingerprint":item["snapshot_fingerprint"],
                                         "reason":reason,"detail":"synthetic re-offer refusal",
-                                        "permanent":true,"occurrence_count":1
+                                        "permanent":matches!(answer, Answer::Refuse(_)),"occurrence_count":1
                                     })
                                 })
                                 .collect();
@@ -2356,4 +2358,263 @@ fn returning_history_obeys_the_move_hold() {
         quiet.index.files[&key].effective_upload_body_witness_revision,
         settled_revision
     );
+}
+
+thread_local! {
+    static FINALIZED_PROBE_ITEMS: std::cell::RefCell<Option<Vec<SnapshotItem>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn observe_finalized_probe_items(items: &[SnapshotItem]) {
+    FINALIZED_PROBE_ITEMS.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            *captured = items.to_vec();
+        }
+    });
+}
+
+fn held_probe_cycle(pipeline: &mut ReofferPipeline, now: u64) -> (CycleResult, Vec<SnapshotItem>) {
+    FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let cycle = pipeline.cycle(now);
+    let items = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(cycle.result.is_ok(), "{:?}", cycle.result);
+    assert!(cycle.cache_enabled);
+    (cycle, items)
+}
+
+fn body_set(item: &SnapshotItem) -> String {
+    crate::snapshots::e2_pipeline_scan_fixture::file_upload_body_set(std::slice::from_ref(item))
+}
+
+fn force_held_file_parse(cycle: &mut CycleResult) {
+    for entry in cycle.index.files.values_mut() {
+        entry.last_snapshot_fingerprint = None;
+        entry.last_upload_body_witness = None;
+    }
+    cycle.index.save(&cycle.index_path).unwrap();
+}
+
+/// [regress] Real finalization records a cache-bearing body before bootstrap;
+/// only its exact server-covered probe may retire this file revision's debt.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_stale_refusal_earns_receipt_in_refusal_pass() {
+    if !supported("held_probe_stale_refusal_earns_receipt_in_refusal_pass") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-receipt",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (first, finalized) = held_probe_cycle(&mut pipeline, now);
+    assert_eq!(finalized.len(), 1);
+    let mut full = finalized[0].clone();
+    assert!(
+        full.cache_observations.is_some(),
+        "the real finalizer carried cache fields"
+    );
+    prepare_snapshot_cache_for_upload(
+        &mut full,
+        &test_upload_progress(),
+        true,
+        false,
+        &BTreeSet::new(),
+    );
+    let probe = cache_head_probe(&full);
+    assert_ne!(
+        body_set(&full),
+        body_set(&probe),
+        "non-vacuous witness mismatch"
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let mut sent = offered[0].clone();
+    sent.as_object_mut().unwrap().remove("semantic_envelope");
+    assert_eq!(sent, serde_json::to_value(&probe).unwrap());
+    let entry = first.index.files.values().next().unwrap();
+    assert_eq!(entry.last_upload_body_witness, Some(body_set(&probe)));
+    assert_eq!(
+        entry.upload_context_receipt.as_ref().unwrap().body_witness,
+        body_set(&probe)
+    );
+    assert!(first.progress.accepted_fingerprints.is_empty());
+    crate::snapshots::e2_pipeline_scan_fixture::assert_file_receipt_retires_debt(
+        std::slice::from_ref(&probe),
+        true,
+        |index| {
+            let covered = first.progress.covered_stale_bodies();
+            let candidates =
+                index.file_upload_context_ack_candidates(std::slice::from_ref(&probe), &covered);
+            index.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &covered);
+        },
+    );
+    let (quiet, _) = held_probe_cycle(&mut pipeline, now + 60);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        1,
+        "pass two offers zero bodies"
+    );
+    assert_eq!(
+        quiet
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .upload_context_receipt,
+        entry.upload_context_receipt
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_mixed_refusal_keeps_retry_debt_without_receipt() {
+    if !supported("held_probe_mixed_refusal_keeps_retry_debt_without_receipt") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-mixed",
+        Answer::Retryable("accepted_log_stale_older_mixed"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (cycle, finalized) = held_probe_cycle(&mut pipeline, now);
+    let probe = cache_head_probe(&finalized[0]);
+    let entry = cycle.index.files.values().next().unwrap();
+    assert_eq!(entry.last_upload_body_witness, Some(body_set(&probe)));
+    assert!(entry.upload_context_receipt.is_none());
+    assert_eq!(
+        cycle.index.quarantined_snapshot_fingerprints[&probe.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(cycle.progress.permanent_rejections.is_empty());
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_old_refusal_cannot_receipt_legacy_or_grown_body() {
+    if !supported("held_probe_old_refusal_cannot_receipt_legacy_or_grown_body") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-old",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut cycle, finalized) = held_probe_cycle(&mut pipeline, now);
+    let mut probe = cache_head_probe(&finalized[0]);
+    for grown in [false, true] {
+        let mut progress = cycle.progress.clone();
+        if grown {
+            probe.tool_usage_truncated = !probe.tool_usage_truncated;
+        } else {
+            progress
+                .permanent_rejections
+                .get_mut(&probe.snapshot_fingerprint)
+                .unwrap()
+                .exposure = None;
+        }
+        crate::snapshots::e2_pipeline_scan_fixture::assert_file_receipt_retires_debt(
+            std::slice::from_ref(&probe),
+            false,
+            |index| {
+                let covered = progress.covered_stale_bodies();
+                let candidates = index
+                    .file_upload_context_ack_candidates(std::slice::from_ref(&probe), &covered);
+                index.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &covered);
+            },
+        );
+    }
+    // Also restore an actual legacy record through prepare/finalize.
+    cycle
+        .progress
+        .permanent_rejections
+        .values_mut()
+        .for_each(|record| record.exposure = None);
+    cycle.progress.save(&cycle.progress_path).unwrap();
+    for entry in cycle.index.files.values_mut() {
+        entry.upload_context_receipt = None;
+    }
+    force_held_file_parse(&mut cycle);
+    let (legacy, _) = held_probe_cycle(&mut pipeline, now + 60);
+    assert!(legacy
+        .index
+        .files
+        .values()
+        .all(|entry| entry.upload_context_receipt.is_none()));
+    assert_eq!(pipeline.server.offered().len(), 1);
+}
+
+/// An ordinary later parse of unchanged bytes keeps the probe witness; no
+/// cache observation is sent on the first, quiet or explicitly forced pass.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_cache_observations_never_offered() {
+    if !supported("held_probe_cache_observations_never_offered") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-reparse",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (first, finalized) = held_probe_cycle(&mut pipeline, now);
+    let digest = body_set(&cache_head_probe(&finalized[0]));
+    assert_eq!(
+        first
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(digest.clone())
+    );
+    let (mut quiet, _) = held_probe_cycle(&mut pipeline, now + 60);
+    force_held_file_parse(&mut quiet);
+    let (parsed, reads, _) = pipeline.measured_cycle(now + 120, false);
+    assert!(parsed.result.is_ok(), "{:?}", parsed.result);
+    assert_eq!(reads, 1, "the unchanged file was explicitly parsed again");
+    assert_eq!(
+        parsed
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(digest)
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    assert!(offered
+        .iter()
+        .all(|item| item.get("cache_observations").is_none()));
 }

@@ -888,3 +888,12 @@ pub(crate) fn legacy_owner_of_terminal_family_for_test(
         .legacy_owner_roots
         .insert(owner.to_owned());
 }
+
+pub(crate) fn file_upload_body_set(items: &[SnapshotItem]) -> String {
+    snapshot_file_upload_body_set_hex(
+        items
+            .iter()
+            .map(snapshot_upload_body_witness)
+            .collect::<BTreeSet<_>>(),
+    )
+}
