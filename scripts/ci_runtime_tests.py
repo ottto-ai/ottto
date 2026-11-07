@@ -84,6 +84,8 @@ NEVER_RETRY_MODULES = frozenset({
     "claude_request_identity_window_tests",
     "money_equivalence_tests",
     "money_oracle",
+    # Keeps every scan test never-retry once its tests leave snapshots.rs.
+    "snapshots",
     "upload_context_receipt_tests",
 })
 
