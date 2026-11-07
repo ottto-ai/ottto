@@ -501,7 +501,7 @@ it pretty-printed, and every reader accepts either, since a receipt binds whiche
 exact bytes were written. A save whose serialized ledger equals the bytes already
 on disk writes neither file and claims no generation: under the progress lock, the
 current receipt must still seal those bytes, and only the directory sync is
-retried. OFF/v1 and Codex/Pi do not create companions.
+retried. Sources not on state v2 do not create companions.
 The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
 recovery or substitute for a missing exact receipt.
 
