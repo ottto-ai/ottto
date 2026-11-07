@@ -7257,9 +7257,10 @@ fn capture_codex_recovery_evidence(
     index_path: &Path,
     progress_path: &Path,
     validate_authority: impl Fn() -> Result<()>,
-) {
+) -> bool {
     let (mut captured, changed) =
         index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
+    let mut adopted = false;
     if !changed.is_empty() {
         let protected = scan_result
             .snapshots
@@ -7268,29 +7269,42 @@ fn capture_codex_recovery_evidence(
             .cloned()
             .collect::<Vec<_>>();
         let saved = (|| -> Result<()> {
-            let _progress_lock = SnapshotProgressLock::acquire(progress_path)?;
+            // A state-store save runs its progress recovery under this owner,
+            // as the partial checkpoint does: locking the progress file again
+            // on a second descriptor would refuse this process's own lock.
+            let progress_owner = SnapshotProgressLock::acquire(progress_path)?;
+            let progress_owner = if crate::snapshots::state_v2_growth_retention_active(&captured) {
+                progress_owner.for_v2(progress_path)
+            } else {
+                progress_owner
+            };
             validate_authority()?;
             let validator = scan_result
                 .codex_joining_validator()
                 .context("Codex recovery capture lacks a source witness")?;
             validator.validate(&protected)?;
-            captured.save(index_path)
+            captured.save_with_progress_owner(index_path, None, &progress_owner)
         })();
         match saved {
             Ok(()) => {
                 index.generation = captured.generation;
                 index.retain_persistence_baseline_from(&captured);
                 *committed_index = captured;
+                adopted = true;
             }
-            Err(_) => scan_result.hold_codex_groups(
+            Err(error) => scan_result.hold_codex_groups(
                 index,
                 committed_index,
                 &changed,
-                "recovery capture could not durably publish",
+                &format!(
+                    "recovery capture could not durably publish ({})",
+                    safe_error(&error)
+                ),
             ),
         }
     }
     scan_result.finish_codex_capture_boundary(index);
+    adopted
 }
 
 /// The batch request around `snapshots` for this collector's source,
@@ -7647,8 +7661,9 @@ fn finish_sync_source(
         },
     );
     index.advance_empty_claude_proof_corrections(&scan_result);
+    let mut capture_adopted = false;
     if source == SnapshotSource::Codex {
-        capture_codex_recovery_evidence(
+        capture_adopted = capture_codex_recovery_evidence(
             &mut index,
             &mut committed_index,
             &mut scan_result,
@@ -7658,6 +7673,18 @@ fn finish_sync_source(
         );
         backfill_succeeded &= scan_result.census_complete;
     }
+    // An adopted capture moved this graph to the generation it saved, and the
+    // guard built before it refuses that graph. Every later boundary takes a
+    // new guard from the same constructor, as after any adopted save.
+    let state_v2_guard = if capture_adopted {
+        crate::snapshots::state_v2_side_effect_guard(&index_path, &index)
+    } else {
+        state_v2_guard
+    };
+    let ensure_authority = || {
+        state_v2_guard()?;
+        ensure_destination_authority()
+    };
     // A parsed file can emit several legacy siblings. Only the persisted
     // migration lease may re-enter an ambiguous old identity this cycle; new
     // fingerprints and ordinary changed entities continue through normally.
