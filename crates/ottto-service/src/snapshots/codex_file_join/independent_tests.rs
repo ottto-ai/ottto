@@ -630,6 +630,94 @@ fn independent_header_gate_compares_raw_creator_pairs() {
     );
 }
 
+/// [money] Forked members fold only when both reference one parent's history
+/// instead of carrying it: a paginated fork-creation header (ordinal at the
+/// parent's base end) and a paginated revert whose base is this session.
+/// Different fork parents, a non-paginated fork, a paginated fork whose base
+/// is neither, and subagent or created-thread headers still refuse.
+#[test]
+fn independent_header_gate_folds_paginated_fork_members_of_one_parent() {
+    let pair = json!({"creator_user_id": "synthetic-user-a",
+        "creator_account_id": "synthetic-workspace-a"});
+    let header = |created: &str, ordinal: u64, extra: Value| {
+        let mut fields = pair.clone();
+        fields.as_object_mut().unwrap().extend(
+            json!({"session_id": OWNER, "history_mode": "paginated"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        fields
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut header = meta(OWNER, created, fields);
+        header["ordinal"] = json!(ordinal);
+        header
+    };
+    let original = |parent: &str| {
+        header(
+            "2026-10-01T09:00:00Z",
+            5,
+            json!({"forked_from_id": parent, "history_base": {"thread_id": parent,
+                "end_ordinal_exclusive": 5, "end_byte_offset": 900}}),
+        )
+    };
+    let revert = |parent: &str, base: &str| {
+        header(
+            "2026-10-01T09:01:00Z",
+            9,
+            json!({"forked_from_id": parent, "history_base": {"thread_id": base,
+                "end_ordinal_exclusive": 9, "end_byte_offset": 1800}}),
+        )
+    };
+    let gate = |first: &Value, second: &Value| {
+        let mut proof = StreamProof::independent(OWNER.into(), 2);
+        for (position, header) in [first, second].into_iter().enumerate() {
+            proof.begin_member(position);
+            feed(&mut proof, std::slice::from_ref(header), [0]);
+            proof.end_member(1);
+        }
+        proof.refusal()
+    };
+    let first = original(OTHER);
+    assert!(codex_paginated_fork_creation_header(
+        &first,
+        &first["payload"]
+    ));
+    assert!(codex_creator_header_evidence(&first, &first["payload"]).is_some());
+    let same = revert(OTHER, OWNER);
+    assert!(codex_creator_header_evidence(&same, &same["payload"]).is_none());
+    assert_eq!(gate(&first, &same), None, "one fork parent folds");
+    assert_eq!(
+        gate(&first, &revert(UNKNOWN, OWNER)),
+        Some((JoinRefusal::Overlap, 1)),
+        "different fork parents"
+    );
+    let forked = Some((JoinRefusal::ForkedFromOtherSession, 1));
+    let mut stray = revert(OTHER, UNKNOWN);
+    stray["ordinal"] = json!(3);
+    assert_eq!(
+        gate(&first, &stray),
+        forked,
+        "a base that is neither this session nor ends at the header ordinal"
+    );
+    let mut inline = same.clone();
+    inline["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("history_mode");
+    assert_eq!(gate(&first, &inline), forked, "non-paginated fork");
+    for (field, value) in [
+        ("subagent_history_start_ordinal", json!(9)),
+        ("thread_source", json!("agent_created_thread")),
+    ] {
+        let mut other = same.clone();
+        other["payload"][field] = value;
+        assert_eq!(gate(&first, &other), forked, "{field}");
+    }
+}
+
 /// [money] The folded creator evidence is the original member's own certified
 /// evidence, byte-identical. A certified later member under an uncertified
 /// original holds instead of leaving the folded body without its creator.

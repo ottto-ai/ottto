@@ -1075,3 +1075,275 @@ fn uncertified_revert_folds_untagged_when_the_saved_account_differs() {
         "the session binding is unchanged"
     );
 }
+
+/// The fork parent both members reference; it is not in the inventory.
+const PARENT: &str = "019e5a00-0000-7000-8000-00000000000c";
+
+/// A paginated fork session and its revert. The original's header is the
+/// fork's creation header, at the end of the parent's referenced history; the
+/// revert's header is at the end of this session's own history. Both name the
+/// parent and the original's creator pair, and neither file carries the
+/// history it references: each file holds only its own records. With
+/// `copied`, the revert also carries the original's records before its own.
+fn fork_archives(c: &Corpus, turns: [u64; 2], copied: bool) -> Vec<PathBuf> {
+    let original = c
+        .root
+        .join(format!("rollout-2026-10-27T07-00-00-{A}.jsonl"));
+    let read = |count: u64| {
+        rollout(c, A, "a", count);
+        let rows = std::fs::read_to_string(&original)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        std::fs::remove_file(&original).unwrap();
+        rows
+    };
+    let paginate = |rows: &mut [Value], start: u64, base: &str| {
+        let payload = rows[0]["payload"].as_object_mut().unwrap();
+        payload.extend(
+            json!({"session_id": A, "history_mode": "paginated", "forked_from_id": PARENT,
+                "history_base": {"thread_id": base, "end_ordinal_exclusive": start,
+                    "end_byte_offset": 4096}})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        for (n, row) in rows.iter_mut().enumerate() {
+            row["ordinal"] = json!(start + n as u64);
+        }
+    };
+    let mut first = read(turns[0]);
+    paginate(&mut first, 5, PARENT);
+    let mut second = read(turns[1]);
+    paginate(&mut second, 6 + turns[0], A);
+    second[0]["payload"]["timestamp"] = json!("2026-10-27T07:01:00Z");
+    second[0]["timestamp"] = json!("2026-10-27T07:01:00Z");
+    for row in &mut second[1..] {
+        row["timestamp"] = json!("2026-10-27T07:31:00Z");
+    }
+    if copied {
+        let own = second.split_off(1);
+        second.extend(first[1..].iter().cloned());
+        second.extend(own);
+    }
+    let paths = vec![
+        original.with_extension("jsonl.zst"),
+        c.root
+            .join(format!("rollout-2026-10-27T07-01-00-{A}_{B}.jsonl.zst")),
+    ];
+    for (path, rows) in paths.iter().zip([first, second]) {
+        let body = rows
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>();
+        std::fs::write(path, zstd::stream::encode_all(body.as_bytes(), 1).unwrap()).unwrap();
+    }
+    paths
+}
+
+/// [money] A paginated fork session and its revert, both naming one fork
+/// parent, fold into one summed body: every count is the member sum (1,268 +
+/// 251 = 1,519 requests), each member counts only its own records (the
+/// parent's referenced history is never counted), the original's certified
+/// evidence and the saved binding place every row, a durable state-store route
+/// emits the same body, and the acknowledged group restarts reading zero bytes.
+#[test]
+fn paginated_fork_revert_group_folds_one_summed_body() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let mut c = Corpus::new("codex-paginated-fork-revert-fold");
+    c.base = c.base.canonicalize().unwrap();
+    c.root = c.base.join("projects");
+    c.support = c.base.join("support");
+    let paths = fork_archives(&c, [1268, 251], false);
+    let (account, workspace) = original_pair();
+    let mut prior = ScanIndex::default();
+    let key = fixture::codex_start_binding(
+        &mut prior,
+        "e2-synthetic-machine",
+        A,
+        account.clone(),
+        Some(workspace.clone()),
+    );
+    let saved = serde_json::to_value(&prior).unwrap()["session_account_bindings"][&key].clone();
+    // Each file finished alone counts only its own physical records.
+    let (mut alone, mut members) =
+        fixture::codex_legacy_singletons(std::slice::from_ref(&c.root), &c.support, prior.clone());
+    alone.bind_session_accounts(SOURCE, "e2-synthetic-machine", &mut members.snapshots, &[]);
+    members.snapshots.sort_by_key(|item| item.request_count);
+    assert_eq!(
+        members
+            .snapshots
+            .iter()
+            .map(|item| item.request_count)
+            .collect::<Vec<_>>(),
+        [251, 1268],
+        "no referenced parent history is counted"
+    );
+    let (index, folded, _) = page(&c, &E2ScanFixture::default(), prior.clone());
+    assert_eq!(folded.snapshots.len(), 1, "one summed body, no singleton");
+    let item = &folded.snapshots[0];
+    assert_eq!(item.source_session_id, A);
+    assert_eq!(item.request_count, 1519);
+    let body = serde_json::to_value(item).unwrap();
+    let alone = members
+        .snapshots
+        .iter()
+        .map(|member| serde_json::to_value(member).unwrap())
+        .collect::<Vec<_>>();
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+    ] {
+        let sum = alone
+            .iter()
+            .map(|member| member[field].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        assert_eq!(body[field].as_u64().unwrap_or(0), sum, "{field}");
+        assert_eq!(
+            body.get(field).is_some_and(|v| !v.is_null()),
+            alone
+                .iter()
+                .any(|member| member.get(field).is_some_and(|v| !v.is_null())),
+            "{field} presence"
+        );
+    }
+    let tags = |item: &SnapshotItem| {
+        item.model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .map(|row| row.account_identifier_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let bound = std::collections::BTreeSet::from([Some(account.clone())]);
+    assert_eq!(tags(&members.snapshots[1]), bound, "the original alone");
+    assert_eq!(tags(item), bound, "the folded body");
+    assert!(members.snapshots[1].session_account_evidence.is_some());
+    assert!(members.snapshots[0].session_account_evidence.is_none());
+    assert_eq!(
+        serde_json::to_value(&item.session_account_evidence).unwrap(),
+        serde_json::to_value(&members.snapshots[1].session_account_evidence).unwrap(),
+        "the original's own certified evidence"
+    );
+    assert_eq!(
+        serde_json::to_value(&index).unwrap()["session_account_bindings"][&key],
+        saved,
+        "the session binding is unchanged"
+    );
+    let reference = fixture::scan_money(SOURCE, &index, &folded);
+
+    // The held machine's durable route: the group folds on a state store,
+    // captures, is ACKed once and stays quiet.
+    let (session, mut stored) =
+        StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
+    fixture::codex_start_binding(
+        &mut stored,
+        "e2-synthetic-machine",
+        A,
+        account.clone(),
+        Some(workspace),
+    );
+    let stored = session.save_reload(&mut stored);
+    let (mut index, scan, _) = page(&c, &E2ScanFixture::default(), stored.clone());
+    assert_eq!(scan.snapshots.len(), 1, "one upload body for both files");
+    fixture::money_oracle::assert_equivalent(
+        &reference,
+        &fixture::scan_money(SOURCE, &index, &scan),
+    );
+    let (mut captured, changed) = index.stage_codex_recovery_capture(&stored, &scan.snapshots);
+    assert!(changed.contains(A));
+    let captured = session.save_reload(&mut captured);
+    index.generation = captured.generation;
+    index.retain_persistence_baseline_from(&captured);
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(SOURCE));
+    let (outcome, batches, _) = upload_source_under(
+        SOURCE,
+        SnapshotUploadPolicy::default(),
+        &scan.snapshots,
+        &mut progress,
+        ack,
+    );
+    assert_eq!(outcome.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(batches.len(), 1, "exactly one body");
+    settle_index_after_upload(&mut index, &captured, &progress);
+    let mut prior = session.save_reload(&mut index);
+    fixture::codex_rearm_unsettled(&mut prior);
+    assert!(
+        prior
+            .files
+            .values()
+            .all(|entry| !entry.source_file_fingerprint.is_empty()),
+        "an acknowledged group never re-arms"
+    );
+    for mode in [fixture::Mode::Restart, fixture::Mode::DiskRestore] {
+        let ((_, quiet, modes), io) =
+            fixture::observe_codex_quiet(|| page(&c, &E2ScanFixture::default(), prior.clone()));
+        let mut route = fixture::scan_money(SOURCE, &prior, &quiet);
+        route.mode = mode;
+        route.modes = modes;
+        route.io = io;
+        assert_eq!(quiet.semantic_noop_count, paths.len());
+        fixture::money_oracle::assert_quiet_restart_zero_bytes(&route);
+    }
+}
+
+/// [money] Fork members that differ in parent, a revert that is not paginated,
+/// and a revert that carries the original's records before its own all hold
+/// the whole group: no singleton, the saved starting binding survives, and no
+/// record is counted twice.
+#[test]
+fn paginated_fork_group_holds_on_other_parent_inline_or_copied_records() {
+    let _decoder = fixture::codex_decoder_test_lock();
+    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+    let (account, workspace) = original_pair();
+    for tag in ["other-parent", "inline", "copied"] {
+        let c = Corpus::new(&format!("codex-paginated-fork-{tag}"));
+        let paths = fork_archives(&c, [8, 88], tag == "copied");
+        match tag {
+            "other-parent" => edit_revert_header(&paths[1], |header| {
+                header["payload"]["forked_from_id"] = json!(B);
+            }),
+            "inline" => edit_revert_header(&paths[1], |header| {
+                header["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("history_mode");
+            }),
+            _ => {}
+        }
+        let mut prior = ScanIndex::default();
+        let key = fixture::codex_start_binding(
+            &mut prior,
+            "e2-synthetic-machine",
+            A,
+            account.clone(),
+            Some(workspace.clone()),
+        );
+        let saved = serde_json::to_value(&prior).unwrap()["session_account_bindings"][&key].clone();
+        let (after, scan, _) = page(&c, &E2ScanFixture::default(), prior);
+        assert_eq!(
+            serde_json::to_value(&after).unwrap()["session_account_bindings"][&key],
+            saved,
+            "{tag}: the saved starting binding survives"
+        );
+        assert!(
+            scan.snapshots
+                .iter()
+                .all(|item| item.source_session_id != A),
+            "{tag}: no singleton"
+        );
+        assert!(scan.ownership_incomplete_file_count >= 2, "{tag}");
+    }
+}
