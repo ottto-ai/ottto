@@ -483,3 +483,284 @@ fn roster_only_for_a_complete_walk_without_issues() {
     assert_eq!(roster(Some(5), true, false), None, "listing error");
     assert_eq!(roster(Some(5), false, true), None, "walk issue");
 }
+
+/// How the receiver answered a folded Codex body.
+#[derive(Clone, Copy, Debug)]
+enum FoldAck {
+    Exact,
+    Refused,
+    NotStored,
+    Partial,
+}
+
+/// [money] A folded Codex body carries one member's source revision. Every
+/// joined member earns its own receipt from the exact ACK of that body under
+/// its own revision, so each member's held revision retires. Nothing else
+/// does: a refused, not-stored or partial answer, a member of another group,
+/// a member whose own body is another one (it grew and folded again), and an
+/// unjoined file with the same entity and body all stay held, with no receipt.
+#[test]
+fn folded_members_retire_held_debt_only_on_the_exact_ack_of_their_body() {
+    for (members, ack) in [
+        (2, FoldAck::Exact),
+        (3, FoldAck::Exact),
+        (2, FoldAck::Refused),
+        (2, FoldAck::NotStored),
+        (2, FoldAck::Partial),
+    ] {
+        let mut f = Fixture::new(Source::Codex, "g7-fold-receipts");
+        let mut items = vec![crate::snapshots::cache_adapter_tests::cache_fixture_item()];
+        if matches!(ack, FoldAck::Partial) {
+            let mut second = items[0].clone();
+            second.request_count += 1;
+            items.push(second);
+        }
+        for (n, item) in items.iter_mut().enumerate() {
+            // The fold body names the first member's revision only.
+            item.source_file_fingerprint = Some("1".repeat(64));
+            item.snapshot_fingerprint = (n + 7).to_string().repeat(64);
+        }
+        let bodies = items
+            .iter()
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let entities = bodies.keys().cloned().collect::<BTreeSet<_>>();
+        let folded = snapshot_file_upload_body_set_hex(bodies.values().collect::<BTreeSet<_>>());
+        let regrown = snapshot_file_upload_body_set_hex(["a".repeat(64)]);
+        // (name, own revision, group marker, own body, joined to the offer)
+        let mut files = (1..=members)
+            .map(|n| {
+                (
+                    format!("member-{n}.jsonl"),
+                    n.to_string().repeat(64),
+                    Some("joined-a"),
+                    folded.clone(),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        files.extend([
+            (
+                "other-group.jsonl".to_string(),
+                "5".repeat(64),
+                Some("joined-b"),
+                folded.clone(),
+                false,
+            ),
+            (
+                "regrown-member.jsonl".to_string(),
+                "6".repeat(64),
+                Some("joined-a"),
+                regrown,
+                false,
+            ),
+            (
+                "unjoined.jsonl".to_string(),
+                "9".repeat(64),
+                None,
+                folded.clone(),
+                false,
+            ),
+        ]);
+        for (name, source, marker, body, _) in &files {
+            let path = f.file(name, 100);
+            age(&path, 9 * HOUR);
+            let key = local_index_key(&path);
+            let mut stored = entry(&path);
+            stored.source_file_fingerprint = source.clone();
+            stored.codex_joined_member_set = marker.map(str::to_owned);
+            stored.last_upload_body_witness = Some(body.clone());
+            f.index.files.insert(key.clone(), stored);
+            f.index
+                .file_snapshot_fingerprints
+                .insert(key, entities.clone());
+        }
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        let before = f.walk();
+        assert_eq!(before["debt"]["held_files"], files.len(), "{ack:?}");
+        f.save();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        let candidates = f.index.file_upload_context_ack_candidates(&items);
+        let mut acks = bodies.clone();
+        match ack {
+            FoldAck::Exact => {}
+            FoldAck::Refused => {
+                for entity in &entities {
+                    f.index
+                        .quarantined_snapshot_fingerprints
+                        .insert(entity.clone(), snapshot_quarantine_record(f.source));
+                }
+                acks.clear();
+            }
+            FoldAck::NotStored => acks.clear(),
+            FoldAck::Partial => {
+                acks.pop_last().expect("two bodies");
+            }
+        }
+        let exact = matches!(ack, FoldAck::Exact);
+        let counts = f.index.accept_file_upload_context_acks(&candidates, &acks);
+        let earned = if exact { members } else { 0 };
+        assert_eq!(counts.files, earned as u64, "{ack:?} {members}");
+        let after = f.walk();
+        assert_eq!(
+            after["debt"]["outstanding_files"],
+            files.len() - earned,
+            "{ack:?} {members}"
+        );
+        f.save();
+        for (name, source, _, _, joined) in &files {
+            let path = f.root.join(name);
+            let receipt = f.index.files[&local_index_key(&path)]
+                .upload_context_receipt
+                .clone();
+            let owed = committed(&f.index, &path);
+            if exact && *joined {
+                let receipt = receipt.expect("each member's own receipt");
+                assert_eq!(&receipt.source_witness, source, "{name}");
+                assert_eq!(receipt.body_witness, folded, "{name}");
+                assert!(owed.is_empty(), "{name}: held revision retired");
+            } else {
+                assert_eq!(receipt, None, "{name} {ack:?}");
+                assert_eq!(owed.len(), 1, "{name} {ack:?}");
+                assert!(
+                    owed.values()
+                        .all(|revision| revision.reason_bits & HELD_REVISION != 0),
+                    "{name} {ack:?}"
+                );
+            }
+        }
+        f.close();
+    }
+}
+
+/// [money] A fold accepted by a build that gave only the carrier its receipt
+/// reconciles like a crash after the ACK. After a load, the next finish gives
+/// each unchanged member its own receipt from the carrier's exact receipt of
+/// the same accepted entity and body, reading and sending nothing, and the
+/// member's held revision retires. A member that grew after the ACK keeps its
+/// growth owed. A member whose revision changed since the fold, a group whose
+/// carrier receipt is gone and a group whose entity is not accepted stay held,
+/// with no new receipt.
+#[test]
+fn pre_fix_accepted_fold_members_clear_through_the_carrier_receipt() {
+    let mut f = Fixture::new(Source::Codex, "g7-fold-reconcile");
+    let body = snapshot_file_upload_body_set_hex(["b".repeat(64)]);
+    let receipt = |source: &str, body: &str| Receipt {
+        context_fingerprint: CONTEXT.into(),
+        replay_generation: RECEIPT_REPLAY_EPOCH,
+        source_witness: source.to_owned(),
+        body_witness: body.to_owned(),
+    };
+    // (group, members, carrier receipt kept, entity accepted)
+    let groups = [
+        ("kept", 3, true, true),
+        ("grown", 2, true, true),
+        ("changed", 2, true, true),
+        ("unproven", 2, false, true),
+        ("unaccepted", 2, true, false),
+    ];
+    let mut files = Vec::new();
+    let mut accepted = BTreeSet::new();
+    for (g, (group, members, carried, entity_accepted)) in groups.into_iter().enumerate() {
+        let entity = (g + 1).to_string().repeat(64);
+        let group_files = (0..members)
+            .map(|n| {
+                let path = f.file(&format!("{group}-{n}.jsonl"), 100);
+                age(&path, 9 * HOUR);
+                (path, format!("{g}{n}").repeat(32))
+            })
+            .collect::<Vec<_>>();
+        let marker = crate::snapshots::codex_file_join::member_set_witness_of(
+            group_files
+                .iter()
+                .map(|(path, source)| (local_index_key(path), source.as_str())),
+        );
+        for (n, (path, source)) in group_files.into_iter().enumerate() {
+            let key = local_index_key(&path);
+            let mut stored = entry(&path);
+            stored.source_file_fingerprint = source.clone();
+            stored.codex_joined_member_set = Some(marker.clone());
+            stored.last_snapshot_fingerprint = Some(entity.clone());
+            stored.last_upload_body_witness = Some(body.clone());
+            stored.upload_context_receipt = match n {
+                0 => carried.then(|| receipt(&source, &body)),
+                // The singleton receipt of the member's older body.
+                1 => Some(receipt(&source, &"c".repeat(64))),
+                _ => None,
+            };
+            if group == "changed" && n == 1 {
+                stored.source_file_fingerprint = "f".repeat(64);
+            }
+            f.index.files.insert(key.clone(), stored);
+            f.index
+                .file_snapshot_fingerprints
+                .insert(key, BTreeSet::from([entity.clone()]));
+            files.push((group, n, path));
+        }
+        if entity_accepted {
+            accepted.insert(entity);
+        }
+    }
+    f.index
+        .activate_file_upload_context(f.source, CONTEXT.into());
+    let before = f.walk();
+    assert_eq!(
+        before["debt"]["held_files"], 7,
+        "every member without a receipt"
+    );
+    // The install's load, then a member grows after the ACK.
+    f.save();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(f.root.join("grown-1.jsonl"))
+        .unwrap()
+        .write_all(&[b'z'; 40])
+        .unwrap();
+    f.index
+        .activate_file_upload_context(f.source, CONTEXT.into());
+    f.index.record_accepted_snapshot_fingerprints(&accepted);
+    // The next finish, with no candidate and no ACK in this pass.
+    let counts = f
+        .index
+        .accept_file_upload_context_acks(&[], &BTreeMap::new());
+    assert_eq!((counts.files, counts.bytes), (3, 0));
+    let after = f.walk();
+    assert_eq!(after["debt"]["outstanding_files"], 5);
+    assert_eq!(after["debt"]["held_files"], 4);
+    f.save();
+    for (group, n, path) in &files {
+        let stored = &f.index.files[&local_index_key(path)];
+        let owed = committed(&f.index, path);
+        let receipted = stored
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                receipt.body_witness == body
+                    && receipt.source_witness == stored.source_file_fingerprint
+            });
+        let held = owed
+            .values()
+            .any(|revision| revision.reason_bits & HELD_REVISION != 0);
+        match (*group, *n) {
+            ("kept", _) | ("grown", 0) | ("changed", 0) | ("unaccepted", 0) => {
+                assert!(receipted && owed.is_empty(), "{group}-{n}");
+            }
+            ("grown", 1) => {
+                assert!(receipted && !held, "{group}-{n}: held revision retired");
+                assert_eq!(owed.len(), 1, "{group}-{n}: its growth stays owed");
+                assert!(owed
+                    .values()
+                    .all(|revision| revision.reason_bits & UNREAD != 0));
+            }
+            _ => assert!(!receipted && held, "{group}-{n}: stays held"),
+        }
+    }
+    f.close();
+}

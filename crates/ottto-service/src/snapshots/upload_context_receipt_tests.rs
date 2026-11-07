@@ -2667,3 +2667,88 @@ fn owed_line_reports_exempt_buckets() {
         "old file count = owed + listed + empty + ledger_accepted"
     );
 }
+
+/// [money] A folded Codex body offers every joined member a receipt candidate
+/// under the member's own source revision. The carrier's candidate is the
+/// same as without the join, a file with the same body but no join marker gets
+/// none, one exact ACK settles every member and counts the wire body once, and
+/// a not-stored answer settles none.
+#[test]
+fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.source_file_fingerprint = Some("1".repeat(64));
+    item.snapshot_fingerprint = "7".repeat(64);
+    let entity = item.snapshot_fingerprint.clone();
+    let body = snapshot_upload_body_witness(&item);
+    let folded = snapshot_file_upload_body_set_hex([&body]);
+    let key = |n: usize| format!("/synthetic/rollout-member-{n}.jsonl.zst");
+    let build = |joined: bool| {
+        let mut index = ScanIndex::default();
+        index.activate_file_upload_context(SnapshotSource::Codex, "d".repeat(64));
+        for (n, marker) in [(1, joined), (2, joined), (3, joined), (9, false)] {
+            let mut entry: ScanIndexEntry = serde_json::from_value(json!({
+                "size_bytes": 1, "modified_unix_seconds": 1,
+                "source_file_fingerprint": n.to_string().repeat(64),
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap();
+            entry.codex_joined_member_set = marker.then(|| "joined".to_string());
+            entry.last_upload_body_witness = Some(folded.clone());
+            index.files.insert(key(n), entry);
+            index
+                .file_snapshot_fingerprints
+                .insert(key(n), BTreeSet::from([entity.clone()]));
+        }
+        index
+    };
+    let items = vec![item];
+    let unjoined = build(false).file_upload_context_ack_candidates(&items);
+    assert_eq!(unjoined.len(), 1, "without a join only the carrier");
+    let candidates = build(true).file_upload_context_ack_candidates(&items);
+    assert_eq!(candidates.len(), 3, "one per joined member");
+    assert!(
+        candidates.contains(&unjoined[0]),
+        "the carrier's candidate is unchanged"
+    );
+
+    let mut not_stored = build(true);
+    let counts = not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new());
+    assert_eq!((counts.files, counts.bytes), (0, 0));
+    for n in [1, 2, 3, 9] {
+        assert!(not_stored.file_upload_context_requires_adoption(&key(n)));
+    }
+
+    let mut index = build(true);
+    let exact = BTreeMap::from([(entity.clone(), body.clone())]);
+    let counts = index.accept_file_upload_context_acks(&candidates, &exact);
+    let wire = crate::snapshot_sync::snapshot_packing_json_length(&items[0]).unwrap() as u64;
+    assert_eq!(
+        (counts.files, counts.bytes),
+        (3, wire),
+        "the body counts once"
+    );
+    for n in [1, 2, 3] {
+        let receipt = index.files[&key(n)]
+            .upload_context_receipt
+            .clone()
+            .expect("each member's own receipt");
+        assert_eq!(receipt.source_witness, n.to_string().repeat(64));
+        assert_eq!(receipt.body_witness, folded);
+        assert!(!index.file_upload_context_requires_adoption(&key(n)));
+    }
+    assert_eq!(index.files[&key(9)].upload_context_receipt, None);
+    assert!(index.file_upload_context_requires_adoption(&key(9)));
+
+    // A member whose join marker changed after the candidates were taken
+    // earns nothing from them.
+    let mut remarked = build(true);
+    remarked
+        .files
+        .get_mut(&key(2))
+        .unwrap()
+        .codex_joined_member_set = Some("rejoined".into());
+    let counts = remarked.accept_file_upload_context_acks(&candidates, &exact);
+    assert_eq!(counts.files, 2);
+    assert_eq!(remarked.files[&key(2)].upload_context_receipt, None);
+    assert!(remarked.file_upload_context_requires_adoption(&key(2)));
+}

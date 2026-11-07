@@ -197,6 +197,9 @@ pub(crate) struct Candidate {
     prior_acks: BTreeSet<String>,
     /// This pass's catch-up allowance deferred at least one body.
     split: bool,
+    /// The joined-group marker of a member offered another member's body;
+    /// `None` for a file offered its own.
+    joined_marker: Option<String>,
 }
 
 impl Candidate {
@@ -597,6 +600,12 @@ impl ScanIndex {
                 );
             }
         }
+        // A folded Codex body carries one member's source revision; each other
+        // joined member owes its own receipt for that exact body. Its wire
+        // bytes are counted once below.
+        let direct = by_source.keys().copied().collect::<BTreeSet<_>>();
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source);
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source_bytes);
         self.files
             .iter()
             .filter_map(|(key, entry)| {
@@ -656,6 +665,9 @@ impl ScanIndex {
                         .unwrap_or_default(),
                     prior_acks: BTreeSet::new(),
                     split: false,
+                    joined_marker: (!direct.contains(source_witness))
+                        .then(|| entry.codex_joined_member_set.clone())
+                        .flatten(),
                 })
             })
             .collect()
@@ -691,6 +703,12 @@ impl ScanIndex {
                 || self
                     .effective_upload_body_witness_revision_excluded_source_files
                     .contains(&candidate.receipt.source_witness)
+                || candidate.joined_marker.as_ref().is_some_and(|marker| {
+                    self.files
+                        .get(&candidate.key)
+                        .and_then(|entry| entry.codex_joined_member_set.as_ref())
+                        != Some(marker)
+                })
                 || candidate.bodies.iter().any(|(entity, body)| {
                     (fresh_acks.get(entity) != Some(body) && !candidate.prior_acks.contains(entity))
                         || self.quarantined_snapshot_fingerprints.contains_key(entity)
@@ -736,6 +754,7 @@ impl ScanIndex {
                 }
             }
         }
+        counts.files += self.reconcile_joined_member_receipts();
         // A split file stays owed by its missing receipt until its last body
         // is exact. Only a file this pass advanced returns to the queue now;
         // one whose whole tail was deferred waits, as before, so pressure
@@ -760,6 +779,83 @@ impl ScanIndex {
         }
         self.requeue_split_context_reads(progressed.into_iter());
         counts
+    }
+
+    /// A fold accepted before each joined member could take its own receipt
+    /// reconciles like a crash after the ACK, through exact receipts. A member
+    /// takes its own receipt only when another member of its group holds the
+    /// exact receipt of the same accepted entity set and body under this
+    /// file's context, and the group's marker still binds every member's own
+    /// current source revision (a grown or changed member fails it). Reads,
+    /// sends and stores nothing new.
+    fn reconcile_joined_member_receipts(&mut self) -> u64 {
+        let mut groups = BTreeMap::<&String, Vec<(&String, &ScanIndexEntry)>>::new();
+        for (key, entry) in self.files.iter() {
+            if let Some(marker) = entry.codex_joined_member_set.as_ref() {
+                groups.entry(marker).or_default().push((key, entry));
+            }
+        }
+        let mut grants = Vec::new();
+        for (marker, members) in groups {
+            if members.len() < 2
+                || codex_file_join::member_set_witness_of(
+                    members.iter().map(|(key, entry)| {
+                        ((*key).clone(), entry.source_file_fingerprint.as_str())
+                    }),
+                ) != *marker
+            {
+                continue;
+            }
+            let proven = members
+                .iter()
+                .filter(|(key, entry)| self.receipt_matches(key, entry))
+                .filter_map(|(key, entry)| {
+                    Some((
+                        entry.upload_context_receipt.as_ref()?,
+                        self.file_snapshot_fingerprints.get(*key)?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for (key, entry) in &members {
+                let entities = self.file_snapshot_fingerprints.get(*key);
+                let Some(context) = self.file_expected_context(key) else {
+                    continue;
+                };
+                if entry.source_file_fingerprint.is_empty()
+                    || self.receipt_matches(key, entry)
+                    || self.decode_holds_file(key)
+                    || self
+                        .effective_upload_body_witness_revision_excluded_source_files
+                        .contains(&entry.source_file_fingerprint)
+                    || !claude_index_file_body_accepted(self, key, entry)
+                {
+                    continue;
+                }
+                if let Some((receipt, _)) = proven.iter().find(|(receipt, carried)| {
+                    &receipt.context_fingerprint == context
+                        && !receipt.body_witness.is_empty()
+                        && Some(*carried) == entities
+                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                }) {
+                    grants.push((
+                        (*key).clone(),
+                        Receipt {
+                            context_fingerprint: context.clone(),
+                            replay_generation: RECEIPT_REPLAY_EPOCH,
+                            source_witness: entry.source_file_fingerprint.clone(),
+                            body_witness: receipt.body_witness.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        let granted = grants.len() as u64;
+        for (key, receipt) in grants {
+            if let Some(entry) = self.files.get_mut(&key) {
+                entry.upload_context_receipt = Some(receipt);
+            }
+        }
+        granted
     }
 
     /// Local proof that this empty or suppressed file was evaluated under its
@@ -1019,4 +1115,4 @@ crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness
 crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
 crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, retired_direction);
 
-crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split);
+crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split, joined_marker);
