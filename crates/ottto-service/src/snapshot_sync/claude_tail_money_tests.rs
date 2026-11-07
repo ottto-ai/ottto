@@ -3224,7 +3224,7 @@ fn stray_row_echo_ack(
         hashed.cache_observations_state = Some(stored.clone());
         reference.body_witness_digest = Some(snapshot_upload_body_witness(&hashed));
         reference.cache_observations_state =
-            asked.then(|| crate::snapshot_client::CacheStateEcho(stored));
+            asked.then_some(crate::snapshot_client::CacheStateEcho(stored));
     }
     Ok(response)
 }
