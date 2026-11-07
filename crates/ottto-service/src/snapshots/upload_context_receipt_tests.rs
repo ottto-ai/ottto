@@ -2755,3 +2755,61 @@ fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
     assert_eq!(remarked.files[&key(2)].upload_context_receipt, None);
     assert!(remarked.file_upload_context_requires_adoption(&key(2)));
 }
+
+#[test]
+fn held_probe_substitution_updates_every_alias_and_keeps_revision_guard() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (_, items) = f.pending();
+    let key = f.key();
+    let entry = f.index.files[&key].clone();
+    let entities = f.index.file_snapshot_fingerprints[&key].clone();
+    for alias in ["alias", "changed"] {
+        f.index.files.insert(alias.into(), entry.clone());
+        f.index
+            .file_snapshot_fingerprints
+            .insert(alias.into(), entities.clone());
+    }
+    let mut candidates = f
+        .index
+        .file_upload_context_ack_candidates(&items, &BTreeMap::new());
+    assert_eq!(candidates.len(), 3);
+    f.index
+        .files
+        .get_mut("changed")
+        .unwrap()
+        .last_upload_body_witness = Some("changed".into());
+    let fp = items[0].snapshot_fingerprint.clone();
+    let old = snapshot_upload_body_witness(&items[0]);
+    let probe = "e".repeat(64);
+    f.index.substitute_file_upload_context_bodies(
+        &mut candidates,
+        &[(fp.clone(), old, probe.clone())],
+    );
+    let digest = snapshot_file_upload_body_set_hex(BTreeSet::from([probe.clone()]));
+    for alias in [key.as_str(), "alias"] {
+        assert_eq!(
+            f.index.files[alias].last_upload_body_witness,
+            Some(digest.clone())
+        );
+    }
+    f.index.accept_file_upload_context_acks(
+        &candidates,
+        &BTreeMap::new(),
+        &BTreeMap::from([(fp, probe)]),
+    );
+    for alias in [key.as_str(), "alias"] {
+        assert_eq!(
+            f.index.files[alias]
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .body_witness,
+            digest
+        );
+    }
+    assert!(f.index.files["changed"].upload_context_receipt.is_none());
+    assert_eq!(
+        f.index.files["changed"].last_upload_body_witness.as_deref(),
+        Some("changed")
+    );
+}

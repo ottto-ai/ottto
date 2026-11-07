@@ -912,7 +912,9 @@ fn h360_quarantined_probe_carries_exact_held_body_without_request() {
         assert!(ledger.accepted_cache_heads.is_empty());
         let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
         assert_eq!(
-            apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap(),
+            apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger)
+                .unwrap()
+                .len(),
             1,
             "{disposition:?}"
         );
@@ -1046,7 +1048,9 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     );
     let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger)
+            .unwrap()
+            .len(),
         1
     );
     // The sibling's fresh session head never authorizes the held entity's bytes.
@@ -1232,7 +1236,9 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
     assert!(cache_head_probe_held(&ledger, &probes[0]));
     let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger)
+            .unwrap()
+            .len(),
         1
     );
     assert!(snapshots[0].cache_observations.is_none());
@@ -1275,7 +1281,9 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
     assert!(cache_head_probe_held(&ledger, &probes[0]));
     let mut snapshots = vec![with_cache(&probes[0])];
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger)
+            .unwrap()
+            .len(),
         1
     );
     std::fs::remove_dir_all(dir).unwrap();
@@ -1345,7 +1353,9 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         .contains_key(&cache_session_key(&probes[0].source_session_id)));
     let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger)
+            .unwrap()
+            .len(),
         1
     );
     assert!(snapshots[0].cache_observations.is_none());
@@ -1803,7 +1813,9 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
     assert_eq!(calls, [(1, true)]);
     let mut snapshots = vec![with_cache(&probes[0])];
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &restarted).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &restarted)
+            .unwrap()
+            .len(),
         0
     );
     assert_eq!(snapshots[0].cache_base_head_etag, Some("e".repeat(64)));
@@ -1838,7 +1850,8 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
     assert!(projected.cache_observations.is_none());
     assert_eq!(
         apply_bootstrapped_cache_heads("codex", std::slice::from_mut(&mut projected), &ledger)
-            .unwrap(),
+            .unwrap()
+            .len(),
         0
     );
     let dir = std::env::temp_dir().join(format!(
@@ -1868,7 +1881,9 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
     );
     let mut carried = vec![item];
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut carried, &restarted).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut carried, &restarted)
+            .unwrap()
+            .len(),
         1
     );
     assert!(carried[0].cache_base_head_etag.is_none());
@@ -1932,7 +1947,9 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     assert_eq!(deferred, 0);
     let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &restarted).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &restarted)
+            .unwrap()
+            .len(),
         1
     );
     // Once the committed record is due, the lease sends exactly that probe.
@@ -1970,7 +1987,9 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     assert_eq!(calls, [(1, false), (1, true)]);
     let mut snapshots = probes.iter().map(with_cache).collect::<Vec<_>>();
     assert_eq!(
-        apply_bootstrapped_cache_heads("codex", &mut snapshots, &retry).unwrap(),
+        apply_bootstrapped_cache_heads("codex", &mut snapshots, &retry)
+            .unwrap()
+            .len(),
         0
     );
     assert!(snapshots[0].cache_observations.is_some());
@@ -2104,7 +2123,9 @@ fn held_probe_diagnostics_use_hash8_without_identifiers_or_paths() {
             }
             let mut snapshots = vec![with_cache(&probe)];
             let (held, records) = crate::local_resource_diagnostics::capture(|| {
-                apply_bootstrapped_cache_heads(source, &mut snapshots, &ledger).unwrap()
+                apply_bootstrapped_cache_heads(source, &mut snapshots, &ledger)
+                    .unwrap()
+                    .len()
             });
             assert_eq!(held, 1);
             assert_eq!(records.len(), 1);
@@ -2130,4 +2151,51 @@ fn held_probe_diagnostics_use_hash8_without_identifiers_or_paths() {
             assert_eq!(snapshot_upload_body_witness(&snapshots[0]), witness);
         }
     }
+}
+
+#[test]
+fn effective_witness_is_probe_only_while_probe_held() {
+    let item = with_cache(&items(1)[0]);
+    let mut permanent = progress();
+    let fp = &item.snapshot_fingerprint;
+    let probe = cache_head_probe(&item);
+    let p = snapshot_upload_body_witness(&probe);
+    let witness = |ledger: &SnapshotUploadProgress, enabled| {
+        effective_snapshot_upload_body_witness(
+            &item,
+            ledger,
+            enabled,
+            false,
+            &BTreeSet::new(),
+            &Default::default(),
+        )
+    };
+    let w = witness(&permanent, true);
+    assert_ne!(w, p);
+    permanent.quarantine_permanent_body(fp, &p, "accepted_log_stale_older_upload");
+    assert_eq!(witness(&permanent, true), p);
+    let mut leased = permanent.clone();
+    leased.active_reason_reoffers.insert(fp.clone(), p.clone());
+    assert_eq!(witness(&leased, true), w);
+    let mut retry = progress();
+    retry.quarantine_retryable_body(fp, &p, quarantine_retry_after(fp));
+    retry.active_quarantine_retries.insert(fp.clone());
+    assert_eq!(witness(&retry, true), w);
+    let mut headed = permanent.clone();
+    headed
+        .accepted_cache_heads
+        .insert(cache_session_key(&item.source_session_id), "e".repeat(64));
+    let mut projected = item.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, &headed, true, false, &BTreeSet::new());
+    assert_eq!(
+        witness(&headed, true),
+        snapshot_upload_body_witness(&projected)
+    );
+    assert!(projected.cache_base_head_etag.is_some());
+    let mut stripped = item.clone();
+    prepare_snapshot_cache_for_upload(&mut stripped, &permanent, false, false, &BTreeSet::new());
+    assert_eq!(
+        witness(&permanent, false),
+        snapshot_upload_body_witness(&stripped)
+    );
 }

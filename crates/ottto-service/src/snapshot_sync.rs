@@ -271,22 +271,32 @@ fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem
                 }))
 }
 
+fn held_cache_head_probe(
+    progress: &SnapshotUploadProgress,
+    item: &SnapshotItem,
+) -> Option<SnapshotItem> {
+    let probe = cache_head_probe(item);
+    (item.cache_observations.is_some()
+        && item.cache_base_head_etag.is_none()
+        && cache_head_probe_held(progress, &probe))
+    .then_some(probe)
+}
+
 fn apply_bootstrapped_cache_heads(
     source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
-) -> Result<usize> {
-    let mut held = 0usize;
+) -> Result<Vec<(String, String, String)>> {
+    let mut held = Vec::new();
     for snapshot in snapshots {
         if snapshot.cache_observations.is_none() {
             continue;
         }
         if snapshot.cache_base_head_etag.is_none() {
-            let probe = cache_head_probe(snapshot);
             // Check the hold before looking up the head: another entity for
             // the same session may have acquired one, but that cannot release
             // this exact body's quarantine or bypass its bounded retry.
-            if cache_head_probe_held(progress, &probe) {
+            if let Some(probe) = held_cache_head_probe(progress, snapshot) {
                 // No cache patch or accepted head is invented. The normal
                 // uploader sees the exact held probe and keeps its quarantine;
                 // healthy siblings retain their own independent settlement.
@@ -297,8 +307,12 @@ fn apply_bootstrapped_cache_heads(
                         "body_witness_hash8": &snapshot_upload_body_witness(&probe)[..8],
                         "saved_head_present": progress.accepted_cache_heads.contains_key(&cache_session_key(&probe.source_session_id))}),
                 );
+                held.push((
+                    snapshot.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(snapshot),
+                    snapshot_upload_body_witness(&probe),
+                ));
                 *snapshot = probe;
-                held = held.saturating_add(1);
                 continue;
             }
         }
@@ -1453,7 +1467,11 @@ fn effective_snapshot_upload_body_witness(
         head_cas_required,
         legacy_pending,
     );
-    snapshot_upload_body_witness(&projected)
+    snapshot_upload_body_witness(
+        held_cache_head_probe(progress, &projected)
+            .as_ref()
+            .unwrap_or(&projected),
+    )
 }
 
 /// One hash-only group per current file. Duplicate source witnesses are not an
@@ -7707,6 +7725,10 @@ fn finish_sync_source(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
+        &mut scan_result.snapshots,
+    );
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -8052,6 +8074,11 @@ fn finish_sync_source(
                     source.api_slug(),
                 );
             })?;
+            index.substitute_file_upload_context_bodies(
+                &mut upload_progress.context_receipt_candidates,
+                &held,
+            );
+            let held = held.len();
             if held > 0 {
                 eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -23149,7 +23176,9 @@ mod tests {
                 }
                 page[1].cache_base_head_etag = Some("d".repeat(64));
                 assert_eq!(
-                    apply_bootstrapped_cache_heads("codex", &mut page, &f.progress).unwrap(),
+                    apply_bootstrapped_cache_heads("codex", &mut page, &f.progress)
+                        .unwrap()
+                        .len(),
                     0
                 );
                 assert_eq!(page[0].cache_base_head_etag, Some("e".repeat(64)));

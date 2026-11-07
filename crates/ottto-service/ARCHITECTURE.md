@@ -108,6 +108,8 @@ non-permanent reasons hold their entity without invalidating sibling ACKs.
 follows the existing dominated, terminal residue path and never becomes an
 accepted-body ACK. Its exact covered body can earn its file's upload-context
 receipt, retiring that file revision's freshness debt while the refusal stays recorded.
+For a held cache-head probe, the file and candidate witnesses track the cache-free
+probe actually offered; the same exact-coverage receipt gates still apply.
 An optional per-record `exposure` observation, written only
 when a fresh permanent refusal is recorded, separates those records from legacy
 ones; a missing or malformed observation keeps a stale record owed, and legacy

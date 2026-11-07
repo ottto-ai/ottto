@@ -494,7 +494,9 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
 
         let mut items = vec![item.clone()];
         assert_eq!(
-            apply_bootstrapped_cache_heads("codex", &mut items, &progress).unwrap(),
+            apply_bootstrapped_cache_heads("codex", &mut items, &progress)
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(
