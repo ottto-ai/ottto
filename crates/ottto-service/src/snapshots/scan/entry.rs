@@ -433,3 +433,40 @@ pub(in crate::snapshots) fn scan_source_roots_with_limit_and_attribution(
         }
     }
 }
+
+/// What `load_inner` found at the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum LoadOrigin {
+    /// Decoded and accepted from an opened file.
+    Loaded,
+    Missing,
+    /// Renamed away as invalid: the path is missing now.
+    Quarantined,
+}
+
+/// What a snapshot-source index load found, outside `snapshots`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanIndexLoadOrigin {
+    Loaded,
+    Missing,
+    /// Renamed away as invalid and rebuilt empty.
+    Quarantined,
+}
+
+impl From<&LoadOrigin> for ScanIndexLoadOrigin {
+    fn from(origin: &LoadOrigin) -> Self {
+        match origin {
+            LoadOrigin::Loaded => Self::Loaded,
+            LoadOrigin::Missing => Self::Missing,
+            LoadOrigin::Quarantined => Self::Quarantined,
+        }
+    }
+}
+
+impl ScanIndexLoadOrigin {
+    /// The one fresh/rebuilt-load definition, before replay can advance the
+    /// generation.
+    pub(crate) fn is_fresh(self, index: &ScanIndex) -> bool {
+        self != Self::Loaded || (index.generation == 0 && index.files.is_empty())
+    }
+}
