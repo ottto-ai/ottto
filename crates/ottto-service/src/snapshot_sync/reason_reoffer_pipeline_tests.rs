@@ -2659,6 +2659,11 @@ fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleRes
     );
     let probe = cache_head_probe(&full);
     assert_ne!(body_set(&full), body_set(&probe));
+    // finish_cycle transfers terminal custody to the index. Restore it as
+    // real preparation does before inspecting the seeded eligibility.
+    cycle
+        .progress
+        .prepare_quarantine_retries(&cycle.index.quarantined_snapshot_fingerprints);
     assert_eq!(
         cycle.progress.quarantined_fingerprints[&probe.snapshot_fingerprint].disposition,
         SnapshotQuarantineDisposition::UnprovenTerminal
