@@ -26297,6 +26297,10 @@ mod tests {
                 .expect("parse zero-owned suffix")
                 .is_empty()
         );
+        // Its closed-archive twin is confirmed-empty; the plain file stays held.
+        let held = parse_codex_test(&zero_owned_path);
+        assert_eq!(held.ownership_incomplete_file_count, 1);
+        assert!(held.non_progressing_residue());
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(incomplete_path);
         let _ = fs::remove_file(zero_owned_path);
