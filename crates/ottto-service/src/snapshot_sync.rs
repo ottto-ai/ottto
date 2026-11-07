@@ -2643,7 +2643,10 @@ impl SnapshotUploadProgress {
         // ref whose digest differs from this body's witness unless its echoed
         // state reproduces that digest with this body's own account and tool
         // parts. Such a ref's echo is the server's stored cache state, and its
-        // digest is this body's witness with that state.
+        // digest is this body's witness with that state. This relies on every
+        // caller passing a ref from a response already validated against this
+        // exact request (`validate_entity_ack_with_head_cas`), as all upload
+        // paths do; a new recording path must validate first.
         let echoed_cache_state = stored
             .filter(|(entity, local_witness)| {
                 value.get("cache_observations").is_some()
