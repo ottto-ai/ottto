@@ -354,6 +354,31 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("removed or changed: comment before mod tests", out)
 
+    def test_rustfmt_skip_on_an_outlined_module_is_formatting_only(self):
+        base = self.repo.commit({src('snapshots.rs'): ROOT + code('''
+
+            #[cfg(test)]
+            mod tests {
+                fn a() {}
+            }
+        ''')})
+        tests = {src('snapshots/tests.rs'): 'fn a() {}\n'}
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n#[cfg(test)]\n#[ rustfmt :: skip ]\nmod tests;\n',
+                                 **tests})
+        status, out = run(self.repo, base, head)
+        self.assertEqual(status, 0, out)
+        self.assertIn('move-ledger: move-only', out)
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n#[cfg(test)]\n#[cfg(unix)]\nmod tests;\n'})
+        status, out = run(self.repo, base, head)
+        self.assertEqual(status, 1)
+        self.assertIn('module attributes changed for fn a', out)
+        head = self.repo.commit({src('snapshots.rs'): ROOT + '\n#[cfg(test)]\n#[rustfmt::skip]\nmod tests;\n',
+                                 src('snapshots/tests.rs'): '#[rustfmt::skip]\nfn a() {}\n'})
+        status, out = run(self.repo, base, head)
+        self.assertEqual(status, 1)
+        self.assertIn('changed: fn a', out)
+        self.assertIn('+#[rustfmt::skip]', out)
+
     def test_include_str_paths_must_reach_the_same_bytes(self):
         reader = 'fn golden() -> &\'static str {\n    include_str!("../fixtures/a.json")\n}\n'
         base = self.repo.commit({src('snapshots.rs'): ROOT + reader, 'crates/demo/fixtures/a.json': '{}\n'})
