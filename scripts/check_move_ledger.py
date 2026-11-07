@@ -38,6 +38,9 @@ punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
 item must match byte for byte. An item must sit under the same module
 attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
 literal must resolve, from its new file, to a target with the same bytes.
+A module's own `#[rustfmt::skip]` is left out of its attributes: a rustfmt tool
+attribute changes formatting only, never the compiled item (an item's own
+`#[rustfmt::skip]` is part of its text and still matches byte for byte).
 In-place edits of the regular files in VALIDATOR_EDITS are listed and not
 checked; adding, deleting or retyping one of them is checked as usual.
 
@@ -74,6 +77,8 @@ VALIDATOR_EDITS = {
     "scripts/test_codex_zst_downgrade.py",
 }
 DIFF_LIMIT = 40
+# Module attributes that change formatting only, compared with whitespace dropped.
+FORMATTING_MODULE_ATTRS = {"#[rustfmt::skip]"}
 
 
 @dataclass
@@ -390,6 +395,7 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
             container: str, strip_vis: bool = True, kind: str = "") -> None:
         text, vis, paths = normalise(lexed, item_first, item_last, depth, path, source, strip_vis)
         end_line = lexed.line(lexed.tokens[item_last].end - 1)
+        chain = frozenset(attr for attr in chain if re.sub(r"\s+", "", attr) not in FORMATTING_MODULE_ATTRS)
         units.append(Unit(path, lexed.line(start), end_line, len(units), label, name, module, chain,
                           depth, container, text, vis, paths, kind))
 
