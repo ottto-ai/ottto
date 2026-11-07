@@ -1,7 +1,6 @@
 //! Discovery retention: the owed-key exemption from the discovery window
-//! shared by every age gate, the account-move observations it is derived
-//! beside, the frozen-window check on an opened candidate, and the effective
-//! backfill window.
+//! shared by every age gate, and the account-move observations it is derived
+//! beside.
 
 use crate::snapshots::*;
 
@@ -113,20 +112,4 @@ mod discovery_support {
             }
         }
     }
-}
-
-pub(in crate::snapshots) fn opened_candidate_is_within_frozen_window(
-    candidate: &CandidateFile,
-    census_unix_seconds: Option<u64>,
-    backfill_window_days: u64,
-) -> bool {
-    census_unix_seconds.map_or(true, |now| {
-        is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
-    })
-}
-
-pub(in crate::snapshots) fn effective_backfill_window_days(
-    requested_backfill_window_days: u64,
-) -> u64 {
-    requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }

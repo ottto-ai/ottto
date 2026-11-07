@@ -1,7 +1,8 @@
 //! Discovery directories: the bounded per-tick directory walk with its entry
 //! budget and test read faults, the recovery check and Claude absence
 //! classification it applies, the bounded reconciliation of indexed keys the
-//! walk did not find, and the recency and first-read windows.
+//! walk did not find, the recency and first-read windows, the frozen-window
+//! check on an opened candidate and the effective backfill window.
 
 use crate::snapshots::*;
 
@@ -886,4 +887,20 @@ pub(in crate::snapshots) fn first_read_aged(
                 || (codex_archive_path(path)
                     && !matches!(state_v2::legacy_archive_was_seen(index, &key), Ok(false)))));
     !read
+}
+
+pub(in crate::snapshots) fn opened_candidate_is_within_frozen_window(
+    candidate: &CandidateFile,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> bool {
+    census_unix_seconds.map_or(true, |now| {
+        is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
+    })
+}
+
+pub(in crate::snapshots) fn effective_backfill_window_days(
+    requested_backfill_window_days: u64,
+) -> u64 {
+    requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
