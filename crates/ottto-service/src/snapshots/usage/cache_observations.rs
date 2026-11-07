@@ -42,6 +42,39 @@ pub(crate) fn cache_state_from_patch(
         json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
     )
 }
+/// A server-echoed completed state (`cache_state_ack:v1`) in this daemon's
+/// accepted-state shape, or None unless it is one: schema 1, a known
+/// coverage, every row parsed, none retracted or repeated, within the
+/// per-session row and byte bounds.
+pub(crate) fn cache_state_from_echo(echo: &Value) -> Option<Value> {
+    if echo.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let coverage = echo.get("coverage")?.as_str()?;
+    if !matches!(coverage, "complete" | "partial") {
+        return None;
+    }
+    let omitted = match echo
+        .get("omitted_observation_count")
+        .unwrap_or(&Value::Null)
+    {
+        Value::Null => None,
+        count => Some(count.as_u64()?),
+    };
+    let rows = echo.get("observations")?.as_array()?;
+    if rows.len() > cache_observations::MAX_ROWS {
+        return None;
+    }
+    let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
+    for row in rows {
+        let row = serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
+        if observations.insert(row.event_id.clone(), row).is_some() {
+            return None;
+        }
+    }
+    let state = json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":coverage,"omitted_observation_count":omitted});
+    cache_state_within_limits(&state).then_some(state)
+}
 /// Preflight the exact wire and its completion against the ACKed predecessor.
 /// Partial coverage never authorizes deletion, including after budget trimming.
 pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {

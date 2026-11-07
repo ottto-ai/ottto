@@ -879,6 +879,46 @@ pub struct SnapshotEntityRef {
     /// default-empty; older servers never send it. Read, never persisted.
     #[serde(default)]
     pub retained_proof_missing: Vec<String>,
+    /// `cache_state_ack:v1`, stored-body refs only: the server-completed
+    /// cache state behind this ref's witness. Adopted only after it
+    /// reproduces that witness with this body's own parts. Older servers
+    /// never send it.
+    #[serde(default)]
+    pub cache_observations_state: Option<CacheStateEcho>,
+}
+
+/// The echoed cache state as sent; bounded by the server's state limits and
+/// read only while its ACK is validated and recorded.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct CacheStateEcho(pub Value);
+
+// Refs order by their fields; an echo orders by its JSON text.
+impl PartialOrd for CacheStateEcho {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CacheStateEcho {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.to_string().cmp(&other.0.to_string())
+    }
+}
+
+/// `cache_state_ack:v1`: the server's stored cache state for a cache-bearing
+/// body whose digest differs from the local witness because that state holds
+/// rows this daemon never learned. Some only when the echo is a valid state
+/// and this body's own account and tool parts with it hash to the server's
+/// digest exactly.
+pub(crate) fn settled_cache_state_echo(
+    reference: &SnapshotEntityRef,
+    item: &crate::snapshots::SnapshotItem,
+) -> Option<Value> {
+    let state =
+        crate::snapshots::cache_state_from_echo(&reference.cache_observations_state.as_ref()?.0)?;
+    let witness = crate::snapshots::snapshot_upload_body_witness_with_cache_state(item, &state)?;
+    (reference.body_witness_digest.as_deref() == Some(witness.as_str())).then_some(state)
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1186,6 +1226,7 @@ impl SnapshotBatchResponse {
         }
         let mut first = None;
         let mut bad_refs = 0_usize;
+        let mut echo_settled = 0_usize;
         let mut named = std::collections::BTreeSet::new();
         let accepted = self.accepted_entities.iter().map(|r| ("accepted", r));
         let unchanged = self.unchanged_entities.iter().map(|r| ("unchanged", r));
@@ -1202,6 +1243,10 @@ impl SnapshotBatchResponse {
             else {
                 continue;
             };
+            if reason == "digest_mismatch" && settled_cache_state_echo(reference, item).is_some() {
+                echo_settled += 1;
+                continue;
+            }
             // Keep walking after the first refusal: every bad ref is named,
             // and the one diagnostic line counts them all.
             bad_refs += 1;
@@ -1219,6 +1264,11 @@ impl SnapshotBatchResponse {
                     *item,
                 ));
             }
+        }
+        if echo_settled > 0 {
+            eprintln!(
+                "local snapshot ACK settled {echo_settled} body witness(es) through the server's echoed cache state"
+            );
         }
         let Some((reason, class, reference, expected_version, answered, item)) = first else {
             return Ok(());
@@ -1295,6 +1345,7 @@ impl SnapshotBatchResponse {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent
@@ -1379,11 +1430,16 @@ fn warn_body_witness_refusal(
     });
     let line = format!(
         "warning: local snapshot ACK body witness refused: reason={reason} class={class} \
-         session_hash={} fingerprint={} witness_version={expected_version} \
+         session_hash={} fingerprint={} witness_version={expected_version} echoed_digest={} \
          echoed_witness_version={} bad_refs={bad_refs} answered={answered} \
          expected_digest={} account_part={} tool_part={} cache_part={}",
         crate::snapshot_sync::SessionHash::of(&reference.source_session_id),
         reference.snapshot_fingerprint.get(..8).unwrap_or_default(),
+        reference
+            .body_witness_digest
+            .as_deref()
+            .and_then(|digest| digest.get(..8))
+            .unwrap_or("none"),
         reference
             .body_witness_version
             .map_or_else(|| "none".to_string(), |version| version.to_string()),
@@ -4713,6 +4769,7 @@ mod tests {
             head_challenge: None,
             unchanged_basis: None,
             retained_proof_missing: Vec::new(),
+            cache_observations_state: None,
         }
     }
 
@@ -4845,7 +4902,7 @@ mod tests {
             format!(
                 "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
                  class=accepted session_hash={} fingerprint={} witness_version={version} \
-                 echoed_witness_version={version} bad_refs=2 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
+                 echoed_digest=00000000 echoed_witness_version={version} bad_refs=2 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
                 crate::snapshot_sync::SessionHash::of(&first.source_session_id),
                 &first.snapshot_fingerprint[..8],
                 &crate::snapshots::snapshot_upload_body_witness(first)[..8],
@@ -4881,6 +4938,158 @@ mod tests {
         let (request, ack) = witnessed_ack();
         ack.validate_entity_ack(&request).unwrap();
         assert!(BODY_WITNESS_REFUSALS.with(|lines| lines.borrow().is_empty()));
+    }
+
+    /// `cache_state_ack:v1`: an accepted and an unchanged ref whose digests
+    /// cover server-held cache rows these bodies never sent settle only when
+    /// the echoed state, with each body's own account and tool parts,
+    /// reproduces the digest. Every other echo is refused as before.
+    #[test]
+    fn echoed_cache_state_settles_only_an_exact_digest_reproduction() {
+        let (request, ack) = witnessed_ack();
+        let stored = |item: &crate::snapshots::SnapshotItem, state: &Value| {
+            let mut hashed = item.clone();
+            hashed.cache_observations_state = Some(state.clone());
+            crate::snapshots::snapshot_upload_body_witness(&hashed)
+        };
+        let mut server = request.snapshots[0]
+            .cache_observations_state
+            .clone()
+            .unwrap();
+        let mut stray = server["observations"][0].clone();
+        stray["event_id"] = json!(format!("cache:{}", "d".repeat(64)));
+        let rows = server["observations"].as_array_mut().unwrap();
+        rows.push(stray);
+        // The receiver's completed state lists rows by event id.
+        rows.sort_by(|a, b| a["event_id"].as_str().cmp(&b["event_id"].as_str()));
+        let digests = [
+            stored(&request.snapshots[0], &server),
+            stored(&request.snapshots[1], &server),
+        ];
+        let echoed = |digest: [&str; 2], echo: Option<&Value>| {
+            let mut ack = ack.clone();
+            for (reference, digest) in [
+                &mut ack.accepted_entities[0],
+                &mut ack.unchanged_entities[0],
+            ]
+            .into_iter()
+            .zip(digest)
+            {
+                reference.body_witness_digest = Some(digest.to_string());
+                reference.cache_observations_state = echo.cloned().map(CacheStateEcho);
+            }
+            ack
+        };
+        let settled = echoed([digests[0].as_str(), digests[1].as_str()], Some(&server));
+        settled.validate_entity_ack(&request).unwrap();
+        assert!(BODY_WITNESS_REFUSALS.with(|lines| lines.borrow().is_empty()));
+        assert_eq!(
+            settled_cache_state_echo(&settled.accepted_entities[0], &request.snapshots[0]),
+            Some(server.clone())
+        );
+
+        let refused = |ack: SnapshotBatchResponse| {
+            let error = ack.validate_entity_ack(&request).unwrap_err();
+            assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
+            let lines =
+                BODY_WITNESS_REFUSALS.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        // No echo: today's refusal, now naming the echoed digest prefix.
+        let line = refused(echoed([digests[0].as_str(), digests[1].as_str()], None));
+        assert!(
+            line.contains(&format!(" echoed_digest={} ", &digests[0][..8])),
+            "{line}"
+        );
+        assert!(line.contains(" bad_refs=2 "), "{line}");
+        // Not a state: an unparseable row, a retracted row, a repeated row.
+        let edits: [fn(&mut Value); 3] = [
+            |state: &mut Value| state["observations"][0] = json!({"event_id": "x"}),
+            |state: &mut Value| state["observations"][0]["status"] = json!("retracted"),
+            |state: &mut Value| {
+                let row = state["observations"][0].clone();
+                state["observations"].as_array_mut().unwrap().push(row);
+            },
+        ];
+        for edit in edits {
+            let mut bad = server.clone();
+            edit(&mut bad);
+            let digests = [
+                stored(&request.snapshots[0], &bad),
+                stored(&request.snapshots[1], &bad),
+            ];
+            refused(echoed(
+                [digests[0].as_str(), digests[1].as_str()],
+                Some(&bad),
+            ));
+        }
+        // Over the row bound, even when it hashes to the digest.
+        let mut over = server.clone();
+        let row = server["observations"][0].clone();
+        over["observations"] = (0..=crate::snapshots::cache_observations::MAX_ROWS)
+            .map(|n| {
+                let mut row = row.clone();
+                row["event_id"] = json!(format!("cache:{n:064x}"));
+                row
+            })
+            .collect();
+        let digests = [
+            stored(&request.snapshots[0], &over),
+            stored(&request.snapshots[1], &over),
+        ];
+        refused(echoed(
+            [digests[0].as_str(), digests[1].as_str()],
+            Some(&over),
+        ));
+        // A valid state that is not the one hashed into the digest.
+        let local = request.snapshots[0].cache_observations_state.clone();
+        let digests = [
+            stored(&request.snapshots[0], &server),
+            stored(&request.snapshots[1], &server),
+        ];
+        refused(echoed(
+            [digests[0].as_str(), digests[1].as_str()],
+            local.as_ref(),
+        ));
+        // A digest over another body's tool part.
+        let mut other = request.snapshots[0].clone();
+        other.tool_usage_truncated = !other.tool_usage_truncated;
+        let other_digest = stored(&other, &server);
+        let line = refused(echoed(
+            [other_digest.as_str(), digests[1].as_str()],
+            Some(&server),
+        ));
+        assert!(line.contains(" bad_refs=1 "), "{line}");
+        // A version mismatch is refused whatever the echo.
+        let mut ack = echoed([digests[0].as_str(), digests[1].as_str()], Some(&server));
+        ack.accepted_entities[0].body_witness_version = Some(3);
+        let line = refused(ack);
+        assert!(line.contains("reason=version_mismatch "), "{line}");
+    }
+
+    /// Only cache-bearing batches ask for the echo; every other batch keeps
+    /// its exact bytes.
+    #[test]
+    fn only_cache_bearing_batches_request_the_cache_state_echo() {
+        let (request, _) = witnessed_ack();
+        for wire in [
+            serde_json::to_value(&request).unwrap(),
+            serde_json::to_value(request.wire_with_head_cas()).unwrap(),
+        ] {
+            assert_eq!(wire["cache_state_ack_contract"], "cache_state_ack:v1");
+        }
+        let mut plain = request.clone();
+        for item in &mut plain.snapshots {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+        }
+        for wire in [
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::to_value(plain.wire_with_head_cas()).unwrap(),
+        ] {
+            assert!(wire.get("cache_state_ack_contract").is_none());
+        }
     }
 
     #[test]
@@ -4966,6 +5175,7 @@ mod tests {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             }],
         );
         let reference = &ack.accepted_entities[0];

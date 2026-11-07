@@ -47,6 +47,7 @@ pub(crate) fn exact_acks(
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
+                            cache_observations_state: None,
                         })
                         .collect(),
                 unchanged_entities: Vec::new(),
@@ -496,6 +497,7 @@ impl Uploader {
                             head_challenge: None,
                             unchanged_basis: not_stored.then(|| "usage_identical".into()),
                             retained_proof_missing: Vec::new(),
+                            cache_observations_state: None,
                         })
                         .collect::<Vec<_>>();
                 let response = crate::snapshot_client::SnapshotBatchResponse {

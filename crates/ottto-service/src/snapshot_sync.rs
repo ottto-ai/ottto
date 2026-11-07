@@ -2639,6 +2639,18 @@ impl SnapshotUploadProgress {
             return Ok(());
         };
         self.accepted_identity_buckets.record(&value);
+        // `cache_state_ack:v1`: ACK validation refuses a cache-bearing stored
+        // ref whose digest differs from this body's witness unless its echoed
+        // state reproduces that digest with this body's own account and tool
+        // parts. Such a ref's echo is the server's stored cache state, and its
+        // digest is this body's witness with that state.
+        let echoed_cache_state = stored
+            .filter(|(entity, local_witness)| {
+                value.get("cache_observations").is_some()
+                    && entity.body_witness_digest.as_deref() != Some(*local_witness)
+            })
+            .and_then(|(entity, _)| entity.cache_observations_state.as_ref())
+            .and_then(|echo| crate::snapshots::cache_state_from_echo(&echo.0));
         if let Some((entity, local_witness)) = stored {
             // Mirrors `snapshot_ack_body_witness_version`'s public domains.
             let versioned_body = ["session_account_evidence", "cache_observations"]
@@ -2647,7 +2659,8 @@ impl SnapshotUploadProgress {
             let witnessed = self.accepted_identity_buckets.retained_enabled()
                 && versioned_body
                 && entity.body_witness_version.is_some()
-                && entity.body_witness_digest.as_deref() == Some(local_witness);
+                && (entity.body_witness_digest.as_deref() == Some(local_witness)
+                    || echoed_cache_state.is_some());
             if witnessed || !entity.retained_proof_missing.is_empty() {
                 self.accepted_identity_buckets.record_proved(
                     &value,
@@ -2666,10 +2679,17 @@ impl SnapshotUploadProgress {
         let Some(patch) = value.get("cache_observations") else {
             return Ok(());
         };
-        let patch = serde_json::from_value(patch.clone())?;
-        let state =
-            crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch)
-                .ok_or_else(|| anyhow!("cache observations have unparseable accepted state"))?;
+        let state = match echoed_cache_state {
+            Some(state) => state,
+            None => {
+                let patch = serde_json::from_value(patch.clone())?;
+                crate::snapshots::cache_state_from_patch(
+                    self.accepted_cache_states.get(&key),
+                    &patch,
+                )
+                .ok_or_else(|| anyhow!("cache observations have unparseable accepted state"))?
+            }
+        };
         self.accepted_cache_states.insert(key, state);
         Ok(())
     }
@@ -12806,6 +12826,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -13026,6 +13047,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     })
                     .collect();
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -13074,6 +13096,7 @@ mod tests {
                             .then(|| "c".repeat(64)),
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     };
                     if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
                         response.conflict_entities.push(reference);
@@ -13206,6 +13229,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -13320,6 +13344,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -13429,6 +13454,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -13597,6 +13623,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 });
             ack.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(ack)
@@ -13933,6 +13960,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack(&request)?;
                 Ok(response)
@@ -14018,6 +14046,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, enforce)?;
                 Ok(response)
@@ -14069,6 +14098,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 response.validate_entity_ack_with_head_cas(&request, true)?;
                 Ok(response)
@@ -14159,6 +14189,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 };
                 if enforce {
                     response.unchanged_entities.push(reference);
@@ -14232,6 +14263,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: basis.map(str::to_string),
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 });
             let mut progress = test_upload_progress();
             let mut requests = 0;
@@ -14318,6 +14350,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: unchanged.then(|| basis.to_string()),
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 };
                 if unchanged {
                     response.unchanged_entities.push(reference);
@@ -14429,6 +14462,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 };
                 if outcome == "accepted" {
                     response.accepted_entities.push(reference);
@@ -14485,6 +14519,7 @@ mod tests {
                             head_challenge: None,
                             unchanged_basis: None,
                             retained_proof_missing: Vec::new(),
+                            cache_observations_state: None,
                         });
                     let mut request = request.clone();
                     request.snapshots = items;
@@ -14628,6 +14663,7 @@ mod tests {
                     head_challenge: None,
                     unchanged_basis: None,
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 });
             response.validate_entity_ack(&request).unwrap();
             let mut accepted = 0;
@@ -14804,6 +14840,7 @@ mod tests {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),
@@ -15175,6 +15212,7 @@ mod tests {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             };
             let response = crate::snapshot_client::SnapshotBatchResponse {
                 conflict_rescans: Default::default(),
@@ -15450,6 +15488,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     }],
                 })
             },
@@ -15814,6 +15853,7 @@ mod tests {
             head_challenge: None,
             unchanged_basis: None,
             retained_proof_missing: Vec::new(),
+            cache_observations_state: None,
         }
     }
 
@@ -15913,6 +15953,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -23935,6 +23976,7 @@ mod tests {
                         head_challenge: None,
                         unchanged_basis: None,
                         retained_proof_missing: Vec::new(),
+                        cache_observations_state: None,
                     });
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,

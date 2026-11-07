@@ -88,6 +88,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
                     head_challenge: None,
                     unchanged_basis: (!stored).then(|| "usage_identical".into()),
                     retained_proof_missing: Vec::new(),
+                    cache_observations_state: None,
                 };
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
                     conflict_rescans: Default::default(),
@@ -255,6 +256,7 @@ fn retained_ack(
                 head_challenge: None,
                 unchanged_basis: (!stored).then(|| "usage_identical".into()),
                 retained_proof_missing: missing.clone(),
+                cache_observations_state: None,
             };
             Ok(crate::snapshot_client::SnapshotBatchResponse {
                 conflict_rescans: Default::default(),

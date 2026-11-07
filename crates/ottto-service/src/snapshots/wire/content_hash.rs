@@ -257,8 +257,24 @@ pub(in crate::snapshots) fn snapshot_upload_body_witness_payload(
 /// bytes match the backend accepted-log/body-witness contract exactly. Local
 /// progress keys it by fingerprint separately.
 pub(crate) fn snapshot_upload_body_witness(item: &SnapshotItem) -> String {
-    let payload = snapshot_upload_body_witness_payload(item);
-    let canonical = crate::canonical_json::canonicalize(&payload)
+    body_witness_digest(&snapshot_upload_body_witness_payload(item))
+}
+
+/// The witness of a cache-bearing `item` with `state` as its completed cache
+/// state (`cache_state_ack:v1`): only the cache part differs from
+/// `snapshot_upload_body_witness`. None for a body without a cache patch.
+pub(crate) fn snapshot_upload_body_witness_with_cache_state(
+    item: &SnapshotItem,
+    state: &Value,
+) -> Option<String> {
+    item.cache_observations.as_ref()?;
+    let mut payload = snapshot_upload_body_witness_payload(item);
+    payload["cache_observations_state"] = state.clone();
+    Some(body_witness_digest(&payload))
+}
+
+fn body_witness_digest(payload: &Value) -> String {
+    let canonical = crate::canonical_json::canonicalize(payload)
         .expect("snapshot additive body witness canonicalizes");
     format!("{:x}", Sha256::digest(canonical))
 }

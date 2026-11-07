@@ -1108,6 +1108,7 @@ mod tests {
                 head_challenge: None,
                 unchanged_basis: None,
                 retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),

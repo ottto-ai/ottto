@@ -16,10 +16,10 @@ use super::{
     snapshot_source_from_api_slug, CacheObservations, ClaudeCompactionObservation, ClaudeFileBirth,
     ClaudeFileBirthVerdict, ClaudeTranscriptUsageOccurrence, LocalContextPoint, OwnedRequest,
     SnapshotCompactionEvent, SnapshotContextCurve, SnapshotSessionStart, SnapshotUploadPolicy,
-    CLAUDE_CODE_SCAN_IDENTITY_VERSION, CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
-    CODEX_SCAN_IDENTITY_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SCAN_IDENTITY_VERSION,
-    PI_SNAPSHOT_PARSER_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT, SNAPSHOT_HEAD_CAS_CONTRACT,
-    USAGE_DECREASE_HOLD_ACK_CONTRACT,
+    CACHE_STATE_ACK_CONTRACT, CLAUDE_CODE_SCAN_IDENTITY_VERSION,
+    CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SCAN_IDENTITY_VERSION,
+    CODEX_SNAPSHOT_PARSER_VERSION, PI_SCAN_IDENTITY_VERSION, PI_SNAPSHOT_PARSER_VERSION,
+    SNAPSHOT_ENTITY_ACK_CONTRACT, SNAPSHOT_HEAD_CAS_CONTRACT, USAGE_DECREASE_HOLD_ACK_CONTRACT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +229,14 @@ fn serialize_snapshot_batch<S: Serializer>(
     }
     if enforce_head_cas {
         state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
+    }
+    // Only cache-bearing batches opt in; every other batch keeps its bytes.
+    if request
+        .snapshots
+        .iter()
+        .any(|item| item.cache_observations.is_some())
+    {
+        state.serialize_field("cache_state_ack_contract", CACHE_STATE_ACK_CONTRACT)?;
     }
     state.serialize_field("snapshots", &snapshots)?;
     state.serialize_field("client_report", &request.client_report)?;

@@ -40,6 +40,7 @@ fn claude_cache_rows_keep_the_stored_body_ack() {
         head_challenge: None,
         unchanged_basis: None,
         retained_proof_missing: Vec::new(),
+        cache_observations_state: None,
     };
     let ack = |progress: &mut SnapshotUploadProgress, body: &Value| {
         progress
@@ -105,6 +106,7 @@ fn claude_marked_patch_records_from_empty_on_the_stored_ack() {
         head_challenge: None,
         unchanged_basis: None,
         retained_proof_missing: Vec::new(),
+        cache_observations_state: None,
     };
     let key = cache_session_key(SESSION);
     let mut stale_row =
