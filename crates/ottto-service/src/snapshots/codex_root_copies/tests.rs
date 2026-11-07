@@ -126,7 +126,7 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
             let row = &metadata.root_sidecars[root.parent().unwrap()].threads[id];
             let path = Path::new(row.rollout_path.as_deref().unwrap());
             let (bound, extent) = metadata.thread_extent_for_path(id, path);
-            assert_eq!(bound.unwrap(), row);
+            assert_eq!(bound.unwrap(), &**row);
             assert!(extent.unwrap().next_byte_offset > 0);
             assert!(path.starts_with(root));
             if root == &fixture.roots[1] {
@@ -377,10 +377,10 @@ fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
         (4, "2026-10-01T10:04:00.200Z"),
     ] {
         let root = fixture.roots[root_index].parent().unwrap();
-        let mut row = loaded.root_sidecars[root].threads[&fixture.ids[0]].clone();
+        let mut row = CodexStateThread::clone(&loaded.root_sidecars[root].threads[&fixture.ids[0]]);
         row.tokens_used = 400;
         row.updated_at = Some(updated.to_string());
-        let threads = BTreeMap::from([(fixture.ids[0].clone(), row)]);
+        let threads = BTreeMap::from([(fixture.ids[0].clone(), Shared::from(row))]);
         merge_threads(&mut metadata, root, &threads);
         metadata.root_sidecars.insert(
             root.to_path_buf(),
@@ -422,5 +422,55 @@ fn parsed_state_evidence_comes_from_the_physical_home_even_if_a_stale_home_claim
     assert_eq!(
         scan.snapshots[0].snapshot_fingerprint,
         before.snapshots[0].snapshot_fingerprint
+    );
+}
+
+#[test]
+fn selected_state_row_shares_its_home_row_and_keeps_fingerprint_bytes() {
+    let fixture = Fixture::new(1);
+    let loaded = fixture.metadata();
+    let id = &fixture.ids[0];
+    let home = fixture.roots[1].parent().unwrap();
+    assert!(
+        Shared::ptr_eq(
+            &loaded.state_threads[id],
+            &loaded.root_sidecars[home].threads[id]
+        ),
+        "the loader keeps one allocation for a home row and its merged selection"
+    );
+
+    let id = "aaaaaaaa-bbbb-4ccc-8ddd-0000000000ff";
+    let home = Path::new("/codex-home");
+    let path = format!("/codex-home/sessions/2026/11/07/rollout-2026-11-07T10-00-00-{id}.jsonl");
+    let threads = BTreeMap::from([(
+        id.to_string(),
+        Shared::from(CodexStateThread {
+            title: Some("Shared row".to_string()),
+            tokens_used: 400,
+            archived: false,
+            created_at: Some("2026-11-07T10:00:00Z".to_string()),
+            updated_at: Some("2026-11-07T10:05:00Z".to_string()),
+            model: Some("gpt-5.2".to_string()),
+            rollout_path: Some(path),
+        }),
+    )]);
+    let mut metadata = CodexTitleMetadata::default();
+    merge_threads(&mut metadata, home, &threads);
+    metadata.root_sidecars.insert(
+        home.to_path_buf(),
+        RootSidecar {
+            threads,
+            extents: BTreeMap::new(),
+        },
+    );
+    assert!(Shared::ptr_eq(
+        &metadata.state_threads[id],
+        &metadata.root_sidecars[home].threads[id]
+    ));
+    // Golden value of the `codex_session_sidecar:v4` parts for this row, as
+    // computed when each map held its own copy.
+    assert_eq!(
+        metadata.session_sidecar_fingerprint(id),
+        "b52757c57747fb3a72a1e20ce002f5fe08b270a5c26e8e5822f4ba183282f2d5"
     );
 }
