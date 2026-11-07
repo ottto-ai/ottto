@@ -91,7 +91,7 @@ where
 
 /// Lowercase hex of [`snapshot_file_upload_body_set_digest`], as
 /// finalization records it.
-pub(in crate::snapshots) fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
+pub(crate) fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
