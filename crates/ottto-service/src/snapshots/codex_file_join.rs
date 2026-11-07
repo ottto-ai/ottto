@@ -1452,6 +1452,20 @@ fn independent_member_placement(
     Ok(raw)
 }
 
+/// A forked independent member may fold only when its header references the
+/// parent history instead of carrying it: a paginated header that is either
+/// the fork's own creation header (its ordinals start at the parent's base
+/// end) or a revert whose base is this same session. Its physical records are
+/// then its own, and a record repeated across members still refuses as an
+/// admitted-key overlap. Members of different fork parents differ in
+/// classification.
+fn independent_fork_references_prefix(value: &Value, meta: &Value, owner: &str) -> bool {
+    let base =
+        resolve_codex_identity_option(codex_identity_at(meta, &["history_base", "thread_id"]));
+    string_eq_at(meta, &["history_mode"], "paginated")
+        && (codex_paginated_fork_creation_header(value, meta) || base.as_deref() == Some(owner))
+}
+
 /// The group proof, fed inside the one native replay: the native side in
 /// `TierReplay::observe`, the UI side by the parser admission tap (S10)
 /// after actual admission. It moves from member to member with the replay.
@@ -1462,7 +1476,7 @@ pub(super) struct StreamProof {
     v2: bool,
     independent: bool,
     independent_placement: Option<Option<(String, String)>>,
-    independent_classification: Option<(Option<String>, Option<String>)>,
+    independent_classification: Option<(Option<String>, Option<String>, Option<String>)>,
     plans: Vec<MemberPlan>,
     seen: Vec<MemberSeen>,
     position: usize,
@@ -1612,7 +1626,8 @@ impl StreamProof {
                     return Err(JoinRefusal::Overlap);
                 }
                 if self.independent {
-                    if meta.get("forked_from_id").is_some_and(|v| !v.is_null())
+                    if (meta.get("forked_from_id").is_some_and(|v| !v.is_null())
+                        && !independent_fork_references_prefix(value, meta, &self.owner))
                         || meta
                             .get("subagent_history_start_ordinal")
                             .is_some_and(|v| !v.is_null())
@@ -1629,6 +1644,9 @@ impl StreamProof {
                     let classification = (
                         string_at(meta, &["thread_source"]),
                         meta.get("source").map(Value::to_string),
+                        meta.get("forked_from_id")
+                            .filter(|v| !v.is_null())
+                            .map(Value::to_string),
                     );
                     if self
                         .independent_placement
