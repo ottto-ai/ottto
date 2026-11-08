@@ -46,11 +46,12 @@ Preconditions (move mode; each failure names the rule):
      or head; moved files are module files only (never reached by include!);
      a moved non-.rs file keeps its place in its subtree's directory;
   2. macros: moved files carry no `#[macro_use]`, no `macro_rules!` whose
-     transcriber has `super` or a relative `a::b` path (other than `$crate`,
-     `crate`, `Self`, std/core/alloc and extern crates), and only allowlisted
-     attributes and derives (ALLOWED_ATTRS, ALLOWED_DERIVES); macros invoked
-     in moved files expand without `super` or location macros; parents carry
-     no derive outside ALLOWED_DERIVES;
+     transcriber has `super` (other relative heads such as `ffi::` or `self::`
+     resolve at the call site, which either moves with the subtree, keeping its
+     module identity, or does not move), and only allowlisted attributes and
+     derives (ALLOWED_ATTRS, ALLOWED_DERIVES); macros invoked in moved files
+     expand without `super` or location macros; parents carry no derive outside
+     ALLOWED_DERIVES;
   3. item-level macro invocations in the old parent, the new parent and moved
      files are `macro_rules!` definitions, `thread_local!`, or ITEM_MACROS whose
      every crate definition emits no `use`/`mod`/`extern`/`macro_rules`/include
@@ -147,10 +148,13 @@ ALLOWED_ATTRS = {
     "cfg", "cfg_attr", "test", "allow", "warn", "deny", "expect", "must_use", "inline", "doc",
     "non_exhaustive", "repr", "derive", "serde",
     "default",  # the helper of derive(Default) on enum variants
+    "ignore", "should_panic",  # std test attributes
+    "serial", "serial_test::serial",  # test scheduling only
+    "error", "from",  # thiserror::Error helpers: format strings and From impls, context-free
 }
 ALLOWED_DERIVES = {
     "Debug", "Clone", "Copy", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", "Default",
-    "Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize",
+    "Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize", "thiserror::Error",
 }
 # Crate macros allowed at module item level once verified (crate_macros): they emit no import.
 ITEM_MACROS = {
@@ -163,7 +167,6 @@ STD_ITEM_MACROS = {"thread_local"}
 EMITS = {"use", "mod", "extern", "macro_rules", "include", "include_str", "include_bytes"}
 LOCATION_MACROS = {"file", "line", "column", "module_path"}
 LOCATION_IDENTS = {"type_name", "type_name_of_val", "track_caller"}
-ABSOLUTE_HEADS = {"crate", "Self", "std", "core", "alloc"}
 DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 LIMITS = (
     "log/trace targets that logging macros derive from module_path!, and panic Location strings, change "
@@ -740,7 +743,6 @@ class MacroDef:
     emits: list[str]  # item-level tokens that could add bindings (EMITS), unreadable rules
     has_super: bool
     location: bool  # file!/line!/column!/module_path!/type_name.. in a transcriber
-    relative: list[str]  # relative `a::b` path heads in transcribers
     glob_use: bool
     hidden: list[str] = field(default_factory=list)  # include macros, out-of-line `mod x;`, path attributes
 
@@ -777,10 +779,10 @@ def location_at(lx: rst.Lexed, index: int) -> bool:
     return word in LOCATION_IDENTS
 
 
-def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int, externs: set[str]) -> MacroDef:
+def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int) -> MacroDef:
     rules = transcribers(lx, group)
     definition = MacroDef(path, ordinal, set(), [] if rules is not None else ["unreadable rules"], False, False,
-                          [], False)
+                          False)
     for _index, _names, has_path in shape_of(lx).attrs:
         if has_path and group < _index < lx.match[group]:
             definition.hidden.append("a path attribute")
@@ -824,10 +826,6 @@ def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int, externs: set[s
                 definition.glob_use = True
             if lx.is_punct(nxt, "!") and word not in KEYWORDS and not dollar:
                 definition.invoked.add(word)
-            continuation = k >= 2 and lx.is_punct(k - 1, ":") and lx.is_punct(k - 2, ":") or lx.is_punct(k - 1, ".")
-            if (is_path_sep(lx, nxt) and not dollar and not continuation and word not in ABSOLUTE_HEADS
-                    and word not in externs and word not in KEYWORDS):
-                definition.relative.append(word)
     return definition
 
 
@@ -837,7 +835,7 @@ def _statement_end(lx: rst.Lexed, index: int, hi: int) -> int:
     return min(index, hi)
 
 
-def crate_macros(tree: rst.Tree, source: rst.Source, externs: set[str]) -> dict[str, list[MacroDef]]:
+def crate_macros(tree: rst.Tree, source: rst.Source) -> dict[str, list[MacroDef]]:
     found: dict[str, list[MacroDef]] = defaultdict(list)
     for path in sorted(tree.contexts):
         lx = source.lexed(path)
@@ -846,7 +844,7 @@ def crate_macros(tree: rst.Tree, source: rst.Source, externs: set[str]) -> dict[
             if lx.is_ident(i, "macro_rules") and lx.is_punct(code[pos + 1], "!") and lx.is_ident(code[pos + 2]):
                 name, group = lx.tok(code[pos + 2]), code[pos + 3]
                 if group in lx.match:
-                    found[name].append(macro_def(lx, path, len(found[name]), group, externs))
+                    found[name].append(macro_def(lx, path, len(found[name]), group))
     return found
 
 
@@ -1261,7 +1259,7 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
     mapped = lambda path: mine.get(path, path)  # noqa: E731
     canon_head = lambda path: inverse.get(path, path)  # noqa: E731
     externs = extern_names(head, crate, head_tree) | extern_names(base, crate, base_tree)
-    base_macros, head_macros = crate_macros(base_tree, base, externs), crate_macros(head_tree, head, externs)
+    base_macros, head_macros = crate_macros(base_tree, base), crate_macros(head_tree, head)
     edition = crate_edition(base, crate)
     if crate_edition(head, crate) != edition:
         result.fail(f"{crate}: the edition changes")
@@ -1738,9 +1736,6 @@ def _check_moved_file(src, lx, info, root, macros, result) -> None:
                 continue
             if definition.has_super:
                 result.fail(f"rule 2 (macros): {src}: macro_rules! {name} has `super` in a transcriber")
-            if definition.relative:
-                result.fail(f"rule 2 (macros): {src}: macro_rules! {name} has relative path "
-                            f"`{definition.relative[0]}::..` in a transcriber")
     invoked = {lx.tok(k) for k in code if lx.is_ident(k) and lx.tok(k) not in KEYWORDS
                and lx.is_punct(lx.next_code(k + 1), "!") and not inside([(a, b, "") for a, b in macro_bodies], k)}
     for name in sorted(invoked):
@@ -1880,7 +1875,7 @@ def _check_absolutize(changes, base, head, result) -> None:
             head_tree, _lib, head_layout = target_tree(head, crate)
             for problem in dict.fromkeys(layout + head_layout):
                 result.fail(f"rule 8 (targets): {problem}")
-            trees[crate] = (base_tree, head_tree, crate_macros(base_tree, base, extern_names(base, crate, base_tree)))
+            trees[crate] = (base_tree, head_tree, crate_macros(base_tree, base))
         base_tree, head_tree, macros = trees[crate]
         b, h = single(base_tree, path), single(head_tree, path)
         if b is None or h is None or b.module != h.module:

@@ -225,6 +225,72 @@ class MoveAccepts(Base):
         self.assertTrue(any('after removing `mod upload;`' in line for line in result.lines), result.lines)
 
 
+    def test_std_test_serial_and_thiserror_attributes(self):
+        tests = OLD_TESTS + code('''
+
+            #[test]
+            #[ignore]
+            fn slow() {}
+
+            #[test]
+            #[should_panic(expected = "boom")]
+            fn boom() {
+                panic!("boom");
+            }
+
+            #[test]
+            #[serial]
+            fn serial_one() {}
+
+            #[test]
+            #[serial_test::serial]
+            fn serial_two() {}
+        ''')
+        error = code('''
+
+            #[derive(Debug, thiserror::Error)]
+            pub(crate) enum Failure {
+                #[error("bad value {0}")]
+                Bad(u8),
+                #[error(transparent)]
+                Io(#[from] std::io::Error),
+            }
+        ''')
+        base = files(**{'snapshots/old.rs': OLD + error, 'snapshots/old/tests.rs': tests})
+        base['crates/demo/Cargo.toml'] = CARGO + 'serial_test = "3"\nthiserror = "2"\n'
+        head = moved(base, BASIC_MOVE) | {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
+        self.accept(base, head)
+
+    def test_relative_transcriber_heads_invoked_inside_the_subtree(self):
+        extra = code('''
+
+            mod ffi {
+                pub(crate) fn x() -> u8 {
+                    2
+                }
+            }
+
+            fn y() -> u8 {
+                3
+            }
+
+            macro_rules! local {
+                () => {
+                    ffi::x() + self::y()
+                };
+            }
+
+            pub(crate) fn g() -> u8 {
+                local!()
+            }
+        ''')
+        child = 'macro_rules! via_child {\n    () => {\n        ffi::x()\n    };\n}\n\npub(crate) use via_child;\n'
+        old = OLD + extra + '\nmod child;\n\npub(crate) fn h() -> u8 {\n    child::via_child!()\n}\n'
+        base = files(**{'snapshots/old.rs': old, 'snapshots/old/child.rs': child})
+        head = moved(base, BASIC_MOVE | {'snapshots/old/child.rs': 'snapshots/dest/old/child.rs'})
+        head |= {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
+        self.accept(base, head)
+
 class MoveRejects(Base):
     def basic_head(self, base, **extra):
         head = moved(base, BASIC_MOVE) | {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
@@ -488,6 +554,13 @@ class MoveRejects(Base):
                 base = files(**{'snapshots/old.rs': old, 'snapshots/old/child.rs': child + extra})
                 head = self.basic_head(base) | moved(base, {'snapshots/old/child.rs': 'snapshots/dest/old/child.rs'})
                 self.reject(base, head, 'rule 2 (macros)')
+
+    def test_super_in_a_moved_transcriber(self):
+        for chain in ('super::dest::here()', 'super::super::snapshots::dest::here()'):
+            with self.subTest(chain=chain):
+                extra = f'\nmacro_rules! up {{\n    () => {{\n        {chain}\n    }};\n}}\n'
+                base = files(**{'snapshots/old.rs': OLD + extra})
+                self.reject(base, self.basic_head(base), 'has `super` in a transcriber')
 
     def test_derive_or_macro_generated_glob_in_new_parent(self):
         fallback = 'pub(crate) mod old {\n    pub(crate) fn f() -> u8 {\n        5\n    }\n}\n'
