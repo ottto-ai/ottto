@@ -71,6 +71,7 @@ from pathlib import Path
 import rust_source_tree as rst
 
 TSV = re.compile(r"^scripts/(?:source_layout_[^/]+|test_id_renames)\.tsv$")
+INCLUDES_TSV = "scripts/source_layout_includes.tsv"
 TRIVIA = ("ws", "comment", "doc", "idoc")
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 REGULAR = "100644"
@@ -854,6 +855,8 @@ def _check_move(repo, base_sha, head_sha, changes, base, head, result) -> None:
     for path in sorted(modified - result.glue):
         result.fail(f"{path}: edited, but it is neither glue nor a layout TSV")
     mentions = old_path_mentions(repo, head_sha, base, sorted(pairs))
+    if INCLUDES_TSV in mentions:
+        result.fail(f"{INCLUDES_TSV} still names a moved file's old path; update its rows in the same change")
     if mentions:
         result.notes.append(f"old paths still named (by text) in: {', '.join(mentions[:10])}")
     if tsv:

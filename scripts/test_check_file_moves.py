@@ -471,6 +471,13 @@ class MoveRejects(Base):
         head = self.basic_head(base) | moved(base, {'snapshots/notes.txt': 'snapshots/dest/notes.txt'})
         self.reject(base, head, 'no moved file includes it')
 
+    def test_includes_tsv_still_names_the_old_path(self):
+        row = lambda path: f'# file\tkind\tliteral\n{SRC}{path}\tinclude\tx.rs\n'  # noqa: E731
+        base = files() | {'scripts/source_layout_includes.tsv': row('snapshots/old.rs')}
+        self.reject(base, self.basic_head(base), 'source_layout_includes.tsv still names')
+        head = self.basic_head(base) | {'scripts/source_layout_includes.tsv': row('snapshots/dest/old.rs')}
+        self.accept(base, head)
+
 
 class AbsolutizeAccepts(Base):
     def test_super_chains_become_absolute(self):
