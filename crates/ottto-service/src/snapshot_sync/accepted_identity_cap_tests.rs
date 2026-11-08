@@ -173,7 +173,9 @@ fn seed(name: &str, siblings: usize) -> Seeded {
                 publish(&c, &id, &[told(&id, &format!("s{n}"), 5, A, "07:30:00")]);
             }
         }
-        let mut page = c.raw(&scanner, prior.clone(), PAGE, true, &[]);
+        // A page is the chunk written since the last scan; the read limit
+        // covers the whole corpus so no new file of the chunk is deferred.
+        let mut page = c.raw(&scanner, prior.clone(), siblings + 8, true, &[]);
         page.enrich_with(&c, Some(&mut progress.accepted_identity_buckets));
         assert_eq!(
             page.scan.snapshots.len(),
