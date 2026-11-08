@@ -177,10 +177,9 @@ fn send_with(
     route.modes = page.modes;
     if source == SnapshotSource::ClaudeCode {
         // Routed progress holds hints as rows: the page's sessions load them.
+        // A spent hold (the page must reload) keeps its resident hints.
         let sessions = page.scan.snapshots.iter();
-        progress
-            .load_identity(sessions.map(|item| item.source_session_id.as_str()))
-            .unwrap();
+        let _ = progress.load_identity(sessions.map(|item| item.source_session_id.as_str()));
     }
     route.accepted_identity_buckets = Some(
         serde_json::to_value(

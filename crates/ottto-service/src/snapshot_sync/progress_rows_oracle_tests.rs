@@ -174,7 +174,7 @@ fn assert_quiet(source: SnapshotSource, c: &Corpus, index: ScanIndex) -> Page {
         bytes, 0,
         "{source:?}: settled restart consumes no transcript"
     );
-    if source == SOURCE {
+    if source == SnapshotSource::ClaudeCode {
         assert!(samples.is_empty());
         let mut control = accept(source, &quiet);
         control.mode = Mode::Restart;
@@ -191,9 +191,22 @@ fn assert_quiet(source: SnapshotSource, c: &Corpus, index: ScanIndex) -> Page {
 }
 
 /// The post-ACK placement ledger of `sessions`, as `send` observes it.
-fn placement(progress: &SnapshotUploadProgress, sessions: impl Iterator<Item = String>) -> Value {
+/// Identity placement of `sessions`; a routed Claude progress loads their
+/// hint rows first.
+fn placement(
+    source: SnapshotSource,
+    progress: &mut SnapshotUploadProgress,
+    sessions: impl Iterator<Item = String>,
+) -> Value {
+    let sessions = sessions.collect::<Vec<_>>();
+    if source == SnapshotSource::ClaudeCode {
+        progress
+            .load_identity(sessions.iter().map(String::as_str))
+            .unwrap();
+    }
     serde_json::to_value(
         sessions
+            .into_iter()
             .map(|session| {
                 let buckets = progress.accepted_identity_buckets.get(&session);
                 (session, serde_json::to_value(buckets).unwrap())
@@ -523,6 +536,9 @@ fn assert_imported(
     );
     let mut loaded = imported.clone();
     loaded
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    loaded
         .load_identity(["progress-rows-switch", "progress-rows-side-call"])
         .unwrap();
     assert_money_maps(&loaded);
@@ -736,8 +752,11 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                         "{source:?}: {entity} emitted on both pages"
                     );
                 }
-                both.accepted_identity_buckets =
-                    Some(placement(&progress, both.snapshots.keys().cloned()));
+                both.accepted_identity_buckets = Some(placement(
+                    source,
+                    &mut progress,
+                    both.snapshots.keys().cloned(),
+                ));
                 let mut differences = Vec::new();
                 money_oracle::entity_differences(&cold, &both, &mut differences);
                 assert!(differences.is_empty(), "{}", differences.join("\n"));
@@ -1137,6 +1156,9 @@ fn progress_rows_import_carries_the_pre_publication_json_ledger() {
                     "restart reads the rows"
                 );
                 let mut restored = restored;
+                restored
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
                 restored
                     .load_identity(["progress-rows-switch", "progress-rows-side-call"])
                     .unwrap();
