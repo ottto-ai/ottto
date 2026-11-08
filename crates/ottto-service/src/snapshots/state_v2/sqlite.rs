@@ -331,8 +331,6 @@ pub(super) struct Txn<'a> {
     dirty_bytes: u64,
     estimated_pages: u64,
     dirty_rows: u64,
-    /// This transaction changed a row outside upload progress.
-    graph_writes: bool,
 }
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
@@ -456,27 +454,7 @@ pub(in crate::snapshots) fn sqlite_uri(path: &Path, query: &str) -> Result<Strin
     uri.push_str(query);
     Ok(uri)
 }
-/// Who checkpoints the WAL. A custody store's owner checkpoints explicitly
-/// between cycles; a file without such an owner lets SQLite checkpoint once
-/// the WAL reaches `Auto(pages)`. Neither is a timer, and neither evicts data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Checkpoint {
-    Manual,
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the upload history file's policy")
-    )]
-    Auto(u32),
-}
-impl Checkpoint {
-    fn pages(self) -> i64 {
-        match self {
-            Self::Manual => 0,
-            Self::Auto(pages) => i64::from(pages),
-        }
-    }
-}
-fn settings(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()> {
+fn settings(conn: &Connection, import: bool) -> Result<()> {
     // SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
     // OS installation. Refuse an accidental older link before using the store.
     ensure!(
@@ -493,13 +471,13 @@ fn settings(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<(
     );
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;", checkpoint.pages()))?;
+    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;")?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
         ("checkpoint_fullfsync", 1),
         ("secure_delete", 1),
-        ("wal_autocheckpoint", checkpoint.pages()),
+        ("wal_autocheckpoint", 0),
         ("journal_size_limit", 16 * 1024 * 1024),
         ("cache_size", -16384),
         ("mmap_size", 0),
@@ -570,7 +548,7 @@ impl Sqlite {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=OFF;")?;
-        settings(&conn, true, Checkpoint::Manual)?;
+        settings(&conn, true)?;
         migrations::run(&conn)?;
         private_file(path)?;
         let owned = file.metadata()?;
@@ -715,7 +693,7 @@ impl Sqlite {
         let after = fs::symlink_metadata(path)?;
         ensure!(same_object(&before, &after), "state_v2_object_changed");
         migrations::supported(&conn)?;
-        settings(&conn, false, Checkpoint::Manual)?;
+        settings(&conn, false)?;
         migrations::run(&conn)?;
         validate_schema(&conn)?;
         migrations::writer_supported(&conn)?;
@@ -754,7 +732,7 @@ impl Sqlite {
         self.control("phase", &0_u8)?;
         self.conn()?.execute_batch("PRAGMA journal_mode=WAL;")?;
         self.import = false;
-        settings(self.conn()?, false, Checkpoint::Manual)?;
+        settings(self.conn()?, false)?;
         // No committed WAL payload exists: the complete journal-off import is
         // already in the main file, including its write-once identity rows.
         let conn = self.conn.take().expect("checked connection");
@@ -786,7 +764,6 @@ impl Sqlite {
                 dirty_bytes: 0,
                 estimated_pages: 0,
                 dirty_rows: 0,
-                graph_writes: false,
             };
             tx.put(RowInput {
                 value_version: 1,
@@ -883,7 +860,6 @@ impl Sqlite {
             dirty_bytes: 0,
             estimated_pages: 0,
             dirty_rows: 0,
-            graph_writes: false,
         })
     }
     pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
@@ -1019,26 +995,6 @@ fn scan_record_range(
         filter.push_str(&format!(" AND (key_bytes,position)>(?{n},?{})", n + 1));
     }
     record_headers(conn, &filter, values, "key_bytes,position", limit)
-}
-fn scan_records_below(
-    conn: &Connection,
-    after: Option<&RowKey>,
-    below: &RowKey,
-    limit: usize,
-) -> Result<Vec<Header>> {
-    ensure!(limit <= PAGE_HEADERS, "state_v2_header_page_admission");
-    ensure!(
-        below.table() == Table::Records && after.map_or(true, |key| key.table() == Table::Records),
-        "state_v2_prefix_key"
-    );
-    let keys = Table::Records.keys().join(",");
-    let mut values = below.values()?;
-    let mut filter = format!("({keys}) < (?1,?2,?3)");
-    if let Some(after) = after {
-        values.extend(after.values()?);
-        filter.push_str(&format!(" AND ({keys}) > (?4,?5,?6)"));
-    }
-    record_headers(conn, &filter, values, &keys, limit)
 }
 fn scan_record_key(
     conn: &Connection,
@@ -1440,7 +1396,6 @@ impl Transaction for Txn<'_> {
                 self.remember_paths(old)?;
             }
             self.admit_change(row.key, h.len, h.parts, false)?;
-            self.graph_writes |= !progress::owned(row.key);
             delete_chunks(self.store.conn()?, row.key)?;
             self.removed_keys.remove(row.key);
             let conn = self.store.conn()?;
@@ -1546,7 +1501,6 @@ impl Transaction for Txn<'_> {
             if count != 0 && self.original_paths.contains_key(key) {
                 self.removed_keys.insert(key.clone());
             }
-            self.graph_writes |= count != 0 && !progress::owned(key);
             if count != 0 && table == Table::Records && progress::owned(key) {
                 self.progress_delta -= count as i64;
             } else if count != 0 && table == Table::Records {
@@ -1598,14 +1552,6 @@ impl Transaction for Txn<'_> {
         limit: usize,
     ) -> Result<Vec<Header>> {
         scan_record_key(self.store.conn()?, kind, key_bytes, after_position, limit)
-    }
-    fn scan_records_below(
-        &mut self,
-        after: Option<&RowKey>,
-        below: &RowKey,
-        limit: usize,
-    ) -> Result<Vec<Header>> {
-        scan_records_below(self.store.conn()?, after, below, limit)
     }
     fn isolated(
         &mut self,
@@ -1677,7 +1623,7 @@ pub(super) enum Cas {
         expected: u64,
         next: u64,
     },
-    #[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))]
     Progress {
         expected: u64,
         next: u64,
@@ -1708,7 +1654,9 @@ impl Txn<'_> {
         let (expected, next) = cas.span();
         let result = match cas {
             Cas::Graph { .. } => self.stage_graph(expected, next),
-            Cas::Progress { .. } => self.stage_progress(expected, next),
+            // Upload progress: no erasure epoch moves and G stays. Its rows
+            // have no private-path extraction, so they never owe erasure.
+            Cas::Progress { .. } => self.stamp_cas(progress::GENERATION, expected, next),
         };
         if let Err(error) = &result {
             self.store.record_save_error(error);
@@ -1719,7 +1667,9 @@ impl Txn<'_> {
         }
         self.finish_commit(cas, expected, next)
     }
-    fn stage_graph(&mut self, expected: u64, next: u64) -> Result<()> {
+    /// Compare `row` (absent reads as 0) with `expected`, then stamp the
+    /// current writer capability and advance `row` to `next`.
+    fn stamp_cas(&mut self, row: &str, expected: u64, next: u64) -> Result<()> {
         ensure!(
             self.write
                 && !self.failed
@@ -1732,8 +1682,23 @@ impl Txn<'_> {
                             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?),
             "state_v2_generation_order"
         );
-        let actual = self.store.read_control::<u64>("generation")?.unwrap_or(0);
+        let actual = self.store.read_control::<u64>(row)?.unwrap_or(0);
         ensure!(actual == expected, "state_v2_concurrent_change");
+        for (name, value) in [
+            ("minimum_writer_capability", migrations::WRITER_CAPABILITY),
+            (row, next),
+        ] {
+            self.put(RowInput {
+                value_version: 1,
+                key: &RowKey::Meta(name.into()),
+                fixed: &Fixed::None,
+                value: &control_json(&value)?,
+            })?;
+        }
+        Ok(())
+    }
+    fn stage_graph(&mut self, expected: u64, next: u64) -> Result<()> {
+        self.stamp_cas("generation", expected, next)?;
         // Any erasure purges; only an ordinary one charges its epoch rows.
         self.shared_erasure = self.paths_removed()?;
         let purge = self.shared_erasure || self.bookkeeping_erasure;
@@ -1764,57 +1729,6 @@ impl Txn<'_> {
                 value: &control_json(&next)?,
             })?;
         }
-        self.put(RowInput {
-            value_version: 1,
-            key: &RowKey::Meta("minimum_writer_capability".into()),
-            fixed: &Fixed::None,
-            value: &control_json(&migrations::WRITER_CAPABILITY)?,
-        })?;
-        self.put(RowInput {
-            value_version: 1,
-            key: &RowKey::Meta("generation".into()),
-            fixed: &Fixed::None,
-            value: &control_json(&next)?,
-        })?;
-        Ok(())
-    }
-    /// Upload progress only: no graph row, erasure epoch or Tail state moves,
-    /// and G stays. The capability stamp is the same as a graph commit's.
-    fn stage_progress(&mut self, expected: u64, next: u64) -> Result<()> {
-        ensure!(
-            self.write
-                && !self.failed
-                && !self.store.import
-                && next
-                    == expected
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow::anyhow!("state_v2_generation_overflow"))?,
-            "state_v2_generation_order"
-        );
-        ensure!(
-            !self.graph_writes
-                && !self.shared_erasure
-                && !self.bookkeeping_erasure
-                && self.original_paths.is_empty(),
-            "state_v2_progress_scope"
-        );
-        let actual = self
-            .store
-            .read_control::<u64>(progress::GENERATION)?
-            .unwrap_or(0);
-        ensure!(actual == expected, "state_v2_concurrent_change");
-        self.put(RowInput {
-            value_version: 1,
-            key: &RowKey::Meta("minimum_writer_capability".into()),
-            fixed: &Fixed::None,
-            value: &control_json(&migrations::WRITER_CAPABILITY)?,
-        })?;
-        self.put(RowInput {
-            value_version: 1,
-            key: &RowKey::Meta(progress::GENERATION.into()),
-            fixed: &Fixed::None,
-            value: &control_json(&next)?,
-        })?;
         Ok(())
     }
     fn finish_commit(mut self, cas: Cas, expected: u64, next: u64) -> DurableCommitOutcome {
@@ -1889,7 +1803,7 @@ impl Txn<'_> {
                 &store.path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            settings(&conn, store.import, Checkpoint::Manual)?;
+            settings(&conn, store.import)?;
             let generation = cas.durable(&conn)?;
             store.conn = Some(conn);
             Ok(generation)

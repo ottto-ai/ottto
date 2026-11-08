@@ -149,38 +149,36 @@ pub(super) fn hydrate_txn(
             1,
         )?
         .is_empty();
-    // Upload progress is not graph state: walk up to its range, seek past
-    // it once, and walk the rest. No progress header is read.
-    let (progress_first, progress_end) = progress::range()?;
-    let mut below = Some(progress_first);
     let mut after = None;
     let mut retired = BTreeSet::new();
     loop {
-        let page = match &below {
-            Some(below) => tx.scan_records_below(after.as_ref(), below, 128)?,
-            None => tx.scan_prefix(
-                RowPrefix {
-                    table: Table::Records,
-                },
-                after.as_ref(),
-                128,
-            )?,
-        };
-        if page.is_empty() {
-            if below.take().is_some() {
-                after = Some(progress_end.clone());
-                continue;
-            }
+        let page = tx.scan_prefix(
+            RowPrefix {
+                table: Table::Records,
+            },
+            after.as_ref(),
+            128,
+        )?;
+        let Some(last) = page.last() else {
             break;
-        }
+        };
+        after = Some(last.key.clone());
         for header in &page {
             let RowKey::Record { kind, .. } = &header.key else {
                 bail!("state_v2_record_kind");
             };
-            ensure!(
-                catalogue::group(kind.name()).is_some(),
-                "state_v2_unmapped_kind"
-            );
+            let group = catalogue::group(kind.name());
+            ensure!(group.is_some(), "state_v2_unmapped_kind");
+            // Upload progress is not graph state: resume after this kind's
+            // last possible key, so each progress kind costs one header.
+            if group == Some(catalogue::Group::Progress) {
+                after = Some(RowKey::record(
+                    kind.name(),
+                    vec![u8::MAX; KEY_BYTES],
+                    i64::MAX as u64,
+                )?);
+                break;
+            }
             // Legacy archive member keys retain first-seen evidence. Their
             // values stay inert; no policy state or baseline digest is loaded.
             if catalogue::retired(kind.name())
@@ -193,7 +191,6 @@ pub(super) fn hydrate_txn(
                 retired.insert(header.key.clone());
             }
         }
-        after = page.last().map(|h| h.key.clone());
     }
     super::telemetry::hydrate_checkpoint("hydrate_after_catalogue", 0, None);
     let mut index = ScanIndex::default();

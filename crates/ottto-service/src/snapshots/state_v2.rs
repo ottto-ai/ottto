@@ -320,14 +320,6 @@ pub(super) trait Transaction {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>>;
-    /// `scan_prefix` over records that stops before `below` (exclusive): no
-    /// header at or past it is read.
-    fn scan_records_below(
-        &mut self,
-        after: Option<&RowKey>,
-        below: &RowKey,
-        limit: usize,
-    ) -> Result<Vec<Header>>;
     /// One exact key's rows in position order, from position 0 unless a cursor
     /// is given (exclusive). No other key's header is read.
     fn scan_record_key(

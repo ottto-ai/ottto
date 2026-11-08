@@ -1731,7 +1731,7 @@ fn corrupt_retired_row_does_not_fail_load() {
     assert_eq!(cx.retired, BTreeSet::from(rows));
 }
 
-/// [regress] Upload-progress rows live outside the graph: a graph save that
+/// [format] Upload-progress rows live outside the graph: a graph save that
 /// deletes graph rows never deletes or rewrites them, and the graph hydrate
 /// restores the graph alone.
 #[test]

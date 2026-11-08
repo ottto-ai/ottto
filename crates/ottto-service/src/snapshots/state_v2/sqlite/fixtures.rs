@@ -248,32 +248,6 @@ pub(in super::super) fn row_counts_for_test(db: &Sqlite) -> (u64, u64, bool) {
 pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
     db.stats.record_rows = rows;
 }
-/// Make every progress row's header fail its checksum, outside a transaction.
-pub(in super::super) fn corrupt_progress_headers_for_test(db: &Sqlite) -> usize {
-    db.conn()
-        .unwrap()
-        .execute(
-            "UPDATE records SET row_checksum=zeroblob(16) WHERE kind>='progress.' AND kind<'progress/'",
-            [],
-        )
-        .unwrap()
-}
-
-/// [format] the WAL checkpoint policy is set and verified; custody is manual.
-#[test]
-fn checkpoint_policy_is_set_and_verified() {
-    let scratch = crate::test_scratch::ScratchDir::canonical("v2-checkpoint-policy");
-    for (policy, pages) in [(Checkpoint::Manual, 0), (Checkpoint::Auto(1000), 1000)] {
-        let conn = Connection::open(scratch.join(format!("policy-{pages}.sqlite"))).unwrap();
-        conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL;")
-            .unwrap();
-        settings(&conn, false, policy).unwrap();
-        let actual: i64 = conn
-            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(actual, pages);
-    }
-}
 pub(in super::super) fn writer_capability_for_test() -> u64 {
     migrations::WRITER_CAPABILITY
 }

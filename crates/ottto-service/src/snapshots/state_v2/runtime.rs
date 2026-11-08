@@ -851,30 +851,19 @@ fn growth_claim_txn(
 /// progress kinds alone. The caller holds the source's progress owner, then
 /// CheckpointLock. Only `progress_generation` advances: the graph's G, rows
 /// and session stamp stay valid, so a NotPublished page reloads no graph.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "dormant until upload progress moves to rows")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))]
 pub(super) fn commit_progress_locked<S: Serialize, H: Serialize, L: Serialize>(
     path: &Path,
     index: &ScanIndex,
     owner: &crate::snapshot_sync::SnapshotProgressLock,
-    expected: u64,
-    baseline: Option<progress::Baseline>,
+    baseline: progress::Baseline,
     page: &progress::Page<S, H, L>,
 ) -> Result<progress::Outcome> {
     let runtime = index.v2().persistence_v2.clone();
     ensure!(runtime.is_some(), Hold::ReloadRequired);
     crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
         with_save_session(path, runtime, index.generation, |_, session, id| {
-            progress::commit(
-                &mut session.db,
-                &id,
-                session.stamp.0,
-                baseline,
-                expected,
-                page,
-            )
+            progress::commit(&mut session.db, &id, session.stamp.0, baseline, page)
         })?
         .ok_or_else(|| Hold::ReloadRequired.into())
     })

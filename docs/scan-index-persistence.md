@@ -560,8 +560,9 @@ valid. A COMMIT error reopens and classifies from the committed CAS row of the s
 kind of commit. Progress rows (`progress.cache_state`, `progress.cache_head`,
 `progress.identity`, `progress.ledger`) have no private-path extraction, so
 replacing or deleting one never owes erasure. Their kinds form one contiguous key
-range: the graph's catalogue walk seeks past it without reading a header, the graph
-baseline never names them and the graph hydrate never loads them. The ledger row
+range: the graph's catalogue walk reads one header of each progress kind and resumes
+after that kind, the graph baseline never names them and the graph hydrate never
+loads them. The ledger row
 sizes against the 64 MiB value bound, as the whole traversal fields do. No
 production path writes these rows yet.
 

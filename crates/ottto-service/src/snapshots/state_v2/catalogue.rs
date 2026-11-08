@@ -224,7 +224,7 @@ const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_f
 /// Owner-local upload progress: closed kinds owned by `progress.rs`, committed
 /// by their own `progress_generation`, never by the graph's. No `ScanIndex`
 /// field, never a row of `enumerate` or a graph baseline, and no private-path
-/// extraction. One contiguous key range, sorted: the graph walk seeks past it.
+/// extraction. One contiguous key range, sorted: the graph walk steps over it.
 pub(super) const PROGRESS_KINDS: &[&str] = &[
     "progress.cache_head",
     "progress.cache_state",
