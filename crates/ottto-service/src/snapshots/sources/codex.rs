@@ -3,6 +3,7 @@
 //! rollout header checks and the sidecar title metadata rows.
 
 pub(in crate::snapshots) mod config_defaults;
+pub(in crate::snapshots) mod counting;
 pub(in crate::snapshots) mod identity;
 pub(in crate::snapshots) mod line;
 pub(in crate::snapshots) mod recovery_capture;
