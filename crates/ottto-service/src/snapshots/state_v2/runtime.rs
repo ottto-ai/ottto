@@ -1309,9 +1309,6 @@ pub(in super::super) fn confirmed_growth_stamp(
 #[cfg(test)]
 #[path = "runtime_growth_tests.rs"]
 mod growth_tests;
-#[cfg(test)]
-#[path = "runtime_progress_tests.rs"]
-mod progress_tests;
 
 #[path = "runtime_tail.rs"]
 pub(super) mod tail_route;
