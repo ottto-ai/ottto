@@ -2,6 +2,27 @@
 use super::*;
 use crate::upload_receipts::RejectedUsageReason;
 
+// Process/source lifetime: upload progress is reloaded on every preparation.
+pub(super) static HELD_PROBE_REARMED: [std::sync::atomic::AtomicBool; 3] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; 3];
+pub(super) fn rearm_held_probe_once(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    index: &mut ScanIndex,
+) {
+    if HELD_PROBE_REARMED[source.slot()].swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let count = progress.rearm_held_probe_witness_files(index);
+    if count > 0 {
+        crate::local_resource_diagnostics::traversal_point(
+            "held_probe_witness_rearm",
+            source.api_slug(),
+            &serde_json::json!({"count": count}),
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Exposure {
     first_held_unix: Option<u64>,

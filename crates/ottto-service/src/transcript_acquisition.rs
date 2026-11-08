@@ -101,7 +101,9 @@ impl FileStamp {
     /// nanosecond mtime. ctime is never compared: a chmod, an xattr write
     /// (Spotlight, backup, quarantine) or a new hard link moves it without
     /// touching a byte (the re-read rule). A same-size rewrite that keeps
-    /// mtime passes; samples are not consulted here. Without Unix identity
+    /// mtime passes; samples are not consulted here. Durable restore alone may
+    /// certify a moved mtime within a bound last-read ctime using both samples
+    /// and a known, equal birth. Without Unix identity
     /// this is the length alone, as the derived equality was, and
     /// `select_mode` still refuses as `UnsupportedIdentity`.
     pub(crate) fn same_content(&self, other: &Self) -> bool {
@@ -1235,8 +1237,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 /// sealed offset, both samples kept only as their domain-separated SHA-256
 /// (`DURABLE_SAMPLE_DOMAIN`), and the file birth.
 /// ctime is deliberately absent: a metadata-only change (mode, xattr) is not
-/// a refusal input. mtime stays one: at an unchanged length a moved mtime is
-/// a same-size edit, exactly as `select_mode` decides for a RAM checkpoint.
+/// a refusal input. At an unchanged length a moved mtime is a same-size edit,
+/// except when bound to the certificate's indexed read, at or before its
+/// nonzero ctime, with known equal births and both sample digests unchanged.
 ///
 /// `admits` is structural only (object, length, mtime, birth, samples). The
 /// audit clock and staged debt are carried here unchanged and decided again
@@ -1264,7 +1267,7 @@ pub(crate) struct DurableCertificate {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DurableAdmission {
-    /// The object still has exactly the certified length and mtime.
+    /// The object has the certified length; its mtime may be a certified touch.
     pub(crate) unchanged: bool,
     /// Sample bytes re-read from the held FD (at most `2 * SAMPLE_BYTES`).
     pub(crate) sample_bytes_read: usize,
@@ -1364,8 +1367,9 @@ impl DurableCertificate {
         &self,
         file: &mut File,
         scope: Scope,
+        read_changed_nanos: Option<u64>,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        self.restore_with_append(file, scope, true)
+        self.restore_with_append(file, scope, true, read_changed_nanos)
     }
 
     fn restore_with_append(
@@ -1373,14 +1377,20 @@ impl DurableCertificate {
         file: &mut File,
         scope: Scope,
         allow_append: bool,
+        read_changed_nanos: Option<u64>,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        let (admission, head, boundary, current) = self.admit_samples(file, allow_append)?;
+        let (admission, head, boundary, current) =
+            self.admit_samples(file, allow_append, read_changed_nanos)?;
         let checkpoint = Checkpoint {
             stamp: FileStamp {
                 length: self.length,
                 device: self.device,
                 inode: self.inode,
-                modified: self.modified,
+                modified: if admission.unchanged {
+                    current.modified
+                } else {
+                    self.modified
+                },
                 changed: current.changed,
             },
             scope,
@@ -1400,7 +1410,11 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
-    fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
+    fn checked_stamp(
+        &self,
+        file: &File,
+        read_changed_nanos: Option<u64>,
+    ) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
@@ -1422,7 +1436,17 @@ impl DurableCertificate {
         if stamp.length < self.length {
             return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
-        if stamp.length == self.length && stamp.modified != self.modified {
+        let modified_nanos =
+            i128::from(stamp.modified.0) * 1_000_000_000 + i128::from(stamp.modified.1);
+        if stamp.length == self.length
+            && stamp.modified != self.modified
+            && !read_changed_nanos.is_some_and(|bound| {
+                bound != 0
+                    && self.birth_nanos != 0
+                    && birth == self.birth_nanos
+                    && modified_nanos <= i128::from(bound)
+            })
+        {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
         Ok(stamp)
@@ -1432,8 +1456,9 @@ impl DurableCertificate {
         &self,
         file: &mut File,
         allow_append: bool,
+        read_changed_nanos: Option<u64>,
     ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
-        let stamp = self.checked_stamp(file)?;
+        let stamp = self.checked_stamp(file, read_changed_nanos)?;
         let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
@@ -2904,7 +2929,7 @@ mod tests {
             "APFS clamps birth to mtime"
         );
         let (restored, admission) = certificate
-            .restore_grown(&mut f.open(), scope())
+            .restore_grown(&mut f.open(), scope(), None)
             .expect("the certified object continues");
         assert!(!admission.unchanged);
         assert_eq!(
@@ -2915,14 +2940,16 @@ mod tests {
             let mut later = certificate.clone();
             later.birth_nanos = now_birth - 1;
             assert_eq!(
-                later.restore_grown(&mut f.open(), scope()).err(),
+                later.restore_grown(&mut f.open(), scope(), None).err(),
                 Some(CertificateRefusal::Changed(FullReason::Replaced)),
                 "a birth after the certified one is another object"
             );
             let mut unclamped = certificate.clone();
             unclamped.birth_nanos = now_birth + 1;
             assert_eq!(
-                unclamped.restore_grown(&mut f.open(), scope()).map(|_| ()),
+                unclamped
+                    .restore_grown(&mut f.open(), scope(), None)
+                    .map(|_| ()),
                 if cfg!(target_os = "macos") {
                     Ok(())
                 } else {

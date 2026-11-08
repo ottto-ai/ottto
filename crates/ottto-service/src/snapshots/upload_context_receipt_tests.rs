@@ -2813,3 +2813,69 @@ fn held_probe_substitution_updates_every_alias_and_keeps_revision_guard() {
         Some("changed")
     );
 }
+
+/// [behaviour] Exact active ACK stamps are key-independent, including scoped
+/// re-read debt; other contexts, bodies, destinations and replay epochs fail.
+#[test]
+fn file_entity_stamps_require_the_active_ack_context() {
+    let base = "base".to_string();
+    let resumed = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    let active = crate::snapshot_sync::copy_unproven_upload_context(resumed.clone(), true);
+    let mut index = ScanIndex::default();
+    index.activate_upload_context(active.clone());
+    index.set_copy_prefix_base_upload_context(Some(base.clone()));
+    index
+        .claude_money_birth_store
+        .set_money_marks("reowed", claude_copy_prefix_reread::REOWED);
+    index.file_snapshot_fingerprints.insert(
+        "unaffected".into(),
+        BTreeSet::from(["entity".into(), "other".into()]),
+    );
+    let bodies = BTreeMap::from([("entity".into(), "body".into())]);
+    for context in [
+        base,
+        resumed,
+        crate::snapshot_sync::resumed_prefix_upload_context("changed-base".into(), true),
+        active.clone(),
+    ] {
+        index.stamp_entity_upload_context_acks(
+            "destination",
+            &bodies,
+            &BTreeMap::from([("entity".into(), context.clone())]),
+        );
+        for key in ["unaffected", "reowed"] {
+            assert_eq!(
+                index.file_entity_stamp_proves(key, "entity", "body"),
+                context == active,
+                "only the exact active context proves for {key}"
+            );
+            assert!(!index.file_entity_stamp_proves(key, "entity", "wrong-body"));
+        }
+    }
+    let proven = index.clone();
+    index.stamp_entity_upload_context_acks(
+        "another-destination",
+        &BTreeMap::from([("other".into(), "body".into())]),
+        &BTreeMap::from([("other".into(), active.clone())]),
+    );
+    assert!(!index
+        .upload_context_proof
+        .entity_stamps
+        .contains_key("entity"));
+    assert!(!index.file_entity_stamp_proves("unaffected", "entity", "body"));
+    index = proven.clone();
+    index.historical_replay_generation = Some("next-replay".into());
+    assert!(!index.file_entity_stamp_proves("unaffected", "entity", "body"));
+    index = proven;
+    index.set_copy_prefix_base_upload_context(None);
+    assert!(index.file_entity_stamp_proves("codex-shaped", "entity", "body"));
+    index.stamp_entity_upload_context_acks(
+        "destination",
+        &bodies,
+        &BTreeMap::from([(
+            "entity".into(),
+            crate::snapshot_sync::resumed_prefix_upload_context(active, true),
+        )]),
+    );
+    assert!(!index.file_entity_stamp_proves("codex-shaped", "entity", "body"));
+}

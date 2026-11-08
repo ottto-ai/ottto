@@ -96,7 +96,11 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
-  accepted, and parts the server did accept stay recorded.
+  accepted, and parts the server did accept stay recorded. A revision-only move can carry a
+  file's receipt when its final entities and bodies are unchanged and every entity has an
+  exact stamp under the active upload context. Claude records those stamps under its resumed
+  mode while unaffected file receipts use the base context. A copy-capability change therefore
+  conservatively re-sends unchanged files once.
 
 Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
@@ -110,6 +114,10 @@ accepted-body ACK. Its exact covered body can earn its file's upload-context
 receipt, retiring that file revision's freshness debt while the refusal stays recorded.
 For a held cache-head probe, the file and candidate witnesses track the cache-free
 probe actually offered; the same exact-coverage receipt gates still apply.
+On the first preparation per source in a process, files with complete covered stale
+terminal membership and a mismatched body digest are selected once for parsing.
+Their source witness stays intact; aligned files need no further parse. A runtime
+hold or incomplete parse can leave the digest unaligned until the next process.
 An optional per-record `exposure` observation, written only
 when a fresh permanent refusal is recorded, separates those records from legacy
 ones; a missing or malformed observation keeps a stale record owed, and legacy
@@ -149,7 +157,15 @@ presence for probes.
   session facts (title, first prompt, workspace, opening settings; Codex also stores its agent
   label and prelude) among them: no transcript byte is
   read back for content. A refusal is a counted Full; only a newer build's
-  head holds. Codex checks its ownership-affecting sidecar binding before reusing a head; changed
+  head holds. An equal-size mtime move at or before the indexed read's nonzero ctime can
+  restore from that read's certificate when size and stored mtime bind it to the entry,
+  births are known and equal, and both bounded sample digests match. This removes a
+  whole-file read for retention touches; ordinary later writes still read Full. A first
+  touch after a long gap can still read Full; steady reuse depends on the lease cadence
+  remaining within its backdate interval. Source fingerprints include metadata and
+  bounded content samples, rather than a whole-file digest. Freshness debt clears only
+  through the existing receipt proof on a later listing.
+  Codex checks its ownership-affecting sidecar binding before reusing a head; changed
   ownership evidence reconstructs through the counted Full path. Pi stores its usage ledger,
   totals and fork state on the same Tail seam. Each pass removes the
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
