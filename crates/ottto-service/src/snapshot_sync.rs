@@ -3224,6 +3224,42 @@ impl SnapshotUploadProgress {
         Ok(changed)
     }
 
+    fn rearm_held_probe_witness_files(&self, index: &mut ScanIndex) -> usize {
+        use crate::snapshots::snapshot_file_upload_body_set_hex;
+        let covered = self.covered_stale_bodies();
+        let selected = index
+            .files
+            .iter()
+            .filter_map(|(key, entry)| {
+                if index.decode_holds_file(key) {
+                    return None;
+                }
+                let entities = index.file_snapshot_fingerprints.get(key)?;
+                if entities.is_empty() {
+                    return None;
+                }
+                let bodies = entities
+                    .iter()
+                    .map(|fp| {
+                        let record = self.quarantined_fingerprints.get(fp)?;
+                        let body = covered.get(fp)?;
+                        (record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                            && record.upload_body_witness.as_ref() == Some(body))
+                        .then(|| body.clone())
+                    })
+                    .collect::<Option<BTreeSet<_>>>()?;
+                (entry.last_upload_body_witness != Some(snapshot_file_upload_body_set_hex(bodies)))
+                    .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in &selected {
+            let entry = index.files.get_mut(key).expect("selected indexed file");
+            entry.last_snapshot_fingerprint = None;
+            entry.last_upload_body_witness = None;
+        }
+        selected.len()
+    }
+
     fn reselect_pending_cache_heads(&mut self, index: &mut ScanIndex, enabled: bool) -> usize {
         if !enabled || self.pending_cache_heads.is_empty() {
             return 0;
@@ -6853,6 +6889,7 @@ fn prepare_sync_source_inner(
         cooldowns.retain(|_, cooldown| cooldown.input_change_only);
     }
     index.activate_reason_reoffer_cooldowns(cooldowns);
+    stale_owed::rearm_held_probe_once(source, &upload_progress, &mut index);
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -7281,6 +7318,7 @@ fn prepare_continuation_source(
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
+    stale_owed::rearm_held_probe_once(source, &upload_progress, &mut index);
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
     let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
     // K5: reuse the ordinary page's namespace and durable pass, including GC/breaker state.
