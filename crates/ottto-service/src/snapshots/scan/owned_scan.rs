@@ -1097,14 +1097,15 @@ impl OwnedSourceScan {
                     continue;
                 };
                 let own = local_index_key(path);
+                let root_member = member == root;
                 let homes = claude_history_upgrade::path_twins(twin_groups, &member);
                 let narrow = seed.is_some()
-                    && member == root
+                    && root_member
                     && homes.is_some_and(|homes| {
                         homes.iter().all(|(key, _)| *key == own || settled(key))
                     });
                 *scoped.entry(root).or_insert(true) &= narrow;
-                seeds.push((seed, member == root));
+                seeds.push((seed, root_member));
             }
             let (scoped, roots): (Vec<_>, Vec<_>) = scoped.into_iter().partition(|(_, n)| *n);
             for (root, _) in &roots {

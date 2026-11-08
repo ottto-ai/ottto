@@ -467,7 +467,7 @@ fn forced_family_seed_counts() {
             });
             let [by_reason, selection] = seed_counts(&rows);
             let expected_seeds = (seeds.0 > 0)
-                .then(|| [("transcript_changed", seeds.0), (seeds.1, seeds.0)])
+                .then_some([("transcript_changed", seeds.0), (seeds.1, seeds.0)])
                 .into_iter()
                 .flatten()
                 .map(|(reason, n)| (reason.to_string(), n))
