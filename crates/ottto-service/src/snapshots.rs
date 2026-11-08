@@ -2951,6 +2951,7 @@ impl OwnedSourceScan {
                     Some((digest, live, stamp, sidecar))
                 });
                 let OwnedActiveFile {
+                    refold_unchanged,
                     first_read,
                     sampling: file_sampling,
                     candidate,
@@ -3572,6 +3573,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
+                            refold_unchanged: false,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -3638,6 +3640,7 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
+                    refold_unchanged,
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),
@@ -5322,10 +5325,9 @@ impl OwnedSourceScan {
                 }
             };
 
+            let mut refold_unchanged = false;
             let mut file_sampling = None;
             let mut retained_offset = None;
-            // Counted once the page actually reads the file: a fence
-            // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
             if let Some(context) = sampling
                 .as_mut()
@@ -5490,11 +5492,10 @@ impl OwnedSourceScan {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
-                                        // A late-evidence re-fold from
-                                        // stored state, counted by its reason.
                                         if let Some(reason) = parse_reason.filter(|reason| {
                                             tail_source::load::late_evidence(*reason)
                                         }) {
+                                            refold_unchanged = true;
                                             tail_source::counters::bump(
                                                 source,
                                                 "tail_refold",
@@ -5528,8 +5529,7 @@ impl OwnedSourceScan {
                             }
                             None => (None, debt),
                         };
-                        // The cap funds NEW obligations, never a global restore
-                        // gate. Marked files Tail; quiet debt-free copies reuse.
+                        // The cap funds new obligations; quiet debt-free copies reuse.
                         let mut cap_full = false;
                         if allow_sample
                             // Account-held reparses belong to withheld_reparse;
@@ -5627,8 +5627,7 @@ impl OwnedSourceScan {
                             sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
                         }
-                        // H1c: the plan uses absolute offsets; the reader's
-                        // extent is relative to its Full/Tail start.
+                        // Acquisition offsets are absolute; the reader's extent is relative.
                         if source == SnapshotSource::ClaudeCode
                             && (allow_sample || cap_full)
                             && matches!(
@@ -5643,8 +5642,6 @@ impl OwnedSourceScan {
                                     .set_extent_limit(plan.frozen_length() - plan.start_offset());
                             }
                         }
-                        // Restore does not restore/extend an exact-prefix pricing receipt.
-                        // Any new priority contribution below forces a real full replay.
                         if source == SnapshotSource::Codex {
                             sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         }
@@ -5669,6 +5666,8 @@ impl OwnedSourceScan {
                                     )
                                 })
                             });
+                        refold_unchanged &=
+                            mode == crate::transcript_acquisition::ReadMode::Unchanged;
                         planned_mode = Some((mode, audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
@@ -5760,6 +5759,7 @@ impl OwnedSourceScan {
             }
             index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
             let mut active = Box::new(OwnedActiveFile {
+                refold_unchanged,
                 first_read: crate::local_resource_diagnostics::FirstRead::begin(
                     source,
                     candidate.size_bytes,

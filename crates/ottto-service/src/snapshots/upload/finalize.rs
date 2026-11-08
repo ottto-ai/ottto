@@ -6,6 +6,7 @@ use crate::snapshots::*;
 
 #[derive(Debug, Clone)]
 pub(in crate::snapshots) struct PendingIndexFinalization {
+    pub(in crate::snapshots) refold_unchanged: bool,
     pub(in crate::snapshots) withheld_content: Option<withheld_account::Seen>,
     pub(in crate::snapshots) sampled_audit_verified: bool,
     pub(in crate::snapshots) codex_pending_recovery: bool,
@@ -145,8 +146,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     // Backstop of the one emission seam: no held history body is finalized.
     index.veto_claude_history_emission(source, &mut result.snapshots);
+    let mut refold_components = tail_source::refold_moved::Page::new();
     for snapshot in &mut result.snapshots {
-        snapshot.snapshot_fingerprint = snapshot_fingerprint(source, snapshot);
+        let components = snapshot_semantic_component_hashes(source, snapshot);
+        snapshot.snapshot_fingerprint = snapshot_fingerprint_from_component_hashes(
+            source,
+            &snapshot.source_session_id,
+            &components,
+        );
+        tail_source::refold_moved::capture(source, snapshot, &components, &mut refold_components);
         index.snapshot_activity_at.insert(
             snapshot.snapshot_fingerprint.clone(),
             snapshot_semantic_activity_at(snapshot),
@@ -209,6 +217,12 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .unwrap_or_default();
         let final_group_fingerprint = (!final_fingerprints.is_empty())
             .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
+        tail_source::refold_moved::observe(
+            source,
+            pending,
+            final_group_fingerprint.as_deref(),
+            &mut refold_components,
+        );
         let final_upload_body_witness = by_source_file_body_witness
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
