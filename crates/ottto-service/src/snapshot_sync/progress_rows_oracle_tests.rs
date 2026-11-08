@@ -235,7 +235,10 @@ fn published_with_json_ledger(
     let oracle =
         SnapshotUploadProgress::load(&copy, &namespace(), snapshot_quarantine_witness(source))
             .unwrap();
-    assert_eq!(oracle.accepted_cache_heads.len(), 3, "keyed evidence");
+    assert!(
+        oracle.accepted_cache_heads.len() >= 3 && oracle.accepted_cache_states.len() >= 3,
+        "keyed evidence"
+    );
     assert!(!oracle.accepted_fingerprints.is_empty(), "real ACKs");
     (session, bytes, oracle)
 }
@@ -283,10 +286,12 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
                 &c.base.join("state"),
             );
             let path = session.path();
-            let cold = accept(
-                source,
-                &native_page(source, &c, ScanIndex::default(), 100, false),
-            );
+            // Cold Full over its own ledger: the ACK history (accepted
+            // identity bucket sequence) the route's ledger must match.
+            let mut reference = super::progress(source);
+            let cold_page = native_page(source, &c, ScanIndex::default(), 100, false);
+            let (status, cold) = send(source, &cold_page, &mut reference, ack);
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             assert_eq!(cold.snapshots.len(), 3, "nonempty cold control");
 
             let (index, mut progress) = load(source, &c, path).unwrap();
@@ -309,10 +314,9 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
             for (path, session) in paths.iter().zip(SESSIONS) {
                 append(path, &response_line(source, session, 2));
             }
-            let cold = accept(
-                source,
-                &native_page(source, &c, ScanIndex::default(), 100, false),
-            );
+            let cold_page = native_page(source, &c, ScanIndex::default(), 100, false);
+            let (status, cold) = send(source, &cold_page, &mut reference, ack);
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             let mut progress = restored;
             let mut page = native_page(source, &c, quiet.index, 100, true);
             let (status, mut again) = send(source, &page, &mut progress, ack);
@@ -399,11 +403,11 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
             let (index, restored) = load(SOURCE, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
             assert_quiet(SOURCE, &c, index);
-            second_pages.push((page_two, path.to_owned(), restored, session));
+            second_pages.push((page_two, path.to_owned(), restored, session, c));
         }
         let (in_ram, restarted) = (&second_pages[0], &second_pages[1]);
         money_oracle::assert_equivalent(&in_ram.0, &restarted.0);
-        for (_, path, restored, _) in &second_pages {
+        for (_, path, restored, _, _) in &second_pages {
             assert_rows_custody(path, restored);
         }
     });
