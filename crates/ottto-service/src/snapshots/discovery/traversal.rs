@@ -686,11 +686,11 @@ fn refresh_retained_codex_directories(
     if source != SnapshotSource::Codex || codex_census_walk_pending(traversal) {
         return;
     }
-    let recovery = DiscoveryRecovery::from(&index.files);
     let retention = DiscoveryRetention {
         growth,
         ..discovery_retention!(index)
     };
+    let recovery = DiscoveryRecovery::from(retention);
     let moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
@@ -1011,8 +1011,12 @@ impl ScanIndex {
         path: &Path,
         metadata: &fs::Metadata,
     ) -> bool {
-        self.listing_stamp_matches(path, metadata)
-            && !sampled_audit::path_requires_verification(&self.files, path)
+        self.listing_stamp_matches(path, metadata) && !self.owes_verification(path)
+    }
+
+    /// The shared discovery obligation (`sampled_audit::path_requires_verification`).
+    pub(in crate::snapshots) fn owes_verification(&self, path: &Path) -> bool {
+        sampled_audit::path_requires_verification(&self.files, &self.confirmed_empty_files, path)
     }
 
     /// A member of a terminal authority family: a Skip before any growth
