@@ -910,31 +910,19 @@ fn resumed_prefix_sidecar_receipt() {
         let (mut c, _) = receipt_family(name);
         let root = c.root(
             ROOT,
-            &(line(ROOT, "r1", AT, 10)
-                + &line(ROOT, "r2", AT, 30)
-                + &line(ROOT, "gap", "2026-08-02T07:30:10Z", 7)),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 30)),
         );
         input_clock(&root);
-        let mut gap = tagged_api("gap", 7, None);
-        gap.observed_at = "2026-08-02T07:30:10Z".into();
-        gap.fingerprint.clear();
-        gap.fingerprint = format!(
-            "sha256:{:x}",
-            Sha256::digest(serde_json::to_vec(&gap).unwrap())
-        );
+        let gap = c.root(COPY, &line(COPY, "gap-1", AT, 6));
+        c.evidence_for(COPY, &[api_for(COPY, "gap-1", 6, 60)], &[]);
+        input_clock(&gap);
         let mut rows = family_rows();
         rows[0] = tagged_api("r1", 10, Some(&"a".repeat(64)));
         rows.extend([
             tagged_api("r2", 30, Some(&"b".repeat(64))),
             tagged_api("side", 5, Some(&"b".repeat(64))),
-            gap,
         ]);
-        let traces = [
-            trace("r1", ""),
-            trace("r2", ""),
-            trace("side", ""),
-            trace("gap", ""),
-        ];
+        let traces = [trace("r1", ""), trace("r2", ""), trace("side", "")];
         c.evidence(&rows, &traces);
         let disk = Disk::new(&c);
         let scanner = E2ScanFixture::capturing_identity();
@@ -947,8 +935,8 @@ fn resumed_prefix_sidecar_receipt() {
             .find(|item| item.source_session_id == ROOT)
             .unwrap();
         assert_eq!(
-            root.request_count, 4,
-            "three transcript requests and a side call"
+            root.request_count, 3,
+            "two transcript requests and a side call"
         );
         let model_rows = root
             .usage_buckets
@@ -967,21 +955,30 @@ fn resumed_prefix_sidecar_receipt() {
             })
             .collect::<BTreeSet<_>>();
         assert!(accounts.len() >= 2, "two accounts placed on tagged rows");
-        // A mixed-account bucket keeps its unknown share in identity_parts.
-        let gaps = model_rows
+        let gap = warm
+            .scan
+            .snapshots
             .iter()
-            .flat_map(|row| row.identity_parts.iter().flatten())
-            .filter(|part| part.account_identifier_hash.is_none() && part.evidence_ref.is_none())
-            .collect::<Vec<_>>();
-        assert_eq!(gaps.len(), 1, "one evidence gap remains");
+            .find(|item| item.source_session_id == COPY)
+            .unwrap();
+        let unknown = gap
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .find(|row| {
+                row.account_identifier_hash.is_none()
+                    && row.evidence_ref.is_none()
+                    && row.identity_parts.is_none()
+            })
+            .expect("the independent session keeps an unknown row");
         assert_eq!(
             (
-                gaps[0].request_count,
-                gaps[0].input_tokens,
-                gaps[0].output_tokens
+                unknown.request_count,
+                unknown.input_tokens,
+                unknown.output_tokens
             ),
-            (1, 7, 7),
-            "the gap's money stays untagged"
+            (1, 6, 6),
+            "the independent gap's money stays untagged"
         );
         accept_page(&mut warm);
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
