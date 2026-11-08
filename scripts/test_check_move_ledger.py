@@ -586,6 +586,173 @@ class LedgerTests(unittest.TestCase):
         self.assertIn('1 reflowed', out)
         self.assertIn('widened: struct Index', out)
 
+    def test_const_static_and_type_rewrapped_after_a_visibility_token_are_reflowed(self):
+        for before, after in (
+            ('const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);\n',
+             'pub(super) const BUSY_TIMEOUT: std::time::Duration =\n    std::time::Duration::from_secs(5);\n'),
+            ('/// Effort tiers.\nconst EFFORT_TIERS: &[&str] = &["low", "medium", "high", "xhigh", "max"];\n',
+             '/// Effort tiers.\npub(in crate::snapshots) const EFFORT_TIERS: &[&str] =\n'
+             '    &["low", "medium", "high", "xhigh", "max"];\n'),
+            ('static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());\n',
+             'pub(super) static SEEN: std::sync::Mutex<Vec<u64>> =\n    std::sync::Mutex::new(Vec::new());\n'),
+            ('type Ledger<R = crate::snapshots::Holder> = std::collections::BTreeMap<String, R>;\n',
+             'pub(super) type Ledger<R = crate::snapshots::Holder> =\n    std::collections::BTreeMap<String, R>;\n'),
+        ):
+            with self.subTest(after=after):
+                status, out = self.move_long(after, before)
+                self.assertEqual(status, 0, out)
+                self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
+
+    def test_const_reflow_rejects_changed_tokens(self):
+        for before, after in (
+            # A changed literal, an added trailing comma, a macro call and a second visibility token.
+            ('const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);\n',
+             'pub(super) const BUSY_TIMEOUT: std::time::Duration =\n    std::time::Duration::from_secs(6);\n'),
+            ('const TIERS: &[&str] = &["low", "max"];\n', 'pub(super) const TIERS: &[&str] =\n    &["low", "max",];\n'),
+            ('const NAME: &str = concat!("a", "b");\n', 'pub(super) const NAME: &str =\n    concat!("a", "b");\n'),
+            ('const N: u8 = { struct P { a: u8 } 1 };\n',
+             'pub(super) const N: u8 =\n    { struct P { pub a: u8 } 1 };\n'),
+        ):
+            with self.subTest(after=after):
+                status, out = self.move_long(after, before)
+                self.assertEqual(status, 1, out)
+                self.assertIn(' 0 reflowed,', out)
+
+    MACRO = code('''
+        macro_rules! scan_result {
+            (pub struct $name:ident { $($field:ident: $ty:ty,)* }) => {
+                pub struct $name { $($field: $ty,)* }
+                impl $name {
+                    fn empty() -> Self {
+                        Self { $($field: Default::default(),)* }
+                    }
+                }
+            };
+        }
+        scan_result! {
+        pub struct Scan {
+            count: u64,
+        }
+        }
+    ''')
+
+    def test_a_restricted_visibility_added_on_a_generated_fn_in_a_macro_body_is_glue(self):
+        for vis in ('pub(super) ', 'pub(in crate::snapshots) '):
+            with self.subTest(vis=vis):
+                status, out = self.move_long(self.MACRO.replace('fn empty', vis + 'fn empty'), self.MACRO)
+                self.assertEqual(status, 0, out)
+                self.assertIn(' 2 moved, 0 reflowed, 0 widened, 0 problems', out)
+                self.assertIn(f'macro visibility macro_rules macro_rules! scan_result '
+                              f'(crates/demo/src/snapshots/wide.rs:1): + {vis.strip()} before fn empty', out)
+
+    def test_macro_body_rejects_other_tokens_and_wider_or_misplaced_visibility(self):
+        for name, after, expect in (
+            ('non-visibility token', self.MACRO.replace('fn empty', 'const fn empty'),
+             'changed: macro_rules macro_rules! scan_result'),
+            ('wider than before', self.MACRO.replace('fn empty', 'pub(crate) fn empty'),
+             'widened: macro_rules macro_rules! scan_result'),
+            ('bare pub', self.MACRO.replace('fn empty', 'pub fn empty'), 'macro visibility changed'),
+            ('in the matcher', self.MACRO.replace('(pub struct $name', '(pub(super) struct $name'),
+             'macro visibility changed'),
+            ('dropped token', self.MACRO.replace('pub struct $name {', 'struct $name {'), 'macro visibility changed'),
+        ):
+            with self.subTest(name):
+                status, out = self.move_long(after, self.MACRO)
+                self.assertEqual(status, 1, out)
+                self.assertIn(expect, out)
+
+    COIN = code('''
+        //! Money totals.
+
+        #[cfg(test)]
+        mod tests;
+
+        /// Adds the fee to the formatted width.
+        pub(crate) fn total(value: u32) -> u32 {
+            super::helper(value).len() as u32 + crate::snapshots::money::fee()
+        }
+
+        fn fee() -> u32 {
+            // One unit per call.
+            1
+        }
+
+        impl super::Holder {
+            fn doubled(&self) -> u32 {
+                self.value * 2
+            }
+        }
+
+        // Keeps the file long enough for git to see the rename.
+        fn first() {}
+        fn second() {}
+        fn third() {}
+    ''')
+    COIN_TESTS = 'use super::*;\n\n#[test]\nfn adds() {\n    assert_eq!(super::total(1), 2);\n}\n'
+    MONEY_FILES = ('snapshots/money.rs', 'snapshots/money/tests.rs', 'snapshots/sources.rs',
+                   'snapshots/sources/coin.rs', 'snapshots/sources/coin/tests.rs')
+
+    def move_money(self, coin, tests=COIN_TESTS, alias='pub(crate) use sources::coin as money;\n'):
+        """Commit the money module at base, then `git mv` it to sources/coin.rs with `coin` and `tests`."""
+        reset = {src(name): None for name in self.MONEY_FILES if (self.repo.root / src(name)).exists()}
+        self.repo.commit(reset)
+        base = self.repo.commit({src('snapshots.rs'): ROOT + 'mod money;\n', src('snapshots/money.rs'): self.COIN,
+                                 src('snapshots/money/tests.rs'): self.COIN_TESTS})
+        (self.repo.root / src('snapshots/sources/coin')).mkdir(parents=True, exist_ok=True)
+        self.repo.git('mv', src('snapshots/money.rs'), src('snapshots/sources/coin.rs'))
+        self.repo.git('mv', src('snapshots/money/tests.rs'), src('snapshots/sources/coin/tests.rs'))
+        head = self.repo.commit({src('snapshots.rs'): ROOT + 'mod sources;\n' + alias,
+                                 src('snapshots/sources.rs'): 'pub(crate) mod coin;\n',
+                                 src('snapshots/sources/coin.rs'): coin, src('snapshots/sources/coin/tests.rs'): tests})
+        return run(self.repo, base, head)
+
+    def test_a_whole_file_git_mv_with_its_mod_decl_decomposes_into_moved_items(self):
+        # The facade alias, with or without `as`, is a `use` item: glue class (b).
+        for alias in ('pub(crate) use sources::coin as money;\n', 'pub(crate) use sources::coin;\n'):
+            with self.subTest(alias=alias):
+                status, out = self.move_money(self.COIN, alias=alias)
+                self.assertEqual(status, 0, out)
+                self.assertIn('file map: 2 renamed .rs files, 2 module moves, 0 items with respelled paths', out)
+                self.assertIn('module crate::snapshots::money -> crate::snapshots::sources::coin', out)
+                self.assertIn('crates/demo/src/snapshots/money.rs:6-25 fn total .. fn third (6 items) -> '
+                              'crates/demo/src/snapshots/sources/coin.rs:6-25  '
+                              '[crate::snapshots::money -> crate::snapshots::sources::coin]', out)
+                self.assertIn('[crate::snapshots::money::tests -> crate::snapshots::sources::coin::tests]', out)
+                self.assertIn('move-only', out)
+
+    RESPELLED = (COIN.replace('super::helper(value)', 'super::super::helper(value)')
+                 .replace('crate::snapshots::money::fee()', 'crate::snapshots::sources::coin::fee()')
+                 .replace('impl super::Holder', 'impl crate::snapshots::Holder'))
+
+    def test_module_paths_respelled_for_a_moved_module_and_its_facade_alias_are_glue(self):
+        status, out = self.move_money(self.RESPELLED)
+        self.assertEqual(status, 0, out)
+        self.assertIn('file map: 2 renamed .rs files, 2 module moves, 2 items with respelled paths', out)
+        self.assertIn('respelled fn total (crates/demo/src/snapshots/money.rs:6 -> '
+                      'crates/demo/src/snapshots/sources/coin.rs:6)', out)
+        self.assertIn('respelled impl super::Holder :: fn doubled', out)
+        self.assertIn(' 0 widened, 0 problems', out)
+        self.assertIn('move-only', out)
+
+    def test_a_respelled_path_must_resolve_to_the_same_moved_target(self):
+        for name, coin, tests in (
+            ('different module', self.RESPELLED.replace('super::super::helper', 'crate::snapshots::sources::helper'),
+             self.COIN_TESTS),
+            ('crate path respelled relative', self.RESPELLED.replace('crate::snapshots::sources::coin::fee()',
+                                                                     'super::coin::fee()'), self.COIN_TESTS),
+            ('impl header to another module', self.RESPELLED.replace('impl crate::snapshots::Holder',
+                                                                     'impl crate::snapshots::sources::Holder'),
+             self.COIN_TESTS),
+            ('needless respelling', self.RESPELLED,
+             self.COIN_TESTS.replace('super::total(1)', 'crate::snapshots::sources::coin::total(1)')),
+            ('changed name', self.RESPELLED.replace('super::super::helper(value)', 'super::super::second(value)'),
+             self.COIN_TESTS),
+        ):
+            with self.subTest(name):
+                status, out = self.move_money(coin, tests)
+                self.assertEqual(status, 1, out)
+                self.assertIn('changed: ', out)
+
     def test_validator_edits_are_listed_and_only_for_listed_files(self):
         listed = 'crates/ottto-service/tests/support/scan_index_v201.rs'
         other = 'crates/ottto-service/tests/support/other_v201.rs'
