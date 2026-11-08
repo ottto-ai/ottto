@@ -1,6 +1,7 @@
 //! Owner-local upload progress as keyed rows of the custody store: two keyed
-//! cache maps and one ledger row per route, moved in once from the JSON ledger
-//! under the `progress_import` marker.
+//! cache maps and the ledger (every other durable field) as an ordered chunk
+//! stream per route, moved in once from the JSON ledger under the
+//! `progress_import` marker.
 //!
 //! A progress page commits through the shared finalizer as `Cas::Progress`: it
 //! compares and advances `progress_generation` and stamps the current writer
@@ -24,6 +25,13 @@ pub(super) const IMPORT: &str = "progress_import";
 pub(super) const CACHE_STATE: &str = "progress.cache_state";
 pub(super) const CACHE_HEAD: &str = "progress.cache_head";
 const LEDGER: &str = "progress.ledger";
+/// Compact ledger text per chunk row. Stored as a JSON string, a chunk's row
+/// stays under twice this.
+#[cfg(not(test))]
+const CHUNK_BYTES: usize = PART_BYTES;
+/// Small in tests, so a real ledger spans several chunks.
+#[cfg(test)]
+const CHUNK_BYTES: usize = 256;
 const IDENTITY: &str = "progress.identity";
 
 /// A progress row (`catalogue::PROGRESS_KINDS`) or a progress control.
@@ -36,15 +44,15 @@ pub(super) fn owned(key: &RowKey) -> bool {
 }
 
 /// One page's progress, borrowed from the caller's RAM: two keyed maps (a
-/// count manifest plus one row per member) and one ledger row holding every
-/// other durable field.
+/// count manifest plus one row per member) and the ledger holding every other
+/// durable field, stored as a count manifest plus ordered chunk rows.
 pub(super) struct Page<'a, S, H, L> {
     pub(super) cache_state: &'a BTreeMap<String, S>,
     pub(super) cache_head: &'a BTreeMap<String, H>,
     pub(super) ledger: &'a L,
 }
 
-/// Progress as stored: the keyed maps and the ledger row.
+/// Progress as stored: the keyed maps and the ledger.
 pub(super) struct Stored<S, H, L> {
     pub(super) cache_state: BTreeMap<String, S>,
     pub(super) cache_head: BTreeMap<String, H>,
@@ -98,10 +106,6 @@ pub(super) enum Outcome {
 /// wrote rows, so the transaction commits even if nothing else changed.
 pub(super) type Points<'a> = &'a mut dyn FnMut(&mut dyn Transaction, u64) -> Result<bool>;
 
-fn ledger_key() -> Result<RowKey> {
-    mapper::key(LEDGER, "", 1)
-}
-
 fn control<T: DeserializeOwned>(tx: &mut dyn Transaction, name: &str) -> Result<Option<T>> {
     let Some(h) = tx.get(&RowKey::Meta(name.into()))? else {
         return Ok(None);
@@ -121,20 +125,72 @@ pub(super) fn marker(tx: &mut dyn Transaction) -> Result<Option<Marker>> {
     control(tx, IMPORT)
 }
 
-/// A map kind that may be absent at any layout: no manifest means no members.
+/// A map kind's members; `None` without its manifest, when none may exist.
 fn read_kind<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
-    seed: &mut mapper::Digests,
-) -> Result<BTreeMap<String, T>> {
+    seed: Option<&mut mapper::Digests>,
+) -> Result<Option<BTreeMap<String, T>>> {
     if tx.get(&mapper::key(kind, "", 0)?)?.is_none() {
         ensure!(
             tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
             "state_v2_missing_manifest"
         );
-        return Ok(BTreeMap::new());
+        return Ok(None);
     }
-    mapper::read_map(tx, kind, None, Some(seed))
+    mapper::read_map(tx, kind, None, seed).map(Some)
+}
+
+fn chunk_name(index: usize) -> String {
+    format!("{index:010}")
+}
+
+/// The ledger as ordered chunks of its compact JSON text, named by index so
+/// name order is stream order, and the text's length. No total limit.
+fn chunks<L: Serialize>(ledger: &L) -> Result<(BTreeMap<String, String>, u64)> {
+    let text = serde_json::to_string(ledger)?;
+    let mut chunks = BTreeMap::new();
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let mut end = rest.len().min(CHUNK_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.insert(chunk_name(chunks.len()), rest[..end].to_owned());
+        rest = &rest[end..];
+    }
+    Ok((chunks, text.len() as u64))
+}
+
+/// The ledger from its chunk stream. The manifest counts every chunk and the
+/// names run from 0 without a gap, so a missing, extra or out-of-order chunk
+/// refuses: an invalid ledger, which holds the source.
+fn read_ledger_rows<L: DeserializeOwned>(
+    tx: &mut dyn Transaction,
+    seed: Option<&mut mapper::Digests>,
+) -> Result<Option<L>> {
+    let Some(chunks) = read_kind::<String>(tx, LEDGER, seed)? else {
+        return Ok(None);
+    };
+    ensure!(
+        !chunks.is_empty()
+            && chunks
+                .keys()
+                .enumerate()
+                .all(|(index, name)| *name == chunk_name(index)),
+        "state_v2_progress_ledger_chunks"
+    );
+    let text: String = chunks.into_values().collect();
+    Ok(Some(serde_json::from_str(&text)?))
+}
+
+/// The whole ledger's size, one scalar per committed page. Above its target
+/// it raises the shared row alarm; it never holds, refuses or drops.
+fn ledger_bytes(bytes: u64) {
+    telemetry::event("progress_ledger_bytes", &bytes);
+    if bytes > VALUE_BYTES {
+        telemetry::event("row_cap_alarm", &(bytes.saturating_mul(100) / VALUE_BYTES));
+    }
 }
 
 /// The keyed cache maps and the ledger in the caller's read snapshot, with the
@@ -148,13 +204,13 @@ where
 {
     let mut rows = mapper::Digests::new();
     let generation = generation(tx)?;
-    let cache_state = read_kind(tx, CACHE_STATE, &mut rows)?;
-    let cache_head = read_kind(tx, CACHE_HEAD, &mut rows)?;
-    let page = match tx.get(&ledger_key()?)? {
-        Some(h) => Some(Stored {
+    let cache_state = read_kind(tx, CACHE_STATE, Some(&mut rows))?.unwrap_or_default();
+    let cache_head = read_kind(tx, CACHE_HEAD, Some(&mut rows))?.unwrap_or_default();
+    let page = match read_ledger_rows(tx, Some(&mut rows))? {
+        Some(ledger) => Some(Stored {
             cache_state,
             cache_head,
-            ledger: mapper::read(tx, &h, Some(&mut rows))?,
+            ledger,
         }),
         None => {
             ensure!(
@@ -174,16 +230,12 @@ where
     ))
 }
 
-/// The ledger row alone, with the generation it was read at.
+/// The ledger alone, with the generation it was read at.
 pub(super) fn read_ledger<L: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
 ) -> Result<(Option<L>, u64)> {
     let generation = generation(tx)?;
-    let ledger = match tx.get(&ledger_key()?)? {
-        Some(h) => Some(mapper::read(tx, &h, None)?),
-        None => None,
-    };
-    Ok((ledger, generation))
+    Ok((read_ledger_rows(tx, None)?, generation))
 }
 
 /// Identity point rows for `keys` only: one keyed read per key, never the
@@ -244,121 +296,49 @@ fn put_points<'a, T: Serialize>(
     }
 }
 
-/// The rows `page` changes against `old`: the next digests, the keys whose
-/// digest differs, and the keys `page` no longer names.
-struct Plan {
-    next: mapper::Digests,
-    kept: BTreeSet<RowKey>,
-    counts: [(&'static str, usize); 2],
-    writes: BTreeSet<RowKey>,
-    removes: Vec<RowKey>,
-}
-
-fn plan<S: Serialize, H: Serialize, L: Serialize>(
+/// One page as rows against `old`, through the shared mapper delta: a row
+/// whose digest matches `old` is not written, a row `old` names that the page
+/// does not is deleted at `finish`, and a set-aside row the page does not
+/// write again stays as it is, still counted. Without `tx` it only plans the
+/// next digests; a write passes them back as `seed`, so nothing is digested
+/// twice. Returns the next digests and the rows still kept.
+fn page_rows<S: Serialize, H: Serialize, L>(
+    tx: Option<&mut dyn Transaction>,
     old: &Baseline,
     page: &Page<'_, S, H, L>,
-) -> Result<Plan> {
+    chunks: &BTreeMap<String, String>,
+    seed: mapper::Digests,
+) -> Result<(mapper::Digests, BTreeSet<RowKey>)> {
     // A removal deletes what `old` names: only progress rows may be named.
     ensure!(old.rows.keys().all(owned), "state_v2_progress_scope");
-    let mut next = mapper::Digests::new();
-    let mut writes = BTreeSet::new();
-    let mut row = |key: RowKey, digest: [u8; 32]| -> Result<()> {
-        if old.rows.get(&key) != Some(&digest) {
-            writes.insert(key.clone());
-        }
-        ensure!(next.insert(key, digest).is_none(), "state_v2_duplicate_row");
-        Ok(())
-    };
-    // A set-aside row the page does not write again stays as it is, counted.
-    let rewritten = |key: &RowKey| match key {
-        RowKey::Record {
-            kind, key_bytes, ..
-        } => {
-            let name = std::str::from_utf8(key_bytes).unwrap_or_default();
-            match kind.name() {
-                CACHE_STATE => page.cache_state.contains_key(name),
-                CACHE_HEAD => page.cache_head.contains_key(name),
-                _ => true,
-            }
-        }
-        _ => true,
-    };
-    let kept = old
+    let kept: BTreeSet<RowKey> = old
         .kept
         .iter()
-        .filter(|key| !rewritten(key))
-        .filter_map(|key| Some((key.clone(), *old.rows.get(key)?)))
-        .collect::<Vec<_>>();
-    let kept_in = |kind: &str| {
-        kept.iter()
-            .filter(|(key, _)| matches!(key, RowKey::Record { kind: k, .. } if k.name() == kind))
-            .count()
-    };
-    let counts = [
-        (CACHE_STATE, page.cache_state.len() + kept_in(CACHE_STATE)),
-        (CACHE_HEAD, page.cache_head.len() + kept_in(CACHE_HEAD)),
-    ];
-    for (kind, len) in counts {
-        row(mapper::key(kind, "", 0)?, mapper::digest(&len)?)?;
-    }
-    for (key, digest) in &kept {
-        row(key.clone(), *digest)?;
-    }
-    for (name, value) in page.cache_state {
-        row(mapper::key(CACHE_STATE, name, 1)?, mapper::digest(value)?)?;
-    }
-    for (name, value) in page.cache_head {
-        row(mapper::key(CACHE_HEAD, name, 1)?, mapper::digest(value)?)?;
-    }
-    row(ledger_key()?, mapper::digest(page.ledger)?)?;
-    let removes = old
-        .rows
-        .keys()
-        .filter(|key| !next.contains_key(*key))
+        .filter(|key| match key {
+            RowKey::Record {
+                kind, key_bytes, ..
+            } => {
+                let name = std::str::from_utf8(key_bytes).unwrap_or_default();
+                match kind.name() {
+                    CACHE_STATE => !page.cache_state.contains_key(name),
+                    CACHE_HEAD => !page.cache_head.contains_key(name),
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
         .cloned()
         .collect();
-    Ok(Plan {
-        next,
-        kept: kept.into_iter().map(|(key, _)| key).collect(),
-        counts,
-        writes,
-        removes,
-    })
-}
-
-fn put_planned<T: Serialize + ?Sized>(
-    tx: &mut dyn Transaction,
-    plan: &Plan,
-    key: RowKey,
-    value: &T,
-) -> Result<()> {
-    if plan.writes.contains(&key) {
-        mapper::put(tx, &key, value)?;
-    }
-    Ok(())
-}
-
-/// Write the planned rows: changed members and manifests, the ledger, then
-/// the removals.
-fn write<S: Serialize, H: Serialize, L: Serialize>(
-    tx: &mut dyn Transaction,
-    plan: &Plan,
-    page: &Page<'_, S, H, L>,
-) -> Result<()> {
-    for (kind, len) in plan.counts {
-        put_planned(tx, plan, mapper::key(kind, "", 0)?, &len)?;
-    }
-    for (name, value) in page.cache_state {
-        put_planned(tx, plan, mapper::key(CACHE_STATE, name, 1)?, value)?;
-    }
-    for (name, value) in page.cache_head {
-        put_planned(tx, plan, mapper::key(CACHE_HEAD, name, 1)?, value)?;
-    }
-    put_planned(tx, plan, ledger_key()?, page.ledger)?;
-    for key in &plan.removes {
-        mapper::remove(tx, key)?;
-    }
-    Ok(())
+    let mut rows = mapper::Rows {
+        tx,
+        old: old.rows.clone(),
+        seed,
+        ..Default::default()
+    };
+    rows.map_kept(CACHE_STATE, page.cache_state, &kept)?;
+    rows.map_kept(CACHE_HEAD, page.cache_head, &kept)?;
+    rows.map(LEDGER, chunks)?;
+    Ok((rows.finish()?, kept))
 }
 
 /// One page in one write transaction under the caller's source owner, written
@@ -378,28 +358,38 @@ pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
     page: &Page<'_, S, H, L>,
     points: Option<Points<'_>>,
 ) -> Result<Outcome> {
-    let plan = match plan(baseline, page) {
-        Ok(plan) => plan,
-        Err(_) => return not_published(db),
+    let planned = chunks(page.ledger).and_then(|(chunks, bytes)| {
+        let (next, _) = page_rows(None, baseline, page, &chunks, Default::default())?;
+        Ok((chunks, bytes, next))
+    });
+    let Ok((chunks, bytes, next)) = planned else {
+        return not_published(db);
     };
-    if plan.writes.is_empty() && plan.removes.is_empty() && points.is_none() {
+    let changed = next != baseline.rows;
+    if !changed && points.is_none() {
         return Ok(Outcome::Unchanged);
     }
     let expected = baseline.generation;
-    let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
+    let generation = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     db.validate_save(identity, graph)?;
     let mut tx = db.begin(TxnMode::Write)?;
-    let wrote = (|| -> Result<bool> {
-        write(&mut tx, &plan, page)?;
+    let wrote = (|| -> Result<Option<(mapper::Digests, BTreeSet<RowKey>)>> {
+        let rows = page_rows(
+            Some(&mut tx as &mut dyn Transaction),
+            baseline,
+            page,
+            &chunks,
+            next,
+        )?;
         let pointed = match points {
-            Some(points) => points(&mut tx, next)?,
+            Some(points) => points(&mut tx, generation)?,
             None => false,
         };
-        Ok(pointed || !plan.writes.is_empty() || !plan.removes.is_empty())
+        Ok((pointed || changed).then_some(rows))
     })();
-    match wrote {
-        Ok(true) => {}
-        Ok(false) => {
+    let (rows, kept) = match wrote {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
             drop(tx);
             return Ok(Outcome::Unchanged);
         }
@@ -407,13 +397,19 @@ pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
             drop(tx);
             return not_published(db);
         }
-    }
-    match tx.commit_inner(sqlite::Cas::Progress { expected, next }) {
-        DurableCommitOutcome::Committed(generation) => Ok(Outcome::Committed(Baseline {
-            generation,
-            rows: plan.next,
-            kept: plan.kept,
-        })),
+    };
+    match tx.commit_inner(sqlite::Cas::Progress {
+        expected,
+        next: generation,
+    }) {
+        DurableCommitOutcome::Committed(generation) => {
+            ledger_bytes(bytes);
+            Ok(Outcome::Committed(Baseline {
+                generation,
+                rows,
+                kept,
+            }))
+        }
         DurableCommitOutcome::NotPublished => not_published(db),
         DurableCommitOutcome::Published(_) | DurableCommitOutcome::Ambiguous => {
             bail!(Hold::ReloadRequired)
@@ -443,18 +439,26 @@ pub(super) fn import<S: Serialize, H: Serialize, L: Serialize>(
     marker: &Marker,
     points: Option<Points<'_>>,
 ) -> Result<Imported> {
-    let plan = plan(&Baseline::default(), page)?;
+    let fresh = Baseline::default();
+    let (chunks, bytes) = chunks(page.ledger)?;
+    let (next, _) = page_rows(None, &fresh, page, &chunks, Default::default())?;
     let marker = control_json(marker)?;
     db.validate_save(identity, graph)?;
     let mut tx = db.begin(TxnMode::Write)?;
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<Option<mapper::Digests>> {
         if generation(&mut tx)? != 0
             || tx.get(&RowKey::Meta(IMPORT.into()))?.is_some()
-            || tx.get(&ledger_key()?)?.is_some()
+            || tx.get(&mapper::key(LEDGER, "", 0)?)?.is_some()
         {
-            return Ok(false);
+            return Ok(None);
         }
-        write(&mut tx, &plan, page)?;
+        let (rows, _) = page_rows(
+            Some(&mut tx as &mut dyn Transaction),
+            &fresh,
+            page,
+            &chunks,
+            next,
+        )?;
         if let Some(points) = points {
             points(&mut tx, 1)?;
         }
@@ -464,11 +468,11 @@ pub(super) fn import<S: Serialize, H: Serialize, L: Serialize>(
             fixed: &Fixed::None,
             value: &marker,
         })?;
-        Ok(true)
+        Ok(Some(rows))
     })();
-    match result {
-        Ok(true) => {}
-        Ok(false) => {
+    let rows = match result {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
             drop(tx);
             return Ok(Imported::Present);
         }
@@ -477,16 +481,19 @@ pub(super) fn import<S: Serialize, H: Serialize, L: Serialize>(
             not_published(db)?;
             return Err(error.context("state_v2_progress_import_not_published"));
         }
-    }
+    };
     match tx.commit_inner(sqlite::Cas::Progress {
         expected: 0,
         next: 1,
     }) {
-        DurableCommitOutcome::Committed(generation) => Ok(Imported::Committed(Baseline {
-            generation,
-            rows: plan.next,
-            kept: BTreeSet::new(),
-        })),
+        DurableCommitOutcome::Committed(generation) => {
+            ledger_bytes(bytes);
+            Ok(Imported::Committed(Baseline {
+                generation,
+                rows,
+                kept: BTreeSet::new(),
+            }))
+        }
         DurableCommitOutcome::NotPublished => {
             not_published(db)?;
             bail!("state_v2_progress_import_not_published")
@@ -589,7 +596,7 @@ pub(crate) fn read_progress_rows(
     })
 }
 
-/// The committed ledger row and its generation, for a durable-state read.
+/// The committed ledger and its generation, for a durable-state read.
 pub(crate) fn read_progress_ledger(
     index_path: &Path,
     owner: &crate::snapshot_sync::SnapshotProgressLock,

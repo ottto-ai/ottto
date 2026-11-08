@@ -1,5 +1,5 @@
 //! Upload progress of a routed source as keyed rows of its custody store: the
-//! two keyed cache maps and one ledger row (every other durable field). A
+//! two keyed cache maps and the ledger (every other durable field). A
 //! route's first load moves its JSON ledger in once under the import marker;
 //! from then on the rows are the only progress the source reads or writes.
 //!
@@ -9,7 +9,7 @@ use super::*;
 use crate::snapshots::claude_request_identity::{AcceptedSession, IdentityScope};
 use crate::snapshots::{ProgressMarker, ProgressPage, ProgressPoint, ProgressRead};
 
-/// Fields the ledger row never holds: the keyed maps and the generation.
+/// Fields the ledger never holds: the keyed maps and the generation.
 const KEYED: [&str; 3] = [
     "accepted_cache_states",
     "accepted_cache_heads",
@@ -80,8 +80,8 @@ impl SnapshotUploadProgress {
         Ok(progress)
     }
 
-    /// The ledger row of this progress. Identity hints are rows of their
-    /// own (`accepted_identity_scope` holds their barriers).
+    /// The ledger of this progress. Identity hints are rows of their own
+    /// (`accepted_identity_scope` holds their barriers).
     pub(super) fn ledger_row(&mut self) -> Result<serde_json::Value> {
         let states = std::mem::take(&mut self.accepted_cache_states);
         let heads = std::mem::take(&mut self.accepted_cache_heads);
@@ -160,9 +160,12 @@ impl SnapshotUploadProgress {
 
     /// The one-time import: the JSON ledger (or the exact progress a legacy
     /// ACK receipt holds ahead of it) becomes the route's first rows with the
-    /// import marker at P = 1, its identity hints one row per session. Unparseable or invalid input holds the source
-    /// and stays on disk; a failed COMMIT holds this pass, and the next load
-    /// imports again. Once the marker commits the legacy files are purged.
+    /// import marker at P = 1, its identity hints one row per session.
+    /// Unparseable input or an invalid ledger holds the source and stays on
+    /// disk; an invalid keyed entry imports as its row and is set aside, as
+    /// the row loader treats it. A failed COMMIT holds this pass, and the next
+    /// load imports again. Once the marker commits the legacy files are
+    /// purged.
     fn import_rows(
         index: &ScanIndex,
         index_path: &Path,
@@ -197,21 +200,25 @@ impl SnapshotUploadProgress {
             progress = Self::new(namespace.to_owned(), witness.clone());
         }
         anyhow::ensure!(
-            progress.valid(namespace)
-                && progress
-                    .accepted_cache_states
-                    .iter()
-                    .all(|(key, state)| valid_cache_state(key, state))
-                && progress
-                    .accepted_cache_heads
-                    .iter()
-                    .all(|(key, head)| valid_cache_head(key, head)),
+            progress.valid(namespace),
             "snapshot upload progress for import is invalid"
         );
         progress.accepted_identity_scope = IdentityScope {
             key_epoch: progress.accepted_identity_buckets.resident_epoch(),
             ..IdentityScope::default()
         };
+        let states = &progress.accepted_cache_states;
+        let bad_states: Vec<String> = states
+            .iter()
+            .filter(|(key, state)| !valid_cache_state(key, state))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let heads = &progress.accepted_cache_heads;
+        let bad_heads: Vec<String> = heads
+            .iter()
+            .filter(|(key, head)| !valid_cache_head(key, head))
+            .map(|(key, _)| key.clone())
+            .collect();
         let ledger = progress.ledger_row()?;
         let points = progress.accepted_identity_buckets.dirty();
         let page = (
@@ -223,7 +230,16 @@ impl SnapshotUploadProgress {
             index, index_path, owner, page, &points, &marker,
         )?;
         let progress = match rows {
-            Some(rows) => {
+            Some(mut rows) => {
+                // Stored and counted, never accepted evidence: the next body
+                // for that session is fuller, never smaller.
+                rows.set_aside(&bad_states, &bad_heads)?;
+                for key in &bad_states {
+                    progress.accepted_cache_states.remove(key);
+                }
+                for key in &bad_heads {
+                    progress.accepted_cache_heads.remove(key);
+                }
                 progress.generation = rows.generation();
                 progress.rows = Some(Box::new(rows));
                 progress.accepted_identity_buckets.release();

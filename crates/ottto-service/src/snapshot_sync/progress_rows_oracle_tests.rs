@@ -1,5 +1,5 @@
 //! Upload progress on a published route as custody rows: two keyed cache maps
-//! plus one ledger row, one progress transaction per page, moved in once from
+//! plus the ledger stream, one progress transaction per page, moved in once from
 //! the JSON ledger. Each row drives the production pass load, upload/ACK with
 //! the production ledger save as its persistence, page save and pass end, and
 //! compares the emitted money with cold Full across restarts, COMMIT errors
@@ -257,7 +257,7 @@ fn rows(index_path: &Path) -> Rows {
         cache_state: count(members, "progress.cache_state"),
         cache_head: count(members, "progress.cache_head"),
         ledger: count(
-            "SELECT count(*) FROM records WHERE kind=?1 AND key_bytes=x'' AND position=1",
+            "SELECT count(*) FROM records WHERE kind=?1 AND key_bytes=x'' AND position=0",
             "progress.ledger",
         ) == 1,
     }
@@ -304,7 +304,7 @@ fn assert_rows_custody(index_path: &Path, progress: &SnapshotUploadProgress) {
         progress.generation,
         "RAM generation is the committed progress CAS value"
     );
-    assert!(rows.ledger, "one ledger row");
+    assert!(rows.ledger, "the ledger stream's manifest");
     assert_eq!(rows.cache_state, progress.accepted_cache_states.len());
     assert_eq!(rows.cache_head, progress.accepted_cache_heads.len());
     assert_leftovers_purged(index_path);
@@ -972,72 +972,53 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
     });
 }
 
-/// [money] With the production ledger save as the upload's persistence: a
-/// crash between the ACK and the page COMMIT re-offers the exact bytes once
-/// (a receiver duplicate), and a crash after the COMMIT but before the graph
-/// save offers nothing again and settles from the ledger. In both windows the
-/// reloaded graph never settles more than the committed ledger.
+/// [money] With the production ledger save as the upload's persistence, a
+/// crash after the page COMMIT but before the graph save offers nothing again
+/// and settles from the ledger; the reloaded graph never settles more than the
+/// committed ledger. (A crash before the COMMIT is the commit-error row.)
 #[test]
 #[serial]
-fn progress_rows_crash_windows_never_let_the_graph_outrun_the_ledger() {
+fn progress_rows_crash_after_commit_never_lets_the_graph_outrun_the_ledger() {
     with_e2(|| {
-        for committed in [false, true] {
-            let (c, _) = native_corpus_in(
-                corpus(&format!("progress-rows-crash-{committed}")),
-                SOURCE,
-                &SESSIONS,
-            );
-            let session = published(SOURCE, &c);
-            let path = session.path();
-            let cold = accept(
-                SOURCE,
-                &native_page(SOURCE, &c, ScanIndex::default(), 100, false),
-            );
-            let (index, mut progress) = load(SOURCE, &c, path).unwrap();
-            let page = native_page(SOURCE, &c, index, 100, true);
-            if !committed {
-                v2::fail_next_progress_commit_for_test(&page.committed, None);
-            }
-            let mut receiver = Receiver::default();
-            let (status, first) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
-            assert_eq!(status.is_ok(), committed, "the ACK's page COMMIT");
-            money_oracle::assert_equivalent(&cold, &first);
-            let credit = receiver.credit.clone();
-            // The crash: neither the graph save nor the pass end runs.
-            drop((page, progress));
+        let (c, _) = native_corpus_in(corpus("progress-rows-crash"), SOURCE, &SESSIONS);
+        let session = published(SOURCE, &c);
+        let path = session.path();
+        let cold = accept(
+            SOURCE,
+            &native_page(SOURCE, &c, ScanIndex::default(), 100, false),
+        );
+        let (index, mut progress) = load(SOURCE, &c, path).unwrap();
+        let page = native_page(SOURCE, &c, index, 100, true);
+        let mut receiver = Receiver::default();
+        let (status, first) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
+        assert!(status.is_ok(), "the ACK's page COMMIT");
+        money_oracle::assert_equivalent(&cold, &first);
+        let credit = receiver.credit.clone();
+        // The crash: neither the graph save nor the pass end runs.
+        drop((page, progress));
 
-            let (index, mut progress) = load(SOURCE, &c, path).unwrap();
-            assert_graph_behind_ledger(&index, &progress);
-            assert_eq!(
-                progress.accepted_fingerprints.is_empty(),
-                !committed,
-                "the ledger holds exactly the committed ACKs"
-            );
-            let mut page = native_page(SOURCE, &c, index, 100, true);
-            let (status, again) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
-            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-            if committed {
-                assert!(
-                    again.batches.is_empty(),
-                    "committed ACKs are not re-offered"
-                );
-            } else {
-                assert_eq!(
-                    again.batches, first.batches,
-                    "the exact bytes are re-offered"
-                );
-                assert_eq!(receiver.duplicates, first.snapshots.len());
-            }
-            assert_eq!(receiver.credit, credit, "each body was credited once");
-            settle(&mut page, &mut progress, path);
-            assert_graph_behind_ledger(&page.index, &progress);
-            let ram = durable(&progress);
-            drop(page);
-            let (index, restored) = load(SOURCE, &c, path).unwrap();
-            assert_eq!(durable(&restored), ram);
-            assert_quiet(SOURCE, &c, index);
-            assert_rows_custody(path, &restored);
-        }
+        let (index, mut progress) = load(SOURCE, &c, path).unwrap();
+        assert_graph_behind_ledger(&index, &progress);
+        assert!(
+            !progress.accepted_fingerprints.is_empty(),
+            "the ledger holds the committed ACKs"
+        );
+        let mut page = native_page(SOURCE, &c, index, 100, true);
+        let (status, again) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert!(
+            again.batches.is_empty(),
+            "committed ACKs are not re-offered"
+        );
+        assert_eq!(receiver.credit, credit, "each body was credited once");
+        settle(&mut page, &mut progress, path);
+        assert_graph_behind_ledger(&page.index, &progress);
+        let ram = durable(&progress);
+        drop(page);
+        let (index, restored) = load(SOURCE, &c, path).unwrap();
+        assert_eq!(durable(&restored), ram);
+        assert_quiet(SOURCE, &c, index);
+        assert_rows_custody(path, &restored);
     });
 }
 
@@ -1358,81 +1339,96 @@ enum Damage {
     BadHead,
 }
 
+impl Damage {
+    /// The damaged value, and whether it is a cache state (else a head).
+    fn value(self) -> (bool, Value) {
+        match self {
+            Damage::MissingObservations => (true, json!({ "rows": [] })),
+            Damage::TooManyRows => (
+                true,
+                json!({ "observations": (0..513).map(|_| json!({})).collect::<Vec<_>>() }),
+            ),
+            Damage::TooManyBytes => (true, json!({ "observations": ["x".repeat(700_000)] })),
+            Damage::BadHead => (false, json!("not-a-head")),
+        }
+    }
+}
+
 /// [money] A damaged keyed row of a real accepted session (state without
 /// observations, over 512 rows or 655360 bytes; a head that is no hash) is set
 /// aside and counted: it stays in the store, out of RAM, every healthy sibling
 /// loads, and a restart reads no transcript. The session's next upload carries
-/// cold Full's money, and the receiver credits it once.
+/// cold Full's money, and the receiver credits it once. A damaged entry of the
+/// JSON ledger awaiting import does the same: the import commits it as its row
+/// and sets it aside, and never holds the source.
 #[test]
 #[serial]
 fn progress_rows_damaged_cache_row_is_set_aside_and_the_next_upload_is_full() {
     with_e2(|| {
-        for damage in [
-            Damage::MissingObservations,
-            Damage::TooManyRows,
-            Damage::TooManyBytes,
-            Damage::BadHead,
+        for (damage, import) in [
+            (Damage::MissingObservations, false),
+            (Damage::TooManyRows, false),
+            (Damage::TooManyBytes, false),
+            (Damage::BadHead, false),
+            (Damage::TooManyRows, true),
         ] {
             let (c, paths) = native_corpus_in(
-                corpus(&format!("progress-rows-damage-{damage:?}")),
+                corpus(&format!("progress-rows-damage-{damage:?}-{import}")),
                 SOURCE,
                 &SESSIONS,
             );
-            let session = published(SOURCE, &c);
-            let path = session.path();
             let mut reference = super::progress(SOURCE);
             let cold_page = native_page(SOURCE, &c, ScanIndex::default(), 100, false);
             let (status, _) = send(SOURCE, &cold_page, &mut reference, ack);
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-            let (index, mut progress) = load(SOURCE, &c, path).unwrap();
-            let mut page = native_page(SOURCE, &c, index, 100, true);
-            let mut receiver = Receiver::default();
-            let (status, _) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
-            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-            settle(&mut page, &mut progress, path);
-            let healthy = progress.clone();
-            drop(page);
             let key = cache_session_key(SESSIONS[0]);
+            let (state, value) = damage.value();
+            let mut receiver = Receiver::default();
+            let (session, healthy) = if import {
+                let (session, bytes, oracle) = published_with_json_ledger(SOURCE, &c, None);
+                let mut json: Value = serde_json::from_slice(&bytes).unwrap();
+                let map = ["accepted_cache_heads", "accepted_cache_states"][usize::from(state)];
+                json[map][&key] = value;
+                let damaged = serde_json::to_vec(&json).unwrap();
+                std::fs::write(progress_path(session.path()), damaged).unwrap();
+                (session, oracle)
+            } else {
+                let session = published(SOURCE, &c);
+                let path = session.path();
+                let (index, mut progress) = load(SOURCE, &c, path).unwrap();
+                let mut page = native_page(SOURCE, &c, index, 100, true);
+                let (status, _) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
+                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+                settle(&mut page, &mut progress, path);
+                drop(page);
+                let (index, _) = load(SOURCE, &c, path).unwrap();
+                v2::edit_progress_rows_for_test(path, &index, |states, heads, _| {
+                    (if state { states } else { heads }).insert(key.clone(), value);
+                });
+                (session, progress)
+            };
+            let path = session.path();
             assert!(
                 healthy.accepted_cache_states.contains_key(&key)
                     && healthy.accepted_cache_heads.contains_key(&key),
                 "a real accepted session's keyed evidence"
             );
-
-            let (index, _) = load(SOURCE, &c, path).unwrap();
-            v2::edit_progress_rows_for_test(path, &index, |states, heads, _| match damage {
-                Damage::MissingObservations => {
-                    states.insert(key.clone(), json!({ "rows": [] }));
-                }
-                Damage::TooManyRows => {
-                    states.insert(
-                        key.clone(),
-                        json!({ "observations": (0..513).map(|_| json!({})).collect::<Vec<_>>() }),
-                    );
-                }
-                Damage::TooManyBytes => {
-                    states.insert(
-                        key.clone(),
-                        json!({ "observations": ["x".repeat(700_000)] }),
-                    );
-                }
-                Damage::BadHead => {
-                    heads.insert(key.clone(), "not-a-head".into());
-                }
-            });
-            drop(index);
             v2::take_progress_set_aside_for_test();
             let (index, mut progress) = load(SOURCE, &c, path).unwrap();
             assert_eq!(
                 v2::take_progress_set_aside_for_test(),
                 Some(1),
-                "{damage:?}: one row set aside"
+                "{damage:?} {import}: one row set aside"
             );
+            if import {
+                assert!(rows(path).import.is_some(), "the import committed");
+                assert_leftovers_purged(path);
+            }
             let mut expected = healthy.clone();
-            if let Damage::BadHead = damage {
-                expected.accepted_cache_heads.remove(&key);
-            } else {
+            if state {
                 expected.accepted_cache_states.remove(&key);
+            } else {
+                expected.accepted_cache_heads.remove(&key);
             }
             assert_eq!(
                 without_generation(durable(&progress)),
@@ -1481,27 +1477,38 @@ fn progress_rows_damaged_cache_row_is_set_aside_and_the_next_upload_is_full() {
     });
 }
 
-/// [money] An invalid ledger row holds the whole source with zero uploads, as
-/// an invalid JSON ledger does today; so does an invalid JSON ledger awaiting
-/// import, which stays as it was and imports nothing.
+/// [money] An invalid ledger holds the whole source with zero uploads, as an
+/// invalid JSON ledger does today: an invalid value, or a ledger stream that
+/// lost a chunk. So does an invalid JSON ledger awaiting import, which stays
+/// as it was and imports nothing.
 #[test]
 #[serial]
 fn progress_rows_invalid_ledger_or_import_json_holds_with_zero_uploads() {
     with_e2(|| {
-        let (c, _) = native_corpus_in(corpus("progress-rows-invalid-ledger"), SOURCE, &SESSIONS);
-        let (session, _, _) = published_with_json_ledger(SOURCE, &c, None);
-        let path = session.path();
-        let (index, _) = load(SOURCE, &c, path).unwrap();
-        v2::edit_progress_rows_for_test(path, &index, |_, _, ledger| {
-            ledger["accepted_fingerprints"] = json!(["not-a-fingerprint"]);
-        });
-        drop(index);
-        let before = row_digests(path);
-        assert!(
-            load(SOURCE, &c, path).is_err(),
-            "an invalid ledger holds the source"
-        );
-        assert_eq!(row_digests(path), before, "the hold rewrites nothing");
+        for lost_chunk in [false, true] {
+            let (c, _) = native_corpus_in(
+                corpus(&format!("progress-rows-invalid-ledger-{lost_chunk}")),
+                SOURCE,
+                &SESSIONS,
+            );
+            let (session, _, _) = published_with_json_ledger(SOURCE, &c, None);
+            let path = session.path();
+            let (index, _) = load(SOURCE, &c, path).unwrap();
+            if lost_chunk {
+                v2::drop_progress_ledger_chunk_for_test(path);
+            } else {
+                v2::edit_progress_rows_for_test(path, &index, |_, _, ledger| {
+                    ledger["accepted_fingerprints"] = json!(["not-a-fingerprint"]);
+                });
+            }
+            drop(index);
+            let before = row_digests(path);
+            assert!(
+                load(SOURCE, &c, path).is_err(),
+                "an invalid ledger holds the source"
+            );
+            assert_eq!(row_digests(path), before, "the hold rewrites nothing");
+        }
 
         let (c, _) = native_corpus_in(corpus("progress-rows-invalid-import"), SOURCE, &SESSIONS);
         let (session, bytes, _) = published_with_json_ledger(SOURCE, &c, None);
