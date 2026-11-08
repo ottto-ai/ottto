@@ -2730,6 +2730,14 @@ fn human_receipts(payload: &serde_json::Value) -> String {
     if let Some(cursor) = payload.get("next_before").and_then(|value| value.as_u64()) {
         lines.push(format!("Older receipts: ottto receipts --before {cursor}"));
     }
+    if let Some(rows) = payload
+        .get("history_rows_not_written")
+        .and_then(|value| value.as_u64())
+    {
+        lines.push(format!(
+            "Receipts not recorded since the daemon started: {rows}"
+        ));
+    }
     lines.join("\n")
 }
 

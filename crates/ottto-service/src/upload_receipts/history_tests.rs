@@ -336,7 +336,12 @@ fn public_response_equals_todays_receipt_contract() {
         },
     )
     .unwrap();
-    let actual = serde_json::to_value(read(&dir, 50, None, None).unwrap()).unwrap();
+    let mut actual = serde_json::to_value(read(&dir, 50, None, None).unwrap()).unwrap();
+    // The not-written count is process-wide; other tests may have raised it.
+    actual
+        .as_object_mut()
+        .unwrap()
+        .remove("history_rows_not_written");
     let uploaded_at = actual["receipts"][0]["uploaded_at"].clone();
     let expected = serde_json::json!({
         "schema": "ottto.upload_receipts.v1",
@@ -556,6 +561,30 @@ fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
     let scope = defer();
     append_transport_error(&blocked, SourceKind::Pi, 1).unwrap();
     drop(scope);
+}
+
+#[test]
+fn a_held_history_file_counts_every_row_it_could_not_write() {
+    let dir = temp_dir();
+    // A second handle holds the history's owner lock.
+    let held = open(&dir);
+    let here = || ROWS_NOT_WRITTEN_HERE.with(std::cell::Cell::get);
+    let (mine, process) = (here(), HISTORY_ROWS_NOT_WRITTEN.load(Ordering::Relaxed));
+    let started = Instant::now();
+    {
+        let _page = defer();
+        for n in 0..3 {
+            // Recording never refuses the upload.
+            append_transport_error(&dir, SourceKind::Codex, n).unwrap();
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(here() - mine, 3, "every row not written is counted");
+    assert!(HISTORY_ROWS_NOT_WRITTEN.load(Ordering::Relaxed) - process >= 3);
+    drop(held);
+    let response = read(&dir, 500, None, None).unwrap();
+    assert!(response.receipts.is_empty());
+    assert!(response.history_rows_not_written >= Some(3));
 }
 
 #[test]

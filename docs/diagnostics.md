@@ -1109,6 +1109,8 @@ pages of writes), and their space is reused, so the file stays near its 30-day
 size. A history write that fails is
 logged once and never holds or retries an upload; a file another process holds
 costs at most a brief wait, and the attempt is then missing from the history.
+`history_rows_not_written` in `ottto receipts --json` counts those missing
+attempts since the daemon started; it is omitted while none are missing.
 The receipt ring file earlier releases kept is imported once, oldest first, and
 then removed; a ring with any unreadable row is set aside whole, not imported.
 

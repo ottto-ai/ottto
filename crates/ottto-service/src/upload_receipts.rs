@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -31,10 +31,19 @@ const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
 static HISTORY: Mutex<Option<Store>> = Mutex::new(None);
 static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
 static APPEND_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+/// History rows this process could not write (open, lock or write failure),
+/// shown as `history_rows_not_written` by `ottto receipts --json`.
+static HISTORY_ROWS_NOT_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static IMPORT_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static DEFERRED: RefCell<Option<Vec<(PathBuf, Encoded)>>> = const { RefCell::new(None) };
+}
+#[cfg(test)]
+thread_local! {
+    /// This thread's share of the process count, so a test can assert it
+    /// exactly while other tests run.
+    static ROWS_NOT_WRITTEN_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The legacy ring, each row left as its borrowed JSON text so no row is
@@ -780,6 +789,8 @@ pub fn read_page(
         ring_capacity: UPLOAD_RECEIPT_PAGE_SIZE as u16,
         state_path_present: upload_history_path(state_dir).is_file(),
         next_before,
+        history_rows_not_written: Some(HISTORY_ROWS_NOT_WRITTEN.load(Ordering::Relaxed))
+            .filter(|rows| *rows > 0),
     })
 }
 
@@ -864,9 +875,12 @@ impl Drop for Deferred {
     }
 }
 
-/// A history write failure is logged once per process; it never holds,
-/// refuses or retries an upload.
+/// One history row was not written. Every such row is counted; the first is
+/// also logged. It never holds, refuses or retries an upload.
 pub(crate) fn note_append_failure() {
+    HISTORY_ROWS_NOT_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    ROWS_NOT_WRITTEN_HERE.with(|rows| rows.set(rows.get() + 1));
     if !APPEND_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
         eprintln!("ottto-service: snapshot upload receipt persistence failed");
     }
@@ -922,6 +936,8 @@ fn open_history(state_dir: &Path) -> Result<Store> {
         .mode(0o700)
         .create(&snapshots)?;
     let mut store = Store::open(&Store::path(&snapshots))?;
+    // A failed import keeps the ring file for the next open, so no row is
+    // lost and nothing is counted as not written.
     if import_ring(state_dir, &mut store).is_err()
         && !IMPORT_FAILURE_LOGGED.swap(true, Ordering::Relaxed)
     {

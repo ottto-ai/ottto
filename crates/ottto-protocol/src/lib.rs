@@ -4552,6 +4552,10 @@ pub struct UploadReceiptsResponseV1 {
     /// the next page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before: Option<u64>,
+    /// History rows the daemon process could not write since it started.
+    /// Present only when at least one was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_rows_not_written: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
