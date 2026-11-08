@@ -251,3 +251,30 @@ pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
 pub(in super::super) fn writer_capability_for_test() -> u64 {
     migrations::WRITER_CAPABILITY
 }
+
+thread_local! {
+    static LOSE_COMMIT_REPLY: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// The next progress COMMIT on the store at `path` becomes durable, then
+/// reports an error, as a lost reply would: the finalizer must classify it
+/// Published from the reopened store.
+pub(in super::super) fn lose_next_progress_commit_reply(db: &Sqlite) {
+    let path = db.path.clone();
+    LOSE_COMMIT_REPLY.with(|armed| *armed.borrow_mut() = Some(path));
+}
+pub(super) fn after_commit(path: &Path, cas: Cas) -> Result<()> {
+    if !matches!(cas, Cas::Progress { .. }) {
+        return Ok(());
+    }
+    let armed = LOSE_COMMIT_REPLY.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let hit = armed.as_deref() == Some(path);
+        if hit {
+            *armed = None;
+        }
+        hit
+    });
+    anyhow::ensure!(!armed, "test: the COMMIT reply was lost");
+    Ok(())
+}

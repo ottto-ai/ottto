@@ -114,6 +114,10 @@ accepted-body ACK. Its exact covered body can earn its file's upload-context
 receipt, retiring that file revision's freshness debt while the refusal stays recorded.
 For a held cache-head probe, the file and candidate witnesses track the cache-free
 probe actually offered; the same exact-coverage receipt gates still apply.
+On the first preparation per source in a process, files with complete covered stale
+terminal membership and a mismatched body digest are selected once for parsing.
+Their source witness stays intact; aligned files need no further parse. A runtime
+hold or incomplete parse can leave the digest unaligned until the next process.
 An optional per-record `exposure` observation, written only
 when a fresh permanent refusal is recorded, separates those records from legacy
 ones; a missing or malformed observation keeps a stale record owed, and legacy

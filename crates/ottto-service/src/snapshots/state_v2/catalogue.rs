@@ -224,7 +224,8 @@ const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_f
 /// Owner-local upload progress: closed kinds owned by `progress.rs`, committed
 /// by their own `progress_generation`, never by the graph's. No `ScanIndex`
 /// field, never a row of `enumerate` or a graph baseline, and no private-path
-/// extraction. One contiguous key range, sorted: the graph walk steps over it.
+/// extraction. Kept sorted and adjacent for readability; the graph walk steps
+/// over each kind on its own, so correctness does not depend on adjacency.
 pub(super) const PROGRESS_KINDS: &[&str] = &[
     "progress.cache_head",
     "progress.cache_state",
@@ -390,7 +391,7 @@ mod tests {
             .iter()
             .all(|kind| !OWNED.iter().any(|o| o.0 == *kind)));
     }
-    /// [format] the progress kinds are one sorted, contiguous range at their
+    /// [format] the progress kinds are one sorted, adjacent range at their
     /// own layout: no graph, Tail or reserved kind sorts inside it.
     #[test]
     fn progress_kinds_are_one_contiguous_range() {

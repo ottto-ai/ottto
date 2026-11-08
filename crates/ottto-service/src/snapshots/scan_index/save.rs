@@ -6,16 +6,18 @@ use crate::snapshots::*;
 
 impl ScanIndex {
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, false, None)
+        self.save_internal(path, None, false)
     }
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        self.save_internal(path, Some(cap), false, None)
+        self.save_internal(path, Some(cap), false)
     }
+    /// A save while the caller holds the source's progress owner, which a
+    /// routed save never takes itself: owner, then CheckpointLock.
     pub(crate) fn save_with_progress_owner(
         &mut self,
         path: &Path,
         read_limit: Option<usize>,
-        owner: &crate::snapshot_sync::SnapshotProgressLock,
+        _owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
         if !state_v2::state_v2_growth_retention_active(self) {
             return match read_limit {
@@ -23,19 +25,18 @@ impl ScanIndex {
                 None => self.save(path),
             };
         }
-        self.save_internal(path, read_limit, false, Some(owner))
+        self.save_internal(path, read_limit, false)
     }
     /// Test-only since growth claims commit their rows directly.
     #[cfg(test)]
     pub(in crate::snapshots) fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, true, None)
+        self.save_internal(path, None, true)
     }
     fn save_internal(
         &mut self,
         path: &Path,
         read_limit: Option<usize>,
         claim_only: bool,
-        progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     ) -> Result<()> {
         let _save_window = state_v2::state_v2_growth_retention_active(self)
             .then(|| state_v2::telemetry::Window::begin("save"))
@@ -58,7 +59,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         #[cfg(test)]
         pause_scan_index_cas_if_requested_for_test();
-        if state_v2::save_locked(path, self, claim_only, progress_owner, _lock.custody)? {
+        if state_v2::save_locked(path, self, claim_only, _lock.custody)? {
             return Ok(());
         }
         if path.exists() {

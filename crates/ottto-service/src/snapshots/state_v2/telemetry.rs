@@ -582,7 +582,6 @@ mod ops_tests {
                     .collect::<Vec<_>>(),
                 [
                     "hydrate_route_entry",
-                    "hydrate_after_ack",
                     "hydrate_after_catalogue",
                     "hydrate_after_misc",
                     "hydrate_after_files",
