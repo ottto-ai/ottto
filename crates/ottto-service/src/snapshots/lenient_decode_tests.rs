@@ -633,7 +633,6 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
         );
     }
 }
-
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
@@ -665,6 +664,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        refold_unchanged: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
