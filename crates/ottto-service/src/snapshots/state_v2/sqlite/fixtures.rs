@@ -212,8 +212,9 @@ pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
     db.stats.dirty_rows_per_save
 }
 
+type ReopenHook = Box<dyn FnOnce(&Path)>;
 thread_local! {
-    static BEFORE_REOPEN: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+    static BEFORE_REOPEN: std::cell::RefCell<Option<ReopenHook>> =
         const { std::cell::RefCell::new(None) };
 }
 /// Run the armed hook once, after a COMMIT error closed the connection and

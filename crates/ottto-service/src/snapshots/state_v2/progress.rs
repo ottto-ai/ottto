@@ -8,10 +8,6 @@
 //! catalogue walk seeks past these kinds, its baseline never names them and
 //! its hydrate never loads them. They hold no private-path extraction, so
 //! replacing or deleting them never owes erasure.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "dormant until upload progress moves to rows")
-)]
 use super::*;
 use anyhow::{bail, ensure};
 use serde::de::DeserializeOwned;
@@ -20,8 +16,11 @@ use std::collections::BTreeMap;
 
 /// The control a progress commit compares and advances. Absent reads as 0.
 pub(super) const GENERATION: &str = "progress_generation";
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 const CACHE_STATE: &str = "progress.cache_state";
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 const CACHE_HEAD: &str = "progress.cache_head";
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 const LEDGER: &str = "progress.ledger";
 
 /// A progress row (`catalogue::PROGRESS_KINDS`) or the progress CAS control.
@@ -49,6 +48,7 @@ pub(super) fn range() -> Result<(RowKey, RowKey)> {
 
 /// One page's progress: two keyed maps (a count manifest plus one row per
 /// member) and one ledger row holding every other durable field.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 pub(super) struct Page<S, H, L> {
     pub(super) cache_state: BTreeMap<String, S>,
     pub(super) cache_head: BTreeMap<String, H>,
@@ -56,12 +56,18 @@ pub(super) struct Page<S, H, L> {
 }
 
 /// Committed progress row digests at `generation`, the progress CAS value.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Baseline {
     pub(super) generation: u64,
     pub(super) rows: mapper::Digests,
 }
 
+/// Hydrated progress: the page (`None` before any progress) and its baseline.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
+pub(super) type Hydrated<S, H, L> = (Option<Page<S, H, L>>, Baseline);
+
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
     /// The page and `progress_generation` committed; the next baseline.
@@ -70,10 +76,12 @@ pub(super) enum Outcome {
     NotPublished,
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 fn ledger_key() -> Result<RowKey> {
     mapper::key(LEDGER, "", 1)
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 fn generation(tx: &mut dyn Transaction) -> Result<u64> {
     let Some(h) = tx.get(&RowKey::Meta(GENERATION.into()))? else {
         return Ok(0);
@@ -85,6 +93,7 @@ fn generation(tx: &mut dyn Transaction) -> Result<u64> {
 }
 
 /// A map kind that may be absent at any layout: no manifest means no members.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 fn read_kind<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     kind: &str,
@@ -102,7 +111,8 @@ fn read_kind<T: DeserializeOwned + Serialize>(
 
 /// Every progress row in the caller's read snapshot, with the row digests that
 /// seed the next write. `None`: the store holds no progress yet.
-pub(super) fn read<S, H, L>(tx: &mut dyn Transaction) -> Result<(Option<Page<S, H, L>>, Baseline)>
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
+pub(super) fn read<S, H, L>(tx: &mut dyn Transaction) -> Result<Hydrated<S, H, L>>
 where
     S: DeserializeOwned + Serialize,
     H: DeserializeOwned + Serialize,
@@ -131,6 +141,7 @@ where
 
 /// Write `page` against `old`: a row is written only if its digest changed,
 /// and map members missing from `page` are removed. Returns the next digests.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 fn write<S: Serialize, H: Serialize, L: Serialize>(
     tx: &mut dyn Transaction,
     old: mapper::Digests,
@@ -154,6 +165,7 @@ fn write<S: Serialize, H: Serialize, L: Serialize>(
 /// as it is. Without a `baseline` the progress kinds alone are read inside the
 /// transaction. Published and Ambiguous reopened the connection: the caller's
 /// session reloads.
+#[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
 pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
     db: &mut sqlite::Sqlite,
     identity: &Identity,

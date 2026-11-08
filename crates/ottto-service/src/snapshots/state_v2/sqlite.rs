@@ -1673,8 +1673,15 @@ impl Transaction for Txn<'_> {
 /// `progress_generation`, so the graph session's stamp stays valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cas {
-    Graph { expected: u64, next: u64 },
-    Progress { expected: u64, next: u64 },
+    Graph {
+        expected: u64,
+        next: u64,
+    },
+    #[cfg_attr(not(test), allow(dead_code, reason = "no production caller yet"))]
+    Progress {
+        expected: u64,
+        next: u64,
+    },
 }
 impl Cas {
     fn span(self) -> (u64, u64) {
