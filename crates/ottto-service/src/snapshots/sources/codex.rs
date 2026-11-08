@@ -8,3 +8,5 @@ pub(in crate::snapshots) mod line;
 pub(in crate::snapshots) mod recovery_capture;
 pub(in crate::snapshots) mod rollout_header;
 pub(in crate::snapshots) mod sidecar;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;
