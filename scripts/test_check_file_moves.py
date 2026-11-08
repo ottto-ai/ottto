@@ -675,6 +675,25 @@ class MoveRejects(Base):
         self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
                     'rule 4 (glob consumers)')
 
+    def test_precise_capture_bounds_are_not_glob_imports(self):
+        # A `*` after `+ use<..>` and before the next `;` once read as an unreadable glob import.
+        bounds = ("pub(crate) fn g<'a, T>(x: &'a T) -> impl Sized + use<'a, T> {\n    let _ = 2 * 3;\n    x\n}\n\n"
+                  'pub(crate) fn h() -> impl Iterator<Item = u8> + use<> {\n    [2 * 3].into_iter()\n}\n\n')
+        rules = ('macro_rules! make {\n    () => {\n        pub(crate) fn m() -> impl Sized + use<> {\n'
+                 '            2 * 3\n        }\n    };\n}\n\n')
+        base = files(**{'lib.rs': rules + 'mod snapshots;\n', 'snapshots/old.rs': OLD + '\n' + bounds,
+                        'snapshots/caller.rs': bounds + CALLER})
+        base['crates/demo/Cargo.toml'] = CARGO.replace('2021', '2024')
+        self.accept(base, self.basic_head(base))
+        fallback = 'pub(crate) mod old {\n    pub(crate) fn f() -> u8 {\n        5\n    }\n}\n'
+        consumer = bounds + 'use crate::fallback::*;\nuse super::*;\n\npub(crate) fn k() -> u8 {\n    old::f()\n}\n'
+        dest = 'mod consumer;\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
+        base = files(**{'lib.rs': 'mod fallback;\nmod snapshots;\n', 'fallback.rs': fallback,
+                        'snapshots/dest.rs': dest, 'snapshots/dest/consumer.rs': consumer})
+        result = self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
+                             'glob-imports crate::snapshots::dest and names `old`')
+        self.assertFalse([p for p in result.problems if 'use tree' in p], result.problems)
+
     def test_edition_2024_prelude_name(self):
         base = files()
         base['crates/demo/Cargo.toml'] = CARGO.replace('2021', '2024')
