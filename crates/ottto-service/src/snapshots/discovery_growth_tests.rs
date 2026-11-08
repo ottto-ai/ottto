@@ -1562,6 +1562,7 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
     }
 }
 
+mod cleared_group_listing;
 mod codex_archive_tests;
 
 /// [regress] A positive remove hint in a retained Codex generation retires

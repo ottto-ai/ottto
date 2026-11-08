@@ -1,8 +1,8 @@
 //! Reconcile provider metadata across homes without moving file-ownership proof.
-use super::*;
+use crate::snapshots::*;
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct RootSidecar {
+pub(in crate::snapshots) struct RootSidecar {
     pub threads: BTreeMap<String, Shared<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
 }
@@ -13,7 +13,7 @@ pub(super) struct RootSidecar {
 // Keep the precise clock in each home for the existing native ownership checks.
 const COPY_CREATION_PRECISION_NANOS: i128 = 1_000_000_000;
 
-pub(super) fn copy_locator<'a>(
+pub(in crate::snapshots) fn copy_locator<'a>(
     root: &Path,
     id: &str,
     row: &'a CodexStateThread,
@@ -81,7 +81,7 @@ fn compatible_copy(
     }
 }
 
-pub(super) fn merge_threads(
+pub(in crate::snapshots) fn merge_threads(
     metadata: &mut CodexTitleMetadata,
     root: &Path,
     incoming: &BTreeMap<String, Shared<CodexStateThread>>,
@@ -127,7 +127,7 @@ pub(super) fn merge_threads(
     }
 }
 
-pub(super) fn merge_extents(
+pub(in crate::snapshots) fn merge_extents(
     metadata: &mut CodexTitleMetadata,
     incoming: &BTreeMap<String, CodexRolloutExtent>,
 ) {

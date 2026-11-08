@@ -257,12 +257,21 @@ impl ScanIndex {
 /// An accepted sampled generation must be verified even after its activity
 /// ages out. The existing bounded walk remains its sole scheduler. Other old
 /// files keep the configured window, and secure opens/file caps still apply.
+/// A nonempty file with no final snapshot group that is not confirmed empty
+/// (its group was cleared for re-parse) is owed the same way, so every listing
+/// and age gate keeps it until a parse restores the group.
 pub(super) fn path_requires_verification(
     files: &SharedMap<String, ScanIndexEntry>,
+    confirmed_empty: &BTreeSet<String>,
     path: &Path,
 ) -> bool {
-    files.get(&local_index_key(path)).is_some_and(|entry| {
-        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
+    let key = local_index_key(path);
+    files.get(&key).is_some_and(|entry| {
+        entry.has_unverified_source()
+            || entry.source_file_fingerprint.is_empty()
+            || (entry.size_bytes > 0
+                && entry.last_snapshot_fingerprint.is_none()
+                && !confirmed_empty.contains(&key))
     })
 }
 
@@ -273,10 +282,11 @@ pub(super) fn path_requires_verification(
 pub(super) fn path_requires_recovery(
     source: SnapshotSource,
     files: &SharedMap<String, ScanIndexEntry>,
+    confirmed_empty: &BTreeSet<String>,
     path: &Path,
     length: u64,
 ) -> bool {
-    path_requires_verification(files, path)
+    path_requires_verification(files, confirmed_empty, path)
         || (source == SnapshotSource::ClaudeCode
             && files.get(&local_index_key(path)).is_some_and(|entry| {
                 length != entry.size_bytes
@@ -417,12 +427,20 @@ mod tests {
         let candidate = candidate();
         let key = local_index_key(&candidate.path);
         assert!(index.traversal.is_none());
-        assert!(!path_requires_verification(&index.files, &candidate.path));
+        assert!(!path_requires_verification(
+            &index.files,
+            &index.confirmed_empty_files,
+            &candidate.path
+        ));
         queue_cap_retry(&mut index, &candidate);
         let mut loaded: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         assert!(loaded.traversal.is_none());
-        assert!(path_requires_verification(&loaded.files, &candidate.path));
+        assert!(path_requires_verification(
+            &loaded.files,
+            &loaded.confirmed_empty_files,
+            &candidate.path
+        ));
         assert!(!loaded.files[&key].has_unverified_source());
         assert_eq!(loaded.files[&key].size_bytes, 1);
         // Same-process provenance survives the index round-trip until an

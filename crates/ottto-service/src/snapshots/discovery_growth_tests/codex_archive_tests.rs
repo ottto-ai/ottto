@@ -10,9 +10,10 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         let path = f.root.join("archive.jsonl.zst");
         fs::write(&path, b"synthetic").unwrap();
         let key = local_index_key(&path);
-        index
-            .files
-            .insert(key.clone(), crate::snapshots::g7_debt::tests::entry(&path));
+        // A settled entry carries its final group.
+        let mut entry = crate::snapshots::g7_debt::tests::entry(&path);
+        entry.last_snapshot_fingerprint = Some("final".into());
+        index.files.insert(key.clone(), entry);
         if owed {
             index
                 .files

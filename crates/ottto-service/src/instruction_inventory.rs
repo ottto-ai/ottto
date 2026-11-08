@@ -762,7 +762,7 @@ mod tests {
         let malformed = file("malformed.json", "{\"pluginConfigs\":");
         let directory = dir.join("directory.json");
         fs::create_dir(&directory).unwrap();
-        use ClaudeInstructionMode::*;
+        use crate::instruction_inventory::ClaudeInstructionMode::*;
         for (files, expected) in [
             (vec![&missing], OrAgentsMd),
             (vec![&unrelated, &missing], OrAgentsMd),

@@ -2,7 +2,7 @@
 //!
 //! Claude Code writes the count as `usage.output_tokens_details.thinking_tokens`,
 //! a part of `output_tokens`. Fixtures are synthetic usage blocks only.
-use super::*;
+use crate::snapshots::*;
 use serde_json::json;
 
 const FAMILY_ROOT: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -47,7 +47,7 @@ fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
 fn family_stored_before_thinking_reader_is_held_after_upgrade() {
     // Legacy reported-usage rebuild and selectors; `e2` attaches telemetry to native grains.
 
-    use super::tests::{complete_api_row, complete_trace_row, manifest_index_entry};
+    use crate::snapshots::tests::{complete_api_row, complete_trace_row, manifest_index_entry};
     let dir = std::env::temp_dir().join(format!(
         "ottto-claude-thinking-family-{}-{}",
         std::process::id(),

@@ -9,3 +9,5 @@ pub(in crate::snapshots) mod desktop_titles;
 pub(in crate::snapshots) mod line;
 pub(in crate::snapshots) mod settings_defaults;
 pub(in crate::snapshots) mod subagent_identity;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;

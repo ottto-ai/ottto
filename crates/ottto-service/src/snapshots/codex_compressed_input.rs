@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::path::Path;
-#[path = "codex_decoder_allocation.rs"]
 mod decoder_allocation;
 use decoder_allocation::Context as DecoderContext;
 
