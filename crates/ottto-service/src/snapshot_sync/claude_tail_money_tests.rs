@@ -967,13 +967,21 @@ fn resumed_prefix_sidecar_receipt() {
             })
             .collect::<BTreeSet<_>>();
         assert!(accounts.len() >= 2, "two accounts placed on tagged rows");
-        assert!(
-            model_rows
-                .iter()
-                .any(|row| row.account_identifier_hash.is_none()
-                    && row.evidence_ref.is_none()
-                    && row.identity_parts.is_none()),
-            "an evidence gap remains"
+        // A mixed-account bucket keeps its unknown share in identity_parts.
+        let gaps = model_rows
+            .iter()
+            .flat_map(|row| row.identity_parts.iter().flatten())
+            .filter(|part| part.account_identifier_hash.is_none() && part.evidence_ref.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(gaps.len(), 1, "one evidence gap remains");
+        assert_eq!(
+            (
+                gaps[0].request_count,
+                gaps[0].input_tokens,
+                gaps[0].output_tokens
+            ),
+            (1, 7, 7),
+            "the gap's money stays untagged"
         );
         accept_page(&mut warm);
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
