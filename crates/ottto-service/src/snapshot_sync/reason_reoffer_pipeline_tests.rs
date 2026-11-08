@@ -470,34 +470,25 @@ impl ReofferPipeline {
         walk(&self.support);
     }
 
-    /// This pipeline stands in for the daemon on its support directory,
-    /// holding #801's single-writer lock there, so the post-save durable
-    /// write runs.
+    /// Use a canonical state-database route and hold the daemon's
+    /// single-writer lock for the durable restore receipt.
     #[cfg(unix)]
-    fn hold_state_dir_lock(&self) {
+    fn hold_state_dir_lock(&mut self) {
+        self.support = self.support.canonicalize().unwrap();
+        // The fixture's existing environment guard restores this on drop.
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support);
         crate::locked_state_dir::test_locks::hold(&self.support);
     }
 
-    /// Durable warm-cache records on disk under the support directory.
+    /// Committed Tail heads in the saved index's state database.
     #[cfg(unix)]
     fn durable_records(&self) -> usize {
-        fn walk(dir: &std::path::Path, inside: bool) -> usize {
-            std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let store = path.extension().is_some_and(|ext| ext == "durable-tail");
-                        walk(&path, inside || store)
-                    } else {
-                        usize::from(inside && path.extension().is_some_and(|ext| ext == "rec"))
-                    }
-                })
-                .sum()
-        }
-        walk(&self.support, false)
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ));
+        let index = ScanIndex::load(&index_path).unwrap();
+        crate::snapshots::state_v2::tail_kind_counts_for_test(&index)["tail.head"]
     }
 
     fn transcript(&self) -> PathBuf {
