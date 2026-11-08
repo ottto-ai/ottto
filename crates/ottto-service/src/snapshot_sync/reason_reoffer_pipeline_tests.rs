@@ -281,6 +281,8 @@ impl ReofferPipeline {
         let secrets = fixture.base.join(format!("{name}-secrets"));
         std::fs::create_dir_all(&support).unwrap();
         std::fs::create_dir_all(&secrets).unwrap();
+        // State-database admission rejects symlink ancestors in macOS temp paths.
+        let support = support.canonicalize().unwrap();
         let server = ReofferServer::new(first, capture);
         let guards = vec![
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
