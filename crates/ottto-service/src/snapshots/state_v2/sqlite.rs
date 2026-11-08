@@ -1732,6 +1732,8 @@ impl Txn<'_> {
         let started = Instant::now();
         let result = (|| -> Result<()> {
             self.store.conn()?.execute_batch("COMMIT")?;
+            #[cfg(test)]
+            fixtures::after_commit(&self.store.path, cas)?;
             Ok(())
         })();
         let latency = started.elapsed();

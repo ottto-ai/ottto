@@ -132,12 +132,24 @@ fn send(
     progress: &mut SnapshotUploadProgress,
     respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
-    let (status, batches, _) = upload_source_under(
+    send_with(source, page, progress, respond, |_| Ok(()))
+}
+
+/// `send` with the caller's progress persistence after each ACK.
+fn send_with(
+    source: SnapshotSource,
+    page: &Page,
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> (Result<ResumableUploadResult>, RouteResult) {
+    let (status, batches, _) = upload_source_persisting(
         source,
         SnapshotUploadPolicy::default(),
         &page.scan.snapshots,
         progress,
         respond,
+        persist,
     );
     let sent = batches
         .iter()

@@ -21,8 +21,10 @@ mod runtime;
 pub(crate) use runtime::release_collection_page_limit_for_test;
 #[cfg(test)]
 pub(crate) use runtime::{
-    before_progress_import_for_test, edit_progress_rows_for_test,
-    fail_next_progress_commit_for_test,
+    before_progress_import_for_test, claim_growth_for_test, edit_progress_rows_for_test,
+    fail_next_progress_commit_for_test, import_progress_rows_for_test,
+    lose_next_progress_commit_reply_for_test, take_progress_pages_for_test,
+    take_progress_set_aside_for_test,
 };
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;

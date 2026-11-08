@@ -851,7 +851,23 @@ pub(in crate::snapshot_sync) fn upload_source_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_source_persisting(source, upload_policy, items, progress, respond, |_| Ok(()))
+}
+/// `upload_source_under` with the caller's progress persistence, as the
+/// production pass passes its ledger save.
+pub(in crate::snapshot_sync) fn upload_source_persisting(
+    source: SnapshotSource,
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -885,7 +901,7 @@ pub(in crate::snapshot_sync) fn upload_source_under(
             response.validate_entity_ack(&wire)?;
             Ok(response)
         },
-        |_| Ok(()),
+        persist,
     );
     (result, sent, order)
 }
