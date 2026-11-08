@@ -262,7 +262,10 @@ Whole-file moves are checked with `scripts/check_file_moves.py move` (a module f
 file below it move byte for byte; only the old parent's `mod` line, one facade alias at the old
 name and the new parent's `mod` line change; no `super` path in a moved file reaches outside its
 subtree), after an optional change checked with `scripts/check_file_moves.py absolutize` that only
-replaces such `super` paths with the `crate::` path they denote.
+replaces such `super` paths with the `crate::` path they denote. Both modes fail on what they
+cannot reason about (include edges into moved files, unlisted derives, attributes and item-level
+macros, location macros, glob importers that see the new name, unknown Cargo targets, old-path
+strings) and print their limits: implicit log targets, panic locations and runtime paths.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
 
 ## Never drop data

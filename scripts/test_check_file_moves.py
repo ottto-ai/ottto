@@ -166,7 +166,7 @@ class MoveAccepts(Base):
                                           SRC + 'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}
         self.accept(base, head)
 
-    def test_inline_modules_and_included_part_move_inside_the_subtree(self):
+    def test_inline_modules_and_an_unread_data_file_move_inside_the_subtree(self):
         old = OLD + code('''
 
             mod inner {
@@ -174,13 +174,12 @@ class MoveAccepts(Base):
                     super::f()
                 }
             }
-
-            include!("old/part.rs");
         ''')
-        base = files(**{'snapshots/old.rs': old, 'snapshots/old/part.rs': 'fn part() -> u8 {\n    3\n}\n'})
-        head = moved(base, BASIC_MOVE | {'snapshots/old/part.rs': 'snapshots/dest/old/part.rs'})
+        base = files(**{'snapshots/old.rs': old, 'snapshots/old/notes.txt': 'n\n'})
+        head = moved(base, BASIC_MOVE | {'snapshots/old/notes.txt': 'snapshots/dest/old/notes.txt'})
         head |= {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
-        self.accept(base, head)
+        result = self.accept(base, head)
+        self.assertTrue(any('1 data files' in line for line in result.lines), result.lines)
 
     def test_layout_tsv_rides_along(self):
         base = files() | {'scripts/source_layout_limits.tsv': 'path\tlines\n',
@@ -264,7 +263,7 @@ class MoveRejects(Base):
     def test_include_pointing_outside_the_subtree(self):
         old = OLD + '\nconst DATA: &str = include_str!("data.txt");\n'
         base = files(**{'snapshots/old.rs': old, 'snapshots/data.txt': 'x\n'})
-        self.reject(base, self.basic_head(base), 'does not resolve to the moved counterpart')
+        self.reject(base, self.basic_head(base), 'its relative path would name another file')
         old = OLD + '\nconst DATA: &str = include_str!(concat!("da", "ta.txt"));\n'
         base = files(**{'snapshots/old.rs': old, 'snapshots/data.txt': 'x\n'})
         self.reject(base, self.basic_head(base), 'without one plain string literal')
@@ -372,7 +371,7 @@ class MoveRejects(Base):
                         'lib.rs': 'mod other;\nmod snapshots;\n', 'other.rs': 'include!("snapshots/old/part.rs");\n'})
         head = self.basic_head(base, **{'other.rs': 'include!("snapshots/dest/old/part.rs");\n'})
         head |= moved(base, {'snapshots/old/part.rs': 'snapshots/dest/old/part.rs'})
-        self.reject(base, head, 'module contexts')
+        self.reject(base, head, 'reached through include!')
 
     def test_glue_edits(self):
         base = files()
@@ -401,7 +400,7 @@ class MoveRejects(Base):
                             'snapshots/old/tests.rs': 'snapshots/dest/serde/tests.rs'})
         head |= {SRC + 'snapshots.rs': 'mod caller;\nmod dest;\n',
                  SRC + 'snapshots/dest.rs': DEST_WITH_OLD.replace('pub(crate) mod old', 'mod serde')}
-        self.reject(base, head, 'extern crate, prelude or primitive')
+        self.reject(base, head, 'extern crate, prelude (edition 2021) or primitive')
 
     def test_macro_expanded_import_in_new_parent(self):
         dest = ('macro_rules! imports {\n    () => {\n        use crate::fallback::*;\n    };\n}\n\nimports!();\n\n'
@@ -409,7 +408,7 @@ class MoveRejects(Base):
         base = files(**{'lib.rs': 'mod fallback;\nmod snapshots;\n', 'fallback.rs': 'pub(crate) mod old {}\n',
                         'snapshots/dest.rs': dest})
         head = self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'})
-        self.reject(base, head, 'contains `use`')
+        self.reject(base, head, 'not on the item macro allowlist')
 
     def test_renamed_under_globbing_new_parent(self):
         dest = 'use super::*;\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
@@ -466,10 +465,132 @@ class MoveRejects(Base):
         head = self.basic_head(base, **{'snapshots/dest.rs': dest.replace('a\nb', 'a\n\nb') + 'pub(crate) mod old;\n'})
         self.reject(base, head, 'not whole `use` items')
 
-    def test_unreferenced_data_file(self):
+    def test_data_file_outside_the_subtree_directory(self):
         base = files(**{'snapshots/notes.txt': 'n\n'})
         head = self.basic_head(base) | moved(base, {'snapshots/notes.txt': 'snapshots/dest/notes.txt'})
-        self.reject(base, head, 'no moved file includes it')
+        self.reject(base, head, 'must keep its place inside a moved subtree')
+
+    # One fixture per value-changing counterexample of the soundness review.
+
+    def test_included_rust_part_escapes(self):
+        old = OLD + '\ninclude!("old/part.inc");\n'
+        part = 'pub(crate) fn g() -> u8 {\n    super::dest::here()\n}\n'
+        base = files(**{'snapshots/old.rs': old, 'snapshots/old/part.inc': part})
+        head = self.basic_head(base) | moved(base, {'snapshots/old/part.inc': 'snapshots/dest/old/part.inc'})
+        self.reject(base, head, 'rule 1 (includes)')
+
+    def test_macro_expansion_with_super(self):
+        child = 'macro_rules! m {\n    () => {\n        super::dest::here()\n    };\n}\n'
+        for decl, call, extra in (('#[macro_use]\nmod child;\n', 'm!()', ''),
+                                  ('mod child;\n', 'child::m!()', 'pub(crate) use m;\n')):
+            with self.subTest(decl=decl):
+                old = OLD.replace('here() + 1', f'here() + {call}') + decl
+                base = files(**{'snapshots/old.rs': old, 'snapshots/old/child.rs': child + extra})
+                head = self.basic_head(base) | moved(base, {'snapshots/old/child.rs': 'snapshots/dest/old/child.rs'})
+                self.reject(base, head, 'rule 2 (macros)')
+
+    def test_derive_or_macro_generated_glob_in_new_parent(self):
+        fallback = 'pub(crate) mod old {\n    pub(crate) fn f() -> u8 {\n        5\n    }\n}\n'
+        dest = '#[derive(probe::Import)]\nstruct Marker;\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
+        base = files(**{'lib.rs': 'mod fallback;\nmod snapshots;\n', 'fallback.rs': fallback, 'snapshots/dest.rs': dest})
+        self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
+                    'may be a macro')
+        lib = 'macro_rules! imports {\n    ($u:ident) => {\n        $u crate::fallback::*;\n    };\n}\n\nmod fallback;\nmod snapshots;\n'
+        dest = 'imports!(use);\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
+        base = files(**{'lib.rs': lib, 'fallback.rs': fallback, 'snapshots/dest.rs': dest})
+        self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
+                    'rule 3 (item macros)')
+
+    def test_moved_proc_macro_derive_and_attribute(self):
+        for extra, needle in (('#[derive(probe::Read)]\npub(crate) struct Marker;\n', 'derive(probe::Read)'),
+                              ('#[probe::location]\npub(crate) fn g() {}\n', 'probe::location'),
+                              ('#[cfg_attr(all(), derive(Debug, probe::Read))]\npub(crate) struct M;\n', 'derive(probe::Read)')):
+            with self.subTest(needle=needle):
+                base = files(**{'snapshots/old.rs': OLD + '\n' + extra})
+                self.reject(base, self.basic_head(base), needle)
+
+    def test_attribute_literal_bytes(self):
+        parent = 'mod caller;\nmod dest;\n#[cfg(flavor = "a  b")]\nmod old;\n'
+        base = files(**{'snapshots.rs': parent})
+        head = self.basic_head(base, **{
+            'snapshots.rs': 'mod caller;\nmod dest;\n#[cfg(flavor = "a b")]\npub(crate) use crate::snapshots::dest::old;\n',
+            'snapshots/dest.rs': DEST_WITH_OLD.replace('pub(crate) mod old;', '#[cfg(flavor = "a b")]\npub(crate) mod old;')})
+        self.reject(base, head, 'rule 5 (attributes)')
+
+    def test_facade_drops_the_cfg(self):
+        base = files(**{'snapshots.rs': 'mod caller;\nmod dest;\n#[cfg(test)]\nmod old;\n'})
+        head = self.basic_head(base, **{
+            'snapshots/dest.rs': DEST_WITH_OLD.replace('pub(crate) mod old;', '#[cfg(test)]\npub(crate) mod old;')})
+        self.reject(base, head, 'rule 6 (facade cfg)')
+
+    def test_pub_in_names_a_moving_module(self):
+        base = files(**{'snapshots/old.rs': OLD + '\npub(in crate::snapshots::old) fn g() {}\n'})
+        self.reject(base, self.basic_head(base), 'rule 7 (location)')
+
+    def test_location_and_reflection_values(self):
+        for body in ('file!()', 'module_path!()', 'std::any::type_name::<u8>()', 'std::any::type_name_of_val(&1)'):
+            with self.subTest(body=body):
+                base = files(**{'snapshots/old.rs': OLD + f'\npub(crate) fn g() -> &\'static str {{\n    {body}\n}}\n'})
+                self.reject(base, self.basic_head(base), 'rule 7 (location)')
+        base = files(**{'snapshots/old.rs': OLD + '\n#[track_caller]\npub(crate) fn g() {}\n'})
+        self.reject(base, self.basic_head(base), 'rule 7 (location)')
+
+    def test_line_shift_in_a_glue_file(self):
+        dest = 'pub(crate) fn here() -> u8 {\n    0\n}\n\npub(crate) fn at() -> u32 {\n    line!()\n}\n'
+        base = files(**{'snapshots/dest.rs': dest})
+        head = self.basic_head(base, **{'snapshots/dest.rs': 'pub(crate) mod old;\n\n' + dest})
+        self.reject(base, head, 'rule 7 (location)')
+
+    def test_unmoved_include_consumer(self):
+        base = files(**{'snapshots/old/data.txt': 'x\n', 'snapshots.rs': 'mod caller;\nmod consumer;\nmod dest;\nmod old;\n',
+                        'snapshots/consumer.rs': 'pub(crate) const DATA: &str = include_str!("old/data.txt");\n'})
+        head = self.basic_head(base, **{'snapshots.rs': 'mod caller;\nmod consumer;\nmod dest;\n'
+                                                        'pub(crate) use crate::snapshots::dest::old;\n'})
+        head |= moved(base, {'snapshots/old/data.txt': 'snapshots/dest/old/data.txt'})
+        self.reject(base, head, 'rule 1 (includes)')
+
+    def test_macro_generated_include_and_path(self):
+        for body in ('include!("snapshots/old.rs");', '#[path = "snapshots/old.rs"]\n        mod second;'):
+            with self.subTest(body=body):
+                lib = f'macro_rules! more {{\n    () => {{\n        {body}\n    }};\n}}\n\nmod snapshots;\n'
+                base = files(**{'lib.rs': lib})
+                self.reject(base, self.basic_head(base), 'rule 8 (hidden contexts)')
+        base = files(**{'lib.rs': 'mod other;\nmod snapshots;\n', 'other/second.rs': '\n',
+                        'other.rs': '#[cfg_attr(all(), path = "snapshots/old.rs")]\nmod second;\n'})
+        self.reject(base, self.basic_head(base), 'rule 8 (hidden contexts)')
+
+    def test_custom_cargo_target(self):
+        cargo = CARGO + '\n[[bin]]\nname = "custom"\npath = "src/custom.rs"\n'
+        base = files(**{'custom.rs': '#[path = "snapshots/old.rs"]\nmod old;\n\nfn main() {}\n'})
+        base['crates/demo/Cargo.toml'] = cargo
+        self.reject(base, self.basic_head(base), 'rule 8 (targets)')
+        base = files()
+        base['crates/demo/Cargo.toml'] = CARGO + '\n[[bin]]\nname = "ghost"\n'
+        self.reject(base, self.basic_head(base), 'no path and no default file')
+
+    def test_runtime_old_path_read(self):
+        read = ('\npub(crate) fn source() -> String {\n    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), '
+                '"/src/snapshots/old.rs")).unwrap()\n}\n')
+        base = files(**{'snapshots/old.rs': OLD + read})
+        self.reject(base, self.basic_head(base), 'rule 9 (old paths)')
+
+    def test_glob_consumer_of_the_new_parent(self):
+        fallback = 'pub(crate) mod old {\n    pub(crate) fn f() -> u8 {\n        5\n    }\n}\n'
+        consumer = 'use crate::fallback::*;\nuse super::*;\n\npub(crate) fn g() -> u8 {\n    old::f()\n}\n'
+        dest = 'mod consumer;\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
+        base = files(**{'lib.rs': 'mod fallback;\nmod snapshots;\n', 'fallback.rs': fallback,
+                        'snapshots/dest.rs': dest, 'snapshots/dest/consumer.rs': consumer})
+        self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
+                    'rule 4 (glob consumers)')
+
+    def test_edition_2024_prelude_name(self):
+        base = files()
+        base['crates/demo/Cargo.toml'] = CARGO.replace('2021', '2024')
+        head = moved(base, {'snapshots/old.rs': 'snapshots/dest/Future.rs',
+                            'snapshots/old/tests.rs': 'snapshots/dest/Future/tests.rs'})
+        head |= {SRC + 'snapshots.rs': 'mod caller;\nmod dest;\npub(crate) use dest::Future as old;\n',
+                 SRC + 'snapshots/dest.rs': DEST_WITH_OLD.replace('mod old;', 'mod Future;')}
+        self.reject(base, head, 'prelude (edition 2024)')
 
     def test_includes_tsv_still_names_the_old_path(self):
         row = lambda path: f'# file\tkind\tliteral\n{SRC}{path}\tinclude\tx.rs\n'  # noqa: E731
@@ -540,6 +661,16 @@ class AbsolutizeRejects(Base):
                         'has no path')
         self.check_edit('#[tokio::test]\nasync fn f() {\n    super::x();\n}\n',
                         '#[tokio::test]\nasync fn f() {\n    crate::snapshots::x();\n}\n', 'may be a macro')
+
+    def test_derive_observing_the_replaced_path(self):
+        for attr in ('#[derive(probe::Observe)]', '#[cfg_attr(all(), derive(probe::Observe))]'):
+            with self.subTest(attr=attr):
+                old = f'{attr}\npub(crate) struct Marker {{\n    value: super::dest::Value,\n}}\n'
+                self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest'), 'derive(probe::Observe)')
+
+    def test_column_shift_after_a_replacement(self):
+        old = 'fn f() -> u32 {\n    let _ = super::dest::here(); column!()\n}\n'
+        self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest'), 'rule 7 (location)')
 
     def test_attribute_pattern_inside_macro_rules_is_fine(self):
         old = 'macro_rules! m {\n    ($(#[$a:meta])* $f:ident) => {};\n}\n\nfn f() {\n    super::x();\n}\n'
