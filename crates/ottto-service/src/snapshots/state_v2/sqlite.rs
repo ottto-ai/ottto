@@ -433,7 +433,7 @@ pub(super) fn private_parent(path: &Path) -> Result<()> {
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-pub(in crate::snapshots) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)

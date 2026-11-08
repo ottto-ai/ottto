@@ -10493,7 +10493,7 @@ where
     // The remote write happened first. If this local atomic save
     // fails, stop: at most this one idempotent page can replay.
     let saved = persist(progress);
-    attempt_history.flush();
+    drop(attempt_history);
     saved.map_err(|_| {
         anyhow::Error::new(SnapshotLocalStateRejected {
             operation: "save upload checkpoint",
@@ -22373,7 +22373,7 @@ mod tests {
         let root = crate::snapshots::native_join_fixture_root(priority);
         let index_path = root.join("index.json");
         let progress_path = root.join("progress.json");
-        let receipt_dir = root.join("receipts");
+        let receipt_dir = root.canonicalize().unwrap().join("receipts");
         let mut baseline = ScanIndex::default();
         baseline.save(&index_path).unwrap();
         let prepare = |index: &mut ScanIndex| prepare_codex_union_fixture(&root, index);

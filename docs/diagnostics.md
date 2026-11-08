@@ -1107,9 +1107,10 @@ source's newest still stays). The file is not compacted: removed rows are
 zeroed once SQLite next checkpoints its write-ahead log (after about 1,000
 pages of writes), and their space is reused, so the file stays near its 30-day
 size. A history write that fails is
-logged once and never holds, slows or retries an upload; the attempt is then
-missing from the history. The receipt ring file earlier releases kept is
-imported once, oldest first, and then removed.
+logged once and never holds or retries an upload; a file another process holds
+costs at most a brief wait, and the attempt is then missing from the history.
+The receipt ring file earlier releases kept is imported once, oldest first, and
+then removed; a ring with any unreadable row is set aside whole, not imported.
 
 Output is newest first in the order attempts were recorded. One page returns at
 most `--limit` receipts (at most 500, reported as `ring_capacity`). When older

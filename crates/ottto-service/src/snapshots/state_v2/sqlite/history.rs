@@ -6,12 +6,16 @@
 //! window in the same transaction and always keeps every source's newest row,
 //! so no timer or other owner deletes rows. The file is never VACUUMed:
 //! `secure_delete` zeroes expired rows and later appends reuse their pages.
-use super::{linked_engine, lock_owner, pragmas, private_file, same_object, sidecar, Checkpoint};
+use super::super::VALUE_BYTES;
+use super::{
+    linked_engine, lock_owner, pragmas, private_file, private_parent, same_object, sidecar,
+    Checkpoint,
+};
 use anyhow::{bail, ensure, Result};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use sha2::Digest;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) const FILE_NAME: &str = "upload_history.sqlite";
@@ -19,7 +23,6 @@ pub(crate) const FILE_NAME: &str = "upload_history.sqlite";
 pub(crate) const RETENTION_NS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const USER_VERSION: i64 = 1;
 const VALUE_VERSION: u32 = 1;
-const VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const SCHEMA: &str = "
 CREATE TABLE upload_history(
  seq INTEGER PRIMARY KEY,
@@ -140,7 +143,7 @@ impl Store {
     /// connection the file's only writer for its lifetime.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         linked_engine()?;
-        owned_parent(path)?;
+        private_parent(path)?;
         let owner_lock = lock_owner(path)?;
         let created = match fs::symlink_metadata(path) {
             Ok(_) => false,
@@ -188,22 +191,13 @@ impl Store {
         pragmas(&conn, false, Checkpoint::Auto(1000))?;
         match version {
             0 => {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                // Another opener may have initialized it between the reads.
-                if tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
-                    tx.execute_batch(SCHEMA)?;
-                }
+                let tx = conn.transaction()?;
+                tx.execute_batch(SCHEMA)?;
                 tx.commit()?;
             }
             USER_VERSION => {}
             _ => bail!("upload_history_schema_refused"),
         }
-        let objects: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE (type,name) IN (VALUES('table','upload_history'),('index','upload_history_at'),('index','upload_history_src'),('table','ring_imported'))",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(objects == 4, "upload_history_schema_refused");
         private_file(path)?;
         Ok(Self {
             conn,
@@ -300,6 +294,10 @@ impl Store {
         Ok(page)
     }
 
+    pub(crate) fn file_path(&self) -> &Path {
+        &self.path
+    }
+
     fn check_object(&self) -> Result<()> {
         ensure!(
             same_object(&self.file.metadata()?, &fs::symlink_metadata(&self.path)?),
@@ -312,21 +310,6 @@ impl Store {
     pub(crate) fn conn_for_test(&self) -> &Connection {
         &self.conn
     }
-}
-
-/// The file's own directory is a real directory of this user. Unlike the
-/// per-source stores, symlinked ancestors (such as a system temp root) are
-/// allowed: the file is owner-only and held by its `.owner` lock.
-fn owned_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state_v2_unsafe_parent"))?;
-    let m = fs::symlink_metadata(parent)?;
-    ensure!(
-        m.is_dir() && !m.file_type().is_symlink() && m.uid() == unsafe { libc::geteuid() },
-        "state_v2_unsafe_parent"
-    );
-    Ok(())
 }
 
 fn insert(tx: &rusqlite::Transaction<'_>, row: &Encoded) -> Result<i64> {

@@ -4973,7 +4973,7 @@ mod tests {
     #[test]
     fn composition_start_verdict_records_only_final_acknowledged_items() {
         use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
-        let support = crate::test_scratch::private_dir("composition-ack-verdict");
+        let support = crate::test_scratch::canonical_private_dir("composition-ack-verdict");
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         item.cache_observations = None;
         item.session_account_evidence = None;
@@ -5034,10 +5034,7 @@ mod tests {
     fn validated_receipt_transport_is_private_destination_scoped_and_io_noninterfering() {
         use std::io::Write;
         use std::net::TcpListener;
-        let dir =
-            std::env::temp_dir().join(format!("ottto-validated-receipts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_scratch::canonical_private_dir("ottto-validated-receipts");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
@@ -5130,12 +5127,8 @@ mod tests {
         use ottto_protocol::{LocalAccountState, UploadReceiptOutcomeV1};
         use std::net::TcpListener;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "ottto-snapshot-client-receipts-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&state_dir);
-        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_dir =
+            crate::test_scratch::canonical_private_dir("ottto-snapshot-client-receipts");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind receipt fixture");
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {

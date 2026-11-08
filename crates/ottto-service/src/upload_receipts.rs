@@ -9,11 +9,9 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
@@ -28,30 +26,15 @@ const UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION: u16 = 1;
 const UPLOAD_RECEIPTS_RESPONSE_SCHEMA: &str = "ottto.upload_receipts.v1";
 const ID_PREFIX_LEN: usize = 12;
 const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
-/// The most the legacy ring writers stored; their readers quarantined more.
-const MAX_RING_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
-/// After a failed open or write, attempts skip the history this long so an
-/// unwritable or locked file never slows an upload.
-const REOPEN_AFTER: Duration = Duration::from_secs(60);
-static HISTORY: Mutex<History> = Mutex::new(History {
-    state_dir: None,
-    store: None,
-    retry_after: BTreeMap::new(),
-});
+/// The process's one history writer. A failed open or write drops it; the
+/// next attempt opens it again.
+static HISTORY: Mutex<Option<Store>> = Mutex::new(None);
 static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
 static APPEND_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static IMPORT_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static DEFERRED: RefCell<Option<Vec<(PathBuf, Encoded)>>> = const { RefCell::new(None) };
-}
-
-/// The process's one history writer, for the support directory last used,
-/// and when each directory whose history failed may be tried again.
-struct History {
-    state_dir: Option<PathBuf>,
-    store: Option<Store>,
-    retry_after: BTreeMap<PathBuf, Instant>,
 }
 
 /// The legacy ring, each row left as its borrowed JSON text so no row is
@@ -769,11 +752,11 @@ pub fn read_page(
         .transpose()?;
     let limit = usize::from(limit).min(UPLOAD_RECEIPT_PAGE_SIZE);
     let before = before.map(i64::try_from).transpose()?;
-    let source = source.map(source_slug);
+    let source = source.as_ref().map(crate::source_slug);
     let page = with_history(state_dir, false, |store| {
         store.page(&Filter {
             before,
-            source: source.as_deref(),
+            source,
             since_ns,
             limit,
         })
@@ -855,54 +838,28 @@ fn record(state_dir: &Path, receipt: PersistedReceipt, entity_count: u64) -> Res
     }
 }
 
-/// Holds this thread's attempt rows until [`Deferred::flush`] or drop, so a
-/// page writes them after its progress save returns and its locks are free.
-pub(crate) struct Deferred {
-    owner: bool,
-}
+/// Holds this thread's attempt rows until it is dropped, so a page writes
+/// them after its progress save returns and its locks are free.
+pub(crate) struct Deferred(());
 
 pub(crate) fn defer() -> Deferred {
     DEFERRED.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        // A nested scope leaves its rows to the outer one.
-        let owner = slot.is_none();
-        if owner {
-            *slot = Some(Vec::new());
-        }
-        Deferred { owner }
-    })
-}
-
-impl Deferred {
-    pub(crate) fn flush(&self) {
-        if self.owner {
-            let rows = DEFERRED
-                .try_with(|slot| slot.borrow_mut().as_mut().map(std::mem::take))
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            append_all(rows);
-        }
-    }
+        slot.borrow_mut().get_or_insert_with(Vec::new);
+    });
+    Deferred(())
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        if self.owner {
-            let rows = DEFERRED
-                .try_with(|slot| slot.borrow_mut().take())
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            append_all(rows);
-        }
-    }
-}
-
-fn append_all(rows: Vec<(PathBuf, Encoded)>) {
-    for (state_dir, row) in rows {
-        if append_now(&state_dir, &row).is_err() {
-            note_append_failure();
+        let rows = DEFERRED
+            .try_with(|slot| slot.borrow_mut().take())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        for (state_dir, row) in rows {
+            if append_now(&state_dir, &row).is_err() {
+                note_append_failure();
+            }
         }
     }
 }
@@ -936,46 +893,23 @@ fn with_history<T>(
     let mut history = HISTORY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if history.state_dir.as_deref() != Some(state_dir) {
-        history.state_dir = Some(state_dir.to_owned());
-        history.store = None;
+    let path = upload_history_path(state_dir);
+    // Production passes one support directory; another one reopens.
+    if history
+        .as_ref()
+        .is_some_and(|store| store.file_path() != path.as_path())
+    {
+        *history = None;
     }
-    if history.store.is_none() {
-        if !create
-            && !upload_history_path(state_dir).exists()
-            && !upload_receipts_path(state_dir).exists()
-        {
+    if history.is_none() {
+        if !create && !path.exists() && !upload_receipts_path(state_dir).exists() {
             return Ok(None);
         }
-        anyhow::ensure!(
-            history
-                .retry_after
-                .get(state_dir)
-                .is_none_or(|after| Instant::now() >= *after),
-            "upload_history_unavailable"
-        );
-        match open_history(state_dir) {
-            Ok(store) => {
-                history.store = Some(store);
-                history.retry_after.remove(state_dir);
-            }
-            Err(error) => {
-                history
-                    .retry_after
-                    .insert(state_dir.to_owned(), Instant::now() + REOPEN_AFTER);
-                return Err(error);
-            }
-        }
+        *history = Some(open_history(state_dir)?);
     }
-    let result = f(history
-        .store
-        .as_mut()
-        .context("upload_history_unavailable")?);
+    let result = f(history.as_mut().context("upload_history_unavailable")?);
     if result.is_err() {
-        history.store = None;
-        history
-            .retry_after
-            .insert(state_dir.to_owned(), Instant::now() + REOPEN_AFTER);
+        *history = None;
     }
     result.map(Some)
 }
@@ -1007,12 +941,9 @@ fn import_ring(state_dir: &Path, store: &mut Store) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     anyhow::ensure!(metadata.is_file(), "upload_receipt_ring_unimportable");
-    if metadata.len() > MAX_RING_IMPORT_BYTES {
-        quarantine_corrupt_file(&path);
-        return Ok(());
-    }
-    // Peak memory is the file plus the encoded rows: each row is decoded
-    // typed from its own bytes, encoded, and dropped.
+    // Peak memory is the file (the old writers kept it under 4 MiB) plus the
+    // encoded rows: each row is decoded typed from its own bytes, encoded,
+    // and dropped.
     let bytes = std::fs::read(&path).context("read upload receipt ring")?;
     let ring = match serde_json::from_slice::<RingFile<'_>>(&bytes) {
         Ok(ring) if ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION => ring,
@@ -1023,11 +954,13 @@ fn import_ring(state_dir: &Path, store: &mut Store) -> Result<()> {
     };
     let mut rows = Vec::with_capacity(ring.receipts.len());
     for raw in ring.receipts {
+        // One undecodable row quarantines the whole file, like a bad file.
         let (Ok(public), Ok(private)) = (
             serde_json::from_str::<UploadReceiptV1>(raw.get()),
             serde_json::from_str::<RingEvidence>(raw.get()),
         ) else {
-            continue;
+            quarantine_corrupt_file(&path);
+            return Ok(());
         };
         let entity_count = private
             .validated_evidence
@@ -1059,17 +992,10 @@ fn encode(receipt: &PersistedReceipt, entity_count: u64) -> Result<Encoded> {
         .unwrap_or(0);
     Encoded::new(
         uploaded_at_ns,
-        &source_slug(receipt.public.source.clone()),
+        crate::source_slug(&receipt.public.source),
         entity_count,
         &json,
     )
-}
-
-fn source_slug(source: SourceKind) -> String {
-    match serde_json::to_value(source) {
-        Ok(serde_json::Value::String(slug)) => slug,
-        _ => String::new(),
-    }
 }
 
 fn clamp_ns(ns: i128) -> i64 {
@@ -1211,7 +1137,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir() -> ScratchDir {
-        ScratchDir::new("ottto-upload-receipts")
+        ScratchDir::canonical("ottto-upload-receipts")
     }
 
     pub(super) fn response(raw_id: &str) -> SnapshotBatchResponse {

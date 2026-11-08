@@ -1075,11 +1075,6 @@ fn handle_command(
                     crate::upload_receipts::UPLOAD_RECEIPT_PAGE_SIZE
                 )));
             }
-            if before.is_some_and(|before| i64::try_from(before).is_err()) {
-                return Err(LocalApiError::InvalidRequest(
-                    "receipts before is not a valid cursor".to_string(),
-                ));
-            }
             if let Some(value) = since.as_deref() {
                 time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
                     .map_err(|_| {

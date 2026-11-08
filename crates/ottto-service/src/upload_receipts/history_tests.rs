@@ -1,14 +1,16 @@
 use super::*;
+use crate::snapshots::state_v2::sqlite_sidecar as sidecar;
 use crate::snapshots::state_v2::upload_history::{QUERIES_FOR_TEST, RETENTION_NS};
 use crate::test_scratch::ScratchDir;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, Instant};
 
 const DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 const T0: i64 = 1_790_000_000 * 1_000_000_000;
 
 fn temp_dir() -> ScratchDir {
-    ScratchDir::new("ottto-upload-history")
+    ScratchDir::canonical("ottto-upload-history")
 }
 
 /// A direct store on `dir`; never mixed with the process writer for that dir.
@@ -69,10 +71,11 @@ fn all(store: &Store) -> Vec<(i64, SourceKind, u64)> {
 /// Drop the process writer for `dir`, as a daemon restart would.
 fn restart(dir: &Path) {
     let mut history = HISTORY.lock().unwrap_or_else(|p| p.into_inner());
-    history.retry_after.remove(dir);
-    if history.state_dir.as_deref() == Some(dir) {
-        history.state_dir = None;
-        history.store = None;
+    if history
+        .as_ref()
+        .is_some_and(|store| store.file_path() == upload_history_path(dir).as_path())
+    {
+        *history = None;
     }
 }
 
@@ -442,6 +445,26 @@ fn ring_import_is_lossless_deduped_and_survives_interruption() {
 }
 
 #[test]
+fn a_ring_with_one_unreadable_row_is_set_aside_whole() {
+    let dir = temp_dir();
+    let now = OffsetDateTime::now_utc();
+    write_ring(
+        &dir,
+        &[
+            ring_row(now, SourceKind::Codex, 1),
+            serde_json::json!({"outcome": "not a receipt"}),
+        ],
+    );
+    assert!(read(&dir, 500, None, None).unwrap().receipts.is_empty());
+    assert!(!upload_receipts_path(&dir).exists());
+    assert!(std::fs::read_dir(&*dir).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".corrupt.")));
+}
+
+#[test]
 fn ring_import_decodes_rows_without_amplification() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -498,8 +521,8 @@ fn imported_rows_past_30_days_expire_at_the_next_append_except_the_newest() {
 
 #[test]
 fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
-    // Another holder of the history's owner lock: the first append gives up
-    // within the busy bound, and later ones skip the file without waiting.
+    // Another holder of the history's owner lock: an append gives up within
+    // the busy bound and the upload goes on.
     let dir = temp_dir();
     std::fs::create_dir_all(dir.join("snapshots")).unwrap();
     let owner = std::fs::OpenOptions::new()
@@ -508,7 +531,7 @@ fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(sidecar_path(&upload_history_path(&dir), ".owner"))
+        .open(sidecar(&upload_history_path(&dir), ".owner"))
         .unwrap();
     assert_eq!(
         unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -517,20 +540,10 @@ fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
     let started = Instant::now();
     assert!(append_transport_error(&dir, SourceKind::Codex, 1).is_err());
     assert!(started.elapsed() < Duration::from_secs(2));
-    let started = Instant::now();
-    for n in 0..20 {
-        assert!(append_transport_error(&dir, SourceKind::Codex, n).is_err());
-    }
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "skipped appends must not wait on the lock: {:?}",
-        started.elapsed()
-    );
-    // A deferred page flush with the file locked returns normally.
+    // A deferred page write with the file locked returns normally.
     {
-        let scope = defer();
+        let _scope = defer();
         append_transport_error(&dir, SourceKind::Codex, 99).unwrap();
-        scope.flush();
     }
     drop(owner);
     restart(&dir);
@@ -548,22 +561,17 @@ fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
 #[test]
 fn deferred_rows_are_written_once_the_page_save_returns() {
     let dir = temp_dir();
-    let outer = defer();
+    let page = defer();
     append_transport_error(&dir, SourceKind::Codex, 1).unwrap();
-    {
-        // A nested scope leaves its rows to the outer one.
-        let inner = defer();
-        append_transport_error(&dir, SourceKind::Codex, 2).unwrap();
-        inner.flush();
-        drop(inner);
-    }
+    append_transport_error(&dir, SourceKind::Codex, 2).unwrap();
     assert!(!upload_history_path(&dir).exists(), "nothing written yet");
-    outer.flush();
+    drop(page);
     assert_eq!(read(&dir, 500, None, None).unwrap().receipts.len(), 2);
-    // An early return (drop without flush) still writes the attempt.
+    // An early return drops the scope too and still writes the attempt.
+    let page = defer();
     append_transport_error(&dir, SourceKind::Codex, 3).unwrap();
     assert_eq!(read(&dir, 500, None, None).unwrap().receipts.len(), 2);
-    drop(outer);
+    drop(page);
     let kept = read(&dir, 500, None, None).unwrap();
     assert_eq!(
         kept.receipts
@@ -619,10 +627,4 @@ fn query_plans_use_the_rowid_and_named_indexes() {
             _ => unreachable!(),
         }
     }
-}
-
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(suffix);
-    PathBuf::from(name)
 }
