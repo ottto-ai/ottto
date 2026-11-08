@@ -6498,7 +6498,6 @@ pub(crate) fn context_curve_golden_fixture(file: &str, pointer: &str) -> Snapsho
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
 
 #[cfg(test)]
