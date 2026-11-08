@@ -455,7 +455,7 @@ fn published_with_json_ledger(
         let mut value: Value = serde_json::from_slice(&bytes).unwrap();
         value["generation"] = json!(generation);
         bytes = serde_json::to_vec(&value).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(path.as_path(), &bytes).unwrap();
     }
     page.index
         .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -1204,11 +1204,11 @@ fn receipt_ahead(index_path: &Path, identity: Value, previous: &[u8], next: &[u8
             .unwrap_or(0)
     };
     let scope = json!({"generation": identity["fence_generation"], "identity": identity});
-    let receipt = json!({"version": 1, "scope": scope,
+    let value = json!({"version": 1, "scope": scope,
         "previous_generation": generation(previous), "previous_digest": receipt_digest(previous),
         "generation": generation(next), "digest": receipt_digest(next),
         "progress": std::str::from_utf8(next).unwrap()});
-    let bytes = serde_json::to_vec(&receipt).unwrap();
+    let bytes = serde_json::to_vec(&value).unwrap();
     write_owned(&receipt(index_path), &bytes);
     bytes
 }

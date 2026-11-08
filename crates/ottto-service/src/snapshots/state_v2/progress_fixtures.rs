@@ -100,7 +100,7 @@ pub(crate) fn take_progress_set_aside_for_test() -> Option<u64> {
 /// growth read: graph G advances, progress rows do not.
 pub(crate) fn claim_growth_for_test(path: &Path, index: &ScanIndex) {
     let key = index.files.keys().next().expect("an indexed file").clone();
-    let debt: super::super::sampled_audit::GrowthRetention = serde_json::from_value(
+    let debt: crate::snapshots::sampled_audit::GrowthRetention = serde_json::from_value(
         serde_json::json!({"predecessor_size": 1, "last_growth_full_unix": 1}),
     )
     .unwrap();
