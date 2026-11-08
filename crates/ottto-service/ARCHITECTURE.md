@@ -255,10 +255,10 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
 except that a fn with an unchanged body may have a signature rustfmt re-wrapped, a struct may
 have named fields rustfmt re-wrapped and a const, static or type alias may be re-wrapped; only
-visibility, `use`/`mod` lines, path literals and wrappers change, a moved module's
-`crate::`/`super::`/`self::` paths may be respelled to the same target, and a restricted
-visibility may be added on a fn or field a `macro_rules!` body generates; edits to listed
-validator files that anchor on moved code are reported) and
+visibility, `use`/`mod` lines, path literals and wrappers change; module paths fail closed: a
+moved item's path may be respelled only through `mod` items to the same target, an existing
+`use` binding must keep its target, and a facade alias must name an exactly renamed module's new
+path; edits to listed validator files that anchor on moved code are reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.

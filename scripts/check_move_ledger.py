@@ -8,22 +8,21 @@ blocks are opened: their members are the items, so one impl block can be split
 across files. Before comparing, only these glue classes are reversed:
 
   (a) visibility tokens (`pub`, `pub(..)`) on item, field, method and
-      `thread_local!` static lines; not inside `macro_rules!` (see (h));
+      `thread_local!` static lines; not inside `macro_rules!`;
   (b) whole `use` / `pub(..) use` items, `mod x;` items and item-level
-      `include!(..);` items, with their attributes, and `//!` file docs;
+      `include!(..);` items, with their attributes, and `//!` file docs; a
+      `use` item is glue only under the binding rules below;
   (c) the path literal inside `#[path = ".."]`, `include!`, `include_str!` and
       `include_bytes!`;
   (d) the `impl X {` / `}` and inline `mod x {` / `}` wrappers;
   (e) the indentation an item loses when an inline module becomes a file.
 
 Then every base item must equal exactly one head item byte for byte (comments,
-attributes, cfgs), and items that land in one file keep their base order. A
-facade alias `pub(crate) use <new path> [as <old name>];` left at a moved
-module's old place is a `use` item, so (b) already covers it. Three exceptions
-cover what rustfmt re-wraps once a visibility token makes a line too long; each
-still matches, listed as `reflowed`, only if the part that may re-wrap (the fn
-signature, the whole struct, the whole const/static/type item) holds no `!` (a
-macro can see token boundaries this lexer does not keep):
+attributes, cfgs), and items that land in one file keep their base order. Three
+exceptions cover what rustfmt re-wraps once a visibility token makes a line too
+long; each still matches, listed as `reflowed`, only if the part that may
+re-wrap (the fn signature, the whole struct, the whole const/static/type item)
+holds no `!` (a macro can see token boundaries this lexer does not keep):
 
   - a `fn` whose text before `fn` and whose body, from its opening `{`, are
     byte for byte equal and whose only visibility token is the item-level one
@@ -34,11 +33,12 @@ macro can see token boundaries this lexer does not keep):
     field declarations (from each field name to its `,`), when each field's
     tokens are equal with whitespace dropped; a visibility token may stand only
     at the start of a field or before `struct`, and is judged per field;
-  - (g) a `const`, `static` or `type` item whose text before its keyword is byte
+  - a `const`, `static` or `type` item whose text before its keyword is byte
     for byte equal and whose only visibility token is the item-level one, when
     its tokens from the keyword on are equal with whitespace dropped.
 
-In all three, literals and comments stay exact and whitespace between two
+In all three, literals and comments stay exact, a number literal (`1.0`, `1e-3`,
+`0x1F`, `1_000u64`, `1.0f32`) is one token, and whitespace between two
 punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
 item must match byte for byte. An item must sit under the same module
 attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
@@ -49,26 +49,32 @@ attribute changes formatting only, never the compiled item (an item's own
 In-place edits of the regular files in VALIDATOR_EDITS are listed and not
 checked; adding, deleting or retyping one of them is checked as usual.
 
-Two more glue classes are judged per item. Paths are never respelled in a
-`macro_rules!` item: a path in a macro body resolves where the macro is called.
+Module paths fail closed. A path is `crate::`, `super::` or `self::` followed by
+`::`-joined names written without spaces (a `use` path may also start at a child
+module). It "resolves through modules" when every step is the crate root,
+`super`, `self` or a `mod` item, and its last name is a module or an item
+defined there (never a `use` binding, alias or glob). An item names the same
+target at head when the base item it named is paired, by this check, with an
+item in the head module; a module does when its file is an exact rename or the
+same unrenamed file. The file map is only the exact renames (`git diff -B
+-M100%`, R100) of files instantiated in one module context; an edited rename
+maps nothing.
 
-  (f) module path respelling inside an item whose module changed. The file map
-      is the diff's renamed `.rs` files whose module each file owns (reached by
-      `mod`, not `include!`) at both commits; it maps each old module path to
-      its new one. A path is `crate::`, `super::` or `self::` followed by
-      `::`-joined names, written without spaces. A changed path is accepted only
-      when (1) the base path starts with `super`/`self`, means something else
-      when read from the new module, and the head path (`crate`, `super` or
-      `self` led) resolves from the new module to the base target mapped
-      through the file map; or (2) the base path starts with `crate` and names
-      a moved module, and the head path is the same path with that module's
-      new path in its place. Listed as `respelled`.
-  (h) a restricted visibility token (`pub(super)`, `pub(crate)`, `pub(in ..)`)
-      added inside a `macro_rules!` transcriber, right before a `fn` the macro
-      generates or before a field name; the rest of the macro must match byte
-      for byte and no other visibility token in it may change. The token's
-      reach is judged as below from the macro's own module (where its items
-      are generated when the macro is called beside its definition).
+  - A moved item (its module changed) must keep what every unchanged path in it
+    names. Only a path outside any macro call and attribute token tree, in a
+    file instantiated once, may be respelled, and only when both spellings
+    resolve through modules to the same target and the base spelling needed it
+    (`super`/`self` led: it means something else from the new module; `crate`
+    led: its target moved and the head path is `crate` led too). Listed as
+    `respelled`. Paths in `macro_rules!` items are never respelled.
+  - `use` bindings: per module, a binding (its bound name, or a glob) that
+    exists at base and head must name the same target: the same text naming the
+    same place, or two spellings that resolve through modules to the same
+    target (listed as `respelled`); a glob swapped for another fails. Added and
+    removed bindings are glue. A binding at head of the name a gone module had
+    in its old parent is glue only as the facade alias `use <new path> [as <old
+    name>];` that resolves through modules to that module's mapped head path;
+    any other alias or glob that can bind that name fails.
 
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
@@ -96,7 +102,10 @@ import rust_source_tree as rst
 GLUE = {"use", "mod-decl", "include", "inner-doc"}
 HEADER_REFLOW = ("const", "static", "type")
 PATH_HEADS = ("crate", "super", "self")
-RESTRICTED_VIS = re.compile(r"^pub\((?:super|crate|in [\w: ]+)\)$")
+# Items that define a name in their module (a `mod` defines one too, through the module tree).
+DEFINES = {"fn", "struct", "enum", "union", "trait", "const", "static", "type"}
+# Words that may stand before a `!` that negates a parenthesised expression rather than calling a macro.
+NOT_MACRO = {"if", "while", "match", "return", "in", "else", "let", "break", "move", "as", "yield"}
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 REPORT_LIMIT = 50
 # Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
@@ -128,7 +137,7 @@ class Unit:
     vis: list[tuple[int, str]] = field(default_factory=list)  # (offset in text, token)
     paths: list[tuple[str, str, bytes | None]] = field(default_factory=list)  # (macro, literal, target bytes)
     kind: str = ""  # item kind (`fn`, `struct`, ..); "" for leading comments
-    macro_vis: list[tuple[int, str]] = field(default_factory=list)  # visibility tokens inside `macro_rules!`
+    multi: bool = False  # its file is instantiated in more than one module context
 
     @property
     def key(self) -> tuple[str, str]:
@@ -148,10 +157,32 @@ JOINLESS = set("()[]{},;")
 Code = list[tuple[str, str, bool, int]]  # (kind, text, whitespace before it, offset) per non-whitespace token
 
 
+# A Rust number literal from its first digit: a float's `.digits` (or a bare `1.` before anything but `.`
+# or a name), an exponent with its sign, and a suffix. Hex, octal and binary literals end at the suffix.
+NUMBER = re.compile(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*|\.(?![.\w]))?(?:[eE][+-]?[0-9_]*[0-9][0-9_]*)?\w*")
+
+
 def code_tokens(text: str) -> Code:
+    """Non-whitespace tokens; a number literal the lexer splits at `.`, `+` or `-` is one token here."""
     tokens = rst.tokenize(text)
-    return [(token.kind, text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws", token.start)
-            for index, token in enumerate(tokens) if token.kind != "ws"]
+    out: Code = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        end, after = token.end, index + 1
+        if token.kind == "num":
+            found = NUMBER.match(text, token.start)
+            stop = found.end() if found else token.end
+            probe = index
+            while probe < len(tokens) and tokens[probe].end < stop:
+                probe += 1
+            if probe < len(tokens) and tokens[probe].end == stop:
+                end, after = stop, probe + 1
+        if token.kind != "ws":
+            out.append((token.kind, text[token.start:end], index > 0 and tokens[index - 1].kind == "ws",
+                        token.start))
+        index = after
+    return out
 
 
 def depth_at(code: Code, offset: int) -> int:
@@ -430,17 +461,16 @@ def units_of(source: rst.Source, tree: rst.Tree, path: str) -> list[Unit]:
     lexed = source.lexed(path)
     contexts = tree.contexts.get(path, [])
     context = next((c for c in contexts if c.module[0] == "crate"), contexts[0] if contexts else None)
+    multi = len({c.module for c in contexts}) > 1
     units: list[Unit] = []
 
     def add(item_first: int, item_last: int, start: int, label: str, name: str, module, chain, depth,
             container: str, strip_vis: bool = True, kind: str = "") -> None:
-        text, vis, paths = normalise(lexed, item_first, item_last, depth, path, source, True)
-        # Tokens inside a macro body are not the item's visibility; (h) judges them on their own.
-        macro_vis, vis = (vis, []) if not strip_vis else ([], vis)
+        text, vis, paths = normalise(lexed, item_first, item_last, depth, path, source, strip_vis)
         end_line = lexed.line(lexed.tokens[item_last].end - 1)
         chain = frozenset(attr for attr in chain if re.sub(r"\s+", "", attr) not in FORMATTING_MODULE_ATTRS)
         units.append(Unit(path, lexed.line(start), end_line, len(units), label, name, module, chain,
-                          depth, container, text, vis, paths, kind, macro_vis))
+                          depth, container, text, vis, paths, kind, multi))
 
     def lead_comments(item: rst.Item, module, chain, container: str) -> None:
         if item.start >= item.lead:
@@ -516,10 +546,14 @@ class Ledger:
     pairs: list[tuple[Unit, Unit]] = field(default_factory=list)
     reflowed: list[tuple[Unit, Unit]] = field(default_factory=list)
     respelled: list[tuple[Unit, Unit]] = field(default_factory=list)
-    macro_vis: list[str] = field(default_factory=list)
+    respelled_uses: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     widened: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    def fail(self, message: str) -> None:
+        if message not in self.failures:
+            self.failures.append(message)
 
 
 def match_units(base: list[Unit], head: list[Unit], key=lambda unit: unit.key
@@ -569,16 +603,17 @@ def module_moves(pairs: list[tuple[Unit, Unit]], head_modules: set[tuple[str, ..
 
 
 def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]],
-          allow_widened: set[str], file_moves: dict | None = None) -> Ledger:
+          allow_widened: set[str], ident: Identity) -> Ledger:
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
     # A unit with no reflow pass gets a key of its own, so it never pairs.
     reflow_of = {id(unit): reflow(unit) or ((id(unit),), unit.vis) for unit in lost + gained}
     reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_of[id(unit)][0])
+    ident.use_units(base, pairs + reflowed)
     # A re-wrap shifts text offsets, so reflowed units compare visibility by place instead.
     ledger.reflowed = [(replace(old, vis=reflow_of[id(old)][1]), replace(new, vis=reflow_of[id(new)][1]))
                        for old, new in reflowed]
-    ledger.respelled, lost, gained = respell_pairs(lost, gained, file_moves or {})
+    ledger.respelled, lost, gained = respell_pairs(ident, lost, gained)
     ledger.pairs = sorted(pairs + ledger.reflowed + ledger.respelled, key=lambda pair: (pair[0].file, pair[0].seq))
     moves = module_moves(ledger.pairs, head_modules)
     explain_differences(ledger, lost, gained)
@@ -593,8 +628,7 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
                 f"{sorted(old.chain)} -> {sorted(new.chain)}")
         check_paths(ledger, old, new)
         check_visibility(ledger, old, new, moves, allow_widened)
-        if old.macro_vis or new.macro_vis:
-            check_macro_vis(ledger, old, new, moves, allow_widened)
+        check_kept_paths(ledger, ident, old, new)
     for (_, new_file), group in sorted(by_destination.items()):
         group.sort(key=lambda pair: pair[1].seq)
         for before, after in itertools.pairwise(group):
@@ -603,16 +637,385 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
                     f"order changed in {new_file}: {after[0].label} ({after[0].where()}) now follows "
                     f"{before[0].label} ({before[0].where()})")
                 break
+    check_bindings(ledger, ident)
     return ledger
 
 
-PathUse = tuple[int, int, tuple[str, ...]]  # (start, end, `::`-joined names) in a unit's text
+# ---------------------------------------------------------------- module paths and `use` bindings
+
+Module = tuple[str, ...]
+Found = tuple[Module, tuple[str, ...]]  # (module, the defined item's name and what follows it, or ())
+
+
+@dataclass
+class Namespace:
+    """One commit's modules as names: the file holding each module's items, the modules each file is
+    instantiated as, the names each module's items define and the names its `use` items bind."""
+
+    modules: set[Module]
+    owner: dict[Module, str] = field(default_factory=dict)
+    contexts: dict[str, set[Module]] = field(default_factory=dict)
+    defined: dict[Module, dict[str, set[str]]] = field(default_factory=dict)  # module -> name -> files
+    bound: dict[Module, dict[str, list[tuple[str, tuple[str, ...]]]]] = field(default_factory=dict)  # "*" = glob
+    unread: dict[str, int] = field(default_factory=dict)  # file -> line of a `use` item this cannot read
+
+
+def namespace(source: rst.Source, tree: rst.Tree) -> Namespace:
+    names = Namespace(set(tree.modules))
+
+    def walk(lexed: rst.Lexed, items: list[rst.Item], module: Module, path: str) -> None:
+        for item in items:
+            if item.kind == "mod" and item.members is not None:
+                names.owner.setdefault(module + (item.name,), path)
+                walk(lexed, item.members, module + (item.name,), path)
+            elif item.kind in ("use", "extern-crate"):
+                found = use_bindings(lexed.text[item.lead:item.end])
+                if found is None:
+                    names.unread.setdefault(path, lexed.line(item.lead))
+                for name, target in found or []:
+                    names.bound.setdefault(module, {}).setdefault(name, []).append((path, target))
+            elif item.kind in DEFINES:
+                names.defined.setdefault(module, {}).setdefault(item.name, set()).add(path)
+
+    for path, contexts in tree.contexts.items():
+        lexed = source.lexed(path)
+        for module in dict.fromkeys(context.module for context in contexts):
+            names.contexts.setdefault(path, set()).add(module)
+            if any(context.module == module and context.how != "include" for context in contexts):
+                names.owner.setdefault(module, path)
+            walk(lexed, lexed.items, module, path)
+    return names
+
+
+def use_bindings(text: str) -> list[tuple[str, tuple[str, ...]]] | None:
+    """(bound name, or "*" for a glob, and path) for each name a `use` or `extern crate` item binds; None
+    when its shape is not understood. A `self` leaf binds its parent's name; `as _` binds nothing."""
+    code = [(kind, piece) for kind, piece, _, _ in code_tokens(text) if kind not in ("comment", "doc")]
+    pieces = [piece for _, piece in code] + ["", ""]
+    depth, at = 0, None
+    for index, (kind, piece) in enumerate(code):
+        if kind == "punct":
+            depth += (piece in "([{") - (piece in ")]}")
+        elif depth == 0 and kind == "ident" and piece in ("use", "extern"):
+            at = index
+            break
+    if at is None:
+        return None
+    out: list[tuple[str, tuple[str, ...]]] = []
+
+    def ident(index: int) -> bool:
+        return index < len(code) and code[index][0] == "ident"
+
+    def tree(index: int, prefix: tuple[str, ...]) -> int:
+        path = list(prefix)
+        if pieces[index] == ":" and pieces[index + 1] == ":":
+            path.append("::")
+            index += 2
+        while True:
+            if pieces[index] == "*":
+                out.append(("*", tuple(path)))
+                return index + 1
+            if pieces[index] == "{":
+                index += 1
+                while pieces[index] != "}":
+                    index = tree(index, tuple(path))
+                    if pieces[index] == ",":
+                        index += 1
+                    elif pieces[index] != "}":
+                        raise ValueError(index)
+                return index + 1
+            if not ident(index):
+                raise ValueError(index)
+            path.append(pieces[index])
+            index += 1
+            if pieces[index] == ":" and pieces[index + 1] == ":":
+                index += 2
+                continue
+            name = path[-1]
+            if pieces[index] == "as":
+                if not ident(index + 1):
+                    raise ValueError(index)
+                name, index = pieces[index + 1], index + 2
+            if path[-1] == "self":
+                path.pop()
+                if not path:
+                    raise ValueError(index)
+                name = path[-1] if name == "self" else name
+            if name != "_":
+                out.append((name, tuple(path)))
+            return index
+
+    try:
+        if pieces[at] == "extern":
+            if pieces[at + 1] != "crate" or not ident(at + 2):
+                return None
+            name, stop = pieces[at + 2], at + 3
+            if pieces[stop] == "as" and ident(stop + 1):
+                name, stop = pieces[stop + 1], stop + 2
+            out = [] if name == "_" else [(name, ("::", pieces[at + 2]))]
+        else:
+            stop = tree(at + 1, ())
+    except ValueError:
+        return None
+    return out if pieces[stop] == ";" and stop == len(code) - 1 else None
+
+
+def resolve(names: tuple[str, ...], module: Module) -> Module | None:
+    """The absolute path a `crate`/`super`/`self` led path names from `module`."""
+    if names[0] == "crate":
+        return module[:1] + names[1:]
+    here, at = list(module), 0
+    while at < len(names) and names[at] in ("super", "self"):
+        if names[at] == "super":
+            if len(here) <= 1:
+                return None
+            here.pop()
+        at += 1
+    return tuple(here) + names[at:]
+
+
+def through_modules(names: Namespace, path: tuple[str, ...], module: Module) -> Found | None:
+    """What `path` names from `module` when it resolves through modules (see the module docs), else None. A
+    path that does not start with `crate`, `super` or `self` must start at a child module (a `use` path)."""
+    if path[0] in PATH_HEADS:
+        heads = next((at for at, name in enumerate(path) if name not in PATH_HEADS), len(path))
+        here = resolve(path[:heads], module)
+        at = heads
+    else:
+        here, at = module, 0
+    if here is None or (path[0] == "crate" and heads > 1):
+        return None
+    while at < len(path):
+        name = path[at]
+        if name in names.bound.get(here, {}):
+            return None  # a `use` binding of that name: never followed
+        if here + (name,) in names.modules:
+            here, at = here + (name,), at + 1
+            continue
+        if at == 0 or name not in names.defined.get(here, {}):
+            return None
+        return here, path[at:]
+    return here, ()
+
+
+class Identity:
+    """Where a base module or item is at head (see the module docs), and the validated facade aliases."""
+
+    def __init__(self, base: Namespace, head: Namespace, renames: dict[str, str], status: dict[str, set[str]],
+                 changed: set[str]):
+        self.base, self.head, self.renames, self.status, self.changed = base, head, renames, status, changed
+        self.pairs: dict[int, Unit] = {}  # id(base unit) -> its head unit
+        self.defined_units: dict[tuple[Module, str], list[Unit]] = {}
+        self.facades: dict[Module, Module] = {}  # old module path -> the head module its alias names
+        self.alias_failures: list[str] = []
+
+    def use_units(self, base: list[Unit], pairs: list[tuple[Unit, Unit]]) -> None:
+        self.defined_units = {}
+        for unit in base:
+            if unit.kind in DEFINES and not unit.container and unit.module is not None:
+                self.defined_units.setdefault((unit.module, unit.name), []).append(unit)
+        self.pairs = {id(old): new for old, new in pairs}
+
+    def module(self, module: Module) -> Module | None:
+        """The head path of a base module: through its file's exact rename, or the same path when its file
+        stays in place (an inline module may become a new file); None otherwise."""
+        owner = self.base.owner.get(module)
+        if owner is None:
+            return None
+        if owner in self.renames:
+            new = self.renames[owner]
+            (own,), (now,) = self.base.contexts[owner], self.head.contexts[new]
+            if module[:len(own)] != own:
+                return None
+            moved = now + module[len(own):]
+            return moved if self.head.owner.get(moved) == new else None
+        holder = self.head.owner.get(module)
+        # `M` with a score is a rewrite the diff broke but paired with nothing: the file stays in place.
+        in_place = all(code.startswith("M") for code in self.status.get(owner, {"M"}))
+        if in_place and holder is not None and (
+                holder == owner or self.status.get(holder) == {"A"}):
+            return module
+        return None
+
+    def target(self, module: Module, rest: tuple[str, ...]) -> Module | None:
+        """The head module of what `rest` names in base `module`: a defined item's paired home, else the
+        module's own head path."""
+        if not rest or rest[0] not in self.base.defined.get(module, {}):
+            return self.module(module)
+        units = self.defined_units.get((module, rest[0]))
+        if units:
+            homes = {self.pairs[id(unit)].module if id(unit) in self.pairs else None for unit in units}
+            return homes.pop() if len(homes) == 1 and None not in homes else None
+        files = self.base.defined[module][rest[0]]
+        return self.module(module) if all(path not in self.status for path in files) else None
+
+    def respelled_target(self, before: tuple[str, ...], old: Module, after: tuple[str, ...], new: Module
+                         ) -> Module | None:
+        """The head target when both spellings resolve through modules to the same one, else None."""
+        found_before = through_modules(self.base, before, old)
+        found_after = through_modules(self.head, after, new)
+        if found_before is None or found_after is None or found_before[1] != found_after[1]:
+            return None
+        home = self.target(*found_before)
+        return home + found_after[1] if home is not None and home == found_after[0] else None
+
+    def meaning(self, path: tuple[str, ...], module: Module, head: bool) -> Found | None:
+        """(module, rest) a path names by its spelling: the longest module prefix of its absolute path, with a
+        base item mapped to its head home and a head facade alias followed."""
+        names = self.head if head else self.base
+        target = resolve(path, module) if path[0] in PATH_HEADS else module + path
+        if target is None:
+            return None
+        if head:
+            alias = next((cut for cut in range(len(target), 0, -1) if target[:cut] in self.facades), None)
+            if alias is not None:
+                target = self.facades[target[:alias]] + target[alias:]
+        cut = next((cut for cut in range(len(target), 0, -1) if target[:cut] in names.modules), None)
+        if cut is None:
+            return None
+        place, rest = target[:cut], target[cut:]
+        if head:
+            return place, rest
+        home = self.target(place, rest)
+        return None if home is None else (home, rest)
+
+    def same_meaning(self, before: tuple[str, ...], old: Module, after: tuple[str, ...], new: Module) -> bool:
+        was, now = self.meaning(before, old, False), self.meaning(after, new, True)
+        if was is None or now is None:
+            return False
+        if was == now:
+            return True
+        # A moved item still named at its old place, through a head `use` that resolves to its new home.
+        if (was[1] != now[1] or not now[1] or now[1][0] not in self.base.defined.get(now[0], {})
+                or self.module(now[0]) != now[0]):
+            return False
+        return any(through_modules(self.head, path, now[0]) == (was[0], now[1][:1])
+                   for _, path in self.head.bound.get(now[0], {}).get(now[1][0], []))
+
+    def same_binding(self, before: tuple[str, ...], old: Module, after: tuple[str, ...], new: Module,
+                     single: bool) -> bool:
+        if before == after:
+            if before[0] == "::" or (before[0] not in PATH_HEADS and old + before[:1] not in self.base.modules
+                                     and new + after[:1] not in self.head.modules):
+                return True  # an external crate or a name in scope: the same text names the same thing
+            return self.same_meaning(before, old, after, new)
+        return single and self.respelled_target(before, old, after, new) is not None
+
+
+def check_aliases(ident: Identity) -> None:
+    """A head binding of the name a gone module had in its old parent: a validated facade alias goes to
+    ident.facades; any other alias, and a glob that can bind that name, fails."""
+    base, head = ident.base, ident.head
+    for old in sorted(module for module in base.modules if len(module) > 1 and module not in head.modules):
+        parent, name = old[:-1], old[-1]
+        bindings = head.bound.get(parent, {})
+        if parent not in head.modules or not bindings:
+            continue
+        target = ident.module(old) if ident.module(parent) == parent else None
+        for path, use in bindings.get(name, []):
+            if target is not None and through_modules(head, use, parent) == (target, ()):
+                ident.facades[old] = target
+            else:
+                ident.alias_failures.append(
+                    f"`use` binds the old name of moved module {show(old)} without naming its mapped head path"
+                    f" ({show(target)}): `{'::'.join(use)}` in {path}")
+        for path, use in bindings.get("*", []):
+            source = resolve(use, parent) if use[0] in PATH_HEADS else parent + use
+            if source not in head.modules or name in head.defined.get(source, {}) or name in head.bound.get(
+                    source, {}) or "*" in head.bound.get(source, {}) or source + (name,) in head.modules:
+                ident.alias_failures.append(f"glob `use {'::'.join(use)}::*` in {path} can bind the old name of "
+                                            f"moved module {show(old)}")
+
+
+def check_bindings(ledger: Ledger, ident: Identity) -> None:
+    """Class (b) for `use` items (see the module docs)."""
+    base, head, changed = ident.base, ident.head, ident.changed
+    for names, side_name in ((base, "base"), (head, "head")):
+        for path, line in sorted(names.unread.items()):
+            if path in changed:
+                ledger.fail(f"cannot read the `use` item at {path}:{line} ({side_name})")
+    for failure in ident.alias_failures:
+        ledger.fail(failure)
+    for module, bindings in sorted(base.bound.items()):
+        now = ident.module(module) or (module if module in head.modules else None)
+        if now is None:
+            continue
+        later = head.bound.get(now, {})
+        for name, entries in sorted(bindings.items()):
+            after = later.get(name, [])
+            if not after or not any(path in changed for path, _ in entries + after):
+                continue
+
+            def same(a: tuple[str, tuple[str, ...]], b: tuple[str, tuple[str, ...]]) -> bool:
+                single = len(base.contexts.get(a[0], ())) <= 1 and len(head.contexts.get(b[0], ())) <= 1
+                return ident.same_binding(a[1], module, b[1], now, single)
+
+            gone = [a for a in entries if not any(same(a, b) for b in after)]
+            new = [b for b in after if not any(same(a, b) for a in entries)]
+            if not new and name != "*":
+                for b in after:
+                    if all(a[1] != b[1] for a in entries):
+                        was = next(a for a in entries if same(a, b))
+                        ledger.respelled_uses.append(f"`use` {name} in {show(module)}: {'::'.join(was[1])} -> "
+                                                     f"{'::'.join(b[1])} ({b[0]})")
+            if new and (gone or name != "*"):
+                what = "glob" if name == "*" else name
+                ledger.fail(f"`use` binding {what} in {show(module)} now names something else: "
+                            f"{', '.join('::'.join(a[1]) for a in gone) or 'nothing'} -> "
+                            f"{', '.join('::'.join(b[1]) for b in new)} ({new[0][0]})")
+
+
+def check_kept_paths(ledger: Ledger, ident: Identity, old: Unit, new: Unit) -> None:
+    """A moved item's unchanged module paths must still name what they named (see the module docs)."""
+    if old.module is None or new.module is None or old.module == new.module or old.kind == "macro_rules":
+        return
+    for before_text, after_text in ((old.container, new.container), (old.text, new.text)):
+        before_uses, after_uses = path_uses(before_text), path_uses(after_text)
+        if len(before_uses) != len(after_uses):
+            ledger.fail(f"paths differ: {old.label} ({old.where()} -> {new.where()})")
+            continue
+        for (_, _, before, _), (_, _, after, _) in zip(before_uses, after_uses):
+            if before == after and not ident.same_meaning(before, old.module, after, new.module):
+                ledger.fail(f"path names something else after the move: {old.label} `{'::'.join(before)}` "
+                            f"({old.where()} -> {new.where()})")
+
+
+PathUse = tuple[int, int, tuple[str, ...], bool]  # (start, end, `::`-joined names, inside a token tree)
 PLACEHOLDER = "\0path\0"
+
+
+def token_trees(text: str, tokens: list[rst.Token]) -> list[tuple[int, int]]:
+    """Text spans of macro call (`name!(..)`, `[..]`, `{..}`) and attribute (`#[..]`, `#![..]`) token trees;
+    an unclosed one runs to the end of the text."""
+    code = [token for token in tokens if token.kind not in ("ws", "comment", "doc", "idoc")]
+    close: dict[int, int] = {}
+    stack: list[int] = []
+    for index, token in enumerate(code):
+        if token.kind == "punct" and text[token.start] in "([{":
+            stack.append(index)
+        elif token.kind == "punct" and text[token.start] in ")]}" and stack:
+            close[stack.pop()] = index
+    spans = []
+    for index, token in enumerate(code[:-1]):
+        char = text[token.start] if token.kind == "punct" else ""
+        opens = "([{"
+        after = index + 1
+        if char == "#":
+            if text[code[after].start] == "!" and after + 1 < len(code):
+                after += 1
+            opens = "["
+        elif not (char == "!" and index > 0 and code[index - 1].kind == "ident"
+                  and text[code[index - 1].start:code[index - 1].end] not in NOT_MACRO):
+            continue
+        if code[after].kind == "punct" and text[code[after].start] in opens:
+            spans.append((code[after].start, code[close[after]].end if after in close else len(text)))
+    return spans
 
 
 def path_uses(text: str) -> list[PathUse]:
     """`crate::`, `super::` and `self::` led paths written without spaces (not `$crate`)."""
     tokens = rst.tokenize(text)
+    trees = token_trees(text, tokens)
 
     def punct(index: int, char: str) -> bool:
         return 0 <= index < len(tokens) and tokens[index].kind == "punct" and text[tokens[index].start] == char
@@ -633,39 +1036,18 @@ def path_uses(text: str) -> list[PathUse]:
                 if not joined(probe + 1):
                     break
                 probe += 3
-            uses.append((token.start, tokens[last].end, tuple(names)))
+            shielded = any(start <= token.start < end for start, end in trees)
+            uses.append((token.start, tokens[last].end, tuple(names), shielded))
             index = last + 1
             continue
         index += 1
     return uses
 
 
-def resolve(names: tuple[str, ...], module: tuple[str, ...]) -> tuple[str, ...] | None:
-    """The absolute path a `crate`/`super`/`self` led path names from `module`."""
-    if names[0] == "crate":
-        return module[:1] + names[1:]
-    here, at = list(module), 0
-    while at < len(names) and names[at] in ("super", "self"):
-        if names[at] == "super":
-            if len(here) <= 1:
-                return None
-            here.pop()
-        at += 1
-    return tuple(here) + names[at:]
-
-
-def remap(target: tuple[str, ...], file_moves: dict) -> tuple[str, ...]:
-    """`target` with its longest moved module prefix replaced by that module's new path."""
-    for cut in range(len(target), 0, -1):
-        if target[:cut] in file_moves:
-            return file_moves[target[:cut]] + target[cut:]
-    return target
-
-
 def skeleton(text: str) -> tuple[str, list[PathUse]]:
     uses = path_uses(text)
     parts, cursor = [], 0
-    for start, end, _ in uses:
+    for start, end, _, _ in uses:
         parts += [text[cursor:start], PLACEHOLDER]
         cursor = end
     parts.append(text[cursor:])
@@ -673,8 +1055,8 @@ def skeleton(text: str) -> tuple[str, list[PathUse]]:
 
 
 def respell_key(unit: Unit):
-    """(key, paths in the container and the text, paths in the text) of a unit for class (f), or None."""
-    if unit.kind == "macro_rules" or unit.module is None:
+    """(key, paths in the container and the text, paths in the text) of a unit for respelling, or None."""
+    if unit.kind == "macro_rules" or unit.module is None or unit.multi:
         return None
     container, container_uses = skeleton(unit.container)
     text, text_uses = skeleton(unit.text)
@@ -683,105 +1065,65 @@ def respell_key(unit: Unit):
     return (container, text), container_uses + text_uses, text_uses
 
 
-def respelled(old: Unit, old_uses: list[PathUse], new: Unit, new_uses: list[PathUse], file_moves: dict) -> bool:
-    """True when the units differ only by paths that class (f) accepts (see the module docs)."""
+def respelled(ident: Identity, old: Unit, old_uses: list[PathUse], new: Unit, new_uses: list[PathUse]) -> bool:
+    """True when the units differ only by respelled paths (see the module docs)."""
     if old.module == new.module:
         return False
     changed = False
-    for (_, _, before), (_, _, after) in zip(old_uses, new_uses, strict=True):
+    for (_, _, before, shielded_before), (_, _, after, shielded_after) in zip(old_uses, new_uses, strict=True):
         if before == after:
             continue
         changed = True
-        target = resolve(before, old.module)
+        if shielded_before or shielded_after:
+            return False  # inside a macro call or attribute token tree
+        target = ident.respelled_target(before, old.module, after, new.module)
         if target is None:
             return False
-        mapped = remap(target, file_moves)
         if before[0] == "crate":
-            if mapped == target or after[0] != "crate":
-                return False  # names no moved module, or not respelled by its new path
-        elif resolve(before, new.module) == mapped:
+            if after[0] != "crate" or target == resolve(before, old.module):
+                return False  # its target did not move, or not respelled `crate` led
+        elif resolve(before, new.module) == target:
             return False  # still means the same from the new module: no respelling is needed
-        if resolve(after, new.module) != mapped:
-            return False
     return changed
 
 
 def on_skeleton(unit: Unit, text_uses: list[PathUse]) -> Unit:
     """`unit` with its visibility offsets moved onto its skeleton text, where both sides line up."""
     def shift(offset: int) -> int:
-        return offset - sum(end - start - len(PLACEHOLDER) for start, end, _ in text_uses if end <= offset)
+        return offset - sum(end - start - len(PLACEHOLDER) for start, end, _, _ in text_uses if end <= offset)
     return replace(unit, vis=[(shift(offset), token) for offset, token in unit.vis])
 
 
-def respell_pairs(lost: list[Unit], gained: list[Unit], file_moves: dict
+def respell_pairs(ident: Identity, lost: list[Unit], gained: list[Unit]
                   ) -> tuple[list[tuple[Unit, Unit]], list[Unit], list[Unit]]:
-    """Class (f): pair units whose texts are equal outside their paths, when every changed path passes."""
+    """Pair units whose texts are equal outside their paths, when every changed path is a valid respelling."""
     keyed = {id(unit): respell_key(unit) for unit in lost + gained}
     by_key: dict[tuple, list[Unit]] = {}
     for unit in gained:
         if keyed[id(unit)]:
             by_key.setdefault(keyed[id(unit)][0], []).append(unit)
-    pairs, still_lost = [], []
+    # Pair provisionally first: a respelled path may name another respelled item. A provisional pair that
+    # fails leaves both units unpaired, so the change fails either way.
+    for unit in lost:
+        key = keyed[id(unit)]
+        candidate = next((c for c in by_key.get(key[0], []) if c.module != unit.module), None) if key else None
+        if candidate is not None:
+            ident.pairs.setdefault(id(unit), candidate)
+    pairs, still_lost, taken = [], [], set()
     for unit in lost:
         key = keyed[id(unit)]
         candidates = by_key.get(key[0], []) if key else []
-        match = next((c for c in candidates if respelled(unit, key[1], c, keyed[id(c)][1], file_moves)), None)
+        match = next((c for c in candidates if id(c) not in taken
+                      and respelled(ident, unit, key[1], c, keyed[id(c)][1])), None)
         if match is None:
+            ident.pairs.pop(id(unit), None)
             still_lost.append(unit)
             continue
-        candidates[:] = [c for c in candidates if c is not match]
+        taken.add(id(match))
+        ident.pairs[id(unit)] = match
         pairs.append((unit, match))
-    paired = {id(new) for _, new in pairs}
     pairs = [(on_skeleton(old, keyed[id(old)][2]), on_skeleton(new, keyed[id(new)][2])) for old, new in pairs]
-    return pairs, still_lost, [unit for unit in gained if id(unit) not in paired]
-
-
-def transcribers(text: str) -> list[tuple[int, int]]:
-    """Text spans of the transcribers (`=> { .. }`) of a `macro_rules!` item, or [] if its shape is odd."""
-    code = code_tokens(text)
-    start = next((index for index, (kind, piece, _, _) in enumerate(code)
-                  if kind == "ident" and piece == "macro_rules"), None)
-    body = next((index for index in range(start or 0, len(code)) if code[index][0] == "punct"
-                 and code[index][1] in "([{"), None) if start is not None else None
-    if body is None:
-        return []
-    end = closing_bracket(code, body, len(code))
-    spans, at = [], body + 1
-    while at < end:
-        if code[at][1] not in "([{":
-            return []
-        arrow = closing_bracket(code, at, end) + 1
-        if not (arrow + 2 < end and code[arrow][1] == "=" and code[arrow + 1][1] == ">"
-                and code[arrow + 2][1] in "([{"):
-            return []
-        close = closing_bracket(code, arrow + 2, end)
-        spans.append((code[arrow + 2][3], code[close][3]))
-        at = close + 1
-        if at < end and code[at][1] == ";":
-            at += 1
-    return spans
-
-
-GENERATED = re.compile(r"(?:(?:const|async|unsafe)\s+)*fn\b|\$?[A-Za-z_]\w*\s*:(?!:)")
-
-
-def check_macro_vis(ledger: Ledger, old: Unit, new: Unit, moves: dict, allow_widened: set[str]) -> None:
-    """Class (h): a restricted visibility token added before a generated fn or field in a transcriber."""
-    before, after = dict(old.macro_vis), dict(new.macro_vis)
-    spans = transcribers(new.text)
-    for offset in sorted(set(before) | set(after)):
-        if before.get(offset) == after.get(offset):
-            continue
-        token = after.get(offset)
-        if (offset in before or not RESTRICTED_VIS.match(token)
-                or not any(start < offset < end for start, end in spans)
-                or not GENERATED.match(new.text, offset)):
-            ledger.failures.append(f"macro visibility changed: {old.label} ({new.where()}): "
-                                   f"{before.get(offset, 'none')} -> {token or 'none'}")
-            continue
-        ledger.macro_vis.append(f"{old.label} ({new.where()}): + {token} before "
-                                f"{new.text[offset:].split(chr(10))[0][:60]}")
-        check_visibility(ledger, replace(old, vis=[]), replace(new, vis=[(offset, token)]), moves, allow_widened)
+    return pairs, still_lost, [unit for unit in gained if id(unit) not in taken]
 
 
 def check_paths(ledger: Ledger, old: Unit, new: Unit) -> None:
@@ -919,28 +1261,26 @@ def validator_edits(repo: Path, base: str, head: str) -> list[str]:
     return sorted(edits)
 
 
-def renamed_files(repo: Path, base: str, head: str) -> list[tuple[str, str]]:
-    """(old, new) for every `.rs` file git sees as renamed between the commits."""
-    fields = rst.git(repo, "diff", "--find-renames", "--name-status", "-z", "--diff-filter=R", base, head).split("\0")
-    return [(old, new) for status, old, new in zip(fields[0::3], fields[1::3], fields[2::3])
-            if status.startswith("R") and old.endswith(".rs") and new.endswith(".rs")]
-
-
-def owned_module(tree: rst.Tree, path: str) -> tuple[str, ...] | None:
-    """The module a file owns (reached by `mod` or `#[path]`, not `include!`)."""
-    contexts = [c for c in tree.contexts.get(path, []) if c.how in ("mod", "path")]
-    context = next((c for c in contexts if c.module[0] == "crate"), contexts[0] if contexts else None)
-    return context.module if context else None
-
-
-def file_module_moves(renames: list[tuple[str, str]], base_tree: rst.Tree, head_tree: rst.Tree) -> dict:
-    """Old module path -> new module path for each renamed file whose old module is gone at head."""
-    moves = {}
-    for old, new in renames:
-        before, after = owned_module(base_tree, old), owned_module(head_tree, new)
-        if before and after and before != after and before not in head_tree.modules:
-            moves[before] = after
-    return moves
+def file_renames(repo: Path, base: str, head: str) -> tuple[list[tuple[str, str]], dict[str, set[str]]]:
+    """The exact (R100) renames of `.rs` files and the diff status of every path, with rewrites broken
+    (`-B -M100%`) so that a path whose content moved away and was replaced still pairs exactly."""
+    fields = rst.git(repo, "diff", "-B", "-M100%", "--name-status", "-z", base, head).split("\0")
+    renames: list[tuple[str, str]] = []
+    status: dict[str, set[str]] = {}
+    at = 0
+    while at + 1 < len(fields) and fields[at]:
+        code = fields[at]
+        if code[0] in "RC":
+            old, new = fields[at + 1], fields[at + 2]
+            at += 3
+            status.setdefault(old, set()).add(code)
+            status.setdefault(new, set()).add(code)
+            if code == "R100" and old.endswith(".rs") and new.endswith(".rs"):
+                renames.append((old, new))
+        else:
+            status.setdefault(fields[at + 1], set()).add(code)
+            at += 2
+    return renames, status
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -969,13 +1309,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         base_source, base_tree, base_files, base_units = side(repo, base_sha, changed)
         head_source, head_tree, head_files, head_units = side(repo, head_sha, changed, base_source)
-        renames = renamed_files(repo, base_sha, head_sha)
-        file_moves = file_module_moves(renames, base_tree, head_tree)
+        exact, status = file_renames(repo, base_sha, head_sha)
+        base_names, head_names = namespace(base_source, base_tree), namespace(head_source, head_tree)
     except rst.SourceError as error:
         print(f"move-ledger: {error}", file=sys.stderr)
         # A report never blocks a change; an enforced check does.
         return 0 if args.report else 2
-    ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened), file_moves)
+    # The file map: exact renames of files instantiated in one module context at both commits.
+    renames = {old: new for old, new in exact
+               if len(base_names.contexts.get(old, ())) == 1 and len(head_names.contexts.get(new, ())) == 1}
+    ident = Identity(base_names, head_names, renames, status, set(changed))
+    check_aliases(ident)
+    ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened), ident)
     for path in head_files:
         if path in changed and path not in head_tree.contexts:
             ledger.failures.append(f"not reachable by mod: {path}")
@@ -990,22 +1335,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"move-ledger: {len(base_units)} base items in {len(base_files)} files, "
           f"{len(head_units)} head items in {len(head_files)} files: "
           f"{len(ledger.pairs) - moved} untouched, {moved} moved, {len(ledger.reflowed)} reflowed, "
-          f"{len(ledger.widened)} widened, "
+          f"{len(ledger.respelled) + len(ledger.respelled_uses)} respelled, {len(ledger.widened)} widened, "
           f"{len(ledger.failures)} problems")
-    if renames:
-        print(f"move-ledger: file map: {len(renames)} renamed .rs files, {len(file_moves)} module moves, "
-              f"{len(ledger.respelled)} items with respelled paths, {len(ledger.macro_vis)} macro visibility tokens")
+    module_map = sorted({(next(iter(base_names.contexts[old])), next(iter(head_names.contexts[new])))
+                         for old, new in renames.items()} - {(m, m) for m in base_names.modules})
+    if exact:
+        print(f"move-ledger: file map: {len(exact)} exact renames of .rs files, {len(module_map)} module moves, "
+              f"{len(ident.facades)} facade aliases")
     limit = REPORT_LIMIT if args.report else None
-    for before, after in list(file_moves.items())[:limit]:
+    for before, after in module_map[:limit]:
         print(f"  module {show(before)} -> {show(after)}")
+    for before, after in sorted(ident.facades.items())[:limit]:
+        print(f"  facade alias {show(before)} -> {show(after)}")
     for row in rows[:limit]:
         print(f"  moved {row}")
     for old, new in ledger.reflowed[:limit]:
         print(f"  reflowed {old.label} ({old.where()} -> {new.where()})")
     for old, new in ledger.respelled[:limit]:
         print(f"  respelled {old.label} ({old.where()} -> {new.where()})")
-    for row in ledger.macro_vis[:limit]:
-        print(f"  macro visibility {row}")
+    for row in ledger.respelled_uses[:limit]:
+        print(f"  respelled {row}")
     for row in ledger.widened[:limit]:
         print(f"  {row}")
     for note in ledger.notes[:limit]:
