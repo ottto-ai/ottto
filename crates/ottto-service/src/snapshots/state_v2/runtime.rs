@@ -892,9 +892,9 @@ pub(in super::super) fn guard_external(
     guard_current(path, runtime, graph_generation, true)
 }
 
-/// Local receipt binding before collection: a save-pressure hold must not stop
-/// the held pass that retries the save. Lock, reload, fence and generation
-/// checks still apply; uploads keep `guard_external` at each external boundary.
+/// A local guard that ignores a save-pressure hold. Lock, reload, fence and
+/// generation checks still apply.
+#[cfg(test)]
 pub(in super::super) fn guard_local(
     path: &Path,
     runtime: Option<&Arc<Runtime>>,

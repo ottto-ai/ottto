@@ -1921,6 +1921,82 @@ mod progress_rows {
         });
     }
 
+    /// The committed progress rows of the session store, as plain values.
+    fn stored_rows(db: &mut sqlite::Sqlite) -> Json {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let (stored, baseline) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+        let stored = stored.expect("progress rows");
+        json!({
+            "generation": baseline.generation,
+            "cache_state": stored.cache_state,
+            "cache_head": stored.cache_head,
+            "ledger": stored.ledger,
+        })
+    }
+    fn carry_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("OTTTO_PROGRESS_CARRY_DIR").expect("the carry harness"))
+    }
+
+    /// [format] Carry fixture for an older binary: a published route holding
+    /// progress rows at writer capability 6, checkpointed and kept on disk.
+    /// Run only by scripts/test_progress_rows_carry.py.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn write_progress_rows_carry_fixture() {
+        let root = carry_dir();
+        let support = root.join("support");
+        let parent = support.join("snapshots/destinations").join("b".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let f = Fixture {
+            path: parent.join("claude_code-test-scan-index.json"),
+            support,
+        };
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let outcome = commit(
+            &f,
+            &index,
+            progress::Baseline::default(),
+            &page(&["a", "b"], 1),
+        );
+        assert!(matches!(outcome.unwrap(), progress::Outcome::Committed(_)));
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        let mut expected = Json::Null;
+        with_session_db(&index, |db| {
+            expected = stored_rows(db);
+            db.clean_checkpoint().unwrap();
+        });
+        fs::write(
+            root.join("expected.json"),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("index-path.txt"), f.path.to_str().unwrap()).unwrap();
+        // The older binary and the re-upgrade read this store after exit.
+        std::mem::forget(f);
+        println!("PROGRESS_CARRY_FIXTURE_WRITTEN");
+    }
+
+    /// [format] After an older binary refused the store, this binary opens it
+    /// and reads exactly the rows it wrote: re-upgrade equals no downgrade.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn verify_progress_rows_carry_reupgrade() {
+        let root = carry_dir();
+        let path = PathBuf::from(fs::read_to_string(root.join("index-path.txt")).unwrap());
+        let index = load_with(&path, false).unwrap().unwrap();
+        let mut actual = Json::Null;
+        with_session_db(&index, |db| actual = stored_rows(db));
+        let expected: Json =
+            serde_json::from_slice(&fs::read(root.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(
+            actual, expected,
+            "re-upgrade equals the never-downgraded store"
+        );
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        println!("PROGRESS_CARRY_REUPGRADE_VERIFIED");
+    }
+
     /// [behaviour] Progress rows are counted apart from graph records and never
     /// trip the records alarm, and the graph's catalogue walk still finds the
     /// graph kinds on both sides of the progress range.

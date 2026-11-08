@@ -10,6 +10,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      progress_rows_carry:
+        description: "Also run the progress-rows carry check against the v0.1.234 source"
+        type: boolean
+        default: false
   # Daily main run that refreshes the shared Linux cache; PR refs only restore.
   schedule:
     - cron: "0 4 * * *"
@@ -184,3 +189,26 @@ jobs:
         run: |
           echo "shards: $SHARDS"
           test "$SHARDS" = success
+
+  progress-rows-carry:
+    # Dispatch-only, never on pull requests or the schedule: this branch writes
+    # a capability-6 store, the v0.1.234 source must refuse it unchanged, and
+    # this branch then reads back exactly what it wrote.
+    name: Progress rows carry (v0.1.234)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.progress_rows_carry }}
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
+        with:
+          linux-test-env: "true"
+          cache-key: linux-tests
+
+      - name: Carry check
+        run: python3 scripts/test_progress_rows_carry.py
