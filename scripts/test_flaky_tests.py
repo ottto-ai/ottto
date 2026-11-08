@@ -28,6 +28,26 @@ class TallyTests(unittest.TestCase):
         ]
         self.assertEqual(flaky.tally(records), {'a::x': 3, 'a::y': 1})
 
+    def test_renamed_test_keeps_its_history(self):
+        mapped = flaky.renames('target\told_test\tnew_test\n'
+                               'crates/a/src/lib.rs\ta::x\ta::b::x\n'
+                               'crates/a/src/lib.rs\ta::b::x\ta::c::x\n')
+        self.assertEqual(mapped, {'a::x': 'a::c::x', 'a::b::x': 'a::c::x'})
+        records = [
+            record('1', 'rust', '1/1', 'a::x'),
+            record('2', 'rust', '1/1', 'a::b::x'),
+            record('3', 'rust', '1/1', 'a::c::x', 'a::y'),
+        ]
+        self.assertEqual(flaky.tally(records, mapped), {'a::c::x': 3, 'a::y': 1})
+
+    def test_old_id_mapped_to_two_new_ids_stays(self):
+        mapped = flaky.renames('target\told_test\tnew_test\n'
+                               'crates/a/src/lib.rs\ttests::x\ta::tests::x\n'
+                               'crates/b/src/lib.rs\ttests::x\tb::tests::x\n'
+                               'crates/c/src/lib.rs\ttests::y\tc::tests::y\n'
+                               'crates/d/src/lib.rs\ttests::y\tc::tests::y\n')
+        self.assertEqual(mapped, {'tests::y': 'c::tests::y'})
+
     def test_reads_json_from_the_artifact_zip(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w') as archive:
