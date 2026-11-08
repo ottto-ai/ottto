@@ -229,9 +229,9 @@ pub(crate) struct Point<T> {
 }
 
 /// `Points` writing each named hint at the committing generation.
-fn put_points<T: Serialize>(
-    points: &[(&str, T)],
-) -> impl FnMut(&mut dyn Transaction, u64) -> Result<bool> + '_ {
+fn put_points<'a, T: Serialize>(
+    points: &'a [(&'a str, T)],
+) -> impl FnMut(&mut dyn Transaction, u64) -> Result<bool> + 'a {
     move |tx, progress_generation| {
         for (name, accepted) in points {
             let point = Point {

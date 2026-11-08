@@ -528,8 +528,8 @@ fn assert_imported(
         .cloned()
         .collect::<BTreeSet<_>>();
     assert!(!names.is_empty(), "identity placement to move");
-    let rows = imported.rows.as_ref().unwrap();
-    let stored = rows
+    let store = imported.rows.as_ref().unwrap();
+    let stored = store
         .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
         .unwrap();
     for (name, hint) in theirs.as_object().unwrap() {

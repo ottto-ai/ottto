@@ -7556,6 +7556,9 @@ fn finish_sync_source(
             &index,
             machine_id,
         );
+        upload_progress.load_identity(
+            (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
+        )?;
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
@@ -7563,9 +7566,6 @@ fn finish_sync_source(
                 0
             }
         };
-        upload_progress.load_identity(
-            (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
-        )?;
         let (mut disposition, census_withheld, stats) =
             apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                 support_dir,
