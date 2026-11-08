@@ -141,8 +141,10 @@ fn write<S: Serialize, H: Serialize, L: Serialize>(
 /// against `baseline` (hydrated by `read`, or `Baseline::default()` for a
 /// store without progress) and compared with its generation. The writer is
 /// authenticated at the committed graph G, which this commit leaves as it is.
-/// Published and Ambiguous reopened the connection: the caller's session
-/// reloads.
+/// A refusal before or at COMMIT that leaves nothing durable (a write or
+/// admission refusal, a stale baseline) rolls back as NotPublished and keeps
+/// the graph session current. Published and Ambiguous reopened the connection:
+/// the caller's session reloads, Published included, as a conservative choice.
 pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
     db: &mut sqlite::Sqlite,
     identity: &Identity,
@@ -154,14 +156,29 @@ pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
     let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
     db.validate_save(identity, graph)?;
     let mut tx = db.begin(TxnMode::Write)?;
-    let rows = write(&mut tx, baseline.rows, page)?;
+    let rows = match write(&mut tx, baseline.rows, page) {
+        Ok(rows) => rows,
+        Err(_) => {
+            drop(tx);
+            return not_published(db);
+        }
+    };
     match tx.commit_inner(sqlite::Cas::Progress { expected, next }) {
         DurableCommitOutcome::Committed(generation) => {
             Ok(Outcome::Committed(Baseline { generation, rows }))
         }
-        DurableCommitOutcome::NotPublished => Ok(Outcome::NotPublished),
+        DurableCommitOutcome::NotPublished => not_published(db),
         DurableCommitOutcome::Published(_) | DurableCommitOutcome::Ambiguous => {
             bail!(Hold::ReloadRequired)
         }
     }
+}
+/// Nothing became durable. A disk-full failure keeps its typed hold and an
+/// unknown connection state reloads; anything else changed no store state.
+fn not_published(db: &sqlite::Sqlite) -> Result<Outcome> {
+    if let Some(hold) = db.save_failure() {
+        bail!(hold);
+    }
+    ensure!(!db.reload_required(), Hold::ReloadRequired);
+    Ok(Outcome::NotPublished)
 }

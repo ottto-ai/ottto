@@ -850,7 +850,9 @@ fn growth_claim_txn(
 /// session and fence checks, then one BEGIN IMMEDIATE transaction over the
 /// progress kinds alone. The caller holds the source's progress owner, then
 /// CheckpointLock. Only `progress_generation` advances: the graph's G, rows
-/// and session stamp stay valid, so a NotPublished page reloads no graph.
+/// and session stamp stay valid, so a NotPublished page reloads no graph. The
+/// writer authenticates at the same graph lineage a save would, including a
+/// claim-only growth save earlier in this pass.
 #[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))]
 pub(super) fn commit_progress_locked<S: Serialize, H: Serialize, L: Serialize>(
     path: &Path,
@@ -861,9 +863,17 @@ pub(super) fn commit_progress_locked<S: Serialize, H: Serialize, L: Serialize>(
 ) -> Result<progress::Outcome> {
     let runtime = index.v2().persistence_v2.clone();
     ensure!(runtime.is_some(), Hold::ReloadRequired);
+    let graph = super::super::sampled_audit::own_growth_claim_generation(index, path)
+        .unwrap_or(index.generation);
     crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
-        with_save_session(path, runtime, index.generation, |_, session, id| {
-            progress::commit(&mut session.db, &id, session.stamp.0, baseline, page)
+        with_save_session(path, runtime, graph, |_, session, id| {
+            let outcome = progress::commit(&mut session.db, &id, session.stamp.0, baseline, page)?;
+            // A COMMIT error may have reopened the connection. Every graph
+            // commit advances G, so an unchanged G keeps the graph current.
+            let stamp = session.db.stamp()?;
+            ensure!(stamp.0 == session.stamp.0, Hold::ReloadRequired);
+            session.stamp = stamp;
+            Ok(outcome)
         })?
         .ok_or_else(|| Hold::ReloadRequired.into())
     })

@@ -1734,10 +1734,13 @@ mod progress_rows {
         with_session_db(index, |db| value = db.read_control(name).unwrap());
         value
     }
+    /// The graph session's stamp; the session must still be current.
     fn session_stamp(index: &ScanIndex) -> (u64, u64) {
         let runtime = index.v2().persistence_v2.as_ref().unwrap();
         let guard = runtime.session.lock().unwrap();
-        guard.as_ref().unwrap().stamp
+        let session = guard.as_ref().unwrap();
+        assert!(!session.reload, "the graph session must not reload");
+        session.stamp
     }
     fn progress_headers(db: &mut sqlite::Sqlite) -> Vec<Header> {
         let mut tx = db.begin(TxnMode::Read).unwrap();
@@ -1783,13 +1786,22 @@ mod progress_rows {
         assert_eq!(session_stamp(&index), stamp);
         with_session_db(&index, |db| assert_eq!(db.stamp().unwrap(), stamp));
 
-        // A stale baseline refuses: no row, no generation, no reload.
+        // A stale baseline, and a write refusal before COMMIT (a baseline that
+        // names a graph row), refuse: no row, no generation, no reload.
         let mut before = Vec::new();
         with_session_db(&index, |db| before = progress_headers(db));
-        assert_eq!(
-            commit(&f, &index, empty, &page(&["c"], 9)).unwrap(),
-            progress::Outcome::NotPublished
-        );
+        let graph_row = mapper::key("account.current", "x", 1).unwrap();
+        let foreign = progress::Baseline {
+            generation: 1,
+            rows: [(graph_row, [0; 32])].into(),
+        };
+        for refused in [empty, foreign] {
+            assert_eq!(
+                commit(&f, &index, refused, &page(&["c"], 9)).unwrap(),
+                progress::Outcome::NotPublished
+            );
+            assert_eq!(session_stamp(&index), stamp);
+        }
         assert_eq!(control(&index, "progress_generation"), Some(1));
         with_session_db(&index, |db| {
             assert_eq!(progress_headers(db), before);
@@ -1826,6 +1838,7 @@ mod progress_rows {
                 ("progress_generation", 1),
                 DurableCommitOutcome::Published(1),
             ),
+            (("progress_generation", 9), DurableCommitOutcome::Ambiguous),
             // The graph's row moving says nothing about this commit.
             (("generation", G + 1), DurableCommitOutcome::NotPublished),
         ];

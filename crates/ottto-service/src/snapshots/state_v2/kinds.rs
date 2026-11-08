@@ -170,7 +170,8 @@ pub(super) fn hydrate_txn(
             let group = catalogue::group(kind.name());
             ensure!(group.is_some(), "state_v2_unmapped_kind");
             // Upload progress is not graph state: resume after this kind's
-            // last possible key, so each progress kind costs one header.
+            // last possible key, so each progress kind met costs one bounded
+            // header page.
             if group == Some(catalogue::Group::Progress) {
                 after = Some(RowKey::record(
                     kind.name(),
