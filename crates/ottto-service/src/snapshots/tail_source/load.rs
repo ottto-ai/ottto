@@ -376,8 +376,26 @@ fn stored<S: TailSource>(
         return Err(Miss::ConflictOwed);
     }
     // The file against the certificate, before any page.
-    let checkpoint = match decoded.certificate.restore_grown(held, scope.clone()) {
-        Ok((checkpoint, _)) => checkpoint,
+    let cert = &decoded.certificate;
+    // Bind the ctime to the indexed read that minted this certificate, as for
+    // census_base_bound; unavailable birth never binds (same_birth semantics).
+    let read_changed_nanos = index.files.get(key).and_then(|entry| {
+        let nanos = entry.modified_unix_nanos?;
+        let seconds = (nanos / 1_000_000_000) as i64;
+        (cert.length == entry.size_bytes
+            && cert.modified == (seconds, (nanos % 1_000_000_000) as i64)
+            && cert.birth_nanos != 0
+            && entry.opened_birth_nanos == cert.birth_nanos)
+            .then_some(entry.opened_changed_nanos)
+    });
+    let checkpoint = match cert.restore_grown(held, scope.clone(), read_changed_nanos) {
+        Ok((checkpoint, _admission)) => {
+            #[cfg(test)]
+            assert!(
+                _admission.sample_bytes_read <= 2 * crate::transcript_acquisition::SAMPLE_BYTES
+            );
+            checkpoint
+        }
         Err(CertificateRefusal::Changed(reason)) => return Err(Miss::Changed(reason)),
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
