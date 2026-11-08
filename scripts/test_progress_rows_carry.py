@@ -47,7 +47,7 @@ mod progress_rows_carry_probe {
         let before = files(&path);
         assert!(before.iter().any(|(name, _)| name.ends_with(".v2.sqlite")));
         let opened = {
-            let _lock = super::super::CheckpointLock::acquire(&path).unwrap();
+            let _lock = crate::snapshots::CheckpointLock::acquire(&path).unwrap();
             load_locked(&path, false, published(&path).unwrap())
         };
         let error = match opened {
