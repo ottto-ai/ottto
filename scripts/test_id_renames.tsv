@@ -1,1 +1,2 @@
 target	old_test	new_test
+crates/ottto-service/src/lib.rs	snapshot_sync::tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::held_probe_legacy_file_rearms_once	snapshot_sync::tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::held_probe_listing_tests::held_probe_legacy_file_rearms_once

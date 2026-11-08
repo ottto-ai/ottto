@@ -1211,10 +1211,11 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         fs::create_dir_all(&directory).unwrap();
         let path = |name: &str| directory.join(format!("rollout-{name}.jsonl"));
         let mut index = ScanIndex::default();
+        // Settled entries carry their final group; only growth or a hold owes.
         for (name, committed) in [("grown", 2), ("held", 2), ("equal", 3), ("truncated", 4)] {
             append(&path(name), b"{}\n");
             set_old(&path(name));
-            let mut entry = super::tests::manifest_index_entry(None);
+            let mut entry = super::tests::manifest_index_entry(Some("final"));
             entry.size_bytes = committed;
             assert!(!entry.has_unverified_source());
             if recovery_overlap && name == "grown" {
@@ -1237,7 +1238,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         let cap = former_file_cap(source);
         File::create(path("big")).unwrap().set_len(cap + 1).unwrap();
         set_old(&path("big"));
-        let mut big = super::tests::manifest_index_entry(None);
+        let mut big = super::tests::manifest_index_entry(Some("final"));
         big.size_bytes = cap;
         index.files.insert(local_index_key(&path("big")), big);
         ensure_bounded_traversal(source, &[root.projects()], &mut index, NOW, 7);
@@ -1278,7 +1279,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         // Revalidation and opened-object recheck each use their current length.
         // Restore the equal/truncated controls, retired by complete census above.
         for (name, size) in [("equal", 3), ("truncated", 4)] {
-            let mut entry = super::tests::manifest_index_entry(None);
+            let mut entry = super::tests::manifest_index_entry(Some("final"));
             entry.size_bytes = size;
             index.files.insert(local_index_key(&path(name)), entry);
         }
