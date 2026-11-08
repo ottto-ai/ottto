@@ -125,8 +125,40 @@ impl crate::heap_layout_bound::HeapLayoutBound for IdentityScope {
     }
 }
 fn encoded(state: &AcceptedSession) -> Option<[u8; 32]> {
-    let bytes = serde_json::to_vec(state).ok()?;
-    Some(sha2::Sha256::digest(bytes).into())
+    crate::snapshots::serialized_json_digest(state, b"").map(|digest| digest.finalize().into())
+}
+impl AcceptedSession {
+    /// The one per-session rule for a decoded hint, from the ledger or an
+    /// identity row: every bound holds, the vectors are sorted and
+    /// deduplicated, and every share lies in a start. `false`: invalid.
+    fn normalize(&mut self) -> bool {
+        if self.starts.len() > MAX_BUCKETS
+            || self.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
+            || self.proved.len() > MAX_PROVED_ROWS
+            || self.missing.len() > MAX_PENDING_MISSING
+        {
+            return false;
+        }
+        self.proved.sort_unstable();
+        self.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
+        self.missing.sort_unstable();
+        self.missing.dedup();
+        self.starts.sort_unstable();
+        self.starts.dedup();
+        self.shares.sort_unstable();
+        self.shares.dedup();
+        if (self.shares.iter()).any(|share| self.starts.binary_search(&share.bucket).is_err()) {
+            return false;
+        }
+        fn exact<T>(vector: &mut Vec<T>) {
+            *vector = std::mem::take(vector).into_boxed_slice().into_vec();
+        }
+        exact(&mut self.starts);
+        exact(&mut self.shares);
+        exact(&mut self.proved);
+        exact(&mut self.missing);
+        true
+    }
 }
 /// Truncated keyed digests: the (bucket, row) grain and its exact proof.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -704,33 +736,9 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
                         continue;
                     };
-                    if state.starts.len() > MAX_BUCKETS
-                        || state.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
-                        || state.proved.len() > MAX_PROVED_ROWS
-                        || state.missing.len() > MAX_PENDING_MISSING
-                    {
-                        continue;
+                    if state.normalize() {
+                        states.insert(session, state);
                     }
-                    state.proved.sort_unstable();
-                    state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
-                    state.missing.sort_unstable();
-                    state.missing.dedup();
-                    state.starts.sort_unstable();
-                    state.starts.dedup();
-                    state.shares.sort_unstable();
-                    state.shares.dedup();
-                    if state
-                        .shares
-                        .iter()
-                        .any(|share| state.starts.binary_search(&share.bucket).is_err())
-                    {
-                        continue;
-                    }
-                    state.starts = state.starts.into_boxed_slice().into_vec();
-                    state.shares = state.shares.into_boxed_slice().into_vec();
-                    state.proved = state.proved.into_boxed_slice().into_vec();
-                    state.missing = state.missing.into_boxed_slice().into_vec();
-                    states.insert(session, state);
                 }
                 Ok(AcceptedBuckets(states, None, false, false, 0, false))
             }
@@ -765,11 +773,12 @@ impl AcceptedBuckets {
     pub(crate) fn for_test() -> Self {
         Self(BTreeMap::new(), Some(fixture_key()), false, false, 0, false)
     }
+    /// One session at every per-session bound: the per-row maximum.
     #[cfg(test)]
-    pub(crate) fn maximum_for_test() -> Self {
+    pub(crate) fn maximal_session_for_test() -> Self {
         let key = fixture_key();
         Self(
-            (0..16)
+            (0..1)
                 .map(|session| {
                     let starts = (0..MAX_BUCKETS)
                         .map(|n| i64::MIN + n as i64)
@@ -1142,21 +1151,13 @@ impl AcceptedBuckets {
         self.0.clear();
         self.2 |= rotated && self.1.is_some();
     }
-    /// A stored row this key can use: its own epoch, within every bound.
+    /// A stored row this key can use: its own epoch, and already in the
+    /// form the shared per-session rule leaves (rows are written that way).
     pub(crate) fn admissible(&self, state: &AcceptedSession) -> bool {
-        let increasing = |a: &[i64]| a.windows(2).all(|w| w[0] < w[1]);
-        self.1
-            .as_ref()
-            .is_some_and(|key| state.key_epoch == key_epoch(key))
-            && state.starts.len() <= MAX_BUCKETS
-            && state.shares.len() <= max_shares(MAX_ADVERTISED_ITEM_BYTES)
-            && state.proved.len() <= MAX_PROVED_ROWS
-            && state.missing.len() <= MAX_PENDING_MISSING
-            && increasing(&state.starts)
-            && increasing(&state.missing)
-            && state.shares.windows(2).all(|w| w[0] < w[1])
-            && (state.proved.windows(2)).all(|w| (w[0].bucket, w[0].row) < (w[1].bucket, w[1].row))
-            && (state.shares.iter()).all(|share| state.starts.binary_search(&share.bucket).is_ok())
+        let mut normal = state.clone();
+        (self.1.as_ref()).is_some_and(|key| state.key_epoch == key_epoch(key))
+            && normal.normalize()
+            && normal == *state
     }
     /// Make a stored row resident, unless the session already is (a
     /// resident entry is never replaced by a read). `retained_reset`: it
@@ -1340,66 +1341,6 @@ mod tests {
         assert!(state.get("never-acknowledged").is_none());
         assert!(state.get("session-0").is_some(), "no session is evicted");
         assert_eq!(state.get("session-16").unwrap().len(), 0);
-    }
-}
-
-#[cfg(all(test, target_pointer_width = "64"))]
-mod heap_tests {
-    use super::*;
-    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    #[test]
-    fn sixteen_session_priority_ledger_has_a_three_mib_heap_bound() {
-        let state = AcceptedBuckets(
-            (0..16)
-                .map(|n| {
-                    (
-                        format!("{n:064x}"),
-                        AcceptedSession {
-                            key_epoch: [0; 32],
-                            key: None,
-                            stored: None,
-                            _last_ack: Dropped,
-                            starts: (0..MAX_BUCKETS as i64).collect(),
-                            shares: vec![
-                                AcceptedShare {
-                                    bucket: 1,
-                                    row: [0; 32],
-                                    authority: Some([0; 32])
-                                };
-                                MAX_SHARES
-                            ],
-                            incomplete: false,
-                            proved: Vec::new(),
-                            missing: Vec::new(),
-                        },
-                    )
-                })
-                .collect(),
-            None,
-            false,
-            false,
-            0,
-            false,
-        );
-        let mut counter = Counter::new(3 * 1024 * 1024);
-        counter.add(std::mem::size_of_val(&state)).unwrap();
-        state.heap_bound(&mut counter).unwrap();
-        assert!(counter.bytes < 3 * 1024 * 1024);
-        assert_eq!(
-            counter.bytes,
-            2_628_072
-                + 17 * 11 * (std::mem::size_of::<AcceptedSession>() - 56)
-                + std::mem::size_of::<AcceptedBuckets>()
-                - 24
-        );
-        eprintln!(
-            "accepted-share requested-layout maximum={} bytes",
-            counter.bytes
-        );
-        assert_eq!(
-            state.0.values().map(|state| state.len()).sum::<usize>(),
-            16 * MAX_BUCKETS
-        );
     }
 }
 
@@ -1785,54 +1726,47 @@ mod retained_heap_tests {
     use super::*;
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     #[test]
-    fn maximum_ledger_with_proved_rows_has_a_four_mib_heap_bound() {
-        let state = AcceptedBuckets(
-            (0..16)
-                .map(|n| {
-                    (
-                        format!("{n:064x}"),
-                        AcceptedSession {
-                            key_epoch: [0; 32],
-                            key: None,
-                            stored: None,
-                            _last_ack: Dropped,
-                            starts: (0..MAX_BUCKETS as i64).collect(),
-                            shares: vec![
-                                AcceptedShare {
-                                    bucket: 1,
-                                    row: [0; 32],
-                                    authority: Some([0; 32])
-                                };
-                                MAX_SHARES
-                            ],
-                            incomplete: false,
-                            proved: vec![
-                                ProvedRow {
-                                    bucket: 1,
-                                    row: [0; 16],
-                                    proof: [0; 16],
-                                    account: Some([255; 32]),
-                                };
-                                MAX_PROVED_ROWS
-                            ],
-                            missing: (0..MAX_PENDING_MISSING as i64).collect(),
-                        },
-                    )
-                })
-                .collect(),
-            None,
-            false,
-            false,
-            0,
-            false,
-        );
-        let mut counter = Counter::new(4 * 1024 * 1024);
+    fn one_maximal_session_with_proved_rows_has_a_quarter_mib_heap_bound() {
+        let state = AcceptedSession {
+            key_epoch: [0; 32],
+            key: None,
+            stored: None,
+            _last_ack: Dropped,
+            starts: (0..MAX_BUCKETS as i64).collect(),
+            shares: vec![
+                AcceptedShare {
+                    bucket: 1,
+                    row: [0; 32],
+                    authority: Some([0; 32])
+                };
+                MAX_SHARES
+            ],
+            incomplete: false,
+            proved: vec![
+                ProvedRow {
+                    bucket: 1,
+                    row: [0; 16],
+                    proof: [0; 16],
+                    account: Some([255; 32]),
+                };
+                MAX_PROVED_ROWS
+            ],
+            missing: (0..MAX_PENDING_MISSING as i64).collect(),
+        };
+        // Resident hints are the page's sessions, each within this bound.
+        let mut counter = Counter::new(256 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();
         state.heap_bound(&mut counter).unwrap();
+        assert_eq!(std::mem::size_of::<AcceptedShare>(), 80);
         assert_eq!(std::mem::size_of::<ProvedRow>(), 80);
-        assert!(counter.bytes <= 4_010_000, "layout={}", counter.bytes);
+        assert_eq!(
+            counter.bytes,
+            std::mem::size_of::<AcceptedSession>()
+                + (MAX_BUCKETS + MAX_PENDING_MISSING) * 8
+                + (MAX_SHARES + MAX_PROVED_ROWS) * 80
+        );
         eprintln!(
-            "accepted-share+proved-row requested-layout maximum={} bytes",
+            "accepted-share+proved-row requested-layout maximum={} bytes per session",
             counter.bytes
         );
     }

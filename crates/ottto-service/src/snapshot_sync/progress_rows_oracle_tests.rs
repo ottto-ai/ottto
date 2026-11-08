@@ -94,6 +94,8 @@ struct Receiver {
     bodies: BTreeMap<String, String>,
     credit: BTreeMap<String, u64>,
     duplicates: usize,
+    /// The identity hints each ACK's production save held, by row name.
+    acked_hints: BTreeMap<String, Value>,
 }
 
 impl Receiver {
@@ -126,13 +128,57 @@ fn send_to(
     receiver: &mut Receiver,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
     let path = progress_path(index_path);
-    send_with(
+    let mut hints = BTreeMap::new();
+    let sent = send_with(
         source,
         page,
         progress,
         |batch| receiver.respond(batch),
-        |progress| progress.save(&path),
-    )
+        |progress| {
+            let resident = serde_json::to_value(&progress.accepted_identity_buckets)?;
+            hints.extend(serde_json::from_value::<BTreeMap<String, Value>>(resident)?);
+            progress.save(&path)
+        },
+    );
+    receiver.acked_hints.extend(hints);
+    sent
+}
+
+/// The stored identity rows of the hints `receiver` saw ACKed, as hints:
+/// each row's progress generation is dropped and an absent row is omitted.
+fn stored_hints(progress: &SnapshotUploadProgress, receiver: &Receiver) -> BTreeMap<String, Value> {
+    let names = receiver
+        .acked_hints
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let rows = progress.rows.as_ref().expect("a routed progress");
+    let points = rows
+        .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
+        .unwrap();
+    points
+        .into_iter()
+        .map(|(name, point)| (name, point.accepted))
+        .collect()
+}
+
+/// The identity rows hold exactly the ACKed hints; a Claude route has some.
+fn assert_identity_rows(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    receiver: &Receiver,
+    context: &str,
+) {
+    assert_eq!(
+        source == SnapshotSource::ClaudeCode,
+        !receiver.acked_hints.is_empty(),
+        "{source:?} {context}: Claude ACKs record identity hints"
+    );
+    assert_eq!(
+        stored_hints(progress, receiver),
+        receiver.acked_hints,
+        "{source:?} {context}: the identity rows hold the ACKed hints"
+    );
 }
 
 /// The production pass end after an exact ACK: the page's ledger, then the
@@ -635,6 +681,7 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
                 ram,
                 "{source:?}: restart restores the ledger"
             );
+            assert_identity_rows(source, &restored, &receiver, "restart");
             let quiet = assert_quiet(source, &c, index);
 
             for (path, session) in paths.iter().zip(SESSIONS) {
@@ -658,6 +705,7 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
             drop(page);
             let (index, restored) = load(source, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
+            assert_identity_rows(source, &restored, &receiver, "append restart");
             assert_quiet(source, &c, index);
             settled.push((path.to_owned(), restored, session, c));
         }
@@ -766,6 +814,7 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                 drop(second);
                 let (index, restored) = load(source, &c, path).unwrap();
                 assert_eq!(durable(&restored), ram);
+                assert_identity_rows(source, &restored, &receiver, "both pages");
                 assert_quiet(source, &c, index);
                 second_pages.push((page_two, path.to_owned(), restored, session, c));
             }
@@ -853,6 +902,10 @@ fn progress_rows_commit_error_keeps_ram_and_retry_writes_every_row() {
                     "RAM keeps the dirty rows"
                 );
                 assert_eq!(row_digests(path), before, "NotPublished leaves every row");
+                assert!(
+                    stored_hints(&progress, &receiver).is_empty(),
+                    "{source:?}: NotPublished writes no identity row"
+                );
                 let credit = receiver.credit.clone();
 
                 if same_ram {
@@ -885,6 +938,7 @@ fn progress_rows_commit_error_keeps_ram_and_retry_writes_every_row() {
                 drop(page);
                 let (index, restored) = load(source, &c, path).unwrap();
                 assert_eq!(durable(&restored), ram, "the retry wrote every row");
+                assert_identity_rows(source, &restored, &receiver, "NotPublished retry");
                 assert_quiet(source, &c, index);
                 assert_rows_custody(path, &restored);
             }
@@ -932,6 +986,16 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
 
             let (index, mut progress) = load(SOURCE, &c, path).unwrap();
             assert_graph_behind_ledger(&index, &progress);
+            if published_arm {
+                assert_identity_rows(SOURCE, &progress, &receiver, "Published reload");
+            } else {
+                // The page did not land: its hints are absent (untracked
+                // until the next ACK records them again).
+                assert!(
+                    stored_hints(&progress, &receiver).is_empty(),
+                    "Ambiguous reload holds no identity row of the page"
+                );
+            }
             let reloaded = progress.generation;
             let mut page = native_page(SOURCE, &c, index, 100, true);
             let (status, again) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
@@ -966,6 +1030,7 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
             drop(page);
             let (index, restored) = load(SOURCE, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
+            assert_identity_rows(SOURCE, &restored, &receiver, "settled");
             assert_quiet(SOURCE, &c, index);
             assert_rows_custody(path, &restored);
         }

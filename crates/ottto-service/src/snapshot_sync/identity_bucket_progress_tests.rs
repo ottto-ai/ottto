@@ -179,14 +179,15 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     );
 }
 
-/// [regress] a maximum valid identity ledger stays bounded in JSON and load peak.
+/// [regress] one maximal session's hints stay bounded in JSON and load peak:
+/// the per-row bound (sessions are uncapped; each is one identity row).
 #[test]
-fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
+fn maximal_session_progress_json_and_actual_load_peak_are_bounded() {
     let mut progress = progress();
     progress.accepted_identity_buckets =
-        crate::snapshots::claude_request_identity::AcceptedBuckets::maximum_for_test();
+        crate::snapshots::claude_request_identity::AcceptedBuckets::maximal_session_for_test();
     let bytes = serde_json::to_vec(&progress).unwrap();
-    // Worst accepted-ledger caps in the real progress envelope; other ACK owners empty.
+    // Worst per-session caps in the real progress envelope; other ACK owners empty.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -210,8 +211,10 @@ fn maximum_accepted_ledger_progress_json_and_actual_load_peak_are_bounded() {
     let json_bytes = bytes.len();
     let load_peak = allocation.requested_peak_with_overlap;
     eprintln!("E2_ACCEPTED_PROGRESS_JSON_BYTES={json_bytes} E2_ACCEPTED_PROGRESS_LOAD_PEAK_BYTES={load_peak}");
-    assert!(json_bytes <= 7_900_000, "json={json_bytes}");
-    assert!(load_peak <= 13_500_000, "peak={load_peak}");
+    // 16 such sessions measured 7,822,016 JSON bytes and a 13,331,628-byte
+    // peak; one session's peak adds the one-session Value tree to its bytes.
+    assert!(json_bytes <= 500_000, "json={json_bytes}");
+    assert!(load_peak <= 5_000_000, "peak={load_peak}");
     std::fs::remove_dir_all(root).unwrap();
 }
 // Option (ii): only a stored-body entity ACK whose versioned body witness equals
@@ -635,7 +638,7 @@ fn seeded(siblings: usize, route: &Route) -> (SnapshotUploadProgress, Value) {
     (restarted(&mut progress, Some(KEY), route), before)
 }
 /// [behaviour] Store-only proof is superseded durably before a replacement's
-/// POST, for 17 and 736 sessions.
+/// POST (17 sessions; every stored row is store-only after a save).
 fn identity_cap_store_only_proof_is_superseded_before_post_case(sessions: usize) {
     let route = Route::new();
     let (mut progress, _) = seeded(sessions - 1, &route);
@@ -673,10 +676,6 @@ fn identity_cap_store_only_proof_is_superseded_before_post_case(sessions: usize)
 fn identity_cap_store_only_proof_is_superseded_before_post_17() {
     identity_cap_store_only_proof_is_superseded_before_post_case(17);
 }
-#[test]
-fn identity_cap_store_only_proof_is_superseded_before_post_736() {
-    identity_cap_store_only_proof_is_superseded_before_post_case(736);
-}
 /// [behaviour] An ACK record after a restart sees the store's frozen set: a
 /// stripped body keeps the earliest session's frozen shares.
 fn identity_cap_ack_record_keeps_store_only_frozen_shares_case(sessions: usize) {
@@ -696,10 +695,6 @@ fn identity_cap_ack_record_keeps_store_only_frozen_shares_case(sessions: usize) 
 fn identity_cap_ack_record_keeps_store_only_frozen_shares_17() {
     identity_cap_ack_record_keeps_store_only_frozen_shares_case(17);
 }
-#[test]
-fn identity_cap_ack_record_keeps_store_only_frozen_shares_736() {
-    identity_cap_ack_record_keeps_store_only_frozen_shares_case(736);
-}
 /// [behaviour] A replay-generation change reaches a session that is not
 /// resident: proof is cleared, starts and shares are kept, across a restart.
 fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(sessions: usize) {
@@ -718,10 +713,6 @@ fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(sess
 #[test]
 fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_17() {
     identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(17);
-}
-#[test]
-fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_736() {
-    identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(736);
 }
 /// [behaviour] Key changes A→None→A and A→B→A reject every older row, even
 /// for sessions that were not resident; no proof revives.
