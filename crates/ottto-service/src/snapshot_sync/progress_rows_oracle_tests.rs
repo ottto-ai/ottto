@@ -1259,7 +1259,7 @@ fn progress_rows_import_marker_purges_leftovers_unread() {
         let (c, _) = native_corpus_in(corpus("progress-rows-competing-import"), SOURCE, &SESSIONS);
         let (session, _, oracle) = published_with_json_ledger(SOURCE, &c, None);
         let path = session.path();
-        let mut competitor = durable(&oracle);
+        let mut competitor = serde_json::to_value(&oracle).unwrap();
         competitor["generation"] = json!(41);
         competitor["accepted_cache_heads"][cache_session_key("progress-rows-competitor")] =
             json!("f".repeat(64));
@@ -1319,7 +1319,7 @@ fn progress_rows_import_keeps_the_pending_ack_of_legacy_custody() {
             let path = session.path();
             let identity = control(&store(path), "identity").expect("a published identity");
             let (expected, imported_bytes) = if receipt_arm {
-                let mut next = durable(&oracle);
+                let mut next = serde_json::to_value(&oracle).unwrap();
                 next["generation"] = json!(oracle.generation + 1);
                 next["accepted_cache_heads"][cache_session_key("progress-rows-pending")] =
                     json!("a1".repeat(32));
