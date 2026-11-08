@@ -102,17 +102,27 @@ pub(crate) struct ColdSession {
 impl ColdSession {
     /// (custody under `dir`, its cold graph).
     pub(crate) fn publish(source: Source, index: &ScanIndex, dir: &Path) -> (Self, ScanIndex) {
-        let path = dir
-            .join("snapshots/destinations")
-            .join("a".repeat(64))
-            .join(synthetic_file(source, ".json"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let progress = serde_json::to_vec(&serde_json::json!({
             "schema_version": 3,
             "destination_namespace_hash": "a".repeat(64),
         }))
         .unwrap();
-        let cold = publish(index, &path, &progress);
+        Self::publish_with_progress(source, index, dir, &progress)
+    }
+    /// `publish` of a route whose upload-progress JSON holds exactly
+    /// `progress` before publication.
+    pub(crate) fn publish_with_progress(
+        source: Source,
+        index: &ScanIndex,
+        dir: &Path,
+        progress: &[u8],
+    ) -> (Self, ScanIndex) {
+        let path = dir
+            .join("snapshots/destinations")
+            .join("a".repeat(64))
+            .join(synthetic_file(source, ".json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cold = publish(index, &path, progress);
         assert!(cold.v2().persistence_v2.is_some(), "a live session");
         (Self { path }, cold)
     }

@@ -35,7 +35,15 @@ fn native_corpus(source: SnapshotSource) -> (Corpus, Vec<PathBuf>) {
 }
 
 fn native_corpus_of(source: SnapshotSource, sessions: &[&str]) -> (Corpus, Vec<PathBuf>) {
-    let mut c = corpus("unkept-native-oracle");
+    native_corpus_in(corpus("unkept-native-oracle"), source, sessions)
+}
+
+/// `sessions` as native `source` transcripts under the fresh corpus `c`.
+fn native_corpus_in(
+    mut c: Corpus,
+    source: SnapshotSource,
+    sessions: &[&str],
+) -> (Corpus, Vec<PathBuf>) {
     let paths = sessions
         .iter()
         .map(|session| {
@@ -1205,3 +1213,6 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
         }
     });
 }
+
+#[path = "progress_rows_oracle_tests.rs"]
+mod progress_rows_oracle_tests;
