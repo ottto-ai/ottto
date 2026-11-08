@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.95"
+rust-version = "1.99"
 authors = ["Ottto Team"]
 repository = "https://github.com/ottto-ai/ottto"
 homepage = "https://ottto.net"
