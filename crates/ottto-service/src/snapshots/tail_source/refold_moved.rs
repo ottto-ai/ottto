@@ -78,7 +78,7 @@ pub(in crate::snapshots) fn observe(
         for ((_, before), (_, hashes)) in old.iter().zip(entities.iter()) {
             for (i, label) in LABELS.iter().enumerate() {
                 if before[i] != hashes[i] {
-                    bump(*label);
+                    bump(label);
                     moved = true;
                 }
             }
