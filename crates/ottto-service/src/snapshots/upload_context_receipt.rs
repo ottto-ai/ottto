@@ -508,16 +508,16 @@ impl ScanIndex {
                         })))
     }
 
-    /// An entity's durable stamp proves this body under THIS file's context in
-    /// the stamp set's destination and replay generation. The context carries
-    /// the destination namespace, so a destination change is a context change.
-    pub(super) fn file_entity_stamp_proves(&self, key: &str, entity: &str, body: &str) -> bool {
+    /// An entity's durable stamp proves this body under the active ACK context,
+    /// in the stamp set's destination and replay generation. Index selection
+    /// and stamp writes keep the set scoped to its destination.
+    pub(super) fn file_entity_stamp_proves(&self, _key: &str, entity: &str, body: &str) -> bool {
         self.file_upload_context_enabled()
             && self
                 .upload_context_proof
                 .destination_namespace_hash
                 .as_deref()
-                .zip(self.file_expected_context(key))
+                .zip(self.active_upload_context_fingerprint.as_ref())
                 .is_some_and(|(destination, context)| {
                     self.entity_upload_context_proven(destination, entity, body, context)
                 })

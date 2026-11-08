@@ -38,6 +38,7 @@ NATIVE_FIXTURES = frozenset({
 # any other fixture and can be removed here.
 HEAD_ONLY_FIXTURES = (
     "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
+    "resumed_prefix_sidecar_receipt",
 )
 
 

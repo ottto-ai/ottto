@@ -96,7 +96,11 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
-  accepted, and parts the server did accept stay recorded.
+  accepted, and parts the server did accept stay recorded. A revision-only move can carry a
+  file's receipt when its final entities and bodies are unchanged and every entity has an
+  exact stamp under the active upload context. Claude records those stamps under its resumed
+  mode while unaffected file receipts use the base context. A copy-capability change therefore
+  conservatively re-sends unchanged files once.
 
 Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
