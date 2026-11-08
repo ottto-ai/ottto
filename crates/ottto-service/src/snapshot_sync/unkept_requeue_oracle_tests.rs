@@ -208,12 +208,6 @@ fn checkpoint(
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
-    if progress.ack_recovery.is_none() {
-        progress.ack_recovery =
-            crate::snapshots::ProgressRecovery::for_index(&page.committed, index_path)
-                .unwrap()
-                .map(Box::new);
-    }
     progress.save(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,

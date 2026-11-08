@@ -1600,14 +1600,15 @@ struct PermanentSnapshotRejection {
 
 mod ack_retention;
 mod head_conflict;
+mod progress_rows;
 mod upload_context_resend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
-    /// V2-only authenticated companion; never serialized into the v1 ledger.
+    /// A routed source's progress rows; never serialized into the ledger.
     #[serde(skip)]
-    ack_recovery: Option<Box<crate::snapshots::ProgressRecovery>>,
+    rows: Option<Box<crate::snapshots::ProgressRows>>,
     #[serde(default)]
     generation: u64,
     destination_namespace_hash: String,
@@ -1714,7 +1715,7 @@ impl SnapshotUploadProgress {
     ) -> Self {
         Self {
             schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
-            ack_recovery: None,
+            rows: None,
             generation: 0,
             destination_namespace_hash,
             historical_replay_generation: None,
@@ -1747,31 +1748,12 @@ impl SnapshotUploadProgress {
         expected_destination_namespace_hash: &str,
         active_quarantine_witness: SnapshotQuarantineWitness,
     ) -> Result<Self> {
-        Self::load_with_recovery(
-            path,
-            expected_destination_namespace_hash,
-            active_quarantine_witness,
-            None,
-        )
-    }
-
-    fn load_with_recovery(
-        path: &Path,
-        expected_destination_namespace_hash: &str,
-        active_quarantine_witness: SnapshotQuarantineWitness,
-        ack_recovery: Option<crate::snapshots::ProgressRecovery>,
-    ) -> Result<Self> {
         let _lock = SnapshotProgressLock::acquire(path)?;
-        if let Some(recovery) = &ack_recovery {
-            recovery.recover(path)?;
-        }
         if !path.exists() {
-            let mut progress = Self::new(
+            return Ok(Self::new(
                 expected_destination_namespace_hash.to_string(),
                 active_quarantine_witness,
-            );
-            progress.ack_recovery = ack_recovery.map(Box::new);
-            return Ok(progress);
+            ));
         }
         let parsed = std::fs::read(path)
             .context("read snapshot upload progress")
@@ -1789,88 +1771,19 @@ impl SnapshotUploadProgress {
         }
         let mut progress = match parsed {
             Ok(progress)
-                if progress.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
-                    && progress.destination_namespace_hash
-                        == expected_destination_namespace_hash
-                    && is_snapshot_fingerprint(&progress.destination_namespace_hash)
+                if progress.valid(expected_destination_namespace_hash)
                     && progress
-                        .accepted_fingerprints
+                        .accepted_cache_states
                         .iter()
-                        .all(|value| is_snapshot_fingerprint(value))
-                    && progress.accepted_body_witnesses.len()
-                        == progress.accepted_fingerprints.len()
-                    && progress.accepted_body_witnesses.keys().all(|value| {
-                        is_snapshot_fingerprint(value)
-                            && progress.accepted_fingerprints.contains(value)
-                    })
+                        .all(|(key, state)| progress_rows::valid_cache_state(key, state))
                     && progress
-                        .accepted_body_witnesses
-                        .values()
-                        .all(|value| is_snapshot_fingerprint(value))
-                    && progress
-                        .accepted_body_contexts
+                        .accepted_cache_heads
                         .iter()
-                        .all(|(key, context)| {
-                            progress.accepted_body_witnesses.contains_key(key)
-                                && is_snapshot_fingerprint(context)
-                        })
-                    && progress.accepted_cache_heads.iter().all(|(key, head)| {
-                        is_snapshot_fingerprint(key) && is_snapshot_fingerprint(head)
-                    })
-                    && progress.pending_cache_heads.iter().all(|(file, pending)| {
-                        let sessions = pending.entities.values().collect::<BTreeSet<_>>();
-                        is_snapshot_fingerprint(file)
-                            && is_snapshot_fingerprint(&pending.source_file_fingerprint)
-                            && is_snapshot_fingerprint(&pending.group_fingerprint)
-                            && !pending.entities.is_empty()
-                            && pending.reselected_heads.iter().all(|(key, witness)| {
-                                is_snapshot_fingerprint(witness) && sessions.contains(key)
-                            })
-                            && pending
-                                .settled_entities
-                                .iter()
-                                .all(|entity| pending.entities.contains_key(entity))
-                            && pending.entities.iter().all(|(entity, session)| {
-                                is_snapshot_fingerprint(entity) && is_snapshot_fingerprint(session)
-                            })
-                    })
-                    && progress.accepted_cache_states.iter().all(|(key, state)| {
-                        is_snapshot_fingerprint(key)
-                            && state
-                                .get("observations")
-                                .and_then(serde_json::Value::as_array)
-                                .is_some_and(|rows| {
-                                    rows.len() <= crate::snapshots::cache_observations::MAX_ROWS
-                                })
-                            && serde_json::to_vec(state).is_ok_and(|bytes| {
-                                bytes.len() <= crate::snapshots::cache_observations::MAX_STATE_BYTES
-                            })
-                    })
-                    && progress
-                        .quarantined_fingerprints
-                        .keys()
-                        .all(|value| is_snapshot_fingerprint(value))
-                    && progress
-                        .permanent_rejections
-                        .iter()
-                        .all(|(fingerprint, record)| {
-                            is_snapshot_fingerprint(fingerprint)
-                                && is_snapshot_fingerprint(&record.body_witness)
-                        })
-                    && progress.quarantined_fingerprints.values().all(|record| {
-                        snapshot_quarantine_deadline_is_bounded(record)
-                            && record
-                                .upload_body_witness
-                                .as_deref()
-                                .map_or(true, is_snapshot_fingerprint)
-                    }) =>
+                        .all(|(key, head)| progress_rows::valid_cache_head(key, head)) =>
             {
                 progress
             }
             Ok(_) | Err(_) => {
-                if let Some(recovery) = &ack_recovery {
-                    recovery.invalid_progress()?;
-                }
                 quarantine_invalid_progress(path)?;
                 return Ok(Self::new(
                     expected_destination_namespace_hash.to_string(),
@@ -1878,25 +1791,84 @@ impl SnapshotUploadProgress {
                 ));
             }
         };
-        let permanent = &progress.permanent_rejections;
-        progress.terminal_contract_retry_pending_save =
-            crate::snapshots::terminal_contract_retry::rearm(
-                progress
-                    .quarantined_fingerprints
-                    .iter_mut()
-                    .filter(|(fingerprint, record)| {
-                        !permanent.get(*fingerprint).is_some_and(|refusal| {
-                            record.upload_body_witness.as_deref()
-                                == Some(refusal.body_witness.as_str())
-                        })
-                    }),
-                Some(&active_quarantine_witness),
-            ) > 0;
-        progress.ack_recovery = ack_recovery.map(Box::new);
-        progress.active_quarantine_witness = Some(active_quarantine_witness);
-        progress.active_quarantine_retries.clear();
-        progress.active_reason_reoffers.clear();
+        progress.finish_load(active_quarantine_witness);
         Ok(progress)
+    }
+
+    /// Every durable field but the keyed cache maps is admissible for this
+    /// destination.
+    fn valid(&self, namespace: &str) -> bool {
+        self.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && self.destination_namespace_hash == namespace
+            && is_snapshot_fingerprint(&self.destination_namespace_hash)
+            && self
+                .accepted_fingerprints
+                .iter()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self.accepted_body_witnesses.len() == self.accepted_fingerprints.len()
+            && self.accepted_body_witnesses.keys().all(|value| {
+                is_snapshot_fingerprint(value) && self.accepted_fingerprints.contains(value)
+            })
+            && self
+                .accepted_body_witnesses
+                .values()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self.accepted_body_contexts.iter().all(|(key, context)| {
+                self.accepted_body_witnesses.contains_key(key) && is_snapshot_fingerprint(context)
+            })
+            && self.pending_cache_heads.iter().all(|(file, pending)| {
+                let sessions = pending.entities.values().collect::<BTreeSet<_>>();
+                is_snapshot_fingerprint(file)
+                    && is_snapshot_fingerprint(&pending.source_file_fingerprint)
+                    && is_snapshot_fingerprint(&pending.group_fingerprint)
+                    && !pending.entities.is_empty()
+                    && pending.reselected_heads.iter().all(|(key, witness)| {
+                        is_snapshot_fingerprint(witness) && sessions.contains(key)
+                    })
+                    && pending
+                        .settled_entities
+                        .iter()
+                        .all(|entity| pending.entities.contains_key(entity))
+                    && pending.entities.iter().all(|(entity, session)| {
+                        is_snapshot_fingerprint(entity) && is_snapshot_fingerprint(session)
+                    })
+            })
+            && self
+                .quarantined_fingerprints
+                .keys()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self
+                .permanent_rejections
+                .iter()
+                .all(|(fingerprint, record)| {
+                    is_snapshot_fingerprint(fingerprint)
+                        && is_snapshot_fingerprint(&record.body_witness)
+                })
+            && self.quarantined_fingerprints.values().all(|record| {
+                snapshot_quarantine_deadline_is_bounded(record)
+                    && record
+                        .upload_body_witness
+                        .as_deref()
+                        .map_or(true, is_snapshot_fingerprint)
+            })
+    }
+
+    /// Runtime state a loaded ledger starts every pass with.
+    fn finish_load(&mut self, active_quarantine_witness: SnapshotQuarantineWitness) {
+        let permanent = &self.permanent_rejections;
+        self.terminal_contract_retry_pending_save = crate::snapshots::terminal_contract_retry::rearm(
+            self.quarantined_fingerprints
+                .iter_mut()
+                .filter(|(fingerprint, record)| {
+                    !permanent.get(*fingerprint).is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+                }),
+            Some(&active_quarantine_witness),
+        ) > 0;
+        self.active_quarantine_witness = Some(active_quarantine_witness);
+        self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
     }
 
     fn prepare_quarantine_retries(
@@ -3036,11 +3008,13 @@ impl SnapshotUploadProgress {
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+        if self.rows.is_some() {
+            return self.save_rows(path);
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
         let _lock = SnapshotProgressLock::acquire(path)?;
-        let mut previous = None;
         let mut unchanged = false;
         if path.exists() {
             let bytes = match read_limit {
@@ -3063,21 +3037,15 @@ impl SnapshotUploadProgress {
                 &current.quarantined_fingerprints,
             );
             unchanged = serializes_to(&*self, &bytes);
-            if self.ack_recovery.is_some() {
-                previous = Some(crate::snapshots::ProgressSeal::new(&bytes));
-            }
         } else if self.generation != 0 {
             return Err(anyhow!("snapshot upload progress disappeared concurrently"));
         }
         if unchanged {
             // The durable ledger already holds these exact bytes at this
             // generation: write nothing and claim no generation, so the next
-            // writer's compare-and-swap still matches. The current receipt must
-            // still seal them, as a save requires. Retry only the durability
-            // barrier: an earlier rename may be visible but not yet synced.
-            if let (Some(recovery), Some(previous)) = (&self.ack_recovery, previous) {
-                recovery.progress_unchanged(previous)?;
-            }
+            // writer's compare-and-swap still matches. Retry only the
+            // durability barrier: an earlier rename may be visible but not
+            // yet synced.
             return sync_progress_parent(path);
         }
         let previous_generation = self.generation;
@@ -3085,21 +3053,6 @@ impl SnapshotUploadProgress {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("snapshot upload progress generation overflow"))?;
-        // Persist the exact accepted receipt before replacing progress. If the
-        // second write fails, startup replays this receipt before DB handoffs.
-        if let Some(recovery) = &self.ack_recovery {
-            let result = (|| -> Result<()> {
-                let next =
-                    recovery.before_progress_save(previous, || Ok(serde_json::to_vec(&*self)?))?;
-                ottto_core::write_owner_only_file_atomic(path, &next)?;
-                sync_progress_parent(path)?;
-                Ok(())
-            })();
-            if result.is_err() {
-                self.generation = previous_generation;
-            }
-            return result;
-        }
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file =
             std::fs::File::create(&temp_path).context("create snapshot upload progress temp")?;
@@ -3408,7 +3361,7 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.ack_recovery.is_none()
+        if self.rows.is_none()
             && self.accepted_fingerprints.is_empty()
             && self.permanent_rejections.is_empty()
             && self.accepted_cache_states.is_empty()
@@ -3846,26 +3799,32 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
     } else {
         progress_owner
     };
-    let durable: SnapshotUploadProgress = match match read_limit {
-        Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
-        None => std::fs::read(progress_path),
-    } {
-        Ok(bytes) => (if read_limit.is_some() {
-            crate::snapshot_retry::decode_state(&bytes)
-        } else {
-            serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
-        })
-        .context("parse snapshot progress for partial checkpoint")?,
-        Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
-            SnapshotUploadProgress::new(
-                progress.destination_namespace_hash.clone(),
-                progress
-                    .active_quarantine_witness
-                    .clone()
-                    .ok_or_else(|| anyhow!("partial checkpoint lacks a source witness"))?,
-            )
+    let durable: SnapshotUploadProgress = if progress.rows.is_some() {
+        progress.durable_rows(index_path, &progress_owner)?
+    } else {
+        match match read_limit {
+            Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
+            None => std::fs::read(progress_path),
+        } {
+            Ok(bytes) => (if read_limit.is_some() {
+                crate::snapshot_retry::decode_state(&bytes)
+            } else {
+                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+            })
+            .context("parse snapshot progress for partial checkpoint")?,
+            Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
+                SnapshotUploadProgress::new(
+                    progress.destination_namespace_hash.clone(),
+                    progress
+                        .active_quarantine_witness
+                        .clone()
+                        .ok_or_else(|| anyhow!("partial checkpoint lacks a source witness"))?,
+                )
+            }
+            Err(error) => {
+                return Err(error).context("read snapshot progress for partial checkpoint")
+            }
         }
-        Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
     };
     // Refuse only a real concurrent writer, as `save()` does. The accepted
     // and quarantined sets and the upload-context stamp read `durable`.
@@ -6433,31 +6392,18 @@ fn load_source_checkpoints(
         // preserve the pass's measurements rather than start another pass.
         crate::snapshots::state_v2_pass_start();
     }
-    let progress = if custody {
-        None
-    } else {
-        Some(SnapshotUploadProgress::load(
-            progress_path,
-            destination,
-            witness.clone(),
-        )?)
-    };
     let (index, origin) =
         ScanIndex::load_for_snapshot_source_with_custody(index_path, source, support_dir, custody)?;
     crate::snapshots::state_v2_before_collection(&index)?;
     index.require_persistence_available()?;
-    // A first import may publish during this load. Recover/attach its receipt
-    // even though the pre-load admission correctly used the v1 ordering.
-    let recovery = crate::snapshots::ProgressRecovery::for_index(&index, index_path)?;
-    let progress = match (progress, recovery) {
-        (Some(progress), None) => progress,
-        (_, recovery) => SnapshotUploadProgress::load_with_recovery(
-            progress_path,
-            destination,
-            witness,
-            recovery,
-        )?,
-    };
+    // A first import may publish during this load: progress follows the index.
+    let progress = SnapshotUploadProgress::load_for_index(
+        &index,
+        index_path,
+        progress_path,
+        destination,
+        witness,
+    )?;
     Ok((index, origin, progress))
 }
 
@@ -7244,14 +7190,16 @@ fn prepare_continuation_source(
         checkpoint_namespace.as_deref(),
         inputs.cache_observations_enabled,
     );
-    let mut upload_progress = SnapshotUploadProgress::load(
+    let (mut index, _) =
+        ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    index.require_persistence_available()?;
+    let mut upload_progress = SnapshotUploadProgress::load_for_index(
+        &index,
+        &inputs.index_path,
         &inputs.upload_progress_path,
         &inputs.upload_destination_namespace,
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
-    let (mut index, _) =
-        ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
-    index.require_persistence_available()?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
@@ -12153,25 +12101,8 @@ fn adopt_legacy_checkpoint_file(legacy_path: &Path, stable_path: &Path) -> Resul
     migration
 }
 
-/// The runtime route owns the checkpoint lock; use the existing progress lock
-/// for exact receipt replay before it exposes any source graph to callers.
-pub(crate) fn recover_state_v2_progress(
-    index_path: &Path,
-    recovery: &crate::snapshots::ProgressRecovery,
-) -> Result<()> {
-    with_state_v2_progress_owner(index_path, None, |_, path| recovery.recover(path))
-}
-
-pub(crate) fn recover_state_v2_progress_locked(
-    index_path: &Path,
-    recovery: &crate::snapshots::ProgressRecovery,
-    owner: &SnapshotProgressLock,
-) -> Result<()> {
-    with_state_v2_progress_owner(index_path, Some(owner), |_, path| recovery.recover(path))
-}
-
-/// Import only inspects original bytes under the same progress owner as CAS.
-/// The checkpoint owner already holds its lock; no progress store is rewritten.
+/// Test access to a source's progress path under its progress owner.
+#[cfg(test)]
 pub(crate) fn with_state_v2_progress_lock<T>(
     index_path: &Path,
     action: impl FnOnce(&Path) -> Result<T>,
@@ -12236,6 +12167,7 @@ pub(crate) fn above_old_bound_progress_for_test(
     unreachable!()
 }
 
+#[cfg(test)]
 pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str) -> Result<()> {
     // Unknown payload slots are carried byte-exactly. Decode only the owner
     // headers; Serde rejects duplicate headers and consumes the entire object.
@@ -23134,13 +23066,6 @@ mod tests {
                 phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
                 "past the former bound"
             );
-            let recovery = crate::snapshots::ProgressRecovery::synthetic(
-                &f.index_path,
-                &f.progress.destination_namespace_hash,
-                f.baseline.generation,
-            );
-            recovery.adopt_synthetic(Some(&bytes));
-            f.progress.ack_recovery = Some(Box::new(recovery));
             let states = f
                 .progress
                 .accepted_cache_states
@@ -23192,20 +23117,11 @@ mod tests {
                 .iter()
                 .all(|key| f.progress.accepted_cache_states.contains_key(key)));
             assert_eq!(f.progress.accepted_cache_heads, heads, "nothing pruned");
-            let mut receipt = f.index_path.clone().into_os_string();
-            receipt.push(".v2-ack-receipt");
-            let settled_receipt = |f: &SameSourceAckFixture| {
-                let receipt: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+            let settled_ledger = |f: &SameSourceAckFixture| {
                 let saved = std::fs::read(&f.progress_path).unwrap();
                 assert!(phase == 0 || saved.len() > OLD_PROGRESS_BOUND_FOR_TEST);
-                assert_eq!(
-                    receipt["progress"].as_str().unwrap().as_bytes(),
-                    saved,
-                    "receipt carries the exact saved ledger"
-                );
             };
-            settled_receipt(&f);
+            settled_ledger(&f);
             if bootstrap {
                 // S keeps its projected head; T gets the probe's head.
                 let mut page = f.items.clone();
@@ -23278,13 +23194,12 @@ mod tests {
                     &snapshot_upload_body_witness(item)
                 ));
             }
-            settled_receipt(&f);
+            settled_ledger(&f);
             if phase != 1 {
                 continue;
             }
             // Quiet restart from the saved checkpoint: accepted bodies stay
             // suppressed until each file is current by its own receipt.
-            let recovery = f.progress.ack_recovery.take();
             let saved = std::fs::read(&f.progress_path).unwrap();
             let adopted = |index: &ScanIndex| {
                 crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
@@ -23305,7 +23220,6 @@ mod tests {
             grow(&c_path);
             let scan = f.restart(true);
             assert_eq!(std::fs::read(&f.progress_path).unwrap(), saved);
-            f.progress.ack_recovery = recovery;
             assert_eq!(scan.scanned_file_count, 1, "only the grown source is read");
             assert_eq!(
                 f.items.len(),
@@ -23374,23 +23288,21 @@ mod tests {
             );
             assert!(f.baseline.file_snapshot_fingerprints[&f.keys[2]]
                 .contains(&reopened.snapshot_fingerprint));
-            settled_receipt(&f);
+            settled_ledger(&f);
         }
     }
 
     /// [money] Placement past the former 11,182,080 B bound: the placement
     /// oracle's bodies (two accounts, a mid-session switch, a side call, an
     /// evidence gap and a tagged row) are stored-body ACKed into a ledger past
-    /// the old bound, saved receipt-first, crashed before the progress rename
-    /// and recovered by a restart after same-account re-logins A→B→C. The
-    /// recovered ledger passes the transition oracle's
+    /// the old bound, saved, and restored by a restart after same-account
+    /// re-logins A→B→C. The restored ledger passes the transition oracle's
     /// equivalence and placement assertions against the cold one.
     #[test]
     fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
         use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
         let cold = money_oracle::placement_tests::placement_fixture();
         let scratch = crate::test_scratch::ScratchDir::new("v2-placement-above-bound");
-        let index_path = scratch.join("index.json");
         let path = scratch.join("progress.json");
         let mut progress = test_upload_progress();
         progress.accepted_identity_buckets =
@@ -23402,14 +23314,6 @@ mod tests {
             );
         }
         progress.save(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let recovery = crate::snapshots::ProgressRecovery::synthetic(
-            &index_path,
-            &progress.destination_namespace_hash,
-            0,
-        );
-        recovery.adopt_synthetic(Some(&before));
-        progress.ack_recovery = Some(Box::new(recovery.clone()));
         for snapshot in cold.snapshots.values() {
             progress.record_stored_state(snapshot, false, None).unwrap();
         }
@@ -23419,17 +23323,14 @@ mod tests {
             after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
             "past the former bound"
         );
-        // Crash: the exact receipt is durable, the progress rename is lost.
         // The restart follows same-account re-logins A→B→C.
-        ottto_core::write_owner_only_file_atomic(&path, &before).unwrap();
-        let mut restored = SnapshotUploadProgress::load_with_recovery(
+        let mut restored = SnapshotUploadProgress::load(
             &path,
             &relogin_namespace(&progress.destination_namespace_hash, 2),
             test_quarantine_witness(),
-            Some(recovery),
         )
         .unwrap();
-        assert!(std::fs::read(&path).unwrap() == after, "exact replay");
+        assert!(std::fs::read(&path).unwrap() == after, "the saved ledger");
         restored
             .accepted_identity_buckets
             .bind_test_key(Some([0x42; 32]));
@@ -24103,7 +24004,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, ack_recovery, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

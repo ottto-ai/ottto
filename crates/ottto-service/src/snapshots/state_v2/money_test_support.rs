@@ -228,7 +228,7 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         match std::fs::read(progress_path) {
             Ok(bytes) => assert_eq!(
                 bytes, progress,
-                "synthetic custody must seal the actual original bytes"
+                "the published route keeps the actual original bytes"
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ottto_core::write_owner_only_file_atomic(progress_path, progress)?
@@ -237,13 +237,6 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         }
         Ok(())
     })
-    .unwrap();
-    ack::ProgressRecovery::seal_import(
-        identity.clone(),
-        identity.fence_generation,
-        path,
-        Some(progress),
-    )
     .unwrap();
     fence::publish(path, &identity, &mut false).unwrap();
     ScanIndex::load(path).unwrap()

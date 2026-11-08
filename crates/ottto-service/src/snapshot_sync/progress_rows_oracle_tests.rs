@@ -505,6 +505,20 @@ fn assert_imported(
         "the rows carry every JSON field"
     );
     assert_money_maps(imported);
+    // Identity placement stays in the ledger row: never a keyed map, never
+    // an identity row.
+    let ledger = imported.clone().ledger_row().unwrap();
+    assert_eq!(
+        ledger["accepted_identity_buckets"],
+        durable(imported)["accepted_identity_buckets"]
+    );
+    for keyed in [
+        "accepted_cache_states",
+        "accepted_cache_heads",
+        "generation",
+    ] {
+        assert!(ledger.get(keyed).is_none(), "{keyed} is not in the ledger");
+    }
     assert_rows_custody(index_path, imported);
     let rows = rows(index_path);
     assert_eq!(rows.generation, Some(1), "the import commits P 0 -> 1");
@@ -704,9 +718,18 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                 second_pages.push((page_two, path.to_owned(), restored, session, c));
             }
         }
+        // Page two's money after a restart equals page two in RAM: the same
+        // entities, totals and placement. Codex receipt-ownership evidence is
+        // per-process tier-replay bookkeeping, not money, and is not compared.
         for pair in second_pages.chunks(2) {
-            let (in_ram, restarted) = (&pair[0], &pair[1]);
-            money_oracle::assert_equivalent(&in_ram.0, &restarted.0);
+            let (in_ram, restarted) = (&pair[0].0, &pair[1].0);
+            assert_eq!(
+                in_ram.snapshots.keys().collect::<Vec<_>>(),
+                restarted.snapshots.keys().collect::<Vec<_>>()
+            );
+            let mut differences = Vec::new();
+            money_oracle::entity_differences(in_ram, restarted, &mut differences);
+            assert!(differences.is_empty(), "{}", differences.join("\n"));
         }
         for (_, path, restored, _, _) in &second_pages {
             assert_rows_custody(path, restored);

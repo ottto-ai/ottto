@@ -33,8 +33,8 @@ fn revert_archives(c: &Corpus, second_account: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// [money] Capture every physical revision, exact-ACK the combined body, recover
-/// the receipt before saving source progress, then restart and upgrade quietly.
+/// [money] Capture every physical revision, exact-ACK the combined body, persist
+/// the ledger before saving the source, then restart and upgrade quietly.
 #[test]
 fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes() {
     let _decoder = fixture::codex_decoder_test_lock();
@@ -122,12 +122,6 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     let before = serde_json::to_vec(&progress).unwrap();
     let progress_path = c.base.join("codex-progress.json");
     ottto_core::write_owner_only_file_atomic(&progress_path, &before).unwrap();
-    let recovery = crate::snapshots::ProgressRecovery::synthetic(
-        &c.base.join("receipt-index"),
-        &"a".repeat(64),
-        captured.generation,
-    );
-    recovery.adopt_synthetic(Some(&before));
     // The same acquired body/proof remains in the attempt for an exact retry.
     let ((failed, failed_batches, _), retry_bytes) = fixture::observe_consumed(|| {
         upload_source_under(
@@ -153,15 +147,14 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         failed_batches, batches,
         "retry sends the retained exact body"
     );
-    progress.generation += 1;
-    let after = serde_json::to_vec(&progress).unwrap();
-    recovery
-        .before_progress_save_bytes(Some(&before), &after)
-        .unwrap();
-    // Process loss after the exact receipt, before either progress/source save.
-    recovery.recover(&progress_path).unwrap();
-    assert_eq!(std::fs::read(&progress_path).unwrap(), after);
-    let recovered: SnapshotUploadProgress = serde_json::from_slice(&after).unwrap();
+    // Process loss after the ledger save, before the source save.
+    progress.save(&progress_path).unwrap();
+    let recovered = SnapshotUploadProgress::load(
+        &progress_path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SOURCE),
+    )
+    .unwrap();
     settle_index_after_upload(&mut index, &captured, &recovered);
     // Every member, not only the carrier, earns its own receipt from the one
     // exact ACK of the folded body; a not-stored answer earns none.
@@ -614,13 +607,12 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     );
     let daemon = test_daemon("otm_test");
     let progress_path = snapshot_upload_progress_path(session.path());
-    let recovery =
-        crate::snapshots::ProgressRecovery::for_index(&committed, session.path()).unwrap();
-    let progress = SnapshotUploadProgress::load_with_recovery(
+    let progress = SnapshotUploadProgress::load_for_index(
+        &committed,
+        session.path(),
         &progress_path,
         &namespace,
         snapshot_quarantine_witness(SOURCE),
-        recovery,
     )
     .unwrap();
     let home = c.base.join("home");

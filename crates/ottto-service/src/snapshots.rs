@@ -2343,8 +2343,11 @@ fn open_and_identify_scan_candidate(
     )
 }
 
-// Opaque v2-only companion for the unchanged upload-progress store.
-pub(crate) use state_v2::ack::{ProgressRecovery, ProgressSeal};
+// The upload-progress rows of a routed source.
+pub(crate) use state_v2::{
+    import_progress_rows, read_progress_ledger, read_progress_rows, ProgressMarker, ProgressPage,
+    ProgressRead, ProgressRows,
+};
 // OPS diagnostics bridges; the private storage module stays private.
 pub(crate) use state_v2::state_v2_growth_retention_active;
 pub(crate) fn state_v2_pass_start() {

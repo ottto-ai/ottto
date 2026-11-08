@@ -16,36 +16,28 @@ pub(crate) fn fail_next_progress_commit_for_test(index: &ScanIndex, reopen: Opti
     }
 }
 
-/// Rewrite the committed progress rows of `index`'s route through `edit`
+/// Rewrite the committed progress rows of the route at `path` through `edit`
 /// (cache states, cache heads, ledger), as one more progress page.
 pub(crate) fn edit_progress_rows_for_test(
     path: &Path,
-    index: &ScanIndex,
+    _index: &ScanIndex,
     edit: impl FnOnce(
         &mut BTreeMap<String, serde_json::Value>,
         &mut BTreeMap<String, serde_json::Value>,
         &mut serde_json::Value,
     ),
 ) {
-    type Json = serde_json::Value;
-    let runtime = index.v2().persistence_v2.as_ref().expect("a routed index");
-    let (page, baseline) = {
-        let mut guard = runtime.session.lock().unwrap();
-        let db = &mut guard.as_mut().expect("a live session").db;
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        progress::read::<Json, Json, Json>(&mut tx).unwrap()
-    };
-    let mut page = page.expect("the route holds progress rows");
-    edit(
-        &mut page.cache_state,
-        &mut page.cache_head,
-        &mut page.ledger,
-    );
-    let outcome = crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
-        commit_progress_locked(path, index, owner, baseline, &page)
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        let mut read = progress::read_progress_rows(path, owner)?;
+        let mut ledger = read.ledger.expect("the route holds progress rows");
+        edit(&mut read.cache_state, &mut read.cache_head, &mut ledger);
+        let page = read
+            .rows
+            .commit(owner, &read.cache_state, &read.cache_head, &ledger)?;
+        assert!(matches!(page, progress::ProgressPage::Committed(_)));
+        Ok(())
     })
     .unwrap();
-    assert!(matches!(outcome, progress::Outcome::Committed(_)));
 }
 
 type ProgressImportHook = Box<dyn FnOnce(&ScanIndex)>;
@@ -58,7 +50,6 @@ thread_local! {
 pub(crate) fn before_progress_import_for_test(hook: impl FnOnce(&ScanIndex) + 'static) {
     BEFORE_PROGRESS_IMPORT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
-#[expect(dead_code, reason = "the progress import runs the armed hook")]
 pub(in super::super) fn run_before_progress_import(index: &ScanIndex) {
     if let Some(hook) = BEFORE_PROGRESS_IMPORT.with(|slot| slot.borrow_mut().take()) {
         hook(index);
@@ -89,6 +80,19 @@ thread_local! {
 pub(crate) fn take_progress_pages_for_test() -> ProgressPagesForTest {
     PROGRESS_PAGES.with(std::cell::Cell::take)
 }
+/// Count one page outcome; `None` is a page that must reload.
+pub(in super::super) fn count_progress_page_for_test(outcome: Option<&progress::ProgressPage>) {
+    PROGRESS_PAGES.with(|pages| {
+        let mut counts = pages.get();
+        match outcome {
+            Some(progress::ProgressPage::Committed(_)) => counts.committed += 1,
+            Some(progress::ProgressPage::Unchanged) => counts.unchanged += 1,
+            Some(progress::ProgressPage::NotPublished) => counts.not_published += 1,
+            None => counts.reload += 1,
+        }
+        pages.set(counts);
+    });
+}
 
 /// Keyed progress rows the last load set aside, as `progress_row_set_aside`
 /// reported them on this thread.
@@ -115,6 +119,39 @@ pub(crate) fn claim_growth_for_test(path: &Path, index: &ScanIndex) {
 /// Another writer completes the progress import of `json` on `index`'s route,
 /// with its own marker, without this process's progress owner.
 pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
-    let _ = (index, json);
-    panic!("the progress import is not wired yet")
+    use sha2::Digest;
+    type Json = serde_json::Value;
+    let runtime = index.v2().persistence_v2.as_ref().expect("a routed index");
+    let path = runtime
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("a live session")
+        .path
+        .clone();
+    let mut ledger: Json = serde_json::from_slice(json).unwrap();
+    let object = ledger.as_object_mut().unwrap();
+    let mut map = |name: &str| -> BTreeMap<String, Json> {
+        serde_json::from_value(object.remove(name).unwrap_or_default()).unwrap_or_default()
+    };
+    let (states, heads) = (map("accepted_cache_states"), map("accepted_cache_heads"));
+    let generation = object
+        .remove("generation")
+        .and_then(|g| g.as_u64())
+        .unwrap_or(0);
+    let marker = progress::Marker {
+        sha256: format!("{:x}", sha2::Sha256::digest(json)),
+        generation,
+    };
+    let page = progress::Page {
+        cache_state: &states,
+        cache_head: &heads,
+        ledger: &ledger,
+    };
+    let imported = progress_session_locked(&path, |db, identity, graph| {
+        progress::import(db, identity, graph, &page, &marker, None)
+    })
+    .unwrap();
+    assert!(matches!(imported, progress::Imported::Committed(_)));
 }
