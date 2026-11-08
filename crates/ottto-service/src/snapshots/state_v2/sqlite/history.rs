@@ -344,6 +344,9 @@ fn verified(row: &rusqlite::Row<'_>) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+pub(crate) const MMAP_BYTES_FOR_TEST: i64 = super::MMAP_BYTES;
+
+#[cfg(test)]
 pub(crate) const QUERIES_FOR_TEST: [(&str, &str); 4] = [
     ("expire", EXPIRE),
     ("page", PAGE),

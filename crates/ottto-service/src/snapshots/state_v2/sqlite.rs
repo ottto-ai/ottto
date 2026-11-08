@@ -18,6 +18,8 @@ mod migrations;
 mod references;
 use maintenance::{MaintenanceStats, PurgePolicy};
 
+// Default SQLite mmap ceiling: an optimisation ceiling, not a data limit.
+const MMAP_BYTES: i64 = 2_147_418_112;
 const BUSY: Duration = Duration::from_millis(100);
 const PAGE_HEADERS: usize = 128;
 
@@ -491,7 +493,7 @@ fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()
     };
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
+    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size={MMAP_BYTES}; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
@@ -500,7 +502,7 @@ fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()
         ("wal_autocheckpoint", autocheckpoint),
         ("journal_size_limit", 16 * 1024 * 1024),
         ("cache_size", -16384),
-        ("mmap_size", 0),
+        ("mmap_size", MMAP_BYTES),
         ("temp_store", 1),
     ] {
         let actual: i64 = conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?;
