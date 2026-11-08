@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::{SnapshotItem, SnapshotSemanticEnvelope, SnapshotSource};
-use crate::snapshots::usage::cache_observations::cache_state_from_patch;
+use crate::snapshots::usage::cache_observations::upload::cache_state_from_patch;
 use crate::snapshots::{
     claude_request_identity, semantic_attribution, semantic_model_usage, semantic_usage_buckets,
     sha256_hex, SnapshotUploadPolicy, POLICY_NEUTRAL_COMPONENTS, SNAPSHOT_CONTENT_HASH_EPOCH,
