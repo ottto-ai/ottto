@@ -4143,13 +4143,16 @@ pub enum LocalControlCommand {
         #[serde(default, skip_serializing_if = "is_false")]
         retry_relay_authorization: bool,
     },
-    /// Read the daemon's bounded, privacy-safe snapshot upload receipt ring.
+    /// Read one page of the daemon's privacy-safe snapshot upload receipts,
+    /// newest first. `before` is the previous page's `next_before` cursor.
     Receipts {
         limit: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<SourceKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
     },
     AuthStatus,
     /// Agent status for one source or all. On its own it serves the daemon's
@@ -4542,8 +4545,17 @@ pub struct UploadReceiptV1 {
 pub struct UploadReceiptsResponseV1 {
     pub schema: String,
     pub receipts: Vec<UploadReceiptV1>,
+    /// The most receipts one page returns.
     pub ring_capacity: u16,
     pub state_path_present: bool,
+    /// Present when older receipts may follow: pass it as `before` to read
+    /// the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<u64>,
+    /// History rows the daemon process could not write since it started.
+    /// Present only when at least one was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_rows_not_written: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7735,6 +7747,7 @@ mod tests {
                 limit: 25,
                 since: Some("2026-09-10T00:00:00Z".to_string()),
                 source: Some(SourceKind::Codex),
+                before: None,
             }
         );
 

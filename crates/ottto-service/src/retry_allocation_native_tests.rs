@@ -1,47 +1,5 @@
 // Native allocation audit of the optional Pi transport's auxiliary state.
 #[test]
-fn bounded_retry_envelope_receipt_limit_rejects_before_decoded_amplification() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let root = test_dir("retry-envelope-receipt");
-    std::fs::create_dir_all(&root).unwrap();
-    let root = RotationRoot(root);
-    crate::upload_receipts::append_transport_error(&root.0, SourceKind::Pi, 1).unwrap();
-    let path = crate::upload_receipts::upload_receipts_path(&root.0);
-    let seed: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for count in [24_000, 900_000] {
-        let mut row = seed["receipts"][0].to_string();
-        row.pop();
-        row.push_str(",\"unrecognized_extension\":[");
-        row.push_str(&"\"\",".repeat(count));
-        row.push_str("\"\"]}");
-        let body = format!("{{\"schema_version\":1,\"receipts\":[{row}]}}");
-        assert!(body.len() < 4 * 1024 * 1024);
-        std::fs::write(&path, &body).unwrap();
-        let (_, allocation) = crate::retry_allocation_probe::measure(|| {
-            assert!(
-                crate::upload_receipts::append_transport_error_with_context_bounded(
-                    &root.0,
-                    SourceKind::Pi,
-                    1,
-                    &crate::upload_receipts::UploadReceiptContext::default(),
-                )
-                .is_err()
-            );
-        });
-        eprintln!(
-            "receipt_decode_refusal bytes={} requested_peak={} usable_peak={}",
-            body.len(),
-            allocation.requested_peak,
-            allocation.usable_peak
-        );
-        assert!(allocation.requested_peak < 1024 * 1024);
-        assert_eq!(std::fs::read(&path).unwrap(), body.as_bytes());
-    }
-}
-
-#[test]
 fn bounded_retry_envelope_auxiliary_shape_refuses_before_native_decode() {
     let shallow = format!("{{\"future\":[{}0]}}", "0,".repeat(24_000));
     assert!(shallow.len() < crate::snapshot_retry::RESPONSE_BYTES);
@@ -57,56 +15,6 @@ fn bounded_retry_envelope_auxiliary_shape_refuses_before_native_decode() {
     // The response body has a separate cap: legal ACK arrays are not auxiliary
     // checkpoint state and must keep their existing native response contract.
     assert!(serde_json::from_str::<serde_json::Value>(&shallow).is_ok());
-}
-
-#[test]
-fn bounded_retry_envelope_receipt_node_pressure_evicts_oldest_and_keeps_recording() {
-    let root = RotationRoot(test_dir("retry-envelope-receipt-nodes"));
-    std::fs::create_dir_all(&root.0).unwrap();
-    crate::upload_receipts::append_transport_error(&root.0, SourceKind::Pi, 1).unwrap();
-    let path = crate::upload_receipts::upload_receipts_path(&root.0);
-    let seed: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let row = seed["receipts"][0].clone();
-    let nodes = crate::snapshot_retry::state_nodes(&serde_json::to_vec(&row).unwrap()).unwrap();
-    let count = (crate::snapshot_retry::STATE_NODES - 5) / nodes;
-    let seeded =
-        serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":vec![row;count]}))
-            .unwrap();
-    assert!(seeded.len() < crate::snapshot_retry::RESPONSE_BYTES);
-    crate::snapshot_retry::state_shape(&seeded).unwrap();
-    std::fs::write(&path, seeded).unwrap();
-    let context = crate::upload_receipts::UploadReceiptContext::default();
-    crate::upload_receipts::append_http_failure_with_context_bounded(
-        &root.0,
-        SourceKind::Pi,
-        1,
-        ottto_protocol::UploadReceiptOutcomeV1::AuthRejected,
-        401,
-        None,
-        None,
-        &context,
-    )
-    .unwrap();
-    let receipts = crate::upload_receipts::read(&root.0, 500, None, None)
-        .unwrap()
-        .receipts;
-    assert_eq!(receipts.len(), count);
-    assert_eq!(receipts[0].http_status, Some(401));
-    // A second append must advance history again, instead of freezing the ring.
-    crate::upload_receipts::append_transport_error_with_context_bounded(
-        &root.0,
-        SourceKind::Pi,
-        2,
-        &context,
-    )
-    .unwrap();
-    let receipts = crate::upload_receipts::read(&root.0, 500, None, None)
-        .unwrap()
-        .receipts;
-    assert_eq!(receipts.len(), count);
-    assert_eq!(receipts[0].batch_item_count, 2);
-    assert_eq!(receipts[1].http_status, Some(401));
-    crate::snapshot_retry::state_shape(&std::fs::read(path).unwrap()).unwrap();
 }
 
 #[test]

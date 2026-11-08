@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod history;
 mod maintenance;
 mod migrations;
 mod references;
@@ -432,7 +433,7 @@ pub(super) fn private_parent(path: &Path) -> Result<()> {
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-pub(in crate::snapshots) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
@@ -453,13 +454,25 @@ pub(in crate::snapshots) fn sqlite_uri(path: &Path, query: &str) -> Result<Strin
     uri.push_str(query);
     Ok(uri)
 }
-fn settings(conn: &Connection, import: bool) -> Result<()> {
-    // SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
-    // OS installation. Refuse an accidental older link before using the store.
+/// Who checkpoints the WAL. Custody stores checkpoint explicitly between
+/// cycles; the upload history file has no such owner, so SQLite's page-count
+/// autocheckpoint is its owner.
+#[derive(Clone, Copy)]
+enum Checkpoint {
+    Manual,
+    Auto(i64),
+}
+/// SQL exposes sqlite3_libversion/sourceid from the linked engine, not the
+/// OS installation. Refuse an accidental older link before using a store.
+fn linked_engine() -> Result<()> {
     ensure!(
         rusqlite::version_number() >= 3_051_003,
         "state_v2_sqlite_version"
     );
+    Ok(())
+}
+fn settings(conn: &Connection, import: bool) -> Result<()> {
+    linked_engine()?;
     let engine: (String, String) =
         conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -468,15 +481,23 @@ fn settings(conn: &Connection, import: bool) -> Result<()> {
         "sqlite_engine",
         &serde_json::json!({"version":engine.0,"source_id":engine.1,"bundled":true}),
     );
+    pragmas(conn, import, Checkpoint::Manual)
+}
+/// Set and verify every durability and resource PRAGMA of one connection.
+fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()> {
+    let autocheckpoint = match checkpoint {
+        Checkpoint::Manual => 0,
+        Checkpoint::Auto(pages) => pages,
+    };
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;")?;
+    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
         ("checkpoint_fullfsync", 1),
         ("secure_delete", 1),
-        ("wal_autocheckpoint", 0),
+        ("wal_autocheckpoint", autocheckpoint),
         ("journal_size_limit", 16 * 1024 * 1024),
         ("cache_size", -16384),
         ("mmap_size", 0),
