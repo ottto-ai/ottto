@@ -1071,7 +1071,9 @@ fn root_twin_scoped_family() {
         let mut bodies = Vec::new();
         for usage_logs_only in [false, true] {
             if usage_logs_only {
-                c.evidence(&rows, &[trace("r1", "")]);
+                // A late priced side call the main owns.
+                rows.push(api("late-side", 5, 50));
+                c.evidence(&rows, &[trace("late-side", "")]);
             } else {
                 append(&live, &line(ROOT, "r3", "2026-08-02T07:05:00Z", 7));
                 input_clock(&live);

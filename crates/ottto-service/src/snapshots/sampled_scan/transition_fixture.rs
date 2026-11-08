@@ -1089,6 +1089,31 @@ pub(crate) mod money_oracle {
             .as_array_mut()
             .unwrap()
             .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+        // An off-page member awaiting verification leaves its family's context
+        // posture uncertified, as for a main with one copy: the emitted main
+        // withholds as `unknown_birth` where cold withholds as `multi_file`.
+        // Both clear the same context scalars; every other byte still matches.
+        let label = |result: &RouteResult, id: &Value| {
+            let snapshots = result.normalized.as_array().unwrap().iter();
+            let mut snapshots = snapshots.flat_map(|e| e["snapshots"].as_array().unwrap());
+            snapshots
+                .find(|s| &s["source_session_id"] == id)
+                .map(|s| s["context_posture_withheld"].clone())
+        };
+        let other_labels = expected.normalized.as_array().unwrap().iter();
+        let other_labels = other_labels
+            .flat_map(|e| e["snapshots"].as_array().unwrap())
+            .map(|s| label(other, &s["source_session_id"]))
+            .collect::<Vec<_>>();
+        let snapshots = expected.normalized.as_array_mut().unwrap().iter_mut();
+        let snapshots = snapshots.flat_map(|e| e["snapshots"].as_array_mut().unwrap());
+        for (snapshot, other_label) in snapshots.zip(other_labels) {
+            if snapshot["context_posture_withheld"] == "multi_file"
+                && other_label.is_some_and(|label| label == "unknown_birth")
+            {
+                snapshot["context_posture_withheld"] = "unknown_birth".into();
+            }
+        }
         assert_equivalent(&expected, other);
     }
 

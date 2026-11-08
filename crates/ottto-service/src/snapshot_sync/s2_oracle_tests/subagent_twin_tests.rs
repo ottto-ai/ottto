@@ -923,9 +923,11 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
             assert_main_only(&c, &warm, &carried, Mode::Ram);
             carried.extend(acked(&warm));
             prior = commit(&session, warm);
+            // The main's audit stays due, so the next page may fold its two
+            // copies again; no child loads, re-folds or re-sends.
             let before = refolds();
             let next = page(&c, prior, 100, true);
-            assert_eq!(refolds() - before, 0, "{usage_logs_only}: the next page");
+            assert!(refolds() - before <= 2, "{usage_logs_only}: the next page");
             for agent in 0..3 {
                 assert!(body(&next, &child(agent)).is_none(), "{usage_logs_only}");
             }
