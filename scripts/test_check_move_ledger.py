@@ -607,6 +607,26 @@ class LedgerTests(unittest.TestCase):
                     self.assertEqual(status, 1, out)
                     self.assertIn(' 0 reflowed,', out)
 
+    def test_numeric_validation_does_not_repair_the_base_pairing(self):
+        # [regress] Finer numeric keys must not re-pair duplicates and erase a base cfg failure.
+        for kind in ('fn', 'struct'):
+            with self.subTest(kind=kind):
+                def item(number, wrapped=False):
+                    if kind == 'fn':
+                        return (f'pub(crate) fn f(\n x: [u8;{number}],\n) {{}}\n' if wrapped else
+                                f'pub(crate) fn f(x: [u8;{number}]) {{}}\n')
+                    return (f'pub(crate) struct T {{\n x: [u8;{number}],\n}}\n' if wrapped else
+                            f'pub(crate) struct T {{ x: [u8;{number}], }}\n')
+                base = self.repo.commit({src('snapshots.rs'): '#[cfg(test)] mod a;\n#[cfg(unix)] mod b;\n',
+                                         src('snapshots/a.rs'): item('1.0'),
+                                         src('snapshots/b.rs'): item('1 .0')})
+                head = self.repo.commit({src('snapshots.rs'): '#[cfg(unix)] mod a;\n#[cfg(test)] mod b;\n',
+                                         src('snapshots/a.rs'): item('1 .0', True),
+                                         src('snapshots/b.rs'): item('1.0', True)})
+                status, out = run(self.repo, base, head)
+                self.assertEqual(status, 1, out)
+                self.assertIn('module attributes changed', out)
+
     MACRO = code('''
         macro_rules! scan_result {
             (pub struct $name:ident { $($field:ident: $ty:ty,)* }) => {

@@ -37,7 +37,9 @@ holds no `!` (a macro can see token boundaries this lexer does not keep):
 In both, literals and comments stay exact, a number literal (`1.0`, `1e-3`,
 `0x1F`, `1_000u64`, `1.0f32`) is one token, and whitespace between two
 punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
-item must match byte for byte. An item must sit under the same module
+item must match byte for byte. Pairing and its checks stay as in the base
+checker; numeric validation only rejects those pairs, never selects new ones.
+An item must sit under the same module
 attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
 literal must resolve, from its new file, to a target with the same bytes.
 A module's own `#[rustfmt::skip]` is left out of its attributes: a rustfmt tool
@@ -148,7 +150,7 @@ Code = list[tuple[str, str, bool, int]]  # (kind, text, whitespace before it, of
 NUMBER = re.compile(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*|\.(?![.\w]))?(?:[eE][+-]?[0-9_]*[0-9][0-9_]*)?\w*")
 
 
-def code_tokens(text: str) -> Code:
+def code_tokens(text: str, join_numbers: bool = True) -> Code:
     """Non-whitespace tokens; a number literal the lexer splits at `.`, `+` or `-` is one token here."""
     tokens = rst.tokenize(text)
     out: Code = []
@@ -156,7 +158,7 @@ def code_tokens(text: str) -> Code:
     while index < len(tokens):
         token = tokens[index]
         end, after = token.end, index + 1
-        if token.kind == "num":
+        if join_numbers and token.kind == "num":
             found = NUMBER.match(text, token.start)
             stop = found.end() if found else token.end
             probe = index
@@ -199,14 +201,14 @@ def layout_free(code: Code, first: int, stop: int, drop: set[int] = frozenset())
     return tuple(out)
 
 
-def reflow(unit: Unit) -> tuple[tuple, list[tuple[int, str]]] | None:
+def reflow(unit: Unit, join_numbers: bool = True) -> tuple[tuple, list[tuple[int, str]]] | None:
     """(key, visibility) of a rustfmt re-wrap (see the module docs), or None when `unit` gets no reflow
     pass. Two units with equal keys are a reflowed move; the visibility rows are keyed by place (0 for
     the item, 1.. for each struct field) instead of text offset, which the re-wrap shifts. Any `!` means
     no pass: a macro call can see token boundaries this lexer does not keep."""
     if unit.kind not in ("fn", "struct"):
         return None
-    code = code_tokens(unit.text)
+    code = code_tokens(unit.text, join_numbers)
     keyword = next((index for index, (kind, piece, _, _) in enumerate(code)
                     if kind == "ident" and piece == unit.kind and depth_at(code, code[index][3]) == 0), None)
     if keyword is None:
@@ -576,8 +578,14 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
     # A unit with no reflow pass gets a key of its own, so it never pairs.
-    reflow_of = {id(unit): reflow(unit) or ((id(unit),), unit.vis) for unit in lost + gained}
+    # Keep the base checker's pairing exactly: a finer number key must never repair a bad
+    # same-file/duplicate pairing and thereby erase one of the base checker's failures.
+    reflow_of = {id(unit): reflow(unit, join_numbers=False) or ((id(unit),), unit.vis) for unit in lost + gained}
     reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_of[id(unit)][0])
+    strict = {id(unit): reflow(unit) for pair in reflowed for unit in pair}
+    numeric_changes = [(old, new) for old, new in reflowed
+                       if strict[id(old)] is None or strict[id(new)] is None
+                       or strict[id(old)][0] != strict[id(new)][0]]
     # A re-wrap shifts text offsets, so reflowed units compare visibility by place instead.
     ledger.reflowed = [(replace(old, vis=reflow_of[id(old)][1]), replace(new, vis=reflow_of[id(new)][1]))
                        for old, new in reflowed]
@@ -605,6 +613,12 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
                 break
     if uses is not None:
         check_uses(ledger, *uses, base_modules, head, moves)
+    # All base checks above have run on the original pairs. Numeric validation only adds failures;
+    # discard rejected pairs from the printed ledger afterward, never re-pair them.
+    explain_differences(ledger, [old for old, _ in numeric_changes], [new for _, new in numeric_changes])
+    rejected = {(old.file, old.seq) for old, _ in numeric_changes}
+    ledger.reflowed = [(old, new) for old, new in ledger.reflowed if (old.file, old.seq) not in rejected]
+    ledger.pairs = [(old, new) for old, new in ledger.pairs if (old.file, old.seq) not in rejected]
     return ledger
 
 
