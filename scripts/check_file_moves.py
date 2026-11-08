@@ -93,7 +93,16 @@ modules that are not nameable fail; so do top-level items around a replaced
 chain that carry an attribute or derive outside the allowlist or invoke a macro
 whose closure is not listable (closure_gap), a location macro (or a crate macro
 that expands to one) after a replacement on its line, and any crate-wide
-identity problem (identity_problems).
+identity problem (identity_problems). After the lexical replacements, files
+compare as token streams: whitespace between tokens may change, and a trailing
+comma before `)`, `]` or `}` may change outside macro/attribute token trees.
+Single-element tuple/group parentheses keep their comma; ambiguous parentheses
+with top-level angle brackets or closure bars fail closed. Calls may gain a
+trailing argument comma. Comments and literals stay exact, token order stays
+fixed except for use leaves within each lexical scope. Use visibility, exact
+attribute bytes, aliases and multiplicity stay fixed; comments anchor import
+order. Compound-operator boundaries and location-sensitive token positions stay
+fixed. Move mode still compares file bytes exactly.
 
 Threat model and limits. The checker is built for accidental changes by
 trusted authors moving files, not for an adversary crafting
@@ -121,7 +130,7 @@ import re
 import sys
 import tomllib
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -523,33 +532,39 @@ def use_leaves(lx: rst.Lexed, item: rst.Item) -> list[tuple[tuple[str, ...], str
     return use_tree(lx, start, item.last_token, lx.line(item.lead))
 
 
-def use_tree(lx: rst.Lexed, start: int, last: int, line: int) -> list[tuple[tuple[str, ...], str | None, bool]]:
+def use_tree(lx: rst.Lexed, start: int, last: int, line: int,
+             token_leaves: list[list[int]] | None = None) -> list[tuple[tuple[str, ...], str | None, bool]]:
     """The leaves of the use tree after the `use` token `start`, through its `;` token `last`."""
     toks = [i for i in range(start + 1, last + 1) if lx.tokens[i].kind not in TRIVIA]
     texts = [lx.tok(i) for i in toks]
     leaves: list[tuple[tuple[str, ...], str | None, bool]] = []
 
-    def tree(pos: int, prefix: tuple[str, ...]) -> int:
-        path = list(prefix)
+    def tree(pos: int, prefix: tuple[str, ...], prefix_tokens: list[int]) -> int:
+        path, indices = list(prefix), list(prefix_tokens)
         if pos + 1 < len(texts) and texts[pos] == ":" and texts[pos + 1] == ":":
             path.append("::")
+            indices.extend(toks[pos:pos + 2])
             pos += 2
         while True:
             if texts[pos] == "*":
                 leaves.append((tuple(path), None, True))
+                if token_leaves is not None:
+                    token_leaves.append(indices + [toks[pos]])
                 return pos + 1
             if texts[pos] == "{":
                 pos += 1
                 while texts[pos] != "}":
-                    pos = tree(pos, tuple(path))
+                    pos = tree(pos, tuple(path), indices)
                     if texts[pos] == ",":
                         pos += 1
                 return pos + 1
             if not re.match(r"^(?:r#)?\w+$", texts[pos]):
                 raise Unproven(f"{lx.where}:{line}: cannot read use tree")
             path.append(texts[pos])
+            indices.append(toks[pos])
             pos += 1
             if pos + 1 < len(texts) and texts[pos] == ":" and texts[pos + 1] == ":":
+                indices.extend(toks[pos:pos + 2])
                 pos += 2
                 continue
             binding: str | None = path[-1]
@@ -558,12 +573,15 @@ def use_tree(lx: rst.Lexed, start: int, last: int, line: int) -> list[tuple[tupl
                 binding = path[-1] if path else None
             if pos < len(texts) and texts[pos] == "as":
                 binding = None if texts[pos + 1] == "_" else texts[pos + 1]
+                indices.extend(toks[pos:pos + 2])
                 pos += 2
             leaves.append((tuple(path), binding, False))
+            if token_leaves is not None:
+                token_leaves.append(indices)
             return pos
 
     try:
-        end = tree(0, ())
+        end = tree(0, (), [])
     except IndexError:
         end = -1
     if end < 0 or texts[end:] != [";"]:
@@ -2240,6 +2258,223 @@ def _check_absolutize(changes, base, head, result) -> None:
     result.lines.insert(0, f"{len(files)} files, {total} absolutized paths")
 
 
+def _absolutize_token(text: str, tokens: list[rst.Token], index: int) -> tuple[str, str, bool]:
+    """Keep Rust compound operators joint despite the lexer's single-character punctuation.
+
+    `.=` is also retained as the second boundary of `..=`. Delimiters and other
+    punctuation may be separated freely; a compound operator may not.
+    """
+    token = tokens[index]
+    joint = False
+    if token.kind == "punct" and index + 1 < len(tokens):
+        after = tokens[index + 1]
+        joint = after.kind == "punct" and token.end == after.start and text[token.start:after.end] in {
+            "::", "->", "=>", "..", ".=", "&&", "||", "==", "!=", "<=", ">=", "<<", ">>",
+            "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=",
+        }
+    return token.kind, text[token.start:token.end], joint
+
+
+def _absolutize_call(lx: rst.Lexed, code: list[int], pos: int) -> bool:
+    """Recognizable call/parameter parentheses, including turbofish and generic fn headers."""
+    if pos == 0:
+        return False
+    before = code[pos - 1]
+    if lx.is_ident(before) and (lx.tok(before) not in KEYWORDS or lx.tok(before) in ("Self", "fn")):
+        return True
+    if lx.tok(before) in (")", "]", "?"):
+        return True
+    if not lx.is_punct(before, ">"):
+        return False
+    depth = 0
+    for p in range(pos - 1, -1, -1):
+        if lx.is_punct(code[p], ">"):
+            depth += 1
+        elif lx.is_punct(code[p], "<"):
+            depth -= 1
+            if depth == 0:
+                return p >= 2 and (
+                    lx.is_punct(code[p - 1], ":") and lx.is_punct(code[p - 2], ":")
+                    or lx.is_ident(code[p - 1]) and lx.is_ident(code[p - 2], "fn")
+                )
+        elif lx.tok(code[p]) in (";", "{", "}"):
+            break
+    return False
+
+
+def _absolutize_tokens(lx: rst.Lexed) -> list[int]:
+    """Ignore whitespace and safe trailing commas; keep comments and literals verbatim.
+
+    Parentheses with one element may be a tuple, so only a recognizable call
+    can drop its comma. For other parentheses, count direct comma separators
+    only when angle brackets / closure bars cannot hide a nested separator.
+    """
+    code = code_index(lx)
+    positions = {index: pos for pos, index in enumerate(code)}
+    opaque = shape_of(lx).opaque
+    optional = set()
+    for close, open_ in lx.opener.items():
+        pos = positions[close]
+        if pos == 0 or not lx.is_punct(code[pos - 1], ","):
+            continue
+        comma = code[pos - 1]
+        if inside(opaque, comma):
+            continue
+        if lx.is_punct(open_, "("):
+            call = _absolutize_call(lx, code, positions[open_])
+            cursor, separators, ambiguous = open_ + 1, 0, False
+            while cursor < comma:
+                if lx.is_punct(cursor, ","):
+                    separators += 1
+                if lx.tokens[cursor].kind == "punct" and lx.tok(cursor) in ("<", ">", "|"):
+                    ambiguous = True
+                cursor = lx.match.get(cursor, cursor) + 1
+            if lx.next_code(open_ + 1) == comma or not call and (not separators or ambiguous):
+                continue
+        optional.add(comma)
+    return [i for i, token in enumerate(lx.tokens) if token.kind != "ws" and i not in optional]
+
+
+def _absolutize_location(path, old, new, i, j, macro_defs, aliases, result) -> None:
+    """Reflow cannot relocate explicit or crate-macro-derived location observations."""
+    if not old.is_ident(i):
+        return
+    located = location_at(old, i) or (
+        invokes_macro(old, i) and (
+            any(d.location for d in macro_closure(old.tok(i), macro_defs)[0])
+            or closure_gap(old.tok(i), macro_defs, aliases)
+        )
+    )
+    if located:
+        a, b = old.tokens[i].start, new.tokens[j].start
+        old_place = (old.line(a), a - old.text.rfind("\n", 0, a))
+        new_place = (new.line(b), b - new.text.rfind("\n", 0, b))
+        if old_place != new_place:
+            result.fail(f"rule 7 (location): {path}:{old_place[0]}: `{old.tok(i)}` moves from "
+                        f"{old_place} to {new_place}")
+
+
+def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
+    """Flatten imports, sorting leaves within brace scopes and comment barriers.
+
+    Original token indices retain every replacement precondition and location
+    check. Comments inside an import keep that import in the ordinary stream;
+    other comments prevent imports crossing them. Attributes compare as bytes.
+    A documented import freezes import order throughout its brace scope.
+    """
+    code = code_index(lx)
+    at = {i: p for p, i in enumerate(code)}
+    info = shape_of(lx)
+    imports = {}
+    for pos, keyword in enumerate(code):
+        if not lx.is_ident(keyword, "use") or inside(info.opaque, keyword):
+            continue
+        if lx.is_punct(lx.next_code(keyword + 1), "<"):
+            continue  # precise capture bounds, not imports (impl Trait + use<...>)
+        first, previous = keyword, pos - 1
+        if previous >= 0 and lx.is_punct(code[previous], ")"):
+            opening = lx.opener[code[previous]]
+            before = at[opening] - 1
+            if before >= 0 and lx.is_ident(code[before], "pub"):
+                first, previous = code[before], before - 1
+        elif previous >= 0 and lx.is_ident(code[previous], "pub"):
+            first, previous = code[previous], previous - 1
+        while previous >= 0 and lx.is_punct(code[previous], "]"):
+            opening = lx.opener[code[previous]]
+            before = at[opening] - 1
+            if before < 0 or not lx.is_punct(code[before], "#"):
+                break
+            first, previous = code[before], before - 1
+        last = keyword + 1
+        while last < len(lx.tokens) and not lx.is_punct(last, ";"):
+            last = lx.match.get(last, last) + 1
+        if last == len(lx.tokens):
+            raise Unproven(f"{lx.where}: cannot read use item")
+        comments = sum(t.kind in ("comment", "doc", "idoc") for t in lx.tokens[first:last + 1])
+        leaves = []
+        use_tree(lx, keyword, last, lx.line(lx.tokens[keyword].start), leaves)
+        prefix = [i for i in range(first, keyword + 1) if lx.tokens[i].kind != "ws"]
+        item = rst.Item("use", "use", lx.tokens[first].start, lx.tokens[first].start,
+                        lx.tokens[last].end, 0, first_token=first, last_token=last)
+        attrs = tuple(raw_attrs(lx, item))
+        leading = first - 1
+        documented = False
+        while leading >= 0 and lx.tokens[leading].kind in TRIVIA:
+            documented |= lx.tokens[leading].kind == "doc"
+            leading -= 1
+        documented |= any(
+            name == "doc" for i in prefix if lx.is_punct(i, "#")
+            for name, _ in attr_entries(lx, attr_bracket(lx, i))
+        )
+        imports[first] = (last, [prefix + leaf + [last] for leaf in leaves], attrs, comments, documented)
+
+    chains = {first: (last, n) for first, last, n, _ in super_chains(lx)}
+
+    def key(indices):
+        out, p = [], 0
+        while p < len(indices):
+            i = indices[p]
+            if i not in chains:
+                out.append(_absolutize_token(lx.text, lx.tokens, i))
+                p += 1
+                continue
+            last, n = chains[i]
+            nest = [name for a, b, name in sorted(info.mod_blocks) if a < i < b]
+            current = module + tuple(nest)
+            target = current[1:len(current) - n]
+            absolute = "crate" + "".join("::" + name for name in target)
+            if p >= 2 and [lx.tok(k) for k in indices[p - 2:p]] == ["pub", "("] \
+                    and lx.is_punct(lx.next_code(last + 1), ")"):
+                absolute = "crate" if not target else "in " + absolute
+            tokens = rst.tokenize(absolute)
+            out.extend(_absolutize_token(absolute, tokens, k) for k, t in enumerate(tokens) if t.kind != "ws")
+            while p < len(indices) and i <= indices[p] <= last:
+                p += 1
+        return tuple(out)
+
+    groups, removed, inventory = defaultdict(list), defaultdict(set), Counter()
+    frozen = set()
+    stack, children, barriers = [()], defaultdict(int), defaultdict(int)
+    i = 0
+    while i < len(lx.tokens):
+        scope = stack[-1]
+        if i in imports:
+            last, leaves, attrs, comments, documented = imports[i]
+            if documented:
+                frozen.add(scope)
+            for leaf in leaves:
+                normalized = (attrs, key(leaf))
+                inventory[((scope, barriers[scope]), normalized)] += 1
+                if not comments:
+                    groups[(scope, barriers[scope])].append((normalized, leaf))
+            if not comments:
+                removed[scope].update(range(i, last + 1))
+            barriers[scope] += comments
+            i = last + 1
+            continue
+        token = lx.tokens[i]
+        if token.kind in ("comment", "doc", "idoc"):
+            barriers[scope] += 1
+        if not inside(info.opaque, i):
+            if lx.is_punct(i, "{"):
+                child = scope + (children[scope],)
+                children[scope] += 1
+                stack.append(child)
+            elif lx.is_punct(i, "}"):
+                stack.pop()
+        i += 1
+    stream = []
+    for scope, leaves in sorted(groups.items()):
+        if scope[0] in frozen:
+            continue
+        for _normalized, indices in sorted(leaves, key=lambda leaf: (
+                leaf[0], tuple(_absolutize_token(lx.text, lx.tokens, i) for i in leaf[1]))):
+            stream.extend(indices)
+    skipped = {i for scope, indices in removed.items() if scope not in frozen for i in indices}
+    stream.extend(i for i in _absolutize_tokens(lx) if i not in skipped)
+    return stream, inventory
+
+
 def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rst.Lexed, macro_defs, aliases,
                      result: Result) -> int:
     info = shape(old)
@@ -2250,10 +2485,21 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
             named[item.body_open] = item.name
     blocks = [(open_, close, name) for open_, close, name in info.mod_blocks]
     chains = {first: (last, length, contiguous) for first, last, length, contiguous in super_chains(old)}
-    i = j = count = 0
-    while i < len(old.tokens) and j < len(new.tokens):
-        if old.tok(i) == new.tok(j) and old.tokens[i].kind == new.tokens[j].kind:
-            i, j = i + 1, j + 1
+    try:
+        old_stream, old_uses = _absolutize_use_stream(old, module)
+        new_stream, new_uses = _absolutize_use_stream(new, module)
+    except Unproven as error:
+        result.fail(str(error))
+        return 0
+    if old_uses != new_uses:
+        result.fail(f"{path}: edited beyond replacing `super` chains (use leaves, attributes or scope differ)")
+        return 0
+    a = b = count = 0
+    while a < len(old_stream) and b < len(new_stream):
+        i, j = old_stream[a], new_stream[b]
+        if _absolutize_token(old.text, old.tokens, i) == _absolutize_token(new.text, new.tokens, j):
+            _absolutize_location(path, old, new, i, j, macro_defs, aliases, result)
+            a, b = a + 1, b + 1
             continue
         where = f"{path}:{old.line(old.tokens[i].start)}"
         if i not in chains:
@@ -2291,22 +2537,27 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
             expected = "crate" if not target else f"in {absolute}"
         else:
             expected = absolute
-        start = new.tokens[j].start
-        if not new.text.startswith(expected, start):
+        tokens = rst.tokenize(expected)
+        expected_tokens = [_absolutize_token(expected, tokens, k) for k, t in enumerate(tokens) if t.kind != "ws"]
+        actual = [_absolutize_token(new.text, new.tokens, k) for k in new_stream[b:b + len(expected_tokens)]]
+        if actual != expected_tokens:
             result.fail(f"{where}: expected `{expected}` in place of the `super` chain")
-            return count
-        stop = start + len(expected)
-        k = j
-        while k < len(new.tokens) and new.tokens[k].start < stop:
-            k += 1
-        if k < len(new.tokens) and new.tokens[k].start != stop or (k == len(new.tokens) and stop != len(new.text)):
-            result.fail(f"{where}: replacement does not end at a token boundary")
             return count
         _check_column_shift(f"{path}:{old.line(old.tokens[i].start)}", old, last, macro_defs, aliases, result)
         replaced.append(i)
-        i, j, count = last + 1, k, count + 1
-    if i != len(old.tokens) or j != len(new.tokens):
+        while a < len(old_stream) and i <= old_stream[a] <= last:
+            a += 1
+        b, count = b + len(expected_tokens), len(set(replaced))
+    if a != len(old_stream) or b != len(new_stream):
         result.fail(f"{path}: edited beyond replacing `super` chains (at the end of the file)")
+    # Rust macro token trees observe spacing and literal boundaries that the
+    # shared MOVE lexer deliberately does not model. Freeze their source bytes.
+    def macro_bytes(lx):
+        return [lx.text[lx.tokens[first].start:lx.tokens[last].end]
+                for first, last, what in shape_of(lx).opaque if what.endswith("!")]
+
+    if macro_bytes(old) != macro_bytes(new):
+        result.fail(f"{path}: edited beyond replacing `super` chains (macro token tree bytes differ)")
     _absolutize_attrs(path, old, info, replaced, macro_defs, aliases, result)
     return count
 

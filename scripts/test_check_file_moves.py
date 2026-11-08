@@ -353,8 +353,10 @@ class MoveRejects(Base):
 
     def test_edited_rename(self):
         base = files()
-        head = self.basic_head(base, **{'snapshots/dest/old.rs': OLD.replace('+ 1', '+ 2')})
-        self.reject(base, head, 'has no exact move')
+        for edited in (OLD.replace('+ 1', '+ 2'), OLD.replace('    here()', '        here()')):
+            with self.subTest(edited=edited):
+                head = self.basic_head(base, **{'snapshots/dest/old.rs': edited})
+                self.reject(base, head, 'has no exact move')
 
     def test_item_swap_between_moved_and_decoy(self):
         base = files(**{'snapshots/decoy.rs': 'fn local() -> u8 {\n    2\n}\n',
@@ -821,11 +823,186 @@ class AbsolutizeAccepts(Base):
         result = self.accept(base, {SRC + 'snapshots/old.rs': new}, mode='absolutize')
         self.assertIn('1 files, 5 absolutized paths', result.lines[0])
 
+    def test_formatter_rewraps_calls_and_use_trees(self):
+        # [regress] Longer absolute paths made rustfmt rewrap 19 real source files.
+        pairs = [
+            ('fn f() { call(super::dest::here()); }\n',
+             'fn f() {\n    call(\n        crate::snapshots::dest::here(),\n    );\n}\n'),
+            ('use super::{dest, caller};\n',
+             'use crate::snapshots::{\n    dest,\n    caller,\n};\n'),
+            ('fn f() { let _ = [super::dest::here(), 1,]; }\n',
+             'fn f() { let _ = [crate::snapshots::dest::here(), 1]; }\n'),
+            ('fn f() { let _ = (super::dest::here(), 1,); }\n',
+             'fn f() { let _ = (crate::snapshots::dest::here(), 1); }\n'),
+            ('fn f() { call(super::dest::here(), /* exact */); }\n',
+             'fn f() { call(crate::snapshots::dest::here() /* exact */); }\n'),
+        ]
+        pairs += [
+            ('type Callback = fn(super::dest::Value,);\n',
+             'type Callback = fn(crate::snapshots::dest::Value);\n'),
+            ("fn f<'a>(v: &'a str) { call::<T>(super::dest::here()); }\n",
+             "fn f<'a>(v: &'a str,) { call::<T>(crate::snapshots::dest::here(),); }\n"),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.accept(files(**{'snapshots/old.rs': old}),
+                            {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
+
+    def test_formatter_reorders_use_leaves_within_each_scope(self):
+        # [regress] Nine formatted absolute-path files reorder imports or brace leaves.
+        pairs = [
+            ('use super::dest;\nuse crate::snapshots::caller;\n',
+             'use crate::snapshots::caller;\nuse crate::snapshots::dest;\n'),
+            ('use super::{dest, caller};\n',
+             'use crate::snapshots::{caller, dest};\n'),
+            ('use super::{dest::{self, Value as V}, caller};\n',
+             'use crate::snapshots::caller;\nuse crate::snapshots::dest::Value as V;\nuse crate::snapshots::dest::{self};\n'),
+            ('#[cfg(test)]\nuse super::{dest, caller};\n',
+             '#[cfg(test)]\nuse crate::snapshots::caller;\n#[cfg(test)]\nuse crate::snapshots::dest;\n'),
+            ('fn f() -> impl Sized + use<> { super::dest::here() }\n',
+             'fn f() -> impl Sized + use<> { crate::snapshots::dest::here() }\n'),
+            ('mod nested { use super::super::{dest, caller}; }\n',
+             'mod nested { use crate::snapshots::{caller, dest}; }\n'),
+            ('fn f() { use super::{dest, caller}; { use super::{dest, caller}; } }\n',
+             'fn f() { use crate::snapshots::{caller, dest}; { use crate::snapshots::{caller, dest}; } }\n'),
+            ('use super::dest;\nuse crate::snapshots::caller;\nfn f() { super::dest::here(); }\n',
+             'use crate::snapshots::caller;\nuse super::dest;\nfn f() { crate::snapshots::dest::here(); }\n'),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.accept(files(**{'snapshots/old.rs': old}),
+                            {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
+    def test_documented_uses_stay_anchored_while_other_scopes_reorder(self):
+        # [regress] Doc ownership freezes only the containing import scope.
+        for doc in ('/// d', '/** d */', '#[doc = "d"]'):
+            old = (f'{doc}\nuse super::dest;\nuse super::caller;\n'
+                   'fn f() { use super::{dest, caller}; }\n')
+            new = old.replace('super::', 'crate::snapshots::').replace(
+                '{dest, caller}', '{caller, dest}')
+            with self.subTest(doc=doc):
+                self.accept(files(**{'snapshots/old.rs': old}),
+                            {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
+    def test_unchanged_macro_tokens_with_reordered_uses(self):
+        # [regress] Opaque macro bytes need not prevent ordinary import reordering.
+        old = ('use super::dest;\nuse super::caller;\n'
+               'macro_rules! m { () => { use a::{b, c}; }; }\n')
+        new = old.replace('use super::dest;\nuse super::caller;',
+                          'use crate::snapshots::caller;\nuse crate::snapshots::dest;')
+        self.accept(files(**{'snapshots/old.rs': old}),
+                    {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
 
 class AbsolutizeRejects(Base):
     def check_edit(self, old, new, needle, **extra):
         base = files(**{'snapshots/old.rs': old}, **extra)
         self.reject(base, {SRC + 'snapshots/old.rs': new}, needle, mode='absolutize')
+
+    def test_formatter_cannot_change_tuple_or_opaque_commas(self):
+        # [behaviour] Commas inside token trees and singleton tuples carry meaning.
+        for expr in ('(1,)', '(make::<A, B>(),)', '(|a, b| a + b,)',
+                     'vec![1,]', 'assert!(true,)'):
+            old = f'fn f() {{ super::dest::here(); let _ = {expr}; }}\n'
+            new = old.replace('super::dest', 'crate::snapshots::dest').replace(expr, ''.join(expr.rsplit(',', 1)))
+            with self.subTest(expr=expr):
+                self.check_edit(old, new, 'edited beyond')
+        old = '#[derive(Clone,)]\nstruct S(super::dest::Value);\n'
+        self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest').replace('Clone,', 'Clone'),
+                        'edited beyond')
+        old = 'fn f() { let _ = (super::dest::here()); }\n'
+        self.check_edit(old, old.replace('super::dest::here()', 'crate::snapshots::dest::here(),'), 'edited beyond')
+
+    def test_macro_token_tree_bytes_cannot_reflow(self):
+        # [regress] Macro spacing changes stringify output and literal arm selection.
+        pairs = [('stringify!(a+b)', 'stringify!(a + b)'),
+                 ('pick!(1.0)', 'pick!(1 . 0)')]
+        pairs += [(f'pick!({literal}suffix)', f'pick!({literal} suffix)')
+                  for literal in ('"s"', 'b"s"', 'r#"s"#', 'br#"s"#', "'s'", "b's'")]
+        pairs += [(f'stringify!{a}a+b{b}', f'stringify!{a}a + b{b}')
+                  for a, b in (('[', ']'), ('{', '}'))]
+        definitions = ('macro_rules! pick { ($n:literal)=>{1}; '
+                       '($n:literal . $m:literal)=>{2}; ($n:literal suffix)=>{3}; }\n')
+        for before, after in pairs:
+            old = definitions + f'fn f() {{ super::dest::here(); let _ = {before}; }}\n'
+            new = old.replace('super::dest', 'crate::snapshots::dest').replace(before, after)
+            with self.subTest(before=before):
+                self.check_edit(old, new, 'macro token tree bytes differ')
+        old = 'macro_rules! m { () => { 1 }; }\nfn f() { super::dest::here(); }\n'
+        new = old.replace('super::dest', 'crate::snapshots::dest').replace('{ 1 }', '{1}')
+        self.check_edit(old, new, 'macro token tree bytes differ')
+
+    def test_documented_use_cannot_change_doc_owner(self):
+        # [regress] Reordering an import can reassign its doc to an import or function.
+        for doc in ('/// d', '/** d */', '#[doc = "d"]'):
+            pairs = [
+                (f'{doc}\nuse super::dest;\nuse super::caller;\n',
+                 f'{doc}\nuse crate::snapshots::caller;\nuse crate::snapshots::dest;\n'),
+                (f'{doc}\nuse super::dest; fn g() {{}}\n',
+                 f'{doc}\nfn g() {{}} use crate::snapshots::dest;\n'),
+                (f'use super::{{dest, caller}};\n{doc}\nuse super::dest as d;\n',
+                 f'use crate::snapshots::{{caller, dest}};\n{doc}\nuse crate::snapshots::dest as d;\n'),
+            ]
+            for old, new in pairs:
+                with self.subTest(doc=doc, new=new):
+                    self.check_edit(old, new, 'edited beyond')
+
+    def test_formatter_cannot_change_comments_or_literals(self):
+        # [behaviour] Exact tokens include comments and every kind of literal.
+        old = 'fn f() { super::dest::here(); /* keep */ let _ = ("a", \'x\', r#"raw"#); }\n'
+        for before, after in (('keep', 'changed'), ('"a"', '"b"'), ("'x'", "'y'"), ('raw', 'new')):
+            with self.subTest(before=before):
+                self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest').replace(before, after),
+                                'edited beyond')
+
+    def test_formatter_preserves_use_scope_metadata_multiplicity_and_comments(self):
+        # [behaviour] Import equivalence includes scope, exact attributes and explicit aliases.
+        pairs = [
+            ('use super::dest; fn f() {}', 'fn f() { use crate::snapshots::dest; }'),
+            ('fn f() { use super::dest; } fn g() {}',
+             'fn f() {} fn g() { use crate::snapshots::dest; }'),
+            ('mod a { use super::super::dest; } mod b {}',
+             'mod a {} mod b { use crate::snapshots::dest; }'),
+            ('#[cfg(test)] use super::dest;', '#[cfg(any())] use crate::snapshots::dest;'),
+            ('#[cfg(test)] use super::dest;', '#[cfg( test )] use crate::snapshots::dest;'),
+            ('#[cfg(/* keep */test)] use super::dest;',
+             '#[cfg(/* keep */ test)] use crate::snapshots::dest;'),
+            ('pub(super) use super::dest;', 'use crate::snapshots::dest;'),
+            ('use super::dest::{self};', 'use crate::snapshots::dest;'),
+            ('use super::dest as d;', 'use crate::snapshots::dest as other;'),
+            ('use super::dest;', 'use crate::snapshots::dest as dest;'),
+            ('use super::{dest, caller};', 'use crate::snapshots::dest;'),
+            ('use super::{dest as _, dest as _};', 'use crate::snapshots::dest as _;'),
+            ('use super::dest::*;', 'use crate::snapshots::dest;'),
+            ('use super::{dest, /* anchor */ caller};',
+             'use crate::snapshots::{/* anchor */ dest, caller};'),
+            ('use super::dest; /* anchor */ use super::caller;',
+             'use crate::snapshots::dest; use crate::snapshots::caller; /* anchor */'),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.check_edit(old + '\n', new + '\n', 'edited beyond')
+
+    def test_formatter_cannot_split_compound_operators(self):
+        # [behaviour] Whitespace cannot turn short circuiting into eager evaluation.
+        for expr in ('false && side_effect()', 'probe!(false && side_effect())', '0..=9'):
+            old = f'fn f() {{ super::dest::here(); let _ = {expr}; }}\n'
+            new = old.replace('super::dest', 'crate::snapshots::dest').replace('&&', '& &').replace('..=', '.. =')
+            with self.subTest(expr=expr):
+                self.check_edit(old, new, 'edited beyond')
+
+    def test_formatter_cannot_relocate_location_observations(self):
+        # [behaviour] Reflow before a later location macro or track_caller stays forbidden.
+        for observation in ('line!()', 'column!()', 'file!()'):
+            old = f'fn f() {{ call(super::dest::here());\n    let _ = {observation};\n}}\n'
+            new = old.replace('call(super::dest::here());',
+                              'call(\n    crate::snapshots::dest::here(),\n);')
+            with self.subTest(observation=observation):
+                self.check_edit(old, new, 'rule 7 (location)')
+        old = 'fn f() { super::dest::here(); }\n#[track_caller]\nfn g() {}\n'
+        self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest').replace(' }', '\n}'),
+                        'rule 7 (location)')
 
     def test_wrong_target(self):
         self.check_edit('fn f() {\n    super::dest::here();\n}\n', 'fn f() {\n    crate::dest::here();\n}\n',
