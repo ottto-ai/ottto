@@ -2676,8 +2676,13 @@ fn reset_held_probe_process() {
         .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The synthetic server's activity-hint window, the walk's context.
+const HINT_WINDOW_DAYS: u64 = 183;
+
 /// [regress] An unchanged legacy cache-bearing witness gets one parse, then
 /// exact covered-probe receipts retire debt without another parse or offer.
+/// The re-armed file is found by a kept generation's due re-listing into an
+/// empty queue, not by a fresh census walk.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -2703,6 +2708,32 @@ fn held_probe_legacy_file_rearms_once() {
         .iter()
         .all(|body| body.get("cache_observations").is_none()));
     pipeline.server.offered.lock().unwrap().clear();
+    // The completed census retired its walk; keep a finished one, with an
+    // empty queue and a due re-listing, as a long-lived generation has.
+    let roots =
+        crate::snapshot_roots::scan_roots(SnapshotSource::ClaudeCode, &pipeline.fixture.home, &[])
+            .unwrap();
+    let mut kept = ScanIndex::load(&legacy.index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+        &mut kept,
+        SnapshotSource::ClaudeCode,
+        &roots,
+        &current_rfc3339(),
+        HINT_WINDOW_DAYS,
+    );
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut kept);
+    assert!(
+        crate::snapshots::e2_pipeline_scan_fixture::pending_keys_for_test(&kept).is_empty(),
+        "nothing is queued before the listing"
+    );
+    let kept_entry = kept.files.values().next().unwrap();
+    assert_eq!(
+        kept_entry.source_file_fingerprint,
+        original.source_file_fingerprint
+    );
+    assert!(kept_entry.last_snapshot_fingerprint.is_some());
+    assert!(kept.confirmed_empty_files.is_empty());
+    kept.save(&legacy.index_path).unwrap();
     reset_held_probe_process();
     FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     let (reparsed, parsed, _) = pipeline.measured_cycle(now + 60, true);
