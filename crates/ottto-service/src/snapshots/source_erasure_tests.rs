@@ -227,15 +227,15 @@ struct EnvGuard(&'static str, Option<std::ffi::OsString>);
 impl EnvGuard {
     fn set(key: &'static str, value: &Path) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        unsafe { std::env::set_var(key, value) };
         Self(key, previous)
     }
 }
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.1 {
-            Some(previous) => std::env::set_var(self.0, previous),
-            None => std::env::remove_var(self.0),
+            Some(previous) => unsafe { std::env::set_var(self.0, previous) },
+            None => unsafe { std::env::remove_var(self.0) },
         }
     }
 }

@@ -18839,14 +18839,14 @@ for line in sys.stdin:
 
         fn set_os(key: &'static str, value: OsString) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         /// Temporarily unset an env var, restoring it (or its absence) on drop.
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
-            std::env::remove_var(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -18854,9 +18854,9 @@ for line in sys.stdin:
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

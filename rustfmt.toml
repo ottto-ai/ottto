@@ -1,0 +1,4 @@
+# The crates use Rust edition 2024; formatting keeps the 2021 style so the
+# edition change does not reformat the tree. Moving to style_edition 2024 is a
+# separate, purely mechanical `cargo fmt` change.
+style_edition = "2021"

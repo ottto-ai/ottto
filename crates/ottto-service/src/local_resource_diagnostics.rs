@@ -103,7 +103,7 @@ macro_rules! sparse_lifetime_counters {
 /// A process-wide diagnostic static behind `$with`. Each test thread gets its
 /// own copy, so a fixture never reads or drains another test's counts.
 macro_rules! process_static {
-    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr_2021) => {
         $(#[$attr])*
         $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
             #[cfg(not(test))]

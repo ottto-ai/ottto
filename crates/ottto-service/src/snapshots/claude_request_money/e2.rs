@@ -1770,7 +1770,7 @@ fn family_membership(items: &[SnapshotItem], members: &[usize]) -> FamilyMembers
 fn matching_members<'a>(
     view: &'a FamilyMembership,
     request_id: &str,
-) -> impl Iterator<Item = usize> + 'a {
+) -> impl Iterator<Item = usize> + 'a + use<'a> {
     let hash_mask = !view.member_mask;
     let hash = membership_hash(request_id) & hash_mask;
     let start = view.entries.partition_point(|key| key & hash_mask < hash);

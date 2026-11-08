@@ -246,7 +246,7 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
     let root = scratch.as_ref();
     let support = root.join("support");
     fs::create_dir(&support).unwrap();
-    std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support) };
     let account = billing_identity_hash("anthropic", "account", "account-one").unwrap();
     let org = billing_identity_hash("anthropic", "organization", "org-one").unwrap();
     fs::write(
@@ -366,7 +366,7 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
             .reason,
         Reason::SlotNeedsLogin
     );
-    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
 }
 
 #[test]
@@ -385,8 +385,8 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
     fs::create_dir(home.join(".claude")).unwrap();
-    std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support) };
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
     write_refreshable_login(&home);
     let cli = bin.join("claude");
     fs::write(
@@ -540,8 +540,8 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         )
         .unwrap();
     }
-    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
-    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
 }
 
 /// A Codex ChatGPT login with saved quota proof in `root/home`, and the
@@ -557,7 +557,7 @@ fn codex_login_fixture(root: &Path) -> (String, String) {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support) };
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":now+3600,
         "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
@@ -604,7 +604,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
-    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
     let ambient_keys = [
         "CODEX_ACCESS_TOKEN",
         "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
@@ -612,7 +612,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
     ];
     for key in ambient_keys {
-        std::env::set_var(key, "synthetic-override");
+        unsafe { std::env::set_var(key, "synthetic-override") };
     }
     let witness = root.join("commands");
     let quoted = quote_launch_executable(witness.to_str().unwrap()).unwrap();
@@ -699,10 +699,10 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         fs::read_to_string(&witness).unwrap(),
         "--version\n--version\n"
     );
-    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
-    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
     for key in ambient_keys {
-        std::env::remove_var(key);
+        unsafe { std::env::remove_var(key) };
     }
 }
 
@@ -735,8 +735,8 @@ fn codex_launch_uses_the_bundled_cli_before_a_stale_path_install() {
         fs::write(dir.join("codex"), script).unwrap();
         fs::set_permissions(dir.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
     }
-    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
-    std::env::set_var("PATH", &stale);
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
+    unsafe { std::env::set_var("PATH", &stale) };
     let mut registry = Registry::default();
     let result = registry
         .prepare_for_user(
@@ -776,7 +776,7 @@ fn codex_launch_uses_the_bundled_cli_before_a_stale_path_install() {
                 .into_owned()
         )
     );
-    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
 }
 
 #[test]
@@ -796,7 +796,7 @@ fn version_probe_finds_the_selected_installs_shebang_interpreter() {
     )
     .unwrap();
     fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
-    std::env::set_var("PATH", "/usr/bin:/bin");
+    unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
     let path = crate::command_env::interactive_probe_path(root, &cli);
     assert_eq!(
         supported_version(&cli, &fixture_binding(root), root, path.as_deref()).unwrap(),

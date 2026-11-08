@@ -23,7 +23,7 @@ thread_local! {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn malloc_size(ptr: *const std::ffi::c_void) -> usize;
 }
 
@@ -31,7 +31,7 @@ unsafe fn usable(ptr: *const std::ffi::c_void, requested: usize) -> usize {
     #[cfg(target_os = "macos")]
     {
         let _ = requested;
-        malloc_size(ptr)
+        unsafe { malloc_size(ptr) }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -100,37 +100,43 @@ fn record_reallocation(old: usize, old_usable: usize, new: Option<(usize, usize)
 
 unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
-            record(
-                layout.size() as isize,
-                usable(ptr.cast(), layout.size()) as isize,
-                true,
-            );
+        unsafe {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
+                record(
+                    layout.size() as isize,
+                    usable(ptr.cast(), layout.size()) as isize,
+                    true,
+                );
+            }
+            ptr
         }
-        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        process::deallocated(ptr);
-        record(
-            -(layout.size() as isize),
-            -(usable(ptr.cast(), layout.size()) as isize),
-            false,
-        );
-        System.dealloc(ptr, layout);
+        unsafe {
+            process::deallocated(ptr);
+            record(
+                -(layout.size() as isize),
+                -(usable(ptr.cast(), layout.size()) as isize),
+                false,
+            );
+            System.dealloc(ptr, layout);
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let old_usable = usable(ptr.cast(), layout.size());
-        let result = process::reallocate(ptr, layout, size);
-        if !result.is_null() {
-            record_reallocation(
-                layout.size(),
-                old_usable,
-                Some((size, usable(result.cast(), size))),
-            );
+        unsafe {
+            let old_usable = usable(ptr.cast(), layout.size());
+            let result = process::reallocate(ptr, layout, size);
+            if !result.is_null() {
+                record_reallocation(
+                    layout.size(),
+                    old_usable,
+                    Some((size, usable(result.cast(), size))),
+                );
+            }
+            result
         }
-        result
     }
 }
 
@@ -401,29 +407,31 @@ mod process {
         layout: std::alloc::Layout,
         requested: usize,
     ) -> *mut u8 {
-        // Keep the table locks (always process, then caller) across System's
-        // native realloc: another thread may immediately reuse the old address
-        // after System frees it.
-        let (mut process, mut caller) = (PROCESS.active(), CALLER.active());
-        if process.is_none() && caller.is_none() {
-            return System.realloc(old, layout, requested);
-        }
-        let new = System.realloc(old, layout, requested);
-        if !new.is_null() {
-            let usable = super::usable(new.cast(), requested);
-            if let Some(audit) = process.as_deref_mut() {
-                audit.reallocated(old as usize, new as usize, requested, usable);
+        unsafe {
+            // Keep the table locks (always process, then caller) across System's
+            // native realloc: another thread may immediately reuse the old address
+            // after System frees it.
+            let (mut process, mut caller) = (PROCESS.active(), CALLER.active());
+            if process.is_none() && caller.is_none() {
+                return System.realloc(old, layout, requested);
             }
-            if let Some(audit) = caller.as_deref_mut() {
-                if on_caller_thread() {
+            let new = System.realloc(old, layout, requested);
+            if !new.is_null() {
+                let usable = super::usable(new.cast(), requested);
+                if let Some(audit) = process.as_deref_mut() {
                     audit.reallocated(old as usize, new as usize, requested, usable);
-                } else {
-                    // The old pointer is retired; an unrelated thread owns the new one.
-                    audit.remove(old as usize);
+                }
+                if let Some(audit) = caller.as_deref_mut() {
+                    if on_caller_thread() {
+                        audit.reallocated(old as usize, new as usize, requested, usable);
+                    } else {
+                        // The old pointer is retired; an unrelated thread owns the new one.
+                        audit.remove(old as usize);
+                    }
                 }
             }
+            new
         }
-        new
     }
     // Copy bookkeeping only; never walk pointers or allocate. A snapshot is
     // meaningful only inside this thread's existing born-pointer audit.

@@ -210,7 +210,7 @@ fn power_state(answer: i32) -> PlatformState {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn ottto_power_state() -> i32;
     fn pthread_get_qos_class_np(thread: libc::pthread_t, class: *mut u32, rel: *mut i32) -> i32;
     fn pthread_set_qos_class_self_np(class: u32, rel: i32) -> i32;
