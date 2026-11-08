@@ -2,7 +2,7 @@
 //! per-step visit walk of a long tool-heavy session, and byte parity between a
 //! retained-then-tailed read and an independent full read.
 //! No fixture content comes from a provider account.
-use super::*;
+use crate::snapshots::*;
 use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
 use crate::transcript_cache::Retained;
 use std::fs::OpenOptions;

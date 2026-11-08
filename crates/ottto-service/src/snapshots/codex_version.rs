@@ -1,5 +1,5 @@
 //! One bounded MCP sample from the main reader's retained native state.
-use super::{OwnedActiveFile, SnapshotSource};
+use crate::snapshots::{OwnedActiveFile, SnapshotSource};
 use crate::transcript_acquisition::FileObject;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -78,7 +78,7 @@ impl CodexVersionFeed {
         }
     }
     /// No I/O: object identity was captured on the primary open already.
-    pub(super) fn observe(&self, active: &OwnedActiveFile) {
+    pub(in crate::snapshots) fn observe(&self, active: &OwnedActiveFile) {
         if self.eligible_root.as_ref() != Some(&active.candidate.scan_root) {
             return;
         }

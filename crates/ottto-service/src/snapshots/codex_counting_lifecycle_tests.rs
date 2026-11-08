@@ -1,6 +1,6 @@
 //! Synthetic counting transitions at the selected local ACK boundary.
-use super::codex_counting_version::{self, AckEvidence, CountingVersion};
-use super::*;
+use crate::snapshots::codex_counting_version::{self, AckEvidence, CountingVersion};
+use crate::snapshots::*;
 use serde_json::json;
 
 const SESSION: &str = "0199f7a0-0000-7000-8000-00000000c0de";

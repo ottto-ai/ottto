@@ -3,7 +3,7 @@
 //! Real transcripts carry part of a response's usage only in its iterations,
 //! and the top level never exceeds their sum. Each billed kind counts the
 //! larger of the two, never both. Fixtures are synthetic usage blocks only.
-use super::*;
+use crate::snapshots::*;
 use serde_json::json;
 
 const SESSION_EQUAL: &str = "1d164000-0000-4000-8000-00000000000a";
@@ -198,7 +198,7 @@ fn claude_iterations_fold_matches_a_complete_top_level() {
         fs::write(root.join(format!("{SESSION_EQUAL}.jsonl")), equal).unwrap();
         fs::write(root.join(format!("{SESSION_PARTIAL}.jsonl")), partial).unwrap();
         let (index, result) =
-            super::source_erasure_tests::cold_full(&root, &now, ScanIndex::default());
+            crate::snapshots::source_erasure_tests::cold_full(&root, &now, ScanIndex::default());
         let route = sampled_scan::transition_fixture::scan_money(
             SnapshotSource::ClaudeCode,
             &index,

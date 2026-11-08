@@ -8,7 +8,7 @@ use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::owned_heap::OwnedMap;
 
 /// One dictionary's first-seen order: key to slot, as the response book keeps it.
-pub(super) struct StableSlots<K> {
+pub(in crate::snapshots) struct StableSlots<K> {
     index: OwnedMap<K, usize>,
 }
 impl<K> Default for StableSlots<K> {
@@ -35,7 +35,7 @@ impl<K: HeapLayoutBound> HeapLayoutBound for StableSlots<K> {
 }
 impl<K: Ord + Clone + HeapLayoutBound> StableSlots<K> {
     /// The native reducer inserted `key`: it keeps its slot, or takes the next.
-    pub(super) fn note(&mut self, key: &K) {
+    pub(in crate::snapshots) fn note(&mut self, key: &K) {
         if !self.index.contains_key(key) {
             self.adopt(key.clone());
         }
@@ -43,7 +43,7 @@ impl<K: Ord + Clone + HeapLayoutBound> StableSlots<K> {
 }
 impl<K: Ord + HeapLayoutBound> StableSlots<K> {
     /// A decoded slot, in stored order. False: the key is a duplicate.
-    pub(super) fn adopt(&mut self, key: K) -> bool {
+    pub(in crate::snapshots) fn adopt(&mut self, key: K) -> bool {
         let slot = self.index.len();
         if self.index.contains_key(&key) {
             return false;
@@ -52,14 +52,14 @@ impl<K: Ord + HeapLayoutBound> StableSlots<K> {
         true
     }
     /// Every slot, tombstones included.
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::snapshots) fn len(&self) -> usize {
         self.index.len()
     }
-    pub(super) fn contains(&self, key: &K) -> bool {
+    pub(in crate::snapshots) fn contains(&self, key: &K) -> bool {
         self.index.contains_key(key)
     }
     /// The keys in slot order: the index inverted.
-    pub(super) fn ordered(&self) -> Vec<&K> {
+    pub(in crate::snapshots) fn ordered(&self) -> Vec<&K> {
         let mut keys: Vec<(usize, &K)> =
             self.index.iter().map(|(key, slot)| (*slot, key)).collect();
         keys.sort_unstable_by_key(|(slot, _)| *slot);
@@ -69,7 +69,7 @@ impl<K: Ord + HeapLayoutBound> StableSlots<K> {
 
 /// Which of Codex's three name-count maps a name belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum CodexCountMap {
+pub(in crate::snapshots) enum CodexCountMap {
     Tool,
     McpActivity,
     McpUsage,
@@ -85,11 +85,11 @@ crate::heap_layout_bound::no_heap!(true; CodexCountMap);
 /// `activity_mcp_call_ids`; the three name-count maps; and the priority
 /// decisions by turn, which only ever insert (a slot per turn, first seen).
 #[derive(Clone, Default)]
-pub(super) struct CodexDictionarySlots {
-    pub(super) active_turns: StableSlots<String>,
-    pub(super) open_calls: StableSlots<String>,
-    pub(super) name_counts: StableSlots<(CodexCountMap, String)>,
-    pub(super) priority_turns: StableSlots<String>,
+pub(in crate::snapshots) struct CodexDictionarySlots {
+    pub(in crate::snapshots) active_turns: StableSlots<String>,
+    pub(in crate::snapshots) open_calls: StableSlots<String>,
+    pub(in crate::snapshots) name_counts: StableSlots<(CodexCountMap, String)>,
+    pub(in crate::snapshots) priority_turns: StableSlots<String>,
 }
 crate::heap_layout_bound::fields!(CodexDictionarySlots; active_turns, open_calls, name_counts,
     priority_turns);
