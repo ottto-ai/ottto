@@ -164,26 +164,30 @@ fn seed(name: &str, siblings: usize) -> Seeded {
     let mut prior = settle(&c, &ScanIndex::default(), first, &mut progress);
     progress = restarted(&c, progress);
     let mut control = None;
-    let all = (0..siblings).collect::<Vec<_>>();
-    for chunk in all.chunks(PAGE) {
-        for &n in chunk {
-            let id = sibling(n);
-            c.root(&id, &line(&id, &format!("s{n}"), &at("07:30:00"), 5));
-            if n + 1 == siblings {
-                publish(&c, &id, &[told(&id, &format!("s{n}"), 5, A, "07:30:00")]);
-            }
+    for n in 0..siblings {
+        let id = sibling(n);
+        c.root(&id, &line(&id, &format!("s{n}"), &at("07:30:00"), 5));
+        if n + 1 == siblings {
+            publish(&c, &id, &[told(&id, &format!("s{n}"), 5, A, "07:30:00")]);
         }
-        // A page is the chunk written since the last scan; the read limit
-        // covers the whole corpus so no new file of the chunk is deferred.
-        let mut page = c.raw(&scanner, prior.clone(), siblings + 8, true, &[]);
+    }
+    // The scanner's own page bound splits the siblings; every page is ACKed
+    // and progress restarts before the next one.
+    let mut acked = BTreeSet::new();
+    while acked.len() < siblings {
+        let mut page = c.raw(&scanner, prior.clone(), PAGE, true, &[]);
         page.enrich_with(&c, Some(&mut progress.accepted_identity_buckets));
-        assert_eq!(
-            page.scan.snapshots.len(),
-            chunk.len(),
-            "one body per sibling"
-        );
-        if chunk.last() == Some(&(siblings - 1)) {
-            let mut sent = only(&page, &sibling(siblings - 1));
+        let ids = page
+            .scan
+            .snapshots
+            .iter()
+            .map(|item| &item.source_session_id);
+        let before = acked.len();
+        acked.extend(ids.filter(|id| id.as_str() != ROOT).cloned());
+        assert!(acked.len() > before, "each page ACKs new siblings");
+        let last = sibling(siblings - 1);
+        if body(&page, &last).is_some() {
+            let mut sent = only(&page, &last);
             sent.finish();
             control = Some(routed(&sent, sent.upload_policy));
         }
