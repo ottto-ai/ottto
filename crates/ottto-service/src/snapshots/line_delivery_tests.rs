@@ -1160,6 +1160,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 7,
                 crate::snapshots::DiscoveryRetention {
                     files: &SharedMap::default(),
+                    confirmed_empty: &BTreeSet::new(),
                     account_holds: holds,
                     memo: None,
                     growth: None,
@@ -3808,6 +3809,7 @@ fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> C
         BACKFILL_WINDOW_DAYS,
         DiscoveryRetention {
             files: &index.files,
+            confirmed_empty: &index.confirmed_empty_files,
             account_holds: &index.claude_account_deferred_holds,
             memo: Some(&index.withheld_memo),
             growth: None,

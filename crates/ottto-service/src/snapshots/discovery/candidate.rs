@@ -443,11 +443,11 @@ pub(in crate::snapshots) fn candidate_from_traversal_path_at(
             discovery.index.traversal = Some(walk);
         }
     }
-    let recovery = DiscoveryRecovery::from(&discovery.index.files);
     let retention = DiscoveryRetention {
         growth: discovery.growth,
         ..discovery_retention!(discovery.index)
     };
+    let recovery = DiscoveryRecovery::from(retention);
     retention.observe_stamped_growth(
         &pending.path,
         metadata.len(),

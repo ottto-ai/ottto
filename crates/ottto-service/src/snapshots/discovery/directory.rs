@@ -9,10 +9,14 @@ use crate::snapshots::*;
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) struct DiscoveryRecovery<'a> {
     files: &'a SharedMap<String, ScanIndexEntry>,
+    confirmed_empty: &'a BTreeSet<String>,
 }
-impl<'a> From<&'a SharedMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
-    fn from(files: &'a SharedMap<String, ScanIndexEntry>) -> Self {
-        Self { files }
+impl<'a> From<DiscoveryRetention<'a>> for DiscoveryRecovery<'a> {
+    fn from(retention: DiscoveryRetention<'a>) -> Self {
+        Self {
+            files: retention.files,
+            confirmed_empty: retention.confirmed_empty,
+        }
     }
 }
 impl DiscoveryRecovery<'_> {
@@ -22,7 +26,13 @@ impl DiscoveryRecovery<'_> {
         path: &Path,
         length: u64,
     ) -> bool {
-        sampled_audit::path_requires_recovery(source, self.files, path, length)
+        sampled_audit::path_requires_recovery(
+            source,
+            self.files,
+            self.confirmed_empty,
+            path,
+            length,
+        )
     }
 }
 
@@ -384,11 +394,11 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     &metadata,
                 );
             }
-            let recovery = DiscoveryRecovery::from(&index.files);
             let retention = DiscoveryRetention {
                 growth,
                 ..discovery_retention!(index)
             };
+            let recovery = DiscoveryRecovery::from(retention);
             let modified_unix_seconds = metadata
                 .modified()
                 .ok()
@@ -456,7 +466,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                 {
                     true
                 } else if indexed {
-                    stamp_matches && !sampled_audit::path_requires_verification(&index.files, &path)
+                    stamp_matches && !index.owes_verification(&path)
                 } else {
                     traversal.observed_index_keys.contains(&key)
                 };
