@@ -897,3 +897,11 @@ pub(crate) fn file_upload_body_set(items: &[SnapshotItem]) -> String {
             .collect::<BTreeSet<_>>(),
     )
 }
+
+/// Retain a file decode hold alongside its known entry for selection controls.
+pub(crate) fn hold_file_decode_for_test(index: &mut ScanIndex, key: &str) {
+    index
+        .decode_holds
+        .v2_insert("files", key.to_owned(), b"null".to_vec(), None, 4)
+        .unwrap();
+}

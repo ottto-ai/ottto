@@ -6467,10 +6467,10 @@ use scan::json_fields::{string_at, string_eq_at, u64_at};
 
 #[cfg(test)]
 use scan_index::file_set_digest::snapshot_file_entity_set_digest;
+pub(crate) use scan_index::file_set_digest::snapshot_file_upload_body_set_hex;
 use scan_index::file_set_digest::{
     sha256_digest, sha256_hex, sha256_hex_owned, snapshot_file_entity_set_hex,
-    snapshot_file_upload_body_set_digest, snapshot_file_upload_body_set_hex,
-    update_length_prefixed, PrefixDigest,
+    snapshot_file_upload_body_set_digest, update_length_prefixed, PrefixDigest,
 };
 
 pub fn paths_from_events(
