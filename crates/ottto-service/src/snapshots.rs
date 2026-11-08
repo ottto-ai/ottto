@@ -85,7 +85,7 @@ macro_rules! process_state {
     };
 }
 
-pub(crate) mod cache_observations;
+pub(crate) use usage::cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
 mod change_reason;
@@ -1267,9 +1267,9 @@ use scan::lines::apply::{
 };
 use sources::claude::line::claude_cache_request_slot;
 #[cfg(test)]
-use usage::cache_observations::cache_state_within_limits;
-use usage::cache_observations::cache_wire;
-pub(crate) use usage::cache_observations::{
+use usage::cache_observations::upload::cache_state_within_limits;
+use usage::cache_observations::upload::cache_wire;
+pub(crate) use usage::cache_observations::upload::{
     cache_state_from_echo, cache_state_from_patch, prepare_cache_observations,
 };
 
