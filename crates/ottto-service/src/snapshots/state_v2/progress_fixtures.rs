@@ -160,6 +160,23 @@ pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
         serde_json::from_value(object.remove(name).unwrap_or_default()).unwrap_or_default()
     };
     let (states, heads) = (map("accepted_cache_states"), map("accepted_cache_heads"));
+    // Identity hints split into identity rows under their epoch's scope.
+    let hints = map("accepted_identity_buckets");
+    if let Some(hint) = hints.values().next() {
+        object.insert(
+            "accepted_identity_scope".into(),
+            serde_json::json!({"key_epoch": hint["key_epoch"],
+                "discard_before": 0, "retained_before": 0}),
+        );
+    }
+    let mut points = |tx: &mut dyn Transaction, progress_generation: u64| -> Result<bool> {
+        for (name, accepted) in &hints {
+            let point = serde_json::json!({"progress_generation": progress_generation,
+                "accepted": accepted});
+            progress::put_point(tx, name, &point)?;
+        }
+        Ok(!hints.is_empty())
+    };
     let generation = object
         .remove("generation")
         .and_then(|g| g.as_u64())
@@ -174,7 +191,7 @@ pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
         ledger: &ledger,
     };
     let imported = progress_session_locked(&path, |db, identity, graph| {
-        progress::import(db, identity, graph, &page, &marker, None)
+        progress::import(db, identity, graph, &page, &marker, Some(&mut points))
     })
     .unwrap();
     assert!(matches!(imported, progress::Imported::Committed(_)));
