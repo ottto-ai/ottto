@@ -44,7 +44,12 @@ fn attribution_under(c: &Corpus, key: u8) -> crate::session_attribution::Session
     .unwrap()
 }
 
-fn page_under(c: &Corpus, scanner: &E2ScanFixture, mut index: ScanIndex, mode: Mode) -> Page {
+pub(super) fn page_under(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    mut index: ScanIndex,
+    mode: Mode,
+) -> Page {
     // Claude continues from its state database route, never RAM.
     index = scanner.routed(index, &c.base);
     let attribution = mode
@@ -417,7 +422,10 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             // Delivered: the server holds the bodies. The index keeps no proof.
             let delivered = routed(&warm, before.policy);
             assert!(!delivered.snapshots.is_empty(), "{label}: delivered");
-            let owed = crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&warm.index);
+            let owed =
+                crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
+                    &warm.index,
+                );
             assert!(owed > 0, "{label}: positive control, unproven files");
 
             let mut quiet = page_under(&c, &scanner, warm.index.clone(), after);
@@ -441,7 +449,9 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             );
             settle(&c, &mut quiet, after);
             assert_eq!(
-                crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&quiet.index),
+                crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
+                    &quiet.index
+                ),
                 owed,
                 "{label}: still owed, paid by the next read"
             );
