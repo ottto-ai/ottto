@@ -1,35 +1,63 @@
-//! Bounded, privacy-safe snapshot upload receipts.
+//! Privacy-safe snapshot upload receipts, one per batch attempt, kept 30 days
+//! in the upload history file.
 
 use anyhow::{Context, Result};
-use ottto_core::write_owner_only_file_atomic;
 use ottto_protocol::{
     LocalAccountState, SourceKind, UploadReceiptEntityV1, UploadReceiptOutcomeV1, UploadReceiptV1,
     UploadReceiptsResponseV1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
+use crate::snapshots::state_v2::upload_history::{Encoded, Filter, Store};
 use crate::snapshots::SnapshotBatchRequest;
 
-pub const UPLOAD_RECEIPT_RING_CAPACITY: usize = 500;
+/// Most receipts one `ottto receipts` page returns.
+pub const UPLOAD_RECEIPT_PAGE_SIZE: usize = 500;
+/// The ring file earlier releases kept; now only imported once, then removed.
 const UPLOAD_RECEIPTS_FILENAME: &str = "snapshot_upload_receipts.json";
 const UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION: u16 = 1;
 const UPLOAD_RECEIPTS_RESPONSE_SCHEMA: &str = "ottto.upload_receipts.v1";
 const ID_PREFIX_LEN: usize = 12;
 const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
-const MAX_RECEIPT_FILE_BYTES: u64 = 4 * 1024 * 1024;
-static RECEIPT_FILE_LOCK: Mutex<()> = Mutex::new(());
+/// The ring import reads the whole file; a larger file stays where it is.
+const MAX_RING_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+/// After a failed open or write, attempts skip the history this long so an
+/// unwritable or locked file never slows an upload.
+const REOPEN_AFTER: Duration = Duration::from_secs(60);
+static HISTORY: Mutex<History> = Mutex::new(History {
+    state_dir: None,
+    store: None,
+    retry_after: BTreeMap::new(),
+});
 static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
+static APPEND_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+static IMPORT_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistedReceiptRing {
+thread_local! {
+    static DEFERRED: RefCell<Option<Vec<(PathBuf, Encoded)>>> = const { RefCell::new(None) };
+}
+
+/// The process's one history writer, for the support directory last used,
+/// and when each directory whose history failed may be tried again.
+struct History {
+    state_dir: Option<PathBuf>,
+    store: Option<Store>,
+    retry_after: BTreeMap<PathBuf, Instant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RingFile {
     schema_version: u16,
-    receipts: Vec<PersistedReceipt>,
+    receipts: Vec<serde_json::Value>,
 }
 
 // Internal disk fields never enter the public protocol DTO or diagnostics reader.
@@ -478,8 +506,13 @@ pub struct UploadReceiptContext {
     pub account_binding: Option<LocalAccountState>,
 }
 
+/// The ring file earlier releases wrote; read only by the one-time import.
 pub fn upload_receipts_path(state_dir: &Path) -> PathBuf {
     state_dir.join(UPLOAD_RECEIPTS_FILENAME)
+}
+
+pub(crate) fn upload_history_path(state_dir: &Path) -> PathBuf {
+    Store::path(&state_dir.join("snapshots"))
 }
 
 #[cfg(test)]
@@ -534,55 +567,6 @@ pub(crate) fn append_success_with_evidence_context(
     context: &UploadReceiptContext,
     evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
 ) -> Result<()> {
-    append_success_with_evidence_context_limit(
-        state_dir,
-        source,
-        batch_item_count,
-        http_status,
-        server_request_id,
-        response,
-        context,
-        evidence_request,
-        None,
-    )
-}
-
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
-pub(crate) fn append_success_with_evidence_context_bounded(
-    state_dir: &Path,
-    source: SourceKind,
-    batch_item_count: usize,
-    http_status: u16,
-    server_request_id: Option<&str>,
-    response: &SnapshotBatchResponse,
-    context: &UploadReceiptContext,
-    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
-) -> Result<()> {
-    append_success_with_evidence_context_limit(
-        state_dir,
-        source,
-        batch_item_count,
-        http_status,
-        server_request_id,
-        response,
-        context,
-        evidence_request,
-        Some(crate::snapshot_retry::RESPONSE_BYTES),
-    )
-}
-
-#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
-fn append_success_with_evidence_context_limit(
-    state_dir: &Path,
-    source: SourceKind,
-    batch_item_count: usize,
-    http_status: u16,
-    server_request_id: Option<&str>,
-    response: &SnapshotBatchResponse,
-    context: &UploadReceiptContext,
-    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
-    read_limit: Option<usize>,
-) -> Result<()> {
     let outcome = if response.disabled {
         UploadReceiptOutcomeV1::Rejected
     } else if response.rejected_entities.is_empty() && response.conflict_entities.is_empty() {
@@ -635,26 +619,33 @@ fn append_success_with_evidence_context_limit(
             server_request_id,
         )
     });
-    append_with_evidence(
+    // Rows keep at most 50 entities; the stored count is the response's total.
+    let entity_count = response.accepted_entities.len()
+        + response.unchanged_entities.len()
+        + response.conflict_entities.len()
+        + response.rejected_entities.len();
+    record(
         state_dir,
-        UploadReceiptV1 {
-            uploaded_at,
-            outcome,
-            http_status: Some(http_status),
-            server_request_id: sanitize_server_request_id(server_request_id),
-            retry_after_seconds: None,
-            source,
-            device_label: sanitize_device_label(context.device_label.as_deref()),
-            account_binding: context.account_binding.clone(),
-            batch_item_count: batch_item_count as u64,
-            accepted_count: response.accepted,
-            accepted_entities,
-            unchanged_entities,
-            conflict_entities,
-            rejected_entities,
+        PersistedReceipt {
+            public: UploadReceiptV1 {
+                uploaded_at,
+                outcome,
+                http_status: Some(http_status),
+                server_request_id: sanitize_server_request_id(server_request_id),
+                retry_after_seconds: None,
+                source,
+                device_label: sanitize_device_label(context.device_label.as_deref()),
+                account_binding: context.account_binding.clone(),
+                batch_item_count: batch_item_count as u64,
+                accepted_count: response.accepted,
+                accepted_entities,
+                unchanged_entities,
+                conflict_entities,
+                rejected_entities,
+            },
+            validated_evidence: evidence,
         },
-        evidence,
-        read_limit,
+        entity_count as u64,
     )
 }
 
@@ -701,33 +692,6 @@ pub fn append_http_failure_with_context(
             retry_after_seconds,
             context,
         ),
-        None,
-    )
-}
-
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
-pub(crate) fn append_http_failure_with_context_bounded(
-    state_dir: &Path,
-    source: SourceKind,
-    batch_item_count: usize,
-    outcome: UploadReceiptOutcomeV1,
-    http_status: u16,
-    server_request_id: Option<&str>,
-    retry_after_seconds: Option<u64>,
-    context: &UploadReceiptContext,
-) -> Result<()> {
-    append(
-        state_dir,
-        empty_receipt(
-            source,
-            batch_item_count,
-            outcome,
-            Some(http_status),
-            sanitize_server_request_id(server_request_id),
-            retry_after_seconds,
-            context,
-        ),
-        Some(crate::snapshot_retry::RESPONSE_BYTES),
     )
 }
 
@@ -762,72 +726,66 @@ pub fn append_transport_error_with_context(
             None,
             context,
         ),
-        None,
     )
 }
 
-pub(crate) fn append_transport_error_with_context_bounded(
-    state_dir: &Path,
-    source: SourceKind,
-    batch_item_count: usize,
-    context: &UploadReceiptContext,
-) -> Result<()> {
-    append(
-        state_dir,
-        empty_receipt(
-            source,
-            batch_item_count,
-            UploadReceiptOutcomeV1::TransportError,
-            None,
-            None,
-            None,
-            context,
-        ),
-        Some(crate::snapshot_retry::RESPONSE_BYTES),
-    )
-}
-
+/// Newest receipts first: the first page of [`read_page`].
 pub fn read(
     state_dir: &Path,
     limit: u16,
     since: Option<&str>,
     source: Option<SourceKind>,
 ) -> Result<UploadReceiptsResponseV1> {
-    let since = since
+    read_page(state_dir, limit, since, source, None)
+}
+
+/// One page of receipts in append order, newest first. `before` is the
+/// `next_before` cursor of the previous page. Only the public projection
+/// leaves this function; private evidence never enters a response.
+pub fn read_page(
+    state_dir: &Path,
+    limit: u16,
+    since: Option<&str>,
+    source: Option<SourceKind>,
+    before: Option<u64>,
+) -> Result<UploadReceiptsResponseV1> {
+    let since_ns = since
         .map(|value| {
             OffsetDateTime::parse(value, &Rfc3339)
                 .with_context(|| format!("invalid receipts --since timestamp {value:?}"))
+                .map(|since| clamp_ns(since.unix_timestamp_nanos()))
         })
         .transpose()?;
-    let _guard = RECEIPT_FILE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = upload_receipts_path(state_dir);
-    let ring = load_locked(&path)?;
-    let state_path_present = path.is_file();
-    let receipts = ring
-        .receipts
-        .into_iter()
-        .rev()
-        .map(|receipt| receipt.public)
-        .filter(|receipt| {
-            source
-                .as_ref()
-                .map_or(true, |source| receipt.source == *source)
+    let limit = usize::from(limit).min(UPLOAD_RECEIPT_PAGE_SIZE);
+    let before = before.map(i64::try_from).transpose()?;
+    let source = source.map(source_slug);
+    let page = with_history(state_dir, false, |store| {
+        store.page(&Filter {
+            before,
+            source: source.as_deref(),
+            since_ns,
+            limit,
         })
-        .filter(|receipt| {
-            since.map_or(true, |since| {
-                OffsetDateTime::parse(&receipt.uploaded_at, &Rfc3339)
-                    .is_ok_and(|uploaded_at| uploaded_at >= since)
-            })
-        })
-        .take(usize::from(limit.min(UPLOAD_RECEIPT_RING_CAPACITY as u16)))
-        .collect();
+    })?;
+    let mut receipts = Vec::new();
+    let mut next_before = None;
+    if let Some(page) = page {
+        if page.examined == limit && limit > 0 {
+            next_before = page.last_seq.and_then(|seq| u64::try_from(seq).ok());
+        }
+        receipts = page
+            .rows
+            .into_iter()
+            .filter_map(|(_, json)| serde_json::from_slice::<PersistedReceipt>(&json).ok())
+            .map(|receipt| receipt.public)
+            .collect();
+    }
     Ok(UploadReceiptsResponseV1 {
         schema: UPLOAD_RECEIPTS_RESPONSE_SCHEMA.to_string(),
         receipts,
-        ring_capacity: UPLOAD_RECEIPT_RING_CAPACITY as u16,
-        state_path_present,
+        ring_capacity: UPLOAD_RECEIPT_PAGE_SIZE as u16,
+        state_path_present: upload_history_path(state_dir).is_file(),
+        next_before,
     })
 }
 
@@ -858,129 +816,247 @@ fn empty_receipt(
     }
 }
 
-fn append(state_dir: &Path, receipt: UploadReceiptV1, read_limit: Option<usize>) -> Result<()> {
-    append_with_evidence(state_dir, receipt, None, read_limit)
+fn append(state_dir: &Path, receipt: UploadReceiptV1) -> Result<()> {
+    record(
+        state_dir,
+        PersistedReceipt {
+            public: receipt,
+            validated_evidence: None,
+        },
+        0,
+    )
 }
 
-fn append_with_evidence(
+/// Encode the attempt row now; write it now, or after the caller's progress
+/// save when a [`defer`] scope is open on this thread.
+fn record(state_dir: &Path, receipt: PersistedReceipt, entity_count: u64) -> Result<()> {
+    let row = encode(&receipt, entity_count)?;
+    let row = DEFERRED.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(rows) => {
+            rows.push((state_dir.to_owned(), row));
+            None
+        }
+        None => Some(row),
+    });
+    match row {
+        Some(row) => append_now(state_dir, &row),
+        None => Ok(()),
+    }
+}
+
+/// Holds this thread's attempt rows until [`Deferred::flush`] or drop, so a
+/// page writes them after its progress save returns and its locks are free.
+pub(crate) struct Deferred {
+    owner: bool,
+}
+
+pub(crate) fn defer() -> Deferred {
+    DEFERRED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        // A nested scope leaves its rows to the outer one.
+        let owner = slot.is_none();
+        if owner {
+            *slot = Some(Vec::new());
+        }
+        Deferred { owner }
+    })
+}
+
+impl Deferred {
+    pub(crate) fn flush(&self) {
+        if self.owner {
+            let rows = DEFERRED
+                .try_with(|slot| slot.borrow_mut().as_mut().map(std::mem::take))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            append_all(rows);
+        }
+    }
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        if self.owner {
+            let rows = DEFERRED
+                .try_with(|slot| slot.borrow_mut().take())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            append_all(rows);
+        }
+    }
+}
+
+fn append_all(rows: Vec<(PathBuf, Encoded)>) {
+    for (state_dir, row) in rows {
+        if append_now(&state_dir, &row).is_err() {
+            note_append_failure();
+        }
+    }
+}
+
+/// A history write failure is logged once per process; it never holds,
+/// refuses or retries an upload.
+pub(crate) fn note_append_failure() {
+    if !APPEND_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("ottto-service: snapshot upload receipt persistence failed");
+    }
+}
+
+fn append_now(state_dir: &Path, row: &Encoded) -> Result<()> {
+    with_history(state_dir, true, |store| {
+        store.append(
+            row,
+            clamp_ns(OffsetDateTime::now_utc().unix_timestamp_nanos()),
+        )
+    })?;
+    Ok(())
+}
+
+/// Run `f` on the history writer for `state_dir`, opening it (and importing
+/// any ring file) first. Without `create`, a support directory with neither a
+/// history nor a ring file is reported as empty and nothing is created.
+fn with_history<T>(
     state_dir: &Path,
-    receipt: UploadReceiptV1,
-    evidence: Option<ValidatedReceiptEvidence>,
-    read_limit: Option<usize>,
-) -> Result<()> {
-    let _guard = RECEIPT_FILE_LOCK
+    create: bool,
+    f: impl FnOnce(&mut Store) -> Result<T>,
+) -> Result<Option<T>> {
+    let mut history = HISTORY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = upload_receipts_path(state_dir);
-    let mut ring = match read_limit {
-        Some(cap) if path.exists() => {
-            let bytes = crate::snapshot_retry::read_state(&path, cap)?;
-            let ring: PersistedReceiptRing = crate::snapshot_retry::decode_state(&bytes)?;
-            anyhow::ensure!(
-                ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION,
-                "optional receipt schema changed"
-            );
-            ring
-        }
-        _ => load_locked(&path)?,
-    };
-    ring.receipts.push(PersistedReceipt {
-        public: receipt,
-        validated_evidence: evidence,
-    });
-    if ring.receipts.len() > UPLOAD_RECEIPT_RING_CAPACITY {
-        let overflow = ring.receipts.len() - UPLOAD_RECEIPT_RING_CAPACITY;
-        ring.receipts.drain(..overflow);
+    if history.state_dir.as_deref() != Some(state_dir) {
+        history.state_dir = Some(state_dir.to_owned());
+        history.store = None;
     }
-    let file_limit = read_limit
-        .map(|n| n as u64)
-        .unwrap_or(MAX_RECEIPT_FILE_BYTES);
-    let mut payload = serde_json::to_vec(&ring).context("serialize upload receipt ring")?;
-    if payload.len() as u64 > file_limit {
-        let mut remaining_bytes = payload.len();
-        let mut evict = 0;
-        // Each removed row also removes one comma while at least one row remains.
-        // Measure once instead of repeatedly serializing the whole ring per eviction.
-        for row in ring
-            .receipts
-            .iter()
-            .take(ring.receipts.len().saturating_sub(1))
+    if history.store.is_none() {
+        if !create
+            && !upload_history_path(state_dir).exists()
+            && !upload_receipts_path(state_dir).exists()
         {
-            remaining_bytes -= serde_json::to_vec(row)?.len() + 1;
-            evict += 1;
-            if remaining_bytes as u64 <= file_limit {
-                break;
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            history
+                .retry_after
+                .get(state_dir)
+                .is_none_or(|after| Instant::now() >= *after),
+            "upload_history_unavailable"
+        );
+        match open_history(state_dir) {
+            Ok(store) => {
+                history.store = Some(store);
+                history.retry_after.remove(state_dir);
+            }
+            Err(error) => {
+                history
+                    .retry_after
+                    .insert(state_dir.to_owned(), Instant::now() + REOPEN_AFTER);
+                return Err(error);
             }
         }
-        if remaining_bytes as u64 > file_limit {
-            anyhow::bail!("single upload receipt exceeds private state bound");
-        }
-        ring.receipts.drain(..evict);
-        payload = serde_json::to_vec(&ring).context("serialize bounded upload receipt ring")?;
     }
-    if read_limit.is_some() {
-        let mut nodes = crate::snapshot_retry::state_nodes(&payload)?;
-        if nodes > crate::snapshot_retry::STATE_NODES {
-            let mut evict = 0;
-            for row in ring
-                .receipts
-                .iter()
-                .take(ring.receipts.len().saturating_sub(1))
-            {
-                nodes -= crate::snapshot_retry::state_nodes(&serde_json::to_vec(row)?)?;
-                evict += 1;
-                if nodes <= crate::snapshot_retry::STATE_NODES {
-                    break;
-                }
-            }
-            anyhow::ensure!(
-                nodes <= crate::snapshot_retry::STATE_NODES,
-                "single upload receipt exceeds private state shape bound"
-            );
-            ring.receipts.drain(..evict);
-            payload = serde_json::to_vec(&ring).context("serialize shape-bounded receipt ring")?;
-        }
-        crate::snapshot_retry::state_shape(&payload)?;
+    let result = f(history
+        .store
+        .as_mut()
+        .context("upload_history_unavailable")?);
+    if result.is_err() {
+        history.store = None;
+        history
+            .retry_after
+            .insert(state_dir.to_owned(), Instant::now() + REOPEN_AFTER);
     }
-    write_owner_only_file_atomic(&path, &payload).context("persist upload receipt ring")
+    result.map(Some)
 }
 
-fn load_locked(path: &Path) -> Result<PersistedReceiptRing> {
-    if !path.exists() {
-        return Ok(PersistedReceiptRing {
-            schema_version: UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION,
-            receipts: Vec::new(),
-        });
+fn open_history(state_dir: &Path) -> Result<Store> {
+    use std::os::unix::fs::DirBuilderExt;
+    let snapshots = state_dir.join("snapshots");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&snapshots)?;
+    let mut store = Store::open(&Store::path(&snapshots))?;
+    if import_ring(state_dir, &mut store).is_err()
+        && !IMPORT_FAILURE_LOGGED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!("ottto-service: snapshot upload receipt ring import failed; kept for retry");
     }
-    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_RECEIPT_FILE_BYTES) {
-        quarantine_corrupt_file(path);
-        return Ok(PersistedReceiptRing {
-            schema_version: UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION,
-            receipts: Vec::new(),
-        });
-    }
-    let parsed = std::fs::read(path)
+    Ok(store)
+}
+
+/// Import every row of the legacy ring file, oldest first, in one
+/// transaction, then remove the file. Rows an earlier import of the same file
+/// stored are skipped. A failure keeps the file for the next open.
+fn import_ring(state_dir: &Path, store: &mut Store) -> Result<()> {
+    let path = upload_receipts_path(state_dir);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_RING_IMPORT_BYTES,
+        "upload_receipt_ring_unimportable"
+    );
+    let ring = std::fs::read(&path)
         .context("read upload receipt ring")
         .and_then(|bytes| {
-            serde_json::from_slice::<PersistedReceiptRing>(&bytes)
-                .context("parse upload receipt ring")
+            serde_json::from_slice::<RingFile>(&bytes).context("parse upload receipt ring")
         });
-    match parsed {
-        Ok(mut ring) if ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION => {
-            if ring.receipts.len() > UPLOAD_RECEIPT_RING_CAPACITY {
-                let overflow = ring.receipts.len() - UPLOAD_RECEIPT_RING_CAPACITY;
-                ring.receipts.drain(..overflow);
-            }
-            Ok(ring)
-        }
+    let ring = match ring {
+        Ok(ring) if ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION => ring,
         Ok(_) | Err(_) => {
-            quarantine_corrupt_file(path);
-            Ok(PersistedReceiptRing {
-                schema_version: UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION,
-                receipts: Vec::new(),
-            })
+            quarantine_corrupt_file(&path);
+            return Ok(());
         }
+    };
+    let rows = ring
+        .receipts
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<PersistedReceipt>(row).ok())
+        .map(|receipt| {
+            let entity_count = receipt
+                .validated_evidence
+                .as_ref()
+                .map(|evidence| evidence.total_entities)
+                .unwrap_or_else(|| {
+                    let public = &receipt.public;
+                    public.accepted_entities.len()
+                        + public.unchanged_entities.len()
+                        + public.conflict_entities.len()
+                        + public.rejected_entities.len()
+                });
+            encode(&receipt, entity_count as u64)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store.import_ring(&rows)?;
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
+fn encode(receipt: &PersistedReceipt, entity_count: u64) -> Result<Encoded> {
+    let json = serde_json::to_vec(receipt).context("serialize upload receipt")?;
+    let uploaded_at_ns = OffsetDateTime::parse(&receipt.public.uploaded_at, &Rfc3339)
+        .map(|at| clamp_ns(at.unix_timestamp_nanos()))
+        .unwrap_or(0);
+    Encoded::new(
+        uploaded_at_ns,
+        &source_slug(receipt.public.source.clone()),
+        entity_count,
+        &json,
+    )
+}
+
+fn source_slug(source: SourceKind) -> String {
+    match serde_json::to_value(source) {
+        Ok(serde_json::Value::String(slug)) => slug,
+        _ => String::new(),
     }
+}
+
+fn clamp_ns(ns: i128) -> i64 {
+    ns.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 fn quarantine_corrupt_file(path: &Path) {
@@ -989,9 +1065,39 @@ fn quarantine_corrupt_file(path: &Path) {
     let _ = std::fs::rename(path, quarantine);
     if !CORRUPTION_LOGGED.swap(true, Ordering::Relaxed) {
         eprintln!(
-            "ottto-service: corrupt snapshot upload receipt state was quarantined; starting a fresh ring"
+            "ottto-service: corrupt snapshot upload receipt ring was quarantined; it was not imported"
         );
     }
+}
+
+/// Every stored private row, oldest first, for tests that inspect evidence.
+#[cfg(test)]
+pub(crate) fn private_rows_for_test(state_dir: &Path) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut before = None;
+    loop {
+        let page = with_history(state_dir, false, |store| {
+            store.page(&Filter {
+                before,
+                source: None,
+                since_ns: None,
+                limit: UPLOAD_RECEIPT_PAGE_SIZE,
+            })
+        })
+        .unwrap();
+        let Some(page) = page else { break };
+        rows.extend(
+            page.rows
+                .iter()
+                .map(|(_, json)| serde_json::from_slice::<serde_json::Value>(json).unwrap()),
+        );
+        if page.examined < UPLOAD_RECEIPT_PAGE_SIZE {
+            break;
+        }
+        before = page.last_seq;
+    }
+    rows.reverse();
+    rows
 }
 
 fn sanitize_entity_ref(entity: &SnapshotEntityRef) -> UploadReceiptEntityV1 {
@@ -1078,6 +1184,9 @@ fn now_rfc3339() -> String {
 }
 
 #[cfg(test)]
+mod history_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
@@ -1088,7 +1197,7 @@ mod tests {
         ScratchDir::new("ottto-upload-receipts")
     }
 
-    fn response(raw_id: &str) -> SnapshotBatchResponse {
+    pub(super) fn response(raw_id: &str) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
             conflict_rescans: Default::default(),
             accepted: 1,
@@ -1116,7 +1225,7 @@ mod tests {
         }
     }
 
-    fn proof_request(source: &str, cache: bool) -> SnapshotBatchRequest {
+    pub(super) fn proof_request(source: &str, cache: bool) -> SnapshotBatchRequest {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         if !cache {
             item.cache_observations = None;
@@ -1132,7 +1241,10 @@ mod tests {
             client_report: crate::client_report::ClientReport::empty(),
         }
     }
-    fn proof_response(request: &SnapshotBatchRequest, cas: bool) -> SnapshotBatchResponse {
+    pub(super) fn proof_response(
+        request: &SnapshotBatchRequest,
+        cas: bool,
+    ) -> SnapshotBatchResponse {
         let mut ack = response(&request.snapshots[0].source_session_id);
         ack.accepted_entities[0].snapshot_fingerprint =
             request.snapshots[0].snapshot_fingerprint.clone();
@@ -1297,19 +1409,18 @@ mod tests {
             Some((&request, &"a".repeat(64), &"b".repeat(64), true)),
         )
         .unwrap();
-        let private = load_locked(&upload_receipts_path(&dir)).unwrap();
-        assert!(private.receipts[0].validated_evidence.is_some());
+        let private = private_rows_for_test(&dir);
+        assert!(private[0]["validated_evidence"].is_object());
         let public = read(&dir, 500, None, None).unwrap();
         let public_json = serde_json::to_string(&public).unwrap();
         assert!(!public_json.contains("validated_evidence"));
         assert!(!public_json.contains(&first.snapshot_fingerprint));
-        let bytes = std::fs::read(upload_receipts_path(&dir)).unwrap();
-        let disk = String::from_utf8(bytes).unwrap();
+        let disk = serde_json::to_string(&private).unwrap();
         assert!(!disk.contains(&first.source_session_id));
         assert!(!disk.contains(&"e".repeat(64)));
         assert!(!disk.contains("must-not-persist"));
         assert_eq!(
-            std::fs::metadata(upload_receipts_path(&dir))
+            std::fs::metadata(upload_history_path(&dir))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1467,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn private_proof_old_rows_byte_eviction_and_truncation_remain_readable() {
+    fn private_proof_truncation_and_old_ring_rows_remain_readable() {
         let dir = temp_dir();
         let mut request = proof_request("codex", false);
         let first = request.snapshots[0].clone();
@@ -1491,25 +1602,6 @@ mod tests {
         assert_eq!(proof.retained_entities, 50);
         assert_eq!(proof.coverage, "truncated");
         assert!(!proof.entities[1].uploaded_cache_patch_present);
-        {
-            append_success_with_evidence_context(
-                &dir,
-                SourceKind::Codex,
-                51,
-                200,
-                None,
-                &ack,
-                &UploadReceiptContext::default(),
-                Some((&request, &"a".repeat(64), &"b".repeat(64), false)),
-            )
-            .unwrap();
-        }
-        let path = upload_receipts_path(&dir);
-        let row = serde_json::to_value(load_locked(&path).unwrap().receipts.remove(0)).unwrap();
-        let row_bytes = serde_json::to_vec(&row).unwrap().len();
-        let count = ((MAX_RECEIPT_FILE_BYTES as usize - 128) / (row_bytes + 1)).min(500);
-        let seeded = serde_json::json!({"schema_version":1,"receipts":vec![row; count]});
-        std::fs::write(&path, serde_json::to_vec(&seeded).unwrap()).unwrap();
         append_success_with_evidence_context(
             &dir,
             SourceKind::Codex,
@@ -1521,34 +1613,34 @@ mod tests {
             Some((&request, &"a".repeat(64), &"b".repeat(64), false)),
         )
         .unwrap();
-        let ring = load_locked(&upload_receipts_path(&dir)).unwrap();
-        assert!(ring.receipts.len() < 500);
-        assert!(ring.receipts.len() < count + 1);
-        assert!(ring.receipts.last().unwrap().validated_evidence.is_some());
-        assert!(!ring.receipts.is_empty());
-        assert!(
-            std::fs::metadata(upload_receipts_path(&dir)).unwrap().len() <= MAX_RECEIPT_FILE_BYTES
-        );
+        // Rows keep the 50-entity truncation and store the response's total.
+        let stored = private_rows_for_test(&dir);
+        assert_eq!(stored[0]["accepted_entities"].as_array().unwrap().len(), 50);
+        assert_eq!(stored[0]["validated_evidence"]["total_entities"], 51);
+        assert_eq!(super::history_tests::entity_counts(&dir), vec![51]);
+        // A ring row written before private evidence existed imports as is.
         let old = read(&dir, 1, None, None).unwrap().receipts.remove(0);
+        let other = temp_dir();
         std::fs::write(
-            upload_receipts_path(&dir),
+            upload_receipts_path(&other),
             serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":[old]})).unwrap(),
         )
         .unwrap();
-        let migrated = load_locked(&upload_receipts_path(&dir)).unwrap();
-        assert!(migrated.receipts[0].validated_evidence.is_none());
-        assert_eq!(read(&dir, 1, None, None).unwrap().receipts.len(), 1);
+        let migrated = private_rows_for_test(&other);
+        assert!(migrated[0].get("validated_evidence").is_none());
+        assert_eq!(read(&other, 1, None, None).unwrap().receipts[0], old);
+        assert!(!upload_receipts_path(&other).exists());
     }
 
     #[test]
-    fn append_is_private_atomic_bounded_and_sanitized() {
+    fn append_is_private_sanitized_and_keeps_every_attempt() {
         let dir = temp_dir();
         let raw_id = "raw-session-id-must-never-be-stored";
         let context = UploadReceiptContext {
             device_label: Some("  Test\nMac  ".to_string()),
             account_binding: Some(LocalAccountState::Connected),
         };
-        for _ in 0..=UPLOAD_RECEIPT_RING_CAPACITY {
+        for _ in 0..=UPLOAD_RECEIPT_PAGE_SIZE {
             append_success_with_context(
                 &dir,
                 SourceKind::Codex,
@@ -1561,7 +1653,10 @@ mod tests {
             .unwrap();
         }
         let result = read(&dir, 500, None, None).unwrap();
-        assert_eq!(result.receipts.len(), UPLOAD_RECEIPT_RING_CAPACITY);
+        assert_eq!(result.receipts.len(), UPLOAD_RECEIPT_PAGE_SIZE);
+        let older = read_page(&dir, 500, None, None, result.next_before).unwrap();
+        assert_eq!(older.receipts.len(), 1, "no attempt is evicted");
+        assert_eq!(older.next_before, None);
         assert_eq!(
             result.receipts[0].accepted_entities[0]
                 .source_session_id_hash
@@ -1577,10 +1672,10 @@ mod tests {
             result.receipts[0].account_binding,
             Some(LocalAccountState::Connected)
         );
-        let bytes = std::fs::read(upload_receipts_path(&dir)).unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains(raw_id));
+        let private = serde_json::to_string(&private_rows_for_test(&dir)).unwrap();
+        assert!(!private.contains(raw_id));
         assert_eq!(
-            std::fs::metadata(upload_receipts_path(&dir))
+            std::fs::metadata(upload_history_path(&dir))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1591,7 +1686,22 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(state_files, vec![UPLOAD_RECEIPTS_FILENAME]);
+        assert_eq!(state_files, vec!["snapshots"]);
+    }
+
+    #[test]
+    fn an_idle_source_keeps_its_receipt_past_500_newer_attempts() {
+        let dir = temp_dir();
+        append_transport_error(&dir, SourceKind::Pi, 7).unwrap();
+        for n in 0..500 {
+            append_transport_error(&dir, SourceKind::Codex, n).unwrap();
+        }
+        let pi = read(&dir, 500, None, Some(SourceKind::Pi)).unwrap();
+        assert_eq!(pi.receipts.len(), 1, "the older Pi attempt must be kept");
+        assert_eq!(pi.receipts[0].batch_item_count, 7);
+        let codex = read(&dir, 500, None, Some(SourceKind::Codex)).unwrap();
+        assert_eq!(codex.receipts.len(), 500);
+        assert_eq!(codex.receipts[0].batch_item_count, 499);
     }
 
     #[test]

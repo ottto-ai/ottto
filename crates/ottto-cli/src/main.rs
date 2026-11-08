@@ -320,6 +320,12 @@ struct ReceiptsArgs {
     since: Option<String>,
     #[arg(long, value_enum, help = "Filter receipts to one source")]
     source: Option<SourceArg>,
+    #[arg(
+        long,
+        value_name = "CURSOR",
+        help = "Return older receipts: the next_before value of a previous page"
+    )]
+    before: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -2245,6 +2251,7 @@ fn local_command(command: Command) -> LocalControlCommand {
             limit: args.limit,
             since: non_empty_option(args.since.as_deref()),
             source: args.source.map(Into::into),
+            before: args.before,
         },
         Command::Apps(args) => match args.command {
             None => LocalControlCommand::Status {
@@ -2719,6 +2726,9 @@ fn human_receipts(payload: &serde_json::Value) -> String {
             format!("{accepted}/{total}"),
             sanitize_for_terminal(request_id),
         ));
+    }
+    if let Some(cursor) = payload.get("next_before").and_then(|value| value.as_u64()) {
+        lines.push(format!("Older receipts: ottto receipts --before {cursor}"));
     }
     lines.join("\n")
 }
@@ -3402,6 +3412,7 @@ mod tests {
                 limit: 50,
                 since: None,
                 source: None,
+                before: None,
             }
         );
         let error = daemon_unavailable_error(

@@ -47,6 +47,7 @@ mod kinds_files;
 mod kinds_misc;
 mod mapper;
 mod sqlite;
+pub(crate) use sqlite::history as upload_history;
 mod tail;
 use kinds::KindCx;
 #[cfg(test)]

@@ -1066,15 +1066,19 @@ fn handle_command(
             limit,
             since,
             source,
+            before,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            if limit == 0
-                || usize::from(limit) > crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
-            {
+            if limit == 0 || usize::from(limit) > crate::upload_receipts::UPLOAD_RECEIPT_PAGE_SIZE {
                 return Err(LocalApiError::InvalidRequest(format!(
                     "receipts limit must be between 1 and {}",
-                    crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
+                    crate::upload_receipts::UPLOAD_RECEIPT_PAGE_SIZE
                 )));
+            }
+            if before.is_some_and(|before| i64::try_from(before).is_err()) {
+                return Err(LocalApiError::InvalidRequest(
+                    "receipts before is not a valid cursor".to_string(),
+                ));
             }
             if let Some(value) = since.as_deref() {
                 time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
@@ -1085,11 +1089,12 @@ fn handle_command(
                     })?;
             }
             to_value(
-                crate::upload_receipts::read(
+                crate::upload_receipts::read_page(
                     &default_support_dir(),
                     limit,
                     since.as_deref(),
                     source,
+                    before,
                 )
                 .map_err(|_| {
                     LocalApiError::LocalOperationFailed(
@@ -20091,6 +20096,7 @@ for line in sys.stdin:
                     limit: 10,
                     since: None,
                     source: Some(SourceKind::Codex),
+                    before: None,
                 },
             },
         );

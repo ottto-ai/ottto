@@ -132,8 +132,10 @@ daemon prunes accepted hashes that are no longer present in the current scan, so
 a permanently invalid session cannot make the checkpoint grow with every
 historical revision.
 
-Snapshot upload receipts share a bounded, owner-only atomic local ring: at
-most 500 receipts and 4 MiB. A request-specific validated ACK may retain a
+Snapshot upload receipts, one per batch attempt, live in an owner-only local
+SQLite file. Each new receipt removes receipts older than 30 days in the same
+write, except each source's newest receipt, which stays whatever its age.
+Removed rows are zeroed in place. A request-specific validated ACK may retain a
 private content-free annotation with full semantic fingerprints, body-witness
 versions and hashes, one-way session and destination identifiers, hashed
 accepted-head or conflict-challenge references, occurrence counts, uploaded

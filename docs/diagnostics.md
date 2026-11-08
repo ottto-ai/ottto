@@ -1084,17 +1084,35 @@ and installation ids out of diagnostics summaries and support handoffs.
 
 ## Upload Receipts
 
-An upload receipt is a local, bounded record of one snapshot batch attempt and
-the backend acknowledgement, when one was returned. Use receipts to confirm
-when a source uploaded, how many entities the backend accepted, and whether the
-backend shed, rejected, or partially accepted a batch:
+An upload receipt is a local record of one snapshot batch attempt and the
+backend acknowledgement, when one was returned. Every attempt gets one, whatever
+its outcome: accepted, partial, shed, rejected, authorization refused, transport
+error, or a response that did not validate. Use receipts to confirm when a source
+uploaded, how many entities the backend accepted, and whether the backend shed,
+rejected, or partially accepted a batch:
 
 ```bash
 ottto receipts --limit 20
 ottto receipts --json --since 2026-09-10T00:00:00Z --source codex
+ottto receipts --json --before 41234
 ```
 
-The daemon keeps at most 500 receipts. Public receipt output replaces source
+Receipts live in an owner-only SQLite file, `upload_history.sqlite`, in the
+daemon's `snapshots` directory. Each new receipt removes receipts older than 30
+days in the same write, except each source's newest receipt, which is kept
+whatever its age so a source that stopped uploading still shows its last
+attempt. Nothing else deletes receipts and no timer runs; a wall-clock jump
+backward keeps receipts longer, and one forward expires them early (each
+source's newest still stays). The file is not compacted: freed space is zeroed
+and reused, so it stays near its 30-day size. A history write that fails is
+logged once and never holds, slows or retries an upload; the attempt is then
+missing from the history. The receipt ring file earlier releases kept is
+imported once, oldest first, and then removed.
+
+Output is newest first in the order attempts were recorded. One page returns at
+most `--limit` receipts (at most 500, reported as `ring_capacity`). When older
+receipts may follow, the JSON carries `next_before`; pass it as `--before` to
+read the next page. Public receipt output replaces source
 session ids with a 12-hex SHA-256 prefix and limits snapshot fingerprints to
 12 hex characters. Raw source session ids are never stored in receipts.
 Request bodies, authorization headers, tokens,
@@ -1137,12 +1155,14 @@ omit the optional `X-Request-ID` header, in which case the field is `null`.
 }
 ```
 
-The private, owner-only receipt file may additionally retain content-free
+The private, owner-only history file may additionally retain content-free
 request-specific ACK evidence after the existing validator succeeds. This
 annotation contains full semantic fingerprints and body-witness hashes,
 one-way session/destination identifiers, hashed head references, occurrence
 counts, uploaded cache-patch presence, two numeric usage scalars and explicit
-retained-coverage limits. It shares the existing ring's 500-receipt and 4 MiB limits and retains at most 50 entity records per receipt.
+retained-coverage limits. It follows the receipt's 30-day retention, and each
+receipt retains at most 50 entity records; the history also stores the number
+of entities the response named.
 It is excluded from public receipt output, local-control responses and
 diagnostics bundles. Raw head tokens, session ids, request bodies and
 credentials are not retained.

@@ -2540,7 +2540,6 @@ impl SnapshotApiClient {
                             server_request_id.as_deref(),
                             &response,
                             enforce_head_cas,
-                            retry.is_some(),
                         );
                         self.record_composition_start_verdicts(
                             request,
@@ -2556,7 +2555,6 @@ impl SnapshotApiClient {
                             status,
                             server_request_id.as_deref(),
                             None,
-                            retry.is_some(),
                         );
                         Err(anyhow::Error::new(SnapshotAckRejected {
                             reason: "snapshot batch response could not be decoded",
@@ -2578,7 +2576,6 @@ impl SnapshotApiClient {
                     shed.downcast_ref::<UploadShed>()
                         .and_then(|shed| shed.retry_after)
                         .map(|retry_after| retry_after.as_secs()),
-                    retry.is_some(),
                 );
                 Err(shed)
             }
@@ -2592,7 +2589,6 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
-                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(BatchAuthorizationRejected {
                     status: code,
@@ -2607,7 +2603,6 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
-                    retry.is_some(),
                 );
                 // Keep the HTTP client's existing complete-body size bound.
                 // A failed read has no usable locations and stays whole-batch.
@@ -2625,7 +2620,6 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
-                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(UploadFailureDiagnostics::http(
                     "local snapshot upload",
@@ -2635,7 +2629,7 @@ impl SnapshotApiClient {
                 )))
             }
             Err(error) => {
-                self.record_batch_transport_error(request, retry.is_some());
+                self.record_batch_transport_error(request);
                 Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
                     "local snapshot upload",
                     "snapshot_batch",
@@ -2712,7 +2706,6 @@ impl SnapshotApiClient {
         server_request_id: Option<&str>,
         response: &SnapshotBatchResponse,
         enforce_head_cas: bool,
-        bounded: bool,
     ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
@@ -2721,12 +2714,7 @@ impl SnapshotApiClient {
             b"ottto.validated_receipt.api_destination:v1",
             &self.api_base_url,
         );
-        let append = if bounded {
-            crate::upload_receipts::append_success_with_evidence_context_bounded
-        } else {
-            crate::upload_receipts::append_success_with_evidence_context
-        };
-        if append(
+        if crate::upload_receipts::append_success_with_evidence_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -2747,7 +2735,7 @@ impl SnapshotApiClient {
         )
         .is_err()
         {
-            eprintln!("ottto-service: snapshot upload receipt persistence failed");
+            crate::upload_receipts::note_append_failure();
         }
     }
 
@@ -2758,17 +2746,11 @@ impl SnapshotApiClient {
         status: u16,
         server_request_id: Option<&str>,
         retry_after_seconds: Option<u64>,
-        bounded: bool,
     ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        let append = if bounded {
-            crate::upload_receipts::append_http_failure_with_context_bounded
-        } else {
-            crate::upload_receipts::append_http_failure_with_context
-        };
-        if append(
+        if crate::upload_receipts::append_http_failure_with_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -2780,20 +2762,15 @@ impl SnapshotApiClient {
         )
         .is_err()
         {
-            eprintln!("ottto-service: snapshot upload receipt persistence failed");
+            crate::upload_receipts::note_append_failure();
         }
     }
 
-    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest, bounded: bool) {
+    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        let append = if bounded {
-            crate::upload_receipts::append_transport_error_with_context_bounded
-        } else {
-            crate::upload_receipts::append_transport_error_with_context
-        };
-        if append(
+        if crate::upload_receipts::append_transport_error_with_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -2801,7 +2778,7 @@ impl SnapshotApiClient {
         )
         .is_err()
         {
-            eprintln!("ottto-service: snapshot upload receipt persistence failed");
+            crate::upload_receipts::note_append_failure();
         }
     }
 
@@ -5117,11 +5094,7 @@ mod tests {
                 .validate_entity_ack_with_head_cas(&request, true)
                 .unwrap();
         }
-        let disk: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(crate::upload_receipts::upload_receipts_path(&dir)).unwrap(),
-        )
-        .unwrap();
-        let rows = disk["receipts"].as_array().unwrap();
+        let rows = crate::upload_receipts::private_rows_for_test(&dir);
         assert_eq!(rows.len(), 2);
         assert_ne!(
             rows[0]["validated_evidence"]["destination_namespace_hash"],

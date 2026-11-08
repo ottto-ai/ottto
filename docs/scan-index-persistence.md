@@ -502,8 +502,8 @@ exact bytes were written. A save whose serialized ledger equals the bytes alread
 on disk writes neither file and claims no generation: under the progress lock, the
 current receipt must still seal those bytes, and only the directory sync is
 retried. Sources not on state v2 do not create companions.
-The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
-recovery or substitute for a missing exact receipt.
+The diagnostic upload history (`ottto receipts`) is truncated per row and expires
+after 30 days; it cannot authorize recovery or substitute for a missing exact receipt.
 
 For **receipt-first** crashes, replay the newest companion before applying any
 source-DB handoff. Only its exact predecessor or replacement is accepted; replay

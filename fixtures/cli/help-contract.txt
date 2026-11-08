@@ -61,6 +61,7 @@ Options:
       --since <RFC3339>  Return receipts uploaded at or after this timestamp
       --source <SOURCE>  Filter receipts to one source [possible values: codex, claude-code, pi]
       --watch            Emit NDJSON progress events and a final event; requires --json
+      --before <CURSOR>  Return older receipts: the next_before value of a previous page
   -h, --help             Print help
 ### ottto provider-requests --help
 Count this Mac's logged calls to OpenAI and Anthropic per day
