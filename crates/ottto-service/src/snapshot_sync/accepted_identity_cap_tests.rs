@@ -180,6 +180,8 @@ struct Seeded {
     rows: Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
     /// The last sibling, tagged A and never changed, as it was ACKed.
     control: Option<RouteResult>,
+    /// That sibling's ACKed body, serialized.
+    control_bytes: Option<Vec<u8>>,
 }
 
 /// ROOT: r0 under S, r1 under A, gap r2, then a switch to C at r3 and a side
@@ -213,6 +215,7 @@ fn seed(name: &str, siblings: usize) -> Seeded {
     let mut prior = settle(&c, &ScanIndex::default(), first, &mut progress);
     progress = restarted(&route, progress);
     let mut control = None;
+    let mut control_bytes = None;
     for n in 0..siblings {
         let id = sibling(n);
         c.root(&id, &line(&id, &format!("s{n}"), &at("07:30:00"), 5));
@@ -239,6 +242,7 @@ fn seed(name: &str, siblings: usize) -> Seeded {
             let mut sent = only(&page, &last);
             sent.finish();
             control = Some(routed(&sent, sent.upload_policy));
+            control_bytes = Some(serde_json::to_vec(body(&sent, &last).unwrap()).unwrap());
         }
         prior = settle(&c, &prior, page, &mut progress);
         progress = restarted(&route, progress);
@@ -252,6 +256,7 @@ fn seed(name: &str, siblings: usize) -> Seeded {
         progress,
         rows,
         control,
+        control_bytes,
     }
 }
 
@@ -295,12 +300,29 @@ fn session_totals(item: &SnapshotItem) -> serde_json::Value {
     ])
 }
 
-/// Pins the current fallback for a refused share: the body sends the refused
-/// amount untagged with a refusal count, and the receiver places it at the
-/// session's starting binding, which here is S, not the frozen authority A.
-/// The expected body is the unprotected one with every share of the new
-/// authority B moved to the untagged share; S and C keep theirs. A ruling on
-/// that fallback changes only its disclosure, never this path.
+/// The login hashes any usage row or identity part of `item` carries.
+fn wire_logins(item: &SnapshotItem) -> BTreeSet<String> {
+    let item = serde_json::to_value(item).unwrap();
+    let buckets = item["usage_buckets"].as_array().into_iter().flatten();
+    let rows = buckets.flat_map(|bucket| bucket["model_usage"].as_array().into_iter().flatten());
+    rows.flat_map(|row| {
+        let parts = row["identity_parts"].as_array().into_iter().flatten();
+        std::iter::once(row).chain(parts)
+    })
+    .filter_map(|tagged| {
+        tagged["account_identifier_hash"]
+            .as_str()
+            .map(str::to_owned)
+    })
+    .collect()
+}
+
+/// The accepted placement for a refused share: the body sends the refused
+/// amount as an untagged part with a refusal count, and the receiver keeps
+/// that part at the session's starting binding, here S (not the frozen
+/// authority A, not the new authority B). No deferral, hold or resend
+/// applies. The expected body is the unprotected one with every share of B
+/// moved to the untagged part; S and C keep theirs, and no part names A or B.
 fn assert_refused_share_takes_start_binding_fallback(
     item: &SnapshotItem,
     unprotected: &SnapshotItem,
@@ -327,6 +349,19 @@ fn assert_refused_share_takes_start_binding_fallback(
         !placed.contains_key(&own(A)),
         "the frozen authority is not restored"
     );
+    assert!(
+        placed
+            .get(&untagged())
+            .is_some_and(|requests| *requests > 0),
+        "the refused share is the untagged part"
+    );
+    let logins = wire_logins(item);
+    for (who, _) in [A, B] {
+        assert!(
+            !logins.contains(&who.to_string().repeat(64)),
+            "no part carries {who}: {logins:?}"
+        );
+    }
 }
 
 /// Equal row and session totals; placement as pinned above, or unchanged.
@@ -398,6 +433,11 @@ fn revisit_case(name: &str, siblings: usize, growth: Growth) {
             let id = sibling(siblings - 1);
             let now = only(&cold_page, &id);
             assert_equivalent(control, &routed(&now, now.upload_policy));
+            assert_eq!(
+                serde_json::to_vec(body(&now, &id).unwrap()).unwrap(),
+                f.control_bytes.as_deref().unwrap(),
+                "the unchanged sibling's body is byte-identical to the one it ACKed"
+            );
         }
         let settled = settle(&f.c, &f.prior, tail_page, &mut f.progress);
         let quiet_owner = owner(&settled);
@@ -452,11 +492,14 @@ fn identity_cap_unchanged_authority_control() {
     revisit_case("identity-cap-control", 16, Growth::Unchanged);
 }
 
-/// [money] Placement pin on one session: the starting binding S differs from
-/// the frozen authority A, and the refused share takes today's fallback.
+/// [money] Accepted placement of a refused share, beside one tagged sibling:
+/// the starting binding S differs from the frozen authority A, the re-tag
+/// A→B is refused, the refused share is the untagged part (kept at S by the
+/// receiver), no part names A or B, totals are equal, and the sibling's body
+/// is byte-identical to the one it ACKed.
 #[test]
 fn identity_cap_refused_share_start_binding_pin() {
-    revisit_case("identity-cap-start-binding", 0, Growth::NextHour);
+    revisit_case("identity-cap-start-binding", 1, Growth::NextHour);
 }
 
 /// [money] An unreadable identity row loses protection for its own session
