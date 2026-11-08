@@ -291,6 +291,23 @@ class MoveAccepts(Base):
         head |= {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
         self.accept(base, head)
 
+    def test_crate_macro_below_the_second_glue_files_change(self):
+        # Two glue files, the first gains a `use` alias: the second still sees the crate macro-alias names.
+        lib = 'macro_rules! m {\n    () => {\n        0\n    };\n}\n\nmod snapshots;\n'
+        dest = 'pub(crate) fn here() -> u8 {\n    0\n}\n\npub(crate) fn two() -> u8 {\n    m!()\n}\n'
+        base = files(**{'lib.rs': lib, 'snapshots/dest.rs': dest})
+        head = moved(base, BASIC_MOVE) | {SRC + 'snapshots.rs': ALIAS_PARENT,
+                                          SRC + 'snapshots/dest.rs': 'pub(crate) mod old;\n\n' + dest}
+        self.accept(base, head)
+
+    def test_cast_before_not_equal_invokes_no_macro(self):
+        lib = 'macro_rules! differs {\n    ($x:expr, $y:expr) => {\n        $x.len() as u64 != $y\n    };\n}\n\nmod snapshots;\n'
+        old = OLD + '\npub(crate) fn g(v: &[u8]) -> bool {\n    assert!(v.len() as u64 != 3);\n    differs!(v, 2)\n}\n'
+        base = files(**{'lib.rs': lib, 'snapshots/old.rs': old})
+        head = moved(base, BASIC_MOVE) | {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
+        self.accept(base, head)
+
+
 class MoveRejects(Base):
     def basic_head(self, base, **extra):
         head = moved(base, BASIC_MOVE) | {SRC + 'snapshots.rs': ALIAS_PARENT, SRC + 'snapshots/dest.rs': DEST_WITH_OLD}
@@ -714,6 +731,26 @@ class MoveRejects(Base):
             with self.subTest(needle=needle):
                 base = files(**{'lib.rs': lib + 'mod snapshots;\n', 'snapshots/old.rs': OLD + '\n' + extra})
                 self.reject(base, self.basic_head(base), needle)
+
+    def test_alias_seen_after_two_glue_files(self):
+        # The crate macro-alias names reach the rule-3 check of the new parent after the glue-file loop.
+        lib = ('macro_rules! m {\n    () => {\n        0\n    };\n}\npub(crate) use m;\n\n'
+               'macro_rules! fields {\n    () => {\n        const _: u8 = a!();\n    };\n}\n\nmod snapshots;\n')
+        dest = 'fields!();\n\npub(crate) fn here() -> u8 {\n    0\n}\n'
+        base = files(**{'lib.rs': lib, 'snapshots/dest.rs': dest,
+                        'snapshots/caller.rs': 'use crate::m as a;\n\n' + CALLER})
+        head = self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'})
+        self.reject(base, head, 'to a!, a `use .. as` alias')
+
+    def test_macro_invoked_through_an_alias_named_like_a_primitive(self):
+        exported = 'macro_rules! m {\n    () => {\n        0\n    };\n}\npub(crate) use m;\n\n'
+        in_rules = 'macro_rules! rename {\n    () => {\n        use crate::m as u64;\n    };\n}\n\n'
+        old = OLD + '\npub(crate) fn g() -> u8 {\n    u64!()\n}\n'
+        for lib, caller in ((exported, 'use crate::m as u64;\n\n' + CALLER), (exported + in_rules, CALLER)):
+            with self.subTest(caller=caller[:20]):
+                base = files(**{'lib.rs': lib + 'mod snapshots;\n', 'snapshots/old.rs': old,
+                                'snapshots/caller.rs': caller})
+                self.reject(base, self.basic_head(base), 'u64! is invoked through a `use .. as` alias')
 
     def test_f4_glob_visibility_across_contexts(self):
         base = files(**{'snapshots/old.rs': OLD + '\nuse crate::snapshots::caller::*;\n'})

@@ -223,6 +223,18 @@ def code_index(lx: rst.Lexed) -> list[int]:
     return [i for i, token in enumerate(lx.tokens) if token.kind not in TRIVIA]
 
 
+def invokes_macro(lx: rst.Lexed, index: int, hi: int | None = None) -> bool:
+    """Token `index` names a macro invocation: a non-keyword identifier, `!`, then `(`, `[` or `{` (or `$`, a
+    transcriber's group); `x as u64 != y` invokes nothing."""
+    if not lx.is_ident(index) or lx.tok(index) in KEYWORDS:
+        return False
+    bang = lx.next_code(index + 1, hi)
+    if not lx.is_punct(bang, "!"):
+        return False
+    group = lx.next_code(bang + 1, hi)
+    return any(lx.is_punct(group, char) for char in "([{$")
+
+
 def is_path_sep(lx: rst.Lexed, index: int) -> bool:
     """`::` starting at token `index` (two adjacent `:` tokens)."""
     return lx.is_punct(index, ":") and lx.is_punct(index + 1, ":")
@@ -848,7 +860,8 @@ def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int) -> MacroDef:
             nxt = lx.next_code(k + 1, close)
             if not dollar:
                 definition.idents.add(word)
-            if dollar and lx.is_punct(nxt, "!"):
+            if dollar and lx.is_punct(nxt, "!") and any(lx.is_punct(lx.next_code(nxt + 1, close), char)
+                                                        for char in "([{$"):
                 definition.forwards = True
             if word == "super":
                 definition.has_super = True
@@ -866,7 +879,7 @@ def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int) -> MacroDef:
             if word == "use" and any(lx.is_punct(m, "*") and not lx.is_punct(m - 1, "$")
                                      for m in range(k, _statement_end(lx, k, close))):
                 definition.glob_use = True
-            if lx.is_punct(nxt, "!") and word not in KEYWORDS and not dollar:
+            if not dollar and invokes_macro(lx, k, close):
                 definition.invoked.add(word)
     return definition
 
@@ -935,7 +948,7 @@ class UseScan:
     unread: list[tuple[str, set[str]]] = field(default_factory=list)  # (where, identifiers) of unreadable `use`s
     renames: list[tuple[str, str]] = field(default_factory=list)  # (name, where) of every `use .. as name`
     macro_renames: list[tuple[str, str]] = field(default_factory=list)  # the renames not of `{self as name}`
-    other_renames: list[tuple[str, str]] = field(default_factory=list)  # `extern crate .. as`, `as` in macro bodies
+    other_renames: list[tuple[str, str]] = field(default_factory=list)  # `extern crate .. as`, macro-body `use .. as`
     modules: list[tuple[str, str]] = field(default_factory=list)  # (name, where) of every `mod` item
     proc_macros: list[str] = field(default_factory=list)
 
@@ -967,17 +980,19 @@ def _use_scan(tree: rst.Tree, source: rst.Source) -> UseScan:
         info = shape_of(lx)
         rules = [(first, last, what) for first, last, what in info.opaque if what == "macro_rules!"]
         code = code_index(lx)
+        use_end = -1  # last token of the latest `use` statement (an `as` there renames; elsewhere it casts)
         for pos, k in enumerate(code):
             where = f"{path}:{lx.line(lx.tokens[k].start)}"
             nxt = code[pos + 1] if pos + 1 < len(code) else len(lx.tokens)
             if lx.is_ident(k, "as") and lx.is_ident(nxt) and (
-                    inside(rules, k) or [lx.tok(i) for i in code[max(0, pos - 3):pos - 1]] == ["extern", "crate"]):
+                    (k <= use_end and inside(rules, k))
+                    or [lx.tok(i) for i in code[max(0, pos - 3):pos - 1]] == ["extern", "crate"]):
                 scan.other_renames.append((lx.tok(nxt), where))
             if lx.is_ident(k, "mod") and lx.is_ident(nxt):
                 scan.modules.append((lx.tok(nxt), where))
             if not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or lx.is_punct(nxt, "<"):
                 continue
-            last = min(_statement_end(lx, k, len(lx.tokens)), len(lx.tokens) - 1)
+            last = use_end = min(_statement_end(lx, k, len(lx.tokens)), len(lx.tokens) - 1)
             try:
                 leaves = use_tree(lx, k, last, lx.line(lx.tokens[k].start))
             except Unproven:
@@ -1661,17 +1676,17 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
             result.fail(f"{path}: edited beyond mod items and aliases: {problem}")
         _check_line_shift(path, old_lx, new_lx, base_macros | head_macros, aliases, result)
         inserted = {kept[index] for index in new_rows}
-        aliases = []
+        added_uses = []
         covered: set[int] = set()
         for item in new_lx.items:
             span = set(range(new_lx.line(item.start) - 1, new_lx.line(item.end)))
             if span <= inserted and item.kind == "use":
-                aliases.append(item)
+                added_uses.append(item)
                 covered |= span
         if covered != inserted:
             result.fail(f"{path}: added lines that are not whole `use` items: "
                         f"{sorted(index + 1 for index in inserted - covered)[:5]}")
-        for alias in aliases:
+        for alias in added_uses:
             alias_total += _check_alias(path, alias, roots, head_tree, head, h_ctx.module, result)
 
     # Names, visibility, attributes, textual macros.
@@ -1789,11 +1804,9 @@ def _check_line_shift(path, old_lx, new_lx, macros, aliases, result) -> None:
                  min(len(old_rows), len(new_rows))) + 1
     for lx in (old_lx, new_lx):
         for k in code_index(lx):
-            if not lx.is_ident(k) or lx.line(lx.tokens[k].start) < first:
+            if not invokes_macro(lx, k) or lx.line(lx.tokens[k].start) < first:
                 continue
             word = lx.tok(k)
-            if not lx.is_punct(lx.next_code(k + 1), "!") or word in KEYWORDS:
-                continue
             located = word in LOCATION_MACROS or any(d.location for d in macro_closure(word, macros)[0])
             if located or closure_gap(word, macros, aliases):
                 result.fail(f"rule 7 (location): {path}:{lx.line(lx.tokens[k].start)}: {word}! sits below a "
@@ -2067,8 +2080,8 @@ def _check_moved_file(src, lx, info, root, macros, aliases, result) -> None:
                 continue
             if definition.has_super:
                 result.fail(f"rule 2 (macros): {src}: macro_rules! {name} has `super` in a transcriber")
-    invoked = {lx.tok(k) for k in code if lx.is_ident(k) and lx.tok(k) not in KEYWORDS
-               and lx.is_punct(lx.next_code(k + 1), "!") and not inside([(a, b, "") for a, b in macro_bodies], k)}
+    invoked = {lx.tok(k) for k in code if invokes_macro(lx, k)
+               and not inside([(a, b, "") for a, b in macro_bodies], k)}
     for name in sorted(invoked):
         gap = closure_gap(name, macros, aliases)
         if gap:
@@ -2309,8 +2322,7 @@ def _absolutize_attrs(path: str, old: rst.Lexed, info: Shape, changed: list[int]
     bodies = [(first, last, what) for first, last, what in info.opaque if what == "macro_rules!"]
     for first, last in spans:
         for k in range(first, last + 1):
-            if old.is_ident(k) and old.tok(k) not in KEYWORDS and old.is_punct(old.next_code(k + 1), "!") \
-                    and not inside(bodies, k):
+            if invokes_macro(old, k) and not inside(bodies, k):
                 gap = closure_gap(old.tok(k), macro_defs, aliases)
                 if gap:
                     result.fail(f"rule 2 (macros): {path}:{old.line(old.tokens[k].start)}: {gap}")
@@ -2329,7 +2341,7 @@ def _check_column_shift(where: str, old: rst.Lexed, last: int, macro_defs, alias
     k = last + 1
     while k < len(old.tokens) and old.line(old.tokens[k].start) == line:
         if old.is_ident(k) and (location_at(old, k) or (
-                old.is_punct(old.next_code(k + 1), "!") and old.tok(k) not in KEYWORDS
+                invokes_macro(old, k)
                 and (any(d.location for d in macro_closure(old.tok(k), macro_defs)[0])
                      or closure_gap(old.tok(k), macro_defs, aliases)))):
             result.fail(f"rule 7 (location): {where}: `{old.tok(k)}` after the replaced chain on the same line "
