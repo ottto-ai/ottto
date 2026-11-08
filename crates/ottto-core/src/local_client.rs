@@ -175,11 +175,11 @@ mod tests {
     #[test]
     fn default_socket_path_uses_env_override() {
         let old = std::env::var(OTTTO_SOCKET_ENV).ok();
-        std::env::set_var(OTTTO_SOCKET_ENV, "/tmp/ottto-test.sock");
+        unsafe { std::env::set_var(OTTTO_SOCKET_ENV, "/tmp/ottto-test.sock") };
         assert_eq!(default_socket_path(), PathBuf::from("/tmp/ottto-test.sock"));
         match old {
-            Some(value) => std::env::set_var(OTTTO_SOCKET_ENV, value),
-            None => std::env::remove_var(OTTTO_SOCKET_ENV),
+            Some(value) => unsafe { std::env::set_var(OTTTO_SOCKET_ENV, value) },
+            None => unsafe { std::env::remove_var(OTTTO_SOCKET_ENV) },
         }
     }
 

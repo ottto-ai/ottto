@@ -237,7 +237,7 @@ fn command_succeeded(program: &str, args: &[&str]) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn ottto_legacy_smappservice_status(plist_name: *const std::os::raw::c_char) -> i32;
     fn ottto_unregister_legacy_smappservice(plist_name: *const std::os::raw::c_char) -> i32;
 }

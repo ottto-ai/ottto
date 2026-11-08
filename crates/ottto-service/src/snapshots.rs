@@ -37,13 +37,13 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
 macro_rules! discovery_retention {
-    ($index:expr, $growth:expr) => {
+    ($index:expr_2021, $growth:expr_2021) => {
         $crate::snapshots::DiscoveryRetention {
             growth: Some($growth),
             ..discovery_retention!($index)
         }
     };
-    ($index:expr) => {
+    ($index:expr_2021) => {
         $crate::snapshots::DiscoveryRetention {
             files: &$index.files,
             confirmed_empty: &$index.confirmed_empty_files,
@@ -61,7 +61,7 @@ macro_rules! discovery_retention {
 macro_rules! process_state {
     (
         $(#[$attr:meta])*
-        $vis:vis fn $with:ident: $ty:ty = $init:expr; clear_poison: $clear:literal
+        $vis:vis fn $with:ident: $ty:ty = $init:expr_2021; clear_poison: $clear:literal
     ) => {
         $(#[$attr])*
         $vis fn $with<T>(body: impl FnOnce(&mut $ty) -> T) -> T {
@@ -2306,7 +2306,7 @@ pub(crate) fn state_v2_baseline_release(
 pub(crate) fn state_v2_side_effect_guard(
     path: &Path,
     index: &ScanIndex,
-) -> impl Fn() -> Result<()> {
+) -> impl Fn() -> Result<()> + use<> {
     let runtime = index.v2().persistence_v2.clone();
     // This guard belongs to this graph, not to the mutable shared connection.
     // After adopting a successful save, construct a new guard for further IO.
@@ -2474,7 +2474,7 @@ pub(crate) use state_v2::{
 pub(crate) fn state_v2_recovery_save_guard(
     path: &Path,
     index: &ScanIndex,
-) -> Result<Option<impl Fn() -> Result<()>>> {
+) -> Result<Option<impl Fn() -> Result<()> + use<>>> {
     state_v2::recovery_save_guard(path, index)
 }
 

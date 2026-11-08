@@ -4503,7 +4503,7 @@ mod tests {
             .unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
             let previous_search_path = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
-            std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &root);
+            unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &root) };
             Self {
                 root,
                 previous_search_path,
@@ -4552,8 +4552,8 @@ mod tests {
     impl Drop for CloudCliFixture {
         fn drop(&mut self) {
             match self.previous_search_path.take() {
-                Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
-                None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+                Some(value) => unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value) },
+                None => unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") },
             }
             // Even a failing oracle releases the finite escaped fixture. All
             // fake processes also self-terminate after four seconds.

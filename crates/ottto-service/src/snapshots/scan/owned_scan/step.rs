@@ -1689,8 +1689,7 @@ impl OwnedSourceScan {
                             // no reduction (its replay is joined).
                             cursor_eof_applied = Some(publication.eof_applied());
                             cursor_certificate = Some(
-                                Some(checkpoint)
-                                    .filter(|_| census_trusted && active.group.is_none()),
+                                (census_trusted && active.group.is_none()).then_some(checkpoint),
                             );
                             cursor_publication = Some(publication);
                             cursor_fragment = fragment;

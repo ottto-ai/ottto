@@ -105,7 +105,7 @@ pub(super) fn record(counts: &Counts) {
             counts.copy_invalidated_rows,
             counts.copy_invalidated_unfit,
         ]) {
-            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
+            let _ = counter.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }

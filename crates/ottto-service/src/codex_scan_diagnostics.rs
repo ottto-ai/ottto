@@ -86,7 +86,7 @@ thread_local! {
 
 fn begin_census_attempt() {
     with_attempt_counter(|counter| {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         });
     });

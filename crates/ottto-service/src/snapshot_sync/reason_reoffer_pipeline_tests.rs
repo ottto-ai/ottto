@@ -476,7 +476,7 @@ impl ReofferPipeline {
     fn hold_state_dir_lock(&mut self) {
         self.support = self.support.canonicalize().unwrap();
         // The fixture's existing environment guard restores this on drop.
-        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support);
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support) };
         crate::locked_state_dir::test_locks::hold(&self.support);
     }
 

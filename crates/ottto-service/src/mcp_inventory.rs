@@ -3322,7 +3322,7 @@ url = "https://unset.test/mcp"
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
             let prev = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self {
                 key: key.to_string(),
                 prev,
@@ -3333,8 +3333,8 @@ url = "https://unset.test/mcp"
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                None => unsafe { std::env::remove_var(&self.key) },
             }
         }
     }

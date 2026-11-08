@@ -761,7 +761,7 @@ mod tests {
         std::fs::create_dir_all(support.join("empty-bin")).expect("support");
         // No `security` on the search path: no keychain is ever queried.
         let previous_search = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
-        std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin"));
+        unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin")) };
         let launcher = std::sync::Arc::new(SlowLauncher {
             launches: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -809,8 +809,8 @@ mod tests {
         );
         wait_until_idle("race-slot");
         match previous_search {
-            Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
-            None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+            Some(value) => unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value) },
+            None => unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") },
         }
         let _ = std::fs::remove_dir_all(support);
     }
@@ -940,7 +940,7 @@ mod tests {
         std::fs::create_dir_all(support.join("empty-bin")).expect("support");
         // No `security` on the search path: no keychain is ever queried.
         let previous_search = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
-        std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin"));
+        unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin")) };
         let launcher = CountingLauncher(std::sync::atomic::AtomicUsize::new(0));
         let due = live(
             ClaudeLocalLoginState::RefreshPending,
@@ -969,8 +969,8 @@ mod tests {
         assert_eq!(launcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!running().lock().unwrap().contains_key("consent-slot"));
         match previous_search {
-            Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
-            None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+            Some(value) => unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value) },
+            None => unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") },
         }
         let _ = std::fs::remove_dir_all(support);
     }
@@ -1005,7 +1005,7 @@ mod tests {
             .into_iter()
             .map(|(key, value)| {
                 let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
+                unsafe { std::env::set_var(key, value) };
                 (key, previous)
             })
             .collect();
@@ -1069,8 +1069,8 @@ mod tests {
         fn drop(&mut self) {
             for (key, previous) in self.previous.drain(..) {
                 match previous {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
                 }
             }
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1321,7 +1321,7 @@ mod tests {
         ]
         .map(|(key, value)| {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             (key, previous)
         });
         let slot =
@@ -1505,8 +1505,8 @@ mod tests {
 
         for (key, previous) in guards {
             match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
             }
         }
         let _ = std::fs::remove_dir_all(root);

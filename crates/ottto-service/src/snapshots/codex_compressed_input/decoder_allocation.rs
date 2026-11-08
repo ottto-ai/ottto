@@ -9,7 +9,7 @@ use zstd::zstd_safe::zstd_sys as sys;
 const HEADER: usize = 16;
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn malloc_size(ptr: *const c_void) -> usize;
     fn malloc_good_size(size: usize) -> usize;
 }

@@ -208,7 +208,7 @@ impl CrossRootEvidence {
         &'s self,
         root: &'s str,
         request_id: &str,
-    ) -> impl Iterator<Item = &'s String> + 's {
+    ) -> impl Iterator<Item = &'s String> + 's + use<'s> {
         self.scope
             .holders
             .get(&claude_request_hash(request_id))

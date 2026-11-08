@@ -763,7 +763,7 @@ impl Sqlite {
         ensure!(!pl(&RowKey::Meta(name.into())), "state_v2_control_class");
         let conn = self.conn()?;
         migrations::begin_write(conn)?;
-        let result = (|| {
+        (|| {
             let mut tx = Txn {
                 store: self,
                 write: true,
@@ -789,8 +789,7 @@ impl Sqlite {
             tx.store.conn()?.execute_batch("COMMIT")?;
             tx.finished = true;
             Ok(())
-        })();
-        result
+        })()
     }
     pub(super) fn read_control<T: serde::de::DeserializeOwned>(
         &self,

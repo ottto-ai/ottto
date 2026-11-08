@@ -405,7 +405,7 @@ impl ScanIndex {
     fn covered_stamps<'a>(
         &'a self,
         key: &str,
-    ) -> impl Iterator<Item = Option<&'a EntityStamp>> + 'a {
+    ) -> impl Iterator<Item = Option<&'a EntityStamp>> + 'a + use<'a> {
         self.file_snapshot_fingerprints
             .get(key)
             .into_iter()

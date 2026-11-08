@@ -969,15 +969,15 @@ pub(crate) mod test_support {
     impl Drop for Guard {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }
 
     fn guard(key: &'static str, value: &Path) -> Guard {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        unsafe { std::env::set_var(key, value) };
         Guard { key, previous }
     }
 

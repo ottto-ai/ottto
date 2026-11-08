@@ -702,7 +702,7 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
     file.write_all(&prefix[..prefix.len() - 1]).unwrap();
     let field = b",\"claude_request_census\":";
     file.write_all(field).unwrap();
-    for byte in [b'[', b']'] {
+    for byte in *b"[]" {
         let block = [byte; 8192];
         if byte == b']' {
             file.write_all(b"0").unwrap();

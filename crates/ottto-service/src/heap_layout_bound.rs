@@ -102,9 +102,9 @@ pub(crate) fn layout_supported() -> bool {
         && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))
 }
 fn compiler_layout_supported(compiler: &str) -> bool {
-    // These exact versions have source-layout and native allocation coverage.
-    // Refuse future compilers until their container assumptions are validated.
-    compiler.starts_with("rustc 1.88.0 ") || compiler.starts_with("rustc 1.95.0 ")
+    // This exact version has source-layout and native allocation coverage.
+    // Refuse other compilers until their container assumptions are validated.
+    compiler.starts_with("rustc 1.99.1 ")
 }
 macro_rules! scalar { ($($t:ty),*) => { $(impl HeapLayoutBound for $t {
     const INLINE_ONLY: bool = true;
@@ -231,7 +231,7 @@ pub(crate) fn tree_node_bytes<K, V>() -> Option<usize> {
         .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)
 }
 pub(crate) fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
-    // Rust1.88/1.95 B=6:11 key/value slots and12 edges. Charging one full node per
+    // Rust 1.99 B=6: 11 key/value slots and 12 edges. Charging one full node per
     // entry plus one root overcounts unused slots and internal/leaf grouping.
     // A zero-length map may retain its empty allocated root after removal.
     let node = tree_node_bytes::<K, V>()?;
@@ -639,6 +639,18 @@ mod sampled_scalar_buffer_tests {
             requirement.as_deref() == Some("1"),
         );
         require_layout_coverage(supported, requirement.as_deref()).unwrap();
+    }
+
+    /// [behaviour] The layout gate admits the pinned compiler and refuses the
+    /// release it replaced.
+    #[test]
+    fn compiler_allowlist_admits_only_the_validated_release() {
+        assert!(compiler_layout_supported(
+            "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+        ));
+        assert!(!compiler_layout_supported(
+            "rustc 1.95.0 (59807616e 2026-04-14)"
+        ));
     }
 
     #[test]

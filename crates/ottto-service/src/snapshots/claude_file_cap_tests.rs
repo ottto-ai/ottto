@@ -175,7 +175,7 @@ fn footprint() -> (u64, u64) {
         ledger_phys_footprint_peak: i64,
         ledger_rest: [i64; 20],
     }
-    extern "C" {
+    unsafe extern "C" {
         static mach_task_self_: u32;
         fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
     }
