@@ -1032,7 +1032,7 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
                 )
                 .unwrap(),
                 "growth" => {
-                    v2::claim_growth_for_test(path, &first.committed);
+                    v2::claim_growth_for_test(path, &first.index);
                     first.index
                 }
                 _ => {
@@ -1051,7 +1051,7 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
             both.snapshots.extend(page_two.snapshots.clone());
             let mut differences = Vec::new();
             money_oracle::entity_differences(&cold, &both, &mut differences);
-            assert!(differences.is_empty(), "{}", differences.join("\n"));
+            assert!(differences.is_empty(), "{arm}: {}", differences.join("\n"));
             let pages = v2::take_progress_pages_for_test();
             assert_eq!(
                 pages.reload, 0,

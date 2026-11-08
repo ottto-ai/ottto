@@ -100,14 +100,24 @@ pub(crate) fn take_progress_set_aside_for_test() -> Option<u64> {
     telemetry::take_thread_event_for_test("progress_row_set_aside").and_then(|v| v.as_u64())
 }
 
-/// A claim-only growth save on `index`'s route, as a pass makes before a
-/// growth read: graph G advances; no growth row and no progress row changes.
+/// A claim-only growth save by the pass holding `index`, as it makes before
+/// a growth read: under CheckpointLock graph G advances and the pass's claim
+/// receipt follows it; no growth row and no progress row changes.
 pub(crate) fn claim_growth_for_test(path: &Path, index: &ScanIndex) {
     let key = (index.files.keys().next().cloned())
         .unwrap_or_else(|| "progress-rows-growth-claim".to_owned());
+    let _lock = crate::snapshots::CheckpointLock::acquire(path).unwrap();
     let (claimed, _) =
         claim_growth_locked(path, index, index.generation, &key, |_, _, _| true).unwrap();
     assert!(claimed, "the growth claim committed");
+    if index.v2().growth_claim_context.is_some() {
+        crate::snapshots::sampled_audit::publish_growth_claim_receipt(
+            index,
+            path,
+            index.generation + 1,
+        )
+        .unwrap();
+    }
 }
 
 /// Another writer completes the progress import of `json` on `index`'s route,
