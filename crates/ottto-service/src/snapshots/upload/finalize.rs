@@ -146,7 +146,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     // Backstop of the one emission seam: no held history body is finalized.
     index.veto_claude_history_emission(source, &mut result.snapshots);
-    let mut refold_components = tail_source::refold_moved::Page::new();
+    let mut refold_components =
+        tail_source::refold_moved::page(source, &result.pending_finalization);
     for snapshot in &mut result.snapshots {
         let components = snapshot_semantic_component_hashes(source, snapshot);
         snapshot.snapshot_fingerprint = snapshot_fingerprint_from_component_hashes(
@@ -154,7 +155,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             &snapshot.source_session_id,
             &components,
         );
-        tail_source::refold_moved::capture(source, snapshot, &components, &mut refold_components);
+        tail_source::refold_moved::capture(snapshot, &components, &mut refold_components);
         index.snapshot_activity_at.insert(
             snapshot.snapshot_fingerprint.clone(),
             snapshot_semantic_activity_at(snapshot),

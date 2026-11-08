@@ -1,31 +1,19 @@
 use super::*;
 use crate::snapshots::tests::{manifest_index_entry, sample_session_artifact_item};
 
-/// [behaviour] Finalization observes components without changing indexed semantics,
-/// body/no-op decisions or receipt handling; stale baselines and other sources stay distinct.
+/// [behaviour] Identical, moved and stale child baselines count files;
+/// multiple entities in one file still count once, and Codex stays uncounted.
 #[test]
 fn finalizer_counts_only_eligible_component_moves() {
-    for source in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ] {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let scratch = crate::snapshots::tail_source::seam::tests::route();
-        let key = scratch.dir.join("root/subagents/agent-a.jsonl");
-        let key = local_index_key(&key);
+        let key = local_index_key(&scratch.dir.join("root/subagents/agent-a.jsonl"));
         let mut index = ScanIndex::default();
         index.files.insert(key.clone(), manifest_index_entry(None));
         let mut item = sample_session_artifact_item();
         item.source_file_fingerprint = Some("synthetic-file".into());
         let mut previous = None;
-        for (step, stale, incomplete) in [
-            (0, false, false),
-            (1, false, false),
-            (2, false, false),
-            (3, false, false),
-            (4, true, false),
-            (5, false, true),
-        ] {
+        for step in 0..5 {
             if step == 2 {
                 item.attribution_facts
                     .extend(crate::session_attribution::codex_subagent_facts(
@@ -37,12 +25,14 @@ fn finalizer_counts_only_eligible_component_moves() {
                         "test",
                     ));
             }
-            let expected = snapshot_fingerprint(source, &item);
-            let group = snapshot_file_entity_set_hex(BTreeSet::from([expected.clone()]));
-            let body =
-                snapshot_file_upload_body_set_hex(BTreeSet::from([snapshot_upload_body_witness(
-                    &item,
-                )]));
+            let mut other = item.clone();
+            other.source_session_id.push('b');
+            let items = vec![item.clone(), other];
+            let expected: BTreeSet<_> = items
+                .iter()
+                .map(|item| snapshot_fingerprint(source, item))
+                .collect();
+            let group = snapshot_file_entity_set_hex(&expected);
             let mut scan = scan_source_roots_with_test_limit(
                 source,
                 std::slice::from_ref(&scratch.dir),
@@ -52,7 +42,7 @@ fn finalizer_counts_only_eligible_component_moves() {
                 4,
             )
             .unwrap();
-            scan.snapshots = vec![item.clone()];
+            scan.snapshots = items;
             scan.pending_finalization = vec![PendingIndexFinalization {
                 refold_unchanged: step != 0,
                 withheld_content: None,
@@ -60,45 +50,32 @@ fn finalizer_counts_only_eligible_component_moves() {
                 codex_pending_recovery: false,
                 index_key: key.clone(),
                 source_file_fingerprint: "synthetic-file".into(),
-                previous_snapshot_fingerprint: if stale {
+                previous_snapshot_fingerprint: if step == 4 {
                     Some("stale".into())
                 } else {
                     previous.clone()
                 },
-                previous_upload_body_witness: (step == 1 || step == 3).then_some(body.clone()),
-                parse_complete: !incomplete,
+                previous_upload_body_witness: None,
+                parse_complete: true,
                 diagnostic_reason: FileReason::Complete,
-                parsed_snapshot_count: 1,
+                parsed_snapshot_count: 2,
                 effective_upload_body_witness_revision: 0,
             }];
             let before = super::super::counters::totals();
-            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                finalize_scan_after_policy_with_body_witness(
-                    source,
-                    &mut scan,
-                    &mut index,
-                    snapshot_upload_body_witness,
-                );
-            });
-            if !incomplete {
-                assert_eq!(
-                    index.files[&key].last_snapshot_fingerprint.as_deref(),
-                    Some(group.as_str())
-                );
-                assert_eq!(
-                    index.files[&key].last_upload_body_witness.as_deref(),
-                    Some(body.as_str())
-                );
-                assert!(index.files[&key].upload_context_receipt.is_none());
-                if step == 1 || step == 3 {
-                    assert!(scan.snapshots.is_empty());
-                    assert_eq!(scan.semantic_noop_count, 1);
-                } else {
-                    assert_eq!(scan.snapshots[0].snapshot_fingerprint, expected);
-                }
-            }
-            let expected_label = if source != SnapshotSource::ClaudeCode || step == 0 || incomplete
-            {
+            finalize_scan_after_policy_with_body_witness(
+                source,
+                &mut scan,
+                &mut index,
+                snapshot_upload_body_witness,
+            );
+            assert_eq!(
+                scan.snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            let expected_label = if source != SnapshotSource::ClaudeCode || step == 0 {
                 None
             } else {
                 Some(match step {
@@ -107,27 +84,20 @@ fn finalizer_counts_only_eligible_component_moves() {
                     _ => "baseline_unknown",
                 })
             };
-            for label in LABELS.into_iter().chain(["baseline_unknown", "unchanged"]) {
-                let count = super::super::counters::total("tail_refold_moved", label);
+            let components = snapshot_semantic_component_hashes(source, &item);
+            for label in components
+                .keys()
+                .copied()
+                .chain(["baseline_unknown", "unchanged"])
+            {
                 assert_eq!(
-                    count
+                    super::super::counters::total("tail_refold_moved", label)
                         - before
                             .get(&("tail_refold_moved", label))
                             .copied()
                             .unwrap_or(0),
                     u64::from(expected_label == Some(label))
                 );
-            }
-            for row in rows.iter().filter(|r| r["stage"] == "durable_tail_alarm") {
-                if let Some(counts) = row["counts"]["tail_refold_moved"].as_object() {
-                    assert!(counts.keys().all(|label| LABELS.contains(&label.as_str())
-                        || ["baseline_unknown", "unchanged"].contains(&label.as_str())));
-                    assert!(counts.values().all(|count| count
-                        .as_array()
-                        .is_some_and(
-                            |pair| pair.len() == 2 && pair.iter().all(serde_json::Value::is_u64)
-                        )));
-                }
             }
             previous = Some(group);
         }

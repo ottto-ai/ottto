@@ -863,7 +863,6 @@ impl GroupBoot {
         parser.accumulator.codex_tier_replay = Some(replay);
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
-            refold_unchanged: false,
             first_read: crate::local_resource_diagnostics::FirstRead::begin(
                 SnapshotSource::Codex,
                 first.size_bytes,

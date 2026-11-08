@@ -160,7 +160,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) launch_events: Option<Arc<crate::launch_events::LaunchEventInventory>>,
 }
 pub(in crate::snapshots) struct OwnedActiveFile {
-    pub(in crate::snapshots) refold_unchanged: bool,
     pub(in crate::snapshots) first_read: Option<crate::local_resource_diagnostics::FirstRead>,
     pub(in crate::snapshots) sampling: Option<sampled_scan::Active>,
     pub(in crate::snapshots) candidate: CandidateFile,
@@ -1253,4 +1252,4 @@ impl OwnedSourceScan {
     }
 }
 
-crate::heap_layout_bound::fields!(OwnedActiveFile; refold_unchanged, first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
+crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
