@@ -383,14 +383,13 @@ fn revisit_case(name: &str, siblings: usize, growth: Growth) {
 /// [money] More sessions than the former ledger held: the earliest session's
 /// login re-tag A→B is refused after a restart, with equal totals.
 #[test]
-fn identity_cap_revisit_earliest_refuses_retag() {
-    for sessions in [17, 736] {
-        revisit_case(
-            &format!("identity-cap-retag-{sessions}"),
-            sessions - 1,
-            Growth::NextHour,
-        );
-    }
+fn identity_cap_revisit_earliest_of_17_refuses_retag() {
+    revisit_case("identity-cap-retag-17", 16, Growth::NextHour);
+}
+/// [money] The same row over 736 sessions, restored leg only.
+#[test]
+fn identity_cap_revisit_earliest_of_736_refuses_retag() {
+    revisit_case("identity-cap-retag-736", 735, Growth::NextHour);
 }
 
 /// [money] The re-tagged frozen row also grows in its own hour under the new

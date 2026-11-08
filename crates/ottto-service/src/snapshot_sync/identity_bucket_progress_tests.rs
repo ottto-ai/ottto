@@ -546,16 +546,15 @@ fn stored_ack(progress: &mut SnapshotUploadProgress, item: &Value) {
     )
     .unwrap();
 }
-/// Save, load and re-key under `key`, as the next process does.
+/// Save at `path`, load and re-key under `key`, as the next process does.
 fn restarted(
     progress: &mut SnapshotUploadProgress,
     key: Option<[u8; 32]>,
+    path: &Path,
 ) -> SnapshotUploadProgress {
-    let dir = crate::test_scratch::unique_path("ottto-identity-session-cap");
-    std::fs::create_dir_all(&dir).unwrap();
-    progress.save(&dir.join("progress.json")).unwrap();
+    progress.save(path).unwrap();
     let mut loaded = SnapshotUploadProgress::load(
-        &dir.join("progress.json"),
+        path,
         &"a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
@@ -564,8 +563,13 @@ fn restarted(
     loaded
         .accepted_identity_buckets
         .set_retained_enabled(progress.accepted_identity_buckets.retained_enabled());
-    std::fs::remove_dir_all(dir).unwrap();
     loaded
+}
+/// One progress file for a restart chain; the caller removes its directory.
+fn progress_path() -> PathBuf {
+    let dir = crate::test_scratch::unique_path("ottto-identity-session-cap");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("progress.json")
 }
 /// The earliest session's bucket starts and frozen share set.
 fn frozen(progress: &SnapshotUploadProgress) -> Option<Value> {
@@ -578,8 +582,8 @@ fn frozen(progress: &SnapshotUploadProgress) -> Option<Value> {
         })
 }
 /// The earliest session's witnessed proof and frozen shares, then `siblings`
-/// tagged sessions, then a restart. Returns the earliest state as ACKed.
-fn seeded(siblings: usize) -> (SnapshotUploadProgress, Value) {
+/// tagged sessions, then a restart at `path`. Returns the earliest state as ACKed.
+fn seeded(siblings: usize, path: &Path) -> (SnapshotUploadProgress, Value) {
     let mut progress = retained_progress();
     stored_ack(&mut progress, &witnessed_body());
     assert_eq!(retained_rows(&progress), Some((1, 0)));
@@ -590,86 +594,108 @@ fn seeded(siblings: usize) -> (SnapshotUploadProgress, Value) {
         sibling["snapshot_fingerprint"] = json!(format!("{n:064x}"));
         stored_ack(&mut progress, &sibling);
     }
-    (restarted(&mut progress, Some(KEY)), before)
+    (restarted(&mut progress, Some(KEY), path), before)
 }
 /// [behaviour] Store-only proof is superseded durably before a replacement's
 /// POST, for 17 and 736 sessions.
+fn identity_cap_store_only_proof_is_superseded_before_post_case(sessions: usize) {
+    let path = progress_path();
+    let (mut progress, _) = seeded(sessions - 1, &path);
+    let mut replacement = witnessed_body();
+    replacement["snapshot_fingerprint"] = json!("9".repeat(64));
+    replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
+        json!("c".repeat(64));
+    let saved = std::cell::Cell::new(None);
+    let mut accepted = 0;
+    let lost = attempt_snapshot_page(
+        &[replacement],
+        &[0],
+        "synthetic-session-cap-replacement",
+        &mut progress,
+        &mut accepted,
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+        &|_: &Value| "d".repeat(64),
+        &|value: &Value| value["source_session_id"].as_str(),
+        &mut |_| {
+            assert_eq!(
+                saved.get(),
+                Some((0, 0)),
+                "{sessions}: persisted before POST"
+            );
+            Err(anyhow!("reply lost"))
+        },
+        &mut |progress| {
+            saved.set(retained_rows(progress));
+            Ok(())
+        },
+    );
+    assert!(lost.is_err());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
 #[test]
-fn identity_cap_store_only_proof_is_superseded_before_post() {
-    for sessions in [17, 736] {
-        let (mut progress, _) = seeded(sessions - 1);
-        let mut replacement = witnessed_body();
-        replacement["snapshot_fingerprint"] = json!("9".repeat(64));
-        replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
-            json!("c".repeat(64));
-        let saved = std::cell::Cell::new(None);
-        let mut accepted = 0;
-        let lost = attempt_snapshot_page(
-            &[replacement],
-            &[0],
-            "synthetic-session-cap-replacement",
-            &mut progress,
-            &mut accepted,
-            &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
-            &|_: &Value| "d".repeat(64),
-            &|value: &Value| value["source_session_id"].as_str(),
-            &mut |_| {
-                assert_eq!(
-                    saved.get(),
-                    Some((0, 0)),
-                    "{sessions}: persisted before POST"
-                );
-                Err(anyhow!("reply lost"))
-            },
-            &mut |progress| {
-                saved.set(retained_rows(progress));
-                Ok(())
-            },
-        );
-        assert!(lost.is_err());
-    }
+fn identity_cap_store_only_proof_is_superseded_before_post_17() {
+    identity_cap_store_only_proof_is_superseded_before_post_case(17);
+}
+#[test]
+fn identity_cap_store_only_proof_is_superseded_before_post_736() {
+    identity_cap_store_only_proof_is_superseded_before_post_case(736);
 }
 /// [behaviour] An ACK record after a restart sees the store's frozen set: a
 /// stripped body keeps the earliest session's frozen shares.
+fn identity_cap_ack_record_keeps_store_only_frozen_shares_case(sessions: usize) {
+    let path = progress_path();
+    let (mut progress, before) = seeded(sessions - 1, &path);
+    let mut stripped = body();
+    stripped["snapshot_fingerprint"] = json!("8".repeat(64));
+    stripped["usage_buckets"][0]["model_usage"][0] = json!({"model":"claude-synthetic"});
+    stored_ack(&mut progress, &stripped);
+    assert_eq!(
+        frozen(&progress),
+        Some(before),
+        "{sessions}: frozen set kept"
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
 #[test]
-fn identity_cap_ack_record_keeps_store_only_frozen_shares() {
-    for sessions in [17, 736] {
-        let (mut progress, before) = seeded(sessions - 1);
-        let mut stripped = body();
-        stripped["snapshot_fingerprint"] = json!("8".repeat(64));
-        stripped["usage_buckets"][0]["model_usage"][0] = json!({"model":"claude-synthetic"});
-        stored_ack(&mut progress, &stripped);
-        assert_eq!(
-            frozen(&progress),
-            Some(before),
-            "{sessions}: frozen set kept"
-        );
-    }
+fn identity_cap_ack_record_keeps_store_only_frozen_shares_17() {
+    identity_cap_ack_record_keeps_store_only_frozen_shares_case(17);
+}
+#[test]
+fn identity_cap_ack_record_keeps_store_only_frozen_shares_736() {
+    identity_cap_ack_record_keeps_store_only_frozen_shares_case(736);
 }
 /// [behaviour] A replay-generation change reaches a session that is not
 /// resident: proof is cleared, starts and shares are kept, across a restart.
+fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(sessions: usize) {
+    let path = progress_path();
+    let (mut progress, before) = seeded(sessions - 1, &path);
+    assert!(progress.prepare_historical_replay("next-generation"));
+    let progress = restarted(&mut progress, Some(KEY), &path);
+    assert_eq!(
+        retained_rows(&progress),
+        Some((0, 0)),
+        "{sessions}: proof cleared"
+    );
+    assert_eq!(frozen(&progress), Some(before), "{sessions}: shares kept");
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
 #[test]
-fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares() {
-    for sessions in [17, 736] {
-        let (mut progress, before) = seeded(sessions - 1);
-        assert!(progress.prepare_historical_replay("next-generation"));
-        let progress = restarted(&mut progress, Some(KEY));
-        assert_eq!(
-            retained_rows(&progress),
-            Some((0, 0)),
-            "{sessions}: proof cleared"
-        );
-        assert_eq!(frozen(&progress), Some(before), "{sessions}: shares kept");
-    }
+fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_17() {
+    identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(17);
+}
+#[test]
+fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_736() {
+    identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(736);
 }
 /// [behaviour] Key changes A→None→A and A→B→A reject every older row, even
 /// for sessions that were not resident; no proof revives.
 #[test]
 fn identity_cap_key_change_rejects_store_only_rows() {
     for path in [[None, Some(KEY)], [Some([0x43; 32]), Some(KEY)]] {
-        let (mut progress, _) = seeded(16);
+        let file = progress_path();
+        let (mut progress, _) = seeded(16, &file);
         for key in path {
-            progress = restarted(&mut progress, key);
+            progress = restarted(&mut progress, key, &file);
         }
         assert_eq!(frozen(&progress), None, "{path:?}");
         assert_eq!(retained_rows(&progress), None, "{path:?}");
@@ -677,6 +703,7 @@ fn identity_cap_key_change_rejects_store_only_rows() {
             .accepted_identity_buckets
             .get("synthetic-sibling-15")
             .is_none());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }
 /// [money] With option (ii) off, an ACK after a restart that omits a frozen
@@ -691,10 +718,12 @@ fn frozen_shares_survive_an_ack_omitting_their_row_after_restart() {
     stored_ack(&mut progress, &both);
     let before = frozen(&progress).unwrap();
     assert_eq!(before[1].as_array().unwrap().len(), 2, "two frozen rows");
-    let mut progress = restarted(&mut progress, Some(KEY));
+    let path = progress_path();
+    let mut progress = restarted(&mut progress, Some(KEY), &path);
     let mut omitting = body();
     omitting["snapshot_fingerprint"] = json!("7".repeat(64));
     omitting["usage_buckets"][0]["model_usage"] = json!([tagged("claude-other")]);
     stored_ack(&mut progress, &omitting);
     assert_eq!(frozen(&progress), Some(before));
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
