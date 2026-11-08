@@ -199,6 +199,7 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
 fn f6_import_is_journal_off_and_has_no_import_wal() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
+    sqlite::assert_mmap_for_test(&db);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     put(
         &mut tx,
@@ -211,6 +212,7 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
     db.finish_import().unwrap();
     let mut reopened = sqlite::Sqlite::open(&tmp.path(), &identity).unwrap();
     assert_eq!(reopened.read_control::<u64>("generation").unwrap(), Some(1));
+    sqlite::assert_mmap_for_test(&reopened);
     reopened.validate_parts().unwrap();
 }
 

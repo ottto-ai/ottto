@@ -45,6 +45,14 @@ pub(in super::super) fn orphan_part_for_test(db: &mut Sqlite) {
 pub(in super::super) fn erasure_marks_for_test(db: &Sqlite) -> u64 {
     db.stats.erasure_pending_marks
 }
+pub(in super::super) fn assert_mmap_for_test(db: &Sqlite) {
+    let actual: i64 = db
+        .conn()
+        .unwrap()
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(actual, 2_147_418_112);
+}
 pub(in super::super) fn wal_bytes_for_test(db: &Sqlite) -> Option<u64> {
     db.wal_bytes()
 }
