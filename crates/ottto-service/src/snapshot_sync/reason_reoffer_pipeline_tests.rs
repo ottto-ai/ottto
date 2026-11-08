@@ -281,8 +281,6 @@ impl ReofferPipeline {
         let secrets = fixture.base.join(format!("{name}-secrets"));
         std::fs::create_dir_all(&support).unwrap();
         std::fs::create_dir_all(&secrets).unwrap();
-        // State-database admission rejects symlink ancestors in macOS temp paths.
-        let support = support.canonicalize().unwrap();
         let server = ReofferServer::new(first, capture);
         let guards = vec![
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
@@ -465,11 +463,13 @@ impl ReofferPipeline {
         walk(&self.support);
     }
 
-    /// This pipeline stands in for the daemon on its support directory,
-    /// holding #801's single-writer lock there, so the post-save durable
-    /// write runs.
+    /// Use a canonical state-database route and hold the daemon's
+    /// single-writer lock for the durable restore receipt.
     #[cfg(unix)]
-    fn hold_state_dir_lock(&self) {
+    fn hold_state_dir_lock(&mut self) {
+        self.support = self.support.canonicalize().unwrap();
+        // The fixture's existing environment guard restores this on drop.
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support);
         crate::locked_state_dir::test_locks::hold(&self.support);
     }
 
