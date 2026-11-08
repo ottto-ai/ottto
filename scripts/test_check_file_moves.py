@@ -672,6 +672,85 @@ class MoveRejects(Base):
         head = self.basic_head(base) | {'scripts/source_layout_includes.tsv': row('snapshots/dest/old.rs')}
         self.accept(base, head)
 
+    def test_f1_allowlisted_names_bound_by_other_macros(self):
+        for extra, needle in (
+                ('use probe::serial;\n\n#[serial]\npub(crate) fn g() {}\n', 'binds allowlisted `serial` from `probe`'),
+                ('use probe::error;\n\n#[error]\npub(crate) fn g() {}\n', 'binds allowlisted `error`'),
+                ('use probe::Read as Debug;\n\n#[derive(Debug)]\npub(crate) struct Marker;\n', 'as Debug` rebinds'),
+                ('use probe::Read as Serialize;\n\n#[derive(Serialize)]\npub(crate) struct M;\n', 'as Serialize` rebinds')):
+            with self.subTest(needle=needle):
+                base = files(**{'snapshots/old.rs': OLD + '\n' + extra})
+                self.reject(base, self.basic_head(base), needle)
+        for lib, needle in (('macro_rules! ignore {\n    () => {};\n}\n\nmod snapshots;\n', 'macro_rules! ignore shadows'),
+                            ('mod serde {}\nmod snapshots;\n', '`mod serde` shadows'),
+                            ('#[proc_macro_attribute]\npub fn serial() {}\n\nmod snapshots;\n', 'procedural macro')):
+            with self.subTest(needle=needle):
+                base = files(**{'lib.rs': lib})
+                self.reject(base, self.basic_head(base), 'rule 2 (identity)')
+                self.reject(base, self.basic_head(base), needle)
+
+    def test_f2_shadowed_std_item_macro_and_imported_item_macro(self):
+        fallback = 'pub(crate) mod x {\n    pub(crate) fn v() -> u8 {\n        1\n    }\n}\n'
+        lib = ('macro_rules! thread_local {\n    ($u:ident) => {\n        $u crate::fallback::*;\n    };\n}\n\n'
+               'mod fallback;\nmod snapshots;\n')
+        dest = 'thread_local!(use);\n\npub(crate) fn here() -> u8 {\n    x::v()\n}\n'
+        base = files(**{'lib.rs': lib, 'fallback.rs': fallback, 'snapshots/dest.rs': dest})
+        self.reject(base, self.basic_head(base, **{'snapshots/dest.rs': dest + '\npub(crate) mod old;\n'}),
+                    'shadowed by a macro_rules! thread_local')
+        for line, needle in (('use probe::thread_local;\n', 'shadows std thread_local!'),
+                             ('use probe::fields;\n', 'binds item macro fields! from outside the crate')):
+            with self.subTest(needle=needle):
+                base = files(**{'snapshots/caller.rs': line + '\n' + CALLER})
+                self.reject(base, self.basic_head(base), needle)
+
+    def test_f3_macro_aliases_forwarding_and_unknown_callees(self):
+        exported = 'macro_rules! m {\n    () => {\n        super::dest::here()\n    };\n}\npub(crate) use m;\n\n'
+        forward = 'macro_rules! forward {\n    ($m:ident) => {\n        $m!()\n    };\n}\n\n'
+        wrap = 'macro_rules! wrap {\n    () => {\n        probe_macro!()\n    };\n}\n\n'
+        for lib, extra, needle in (
+                (exported, 'use crate::m as a;\n\npub(crate) fn g() -> u8 {\n    a!()\n}\n', 'through a `use .. as` alias'),
+                (exported + forward, 'pub(crate) fn g() -> u8 {\n    forward!(m)\n}\n', 'a macro named by its caller'),
+                (wrap, 'pub(crate) fn g() -> u8 {\n    wrap!()\n}\n', 'probe_macro!, which is not a macro_rules!')):
+            with self.subTest(needle=needle):
+                base = files(**{'lib.rs': lib + 'mod snapshots;\n', 'snapshots/old.rs': OLD + '\n' + extra})
+                self.reject(base, self.basic_head(base), needle)
+
+    def test_f4_glob_visibility_across_contexts(self):
+        base = files(**{'snapshots/old.rs': OLD + '\nuse crate::snapshots::caller::*;\n'})
+        self.reject(base, self.basic_head(base), 'not an ancestor of both')
+        base = files(**{'lib.rs': 'mod outside;\nmod snapshots;\n', 'outside.rs': 'pub(crate) fn o() {}\n',
+                        'snapshots/old.rs': OLD + '\nuse crate::snapshots::*;\n'})
+        head = moved(base, {'snapshots/old.rs': 'outside/old.rs', 'snapshots/old/tests.rs': 'outside/old/tests.rs'})
+        head |= {SRC + 'snapshots.rs': 'mod caller;\nmod dest;\npub(crate) use crate::outside::old;\n',
+                 SRC + 'outside.rs': 'pub(crate) fn o() {}\n\npub(crate) mod old;\n'}
+        self.reject(base, head, 'leaves crate::snapshots')
+        restricted = 'mod caller;\nmod dest;\nmod old;\n\npub(in crate::snapshots::dest) fn drop<T>(_: T) {}\n'
+        base = files(**{'snapshots/old.rs': OLD + '\nuse crate::snapshots::*;\n', 'snapshots.rs': restricted})
+        self.reject(base, self.basic_head(base, **{'snapshots.rs': restricted.replace(
+            'mod old;\n', 'pub(crate) use crate::snapshots::dest::old;\n')}), 'pub(in crate::snapshots::dest)')
+        base = files(**{'snapshots/old.rs': OLD + '\nuse crate::snapshots::*;\n'})
+        self.accept(base, self.basic_head(base))
+
+    def test_f5_downstream_consumers_through_aliases_and_macros(self):
+        consumer = 'use crate::snapshots as alias;\nuse alias::*;\n\npub(crate) fn g() -> u8 {\n    old::f()\n}\n'
+        base = files(**{'lib.rs': 'mod consumer;\nmod snapshots;\n', 'consumer.rs': consumer})
+        self.reject(base, self.basic_head(base), 'rule 4 (glob consumers)')
+        nested = 'mod a {\n    pub(crate) use crate::snapshots as alias;\n}\n\nuse a::alias::*;\n'
+        base = files(**{'lib.rs': 'mod consumer;\nmod snapshots;\n', 'consumer.rs': nested})
+        self.reject(base, self.basic_head(base), 'glob through a `use .. as` alias')
+        base = files(**{'lib.rs': 'macro_rules! m {\n    () => {\n        old::f()\n    };\n}\n\nmod snapshots;\n'})
+        self.reject(base, self.basic_head(base), '`old`, a moved module')
+
+    def test_f6_static_path_literals(self):
+        for literal in ('crates/demo/src/snapshots/./old.rs', 'src/snapshots//old.rs', 'snapshots/old\\x2ers',
+                        'SRC/SNAPSHOTS/OLD.RS', 'src\\\\snapshots\\\\old.rs', 'snapshots/\\u{6f}ld.rs'):
+            with self.subTest(literal=literal):
+                caller = CALLER + f'\npub(crate) const P: &str = "{literal}";\n'
+                base = files(**{'snapshots/caller.rs': caller})
+                self.reject(base, self.basic_head(base), 'rule 9 (old paths)')
+        base = files(**{'snapshots/caller.rs': CALLER + '\npub(crate) const P: &str = "my_snapshots/old.rsx";\n'})
+        self.accept(base, self.basic_head(base))
+
 
 class AbsolutizeAccepts(Base):
     def test_super_chains_become_absolute(self):
@@ -744,6 +823,12 @@ class AbsolutizeRejects(Base):
     def test_column_shift_after_a_replacement(self):
         old = 'fn f() -> u32 {\n    let _ = super::dest::here(); column!()\n}\n'
         self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest'), 'rule 7 (location)')
+
+    def test_alias_wrapping_column_after_a_replacement(self):
+        lib = 'macro_rules! col {\n    () => {\n        column!()\n    };\n}\npub(crate) use col;\n\nmod snapshots;\n'
+        old = 'use crate::col as c;\n\nfn f() -> u32 {\n    let _ = super::dest::here(); c!()\n}\n'
+        self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest'), 'rule 7 (location)',
+                        **{'lib.rs': lib})
 
     def test_attribute_pattern_inside_macro_rules_is_fine(self):
         old = 'macro_rules! m {\n    ($(#[$a:meta])* $f:ident) => {};\n}\n\nfn f() {\n    super::x();\n}\n'

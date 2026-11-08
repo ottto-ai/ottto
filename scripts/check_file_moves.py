@@ -50,13 +50,25 @@ Preconditions (move mode; each failure names the rule):
      resolve at the call site, which either moves with the subtree, keeping its
      module identity, or does not move), and only allowlisted attributes and
      derives (ALLOWED_ATTRS, ALLOWED_DERIVES); macros invoked in moved files
-     expand without `super` or location macros; parents carry no derive outside
-     ALLOWED_DERIVES;
+     expand without `super` or location macros, and their closure is listable:
+     no `use .. as` alias, no `$m!` forwarding, no unknown macro below the
+     first one (closure_gap); parents carry no derive outside ALLOWED_DERIVES.
+     Identity, crate-wide: no allowlisted name (or path head such as `serde`)
+     is bound by a `use .. as`, a `use` from another crate than expected, a
+     `macro_rules!`, a proc macro or a `mod` (identity_problems);
   3. item-level macro invocations in the old parent, the new parent and moved
-     files are `macro_rules!` definitions, `thread_local!`, or ITEM_MACROS whose
-     every crate definition emits no `use`/`mod`/`extern`/`macro_rules`/include
-     at item level and whose input has none of those tokens;
-  4. no file that glob-imports the new parent names the moved module;
+     files are `macro_rules!` definitions, `thread_local!` (when the crate
+     neither defines nor imports another `thread_local`), or ITEM_MACROS,
+     invoked by name, whose every crate definition emits no `use`/`mod`/
+     `extern`/`macro_rules`/include at item level, whose closure is listable
+     and whose input has none of those tokens;
+  4. no file that glob-imports the new parent names the moved module (a glob
+     that does not resolve fails); no glob anywhere goes through a `use .. as`
+     alias it cannot expand; no `macro_rules!` transcriber names a moved
+     module; glob visibility: every root stays in its old top-level module, a
+     glob in a moved file imports its own subtree, another crate, or an
+     ancestor-or-self of both its old and new module (without `pub(in ..)`
+     items narrower than it), and no glob outside a subtree imports into it;
   5. attributes compare as exact source bytes;
   6. a facade alias carries exactly the removed declaration's cfg/cfg_attr;
   7. moved files have no `pub(in crate::..)` naming a module whose path changes,
@@ -66,8 +78,10 @@ Preconditions (move mode; each failure names the rule):
      or auto-discovered) are all understood, and no non-lib target reaches a
      moved file; no `#[cfg_attr(.., path = ..)]` and no macro_rules! that emits
      an out-of-line `mod x;`, a path attribute or an include, anywhere;
-  9. no tracked file except docs names a moved file's old path (repo-, crate-
-     or src-relative).
+  9. no tracked text file except docs and layout TSVs (the includes TSV is
+     checked) contains a moved file's old path below src/ after decoding
+     string escapes and normalizing `./`, repeated separators, backslashes
+     and case.
 
 Mode `absolutize` (a pull request with an `Absolutize:` line): no file moves;
 each changed `.rs` file differs only where a `super` chain at the start of a
@@ -76,10 +90,21 @@ path (`super::`.., `pub(super)`, `pub(in super..)`) is replaced by the
 module context and the inline modules around it. Chains inside attributes,
 macro invocations or `macro_rules!` bodies, spaced chains, chains inside
 modules that are not nameable fail; so do top-level items around a replaced
-chain that carry an attribute or derive outside the allowlist, and a location
-macro (or a crate macro that expands to one) after a replacement on its line.
+chain that carry an attribute or derive outside the allowlist or invoke a macro
+whose closure is not listable (closure_gap), a location macro (or a crate macro
+that expands to one) after a replacement on its line, and any crate-wide
+identity problem (identity_problems).
 
-Attestation limits (also printed with every summary): see LIMITS.
+Threat model and limits. The checker is built for accidental changes by
+trusted authors moving files, not for an adversary crafting
+code to slip past it. It fails closed on every construct listed above that it
+cannot reason about, preferring simple crate-wide scans to name resolution, so
+a rare legitimate shape may fail and needs a deliberate allowlist change.
+Known limits (also printed with every summary, see LIMITS): log/trace targets
+that logging macros derive implicitly from module_path!, and panic Location
+strings, change with a move; approved derives/attributes and external crates'
+macros are assumed context-free; paths built at runtime, and
+include!(env!(..)) paths set by a build script, are not checked.
 
 Exit status: 0 when the change is file-move-only / absolutize-only (or with
 --report), 1 when it is not, 2 on a usage or setup error.
@@ -93,7 +118,6 @@ import difflib
 import fnmatch
 import posixpath
 import re
-import subprocess
 import sys
 import tomllib
 import traceback
@@ -105,6 +129,7 @@ import rust_source_tree as rst
 
 TSV = re.compile(r"^scripts/(?:source_layout_[^/]+|test_id_renames)\.tsv$")
 INCLUDES_TSV = "scripts/source_layout_includes.tsv"
+LAYOUT_TSV = re.compile(r"^scripts/source_layout_[^/]+\.tsv$")
 TRIVIA = ("ws", "comment", "doc", "idoc")
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 REGULAR = "100644"
@@ -163,12 +188,23 @@ ITEM_MACROS = {
     "split_fields", "unit_enum", "codex_cursor_events",
 }
 STD_ITEM_MACROS = {"thread_local"}
+# Heads of allowlisted attribute/derive paths, and the crates a `use` of an allowlisted bare name may come from.
+# Any other binding of these names anywhere in the crate (`use .. as`, another crate's item, a macro_rules!, a
+# proc macro, a module) could make an allowlisted spelling name some other macro.
+IDENTITY_HEADS = {name.split("::")[0] for name in ALLOWED_ATTRS | ALLOWED_DERIVES if "::" in name}
+IDENTITY_NAMES = {name for name in ALLOWED_ATTRS | ALLOWED_DERIVES if "::" not in name} | IDENTITY_HEADS
+IDENTITY_CRATES = {
+    **{name: {"std", "core"} for name in ALLOWED_DERIVES if "::" not in name},
+    "Serialize": {"serde"}, "Deserialize": {"serde"}, "serial": {"serial_test"},
+}
+PROC_MACRO_ATTRS = {"proc_macro", "proc_macro_derive", "proc_macro_attribute"}
 # Tokens that, at item level of a macro expansion, could add a binding the checker cannot see.
 EMITS = {"use", "mod", "extern", "macro_rules", "include", "include_str", "include_bytes"}
 LOCATION_MACROS = {"file", "line", "column", "module_path"}
 LOCATION_IDENTS = {"type_name", "type_name_of_val", "track_caller"}
 DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 LIMITS = (
+    "built for accidental changes by trusted authors; fails closed on the listed constructs",
     "log/trace targets that logging macros derive from module_path!, and panic Location strings, change "
     "with a move (not checked)",
     "allowlisted derives/attributes and external crates' macros are assumed context-free",
@@ -588,7 +624,7 @@ def _module_facts(tree: rst.Tree, source: rst.Source, module: tuple[str, ...]) -
                          if lx.tokens[i].kind == "ident"]
                 facts.bindings[words[-1] if "as" in words else item.name].append(f"extern crate at {where}")
             elif item.kind == "macro":
-                facts.macros.append((item.name.rstrip("!").split("::")[-1], where))
+                facts.macros.append((item.name.rstrip("!"), where))
             elif item.kind in ("extern", "unknown"):
                 facts.opaque.append(f"{where}: {item.kind} item")
     return facts
@@ -745,6 +781,8 @@ class MacroDef:
     location: bool  # file!/line!/column!/module_path!/type_name.. in a transcriber
     glob_use: bool
     hidden: list[str] = field(default_factory=list)  # include macros, out-of-line `mod x;`, path attributes
+    forwards: bool = False  # a transcriber invokes `$m!`, a macro named by the caller
+    idents: set[str] = field(default_factory=set)  # every identifier in its transcribers
 
 
 def transcribers(lx: rst.Lexed, group: int) -> list[tuple[int, int]] | None:
@@ -808,6 +846,10 @@ def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int) -> MacroDef:
             word = lx.tok(k)
             dollar = prev is not None and lx.is_punct(k - 1, "$")
             nxt = lx.next_code(k + 1, close)
+            if not dollar:
+                definition.idents.add(word)
+            if dollar and lx.is_punct(nxt, "!"):
+                definition.forwards = True
             if word == "super":
                 definition.has_super = True
             if location_at(lx, k):
@@ -848,6 +890,25 @@ def crate_macros(tree: rst.Tree, source: rst.Source) -> dict[str, list[MacroDef]
     return found
 
 
+def closure_gap(name: str, macros: dict[str, list[MacroDef]], aliases) -> str | None:
+    """Why the crate macros `name!` expands through cannot be listed, or None: `name` or a macro it invokes is a
+    `use .. as` alias, a transcriber invokes `$m!`, or invokes a name that is neither a crate nor a std macro.
+    (An unknown `name` itself is an external crate's macro, a stated limit.)"""
+    if name in aliases:
+        return f"{name}! is invoked through a `use .. as` alias"
+    defs, missing = macro_closure(name, macros)
+    for definition in defs:
+        if definition.forwards:
+            return f"{name}! expands (via {definition.path}) to `$m!`, a macro named by its caller"
+        hit = sorted(definition.invoked & set(aliases))
+        if hit:
+            return f"{name}! expands (via {definition.path}) to {hit[0]}!, a `use .. as` alias"
+    unknown = [other for other in missing if other != name]
+    if unknown:
+        return f"{name}! expands through {unknown[0]}!, which is not a macro_rules! of this crate"
+    return None
+
+
 def macro_closure(name: str, macros: dict[str, list[MacroDef]]) -> tuple[list[MacroDef], list[str]]:
     """Every crate definition `name!` may expand through, and the invoked names without one."""
     defs, missing, seen, queue = [], [], set(), [name]
@@ -866,21 +927,143 @@ def macro_closure(name: str, macros: dict[str, list[MacroDef]]) -> tuple[list[Ma
     return defs, missing
 
 
+@dataclass
+class UseScan:
+    """Every `use` (any depth, macro bodies included), rename and proc macro definition in one crate tree."""
+
+    leaves: list[tuple[tuple[str, ...], str | None, bool, str]] = field(default_factory=list)  # path, binding, glob, where
+    unread: list[tuple[str, set[str]]] = field(default_factory=list)  # (where, identifiers) of unreadable `use`s
+    renames: list[tuple[str, str]] = field(default_factory=list)  # (name, where) of every `use .. as name`
+    macro_renames: list[tuple[str, str]] = field(default_factory=list)  # the renames not of `{self as name}`
+    other_renames: list[tuple[str, str]] = field(default_factory=list)  # `extern crate .. as`, `as` in macro bodies
+    modules: list[tuple[str, str]] = field(default_factory=list)  # (name, where) of every `mod` item
+    proc_macros: list[str] = field(default_factory=list)
+
+    @property
+    def aliases(self) -> frozenset[str]:
+        """Every renamed binding (glob paths through any of them fail unless resolved)."""
+        return frozenset(name for name, _ in self.renames + self.other_renames)
+
+    @property
+    def macro_aliases(self) -> frozenset[str]:
+        """Renamed bindings that may name a macro (`{self as m}` binds a module only)."""
+        return frozenset(name for name, _ in self.macro_renames + self.other_renames)
+
+
+_SCANS: dict[int, UseScan] = {}
+
+
+def use_scan(tree: rst.Tree, source: rst.Source) -> UseScan:
+    key = id(tree)
+    if key not in _SCANS:
+        _SCANS[key] = _use_scan(tree, source)
+    return _SCANS[key]
+
+
+def _use_scan(tree: rst.Tree, source: rst.Source) -> UseScan:
+    scan = UseScan()
+    for path in sorted(tree.contexts):
+        lx = source.lexed(path)
+        info = shape_of(lx)
+        rules = [(first, last, what) for first, last, what in info.opaque if what == "macro_rules!"]
+        code = code_index(lx)
+        for pos, k in enumerate(code):
+            where = f"{path}:{lx.line(lx.tokens[k].start)}"
+            nxt = code[pos + 1] if pos + 1 < len(code) else len(lx.tokens)
+            if lx.is_ident(k, "as") and lx.is_ident(nxt) and (
+                    inside(rules, k) or [lx.tok(i) for i in code[max(0, pos - 3):pos - 1]] == ["extern", "crate"]):
+                scan.other_renames.append((lx.tok(nxt), where))
+            if lx.is_ident(k, "mod") and lx.is_ident(nxt):
+                scan.modules.append((lx.tok(nxt), where))
+            if not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or lx.is_punct(nxt, "<"):
+                continue
+            last = min(_statement_end(lx, k, len(lx.tokens)), len(lx.tokens) - 1)
+            try:
+                leaves = use_tree(lx, k, last, lx.line(lx.tokens[k].start))
+            except Unproven:
+                scan.unread.append((where, {lx.tok(i) for i in range(k, last + 1) if lx.is_ident(i)}))
+                continue
+            words = [lx.tok(i) for i in range(k, last + 1) if lx.tokens[i].kind == "ident"]
+            module_only = {words[j + 2] for j in range(len(words) - 2) if words[j:j + 2] == ["self", "as"]}
+            for segments, binding, glob in leaves:
+                scan.leaves.append((segments, binding, glob, where))
+                if binding is not None and not glob and binding != segments[-1]:
+                    scan.renames.append((binding, where))
+                    if binding not in module_only:
+                        scan.macro_renames.append((binding, where))
+        for index, _names, _has_path in info.attrs:
+            if any(entry in PROC_MACRO_ATTRS for entry, _ in attr_entries(lx, attr_bracket(lx, index))):
+                scan.proc_macros.append(f"{path}:{lx.line(lx.tokens[index].start)}")
+    return scan
+
+
+def identity_problems(scan: UseScan, macros: dict[str, list[MacroDef]]) -> list[str]:
+    """Bindings anywhere in the crate that could give an allowlisted attribute/derive spelling (IDENTITY_NAMES) or
+    an item macro (ITEM_MACROS, STD_ITEM_MACROS) another identity than the verified one."""
+    problems = []
+    watched = IDENTITY_NAMES | ITEM_MACROS | STD_ITEM_MACROS
+    for segments, binding, glob, where in scan.leaves:
+        if glob or binding not in watched:
+            continue
+        plain = [segment for segment in segments if segment != "::"]
+        if binding != segments[-1]:
+            problems.append(f"{where}: `use .. as {binding}` rebinds an allowlisted name")
+        elif binding in IDENTITY_HEADS:
+            if plain != [binding]:
+                problems.append(f"{where}: `use {'::'.join(segments)}` binds `{binding}`, the head of an "
+                                "allowlisted path, to something other than that crate")
+        elif binding in IDENTITY_NAMES:
+            if plain[0] not in IDENTITY_CRATES.get(binding, ()):
+                expected = " or ".join(sorted(IDENTITY_CRATES.get(binding, ()))) or "nowhere"
+                problems.append(f"{where}: `use {'::'.join(segments)}` binds allowlisted `{binding}` from "
+                                f"`{plain[0]}` (expected {expected})")
+        elif binding in STD_ITEM_MACROS:
+            if plain[0] not in ("std", "core"):
+                problems.append(f"{where}: `use {'::'.join(segments)}` shadows std {binding}!")
+        elif len(plain) > 1 and plain[0] not in ("crate", "self", "super"):
+            problems.append(f"{where}: `use {'::'.join(segments)}` binds item macro {binding}! from outside the crate")
+    for name, where in scan.other_renames:
+        if name in watched:
+            problems.append(f"{where}: `as {name}` rebinds an allowlisted name")
+    for where, names in scan.unread:
+        hit = sorted(names & watched)
+        if hit:
+            problems.append(f"{where}: cannot read a `use` that names allowlisted `{hit[0]}`")
+    for name, where in scan.modules:
+        if name in IDENTITY_HEADS:
+            problems.append(f"{where}: `mod {name}` shadows the head of an allowlisted path")
+    for name in sorted((IDENTITY_NAMES | STD_ITEM_MACROS) & set(macros)):
+        problems.append(f"{macros[name][0].path}: macro_rules! {name} shadows an allowlisted name")
+    for where in scan.proc_macros:
+        problems.append(f"{where}: a procedural macro definition could shadow an allowlisted name")
+    return problems
+
+
 def item_macro_problem(name: str, macros: dict[str, list[MacroDef]], lx: rst.Lexed | None = None,
-                       item: rst.Item | None = None) -> str | None:
-    """Why an item-level `name!` invocation could add a binding, or None when it cannot."""
+                       item: rst.Item | None = None, aliases: frozenset[str] = frozenset()) -> str | None:
+    """Why an item-level `name!` invocation (`name` may be a path) could add a binding, or None when it cannot.
+
+    A std item macro passes only when the crate does not shadow it (crate-wide uses are checked by
+    identity_problems); a crate item macro must be invoked by its own name, never through an alias.
+    """
+    segments = name.split("::")
+    name = segments[-1]
+    if len(segments) > 1 and segments[0] not in ("crate", "self", "super"):
+        return f"item-level {'::'.join(segments)}! is invoked through a path outside this crate"
     if name in STD_ITEM_MACROS:
-        return None
-    if name not in ITEM_MACROS:
+        if name in macros:
+            return f"item-level {name}! is shadowed by a macro_rules! {name} ({macros[name][0].path})"
+    elif name not in ITEM_MACROS:
         return f"item-level {name}! is not on the item macro allowlist"
-    if name not in macros:
+    elif name not in macros:
         return f"item-level {name}! has no macro_rules! in this crate"
-    defs, missing = macro_closure(name, macros)
-    for definition in defs:
-        if definition.emits:
-            return f"item-level {name}! may expand to {definition.emits[0]} ({definition.path})"
-    if missing:
-        return f"item-level {name}! expands through {missing[0]}!, which is not a macro_rules! of this crate"
+    else:
+        gap = closure_gap(name, macros, aliases)
+        if gap:
+            return f"item-level {gap}"
+        for definition in macro_closure(name, macros)[0]:
+            if definition.emits:
+                return f"item-level {name}! may expand to {definition.emits[0]} ({definition.path})"
     if lx is not None and item is not None:
         for k in range(item.first_token, item.last_token + 1):
             if lx.is_ident(k) and lx.tok(k) in EMITS and (lx.tok(k) != "extern"
@@ -929,19 +1112,41 @@ def git_renames(repo: Path, base: str, head: str) -> set[tuple[str, str]]:
     return renames
 
 
-def old_path_mentions(repo: Path, head: str, base: rst.Source, paths: list[str]) -> list[str]:
-    """Files at head whose text names a moved file's old path (repo-, crate- or src-relative)."""
-    patterns = []
+ESCAPE = re.compile(r"\\\n\s*|\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F_]{1,8})\}")
+
+
+def normalized_path_text(text: str) -> str:
+    """`text` with string escapes decoded (`\\x..`, `\\u{..}`, line continuations), backslashes as `/`, repeated
+    separators and `./` segments collapsed, and lower case, so a static path literal reads as plain text."""
+
+    def decode(match: re.Match) -> str:
+        code = match.group(1) or (match.group(2) or "").replace("_", "")
+        return chr(int(code, 16)) if code and int(code, 16) < 0x110000 else ""
+
+    text = ESCAPE.sub(decode, text).replace("\\", "/").lower()
+    return re.sub(r"/(?:\.?/)+", "/", text)
+
+
+def old_path_mentions(head: rst.Source, base: rst.Source, paths: list[str]) -> list[str]:
+    """Text files at head (layout TSVs other than the includes TSV and docs excepted) that, normalized
+    (normalized_path_text), contain a moved file's old path suffix: its path below the crate's src/ (or below the
+    crate for other files), not preceded by a path character."""
+    suffixes = []
     for path in paths:
-        patterns += ["-e", path]
-        crate = crate_of(path, base)
-        if crate:
-            patterns += ["-e", posixpath.relpath(path, crate)]
-            if path.startswith(f"{crate}/src/"):
-                patterns += ["-e", posixpath.relpath(path, f"{crate}/src")]
-    done = subprocess.run(["git", "-C", str(repo), "grep", "-l", "-F", *patterns, head],
-                          capture_output=True, text=True, check=False)
-    return sorted({line.split(":", 1)[1] for line in done.stdout.splitlines() if ":" in line})
+        crate = crate_of(path, base) or ""
+        relative = posixpath.relpath(path, f"{crate}/src") if path.startswith(f"{crate}/src/") else path[len(crate):]
+        suffixes.append(re.compile(r"(?<![\w.-])" + re.escape(relative.strip("/").lower()) + r"(?!\w)"))
+    found = []
+    for path in head.files():
+        if is_doc(path) or LAYOUT_TSV.match(path) and path != INCLUDES_TSV:
+            continue
+        data = head.read_bytes(path)
+        if b"\0" in data:
+            continue
+        text = normalized_path_text(data.decode("utf-8", errors="replace"))
+        if any(suffix.search(text) for suffix in suffixes):
+            found.append(path)
+    return found
 
 
 # ---------------------------------------------------------------- line stripping
@@ -1126,6 +1331,7 @@ class Root:
 def check_move(repo: Path, base_sha: str, head_sha: str) -> Result:
     result = Result()
     _FACTS.clear()
+    _SCANS.clear()
     changes = raw_changes(repo, base_sha, head_sha)
     base, head = rst.GitSource(repo, base_sha), rst.GitSource(repo, head_sha)
     head.share_with(base)
@@ -1233,7 +1439,7 @@ def _check_move(repo, base_sha, head_sha, changes, base, head, result) -> None:
         _check_crate(crate, pairs, inverse, stripped, modified, base, head, result)
     for path in sorted(modified - result.glue):
         result.fail(f"{path}: edited, but it is neither glue nor a layout TSV")
-    mentions = old_path_mentions(repo, head_sha, base, sorted(pairs))
+    mentions = old_path_mentions(head, base, sorted(pairs))
     if INCLUDES_TSV in mentions:
         result.fail(f"{INCLUDES_TSV} still names a moved file's old path; update its rows in the same change")
     docs = [path for path in mentions if is_doc(path)]
@@ -1260,6 +1466,7 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
     canon_head = lambda path: inverse.get(path, path)  # noqa: E731
     externs = extern_names(head, crate, head_tree) | extern_names(base, crate, base_tree)
     base_macros, head_macros = crate_macros(base_tree, base), crate_macros(head_tree, head)
+    aliases = use_scan(base_tree, base).macro_aliases | use_scan(head_tree, head).macro_aliases
     edition = crate_edition(base, crate)
     if crate_edition(head, crate) != edition:
         result.fail(f"{crate}: the edition changes")
@@ -1393,10 +1600,11 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
             else:
                 result.fail(f"rule 1 (includes): {where}: {macro}!(\"{literal}\") in a moved file; "
                             "its relative path would name another file")
-        _check_moved_file(src, lx, info, root, base_macros, result)
-        _check_item_macros(src, lx, list(walk_items(lx.items)), base_macros, result)
+        _check_moved_file(src, lx, info, root, base_macros, aliases, result)
+        _check_item_macros(src, lx, list(walk_items(lx.items)), base_macros, result, aliases)
     _check_crate_wide(((base_tree, base, base_macros), (head_tree, head, head_macros)), mine, inverse, roots,
-                      result)
+                      externs, result)
+    _check_glob_visibility(base_tree, base, mine, owner, roots, externs, result)
     added_lines = {dst: {head.lexed(dst).line(item.lead) for item in items} for dst, items in stripped.items()}
 
     def links_of(tree, path, skip=frozenset()):
@@ -1451,7 +1659,7 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
         blank_total += blanks
         for problem in problems:
             result.fail(f"{path}: edited beyond mod items and aliases: {problem}")
-        _check_line_shift(path, old_lx, new_lx, base_macros | head_macros, result)
+        _check_line_shift(path, old_lx, new_lx, base_macros | head_macros, aliases, result)
         inserted = {kept[index] for index in new_rows}
         aliases = []
         covered: set[int] = set()
@@ -1491,7 +1699,7 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
         else:
             facts = module_facts(base_tree, base, old_new_parent.module)
             _check_fresh_name(where, new_name, facts, base_tree, base, old_new_parent.module,
-                              root.old[:-1], old_name, externs, base_macros, edition, result)
+                              root.old[:-1], old_name, externs, base_macros, edition, aliases, result)
         if root.new_parent in stripped:
             names = ident_tokens(base.read(inverse[root.new_parent]))
             if new_name in names:
@@ -1503,17 +1711,17 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
                 result.fail(f"{where}: old name `{old_name}` is bound by {facts.bindings[old_name]} at head")
             if facts.globs:
                 result.fail(f"{where}: old parent has glob imports, so `{old_name}` needs an alias")
-            for problem in _name_risks(old_name, facts, externs, head_macros, edition):
+            for problem in _name_risks(old_name, facts, externs, head_macros, edition, aliases):
                 result.fail(f"{where}: old name: {problem}")
         # Rule 4: files that glob-import a parent must not name the module that appears there.
-        _check_glob_consumers(where, head_tree, head, root.new[:-1], new_name, None, result)
+        _check_glob_consumers(where, head_tree, head, root.new[:-1], new_name, None, externs, result)
         if root.alias is not None and visibility(head.lexed(root.old_parent), root.alias) != old_vis:
-            _check_glob_consumers(where, head_tree, head, root.old[:-1], old_name, root.old[:-1], result)
+            _check_glob_consumers(where, head_tree, head, root.old[:-1], old_name, root.old[:-1], externs, result)
         # Rule 3: item-level macro invocations in both parents.
         for tree, source, module, macros in ((base_tree, base, root.old[:-1], base_macros),
                                              (head_tree, head, root.new[:-1], head_macros)):
             for path in module_files(tree, module):
-                _check_item_macros(path, source.lexed(path), source.lexed(path).items, macros, result)
+                _check_item_macros(path, source.lexed(path), source.lexed(path).items, macros, result, aliases)
         # Textual macro scope at the old and the new declaration point.
         names = set()
         for member in root.members:
@@ -1565,16 +1773,16 @@ def _check_crate(crate, pairs, inverse, stripped, modified, base, head, result) 
                             + ", ".join(f"`mod {item.name};`" for item in items))
 
 
-def _check_item_macros(path, lx, items, macros, result) -> None:
+def _check_item_macros(path, lx, items, macros, result, aliases=frozenset()) -> None:
     """Rule 3: item-level macro invocations among `items` cannot add a binding."""
     for item in items:
         if item.kind == "macro":
-            problem = item_macro_problem(item.name.rstrip("!").split("::")[-1], macros, lx, item)
+            problem = item_macro_problem(item.name.rstrip("!"), macros, lx, item, aliases)
             if problem:
                 result.fail(f"rule 3 (item macros): {path}:{lx.line(item.lead)}: {problem}")
 
 
-def _check_line_shift(path, old_lx, new_lx, macros, result) -> None:
+def _check_line_shift(path, old_lx, new_lx, macros, aliases, result) -> None:
     """Rule 7 in a glue file: no line! (or a crate macro reaching a location macro) below its first change."""
     old_rows, new_rows = old_lx.text.splitlines(), new_lx.text.splitlines()
     first = next((index for index, (a, b) in enumerate(zip(old_rows, new_rows)) if a != b),
@@ -1587,7 +1795,7 @@ def _check_line_shift(path, old_lx, new_lx, macros, result) -> None:
             if not lx.is_punct(lx.next_code(k + 1), "!") or word in KEYWORDS:
                 continue
             located = word in LOCATION_MACROS or any(d.location for d in macro_closure(word, macros)[0])
-            if located:
+            if located or closure_gap(word, macros, aliases):
                 result.fail(f"rule 7 (location): {path}:{lx.line(lx.tokens[k].start)}: {word}! sits below a "
                             "glue change, so its line can shift")
 
@@ -1615,7 +1823,51 @@ def glob_uses(lx: rst.Lexed, module: tuple[str, ...]):
                 yield module + nest, segments, line
 
 
-def _check_glob_consumers(where, tree, source, parent, name, skip_below, result) -> None:
+def file_aliases(lx: rst.Lexed) -> dict[str, tuple[str, ...] | None]:
+    """Top-level `use <path> as <name>` bindings of one file (None for a name renamed twice)."""
+    cached = lx.__dict__.get("_aliases")
+    if cached is None:
+        cached = lx.__dict__["_aliases"] = {}
+        for item in lx.items:
+            if item.kind != "use":
+                continue
+            try:
+                leaves = use_leaves(lx, item)
+            except Unproven:
+                continue
+            for segments, binding, glob in leaves:
+                if binding is not None and not glob and binding != segments[-1]:
+                    cached[binding] = None if binding in cached else segments
+    return cached
+
+
+def glob_target(tree: rst.Tree, source: rst.Source, path: str, context: tuple[str, ...], module: tuple[str, ...],
+                segments: tuple[str, ...] | None, externs: set[str]) -> tuple[str, ...] | None:
+    """The module a glob `use <segments>::*` in `module` (file `path`, whose module is `context`) imports; None for
+    another crate's module. A head renamed by a top-level `use <p> as <head>;` of the same file is expanded once;
+    an enum's variants (`use <module path>::<Enum>::*`, variants have no privacy of their own) also give None;
+    anything else that does not resolve through `mod` declarations is Unproven."""
+    if segments is None:
+        raise Unproven("cannot read the use tree")
+    alias = file_aliases(source.lexed(path)).get(segments[0]) if module == context else None
+    if alias is not None:
+        segments = alias + segments[1:]
+    try:
+        return resolve_mod_path(tree, source, module, segments)
+    except Unproven:
+        if segments[0] == "::" or segments[0] in externs and segments[0] not in file_aliases(source.lexed(path)):
+            return None
+        try:
+            owner = resolve_mod_path(tree, source, module, segments[:-1]) if len(segments) > 1 else module
+        except Unproven:
+            raise Unproven(f"`{'::'.join(segments)}` does not resolve through `mod` declarations") from None
+        bound = module_facts(tree, source, owner).bindings.get(segments[-1], [])
+        if len(bound) == 1 and bound[0].startswith("enum "):
+            return None
+        raise
+
+
+def _check_glob_consumers(where, tree, source, parent, name, skip_below, externs, result) -> None:
     """Rule 4: no file that glob-imports `parent` names `name` (descendants of `skip_below` excepted)."""
     for path in sorted(tree.contexts):
         lx = source.lexed(path)
@@ -1626,26 +1878,105 @@ def _check_glob_consumers(where, tree, source, parent, name, skip_below, result)
                 if skip_below is not None and module[:len(skip_below)] == skip_below:
                     continue
                 try:
-                    if segments is None:
-                        raise Unproven("cannot read the use tree")
-                    hit = resolve_mod_path(tree, source, module, segments) == parent
+                    hit = glob_target(tree, source, path, context.module, module, segments, externs) == parent
                 except Unproven as error:
-                    hit = segments is None or segments[-1:] == parent[-1:] or set(segments) <= {"super", "self",
-                                                                                               "crate"}
-                    if hit:
-                        result.fail(f"rule 4 (glob consumers): {where}: {path}:{line}: cannot prove the glob "
-                                    f"does not import {'::'.join(parent)}: {error}")
-                        continue
+                    result.fail(f"rule 4 (glob consumers): {where}: {path}:{line}: cannot prove the glob "
+                                f"does not import {'::'.join(parent)}: {error}")
+                    continue
                 if hit:
                     result.fail(f"rule 4 (glob consumers): {where}: {path}:{line} glob-imports "
                                 f"{'::'.join(parent)} and names `{name}`")
 
 
-def _check_crate_wide(trees, mine, inverse, roots, result) -> None:
-    """Rules 1 and 8 over every file of every target, at base and head."""
+def _check_glob_visibility(tree, source, mine, owner, roots, externs, result) -> None:
+    """Rule 4 (glob visibility): a glob sees its module's private and `pub(in ..)` items depending on where it is.
+
+    Every root stays inside its old top-level module; a glob in a moved file imports a module inside its subtree,
+    another crate's module, or an ancestor-or-self G of both its old and its new module, with no `pub(in ..)` item
+    in G narrower than G; no glob outside a moved subtree imports a module inside it."""
+    for root in sorted(roots.values(), key=lambda root: root.src):
+        if root.old[:2] != root.new[:2]:
+            result.fail(f"rule 4 (glob visibility): {root.src} -> {root.dst}: leaves crate::{root.old[1]}, the old "
+                        "path's top-level module")
+    old_names = {root.old[-1] for root in roots.values()}
+    for path in sorted(tree.contexts):
+        lx = source.lexed(path)
+        root = roots.get(owner.get(path, ""))
+        for context in tree.contexts[path]:
+            for module, segments, line in glob_uses(lx, context.module):
+                where = f"rule 4 (glob visibility): {path}:{line}"
+                try:
+                    target = glob_target(tree, source, path, context.module, module, segments, externs)
+                except Unproven as error:
+                    if root is not None or segments is None or set(segments) & old_names:
+                        result.fail(f"{where}: cannot resolve the glob: {error}")
+                    continue
+                if target is None:
+                    continue
+                inner = [other for other in roots.values() if target[:len(other.old)] == other.old]
+                if inner and inner[-1] is not root:
+                    result.fail(f"{where}: glob-imports {'::'.join(target)} inside moved "
+                                f"{'::'.join(inner[-1].old)}, whose restricted items depend on its place")
+                if root is None or inner:
+                    continue
+                new = root.new + module[len(root.old):]
+                if module[:len(target)] != target or new[:len(target)] != target:
+                    result.fail(f"{where}: glob-imports {'::'.join(target)}, which is not an ancestor of both "
+                                f"{'::'.join(module)} and {'::'.join(new)}; its private items would differ")
+                    continue
+                for item_where, vis in restricted_items(tree, source, target):
+                    result.fail(f"{where}: glob-imports {'::'.join(target)}, whose {vis} item at {item_where} is "
+                                "visible depending on the importer's place")
+
+
+def restricted_items(tree: rst.Tree, source: rst.Source, module: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Items of `module` with `pub(in <path>)` where <path> is not an ancestor-or-self of `module`."""
+    out = []
+    for path in module_files(tree, module):
+        lx = source.lexed(path)
+        for item in lx.items:
+            vis = visibility(lx, item) if item.kind not in ("comment", "inner-doc", "inner-attr") else ""
+            if not vis.startswith("pub(in "):
+                continue
+            segments = tuple(vis[len("pub(in "):-1].split("::"))
+            if segments[0] == "crate":
+                named = module[:1] + segments[1:]
+            elif set(segments) == {"super"}:
+                named = module[:max(1, len(module) - len(segments))]
+            else:
+                named = None
+            if named is None or module[:len(named)] != named:
+                out.append((f"{path}:{lx.line(item.lead)}", vis))
+    return out
+
+
+def _check_crate_wide(trees, mine, inverse, roots, externs, result) -> None:
+    """Rules 1 and 8 over every file of every target, at base and head; also globs through `use .. as` aliases
+    (rule 4) and allowlisted names bound by anything but their expected crate (rule 2)."""
     for label, (tree, source, macros), moved, dirs in (
             ("base", trees[0], set(mine), [subtree_dir(root.src) for root in roots.values()]),
             ("head", trees[1], set(inverse), [subtree_dir(root.dst) for root in roots.values()])):
+        scan = use_scan(tree, source)
+        for problem in identity_problems(scan, macros):
+            result.fail(f"rule 2 (identity): {label} {problem}")
+        names = {name for root in roots.values() for name in (root.old[-1], root.new[-1])}
+        for name, definitions in sorted(macros.items()):
+            for definition in definitions:
+                hit = sorted(definition.idents & names)
+                if hit:
+                    result.fail(f"rule 4 (glob consumers): {label} {definition.path}: macro_rules! {name} names "
+                                f"`{hit[0]}`, a moved module, so its expansion may reach it")
+        for path in sorted(tree.contexts):
+            lx = source.lexed(path)
+            for context in tree.contexts[path]:
+                for module, segments, line in glob_uses(lx, context.module):
+                    if segments is None or not set(segments) & scan.aliases:
+                        continue
+                    try:
+                        glob_target(tree, source, path, context.module, module, segments, externs)
+                    except Unproven as error:
+                        result.fail(f"rule 4 (glob consumers): {label} {path}:{line}: glob through a `use .. as` "
+                                    f"alias: {error}")
         for name, definitions in sorted(macros.items()):
             for definition in definitions:
                 if definition.hidden:
@@ -1703,7 +2034,7 @@ def subtree_dir(path: str) -> str:
     return posixpath.dirname(path) + "/" if posixpath.basename(path) == "mod.rs" else path[:-3] + "/"
 
 
-def _check_moved_file(src, lx, info, root, macros, result) -> None:
+def _check_moved_file(src, lx, info, root, macros, aliases, result) -> None:
     """Rules 2 and 7 inside one moved file."""
     macro_bodies = [(first, last) for first, last, what in info.opaque if what == "macro_rules!"]
     for index, _names, _has_path in info.attrs:
@@ -1739,6 +2070,9 @@ def _check_moved_file(src, lx, info, root, macros, result) -> None:
     invoked = {lx.tok(k) for k in code if lx.is_ident(k) and lx.tok(k) not in KEYWORDS
                and lx.is_punct(lx.next_code(k + 1), "!") and not inside([(a, b, "") for a, b in macro_bodies], k)}
     for name in sorted(invoked):
+        gap = closure_gap(name, macros, aliases)
+        if gap:
+            result.fail(f"rule 2 (macros): {src}: {gap}")
         defs, _ = macro_closure(name, macros)
         for definition in defs:
             if definition.has_super or definition.location:
@@ -1799,13 +2133,13 @@ def _check_alias(path, alias, roots, tree, source, module, result) -> int:
     return 1
 
 
-def _name_risks(name: str, facts: Facts, externs: set[str], macros, edition: str) -> list[str]:
+def _name_risks(name: str, facts: Facts, externs: set[str], macros, edition: str, aliases) -> list[str]:
     problems = []
     prelude = PRELUDE_2024 if edition == "2024" else PRELUDE
     if name in externs or name in prelude or name in PRIMITIVES:
         problems.append(f"`{name}` is also an extern crate, prelude (edition {edition}) or primitive name")
     for macro, where in facts.macros:
-        problem = item_macro_problem(macro, macros)
+        problem = item_macro_problem(macro, macros, aliases=aliases)
         if problem:
             problems.append(f"{where}: {problem}")
     problems.extend(facts.opaque)
@@ -1813,7 +2147,7 @@ def _name_risks(name: str, facts: Facts, externs: set[str], macros, edition: str
 
 
 def _check_fresh_name(where, name, facts, tree, source, module, old_parent, old_name, externs, macros,
-                      edition, result) -> None:
+                      edition, aliases, result) -> None:
     """At base, `name` in the new parent's namespace was unbound or already the moved module."""
     if facts.bindings.get(name):
         result.fail(f"{where}: `{name}` was already bound in the new parent: {facts.bindings[name]}")
@@ -1829,7 +2163,7 @@ def _check_fresh_name(where, name, facts, tree, source, module, old_parent, old_
                             "which may bind the new name")
         if name != old_name:
             result.fail(f"{where}: renamed module under a new parent with glob imports")
-    for problem in _name_risks(name, facts, externs, macros, edition):
+    for problem in _name_risks(name, facts, externs, macros, edition, aliases):
         result.fail(f"{where}: new name: {problem}")
 
 
@@ -1839,6 +2173,7 @@ def _check_fresh_name(where, name, facts, tree, source, module, old_parent, old_
 def check_absolutize(repo: Path, base_sha: str, head_sha: str) -> Result:
     result = Result()
     _FACTS.clear()
+    _SCANS.clear()
     base, head = rst.GitSource(repo, base_sha), rst.GitSource(repo, head_sha)
     head.share_with(base)
     try:
@@ -1875,20 +2210,24 @@ def _check_absolutize(changes, base, head, result) -> None:
             head_tree, _lib, head_layout = target_tree(head, crate)
             for problem in dict.fromkeys(layout + head_layout):
                 result.fail(f"rule 8 (targets): {problem}")
-            trees[crate] = (base_tree, head_tree, crate_macros(base_tree, base))
-        base_tree, head_tree, macros = trees[crate]
+            macros = crate_macros(base_tree, base)
+            scan = use_scan(base_tree, base)
+            for problem in identity_problems(scan, macros):
+                result.fail(f"rule 2 (identity): base {problem}")
+            trees[crate] = (base_tree, head_tree, macros, scan.macro_aliases)
+        base_tree, head_tree, macros, aliases = trees[crate]
         b, h = single(base_tree, path), single(head_tree, path)
         if b is None or h is None or b.module != h.module:
             result.fail(f"{path}: needs exactly one module context, the same at base and head")
             continue
-        count = _absolutize_file(path, b.module, base.lexed(path), head.lexed(path), macros, result)
+        count = _absolutize_file(path, b.module, base.lexed(path), head.lexed(path), macros, aliases, result)
         if count:
             total += count
             result.lines.append(f"  {path}: {count} paths")
     result.lines.insert(0, f"{len(files)} files, {total} absolutized paths")
 
 
-def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rst.Lexed, macro_defs,
+def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rst.Lexed, macro_defs, aliases,
                      result: Result) -> int:
     info = shape(old)
     replaced: list[int] = []
@@ -1950,23 +2289,31 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
         if k < len(new.tokens) and new.tokens[k].start != stop or (k == len(new.tokens) and stop != len(new.text)):
             result.fail(f"{where}: replacement does not end at a token boundary")
             return count
-        _check_column_shift(f"{path}:{old.line(old.tokens[i].start)}", old, last, macro_defs, result)
+        _check_column_shift(f"{path}:{old.line(old.tokens[i].start)}", old, last, macro_defs, aliases, result)
         replaced.append(i)
         i, j, count = last + 1, k, count + 1
     if i != len(old.tokens) or j != len(new.tokens):
         result.fail(f"{path}: edited beyond replacing `super` chains (at the end of the file)")
-    _absolutize_attrs(path, old, info, replaced, result)
+    _absolutize_attrs(path, old, info, replaced, macro_defs, aliases, result)
     return count
 
 
-def _absolutize_attrs(path: str, old: rst.Lexed, info: Shape, changed: list[int], result: Result) -> None:
+def _absolutize_attrs(path: str, old: rst.Lexed, info: Shape, changed: list[int], macro_defs, aliases,
+                      result: Result) -> None:
     """Rule 2: top-level items around replaced chains (and the file's inner attributes) carry only allowlisted
-    attributes and derives."""
+    attributes and derives, and invoke no macro whose expansion closure cannot be listed (closure_gap)."""
     spans = []
     for item in old.items:
         if item.kind == "inner-attr" or any(item.first_token <= chain <= item.last_token for chain in changed):
             spans.append((item.first_token, item.last_token))
     bodies = [(first, last, what) for first, last, what in info.opaque if what == "macro_rules!"]
+    for first, last in spans:
+        for k in range(first, last + 1):
+            if old.is_ident(k) and old.tok(k) not in KEYWORDS and old.is_punct(old.next_code(k + 1), "!") \
+                    and not inside(bodies, k):
+                gap = closure_gap(old.tok(k), macro_defs, aliases)
+                if gap:
+                    result.fail(f"rule 2 (macros): {path}:{old.line(old.tokens[k].start)}: {gap}")
     for index, _names, _has_path in info.attrs:
         if inside(bodies, index) or not any(first <= index <= last for first, last in spans):
             continue
@@ -1975,7 +2322,7 @@ def _absolutize_attrs(path: str, old: rst.Lexed, info: Shape, changed: list[int]
                         "on the allowlist (may be a macro)")
 
 
-def _check_column_shift(where: str, old: rst.Lexed, last: int, macro_defs, result: Result) -> None:
+def _check_column_shift(where: str, old: rst.Lexed, last: int, macro_defs, aliases, result: Result) -> None:
     """Rule 7: nothing after a replaced chain on its line reports a column (location macros, or crate macros
     that expand to one)."""
     line = old.line(old.tokens[last].start)
@@ -1983,7 +2330,8 @@ def _check_column_shift(where: str, old: rst.Lexed, last: int, macro_defs, resul
     while k < len(old.tokens) and old.line(old.tokens[k].start) == line:
         if old.is_ident(k) and (location_at(old, k) or (
                 old.is_punct(old.next_code(k + 1), "!") and old.tok(k) not in KEYWORDS
-                and any(d.location for d in macro_closure(old.tok(k), macro_defs)[0]))):
+                and (any(d.location for d in macro_closure(old.tok(k), macro_defs)[0])
+                     or closure_gap(old.tok(k), macro_defs, aliases)))):
             result.fail(f"rule 7 (location): {where}: `{old.tok(k)}` after the replaced chain on the same line "
                         "would report another column")
         k += 1
