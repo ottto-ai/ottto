@@ -149,17 +149,28 @@ pub(super) fn hydrate_txn(
             1,
         )?
         .is_empty();
+    // Upload progress is not graph state: walk up to its range, seek past
+    // it once, and walk the rest. No progress header is read.
+    let (progress_first, progress_end) = progress::range()?;
+    let mut below = Some(progress_first);
     let mut after = None;
     let mut retired = BTreeSet::new();
     loop {
-        let page = tx.scan_prefix(
-            RowPrefix {
-                table: Table::Records,
-            },
-            after.as_ref(),
-            128,
-        )?;
+        let page = match &below {
+            Some(below) => tx.scan_records_below(after.as_ref(), below, 128)?,
+            None => tx.scan_prefix(
+                RowPrefix {
+                    table: Table::Records,
+                },
+                after.as_ref(),
+                128,
+            )?,
+        };
         if page.is_empty() {
+            if below.take().is_some() {
+                after = Some(progress_end.clone());
+                continue;
+            }
             break;
         }
         for header in &page {
@@ -399,6 +410,8 @@ pub(super) fn private_paths(
         RowKey::Record { kind, .. } => {
             let extract = match catalogue::group(kind.name()) {
                 Some(catalogue::Group::Misc) => kinds_misc::private_paths,
+                // Upload progress holds no private-path extraction.
+                Some(catalogue::Group::Progress) => return Ok(()),
                 Some(_) => mapper::private_paths,
                 None => bail!("state_v2_unmapped_kind"),
             };

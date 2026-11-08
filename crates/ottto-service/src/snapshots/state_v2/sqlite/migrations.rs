@@ -183,11 +183,13 @@ mod tests {
             WRITER_CAPABILITY,
             WRITER_CAPABILITIES_HISTORY.last().unwrap().0
         );
-        // Tail kinds use TAIL_LAYOUT; graph kinds use their catalogue entry.
+        // Tail and progress kinds use their own layout; graph kinds use their
+        // catalogue entry.
         for kind in catalogue::OWNED
             .iter()
             .map(|(kind, _)| kind)
             .chain(catalogue::TAIL_KINDS.iter())
+            .chain(catalogue::PROGRESS_KINDS.iter())
         {
             assert!(catalogue::introduced(kind).unwrap() <= catalogue::LAYOUT);
         }

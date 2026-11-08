@@ -858,6 +858,14 @@ impl Transaction for ReadBack<'_> {
     fn scan_prefix(&mut self, _: RowPrefix, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
         Ok(Vec::new())
     }
+    fn scan_records_below(
+        &mut self,
+        _: Option<&RowKey>,
+        _: &RowKey,
+        _: usize,
+    ) -> Result<Vec<Header>> {
+        Ok(Vec::new())
+    }
     fn scan_kind(&mut self, _: &RecordKind, _: Option<&RowKey>, _: usize) -> Result<Vec<Header>> {
         Ok(Vec::new())
     }

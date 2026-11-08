@@ -46,6 +46,7 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod mapper;
+mod progress;
 mod sqlite;
 mod tail;
 use kinds::KindCx;
@@ -319,6 +320,14 @@ pub(super) trait Transaction {
         after: Option<&RowKey>,
         limit: usize,
     ) -> Result<Vec<Header>>;
+    /// `scan_prefix` over records that stops before `below` (exclusive): no
+    /// header at or past it is read.
+    fn scan_records_below(
+        &mut self,
+        after: Option<&RowKey>,
+        below: &RowKey,
+        limit: usize,
+    ) -> Result<Vec<Header>>;
     /// One exact key's rows in position order, from position 0 unless a cursor
     /// is given (exclusive). No other key's header is read.
     fn scan_record_key(
@@ -369,10 +378,14 @@ fn value_target(key: &RowKey) -> u64 {
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
-        // The two whole fields that exceed 1 MiB on real stores share the
-        // value bound, so a large row commits instead of refusing its save.
+        // The two whole fields that exceed 1 MiB on real stores, and the
+        // upload-progress ledger, share the value bound, so a large row
+        // commits without a standing alarm.
         RowKey::Record { kind, .. }
-            if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
+            if matches!(
+                kind.name(),
+                "scan_state.traversal" | "v1_field.birth_store" | "progress.ledger"
+            ) =>
         {
             VALUE_BYTES
         }
@@ -557,6 +570,7 @@ fn control_name(name: &str) -> bool {
             | "repair_commitment"
             | "field_presence"
             | "limits"
+            | "progress_generation"
     )
 }
 

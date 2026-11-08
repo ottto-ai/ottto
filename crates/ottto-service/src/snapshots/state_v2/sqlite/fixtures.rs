@@ -211,3 +211,68 @@ pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
 pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
     db.stats.dirty_rows_per_save
 }
+
+thread_local! {
+    static BEFORE_REOPEN: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Run the armed hook once, after a COMMIT error closed the connection and
+/// before the finalizer reopens it to classify the outcome.
+pub(super) fn before_reopen(path: &Path) {
+    if let Some(hook) = BEFORE_REOPEN.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
+}
+/// Once the next COMMIT error closes the connection, another connection
+/// commits `name` = `value`, as a racing or partly durable writer would.
+pub(in super::super) fn on_reopen_write_control(name: &'static str, value: u64) {
+    BEFORE_REOPEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(BUSY).unwrap();
+            let bytes = control_json(&value).unwrap();
+            conn.execute(
+                "INSERT INTO control(name,value_version,value,row_checksum) VALUES(?1,1,?2,?3) ON CONFLICT(name) DO UPDATE SET value=excluded.value,row_checksum=excluded.row_checksum",
+                params![name, bytes, control_checksum(name, 1, &bytes).to_vec()],
+            )
+            .unwrap();
+        }));
+    });
+}
+/// (graph record rows, progress rows, records alarm) as the store counts them.
+pub(in super::super) fn row_counts_for_test(db: &Sqlite) -> (u64, u64, bool) {
+    let s = &db.stats;
+    (s.record_rows, s.progress_rows, s.records_alarm)
+}
+pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
+    db.stats.record_rows = rows;
+}
+/// Make every progress row's header fail its checksum, outside a transaction.
+pub(in super::super) fn corrupt_progress_headers_for_test(db: &Sqlite) -> usize {
+    db.conn()
+        .unwrap()
+        .execute(
+            "UPDATE records SET row_checksum=zeroblob(16) WHERE kind>='progress.' AND kind<'progress/'",
+            [],
+        )
+        .unwrap()
+}
+
+/// [format] the WAL checkpoint policy is set and verified; custody is manual.
+#[test]
+fn checkpoint_policy_is_set_and_verified() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-checkpoint-policy");
+    for (policy, pages) in [(Checkpoint::Manual, 0), (Checkpoint::Auto(1000), 1000)] {
+        let conn = Connection::open(scratch.join(format!("policy-{pages}.sqlite"))).unwrap();
+        conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL;")
+            .unwrap();
+        settings(&conn, false, policy).unwrap();
+        let actual: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual, pages);
+    }
+}
+pub(in super::super) fn writer_capability_for_test() -> u64 {
+    migrations::WRITER_CAPABILITY
+}
