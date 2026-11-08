@@ -20074,7 +20074,7 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn handles_authenticated_receipts_request_from_private_ring() {
-        let support_root = telemetry_key_store_root("receipts-control");
+        let support_root = control_test_root("receipts-control");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         crate::upload_receipts::append_transport_error(&support_root, SourceKind::Codex, 3)
