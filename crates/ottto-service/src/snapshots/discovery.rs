@@ -14,4 +14,6 @@ pub(super) mod candidate;
 pub(super) mod candidate_open;
 pub(super) mod directory;
 pub(super) mod retention;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;
 pub(super) mod traversal;

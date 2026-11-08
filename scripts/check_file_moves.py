@@ -232,6 +232,11 @@ def code_index(lx: rst.Lexed) -> list[int]:
     return [i for i, token in enumerate(lx.tokens) if token.kind not in TRIVIA]
 
 
+def capture_bounds(lx: rst.Lexed, index: int) -> bool:
+    """Token `index` is the `use` of precise capture bounds (`impl Trait + use<..>`), not an import."""
+    return lx.is_ident(index, "use") and lx.is_punct(lx.next_code(index + 1), "<")
+
+
 def invokes_macro(lx: rst.Lexed, index: int, hi: int | None = None) -> bool:
     """Token `index` names a macro invocation: a non-keyword identifier, `!`, then `(`, `[` or `{` (or `$`, a
     transcriber's group); `x as u64 != y` invokes nothing."""
@@ -885,6 +890,8 @@ def macro_def(lx: rst.Lexed, path: str, ordinal: int, group: int) -> MacroDef:
                 definition.has_super = True
             if location_at(lx, k):
                 definition.location = True
+            if capture_bounds(lx, k):
+                continue
             if depth == 0 and not dollar and word in EMITS and (word != "extern" or lx.is_ident(nxt, "crate")):
                 definition.emits.append(word)
             if word in PATH_MACROS and lx.is_punct(nxt, "!") and not dollar:
@@ -1008,7 +1015,7 @@ def _use_scan(tree: rst.Tree, source: rst.Source) -> UseScan:
                 scan.other_renames.append((lx.tok(nxt), where))
             if lx.is_ident(k, "mod") and lx.is_ident(nxt):
                 scan.modules.append((lx.tok(nxt), where))
-            if not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or lx.is_punct(nxt, "<"):
+            if not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or capture_bounds(lx, k):
                 continue
             last = use_end = min(_statement_end(lx, k, len(lx.tokens)), len(lx.tokens) - 1)
             try:
@@ -1099,8 +1106,8 @@ def item_macro_problem(name: str, macros: dict[str, list[MacroDef]], lx: rst.Lex
                 return f"item-level {name}! may expand to {definition.emits[0]} ({definition.path})"
     if lx is not None and item is not None:
         for k in range(item.first_token, item.last_token + 1):
-            if lx.is_ident(k) and lx.tok(k) in EMITS and (lx.tok(k) != "extern"
-                                                          or lx.is_ident(lx.next_code(k + 1), "crate")):
+            if lx.is_ident(k) and lx.tok(k) in EMITS and not capture_bounds(lx, k) and (
+                    lx.tok(k) != "extern" or lx.is_ident(lx.next_code(k + 1), "crate")):
                 return f"item-level {name}! input has `{lx.tok(k)}`"
     return None
 
@@ -1837,7 +1844,8 @@ def glob_uses(lx: rst.Lexed, module: tuple[str, ...]):
     rules = [(first, last, what) for first, last, what in info.opaque if what == "macro_rules!"]
     code = code_index(lx)
     for pos, k in enumerate(code):
-        if not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or inside(rules, k):
+        if (not lx.is_ident(k, "use") or (pos and lx.is_punct(code[pos - 1], "$")) or capture_bounds(lx, k)
+                or inside(rules, k)):
             continue
         last = min(_statement_end(lx, k, len(lx.tokens)), len(lx.tokens) - 1)
         line = lx.line(lx.tokens[k].start)
@@ -2367,10 +2375,8 @@ def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
     info = shape_of(lx)
     imports = {}
     for pos, keyword in enumerate(code):
-        if not lx.is_ident(keyword, "use") or inside(info.opaque, keyword):
+        if not lx.is_ident(keyword, "use") or capture_bounds(lx, keyword) or inside(info.opaque, keyword):
             continue
-        if lx.is_punct(lx.next_code(keyword + 1), "<"):
-            continue  # precise capture bounds, not imports (impl Trait + use<...>)
         first, previous = keyword, pos - 1
         if previous >= 0 and lx.is_punct(code[previous], ")"):
             opening = lx.opener[code[previous]]
