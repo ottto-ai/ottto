@@ -439,9 +439,11 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                 }
                 continue;
             }
+            let key = local_index_key(&path);
+            let indexed = index.files.contains_key(&key);
+            let stamp_matches = index.listing_stamp_matches(&path, &metadata);
             let mut owed_unchanged = false;
             if relisting {
-                let key = local_index_key(&path);
                 // Unchanged and not owed: seen, never queued. A file this
                 // generation already saw with no entry (held) has
                 // no stamp; its owner's floor re-offers it. A Codex inventory
@@ -453,8 +455,8 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     .is_some_and(|hold| hold.owed.contains(&key))
                 {
                     true
-                } else if index.files.contains_key(&key) {
-                    index.listing_unchanged(&path, &metadata)
+                } else if indexed {
+                    stamp_matches && !sampled_audit::path_requires_verification(&index.files, &path)
                 } else {
                     traversal.observed_index_keys.contains(&key)
                 };
@@ -463,7 +465,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
 
-                owed_unchanged = index.listing_stamp_matches(&path, &metadata);
+                owed_unchanged = stamp_matches;
                 if owed_unchanged
                     && !pending.contains_key(&path)
                     && !pace_listing_owed(&mut traversal, &key)
@@ -472,35 +474,34 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
             }
+            let changed = !stamp_matches && (relisting || indexed);
             let census_member = !relisting || fresh_path_census_member(source, &traversal, &path);
             // Presence and enqueue authority are separate. A new-round walk
             // sees pending/floor-blocked files even when it adds no read work.
             crate::local_resource_diagnostics::observe_file_size(source, metadata.len());
             traversal.counts.max_unread_bytes = traversal.counts.max_unread_bytes.max(
-                metadata.len().saturating_sub(
-                    index
-                        .files
-                        .get(&local_index_key(&path))
-                        .map_or(0, |entry| entry.size_bytes),
-                ),
+                metadata
+                    .len()
+                    .saturating_sub(index.files.get(&key).map_or(0, |entry| entry.size_bytes)),
             );
             traversal.counts.discovered_file_count += 1;
-            let first_observed = traversal.observed_index_keys.insert(local_index_key(&path));
+            let first_observed = traversal.observed_index_keys.insert(key);
 
             if let Some(&position) = pending.get(&path) {
-                if !relisting {
-                    let existing = traversal
-                        .pending_candidates
-                        .get_mut(position)
-                        .expect("walk queue position");
-                    existing.census_member = true;
-                    existing.watcher_hint |= directory.watcher_hint;
-                }
-            } else {
-                // A re-listed change is fresh data and joins the census by
-                // the watcher-hint rule.
+                let existing = traversal
+                    .pending_candidates
+                    .get_mut(position)
+                    .expect("walk queue position");
                 traversal.counts.listing_changes_without_hint +=
-                    u64::from(relisting && !owed_unchanged);
+                    u64::from(changed && !existing.watcher_hint);
+                if !relisting {
+                    existing.census_member = true;
+                }
+                existing.watcher_hint |= directory.watcher_hint || changed;
+            } else {
+                // Changed indexed files get hint priority even on a census walk.
+                traversal.counts.listing_changes_without_hint +=
+                    u64::from(changed && !directory.watcher_hint);
                 traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
                 relisted_members += usize::from(relisting && census_member && first_observed);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
@@ -508,7 +509,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member,
-                    watcher_hint: relisting || directory.watcher_hint,
+                    watcher_hint: relisting || changed || directory.watcher_hint,
                 });
             }
         }

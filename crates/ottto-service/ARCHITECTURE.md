@@ -18,6 +18,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   whose length grew past its saved size is never dropped from discovery because of its age. A file
   never read, last modified more than 60 days before the walk, is not read for the first time;
   a file already read, owed or queued keeps the walk's window.
+  Each listing gives hint priority to indexed files whose listing stamp changed since their
+  last read, promoting queued files in place. Unchanged census files, including owed files,
+  keep their ordinary queue order. Existing selection budgets and read gates still apply.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
