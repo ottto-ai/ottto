@@ -710,6 +710,311 @@ claude_tests!(
     failed_then_healthy_telemetry
 );
 
+/// A production resumed-mode page: receipts use the base, stamps the exact
+/// active mode, including the copy capability.
+#[cfg(unix)]
+fn resumed_page(c: &Corpus, scanner: &E2ScanFixture, index: ScanIndex) -> Page {
+    super::privacy_flip_money_tests::page_under(
+        c,
+        scanner,
+        index,
+        crate::snapshots::privacy_flip_modes::Mode {
+            policy: SnapshotUploadPolicy::default(),
+            key: 0,
+            cache: false,
+            copy: true,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn receipt_family(name: &str) -> (Corpus, Vec<PathBuf>) {
+    let mut c = corpus(name);
+    let root = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+    input_clock(&root);
+    let children = (0..3)
+        .map(|n| {
+            let path = c.agent(n, &line(ROOT, &format!("child-{n}"), AT, 20));
+            input_clock(&path);
+            path
+        })
+        .collect();
+    (c, children)
+}
+
+#[cfg(unix)]
+fn family_rows() -> Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence> {
+    let mut rows = vec![api("r1", 10, 100)];
+    rows.extend((0..3).map(|n| api(&format!("child-{n}"), 20, 200)));
+    rows
+}
+
+#[cfg(unix)]
+fn finish_resumed(c: &Corpus, mut page: Page) -> Page {
+    page.enrich(c);
+    page.finish();
+    page
+}
+
+#[cfg(unix)]
+fn posted_sessions(page: &Page) -> BTreeSet<String> {
+    page.scan
+        .snapshots
+        .iter()
+        .map(|item| item.source_session_id.clone())
+        .collect()
+}
+
+/// [regress] A root-only sidecar growth carries all three unchanged children's
+/// base-context receipts using stamps recorded under the active ACK mode.
+#[cfg(unix)]
+#[test]
+fn resumed_prefix_sidecar_move_carries_receipt() {
+    with_e2(|| {
+        let (c, children) = receipt_family("resumed-prefix-receipt");
+        let mut rows = family_rows();
+        c.evidence(&rows, &[]);
+        let scanner = E2ScanFixture::default();
+        let mut warm = finish_resumed(&c, resumed_page(&c, &scanner, ScanIndex::default()));
+        assert_eq!(warm.scan.snapshots.len(), 4);
+        accept_page(&mut warm);
+        let base = warm.index.copy_prefix_base_upload_context.clone().unwrap();
+        let active =
+            copy_unproven_upload_context(resumed_prefix_upload_context(base.clone(), true), true);
+        assert_ne!(active, base, "the fixture must exercise resumed mode");
+        let stamps = serde_json::to_value(&warm.index.upload_context_proof).unwrap();
+        for path in &children {
+            let key = path.to_str().unwrap();
+            assert!(!upload_context_owed_for_test(&warm.index, path));
+            assert_eq!(warm.index.file_snapshot_fingerprints[key].len(), 1);
+            assert_eq!(
+                warm.index.files[key]
+                    .upload_context_receipt
+                    .as_ref()
+                    .unwrap()
+                    .context_fingerprint,
+                base
+            );
+            for entity in &warm.index.file_snapshot_fingerprints[key] {
+                assert_eq!(
+                    stamps["entity_stamps"][entity]["context_fingerprint"],
+                    active
+                );
+            }
+        }
+        rows.push(api("root-only-side", 5, 50));
+        c.evidence(&rows, &[]);
+        let next = finish_resumed(&c, resumed_page(&c, &scanner, warm.index.clone()));
+        assert_eq!(
+            posted_sessions(&next),
+            BTreeSet::from([ROOT.to_string()]),
+            "only the root posts after root-only sidecar growth"
+        );
+        for path in children {
+            let key = path.to_str().unwrap();
+            let entry = &next.index.files[key];
+            assert_ne!(
+                entry.source_file_fingerprint,
+                warm.index.files[key].source_file_fingerprint
+            );
+            let receipt = entry.upload_context_receipt.as_ref().unwrap();
+            assert_eq!(receipt.context_fingerprint, base);
+            assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+            assert!(!upload_context_owed_for_test(&next.index, &path));
+        }
+    });
+}
+
+/// [behaviour] Late request-owned evidence still changes and sends only its
+/// child's body once, even after the previous revision was accepted.
+#[cfg(unix)]
+#[test]
+fn child_own_late_row_uploads_once() {
+    with_e2(|| {
+        let (c, _) = receipt_family("resumed-prefix-late-child");
+        let mut rows = family_rows();
+        rows.pop();
+        c.evidence(&rows, &[]);
+        let scanner = E2ScanFixture::default();
+        let mut warm = finish_resumed(&c, resumed_page(&c, &scanner, ScanIndex::default()));
+        let child = format!("{ROOT}_agent-002");
+        let before = warm
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == child)
+            .unwrap()
+            .clone();
+        accept_page(&mut warm);
+        rows.push(api("child-2", 20, 300));
+        c.evidence(&rows, &[]);
+        let mut next = finish_resumed(&c, resumed_page(&c, &scanner, warm.index));
+        assert_eq!(posted_sessions(&next), BTreeSet::from([child]));
+        assert_ne!(canonical(&next.scan.snapshots[0]), canonical(&before));
+        assert_ne!(
+            next.scan.snapshots[0].snapshot_fingerprint,
+            before.snapshot_fingerprint
+        );
+        accept_page(&mut next);
+        let quiet = finish_resumed(&c, resumed_page(&c, &scanner, next.index));
+        assert!(quiet.scan.snapshots.is_empty());
+    });
+}
+
+/// [behaviour] A trace-owned side call after settlement belongs to its child,
+/// contributes once, and does not increase the root's accepted request count.
+#[cfg(unix)]
+#[test]
+fn child_side_call_counted_after_settle() {
+    with_e2(|| {
+        let (c, _) = receipt_family("resumed-prefix-child-side");
+        let mut rows = family_rows();
+        c.evidence(&rows, &[]);
+        let scanner = E2ScanFixture::default();
+        let mut warm = finish_resumed(&c, resumed_page(&c, &scanner, ScanIndex::default()));
+        let root = warm
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        assert_eq!((root.request_count, root.input_tokens), (1, 10));
+        accept_page(&mut warm);
+        rows.push(api("child-side", 5, 50));
+        c.evidence(&rows, &[trace("child-side", "001")]);
+        let mut next = finish_resumed(&c, resumed_page(&c, &scanner, warm.index));
+        assert_eq!(
+            posted_sessions(&next),
+            BTreeSet::from([format!("{ROOT}_agent-001")])
+        );
+        let child = &next.scan.snapshots[0];
+        assert_eq!((child.request_count, child.input_tokens), (2, 25));
+        accept_page(&mut next);
+        let quiet = finish_resumed(&c, resumed_page(&c, &scanner, next.index));
+        assert!(quiet.scan.snapshots.is_empty());
+    });
+}
+
+/// [money] Resumed-mode Tail, cold Full and a restarted disk owner emit the
+/// same root-only replacement with two accounts, tags, a side call and a gap.
+#[cfg(unix)]
+#[test]
+fn resumed_prefix_sidecar_receipt() {
+    let name = "resumed_prefix_sidecar_receipt";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        use super::state_v2_money_tests::{routed, tagged_api};
+        use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent;
+        let (mut c, _) = receipt_family(name);
+        let root = c.root(
+            ROOT,
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 30)),
+        );
+        input_clock(&root);
+        let gap = c.root(COPY, &line(COPY, "gap-1", AT, 6));
+        c.evidence_for(COPY, &[api_for(COPY, "gap-1", 6, 60)], &[]);
+        input_clock(&gap);
+        let mut rows = family_rows();
+        rows[0] = tagged_api("r1", 10, Some(&"a".repeat(64)));
+        rows.extend([
+            tagged_api("r2", 30, Some(&"b".repeat(64))),
+            tagged_api("side", 5, Some(&"b".repeat(64))),
+        ]);
+        let traces = [trace("r1", ""), trace("r2", ""), trace("side", "")];
+        c.evidence(&rows, &traces);
+        let disk = Disk::new(&c);
+        let scanner = E2ScanFixture::capturing_identity();
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut warm = finish_resumed(&c, resumed_page(&c, &scanner, ScanIndex::default()));
+        let root = warm
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap();
+        assert_eq!(
+            root.request_count, 3,
+            "two transcript requests and a side call"
+        );
+        let model_rows = root
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .collect::<Vec<_>>();
+        let accounts = model_rows
+            .iter()
+            .flat_map(|row| {
+                row.account_identifier_hash.iter().chain(
+                    row.identity_parts
+                        .iter()
+                        .flatten()
+                        .filter_map(|part| part.account_identifier_hash.as_ref()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(accounts.len() >= 2, "two accounts placed on tagged rows");
+        let gap = warm
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == COPY)
+            .unwrap();
+        let unknown = gap
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .find(|row| {
+                row.account_identifier_hash.is_none()
+                    && row.evidence_ref.is_none()
+                    && row.identity_parts.is_none()
+            })
+            .expect("the independent session keeps an unknown row");
+        assert_eq!(
+            (
+                unknown.request_count,
+                unknown.input_tokens,
+                unknown.output_tokens
+            ),
+            (1, 6, 6),
+            "the independent gap's money stays untagged"
+        );
+        accept_page(&mut warm);
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+        rows.push(tagged_api("root-only-side", 2, Some(&"b".repeat(64))));
+        let mut traces = traces.to_vec();
+        traces.push(trace("root-only-side", ""));
+        c.evidence(&rows, &traces);
+        save_inputs(&c);
+        let restart = E2ScanFixture::capturing_identity();
+        disk.begin(&restart, SnapshotSource::ClaudeCode);
+        let mut pages = [
+            resumed_page(&c, &scanner, prior.clone()),
+            resumed_page(&c, &E2ScanFixture::capturing_identity(), prior.clone()),
+            resumed_page(&c, &restart, prior),
+        ];
+        assert_eq!(pages[0].modes, (0, 0, 4), "retained sidecar refolds");
+        assert!(pages[1].modes.0 >= 4, "cold Full reads the changed family");
+        assert_eq!(pages[1].modes.1 + pages[1].modes.2, 0, "cold Full");
+        assert_eq!(pages[2].modes, (0, 0, 4), "disk sidecar refolds");
+        finish_claude_pages(&c, &mut pages);
+        for page in &pages {
+            assert_eq!(
+                posted_sessions(page),
+                BTreeSet::from([ROOT.to_string()]),
+                "zero child entities"
+            );
+        }
+        let routes = pages
+            .each_ref()
+            .map(|page| routed(page, SnapshotUploadPolicy::default()));
+        assert_equivalent(&routes[1], &routes[0]);
+        assert_equivalent(&routes[1], &routes[2]);
+        receipt(name, &[compare_claude_uploads(&pages)]);
+    });
+}
+
 fn codex_rows(turn: &str, tokens: u64) -> String {
     let usage = json!({"input_tokens":tokens,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":tokens+2});
     [
@@ -2589,8 +2894,8 @@ fn pi_live_retry_admits_a_shed_that_keeps_every_entry() {
     );
 }
 
-/// [money] A mode-only change reads nothing, an mtime-only change reads Full,
-/// and later growth restores and Tails, each equal to cold Full.
+/// [money] A mode-only change reads nothing, a certified backdated mtime move
+/// restores unchanged, and later growth Tails, each equal to cold Full.
 #[test]
 fn pi_acquisition_metadata_changes() {
     pi_row!("pi_acquisition_metadata_changes");
@@ -2627,7 +2932,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         next,
-        PiPageExpect::modes((1, 0, 0), (1, 0, 0)),
+        PiPageExpect::modes((0, 0, 1), (0, 0, 1)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(
