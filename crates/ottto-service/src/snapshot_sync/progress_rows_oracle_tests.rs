@@ -1425,6 +1425,10 @@ fn progress_rows_damaged_cache_row_is_set_aside_and_the_next_upload_is_full() {
                 assert_leftovers_purged(path);
             }
             let mut expected = healthy.clone();
+            if import {
+                // The import adds the identity rows' scope to the ledger.
+                expected.accepted_identity_scope = progress.accepted_identity_scope.clone();
+            }
             if state {
                 expected.accepted_cache_states.remove(&key);
             } else {
