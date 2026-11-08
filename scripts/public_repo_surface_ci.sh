@@ -234,6 +234,25 @@ move_check() {
   fi
 }
 
+# Whole-file module moves and their path-absolutizing prep changes: same base,
+# report always; a line starting with `File-move:` or `Absolutize:` in the pull
+# request description makes the matching mode blocking.
+file_move_check() {
+  local mode="$1"
+  local body_line="$2"
+  local base
+  base="$(move_check_base)"
+  if [[ -z "$base" ]]; then
+    echo "public-surface-ci: no base commit; skipping the file move check ($mode)"
+    return 0
+  fi
+  if grep -q "^$body_line" <<< "${MOVE_ONLY_PR_BODY:-}"; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD --report
+  fi
+}
+
 # Report only for now; later changes pass --enforce <rule,...>.
 source_layout_report() {
   local base
@@ -257,7 +276,10 @@ run_step P "test Mac batch helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts
 run_step P "test move ledger check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_move_ledger.py
 run_step P "test test-ID map check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_test_id_map.py
 run_step P "test source layout check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_source_layout.py
+run_step P "test file move check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_file_moves.py
 run_step P "check that a move-only change only moves items" move_check scripts/check_move_ledger.py
+run_step P "check that a file-move change only moves whole module files" file_move_check move File-move:
+run_step P "check that an absolutize change only makes super paths absolute" file_move_check absolutize Absolutize:
 run_step P "check test IDs and never-retry decisions" move_check scripts/check_test_id_map.py
 run_step P "report the snapshots source layout" source_layout_report
 

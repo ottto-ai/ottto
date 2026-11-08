@@ -258,6 +258,11 @@ have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path l
 wrappers change; edits to listed validator files that anchor on moved code are reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
+Whole-file moves are checked with `scripts/check_file_moves.py move` (a module file and every
+file below it move byte for byte; only the old parent's `mod` line, one facade alias at the old
+name and the new parent's `mod` line change; no `super` path in a moved file reaches outside its
+subtree), after an optional change checked with `scripts/check_file_moves.py absolutize` that only
+replaces such `super` paths with the `crate::` path they denote.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
 
 ## Never drop data
