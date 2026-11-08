@@ -1267,7 +1267,7 @@ pub(crate) struct DurableCertificate {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DurableAdmission {
-    /// The object still has exactly the certified length and mtime.
+    /// The object has the certified length; its mtime may be a certified touch.
     pub(crate) unchanged: bool,
     /// Sample bytes re-read from the held FD (at most `2 * SAMPLE_BYTES`).
     pub(crate) sample_bytes_read: usize,

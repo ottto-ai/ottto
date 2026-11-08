@@ -59,7 +59,8 @@ fn lease_touch_disk_restore_matches_cold_full_without_transcript_reads() {
             tags.contains(&"1".repeat(64)) && tags.contains(&"2".repeat(64)),
             "two tagged accounts and a mid-session switch: {tags}"
         );
-        accept_page(&mut first);
+        // Commit the certified reduction before delivery. The touched pass
+        // emits its whole body and earns the receipt used by the quiet pass.
         let mut index = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
 
         // A new process sees a retention renewal: old mtime < new mtime <= stored ctime.
