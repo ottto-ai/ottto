@@ -863,5 +863,4 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
 }
 
 #[cfg(test)]
-#[path = "g7_debt_tests.rs"]
 pub(super) mod tests;

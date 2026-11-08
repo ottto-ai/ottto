@@ -19,10 +19,7 @@ crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_holder_red
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_pipeline_observer_tests.rs
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_tests.rs
 crates/ottto-service/src/snapshots/claude_request_money/e2_holder_redrift_tests.rs	path	e2_copy_route_tests.rs
-crates/ottto-service/src/snapshots/codex_compressed_input.rs	path	codex_decoder_allocation.rs
-crates/ottto-service/src/snapshots/codex_file_join.rs	path	codex_file_join/header_cache_output_tests.rs
 crates/ottto-service/src/snapshots/codex_file_join/group_job.rs	path	group_job_tests.rs
-crates/ottto-service/src/snapshots/g7_debt.rs	path	g7_debt_tests.rs
 crates/ottto-service/src/snapshots/money_freshness.rs	path	money_freshness_tests.rs
 crates/ottto-service/src/snapshots/ownership_diagnostics.rs	path	ownership_diagnostics_tests.rs
 crates/ottto-service/src/snapshots/privacy_flip_tests.rs	path	privacy_flip_tail_tests.rs
