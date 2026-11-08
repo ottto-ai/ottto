@@ -244,7 +244,8 @@ fn rows(index_path: &Path) -> Rows {
     }
 }
 
-type RowDigests = (Option<Value>, BTreeMap<(String, Vec<u8>, i64), Vec<u8>>);
+type StoredKey = (String, Vec<u8>, i64);
+type RowDigests = (Option<Value>, BTreeMap<StoredKey, Vec<u8>>);
 
 /// Every durable progress row by key with its value digest, and the CAS value.
 fn row_digests(index_path: &Path) -> RowDigests {
@@ -256,12 +257,9 @@ fn row_digests(index_path: &Path) -> RowDigests {
         )
         .unwrap();
     let rows = stmt
-        .query_map(
-            [],
-            |row| -> rusqlite::Result<((String, Vec<u8>, i64), Vec<u8>)> {
-                Ok(((row.get(0)?, row.get(1)?, row.get(2)?), row.get(3)?))
-            },
-        )
+        .query_map([], |row| -> rusqlite::Result<(StoredKey, Vec<u8>)> {
+            Ok(((row.get(0)?, row.get(1)?, row.get(2)?), row.get(3)?))
+        })
         .unwrap()
         .map(Result::unwrap)
         .collect();

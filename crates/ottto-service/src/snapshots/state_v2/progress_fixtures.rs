@@ -116,5 +116,5 @@ pub(crate) fn claim_growth_for_test(path: &Path, index: &ScanIndex) {
 /// with its own marker, without this process's progress owner.
 pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
     let _ = (index, json);
-    unimplemented!("the progress import is not wired yet")
+    panic!("the progress import is not wired yet")
 }
