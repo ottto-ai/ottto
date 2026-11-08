@@ -1038,6 +1038,60 @@ pub(crate) mod money_oracle {
         }
     }
 
+    /// `other` left unchanged entities off its page: each carries its accepted
+    /// body (`other.accepted`). Each carried body equals cold's money fields
+    /// and placement; the emitted ones equal cold with the carried filtered
+    /// out, as `assert_held` filters. An entity cold emits that `other`
+    /// neither emits nor carries is still missing.
+    pub(crate) fn assert_carried_equivalent(cold: &RouteResult, other: &RouteResult) {
+        let mut expected = cold.clone();
+        let mut differences = Vec::new();
+        for (entity, body) in &cold.snapshots {
+            if other.snapshots.contains_key(entity) {
+                continue;
+            }
+            expected.snapshots.remove(entity);
+            let Some(carried) = other.accepted.get(entity) else {
+                differences.push(format!("entity/{entity}: missing/extra emitted entity"));
+                continue;
+            };
+            for field in FIELDS {
+                let path = format!("carried/{entity}/{field}");
+                diff(
+                    &path,
+                    &body[*field],
+                    &carried.body[*field],
+                    &mut differences,
+                );
+            }
+            diff(
+                &format!("carried/placement/{entity}"),
+                &placement_snapshot(body),
+                &placement_snapshot(&carried.body),
+                &mut differences,
+            );
+            for envelope in expected.normalized.as_array_mut().unwrap().iter_mut() {
+                envelope["snapshots"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|s| s["source_session_id"] != entity.as_str());
+            }
+        }
+        assert!(
+            differences.is_empty(),
+            "{:?} carried vs {:?}:\n{}",
+            other.mode,
+            cold.mode,
+            differences.join("\n")
+        );
+        expected
+            .normalized
+            .as_array_mut()
+            .unwrap()
+            .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+        assert_equivalent(&expected, other);
+    }
+
     pub(crate) fn assert_quiet_restart_zero_bytes(result: &RouteResult) {
         assert_quiet_restart_with_anchor_window(result, 0);
     }

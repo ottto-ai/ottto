@@ -365,6 +365,15 @@ pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
         .for_each(age);
 }
 
+/// `path`'s verification aged past the audit interval: its sampled audit is
+/// overdue, as a growing file's marker that never settles reads.
+pub(crate) fn overdue_audit_for_test(index: &mut ScanIndex, path: &Path) {
+    let due = sampled_scan::now_seconds() - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    let entry = index.files.get_mut(&local_index_key(path)).unwrap();
+    entry.set_unverified_deadline(due - 1);
+    assert!(entry.audit_requires_full(sampled_scan::now_seconds()));
+}
+
 /// The state database `index` is bound to, if any.
 pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
     state_v2::runtime_path(index).ok().flatten()

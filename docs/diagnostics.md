@@ -1755,12 +1755,15 @@ and it never affects money.
 ## Claude forced-family seeds
 
 The Claude `native_collection_page` line carries, nonzero only,
-`forced_family_seeds` (path twins whose own candidate decision pulled their
-family in, one per twin, keyed by that `CandidateParseReason` label, `other`
-for a Parse without one, or `identification_failed`), and in `page_selection`
-`forced_family_roots` (distinct roots those twins forced) and
-`forced_family_members_pulled` (family paths the closure for every forced root
-names: the ones it adds and the ones already on the page). Counted after
+`forced_family_seeds` (path twins whose own candidate decision selected them,
+one per twin, keyed by that `CandidateParseReason` label, `other` for a Parse
+without one, or `identification_failed`, and again as `root_member` or
+`child_member`), and in `page_selection` `forced_family_roots` (distinct roots
+those twins forced), `forced_family_members_pulled` (family paths the closure
+for every forced root names: the ones it adds and the ones already on the page)
+and `forced_family_member_scoped` (distinct roots read only as their own homes:
+every seed of the root is an identified root copy and its other copies are
+unchanged and verified, so its subagents keep their own decisions). Counted after
 selection since the previous Claude page; counts only, no ids or paths; they
 never affect selection or money.
 
