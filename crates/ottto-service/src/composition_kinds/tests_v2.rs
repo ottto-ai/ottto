@@ -79,7 +79,7 @@ fn paths(list: &[&str]) -> Vec<String> {
 
 #[test]
 fn shell_commands_split_into_output_segments() {
-    use ShellClass::*;
+    use super::shell::ShellClass::*;
     let cases: Vec<(&str, Vec<Segment>)> = vec![
         // `cd` changes the folder later relative paths join to.
         (

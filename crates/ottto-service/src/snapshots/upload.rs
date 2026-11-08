@@ -5,3 +5,5 @@
 mod committable_subset;
 pub(super) mod finalize;
 mod reoffer_quarantine;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;
