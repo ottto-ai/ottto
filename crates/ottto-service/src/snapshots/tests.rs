@@ -1201,14 +1201,10 @@ fn codex_capability_activity_uses_only_allowlisted_tool_surface_metadata() {
             && row.count == 1
     }));
     assert!(summary.capability_counts.iter().any(|row| {
-        row.capability_id == "browser.in_app"
-            && row.raw_origin == "browser:iab"
-            && row.count == 1
+        row.capability_id == "browser.in_app" && row.raw_origin == "browser:iab" && row.count == 1
     }));
     assert!(summary.capability_counts.iter().any(|row| {
-        row.capability_id == "computer.use"
-            && row.raw_origin == "computer-use"
-            && row.count == 1
+        row.capability_id == "computer.use" && row.raw_origin == "computer-use" && row.count == 1
     }));
     assert_eq!(summary.capability_buckets.len(), 3);
     let encoded = serde_json::to_string(summary).expect("serialize");
@@ -1257,9 +1253,7 @@ fn claude_capability_activity_normalizes_built_in_mcp_names_and_dedupes_tool_use
             && row.count == 1
     }));
     assert!(summary.capability_counts.iter().any(|row| {
-        row.capability_id == "computer.use"
-            && row.raw_origin == "computer-use"
-            && row.count == 1
+        row.capability_id == "computer.use" && row.raw_origin == "computer-use" && row.count == 1
     }));
     assert_eq!(
         item.tool_usage.as_deref(),
@@ -1798,8 +1792,7 @@ fn frozen_sweep_visits_every_preexisting_key_despite_sustained_tail_churn() {
     let mut upper_bound = None;
     let mut visited = BTreeSet::new();
     for cycle in 0..3 {
-        let mut selection =
-            BoundedCandidateSelection::new(cursor.clone(), upper_bound.clone(), 2);
+        let mut selection = BoundedCandidateSelection::new(cursor.clone(), upper_bound.clone(), 2);
         for name in preexisting {
             selection.insert(test_candidate(root.join(name)));
         }
@@ -1929,8 +1922,7 @@ fn opened_replacement_is_rechecked_against_the_frozen_lookback_window() {
         )
         .expect("restore replacement to old mtime");
     drop(replacement);
-    open_candidate_file(SnapshotSource::Pi, &mut candidate)
-        .expect("open exact replacement object");
+    open_candidate_file(SnapshotSource::Pi, &mut candidate).expect("open exact replacement object");
 
     assert!(
         !opened_candidate_is_within_frozen_window(&candidate, census_at, BACKFILL_WINDOW_DAYS,),
@@ -1946,8 +1938,7 @@ fn opened_object_identity_moves_on_middle_rewrite_with_size_and_mtime_restored()
 
     let root = temp_dir("opened-object-middle-rewrite");
     let path = root.join("session.jsonl");
-    fs::write(&path, vec![b'a'; FILE_CONTENT_SAMPLE_BYTES * 3])
-        .expect("write original content");
+    fs::write(&path, vec![b'a'; FILE_CONTENT_SAMPLE_BYTES * 3]).expect("write original content");
     let original_metadata = fs::metadata(&path).expect("original metadata");
     let mut first = test_candidate(path.clone());
     open_candidate_file(SnapshotSource::ClaudeCode, &mut first).expect("open first content");
@@ -2035,8 +2026,7 @@ fn opened_candidate_cannot_escape_through_replaced_intermediate_directory() {
     let nested = root.join("nested");
     fs::create_dir_all(&nested).expect("nested root");
     fs::write(nested.join("session.jsonl"), b"{}\n").expect("inside transcript");
-    fs::write(outside.join("session.jsonl"), b"{\"outside\":true}\n")
-        .expect("outside transcript");
+    fs::write(outside.join("session.jsonl"), b"{\"outside\":true}\n").expect("outside transcript");
     let mut candidate = test_candidate(nested.join("session.jsonl"));
     candidate.scan_root = root.clone();
 
@@ -2386,8 +2376,7 @@ fn claude_authority_family_evolution_reparses_every_quarantined_sibling() {
                 .join(format!("agent-{agent_id}.jsonl")),
             None => root.join(format!("{root_session_id}.jsonl")),
         };
-        fs::create_dir_all(path.parent().expect("member parent"))
-            .expect("create family directory");
+        fs::create_dir_all(path.parent().expect("member parent")).expect("create family directory");
         let request_id = agent_id.unwrap_or("root");
         fs::write(
             &path,
@@ -2601,8 +2590,7 @@ fn due_quarantine_retry_is_not_suppressed_as_a_semantic_noop() {
         fingerprint.clone(),
         SnapshotQuarantineRecord {
             contract_retry_claims: None,
-            reconstruction_contract:
-                crate::snapshots::terminal_contract_retry::current_contract(),
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::Pi),
             retry_after_unix_seconds: 0,
             upload_body_witness: None,
@@ -2642,13 +2630,7 @@ fn write_sessions(directory: &Path, count: usize) {
 
 /// One walk tick with a directory budget of 3 entries.
 fn walk_tick(source: SnapshotSource, index: &mut ScanIndex) {
-    advance_bounded_directory_traversal_with_budget(
-        source,
-        index,
-        BACKFILL_WINDOW_DAYS,
-        3,
-        None,
-    );
+    advance_bounded_directory_traversal_with_budget(source, index, BACKFILL_WINDOW_DAYS, 3, None);
 }
 
 fn start_walk(source: SnapshotSource, root: &Path) -> ScanIndex {
@@ -2678,8 +2660,7 @@ fn candidate_paths(index: &ScanIndex) -> BTreeSet<PathBuf> {
 #[test]
 fn wide_single_directory_lists_in_full_on_a_fresh_tick() {
     for source in WALK_SOURCES {
-        let root =
-            fs::canonicalize(temp_dir("bounded-wide-directory")).expect("canonical root");
+        let root = fs::canonicalize(temp_dir("bounded-wide-directory")).expect("canonical root");
         write_sessions(&root, 4);
         let mut index = start_walk(source, &root);
         walk_tick(source, &mut index);
@@ -2745,8 +2726,8 @@ fn wide_directory_defers_on_a_partly_spent_tick_then_lists_in_full() {
 #[test]
 fn subdirectory_inside_a_wide_directory_is_discovered() {
     for source in WALK_SOURCES {
-        let root = fs::canonicalize(temp_dir("bounded-wide-directory-nested"))
-            .expect("canonical root");
+        let root =
+            fs::canonicalize(temp_dir("bounded-wide-directory-nested")).expect("canonical root");
         write_sessions(&root, 4);
         let nested = root.join("nested");
         fs::create_dir_all(&nested).expect("create nested directory");
@@ -4447,12 +4428,12 @@ fn every_lossy_line_class_is_quarantined_or_terminally_disclosed() {
             let path = root.join("session.jsonl");
             let mut bytes = format!("{session}{usage}").into_bytes();
             match case {
-            "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
-            "recognized-drop" => bytes.extend_from_slice(
-                b"{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":\"invalid\"}}}\n",
-            ),
-            _ => unreachable!(),
-        }
+                "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
+                "recognized-drop" => bytes.extend_from_slice(
+                    b"{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":\"invalid\"}}}\n",
+                ),
+                _ => unreachable!(),
+            }
             fs::write(&path, bytes).expect("write lossy fixture");
             let mut index = ScanIndex::default();
             let scan = scan_source_roots_with_limit(
@@ -4562,9 +4543,7 @@ fn terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
         index.terminal_jsonl_dispositions.insert(
             moved_key.clone(),
             TerminalJsonlDisposition {
-                source_file_fingerprint: index.files[&moved_key]
-                    .source_file_fingerprint
-                    .clone(),
+                source_file_fingerprint: index.files[&moved_key].source_file_fingerprint.clone(),
                 ..historical
             },
         );
@@ -4772,9 +4751,10 @@ fn codex_parser_emits_direct_scheduled_and_parent_subagent_facts() {
     .into_iter()
     .next()
     .expect("automation snapshot");
-    assert!(automation.attribution_facts.iter().any(|fact| {
-        fact.field == "origin_kind" && fact.value == "provider_scheduled_task"
-    }));
+    assert!(automation
+        .attribution_facts
+        .iter()
+        .any(|fact| { fact.field == "origin_kind" && fact.value == "provider_scheduled_task" }));
     assert!(automation
         .attribution_facts
         .iter()
@@ -5311,9 +5291,10 @@ fn codex_state_sqlite_annotates_rollouts_and_never_emits_total_only_snapshots() 
     assert!(
         scan.snapshots
             .iter()
-            .all(|snapshot| snapshot.source_session_id
-                != "019e253c-8888-7000-9000-bbbbbbbbbbbb"
-                && snapshot.provenance.collector != "codex_state_sqlite"),
+            .all(
+                |snapshot| snapshot.source_session_id != "019e253c-8888-7000-9000-bbbbbbbbbbbb"
+                    && snapshot.provenance.collector != "codex_state_sqlite"
+            ),
         "a state row without a rollout emits nothing"
     );
     let _ = fs::remove_dir_all(codex_dir);
@@ -5544,8 +5525,7 @@ fn codex_state_rows_without_a_rollout_emit_nothing_under_either_title() {
             ),
         )
         .expect("write rollout");
-        let connection =
-            Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
         connection
             .execute(CODEX_THREADS_DDL, [])
             .expect("create threads");
@@ -6050,8 +6030,7 @@ fn pi_scan_reprocesses_v6_zero_parse_index_entries() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_secs();
-    let v6_key =
-        source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
+    let v6_key = source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
     let legacy_entry = ScanIndexEntry {
         codex_fragment: None,
         size_bytes,
@@ -6404,10 +6383,10 @@ fn parse_artifact_url_requires_a_repository_prefix_before_the_marker() {
         ("/owner/repo/issues/abc", None),
         ("/owner/repo/pull/\u{0661}", None),
     ] {
-        let actual = parse_artifact_url(&format!("https://example.com{path}"))
-            .map(|a| (a.kind, a.value));
-        let expected = expected
-            .map(|(kind, value)| (kind.to_string(), format!("https://example.com{value}")));
+        let actual =
+            parse_artifact_url(&format!("https://example.com{path}")).map(|a| (a.kind, a.value));
+        let expected =
+            expected.map(|(kind, value)| (kind.to_string(), format!("https://example.com{value}")));
         assert_eq!(actual, expected, "{path}");
     }
 }
@@ -6865,9 +6844,7 @@ fn codex_parser_splits_cumulative_usage_by_selector() {
     let fast = item
         .model_usage
         .iter()
-        .find(|row| {
-            row.selector_context.get("service_tier").map(String::as_str) == Some("fast")
-        })
+        .find(|row| row.selector_context.get("service_tier").map(String::as_str) == Some("fast"))
         .expect("fast row");
     assert_eq!(standard.input_tokens, 100);
     assert_eq!(standard.output_tokens, 30);
@@ -7597,9 +7574,8 @@ fn claude_local_otel_account_hash_stamps_unique_and_clears_conflict() {
         ),
     )
     .expect("write fixture");
-    let mut items =
-        parse_claude_code_jsonl_file(&path, "2026-07-31T10:02:00Z", "fp".to_string())
-            .expect("parse");
+    let mut items = parse_claude_code_jsonl_file(&path, "2026-07-31T10:02:00Z", "fp".to_string())
+        .expect("parse");
     let account_a = "a".repeat(64);
     let account_b = "b".repeat(64);
     let unique = BTreeMap::from([(
@@ -7896,8 +7872,7 @@ fn claude_account_family_fixture(ordinary_money: bool) -> (PathBuf, String, Vec<
     )
     .expect("parse parent");
     items.extend(
-        parse(&child_path, "2026-08-02T07:01:00Z", "child-fp".to_string())
-            .expect("parse child"),
+        parse(&child_path, "2026-08-02T07:01:00Z", "child-fp".to_string()).expect("parse child"),
     );
     assert_eq!(items.iter().map(|item| item.request_count).sum::<u64>(), 5);
     assert!(items[1]
@@ -8001,12 +7976,9 @@ fn cache_split_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
                     "ephemeral_1h_input_tokens": 0}}}
     });
     fs::write(&path, format!("{record}\n")).unwrap();
-    let items = parse_claude_code_jsonl_file(
-        &path,
-        "2026-08-02T07:01:00Z",
-        "cache-split-fp".to_string(),
-    )
-    .unwrap();
+    let items =
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "cache-split-fp".to_string())
+            .unwrap();
     assert_eq!(items.len(), 1);
     (root, parent, items)
 }
@@ -8165,12 +8137,8 @@ fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
     // full session-start split.
     let expected_child_start = items[1].session_start.clone();
 
-    let disposition = apply_claude_reported_usage_with_index(
-        &mut items,
-        &api_report,
-        &trace_report,
-        &mut index,
-    );
+    let disposition =
+        apply_claude_reported_usage_with_index(&mut items, &api_report, &trace_report, &mut index);
 
     let child = &items[1];
     assert_eq!(
@@ -8233,8 +8201,7 @@ fn d1_subagent_account_specimen(
         evidence: BTreeMap::from([(root, trace.to_vec())]),
         ..Default::default()
     };
-    claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report)
-        .coverage
+    claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report).coverage
         == [claude_request_accounts::Coverage::Complete]
 }
 
@@ -8482,9 +8449,7 @@ fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
                 "wrong_trace_owner" => {
                     witnesses[0] = complete_trace_row(&root, "req_5", "different-child")
                 }
-                "trace_client_mismatch" => {
-                    witnesses[0].client_request_id = "other-client".into()
-                }
+                "trace_client_mismatch" => witnesses[0].client_request_id = "other-client".into(),
                 "known_account_conflict" => set_session_account_hash(&mut candidate, Some(&a)),
                 "cloud_destination" => {
                     candidate.usage_buckets[0].model_usage[0].gateway_provider =
@@ -8937,9 +8902,7 @@ fn claude_subagent_sidecar_lineage_cases() {
     let parent = "abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1";
     for (sidecar, parent_ref, kind, depth) in [
         (
-            Some(
-                r#"{"agentType":"Explore","spawnDepth":2,"parentAgentId":"a665ed7d7731771a8"}"#,
-            ),
+            Some(r#"{"agentType":"Explore","spawnDepth":2,"parentAgentId":"a665ed7d7731771a8"}"#),
             format!("{parent}_agent-a665ed7d7731771a8"),
             Some("Explore"),
             Some("2"),
@@ -9025,11 +8988,10 @@ fn claude_workflow_journal_is_never_collected_or_emitted() {
     );
     let (files, _, _, _) = selection.finish(census.discovered_file_count);
     assert!(
-        files.iter().all(|candidate| candidate
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some("journal.jsonl")),
+        files.iter().all(
+            |candidate| candidate.path.file_name().and_then(|value| value.to_str())
+                != Some("journal.jsonl")
+        ),
         "workflow journals must not become scan candidates"
     );
     assert_eq!(files.len(), 1, "only the agent transcript is a candidate");
@@ -9606,8 +9568,7 @@ fn claude_subagent_sidecar_fingerprint_tracks_naming_material() {
     let identity = claude_subagent_identity(&transcript).expect("identity");
 
     let support_dir = root.join("support");
-    let baseline =
-        claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+    let baseline = claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
     assert_eq!(
         baseline,
         claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir)),
@@ -9631,8 +9592,7 @@ fn claude_subagent_sidecar_fingerprint_tracks_naming_material() {
         "{\"agentType\":\"workflow-subagent\"}",
     )
     .expect("write sidecar");
-    let with_meta =
-        claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
+    let with_meta = claude_subagent_sidecar_fingerprint(&transcript, &identity, Some(&support_dir));
     assert_ne!(with_manifest, with_meta);
 
     // Root-scoped OTLP identity arriving later must also re-select the
@@ -10437,8 +10397,7 @@ fn claude_compaction_events_take_owned_sizes_and_trigger() {
     let mut grown_lines = lines.clone();
     let next = claude_sized_request("2026-10-20T11:05:00Z", "req_s8", 47_000);
     grown_lines.push(&next);
-    let mut grown =
-        parse_claude_compaction_fixture("claude-compaction-sizes-grown", &grown_lines);
+    let mut grown = parse_claude_compaction_fixture("claude-compaction-sizes-grown", &grown_lines);
     rebuild_all_owned(&mut grown);
     assert_eq!(grown.compaction_events[3].after, Some(47_000));
     assert_eq!(grown.compaction_events[4].after, Some(47_000));
@@ -10818,9 +10777,7 @@ fn context_curve_is_hash_neutral_and_deterministically_bounded() {
         .iter()
         .all(|window| window.model.len() == 128));
     assert!(first.retained_point_count <= MAX_CONTEXT_CURVE_POINTS as u64);
-    assert!(
-        serde_json::to_vec(&first).expect("serialize").len() <= MAX_CONTEXT_CURVE_WIRE_BYTES
-    );
+    assert!(serde_json::to_vec(&first).expect("serialize").len() <= MAX_CONTEXT_CURVE_WIRE_BYTES);
     assert_eq!(
         first
             .boundaries
@@ -11599,11 +11556,7 @@ fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, S
     (home, root, loaded)
 }
 
-fn projection_adoption_scan(
-    root: &Path,
-    index: &mut ScanIndex,
-    limit: usize,
-) -> SourceScanResult {
+fn projection_adoption_scan(root: &Path, index: &mut ScanIndex, limit: usize) -> SourceScanResult {
     scan_source_roots_with_limit(
         SnapshotSource::Codex,
         &[root.to_path_buf()],
@@ -11748,8 +11701,7 @@ fn unkept_same_stamp_adoption_retains_the_existing_walk_residual() {
         snapshot_upload_body_witness,
     );
     assert_eq!(scan.snapshots.len(), 2);
-    let mut selected =
-        working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let mut selected = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     let before = selected
         .traversal
         .as_ref()
@@ -11790,8 +11742,7 @@ fn unkept_terminal_page_waits_for_a_fresh_traversal() {
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut working);
     assert_eq!(scan.snapshots.len(), 3);
     assert!(working.traversal.is_none());
-    let mut selected =
-        working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let mut selected = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &BTreeSet::new());
     assert!(selected.traversal.is_none());
     assert!(selected.files.is_empty());
@@ -11836,8 +11787,7 @@ fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
             previous.files[key].last_upload_body_witness
         );
     }
-    let mut unaccepted =
-        index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let mut unaccepted = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert!(unaccepted
         .files
         .values()
@@ -11857,8 +11807,7 @@ fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
-    let mut settled =
-        retry_index.committable_subset(&retry_previous, &accepted, &BTreeMap::new());
+    let mut settled = retry_index.committable_subset(&retry_previous, &accepted, &BTreeMap::new());
     crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
         &mut settled,
         &retry.snapshots,
@@ -12085,9 +12034,7 @@ fn claude_context_backfill_scan(
 ) -> SourceScanResult {
     index.activate_upload_context("already-admitted-context".into());
     index.activate_effective_upload_body_witness_revision(
-        crate::snapshot_sync::effective_upload_body_witness_revision(
-            SnapshotSource::ClaudeCode,
-        ),
+        crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
     );
     index.adopt_effective_upload_body_witness_revision_monotonically();
     scan_source_roots_with_limit(
@@ -12111,8 +12058,7 @@ fn claude_context_backfill_leaves_codex_and_pi_unselected() {
         ),
         (1, 1)
     );
-    let (home, root, mut index) =
-        projection_adoption_fixture("claude-context-backfill-codex", 3);
+    let (home, root, mut index) = projection_adoption_fixture("claude-context-backfill-codex", 3);
     index.activate_effective_upload_body_witness_revision(1);
     let previous = index.clone();
     // The Claude-only list never holds Codex adoption, whatever its age.
@@ -12364,10 +12310,7 @@ fn claude_desktop_fixture(
     (home, transcript_path, projects_root)
 }
 
-fn claude_original_carrier_fixture(
-    metadata: &ClaudeTitleMetadata,
-    prefix: &str,
-) -> SnapshotItem {
+fn claude_original_carrier_fixture(metadata: &ClaudeTitleMetadata, prefix: &str) -> SnapshotItem {
     // Several tests call this helper concurrently. Timestamp-only names
     // plus create_dir_all can adopt another call's transcript directory.
     let root = crate::test_scratch::ScratchDir::new("claude-original-carrier");
@@ -12431,8 +12374,7 @@ fn claude_original_carrier_metadata() -> ClaudeTitleMetadata {
     index
         .claude_desktop_title_files
         .insert(local_index_key(&path), entry);
-    let restored: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    let restored: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
     ClaudeTitleMetadata::from_durable_index(&restored, false)
 }
 
@@ -12448,8 +12390,7 @@ fn claude_original_carrier_missing_metadata() -> ClaudeTitleMetadata {
 fn claude_original_carrier_actual_parse_preserves_identity_and_usage() {
     let metadata = claude_original_carrier_metadata();
     let complete = claude_original_carrier_fixture(&metadata, "");
-    let missing =
-        claude_original_carrier_fixture(&claude_original_carrier_missing_metadata(), "");
+    let missing = claude_original_carrier_fixture(&claude_original_carrier_missing_metadata(), "");
     let identity = complete.session_account_evidence.as_ref().unwrap();
     assert_eq!(identity.identity_disposition, Some("complete"));
     assert_eq!(
@@ -12687,7 +12628,8 @@ fn claude_original_carrier_healthy_paged_refresh_keeps_completed_identity() {
 fn claude_original_carrier_census_loss_revisits_consumed_transcript_page() {
     let record = |id: &str| {
         json!({"timestamp":"2026-09-30T10:00:00Z", "sessionId":id,
-        "message":{"id":id,"model":"claude-opus-4-8","usage":{"input_tokens":5,"output_tokens":2}}}).to_string()
+        "message":{"id":id,"model":"claude-opus-4-8","usage":{"input_tokens":5,"output_tokens":2}}})
+        .to_string()
     };
     let (home, first_path, projects) = claude_desktop_fixture(
         "claude-original-loss-revisit",
@@ -12816,8 +12758,13 @@ fn claude_original_carrier_requires_owned_id_and_tracks_census_recovery() {
     let metadata = claude_original_carrier_metadata();
     let root = temp_dir("claude-original-no-owned-id");
     let path = root.join("native-session.jsonl");
-    fs::write(&path, json!({"timestamp":"2026-09-30T10:00:00Z", "message":{
-        "id":"message", "model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}}).to_string()).unwrap();
+    fs::write(
+        &path,
+        json!({"timestamp":"2026-09-30T10:00:00Z", "message":{
+        "id":"message", "model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}})
+        .to_string(),
+    )
+    .unwrap();
     let item = parse_claude_code_jsonl_file_with_title_metadata(
         &path,
         "2026-09-30T10:05:00Z",
@@ -13080,8 +13027,8 @@ fn claude_original_carrier_source_generated_wire_corpus() {
 #[test]
 fn claude_original_carrier_request_observations_veto_without_creating_identity() {
     use crate::claude_local_otel::{
-        ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
-        ClaudeIdentityDisposition, ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence,
+        ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
+        ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence,
     };
     let original = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
     let observed = |request: &str, org: &str| ClaudeLocalOtelEvidence {
@@ -13778,8 +13725,7 @@ fn claude_desktop_spawned_session_with_a_path_cli_session_id_emits_no_lineage() 
             .join("workspace");
         fs::write(store_dir.join("local_desktop-0.json"), parent_record)
             .expect("write parent store file");
-        let metadata =
-            ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
         assert_eq!(
             metadata
                 .spawn_lineage(child)
@@ -13847,9 +13793,8 @@ fn claude_desktop_store_title_applies_to_matching_session() {
         item.session_display_name_source.as_deref(),
         Some("desktop_title")
     );
-    let expected_hash =
-        ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
-            .expect("account hash");
+    let expected_hash = ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+        .expect("account hash");
     assert!(item
         .model_usage
         .iter()
@@ -14189,9 +14134,8 @@ fn late_claude_desktop_account_mapping_escapes_semantic_noop_suppression() {
     assert_eq!(second.scanned_file_count, 1);
     assert_eq!(second.semantic_noop_count, 0);
     assert_eq!(second.snapshots.len(), 1);
-    let expected_hash =
-        ottto_core::billing_identity_hash("anthropic", "account", "account-late")
-            .expect("account hash");
+    let expected_hash = ottto_core::billing_identity_hash("anthropic", "account", "account-late")
+        .expect("account hash");
     assert!(second.snapshots[0]
         .model_usage
         .iter()
@@ -14367,9 +14311,8 @@ fn claude_desktop_account_identity_fails_closed_across_accounts() {
         ambiguous_fingerprint,
         exact.session_sidecar_fingerprint(session_id)
     );
-    let expected_hash =
-        ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
-            .expect("account hash");
+    let expected_hash = ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+        .expect("account hash");
     assert_eq!(
         exact.account_identifier_hash(session_id),
         Some(expected_hash.as_str())
@@ -14501,9 +14444,8 @@ fn one_sided_claude_title_shapes_preserve_account_only_mapping() {
     assert_eq!(index.claude_desktop_title_files.len(), 1);
     assert_eq!(scan.snapshots.len(), 1);
     assert!(scan.snapshots[0].session_display_name.is_none());
-    let expected_hash =
-        ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
-            .expect("account hash");
+    let expected_hash = ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+        .expect("account hash");
     assert!(scan.snapshots[0]
         .model_usage
         .iter()
@@ -14741,9 +14683,7 @@ fn pi_parser_applies_selector_custom_entries_to_following_messages() {
     let flex_batch = item
         .model_usage
         .iter()
-        .find(|row| {
-            row.selector_context.get("service_tier").map(String::as_str) == Some("flex")
-        })
+        .find(|row| row.selector_context.get("service_tier").map(String::as_str) == Some("flex"))
         .expect("flex row");
     let fast = item
         .model_usage
@@ -16280,13 +16220,10 @@ fn parse_codex_test(path: &Path) -> ParsedJsonlFile {
     parse_codex_test_with_metadata(path, &CodexTitleMetadata::default())
 }
 
-fn parse_codex_test_with_metadata(
-    path: &Path,
-    metadata: &CodexTitleMetadata,
-) -> ParsedJsonlFile {
+fn parse_codex_test_with_metadata(path: &Path, metadata: &CodexTitleMetadata) -> ParsedJsonlFile {
     let mut file = File::open(path).expect("open Codex fixture");
-    let identity = opened_object_identity(SnapshotSource::Codex, &mut file)
-        .expect("identify Codex fixture");
+    let identity =
+        opened_object_identity(SnapshotSource::Codex, &mut file).expect("identify Codex fixture");
     parse_opened_jsonl_file(
         file,
         &identity,
@@ -16447,8 +16384,7 @@ fn codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture() {
         .get("usage_accounting_contract")
         .is_none());
     assert_ne!(
-        snapshot_semantic_component_hashes(SnapshotSource::Codex, &item)
-            .get("usage_accounting"),
+        snapshot_semantic_component_hashes(SnapshotSource::Codex, &item).get("usage_accounting"),
         snapshot_semantic_component_hashes(SnapshotSource::Codex, &legacy_hash_shape)
             .get("usage_accounting")
     );
@@ -16716,8 +16652,7 @@ fn codex_created_thread_native_witness_breaks_fail_the_whole_file_closed() {
             "native-spawn-delay" => child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z"),
             _ => unreachable!(),
         }
-        let (root, parsed) =
-            parse_trusted_created_thread_test(name, child_id, parent_id, &child);
+        let (root, parsed) = parse_trusted_created_thread_test(name, child_id, parent_id, &child);
         assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
         assert!(parsed.report.complete(), "{name}");
         assert!(!parsed.progress_complete(), "{name}");
@@ -17303,8 +17238,7 @@ fn sqlite_wal_and_shm_exist(path: &Path) -> [bool; 2] {
 fn rollout_ordinal(path: &Path) -> (Result<Option<u64>>, SidecarOpenCounts) {
     let mut open = SidecarOpenCounts::default();
     let mut extents = BTreeMap::new();
-    let result =
-        load_codex_rollout_extents(path, &mut open, &mut extents, &mut BTreeSet::new());
+    let result = load_codex_rollout_extents(path, &mut open, &mut extents, &mut BTreeSet::new());
     let ordinal = result.map(|()| extents.into_values().next().map(|e| e.next_ordinal));
     (ordinal, open)
 }
@@ -17364,8 +17298,7 @@ fn codex_sidecar_plain_open_reads_live_wal_without_writing_beside_it() {
     for dir in [&codex_dir, &indexed, &bare] {
         fs::create_dir_all(dir).expect("create history fixture root");
     }
-    let history_path =
-        codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
+    let history_path = codex_idle_wal_history(&codex_dir, "01a04e22-49cf-7460-9fd7-f7dbfd2f05e4");
     let alias_path = codex_dir.join("alias.sqlite");
     std::os::unix::fs::symlink(&history_path, &alias_path).expect("link history fixture");
     let (ordinal, open) = rollout_ordinal(&alias_path);
@@ -17429,8 +17362,8 @@ fn codex_sidecar_plain_open_reads_live_wal_without_writing_beside_it() {
         let bytes = suffixes
             .iter()
             .map(|suffix| {
-                let bytes = fs::read(state_v2::sidecar(&history_path, suffix))
-                    .expect("read live sidecar");
+                let bytes =
+                    fs::read(state_v2::sidecar(&history_path, suffix)).expect("read live sidecar");
                 let sidecar = state_v2::sidecar(&copy, suffix);
                 fs::write(&sidecar, &bytes).expect("copy sidecar");
                 // The guard refuses a sidecar whose mode differs from
@@ -17481,8 +17414,7 @@ fn codex_sidecar_snapshot_fails_busy_once_the_database_moves() {
     let home = temp_dir("codex-idle-wal-snapshot-moves");
     let codex_dir = home.join(".codex");
     fs::create_dir_all(&codex_dir).expect("create history fixture root");
-    let history_path =
-        codex_idle_wal_history(&codex_dir, "01a04e23-49cf-7460-9fd7-f7dbfd2f05e4");
+    let history_path = codex_idle_wal_history(&codex_dir, "01a04e23-49cf-7460-9fd7-f7dbfd2f05e4");
     let is_busy = |error: anyhow::Error| {
         matches!(
             error.downcast_ref::<rusqlite::Error>(),
@@ -17731,8 +17663,8 @@ fn codex_created_thread_schema_deficiency_is_unscoped_and_additive_growth_is_saf
         let codex_dir = home.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create schema fixture root");
-        let database = Connection::open(codex_dir.join("state_5.sqlite"))
-            .expect("open schema fixture state");
+        let database =
+            Connection::open(codex_dir.join("state_5.sqlite")).expect("open schema fixture state");
         database
             .execute_batch(schema)
             .expect("create deficient schema");
@@ -17813,8 +17745,8 @@ fn codex_created_thread_timestamp_prefixed_legacy_identity_uses_evidence_not_gue
     fs::create_dir_all(&sessions_dir).expect("create timestamp identity root");
     let legacy = "2026-08-29T12-00-00-x01A03E99-49CF-7460-9FD7-F7DBFD2F05E4";
     let modern = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
-    let database = Connection::open(codex_dir.join("state_5.sqlite"))
-        .expect("open timestamp identity state");
+    let database =
+        Connection::open(codex_dir.join("state_5.sqlite")).expect("open timestamp identity state");
     database
         .execute_batch(
             "CREATE TABLE threads (\
@@ -18176,8 +18108,7 @@ fn codex_created_thread_parentless_lineage_marking_never_removes_a_parent() {
     let grandchild = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
     let seed = |codex_dir: &Path, message: Option<&str>, edges: Option<&[(&str, &str)]>| {
         fs::create_dir_all(codex_dir.join("sessions")).expect("create sessions");
-        let database =
-            Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+        let database = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
         database
             .execute_batch(
                 "CREATE TABLE threads (\
@@ -18293,9 +18224,8 @@ fn codex_created_thread_parentless_lineage_marking_never_removes_a_parent() {
         let home = temp_dir("codex-parentless-marking-descendants");
         let codex_dir = home.join(".codex");
         seed(&codex_dir, message, edges);
-        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(
-            &codex_dir.join("sessions"),
-        ));
+        let metadata =
+            CodexTitleMetadata::load_from_roots(std::slice::from_ref(&codex_dir.join("sessions")));
         assert!(metadata.spawn_parent_conflicts.contains(child), "{case}");
         if edges.is_some() {
             assert_eq!(
@@ -18651,10 +18581,9 @@ fn codex_same_id_resume_conserves_usage() {
             ),
         ],
     );
-    let same_id_item =
-        parse_codex_jsonl_file(&same_id, "2026-08-02T09:11:00Z", "fp".to_string())
-            .expect("parse same-id resume")
-            .remove(0);
+    let same_id_item = parse_codex_jsonl_file(&same_id, "2026-08-02T09:11:00Z", "fp".to_string())
+        .expect("parse same-id resume")
+        .remove(0);
     assert_eq!(
         (
             same_id_item.input_tokens,
@@ -19190,9 +19119,8 @@ fn pi_unlabeled_turn_lands_in_distinct_row_from_labeled_turn() {
     )
     .expect("write fixture");
 
-    let items =
-        parse_pi_jsonl_file(&path, "2026-05-20T09:05:00Z", "iso-fingerprint".to_string())
-            .expect("parse");
+    let items = parse_pi_jsonl_file(&path, "2026-05-20T09:05:00Z", "iso-fingerprint".to_string())
+        .expect("parse");
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert_eq!(item.model_usage.len(), 2);
@@ -20343,8 +20271,7 @@ fn codex_depth_two_root_locator_requires_native_structure_for_both_callers() {
 #[test]
 fn codex_paginated_fork_names_itself_when_base_is_a_parent_segment() {
     let mut header = codex_paginated_creator_fixture();
-    header["payload"]["history_base"]["thread_id"] =
-        json!("019e253c-4444-7000-9000-dddddddddddd");
+    header["payload"]["history_base"]["thread_id"] = json!("019e253c-4444-7000-9000-dddddddddddd");
     let id = header["payload"]["id"].as_str().unwrap().to_string();
     let parent_id = header["payload"]["forked_from_id"].clone();
     let usage = |ordinal| {
@@ -20791,8 +20718,7 @@ fn codex_child_creator_native_parent_locator_keeps_own_original_pair() {
     ] {
         let mut header = codex_child_creator_header();
         header["payload"]["session_id"] = json!(parent.to_ascii_lowercase());
-        header["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] =
-            json!(parent);
+        header["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] = json!(parent);
         let id = header["payload"]["id"].as_str().unwrap();
         let item = codex_creator_item(std::slice::from_ref(&header), id);
         let evidence = item
@@ -20953,8 +20879,7 @@ fn codex_creator_header_uses_proved_provider_namespace_without_billing_changes()
         .as_object_mut()
         .unwrap()
         .remove("creator_account_id");
-    let legacy =
-        codex_creator_item(&[legacy_header], header["payload"]["id"].as_str().unwrap());
+    let legacy = codex_creator_item(&[legacy_header], header["payload"]["id"].as_str().unwrap());
     assert_eq!(
         snapshot_semantic_component_hashes(SnapshotSource::Codex, &item),
         snapshot_semantic_component_hashes(SnapshotSource::Codex, &legacy)
@@ -20980,11 +20905,8 @@ fn codex_creator_header_uses_proved_provider_namespace_without_billing_changes()
 fn codex_creator_pair_survives_rollout_created_after_cycle_start() {
     let header = codex_creator_header();
     let id = header["payload"]["id"].as_str().unwrap();
-    let born_after_cycle_start = codex_creator_item_collected_at(
-        std::slice::from_ref(&header),
-        id,
-        "2026-09-30T09:59:53Z",
-    );
+    let born_after_cycle_start =
+        codex_creator_item_collected_at(std::slice::from_ref(&header), id, "2026-09-30T09:59:53Z");
     assert!(born_after_cycle_start.session_account_evidence.is_some());
     assert_eq!(
         born_after_cycle_start.session_account_evidence,
@@ -21160,8 +21082,8 @@ fn session_usage_upload_body_contains_only_account_hashes() {
     let unsafe_body = serde_json::to_string(&request).expect("serialize negative control");
     assert!(unsafe_body.contains(raw_account));
 
-    let hash = ottto_core::billing_identity_hash("openai", "account", raw_account)
-        .expect("account hash");
+    let hash =
+        ottto_core::billing_identity_hash("openai", "account", raw_account).expect("account hash");
     set_session_account_hash(&mut request.snapshots[0], Some(&hash));
     let upload_body = serde_json::to_string(&request).expect("serialize upload body");
     assert!(!upload_body.contains('@'));
@@ -21186,10 +21108,7 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
         reasoning_effort: None,
         unattributed_total_tokens: 0,
         request_count: 1,
-        selector_context: BTreeMap::from([(
-            "service_tier".to_string(),
-            "standard".to_string(),
-        )]),
+        selector_context: BTreeMap::from([("service_tier".to_string(), "standard".to_string())]),
         selector_sources: BTreeMap::from([(
             "service_tier".to_string(),
             "message.usage.service_tier".to_string(),
@@ -22130,8 +22049,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
         "old-entity".into(),
         SnapshotQuarantineRecord {
             contract_retry_claims: None,
-            reconstruction_contract:
-                crate::snapshots::terminal_contract_retry::current_contract(),
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some("old-body".into()),
@@ -22167,8 +22085,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
         "finalization keeps the leased body instead of a semantic no-op"
     );
     // Runtime only: neither a save nor a committable subset persists it.
-    let saved: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    let saved: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
     assert_eq!(
         saved.candidate_decision_at(&candidate, 0),
         CandidateDecision::Skip
@@ -22261,8 +22178,7 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
     index
         .quarantined_snapshot_fingerprints
         .insert("refused-entity".into(), conflict.clone());
-    let saved: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    let saved: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
     assert!(saved.reason_reoffer_cooldowns.is_empty(), "never persisted");
     assert_eq!(saved.reason_reoffer_cooldown_deferred_count(), 0);
 
@@ -22805,8 +22721,7 @@ fn f2_traversal_reset_is_scoped_to_the_terminal_unhealthy_shape() {
     let mut kept = Vec::new();
     for (label, traversal) in retained {
         let mut index = traversal_reset_scope_index(traversal);
-        let (armed, _) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        let (armed, _) = index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
         assert!(!armed.is_empty(), "{label}: the page must arm");
         assert!(
             index.bounded_sweep_had_unsettled_upload,
