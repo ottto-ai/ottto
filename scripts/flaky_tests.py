@@ -7,6 +7,10 @@ test jobs upload that file as a `flaky-tests-*` artifact only when a test was
 flaky. This counts those artifacts. A listed test needs an issue for its owner:
 a retry keeps the merge moving, it does not fix the test.
 
+A test renamed through scripts/test_id_renames.tsv (old ID -> new ID, chains
+followed) is counted under its newest ID, so its history carries over. Records
+carry no target, so an old ID that maps to different new IDs stays as it is.
+
 Exit 0 when no test reached the threshold, 3 when one did, 2 on a gh error.
 """
 
@@ -19,8 +23,10 @@ import json
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
 
 PREFIX = "flaky-tests-"
+RENAMES = Path(__file__).with_name("test_id_renames.tsv")
 
 
 def gh(args: list[str]) -> bytes:
@@ -50,13 +56,32 @@ def records_of(zipped: bytes) -> list[dict]:
         return [json.loads(archive.read(name)) for name in archive.namelist() if name.endswith(".json")]
 
 
-def tally(records: list[dict]) -> dict[str, int]:
-    """Per test: how many distinct job runs reported it flaky."""
+def renames(text: str) -> dict[str, str]:
+    """Old test ID -> newest ID from test_id_renames.tsv rows (target, old, new)."""
+    targets: dict[str, set[str]] = {}
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 3 and not line.startswith("#") and fields != ["target", "old_test", "new_test"]:
+            targets.setdefault(fields[1], set()).add(fields[2])
+    step = {old: next(iter(new)) for old, new in targets.items() if len(new) == 1}
+    newest = {}
+    for old in step:
+        name, seen = old, {old}
+        while name in step and step[name] not in seen:
+            name = step[name]
+            seen.add(name)
+        newest[old] = name
+    return newest
+
+
+def tally(records: list[dict], mapped: dict[str, str] | None = None) -> dict[str, int]:
+    """Per test (newest ID): how many distinct job runs reported it flaky."""
+    mapped = mapped or {}
     seen: dict[str, set[tuple]] = {}
     for record in records:
         where = (record.get("run_id"), record.get("run_attempt"), record.get("job"), record.get("shard"))
         for entry in record.get("flaky", []):
-            seen.setdefault(entry["test"], set()).add(where)
+            seen.setdefault(mapped.get(entry["test"], entry["test"]), set()).add(where)
     return {test: len(runs) for test, runs in seen.items()}
 
 
@@ -74,7 +99,7 @@ def main() -> int:
     except (subprocess.CalledProcessError, zipfile.BadZipFile, ValueError) as error:
         print(f"flaky_tests: {error}", file=sys.stderr)
         return 2
-    counts = tally(records)
+    counts = tally(records, renames(RENAMES.read_text(encoding="utf-8")) if RENAMES.exists() else {})
     over = sorted((test for test, n in counts.items() if n >= args.threshold), key=lambda t: (-counts[t], t))
     print(f"flaky_tests: {len(records)} report(s), {len(counts)} flaky test(s) in {args.days:g} days")
     for test in sorted(counts, key=lambda t: (-counts[t], t)):
