@@ -72,8 +72,14 @@ fn load(
 }
 
 /// Every durable progress field, as the ledger and both maps hold them.
+/// Resident identity hints are a page's working set; their rows are durable.
 fn durable(progress: &SnapshotUploadProgress) -> Value {
-    serde_json::to_value(progress).unwrap()
+    let mut value = serde_json::to_value(progress).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("accepted_identity_buckets");
+    value
 }
 
 fn without_generation(mut value: Value) -> Value {
@@ -501,26 +507,25 @@ fn assert_imported(
 ) {
     // Identity placement moves to one identity row per session, stamped with
     // the imported P; the ledger keeps only their scope.
-    let hints = |progress: &SnapshotUploadProgress| {
-        let mut value = without_generation(durable(progress));
-        let fields = value.as_object_mut().unwrap();
-        fields.remove("accepted_identity_scope");
-        fields
-            .remove("accepted_identity_buckets")
-            .unwrap_or_default()
-    };
-    let (mut ours, theirs) = (without_generation(durable(imported)), hints(oracle));
-    assert!(hints(imported).is_null(), "no hint stays resident");
+    let theirs = serde_json::to_value(&oracle.accepted_identity_buckets).unwrap();
+    assert!(
+        imported.accepted_identity_buckets.is_empty(),
+        "no resident hint"
+    );
+    let mut ours = without_generation(durable(imported));
     ours.as_object_mut()
         .unwrap()
         .remove("accepted_identity_scope");
-    let mut expected = without_generation(durable(oracle));
-    expected
-        .as_object_mut()
-        .unwrap()
-        .remove("accepted_identity_buckets");
-    assert_eq!(ours, expected, "the rows carry every JSON field");
-    assert_money_maps(imported);
+    assert_eq!(
+        ours,
+        without_generation(durable(oracle)),
+        "the rows carry every JSON field"
+    );
+    let mut loaded = imported.clone();
+    loaded
+        .load_identity(["progress-rows-switch", "progress-rows-side-call"])
+        .unwrap();
+    assert_money_maps(&loaded);
     let names = theirs
         .as_object()
         .unwrap()
@@ -1131,6 +1136,10 @@ fn progress_rows_import_carries_the_pre_publication_json_ledger() {
                     durable(&imported),
                     "restart reads the rows"
                 );
+                let mut restored = restored;
+                restored
+                    .load_identity(["progress-rows-switch", "progress-rows-side-call"])
+                    .unwrap();
                 assert_money_maps(&restored);
                 assert_quiet(source, &c, index);
             }

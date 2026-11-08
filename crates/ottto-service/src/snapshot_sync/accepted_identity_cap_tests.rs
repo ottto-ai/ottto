@@ -81,20 +81,26 @@ fn publish(c: &Corpus, session: &str, rows: &[crate::claude_local_otel::ClaudeLo
 }
 
 /// A published Claude route: its progress rows hold the identity hints.
-/// Dropping it erases the custody.
+/// Dropping it erases the custody, then its directory.
 pub(super) struct Route {
     session: crate::snapshots::StateV2ColdSession,
     index: ScanIndex,
+    _dir: crate::test_scratch::ScratchDir,
 }
 
 impl Route {
-    pub(super) fn new(c: &Corpus) -> Self {
+    pub(super) fn new() -> Self {
+        let dir = crate::test_scratch::ScratchDir::canonical("identity-cap-route");
         let (session, index) = crate::snapshots::StateV2ColdSession::publish(
             crate::snapshots::scan_index_persistence::Source::Claude,
             &ScanIndex::default(),
-            &c.base.join("state"),
+            &dir,
         );
-        Self { session, index }
+        Self {
+            session,
+            index,
+            _dir: dir,
+        }
     }
     pub(super) fn progress_path(&self) -> PathBuf {
         snapshot_upload_progress_path(self.session.path())
@@ -196,7 +202,7 @@ fn seed(name: &str, siblings: usize) -> Seeded {
     ];
     publish(&c, ROOT, &rows);
     let scanner = E2ScanFixture::capturing_identity();
-    let route = Route::new(&c);
+    let route = Route::new();
     let mut progress = route.load();
     let mut first = c.raw(&scanner, ScanIndex::default(), PAGE, true, &[]);
     enrich(&c, &mut first, &mut progress);

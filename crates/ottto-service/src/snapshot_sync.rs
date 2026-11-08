@@ -10146,7 +10146,7 @@ where
     }
     let mut replaced_retained_proof = false;
     if !progress.accepted_identity_scope.is_unset() {
-        progress.load_identity(batch.iter().filter_map(|item| session_id(item)))?;
+        progress.load_identity(batch.iter().filter_map(session_id))?;
     }
     // Only proof the ledger holds can be replaced, whatever the capability.
     if progress.accepted_identity_buckets.has_retained() {

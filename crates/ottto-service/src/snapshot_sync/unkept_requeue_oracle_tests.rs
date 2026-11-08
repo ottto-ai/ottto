@@ -175,6 +175,13 @@ fn send_with(
         route.codex_evidence = fixture::codex_evidence(&page.index, &page.scan);
     }
     route.modes = page.modes;
+    if source == SnapshotSource::ClaudeCode {
+        // Routed progress holds hints as rows: the page's sessions load them.
+        let sessions = page.scan.snapshots.iter();
+        progress
+            .load_identity(sessions.map(|item| item.source_session_id.as_str()))
+            .unwrap();
+    }
     route.accepted_identity_buckets = Some(
         serde_json::to_value(
             page.scan
