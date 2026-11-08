@@ -21,8 +21,8 @@ mod runtime;
 pub(crate) use runtime::release_collection_page_limit_for_test;
 #[cfg(test)]
 pub(crate) use runtime::{
-    before_progress_import_for_test, claim_growth_for_test, edit_progress_rows_for_test,
-    fail_next_progress_commit_for_test, import_progress_rows_for_test,
+    before_progress_import_for_test, claim_growth_for_test, drop_progress_ledger_chunk_for_test,
+    edit_progress_rows_for_test, fail_next_progress_commit_for_test, import_progress_rows_for_test,
     lose_next_progress_commit_reply_for_test, take_progress_pages_for_test,
     take_progress_set_aside_for_test,
 };
@@ -379,14 +379,10 @@ fn value_target(key: &RowKey) -> u64 {
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
-        // The two whole fields that exceed 1 MiB on real stores, and the
-        // upload-progress ledger, share the value bound, so a large row
-        // commits without a standing alarm.
+        // The two whole fields that exceed 1 MiB on real stores share the
+        // value bound, so a large row commits without a standing alarm.
         RowKey::Record { kind, .. }
-            if matches!(
-                kind.name(),
-                "scan_state.traversal" | "v1_field.birth_store" | "progress.ledger"
-            ) =>
+            if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
         {
             VALUE_BYTES
         }

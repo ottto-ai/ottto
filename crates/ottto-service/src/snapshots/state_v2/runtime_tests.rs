@@ -1913,12 +1913,98 @@ mod progress_rows {
             assert_eq!(identity_rows(db), stored);
             let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
             db.audit_headers().unwrap();
-            // One member of each map, two manifests, the ledger, 3 identity.
+            // One member and a manifest per map, the ledger's manifest and one
+            // chunk, 3 identity.
             let (_, progress_rows, _) = sqlite::row_counts_for_test(db);
-            assert_eq!(progress_rows, 5 + 3);
+            assert_eq!(progress_rows, 6 + 3);
             let (_, cx) = kinds::hydrate(db, identity.binding.clone()).unwrap();
             assert!(cx.retired.iter().all(|key| !progress::owned(key)));
         });
+    }
+
+    /// [behaviour] The ledger is an ordered chunk stream with no total limit:
+    /// a ledger over many chunks (multi-byte text split on char boundaries)
+    /// round-trips exactly, a smaller one deletes its trailing chunks, each
+    /// committed page records the ledger's bytes, and a missing, extra or
+    /// out-of-order chunk refuses the read, so the source holds.
+    #[test]
+    fn progress_ledger_is_an_ordered_chunk_stream() {
+        fn chunks(db: &mut sqlite::Sqlite) -> Vec<Header> {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let kind = RecordKind::parse("progress.ledger").unwrap();
+            let headers = tx.scan_kind(&kind, None, 128).unwrap();
+            let members = headers.into_iter();
+            members
+                .filter(|h| matches!(h.key, RowKey::Record { position: 1, .. }))
+                .collect()
+        }
+        fn stored_ledger(db: &mut sqlite::Sqlite) -> Result<Json> {
+            let mut tx = db.begin(TxnMode::Read)?;
+            let (stored, _) = progress::read::<Json, Json, Json>(&mut tx)?;
+            Ok(stored.context("progress rows")?.ledger)
+        }
+        let mut big = page(&["a"], 1);
+        big.ledger["text"] = json!("\u{e9}\u{20ac}".repeat(300) + &"x".repeat(1000));
+        let bytes = serde_json::to_string(&big.ledger).unwrap().len();
+        let small = page(&["a"], 2);
+
+        for damage in [None, Some("missing"), Some("extra"), Some("gap")] {
+            let f = Fixture::new();
+            f.published();
+            let index = load_with(&f.path, false).unwrap().unwrap();
+            telemetry::take_thread_event_for_test("progress_ledger_bytes");
+            let empty = progress::Baseline::default();
+            let progress::Outcome::Committed(baseline) = commit(&f, &index, empty, &big).unwrap()
+            else {
+                panic!("the first page commits");
+            };
+            assert_eq!(
+                telemetry::take_thread_event_for_test("progress_ledger_bytes"),
+                Some(json!(bytes)),
+                "one scalar per committed page"
+            );
+            let mut stored = Vec::new();
+            with_session_db(&index, |db| {
+                stored = chunks(db);
+                assert_eq!(stored_ledger(db).unwrap(), big.ledger);
+            });
+            assert!(stored.len() > 4, "{} chunks", stored.len());
+            let Some(damage) = damage else {
+                assert_eq!(
+                    commit(&f, &index, baseline.clone(), &big).unwrap(),
+                    progress::Outcome::Unchanged
+                );
+                assert!(commit(&f, &index, baseline, &small).is_ok());
+                with_session_db(&index, |db| {
+                    assert_eq!(chunks(db).len(), 1, "trailing chunks are deleted");
+                    assert_eq!(stored_ledger(db).unwrap(), small.ledger);
+                });
+                continue;
+            };
+            with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Write).unwrap();
+                let name = |n: usize| format!("{n:010}");
+                let at = |n: usize| mapper::key("progress.ledger", &name(n), 1).unwrap();
+                let last = stored.len() - 1;
+                match damage {
+                    "missing" => mapper::remove(&mut tx, &stored[1].key).unwrap(),
+                    "extra" => {
+                        mapper::put(&mut tx, &at(stored.len()), &"x").unwrap();
+                    }
+                    _ => {
+                        let value: String = mapper::read(&mut tx, &stored[last], None).unwrap();
+                        mapper::remove(&mut tx, &stored[last].key).unwrap();
+                        mapper::put(&mut tx, &at(last + 5), &value).unwrap();
+                    }
+                }
+                let outcome = tx.commit_inner(sqlite::Cas::Progress {
+                    expected: 1,
+                    next: 2,
+                });
+                assert_eq!(outcome, DurableCommitOutcome::Committed(2));
+                assert!(stored_ledger(db).is_err(), "{damage}: the read refuses");
+            });
+        }
     }
 
     /// The committed progress rows of the session store, as plain values.
@@ -2016,8 +2102,9 @@ mod progress_rows {
             let page = page(&["s"], 1);
             let outcome = progress::commit(db, &identity, G, &empty, &view(&page), None).unwrap();
             assert!(matches!(outcome, progress::Outcome::Committed(_)));
-            // One member of each map, their two manifests and the ledger.
-            let rows = 5;
+            // One member of each map, their two manifests, the ledger's
+            // manifest and its one chunk.
+            let rows = 6;
             assert_eq!(sqlite::row_counts_for_test(db), (200_000, rows, false));
             db.audit_headers().unwrap();
             assert_eq!(sqlite::row_counts_for_test(db), (graph, rows, false));

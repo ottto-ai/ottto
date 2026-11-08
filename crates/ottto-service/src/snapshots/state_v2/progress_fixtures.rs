@@ -40,6 +40,32 @@ pub(crate) fn edit_progress_rows_for_test(
     .unwrap();
 }
 
+/// Delete the last chunk row of the committed ledger stream of the route at
+/// `path`, its manifest left as it is, as one more progress commit.
+pub(crate) fn drop_progress_ledger_chunk_for_test(path: &Path) {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        with_progress_session(path, owner, |db, identity, graph| {
+            let generation = db.read_control::<u64>(progress::GENERATION)?.unwrap_or(0);
+            db.validate_save(identity, graph)?;
+            let mut tx = db.begin(TxnMode::Write)?;
+            let kind = RecordKind::parse("progress.ledger")?;
+            let mut last: Option<RowKey> = None;
+            while let Some(h) = tx.scan_kind(&kind, last.as_ref(), 1)?.pop() {
+                last = Some(h.key);
+            }
+            mapper::remove(&mut tx, &last.expect("a ledger chunk"))?;
+            let next = generation + 1;
+            let outcome = tx.commit_inner(sqlite::Cas::Progress {
+                expected: generation,
+                next,
+            });
+            assert_eq!(outcome, DurableCommitOutcome::Committed(next));
+            Ok(())
+        })
+    })
+    .unwrap();
+}
+
 type ProgressImportHook = Box<dyn FnOnce(&ScanIndex)>;
 thread_local! {
     static BEFORE_PROGRESS_IMPORT: std::cell::RefCell<Option<ProgressImportHook>> =
