@@ -2,6 +2,8 @@
 //! reading, the page step's result, the candidate preparation, and the
 //! constructors that decide what a page selects.
 
+mod step;
+
 use crate::snapshots::*;
 
 pub(in crate::snapshots) fn prepare_owned_scan_candidate(
