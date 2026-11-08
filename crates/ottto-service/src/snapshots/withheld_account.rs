@@ -6,11 +6,11 @@
 //! their content/evidence witness immediately; metadata alone cannot rearm it.
 //! Losing state costs a reparse, never a Skip. Tokens are last-parse estimates
 //! and held ages are wall-clock estimates since this process first saw a hold.
-use super::*;
 use crate::local_resource_diagnostics::{withheld_event, WithheldEvent};
+use crate::snapshots::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Seen {
+pub(in crate::snapshots) struct Seen {
     size_bytes: u64,
     evidence: [u8; 32],
     // Device, inode, birth: only CONTENT carries a usable generation.
@@ -78,7 +78,7 @@ impl State {
         Some(self.entries.entry(key).or_insert_with(|| Entry {
             seen: None,
             tokens: None,
-            first_seen: super::sampled_scan::now_seconds(),
+            first_seen: crate::snapshots::sampled_scan::now_seconds(),
             absence: None,
         }))
     }
@@ -120,7 +120,7 @@ impl Memo {
     }
     /// Same capped entry, now owned by the proven physical generation's new path.
     /// Moving custody grants no release counter or acceptance credit.
-    pub(super) fn rekey(&self, from: &str, to: &str) {
+    pub(in crate::snapshots) fn rekey(&self, from: &str, to: &str) {
         self.with_state(|state| {
             if let Some(mut entry) = state.entries.remove(&memo_key(from)) {
                 entry.absence = None;
@@ -135,7 +135,7 @@ impl Memo {
             }
         });
     }
-    pub(super) fn reset_absence(&self, key: &str) {
+    pub(in crate::snapshots) fn reset_absence(&self, key: &str) {
         self.with_state(|state| {
             if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
                 entry.absence = None;
@@ -160,7 +160,7 @@ fn memo_key(index_key: &str) -> [u8; 32] {
 /// Generation is checked separately by Seen; this digest binds the same
 /// device/inode and bounded samples across metadata-only birth clamps. No
 /// stat or birth (including platforms without them) means no memo witness.
-pub(super) fn content_stamp(
+pub(in crate::snapshots) fn content_stamp(
     len: u64,
     stat: Option<&OpenedObjectStat>,
     samples: &OpenedContentSamples,
@@ -199,7 +199,10 @@ impl ScanIndex {
 
     /// Capture at validated parse completion, even before its first hold is
     /// recorded. The completion owner carries this RAM-only value to classify.
-    pub(super) fn withheld_completed_seen(&self, candidate: &CandidateFile) -> Option<Seen> {
+    pub(in crate::snapshots) fn withheld_completed_seen(
+        &self,
+        candidate: &CandidateFile,
+    ) -> Option<Seen> {
         let [device, inode] = candidate.physical_identity?;
         let birth = candidate.fingerprint_birth_nanos;
         if birth == 0 {
@@ -227,7 +230,7 @@ impl ScanIndex {
     }
 
     /// Call after recording the hold, using only the completed parse witness.
-    pub(super) fn remember_withheld_content(&self, key: &str, seen: Seen) {
+    pub(in crate::snapshots) fn remember_withheld_content(&self, key: &str, seen: Seen) {
         if self.claude_account_deferred_holds.contains_key(key) {
             self.withheld_memo.with_state(|state| {
                 if let Some(entry) = state.entry(memo_key(key)) {
@@ -240,7 +243,7 @@ impl ScanIndex {
     /// An unstampable object has no completed CONTENT witness. Keep token/age
     /// disclosure, but make its next recovery a start, not evidence inferred
     /// from the temporary PARSED accounting stamp.
-    pub(super) fn forget_withheld_content(&self, key: &str) {
+    pub(in crate::snapshots) fn forget_withheld_content(&self, key: &str) {
         if self.claude_account_deferred_holds.contains_key(key) {
             self.withheld_memo.with_state(|state| {
                 if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
@@ -252,7 +255,11 @@ impl ScanIndex {
 
     /// Direct CONTENT comparison: no later metadata-sensitive promotion step.
     /// This avoids parsing/line delivery, not the existing acquisition samples.
-    pub(super) fn withheld_account_unchanged(&self, key: &str, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn withheld_account_unchanged(
+        &self,
+        key: &str,
+        candidate: &CandidateFile,
+    ) -> bool {
         if !self.claude_account_deferred_holds.contains_key(key) {
             return false;
         }
@@ -297,7 +304,12 @@ impl ScanIndex {
     /// Count EVERY completed reparse, even an identical PARSED digest. The
     /// temporary PARSED witness supports trigger accounting only; it cannot
     /// grant a Skip. Completion immediately overwrites it with CONTENT.
-    pub(super) fn note_withheld_account_parse(&self, key: &str, fingerprint: &str, was_held: bool) {
+    pub(in crate::snapshots) fn note_withheld_account_parse(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        was_held: bool,
+    ) {
         // Called before the durable hold is changed; only prior holds have
         // a reparse trigger. A first admission is recorded by completion.
         if !was_held {
@@ -342,7 +354,7 @@ impl ScanIndex {
 /// The existing capped memo owns removal evidence too. Refusal, poison, clock
 /// reversal or any uncertain/present observation starts a new sequence.
 impl Memo {
-    pub(super) fn absence_eligible(
+    pub(in crate::snapshots) fn absence_eligible(
         &self,
         key: &str,
         parent: Option<sampled_audit::AbsenceParent>,
@@ -415,7 +427,7 @@ impl State {
 
 /// Parent calls at durable hold removal, before admitting a replacement.
 impl Memo {
-    pub(super) fn released_resolved(&self, key: &str) {
+    pub(in crate::snapshots) fn released_resolved(&self, key: &str) {
         self.remove_released(key);
     }
 }
@@ -436,7 +448,7 @@ impl Memo {
 /// Proven absence releases the last-known parsed tokens, if known. This is
 /// disclosure of discarded withheld usage, never upload/ACK credit.
 impl Memo {
-    pub(super) fn released_deleted(&self, key: &str) {
+    pub(in crate::snapshots) fn released_deleted(&self, key: &str) {
         let tokens = self.remove_released(key);
         withheld_event(WithheldEvent::ReleasedDeleted, 1);
         if let Some(tokens) = tokens.filter(|tokens| *tokens > 0) {
@@ -446,7 +458,7 @@ impl Memo {
 }
 
 impl Memo {
-    pub(super) fn hold_tokens(&self, key: &str, tokens: u64) {
+    pub(in crate::snapshots) fn hold_tokens(&self, key: &str, tokens: u64) {
         self.with_state(|state| {
             if let Some(entry) = state.entry(memo_key(key)) {
                 entry.tokens = Some(tokens);
@@ -459,7 +471,7 @@ impl Memo {
 /// Refresh actual population even if details were refused. The temporary
 /// digest vector is bounded by the durable hold cap and owns no retained state.
 impl Memo {
-    pub(super) fn retain_held(&self, holds: &BTreeMap<String, String>) {
+    pub(in crate::snapshots) fn retain_held(&self, holds: &BTreeMap<String, String>) {
         let mut live = holds.keys().map(|key| memo_key(key)).collect::<Vec<_>>();
         live.sort_unstable();
         self.with_mutex(|mutex| {
@@ -550,7 +562,7 @@ pub(crate) struct HeldGauge {
 impl Memo {
     pub(crate) fn held_gauge(&self) -> Option<HeldGauge> {
         const DAY: u64 = 86_400;
-        let now = super::sampled_scan::now_seconds();
+        let now = crate::snapshots::sampled_scan::now_seconds();
         self.with_mutex(|mutex| {
             // A poisoned guard may disclose population; never use it for Skip.
             let (state, poisoned) = match mutex.lock() {
@@ -1194,7 +1206,7 @@ mod tests {
     }
 
     fn parsed(index: &mut ScanIndex, key: &str, size: u64) {
-        let mut entry = super::super::tests::manifest_index_entry(None);
+        let mut entry = crate::snapshots::tests::manifest_index_entry(None);
         entry.size_bytes = size;
         entry.source_file_fingerprint = "parsed".to_string();
         index.files.insert(key.to_string(), entry);

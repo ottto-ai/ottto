@@ -18,9 +18,9 @@
 //! Raw request, message and tool-use ids here (class `L`) are never uploaded
 //! except where the upload contract already carries them; persisted only in
 //! the local durable-tail store.
-use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::owned_heap::{OwnedMap, OwnedVec, ValueGuard};
+use crate::snapshots::*;
 use std::collections::BTreeMap;
 
 /// Distinct selectors interned per file. Sessions normally carry a handful;
@@ -31,21 +31,21 @@ const MAX_INTERNED_SELECTORS: usize = 64;
 /// response key to its slot, the responses in first-seen order, and the
 /// file's interned selectors.
 #[derive(Debug, Clone, Default)]
-pub(super) struct ClaudeResponseBook {
+pub(in crate::snapshots) struct ClaudeResponseBook {
     index: OwnedMap<String, u32>,
     responses: OwnedVec<ClaudeResponseObservation>,
-    pub(super) selectors: ClaudeSelectorTable,
+    pub(in crate::snapshots) selectors: ClaudeSelectorTable,
 }
 
 impl ClaudeResponseBook {
     /// Responses in first-seen order.
-    pub(super) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
+    pub(in crate::snapshots) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
         self.responses.iter()
     }
 
     /// Each slot's response key: the index inverted. Tail pages store a key
     /// beside its response, so the index re-derives from the pages.
-    pub(super) fn slot_keys(&self) -> Vec<&str> {
+    pub(in crate::snapshots) fn slot_keys(&self) -> Vec<&str> {
         let mut keys = vec![""; self.responses.len()];
         for (key, slot) in self.index.iter() {
             if let Some(at) = keys.get_mut(*slot as usize) {
@@ -55,7 +55,7 @@ impl ClaudeResponseBook {
         keys
     }
 
-    pub(super) fn get_mut(
+    pub(in crate::snapshots) fn get_mut(
         &mut self,
         key: &str,
     ) -> Option<ValueGuard<'_, ClaudeResponseObservation>> {
@@ -65,7 +65,11 @@ impl ClaudeResponseBook {
 
     /// Adds a response under a key that is not yet present. Returns false,
     /// retaining nothing, if its slot cannot be indexed.
-    pub(super) fn insert(&mut self, key: String, response: ClaudeResponseObservation) -> bool {
+    pub(in crate::snapshots) fn insert(
+        &mut self,
+        key: String,
+        response: ClaudeResponseObservation,
+    ) -> bool {
         let Ok(slot) = u32::try_from(self.responses.len()) else {
             return false;
         };
@@ -74,13 +78,15 @@ impl ClaudeResponseBook {
         true
     }
 
-    pub(super) fn into_parts(self) -> (Vec<ClaudeResponseObservation>, ClaudeSelectorTable) {
+    pub(in crate::snapshots) fn into_parts(
+        self,
+    ) -> (Vec<ClaudeResponseObservation>, ClaudeSelectorTable) {
         (self.responses.into_vec(), self.selectors)
     }
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct ClaudeSelectorTable {
+pub(in crate::snapshots) struct ClaudeSelectorTable {
     selectors: OwnedVec<SelectorCapture>,
 }
 
@@ -88,7 +94,10 @@ impl ClaudeSelectorTable {
     /// Equal selectors (context and sources) share one entry. Equality is by
     /// value, never "same as the previous record", so record order and the
     /// last-writer `sources` merge are untouched.
-    pub(super) fn intern(&mut self, selector: SelectorCapture) -> CompactClaudeSelector {
+    pub(in crate::snapshots) fn intern(
+        &mut self,
+        selector: SelectorCapture,
+    ) -> CompactClaudeSelector {
         if let Some(index) = self.selectors.iter().rposition(|known| *known == selector) {
             return CompactClaudeSelector::Interned(index as u32);
         }
@@ -108,7 +117,7 @@ impl ClaudeSelectorTable {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum CompactClaudeSelector {
+pub(in crate::snapshots) enum CompactClaudeSelector {
     Interned(u32),
     Inline(Box<SelectorCapture>),
 }
@@ -320,7 +329,7 @@ impl ClaudeSlot {
 
 /// Retained form of one `ClaudeResponseRecord`.
 #[derive(Debug, Clone)]
-pub(super) struct CompactClaudeResponseRecord {
+pub(in crate::snapshots) struct CompactClaudeResponseRecord {
     usage: CompactClaudeUsage,
     slot: ClaudeSlot,
     physical_sequence: u16,
@@ -347,7 +356,7 @@ impl CompactClaudeResponseRecord {
     /// that index from the vector; the saved field keeps its old width, so past
     /// `u16::MAX` it saturates.
     #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
-    pub(super) fn encode(
+    pub(in crate::snapshots) fn encode(
         first: Option<&Self>,
         position: usize,
         usage: UsageTotals,
@@ -391,7 +400,10 @@ impl CompactClaudeResponseRecord {
     /// decoding. `first` is the response's first retained record. A
     /// back-reference without one cannot occur (the first record is always
     /// encoded with its own text) and reads as no id.
-    pub(super) fn request_id<'a>(&'a self, first: Option<&'a Self>) -> Option<&'a str> {
+    pub(in crate::snapshots) fn request_id<'a>(
+        &'a self,
+        first: Option<&'a Self>,
+    ) -> Option<&'a str> {
         self.request_id
             .get(first.map(|first| &first.request_id))?
             .as_deref()
@@ -440,7 +452,7 @@ impl CompactClaudeResponseRecord {
 
 /// Decode one response's records in physical order. Any record that cannot
 /// be decoded exactly fails the whole response closed.
-pub(super) fn decode_records(
+pub(in crate::snapshots) fn decode_records(
     records: Vec<CompactClaudeResponseRecord>,
     selectors: &ClaudeSelectorTable,
 ) -> Option<Vec<ClaudeResponseRecord>> {
@@ -545,81 +557,81 @@ crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
 /// compact form of `claude_response_records` and decoded back to this form
 /// before resolution.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ClaudeResponseRecord {
-    pub(super) cache_slot: RequestSlot,
-    pub(super) physical_sequence: u64,
-    pub(super) usage: UsageTotals,
-    pub(super) model: Option<String>,
-    pub(super) selector: SelectorCapture,
-    pub(super) reasoning_effort: Option<String>,
-    pub(super) request_id: Option<String>,
-    pub(super) timestamp: Option<String>,
-    pub(super) computed_effective_input_context: Option<u64>,
-    pub(super) tool_uses: BTreeMap<String, String>,
+pub(in crate::snapshots) struct ClaudeResponseRecord {
+    pub(in crate::snapshots) cache_slot: RequestSlot,
+    pub(in crate::snapshots) physical_sequence: u64,
+    pub(in crate::snapshots) usage: UsageTotals,
+    pub(in crate::snapshots) model: Option<String>,
+    pub(in crate::snapshots) selector: SelectorCapture,
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+    pub(in crate::snapshots) request_id: Option<String>,
+    pub(in crate::snapshots) timestamp: Option<String>,
+    pub(in crate::snapshots) computed_effective_input_context: Option<u64>,
+    pub(in crate::snapshots) tool_uses: BTreeMap<String, String>,
 }
 
 // Response-local buffering repairs provider-time ordering, so it grows with the
 // file's usage-bearing lines and never refuses one. Above this size the
 // finalizer only counts a hit: it gates nothing.
-pub(super) const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
+pub(in crate::snapshots) const CLAUDE_RECORDS_PER_FILE_ALARM: usize = 65_536;
 
 /// One Claude provider response assembled from its content-block transcript
 /// records. Usage is withheld from the session projection until this response
 /// is complete, canonically ordered, and internally consistent.
 #[derive(Debug, Clone)]
-pub(super) struct ClaudeResponseObservation {
-    pub(super) sequence: u64,
+pub(in crate::snapshots) struct ClaudeResponseObservation {
+    pub(in crate::snapshots) sequence: u64,
     preceding_user_timestamp: Option<String>,
-    pub(super) records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    pub(in crate::snapshots) records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     /// Never set any more. A book saved while the record caps existed may
     /// carry it: that book lost records, so it stays retryable until a cold
     /// read, which now keeps them all.
     record_limit_exceeded: bool,
-    pub(super) desktop_request: bool,
+    pub(in crate::snapshots) desktop_request: bool,
     /// `e2::RULE_EPOCH` at the request's first admission; a later record of
     /// the same request keeps it.
-    pub(super) rule_epoch: u8,
+    pub(in crate::snapshots) rule_epoch: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ResolvedClaudeResponse {
-    pub(super) cache_slot: RequestSlot,
-    pub(super) sequence: u64,
-    pub(super) usage: UsageTotals,
-    pub(super) model: Option<String>,
-    pub(super) selector: SelectorCapture,
-    pub(super) reasoning_effort: Option<String>,
-    pub(super) request_id: Option<String>,
-    pub(super) first_timestamp: Option<String>,
-    pub(super) terminal_timestamp: Option<String>,
-    pub(super) event_clock_complete: bool,
-    pub(super) desktop_request: bool,
-    pub(super) preceding_user_timestamp: Option<String>,
-    pub(super) computed_effective_input_context: Option<u64>,
-    pub(super) tool_uses: BTreeMap<String, String>,
+pub(in crate::snapshots) struct ResolvedClaudeResponse {
+    pub(in crate::snapshots) cache_slot: RequestSlot,
+    pub(in crate::snapshots) sequence: u64,
+    pub(in crate::snapshots) usage: UsageTotals,
+    pub(in crate::snapshots) model: Option<String>,
+    pub(in crate::snapshots) selector: SelectorCapture,
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+    pub(in crate::snapshots) request_id: Option<String>,
+    pub(in crate::snapshots) first_timestamp: Option<String>,
+    pub(in crate::snapshots) terminal_timestamp: Option<String>,
+    pub(in crate::snapshots) event_clock_complete: bool,
+    pub(in crate::snapshots) desktop_request: bool,
+    pub(in crate::snapshots) preceding_user_timestamp: Option<String>,
+    pub(in crate::snapshots) computed_effective_input_context: Option<u64>,
+    pub(in crate::snapshots) tool_uses: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeTranscriptUsageOccurrence {
-    pub(super) sequence: u64,
-    pub(super) usage: UsageTotals,
-    pub(super) model: Option<String>,
+    pub(in crate::snapshots) sequence: u64,
+    pub(in crate::snapshots) usage: UsageTotals,
+    pub(in crate::snapshots) model: Option<String>,
     // Shared: a page retains every occurrence until upload, and nearly all of a
     // session's requests carry an identical selector.
-    pub(super) selector: Arc<SelectorCapture>,
-    pub(super) reasoning_effort: Option<String>,
-    pub(super) timestamp: Option<String>,
+    pub(in crate::snapshots) selector: Arc<SelectorCapture>,
+    pub(in crate::snapshots) reasoning_effort: Option<String>,
+    pub(in crate::snapshots) timestamp: Option<String>,
     // Evaluated before response folding can retain a stamped partial. Local only.
-    pub(super) event_clock_complete: bool,
-    pub(super) desktop_request: bool,
-    pub(super) effective_input_context: u64,
+    pub(in crate::snapshots) event_clock_complete: bool,
+    pub(in crate::snapshots) desktop_request: bool,
+    pub(in crate::snapshots) effective_input_context: u64,
     /// Page-local `e2` outcome; neither persisted nor sent.
-    pub(super) telemetry_attached: bool,
+    pub(in crate::snapshots) telemetry_attached: bool,
 }
 
 /// Why a retained Claude response has no resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ClaudeResolveFailure {
+pub(in crate::snapshots) enum ClaudeResolveFailure {
     /// A compact record no longer decodes against the file's selector table,
     /// or a restored book already lost records.
     Decode,
@@ -629,7 +641,7 @@ pub(super) enum ClaudeResolveFailure {
 
 impl ClaudeResponseObservation {
     #[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
-    pub(super) fn new(
+    pub(in crate::snapshots) fn new(
         sequence: u64,
         usage: UsageTotals,
         model: Option<String>,
@@ -666,7 +678,7 @@ impl ClaudeResponseObservation {
     }
 
     #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
-    pub(super) fn push(
+    pub(in crate::snapshots) fn push(
         &mut self,
         usage: UsageTotals,
         model: Option<String>,
@@ -695,7 +707,7 @@ impl ClaudeResponseObservation {
     }
 
     #[cfg(test)]
-    pub(super) fn resolve_with(
+    pub(in crate::snapshots) fn resolve_with(
         self,
         selectors: &ClaudeSelectorTable,
     ) -> Option<ResolvedClaudeResponse> {
@@ -704,7 +716,7 @@ impl ClaudeResponseObservation {
 
     /// Resolve against the file's selector table, telling why a response
     /// has no resolution.
-    pub(super) fn resolve_classified(
+    pub(in crate::snapshots) fn resolve_classified(
         self,
         selectors: &ClaudeSelectorTable,
     ) -> Result<ResolvedClaudeResponse, ClaudeResolveFailure> {

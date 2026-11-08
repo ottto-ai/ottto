@@ -1,7 +1,7 @@
 //! LD: RAM-only delivery of the lines the one primary reader already read; no
 //! transcript open, seek or read is added and no line outlives its callback.
-use super::{OwnedActiveFile, OwnedJsonlParser, OwnedSourceScan, SnapshotSource};
 use crate::local_resource_diagnostics::LineDeliveryCounts;
+use crate::snapshots::{OwnedActiveFile, OwnedJsonlParser, OwnedSourceScan, SnapshotSource};
 use crate::transcript_acquisition::{FileObject, ReadMode};
 use serde_json::Value;
 use std::time::SystemTime;
@@ -66,8 +66,8 @@ pub(crate) enum DeliveryEnd {
     Incomplete,
 }
 /// Reader-level tap: physical length (newline and skipped bytes) and line.
-pub(super) type LineTap<'a> = &'a mut dyn FnMut(u64, &PhysicalLine<'_>);
-pub(super) struct LineDelivery {
+pub(in crate::snapshots) type LineTap<'a> = &'a mut dyn FnMut(u64, &PhysicalLine<'_>);
+pub(in crate::snapshots) struct LineDelivery {
     name: &'static str,
     observer: Box<dyn LineObserver + Send>,
     /// A fresh primary file is active and not yet dispatched.
@@ -98,18 +98,22 @@ impl OwnedSourceScan {
 }
 impl OwnedActiveFile {
     /// Shared primary-reader role gate for borrowed consumers.
-    pub(super) fn is_primary_for(&self, source: SnapshotSource) -> bool {
+    pub(in crate::snapshots) fn is_primary_for(&self, source: SnapshotSource) -> bool {
         self.parser.source == source && self.group.is_none()
     }
 }
 impl LineDelivery {
     /// A fresh primary read of the active file: opened, or replaced in place.
-    pub(super) fn arm(&mut self) {
+    pub(in crate::snapshots) fn arm(&mut self) {
         self.end_open(DeliveryEnd::Incomplete);
         self.armed = true;
     }
     /// The single begin site: the common step dispatch, roles final.
-    pub(super) fn begin_armed(&mut self, active: &OwnedActiveFile, roots: &[std::path::PathBuf]) {
+    pub(in crate::snapshots) fn begin_armed(
+        &mut self,
+        active: &OwnedActiveFile,
+        roots: &[std::path::PathBuf],
+    ) {
         if !std::mem::take(&mut self.armed) || !active.is_primary_for(active.parser.source) {
             return;
         }
@@ -138,7 +142,10 @@ impl LineDelivery {
         let want = self.observer.begin(&view) == Want::Lines;
         self.open = Some((view, want));
     }
-    pub(super) fn step(&mut self, parser: &mut OwnedJsonlParser) -> anyhow::Result<bool> {
+    pub(in crate::snapshots) fn step(
+        &mut self,
+        parser: &mut OwnedJsonlParser,
+    ) -> anyhow::Result<bool> {
         let stepped = match &self.open {
             Some((view, true)) => {
                 let (observer, counts) = (&mut self.observer, &mut self.counts);
@@ -158,11 +165,11 @@ impl LineDelivery {
         stepped
     }
     /// The active file is gone: an armed one never began, an open one ends.
-    pub(super) fn left_active(&mut self) {
+    pub(in crate::snapshots) fn left_active(&mut self) {
         self.armed = false;
         self.end_open(DeliveryEnd::Incomplete);
     }
-    pub(super) fn take_page(&mut self) -> (&'static str, LineDeliveryCounts) {
+    pub(in crate::snapshots) fn take_page(&mut self) -> (&'static str, LineDeliveryCounts) {
         (self.name, std::mem::take(&mut self.counts))
     }
     fn end_open(&mut self, end: DeliveryEnd) {

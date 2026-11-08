@@ -2,14 +2,14 @@
 //! mode are named by the single registered slot their creator pair matches,
 //! when that slot's saved login is a subscription login.
 
-use super::tests::{manifest_index_entry, valid_v6_batch_request};
-use super::*;
 use crate::codex_scan_diagnostics::{
     CREATOR_API_KEY as API_KEY, CREATOR_DIFFERENT_OWNER as DIFFERENT_OWNER,
     CREATOR_MODE_UNREADABLE as MODE_UNREADABLE, CREATOR_MULTI_MATCH as MULTI_MATCH,
     CREATOR_NAMED as NAMED, CREATOR_NOT_FORCED_CHATGPT as NOT_FORCED, CREATOR_NO_MATCH as NO_MATCH,
     CREATOR_NO_PAIR as NO_PAIR, CREATOR_PREVIOUSLY_UPLOADED as PREVIOUSLY_UPLOADED,
 };
+use crate::snapshots::tests::{manifest_index_entry, valid_v6_batch_request};
+use crate::snapshots::*;
 
 const HOME_A: &str = "/synthetic/codex-slot-a";
 

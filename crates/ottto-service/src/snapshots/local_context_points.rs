@@ -35,8 +35,8 @@ const LOCAL_CONTEXT_POINT_RECENT_SECONDS: i64 = 75 * 60;
 /// in sequence order (Claude Code's request-id map): 96 KiB of scratch for
 /// reference entries on 64-bit targets. Fold transients have no heap charge
 /// site; this allocation is fixed, and retained points are charged below.
-pub(super) const LOCAL_CONTEXT_POINT_ORDER_WINDOW: usize = 4096;
-pub(super) const LOCAL_CONTEXT_POINT_ORDER_PASSES: usize = 8;
+pub(in crate::snapshots) const LOCAL_CONTEXT_POINT_ORDER_WINDOW: usize = 4096;
+pub(in crate::snapshots) const LOCAL_CONTEXT_POINT_ORDER_PASSES: usize = 8;
 
 // Payloads need not be ordered. Including position makes every key unique,
 // so unstable sorting preserves the old stable sequence-sort tie order.
@@ -95,7 +95,7 @@ crate::heap_layout_bound::no_heap!(true; LocalContextPoint);
 /// Per-accumulator point list, at most `LOCAL_CONTEXT_POINT_CAP` entries of
 /// 8 bytes each.
 #[derive(Debug, Clone, Default)]
-pub(super) struct LocalContextPoints {
+pub(in crate::snapshots) struct LocalContextPoints {
     points: Vec<LocalContextPoint>,
 }
 crate::durable_tail_codec::durable_struct!(LocalContextPoints {
@@ -103,7 +103,7 @@ crate::durable_tail_codec::durable_struct!(LocalContextPoints {
 });
 
 impl LocalContextPoints {
-    pub(super) fn push(&mut self, at: Option<&str>, prompt_tokens: u64) {
+    pub(in crate::snapshots) fn push(&mut self, at: Option<&str>, prompt_tokens: u64) {
         if prompt_tokens == 0 {
             return;
         }
@@ -169,7 +169,7 @@ impl LocalContextPoints {
 
     /// The points, when the session's last activity is recent at `now`;
     /// otherwise none.
-    pub(super) fn into_recent(
+    pub(in crate::snapshots) fn into_recent(
         self,
         last_activity_at: Option<&str>,
         now: &str,
@@ -183,7 +183,7 @@ impl LocalContextPoints {
 
     /// The strict fold already has sequence-ordered requests. Consume them
     /// once, with no ordering scratch or unordered-input budget.
-    pub(super) fn from_ordered_requests<'a, T>(
+    pub(in crate::snapshots) fn from_ordered_requests<'a, T>(
         requests: impl Iterator<Item = T>,
         point: impl Fn(T) -> Option<(Option<&'a str>, u64)>,
     ) -> Vec<LocalContextPoint> {
@@ -205,7 +205,7 @@ impl LocalContextPoints {
     /// Selection uses O(n log W) key comparisons per pass and O(log W) tuple
     /// moves per heap update, then one in-place O(W log W) sort. No insertion
     /// shifts a window-sized suffix.
-    pub(super) fn from_requests_by_sequence<'a, T, I>(
+    pub(in crate::snapshots) fn from_requests_by_sequence<'a, T, I>(
         requests: I,
         sequence: impl Fn(T) -> u64,
         point: impl Fn(T) -> Option<(Option<&'a str>, u64)>,
@@ -267,7 +267,10 @@ impl LocalContextPoints {
 
 /// Whether a session whose last activity is `last_activity_at` may carry
 /// points at `now` (the 75-minute output gate).
-pub(super) fn local_context_points_recent(last_activity_at: Option<&str>, now: &str) -> bool {
+pub(in crate::snapshots) fn local_context_points_recent(
+    last_activity_at: Option<&str>,
+    now: &str,
+) -> bool {
     last_activity_at
         .and_then(|last| OffsetDateTime::parse(last, &Rfc3339).ok())
         .zip(OffsetDateTime::parse(now, &Rfc3339).ok())

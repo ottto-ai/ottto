@@ -10,7 +10,7 @@ use decoder_allocation::Context as DecoderContext;
 
 /// One predicate for a candidate's encoding or the already-opened input kind.
 /// A suffix is only a refusal signal, never ownership or decode authority.
-pub(super) fn is_compressed_codex_rollout(
+pub(in crate::snapshots) fn is_compressed_codex_rollout(
     path: Option<&Path>,
     input: Option<&OpenedInput>,
 ) -> bool {
@@ -19,7 +19,7 @@ pub(super) fn is_compressed_codex_rollout(
         || input.is_some_and(OpenedInput::is_compressed)
 }
 
-pub(super) fn refuse_compressed_codex(
+pub(in crate::snapshots) fn refuse_compressed_codex(
     path: Option<&Path>,
     input: Option<&OpenedInput>,
     cause: CodexZstCause,
@@ -68,7 +68,7 @@ fn decoder_reservation() -> io::Result<usize> {
 /// Credit a caller pays before `OpenedInput::compressed`: decoder heap, the
 /// boxed reader and its decoded-byte buffer. The JSONL line buffer and parsed
 /// accumulator stay charged by their existing owners.
-pub(super) fn compressed_input_credit() -> io::Result<usize> {
+pub(in crate::snapshots) fn compressed_input_credit() -> io::Result<usize> {
     decoder_reservation()?
         .checked_add(BUFFER_BYTES)
         .and_then(|n| n.checked_add(size_of::<BufReader<BoundedDecoder<File>>>()))
@@ -78,7 +78,7 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
 /// Streaming decoder with sticky failure and an explicit decoded-byte budget.
 /// EOF is successful only after a complete frame (including checksum). Supports
 /// concatenated frames; a truncated last frame is never a successful prefix.
-pub(super) struct BoundedDecoder<R: Read> {
+pub(in crate::snapshots) struct BoundedDecoder<R: Read> {
     input: BufReader<io::Take<R>>,
     physical_limit: u64,
     context: DecoderContext,
@@ -96,7 +96,7 @@ pub(super) struct BoundedDecoder<R: Read> {
 impl<R: Read> BoundedDecoder<R> {
     fn new(input: R, decoded_limit: u64) -> io::Result<Self> {
         #[cfg(test)]
-        super::codex_zst_refusal_tests::decoder_constructed();
+        crate::snapshots::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
         let mut context =
             DecoderContext::new(reserved.saturating_sub(BUFFER_BYTES)).ok_or_else(|| {
@@ -125,7 +125,7 @@ impl<R: Read> BoundedDecoder<R> {
     }
 
     #[cfg(test)]
-    pub(super) fn decoded_bytes(&self) -> u64 {
+    pub(in crate::snapshots) fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
     }
     fn read_inner(&mut self, output: &mut [u8]) -> io::Result<usize> {
@@ -245,21 +245,21 @@ impl<R: Read> Drop for BoundedDecoder<R> {
     clippy::large_enum_variant,
     reason = "keeps main's inline Plain buffer"
 )]
-pub(super) enum OpenedInput {
+pub(in crate::snapshots) enum OpenedInput {
     Plain(BufReader<File>),
     Compressed(
         Box<BufReader<BoundedDecoder<File>>>,
-        Option<super::sampled_scan::codex_cursor::DecoderOwner>,
+        Option<crate::snapshots::sampled_scan::codex_cursor::DecoderOwner>,
     ),
 }
 
 impl OpenedInput {
     /// The ordinary input encoding, after the caller securely opens the object.
     /// Refused decoder funding uses the caller's ordinary requeue/yield path.
-    pub(super) fn encoded(
+    pub(in crate::snapshots) fn encoded(
         file: File,
         path: &Path,
-        cache: Option<&std::sync::Arc<super::sampled_scan::SharedCache>>,
+        cache: Option<&std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>>,
     ) -> io::Result<Self> {
         if !is_compressed_codex_rollout(Some(path), None) {
             return Ok(Self::plain(file));
@@ -273,14 +273,18 @@ impl OpenedInput {
             })
     }
 
-    pub(super) fn plain(file: File) -> Self {
+    pub(in crate::snapshots) fn plain(file: File) -> Self {
         Self::Plain(BufReader::new(file))
     }
 
     /// `credit` must cover `compressed_input_credit()`. `decoded_limit` is the
     /// sticky per-file cap on decoded bytes; reaching it with more content,
     /// truncation, corruption or an oversized window fails the read.
-    pub(super) fn compressed(file: File, decoded_limit: u64, credit: usize) -> io::Result<Self> {
+    pub(in crate::snapshots) fn compressed(
+        file: File,
+        decoded_limit: u64,
+        credit: usize,
+    ) -> io::Result<Self> {
         if credit < compressed_input_credit()? {
             return Err(invalid("compressed rollout input was not prepaid"));
         }
@@ -289,12 +293,13 @@ impl OpenedInput {
         Ok(Self::Compressed(Box::new(decoded), None))
     }
 
-    pub(super) fn funded(
+    pub(in crate::snapshots) fn funded(
         file: File,
-        cache: &std::sync::Arc<super::sampled_scan::SharedCache>,
+        cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
     ) -> io::Result<Option<Self>> {
         let credit = compressed_input_credit()?;
-        let Some(owner) = super::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
+        let Some(owner) =
+            crate::snapshots::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
         else {
             codex_zst_refused(CodexZstCause::AdmissionRefused);
             return Ok(None);
@@ -311,17 +316,17 @@ impl OpenedInput {
         }
         input.map(Some)
     }
-    pub(super) fn header_only(mut self) -> Self {
+    pub(in crate::snapshots) fn header_only(mut self) -> Self {
         if let Self::Compressed(reader, _) = &mut self {
             let decoder = reader.get_mut();
-            decoder.remaining = super::codex_file_join::MAX_HEADER_BYTES as u64;
-            decoder.physical_limit = 2 * super::codex_file_join::MAX_HEADER_BYTES as u64;
+            decoder.remaining = crate::snapshots::codex_file_join::MAX_HEADER_BYTES as u64;
+            decoder.physical_limit = 2 * crate::snapshots::codex_file_join::MAX_HEADER_BYTES as u64;
             decoder.input.get_mut().set_limit(decoder.physical_limit);
             decoder.header = true;
         }
         self
     }
-    pub(super) fn close(self) {
+    pub(in crate::snapshots) fn close(self) {
         if let Self::Compressed(reader, owner) = self {
             drop(reader);
             if let Some(owner) = owner {
@@ -329,28 +334,28 @@ impl OpenedInput {
             }
         }
     }
-    pub(super) fn is_compressed(&self) -> bool {
+    pub(in crate::snapshots) fn is_compressed(&self) -> bool {
         matches!(self, Self::Compressed(..))
     }
 
     /// The original opened File: metadata and identity revalidation use it, so
     /// no path is ever reopened. Never seek a compressed File before its
     /// decoder reaches EOF.
-    pub(super) fn get_ref(&self) -> &File {
+    pub(in crate::snapshots) fn get_ref(&self) -> &File {
         match self {
             Self::Plain(reader) => reader.get_ref(),
             Self::Compressed(reader, _) => reader.get_ref().input.get_ref().get_ref(),
         }
     }
 
-    pub(super) fn get_mut(&mut self) -> &mut File {
+    pub(in crate::snapshots) fn get_mut(&mut self) -> &mut File {
         match self {
             Self::Plain(reader) => reader.get_mut(),
             Self::Compressed(reader, _) => reader.get_mut().input.get_mut().get_mut(),
         }
     }
 
-    pub(super) fn buffer(&self) -> &[u8] {
+    pub(in crate::snapshots) fn buffer(&self) -> &[u8] {
         match self {
             Self::Plain(reader) => reader.buffer(),
             Self::Compressed(reader, _) => reader.buffer(),
@@ -360,7 +365,7 @@ impl OpenedInput {
     /// Funded decoder memory is charged by its outstanding SharedCache claim.
     /// Unfunded synthetic input charges its box, buffer and full decoder credit;
     /// plain input charges only its buffer.
-    pub(super) fn capacity(&self) -> usize {
+    pub(in crate::snapshots) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
             Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
@@ -401,8 +406,8 @@ impl BufRead for OpenedInput {
 
 #[cfg(test)]
 pub(in crate::snapshots) mod tests {
-    use super::super::*;
     use super::*;
+    use crate::snapshots::*;
     use crate::transcript_acquisition::Scope;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};

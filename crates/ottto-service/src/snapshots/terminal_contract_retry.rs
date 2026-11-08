@@ -1,5 +1,7 @@
 //! Bounded paced reassessment of an unchanged rejected body after reconstruction changes.
-use super::{SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness};
+use crate::snapshots::{
+    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Bump only in PRs that change reconstruction logic or its contract. A bump
@@ -10,14 +12,14 @@ const RECONSTRUCTION_CONTRACT: u16 = 1;
 /// attempt rather than resetting unrelated state or becoming opaque debt.
 const UNKNOWN_CONTRACT: u16 = 0;
 
-pub(super) const fn legacy_contract() -> u16 {
+pub(in crate::snapshots) const fn legacy_contract() -> u16 {
     1
 }
 
 /// Decode non-identity bookkeeping without failing its enclosing record.
 /// Consume malformed containers too, without allocating their contents. Missing
 /// fields still use `legacy_contract`; only malformed-present values are unknown.
-pub(super) fn decode_contract<'de, D: serde::Deserializer<'de>>(
+pub(in crate::snapshots) fn decode_contract<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u16, D::Error> {
     decode_u16(deserializer, UNKNOWN_CONTRACT)
@@ -25,7 +27,7 @@ pub(super) fn decode_contract<'de, D: serde::Deserializer<'de>>(
 
 /// A malformed-present claim is exhausted, never a fresh budget. Absence means
 /// an ordinary pre-existing retry; a contract migration explicitly sets Some(0).
-pub(super) fn decode_claims<'de, D: serde::Deserializer<'de>>(
+pub(in crate::snapshots) fn decode_claims<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<u16>, D::Error> {
     decode_u16(d, MAX_CLAIMS).map(Some)
@@ -109,7 +111,8 @@ pub(crate) fn rearm<'a>(
             continue;
         }
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
-        record.failed_reconstruction_count = super::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1;
+        record.failed_reconstruction_count =
+            crate::snapshots::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1;
         record.retry_after_unix_seconds = crate::snapshot_sync::quarantine_retry_after(fingerprint);
         record.reconstruction_contract = current;
         record.contract_retry_claims = Some(0);
@@ -159,7 +162,7 @@ pub(crate) fn exhaust(record: &mut SnapshotQuarantineRecord) -> bool {
         && record.disposition == SnapshotQuarantineDisposition::RetryPending
     {
         record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-        record.failed_reconstruction_count = super::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.failed_reconstruction_count = crate::snapshots::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
         record.retry_after_unix_seconds = 0;
         TERMINAL_CONTRACT_RETRY_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
         return true;

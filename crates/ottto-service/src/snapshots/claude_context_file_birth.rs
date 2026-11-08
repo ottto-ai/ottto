@@ -16,7 +16,7 @@
 //! Everything here is local. Nothing is uploaded except the existing scalar
 //! fields and the content-free local counters; the content-free scalars are
 //! persisted only in the local durable-tail store.
-use super::*;
+use crate::snapshots::*;
 use std::hash::{Hash, Hasher};
 
 /// A record this much older than its root file's birth was copied in.
@@ -239,7 +239,7 @@ impl ClaudeFileBirth {
     /// Bind the rule to the opened physical file. `metadata` comes from the
     /// open descriptor; subagent identity uses the same path rule as the
     /// family census, so an alias cannot reach the exemption another way.
-    pub(super) fn observe(path: &Path, metadata: Option<&fs::Metadata>) -> Self {
+    pub(in crate::snapshots) fn observe(path: &Path, metadata: Option<&fs::Metadata>) -> Self {
         let scope = match claude_index_path_member_ref(path) {
             None => ClaudeBirthScope::NotObserved,
             Some(member) if member.subagent_stem.is_some() => ClaudeBirthScope::Subagent,
@@ -262,9 +262,9 @@ impl ClaudeFileBirth {
         #[cfg(test)]
         let birth = {
             let mut birth = birth;
-            if let Some(staged) =
-                super::claude_history_upgrade::staged_birth_for_test(&local_index_key(path))
-            {
+            if let Some(staged) = crate::snapshots::claude_history_upgrade::staged_birth_for_test(
+                &local_index_key(path),
+            ) {
                 if matches!(
                     birth.scope,
                     ClaudeBirthScope::Root(_) | ClaudeBirthScope::RootUnknownBirth
@@ -279,7 +279,7 @@ impl ClaudeFileBirth {
 
     /// Acquisition proved the retained prefix belongs to this same object.
     /// Refresh its current extent without replacing accumulated birth evidence.
-    pub(super) fn refresh_opened(&mut self, current: &Self) {
+    pub(in crate::snapshots) fn refresh_opened(&mut self, current: &Self) {
         self.opened = current.opened;
         // Same path, same key for a RAM copy; a durable-restored copy never
         // carries this path-derived key and takes it from the live parse.
@@ -357,8 +357,12 @@ impl ClaudeFileBirth {
     /// One owned or copied line, before its response is resolved. Only the
     /// opening window is checked, so this costs at most a few timestamp parses
     /// per file.
-    pub(super) fn observe_line(&mut self, timestamp: Option<&str>, responses_before: u64) {
-        if responses_before < super::session_start::WINDOW_REQUESTS as u64
+    pub(in crate::snapshots) fn observe_line(
+        &mut self,
+        timestamp: Option<&str>,
+        responses_before: u64,
+    ) {
+        if responses_before < crate::snapshots::session_start::WINDOW_REQUESTS as u64
             && self.copied(timestamp) == Some(true)
         {
             self.tagged_in_opening = true;
@@ -367,7 +371,7 @@ impl ClaudeFileBirth {
 
     /// One resolved response, in transcript order. Today's naive scalars are
     /// computed beside this and stay untouched; the fold decides which ships.
-    pub(super) fn observe_response_at(
+    pub(in crate::snapshots) fn observe_response_at(
         &mut self,
         sequence: u64,
         at: Option<i128>,
@@ -385,7 +389,7 @@ impl ClaudeFileBirth {
         if copied {
             self.tagged_responses = self.tagged_responses.saturating_add(1);
             self.tagged_before_first_own |= self.own_responses == 0;
-            if sequence < super::session_start::WINDOW_REQUESTS as u64 {
+            if sequence < crate::snapshots::session_start::WINDOW_REQUESTS as u64 {
                 self.tagged_in_opening = true;
             }
             return;
@@ -444,7 +448,7 @@ impl ClaudeFileBirth {
 
 /// Replace the item's first/peak/last and compaction scalars with the own-only
 /// values. One source for every branch that ships parser scalars.
-pub(super) fn apply_own_context_scalars(
+pub(in crate::snapshots) fn apply_own_context_scalars(
     item: &mut SnapshotItem,
     counts: &mut ClaudeContextFileBirthCounts,
 ) {
@@ -485,8 +489,8 @@ pub(super) fn apply_own_context_scalars(
 /// with the file it was copied from. Earlier means an earlier first
 /// response, then the lower session id: content only, so cold, Tail and
 /// restored reads agree. `None` when no own response has a readable time.
-pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
-    use super::claude_request_money::e2::{earlier_holders, first_own_turn_at};
+pub(in crate::snapshots) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> {
+    use crate::snapshots::claude_request_money::e2::{earlier_holders, first_own_turn_at};
     let order = items
         .iter()
         .map(|item| {
@@ -521,7 +525,7 @@ pub(super) fn cache_content_births(items: &[SnapshotItem]) -> Vec<Option<i128>> 
 /// A cache request is the file's own unless its provider time is more than
 /// the copy slack before the content birth. An unreadable time is kept, so
 /// the wire makes the session partial instead of dropping it.
-pub(super) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
+pub(in crate::snapshots) fn cache_owns(birth: i128, occurred_at: &str) -> bool {
     rfc3339_unix_nanos(occurred_at).map_or(true, |at| {
         before_birth(at, birth, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) != Some(true)
     })
@@ -604,14 +608,18 @@ enum TelemetryOwner<'r> {
 /// stable hash, and its sidecar root when the row's session is that root
 /// (`None`: no single owner).
 #[derive(Clone, Copy)]
-pub(super) struct TelemetryRow<'r> {
-    pub(super) request_hash: u64,
-    pub(super) owner: Option<&'r str>,
+pub(in crate::snapshots) struct TelemetryRow<'r> {
+    pub(in crate::snapshots) request_hash: u64,
+    pub(in crate::snapshots) owner: Option<&'r str>,
 }
 
 impl<'r> TelemetryRow<'r> {
     /// `None` for a row without a request id, which names no request.
-    pub(super) fn of(root: &'r str, session_id: &str, request_id: &str) -> Option<Self> {
+    pub(in crate::snapshots) fn of(
+        root: &'r str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<Self> {
         (!request_id.is_empty()).then(|| Self {
             request_hash: stable_hash(request_id),
             owner: (session_id == root).then_some(root),
@@ -637,7 +645,7 @@ pub(crate) type ClaudeVetoApiRows =
 /// fall in one partition, so the verdicts equal those of a single page-wide
 /// lookup. Partitions that cannot be sized under the bound refuse the page:
 /// every judged item withholds (fail closed).
-pub(super) struct ClaudeTelemetryTripwire {
+pub(in crate::snapshots) struct ClaudeTelemetryTripwire {
     /// Item path hash to its check, sorted by hash: `None` on a
     /// contradiction, otherwise whether telemetry reported every kept request
     /// under its root.
@@ -647,7 +655,7 @@ pub(super) struct ClaudeTelemetryTripwire {
 }
 
 impl ClaudeTelemetryTripwire {
-    pub(super) fn build(
+    pub(in crate::snapshots) fn build(
         items: &[SnapshotItem],
         max_requests: usize,
         api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -676,7 +684,11 @@ impl ClaudeTelemetryTripwire {
     }
 
     /// `build` over any source of the loaded rows' telemetry rows.
-    pub(super) fn build_from<'r, F, I>(items: &[SnapshotItem], max_requests: usize, rows: F) -> Self
+    pub(in crate::snapshots) fn build_from<'r, F, I>(
+        items: &[SnapshotItem],
+        max_requests: usize,
+        rows: F,
+    ) -> Self
     where
         F: Fn() -> I,
         I: Iterator<Item = TelemetryRow<'r>>,
@@ -797,7 +809,7 @@ impl ClaudeTelemetryTripwire {
 
     /// Family roots over their own evidence bound this fold. Read-only, for
     /// #677's local stop alarm (hashed there; never logged raw).
-    pub(super) fn over_bound_roots(&self) -> &BTreeSet<String> {
+    pub(in crate::snapshots) fn over_bound_roots(&self) -> &BTreeSet<String> {
         &self.over_bound_roots
     }
 
@@ -846,7 +858,7 @@ pub(crate) fn with_claude_evidence_bound_for_test<T>(bound: usize, body: impl Fn
 /// loaded row) and the slice of `request_id`, so a test can place a request
 /// in a later slice.
 #[cfg(test)]
-pub(super) fn telemetry_slice_for_test(
+pub(in crate::snapshots) fn telemetry_slice_for_test(
     loaded_request_ids: &[&str],
     max_requests: usize,
     request_id: &str,
@@ -916,12 +928,12 @@ impl ClaudeRememberedTripwire {
     }
 
     /// This exact file version was vetoed earlier, or memory overflowed.
-    pub(super) fn holds(&self, item: &SnapshotItem) -> bool {
+    pub(in crate::snapshots) fn holds(&self, item: &SnapshotItem) -> bool {
         let (path, fingerprint) = Self::key(item);
         self.overflowed || self.vetoed.get(&path) == Some(&fingerprint)
     }
 
-    pub(super) fn remember(&mut self, item: &SnapshotItem) {
+    pub(in crate::snapshots) fn remember(&mut self, item: &SnapshotItem) {
         let (path, fingerprint) = Self::key(item);
         if self.vetoed.len() >= self.capacity && !self.vetoed.contains_key(&path) {
             // Fail closed: a veto that cannot be remembered withholds every
@@ -933,7 +945,7 @@ impl ClaudeRememberedTripwire {
     }
 
     /// The file changed since its veto and was admitted: drop the stale row.
-    pub(super) fn forget(&mut self, item: &SnapshotItem) {
+    pub(in crate::snapshots) fn forget(&mut self, item: &SnapshotItem) {
         self.vetoed.remove(&item.claude_file_birth.path_key_hash);
     }
 }
@@ -942,7 +954,8 @@ static REMEMBERED_TRIPWIRE: Mutex<ClaudeRememberedTripwire> =
     Mutex::new(ClaudeRememberedTripwire::new(MAX_REMEMBERED_TRIPWIRE_FILES));
 
 /// The process-lifetime veto memory, held for one fold.
-pub(super) fn remembered_tripwire() -> std::sync::MutexGuard<'static, ClaudeRememberedTripwire> {
+pub(in crate::snapshots) fn remembered_tripwire(
+) -> std::sync::MutexGuard<'static, ClaudeRememberedTripwire> {
     REMEMBERED_TRIPWIRE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1083,7 +1096,11 @@ impl ClaudeContextFileBirthCounts {
     }
 
     /// Count one body the fold left without the v1 contract (R9).
-    pub(super) fn record_contractless(&mut self, item: &SnapshotItem, witness_present: bool) {
+    pub(in crate::snapshots) fn record_contractless(
+        &mut self,
+        item: &SnapshotItem,
+        witness_present: bool,
+    ) {
         let carries_scalars = item.peak_context_fill_tokens.is_some()
             || item.first_turn_context_tokens.is_some()
             || item.last_turn_context_tokens.is_some()
@@ -1112,7 +1129,7 @@ struct ResourceWithholdAlarm {
 /// The first fold of the process that withholds for a
 /// resource limit raises one local alarm on the service log. Counts only: no
 /// path, id, wire field or UI. Later folds keep counting on the counts line.
-pub(super) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCounts) {
+pub(in crate::snapshots) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCounts) {
     if !counts.resource_withheld() {
         return;
     }
@@ -1136,7 +1153,7 @@ pub(super) fn alarm_first_resource_withhold(counts: &ClaudeContextFileBirthCount
 /// merged here (a real merge is a later slice), so every file of such an id
 /// withholds its whole tuple while the second file exists. Scratch: one
 /// borrowed entry per page item and one reused key buffer for the index walk.
-pub(super) fn claude_multi_file_members(
+pub(in crate::snapshots) fn claude_multi_file_members(
     snapshots: &[SnapshotItem],
     index: &ScanIndex,
 ) -> BTreeSet<String> {
@@ -1179,7 +1196,7 @@ pub(super) fn claude_multi_file_members(
 /// Design E admission for an item the strict rule did not own. Admitted
 /// scalars are the parser's own-only values; anything else clears the tuple
 /// and session start exactly as before.
-pub(super) fn admit_claude_file_birth_posture(
+pub(in crate::snapshots) fn admit_claude_file_birth_posture(
     item: &mut SnapshotItem,
     root_session_id: &str,
     tripwire: &ClaudeTelemetryTripwire,

@@ -6,9 +6,11 @@
 //! settlement. One path for every source; sources differ only by the index
 //! state the existing adapters already keep. The walk's own state rides in
 //! `money_freshness::WalkFold`.
-use super::money_freshness::{WalkFold, ALARM_AFTER};
-use super::state_v2::{DebtSummary, NoUploadRequired, Observation, Representation, TailHead};
-use super::*;
+use crate::snapshots::money_freshness::{WalkFold, ALARM_AFTER};
+use crate::snapshots::state_v2::{
+    DebtSummary, NoUploadRequired, Observation, Representation, TailHead,
+};
+use crate::snapshots::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -353,7 +355,7 @@ fn over_alarm_age(now_ms: u64, at: u64) -> bool {
 
 /// A source's persisted debt, as scalars. No cap: every owed file counts.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Report {
+pub(in crate::snapshots) struct Report {
     available: bool,
     outstanding_files: u64,
     held_files: u64,
@@ -373,7 +375,7 @@ pub(super) struct Report {
 }
 impl Report {
     /// Storage could not be read, or this process has no aggregate yet: never fresh.
-    pub(super) const UNAVAILABLE: Self = Self {
+    pub(in crate::snapshots) const UNAVAILABLE: Self = Self {
         available: false,
         outstanding_files: 0,
         held_files: 0,
@@ -410,7 +412,7 @@ impl Report {
         });
     }
     /// Over 6 h, unknown age, or no complete discovery within 6 h.
-    pub(super) fn alarm(&self, now_ms: u64) -> bool {
+    pub(in crate::snapshots) fn alarm(&self, now_ms: u64) -> bool {
         !self.available
             || self.over_6h_files > 0
             || self
@@ -422,7 +424,7 @@ impl Report {
                 .map_or(true, |at| over_alarm_age(now_ms, at))
     }
     /// The per-source fields; `null` when storage could not be read.
-    pub(super) fn fields(&self, now_ms: u64) -> serde_json::Value {
+    pub(in crate::snapshots) fn fields(&self, now_ms: u64) -> serde_json::Value {
         if !self.available {
             return serde_json::Value::Null;
         }
@@ -448,7 +450,7 @@ impl Report {
 /// persisted; this only knows which files the walk counted, so a walk resumed
 /// after a restart is never complete.
 #[derive(Debug)]
-pub(super) struct Walk {
+pub(in crate::snapshots) struct Walk {
     /// Unix ms when this process saw the walk begin at the roots.
     started_at: Option<u64>,
     incomplete: bool,
@@ -463,7 +465,7 @@ pub(super) struct Walk {
     sums: Report,
 }
 impl Walk {
-    pub(super) const EMPTY: Self = Self {
+    pub(in crate::snapshots) const EMPTY: Self = Self {
         started_at: None,
         incomplete: false,
         unavailable: false,
@@ -474,7 +476,7 @@ impl Walk {
 
     /// The roster of a complete walk begun in this process with no walk
     /// issue; `None` otherwise. Moves the roster out of the walk.
-    pub(super) fn complete_roster(&mut self) -> Option<Roster> {
+    pub(in crate::snapshots) fn complete_roster(&mut self) -> Option<Roster> {
         let started_at_ms = self
             .started_at
             .filter(|_| !self.incomplete && !self.unavailable && !self.issue)?;
@@ -511,16 +513,16 @@ pub(crate) struct Roster {
 }
 
 /// One listed file, as the walk saw it.
-pub(super) struct Listing<'a> {
-    pub(super) path: &'a Path,
-    pub(super) metadata: &'a std::fs::Metadata,
+pub(in crate::snapshots) struct Listing<'a> {
+    pub(in crate::snapshots) path: &'a Path,
+    pub(in crate::snapshots) metadata: &'a std::fs::Metadata,
     /// Inside the discovery window: outside it no new debt starts (the read
     /// filters, as for the never-indexed count).
-    pub(super) in_window: bool,
+    pub(in crate::snapshots) in_window: bool,
 }
 
 /// One discovery page of one source.
-pub(super) struct Page<'a> {
+pub(in crate::snapshots) struct Page<'a> {
     source: SnapshotSource,
     /// `None`: a v1 graph, which has no Tail store and so no debt.
     route: Option<PathBuf>,
@@ -543,7 +545,7 @@ fn listing_errors(counts: &ScanTraversalCounts) -> (usize, usize) {
 impl<'a> Page<'a> {
     /// A walk begins with exactly the configured roots pending, and then with a
     /// fresh fold.
-    pub(super) fn begin(
+    pub(in crate::snapshots) fn begin(
         source: SnapshotSource,
         index: &ScanIndex,
         traversal: &ScanTraversalCheckpoint,
@@ -590,7 +592,7 @@ impl<'a> Page<'a> {
 
     /// A listing error or a too-wide directory leaves the walk incomplete. A
     /// re-listing pass restores its counts, so compare before that restore.
-    pub(super) fn counts(
+    pub(in crate::snapshots) fn counts(
         &mut self,
         counts: &ScanTraversalCounts,
         before: Option<&ScanTraversalCounts>,
@@ -602,12 +604,12 @@ impl<'a> Page<'a> {
 
     /// An entry the walk could not list, or a queued directory that is gone
     /// with no confirmed removal, proves nothing absent: no erasure this walk.
-    pub(super) fn unlisted(&mut self) {
+    pub(in crate::snapshots) fn unlisted(&mut self) {
         self.fold.debt.incomplete = true;
     }
 
     /// Any walk issue on this page (symlink, unreadable, too wide, gone).
-    pub(super) fn walk_issue(&mut self) {
+    pub(in crate::snapshots) fn walk_issue(&mut self) {
         self.fold.debt.issue = true;
     }
 
@@ -625,7 +627,11 @@ impl<'a> Page<'a> {
 
     /// A file excluded from upload by the daemon's own snapshot rule is never
     /// upload-required: no debt, counted as no upload required.
-    pub(super) fn excluded(&mut self, path: &Path, metadata: Option<&std::fs::Metadata>) {
+    pub(in crate::snapshots) fn excluded(
+        &mut self,
+        path: &Path,
+        metadata: Option<&std::fs::Metadata>,
+    ) {
         if self.roster(path, metadata) && self.route.is_some() {
             self.fold.debt.sums.no_upload_required_files += 1;
         }
@@ -714,7 +720,7 @@ impl<'a> Page<'a> {
 
     /// Reconcile one listed file, once per walk, and stage what changed. A head
     /// this build cannot read is counted unknown and never written.
-    pub(super) fn listed(&mut self, index: &ScanIndex, listing: Listing<'_>) {
+    pub(in crate::snapshots) fn listed(&mut self, index: &ScanIndex, listing: Listing<'_>) {
         if !self.roster(listing.path, Some(listing.metadata)) || self.route.is_none() {
             return;
         }
@@ -791,7 +797,11 @@ impl<'a> Page<'a> {
     /// when owed) and records its start as the last complete discovery; then
     /// the source's whole persisted debt is aggregated. `None`: a page that is
     /// not a walk's end, or a v1 graph.
-    pub(super) fn end(self, index: &mut ScanIndex, walk_ended: bool) -> Option<Report> {
+    pub(in crate::snapshots) fn end(
+        self,
+        index: &mut ScanIndex,
+        walk_ended: bool,
+    ) -> Option<Report> {
         let Self {
             route,
             root_walk,
@@ -863,4 +873,4 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(in crate::snapshots) mod tests;

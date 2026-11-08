@@ -1,20 +1,20 @@
 //! The selection-time first cause of a file read, for the daemon-local
 //! change-reason counts. It reads only persisted state the gate already
 //! decided on and never changes a decision.
-use super::*;
 use crate::local_resource_diagnostics::change_reason::{self as counts, Token};
+use crate::snapshots::*;
 
 /// The selector arm behind a `SourceChanged` read (an account memo-miss
 /// carries none).
 #[derive(Clone, Copy, Debug)]
-pub(super) enum SourceChange {
+pub(in crate::snapshots) enum SourceChange {
     CopyRemoval,
     Fingerprint,
 }
 
 impl ScanIndex {
     /// Tag a file the scan is about to read with its first cause.
-    pub(super) fn note_change_reason_selected(
+    pub(in crate::snapshots) fn note_change_reason_selected(
         &self,
         source: SnapshotSource,
         candidate: &CandidateFile,
