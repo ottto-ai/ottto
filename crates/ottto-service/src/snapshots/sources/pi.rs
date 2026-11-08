@@ -2,6 +2,9 @@
 //! and their timestamps, and the dedup and fork ledgers that count each
 //! response once.
 
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
