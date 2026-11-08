@@ -615,8 +615,8 @@ class LedgerTests(unittest.TestCase):
                     if kind == 'fn':
                         return (f'pub(crate) fn f(\n x: [u8;{number}],\n) {{}}\n' if wrapped else
                                 f'pub(crate) fn f(x: [u8;{number}]) {{}}\n')
-                    return (f'pub(crate) struct T {{\n x: [u8;{number}],\n}}\n' if wrapped else
-                            f'pub(crate) struct T {{ x: [u8;{number}], }}\n')
+                    return (f'pub(crate) struct T {{\n x:\n  [u8;{number}],\n}}\n' if wrapped else
+                            f'pub(crate) struct T {{\n x: [u8;{number}],\n}}\n')
                 base = self.repo.commit({src('snapshots.rs'): '#[cfg(test)] mod a;\n#[cfg(unix)] mod b;\n',
                                          src('snapshots/a.rs'): item('1.0'),
                                          src('snapshots/b.rs'): item('1 .0')})
