@@ -22051,6 +22051,10 @@ mod tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }
         #[cfg(unix)]
+        mod accepted_identity_cap_tests {
+            include!("snapshot_sync/accepted_identity_cap_tests.rs");
+        }
+        #[cfg(unix)]
         mod claude_org_line_money_tests {
             include!("snapshot_sync/claude_org_line_money_tests.rs");
         }

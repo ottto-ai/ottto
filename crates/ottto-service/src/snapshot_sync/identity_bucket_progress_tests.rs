@@ -497,3 +497,204 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
     assert_eq!(counts["identity_cap"]["retained_set_cleared"], json!(2));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+// Hints for more sessions than the former ledger held. The earliest session is
+// ACKed first, then `siblings` more; after a restart only the store holds its
+// state, which every consumer and scope change must still reach.
+const EARLIEST: &str = "synthetic-sticky-session";
+const KEY: [u8; 32] = [0x42; 32];
+/// A stored-body entity ACK of `item` whose digest echoes the local witness.
+fn stored_ack(progress: &mut SnapshotUploadProgress, item: &Value) {
+    let mut accepted = 0;
+    attempt_snapshot_page(
+        std::slice::from_ref(item),
+        &[0],
+        "synthetic-session-cap",
+        progress,
+        &mut accepted,
+        &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+        &|_: &Value| "d".repeat(64),
+        &|value: &Value| value["source_session_id"].as_str(),
+        &mut |_| {
+            let entity = crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: item["source_session_id"].as_str().unwrap().into(),
+                snapshot_fingerprint: item["snapshot_fingerprint"].as_str().unwrap().into(),
+                occurrence_count: 1,
+                body_witness_version: Some(3),
+                body_witness_digest: Some("d".repeat(64)),
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
+                cache_observations_state: None,
+            };
+            Ok(crate::snapshot_client::SnapshotBatchResponse {
+                conflict_rescans: Default::default(),
+                accepted: 1,
+                sessions_reconciled: 0,
+                session_ids: vec![],
+                disabled: false,
+                disabled_reason: None,
+                entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                accepted_entities: vec![entity],
+                unchanged_entities: vec![],
+                rejected_entities: vec![],
+                conflict_entities: vec![],
+            })
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+}
+/// Save, load and re-key under `key`, as the next process does.
+fn restarted(
+    progress: &mut SnapshotUploadProgress,
+    key: Option<[u8; 32]>,
+) -> SnapshotUploadProgress {
+    let dir = crate::test_scratch::unique_path("ottto-identity-session-cap");
+    std::fs::create_dir_all(&dir).unwrap();
+    progress.save(&dir.join("progress.json")).unwrap();
+    let mut loaded = SnapshotUploadProgress::load(
+        &dir.join("progress.json"),
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    loaded.accepted_identity_buckets.bind_test_key(key);
+    loaded
+        .accepted_identity_buckets
+        .set_retained_enabled(progress.accepted_identity_buckets.retained_enabled());
+    std::fs::remove_dir_all(dir).unwrap();
+    loaded
+}
+/// The earliest session's bucket starts and frozen share set.
+fn frozen(progress: &SnapshotUploadProgress) -> Option<Value> {
+    progress
+        .accepted_identity_buckets
+        .get(EARLIEST)
+        .map(|state| {
+            let state = serde_json::to_value(state).unwrap();
+            json!([state["starts"], state["shares"]])
+        })
+}
+/// The earliest session's witnessed proof and frozen shares, then `siblings`
+/// tagged sessions, then a restart. Returns the earliest state as ACKed.
+fn seeded(siblings: usize) -> (SnapshotUploadProgress, Value) {
+    let mut progress = retained_progress();
+    stored_ack(&mut progress, &witnessed_body());
+    assert_eq!(retained_rows(&progress), Some((1, 0)));
+    let before = frozen(&progress).unwrap();
+    for n in 0..siblings {
+        let mut sibling = body();
+        sibling["source_session_id"] = json!(format!("synthetic-sibling-{n}"));
+        sibling["snapshot_fingerprint"] = json!(format!("{n:064x}"));
+        stored_ack(&mut progress, &sibling);
+    }
+    (restarted(&mut progress, Some(KEY)), before)
+}
+/// [behaviour] Store-only proof is superseded durably before a replacement's
+/// POST, for 17 and 736 sessions.
+#[test]
+fn identity_cap_store_only_proof_is_superseded_before_post() {
+    for sessions in [17, 736] {
+        let (mut progress, _) = seeded(sessions - 1);
+        let mut replacement = witnessed_body();
+        replacement["snapshot_fingerprint"] = json!("9".repeat(64));
+        replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
+            json!("c".repeat(64));
+        let saved = std::cell::Cell::new(None);
+        let mut accepted = 0;
+        let lost = attempt_snapshot_page(
+            &[replacement],
+            &[0],
+            "synthetic-session-cap-replacement",
+            &mut progress,
+            &mut accepted,
+            &|value: &Value| value["snapshot_fingerprint"].as_str().unwrap(),
+            &|_: &Value| "d".repeat(64),
+            &|value: &Value| value["source_session_id"].as_str(),
+            &mut |_| {
+                assert_eq!(
+                    saved.get(),
+                    Some((0, 0)),
+                    "{sessions}: persisted before POST"
+                );
+                Err(anyhow!("reply lost"))
+            },
+            &mut |progress| {
+                saved.set(retained_rows(progress));
+                Ok(())
+            },
+        );
+        assert!(lost.is_err());
+    }
+}
+/// [behaviour] An ACK record after a restart sees the store's frozen set: a
+/// stripped body keeps the earliest session's frozen shares.
+#[test]
+fn identity_cap_ack_record_keeps_store_only_frozen_shares() {
+    for sessions in [17, 736] {
+        let (mut progress, before) = seeded(sessions - 1);
+        let mut stripped = body();
+        stripped["snapshot_fingerprint"] = json!("8".repeat(64));
+        stripped["usage_buckets"][0]["model_usage"][0] = json!({"model":"claude-synthetic"});
+        stored_ack(&mut progress, &stripped);
+        assert_eq!(
+            frozen(&progress),
+            Some(before),
+            "{sessions}: frozen set kept"
+        );
+    }
+}
+/// [behaviour] A replay-generation change reaches a session that is not
+/// resident: proof is cleared, starts and shares are kept, across a restart.
+#[test]
+fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares() {
+    for sessions in [17, 736] {
+        let (mut progress, before) = seeded(sessions - 1);
+        assert!(progress.prepare_historical_replay("next-generation"));
+        let progress = restarted(&mut progress, Some(KEY));
+        assert_eq!(
+            retained_rows(&progress),
+            Some((0, 0)),
+            "{sessions}: proof cleared"
+        );
+        assert_eq!(frozen(&progress), Some(before), "{sessions}: shares kept");
+    }
+}
+/// [behaviour] Key changes A→None→A and A→B→A reject every older row, even
+/// for sessions that were not resident; no proof revives.
+#[test]
+fn identity_cap_key_change_rejects_store_only_rows() {
+    for path in [[None, Some(KEY)], [Some([0x43; 32]), Some(KEY)]] {
+        let (mut progress, _) = seeded(16);
+        for key in path {
+            progress = restarted(&mut progress, key);
+        }
+        assert_eq!(frozen(&progress), None, "{path:?}");
+        assert_eq!(retained_rows(&progress), None, "{path:?}");
+        assert!(progress
+            .accepted_identity_buckets
+            .get("synthetic-sibling-15")
+            .is_none());
+    }
+}
+/// [money] With option (ii) off, an ACK after a restart that omits a frozen
+/// row of a present bucket keeps that row's older frozen shares.
+#[test]
+fn frozen_shares_survive_an_ack_omitting_their_row_after_restart() {
+    let tagged = |model: &str| json!({"model":model,"evidence_ref":0,"account_identifier_hash":"a".repeat(64)});
+    let mut progress = progress();
+    let mut both = body();
+    both["usage_buckets"][0]["model_usage"] =
+        json!([tagged("claude-synthetic"), tagged("claude-other")]);
+    stored_ack(&mut progress, &both);
+    let before = frozen(&progress).unwrap();
+    assert_eq!(before[1].as_array().unwrap().len(), 2, "two frozen rows");
+    let mut progress = restarted(&mut progress, Some(KEY));
+    let mut omitting = body();
+    omitting["snapshot_fingerprint"] = json!("7".repeat(64));
+    omitting["usage_buckets"][0]["model_usage"] = json!([tagged("claude-other")]);
+    stored_ack(&mut progress, &omitting);
+    assert_eq!(frozen(&progress), Some(before));
+}
