@@ -93,7 +93,14 @@ modules that are not nameable fail; so do top-level items around a replaced
 chain that carry an attribute or derive outside the allowlist or invoke a macro
 whose closure is not listable (closure_gap), a location macro (or a crate macro
 that expands to one) after a replacement on its line, and any crate-wide
-identity problem (identity_problems).
+identity problem (identity_problems). After the lexical replacements, files
+compare as token streams: whitespace between tokens may change, and a trailing
+comma before `)`, `]` or `}` may change outside macro/attribute token trees.
+Single-element tuple/group parentheses keep their comma; ambiguous parentheses
+with top-level angle brackets or closure bars fail closed. Calls may gain a
+trailing argument comma. Comments and literals stay exact, token order stays
+fixed (including use lists and compound-operator boundaries), and location-sensitive tokens must keep their line
+and column. Move mode still compares file bytes exactly.
 
 Threat model and limits. The checker is built for accidental changes by
 trusted authors moving files, not for an adversary crafting
@@ -2240,6 +2247,102 @@ def _check_absolutize(changes, base, head, result) -> None:
     result.lines.insert(0, f"{len(files)} files, {total} absolutized paths")
 
 
+def _absolutize_token(text: str, tokens: list[rst.Token], index: int) -> tuple[str, str, bool]:
+    """Keep Rust compound operators joint despite the lexer's single-character punctuation.
+
+    `.=` is also retained as the second boundary of `..=`. Delimiters and other
+    punctuation may be separated freely; a compound operator may not.
+    """
+    token = tokens[index]
+    joint = False
+    if token.kind == "punct" and index + 1 < len(tokens):
+        after = tokens[index + 1]
+        joint = after.kind == "punct" and token.end == after.start and text[token.start:after.end] in {
+            "::", "->", "=>", "..", ".=", "&&", "||", "==", "!=", "<=", ">=", "<<", ">>",
+            "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=",
+        }
+    return token.kind, text[token.start:token.end], joint
+
+
+def _absolutize_call(lx: rst.Lexed, code: list[int], pos: int) -> bool:
+    """Recognizable call/parameter parentheses, including turbofish and generic fn headers."""
+    if pos == 0:
+        return False
+    before = code[pos - 1]
+    if lx.is_ident(before) and (lx.tok(before) not in KEYWORDS or lx.tok(before) in ("Self", "fn")):
+        return True
+    if lx.tok(before) in (")", "]", "?"):
+        return True
+    if not lx.is_punct(before, ">"):
+        return False
+    depth = 0
+    for p in range(pos - 1, -1, -1):
+        if lx.is_punct(code[p], ">"):
+            depth += 1
+        elif lx.is_punct(code[p], "<"):
+            depth -= 1
+            if depth == 0:
+                return p >= 2 and (
+                    lx.is_punct(code[p - 1], ":") and lx.is_punct(code[p - 2], ":")
+                    or lx.is_ident(code[p - 1]) and lx.is_ident(code[p - 2], "fn")
+                )
+        elif lx.tok(code[p]) in (";", "{", "}"):
+            break
+    return False
+
+
+def _absolutize_tokens(lx: rst.Lexed) -> list[int]:
+    """Ignore whitespace and safe trailing commas; keep comments and literals verbatim.
+
+    Parentheses with one element may be a tuple, so only a recognizable call
+    can drop its comma. For other parentheses, count direct comma separators
+    only when angle brackets / closure bars cannot hide a nested separator.
+    """
+    code = code_index(lx)
+    positions = {index: pos for pos, index in enumerate(code)}
+    opaque = shape_of(lx).opaque
+    optional = set()
+    for close, open_ in lx.opener.items():
+        pos = positions[close]
+        if pos == 0 or not lx.is_punct(code[pos - 1], ","):
+            continue
+        comma = code[pos - 1]
+        if inside(opaque, comma):
+            continue
+        if lx.is_punct(open_, "("):
+            call = _absolutize_call(lx, code, positions[open_])
+            cursor, separators, ambiguous = open_ + 1, 0, False
+            while cursor < comma:
+                if lx.is_punct(cursor, ","):
+                    separators += 1
+                if lx.tokens[cursor].kind == "punct" and lx.tok(cursor) in ("<", ">", "|"):
+                    ambiguous = True
+                cursor = lx.match.get(cursor, cursor) + 1
+            if lx.next_code(open_ + 1) == comma or not call and (not separators or ambiguous):
+                continue
+        optional.add(comma)
+    return [i for i, token in enumerate(lx.tokens) if token.kind != "ws" and i not in optional]
+
+
+def _absolutize_location(path, old, new, i, j, macro_defs, aliases, result) -> None:
+    """Reflow cannot relocate explicit or crate-macro-derived location observations."""
+    if not old.is_ident(i):
+        return
+    located = location_at(old, i) or (
+        invokes_macro(old, i) and (
+            any(d.location for d in macro_closure(old.tok(i), macro_defs)[0])
+            or closure_gap(old.tok(i), macro_defs, aliases)
+        )
+    )
+    if located:
+        a, b = old.tokens[i].start, new.tokens[j].start
+        old_place = (old.line(a), a - old.text.rfind("\n", 0, a))
+        new_place = (new.line(b), b - new.text.rfind("\n", 0, b))
+        if old_place != new_place:
+            result.fail(f"rule 7 (location): {path}:{old_place[0]}: `{old.tok(i)}` moves from "
+                        f"{old_place} to {new_place}")
+
+
 def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rst.Lexed, macro_defs, aliases,
                      result: Result) -> int:
     info = shape(old)
@@ -2250,10 +2353,13 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
             named[item.body_open] = item.name
     blocks = [(open_, close, name) for open_, close, name in info.mod_blocks]
     chains = {first: (last, length, contiguous) for first, last, length, contiguous in super_chains(old)}
-    i = j = count = 0
-    while i < len(old.tokens) and j < len(new.tokens):
-        if old.tok(i) == new.tok(j) and old.tokens[i].kind == new.tokens[j].kind:
-            i, j = i + 1, j + 1
+    old_stream, new_stream = _absolutize_tokens(old), _absolutize_tokens(new)
+    a = b = count = 0
+    while a < len(old_stream) and b < len(new_stream):
+        i, j = old_stream[a], new_stream[b]
+        if _absolutize_token(old.text, old.tokens, i) == _absolutize_token(new.text, new.tokens, j):
+            _absolutize_location(path, old, new, i, j, macro_defs, aliases, result)
+            a, b = a + 1, b + 1
             continue
         where = f"{path}:{old.line(old.tokens[i].start)}"
         if i not in chains:
@@ -2291,21 +2397,18 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
             expected = "crate" if not target else f"in {absolute}"
         else:
             expected = absolute
-        start = new.tokens[j].start
-        if not new.text.startswith(expected, start):
+        tokens = rst.tokenize(expected)
+        expected_tokens = [_absolutize_token(expected, tokens, k) for k, t in enumerate(tokens) if t.kind != "ws"]
+        actual = [_absolutize_token(new.text, new.tokens, k) for k in new_stream[b:b + len(expected_tokens)]]
+        if actual != expected_tokens:
             result.fail(f"{where}: expected `{expected}` in place of the `super` chain")
-            return count
-        stop = start + len(expected)
-        k = j
-        while k < len(new.tokens) and new.tokens[k].start < stop:
-            k += 1
-        if k < len(new.tokens) and new.tokens[k].start != stop or (k == len(new.tokens) and stop != len(new.text)):
-            result.fail(f"{where}: replacement does not end at a token boundary")
             return count
         _check_column_shift(f"{path}:{old.line(old.tokens[i].start)}", old, last, macro_defs, aliases, result)
         replaced.append(i)
-        i, j, count = last + 1, k, count + 1
-    if i != len(old.tokens) or j != len(new.tokens):
+        while a < len(old_stream) and old_stream[a] <= last:
+            a += 1
+        b, count = b + len(expected_tokens), count + 1
+    if a != len(old_stream) or b != len(new_stream):
         result.fail(f"{path}: edited beyond replacing `super` chains (at the end of the file)")
     _absolutize_attrs(path, old, info, replaced, macro_defs, aliases, result)
     return count
