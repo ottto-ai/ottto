@@ -1089,6 +1089,70 @@ class ModulePathTests(unittest.TestCase):
         self.fails(*self.facade_move('pub(crate) use self::dest::new as old;\n',
                                      caller='crate::snapshots::dest::new::local()'), 'changed: fn call')
 
+    MODEL = 'pub(crate) fn total() -> u8 {{\n    {}\n}}\n{}#[cfg(test)]\nmod tests;\n'
+    UPLOAD = 'pub(crate) struct Slot;\n' + ''.join(f'fn slot_{n}() {{}}\n' for n in range(20))
+
+    def nest_model(self, model=None, decl='pub(in crate::snapshots) mod upload;\n', upload=True):
+        """(base, head): S::obs (the model, with its tests file) moves to S::usage::obs, whose old content (the
+        upload state) moves to its child S::usage::obs::upload; the model gains `decl`; a facade alias keeps the
+        old root name and the root's import of the upload state is respelled."""
+        tests = 'use super::*;\n\n#[test]\nfn adds() {\n    assert_eq!(total(), 1);\n}\n'
+        base = module_files('mod obs;\nmod usage;\nuse self::usage::obs::Slot;\n', {
+            'snapshots/obs.rs': self.MODEL.format(1, self.PADDING), 'snapshots/obs/tests.rs': tests,
+            'snapshots/usage.rs': 'pub(super) mod obs;\n', 'snapshots/usage/obs.rs': self.UPLOAD})
+        head = {'snapshots.rs': 'mod usage;\nuse self::usage::obs::upload::Slot;\nuse usage::obs;\n',
+                'snapshots/obs.rs': None, 'snapshots/obs/tests.rs': None,
+                'snapshots/usage/obs.rs': model or self.MODEL.format(1, self.PADDING + decl),
+                'snapshots/usage/obs/tests.rs': tests}
+        if upload:
+            head['snapshots/usage/obs/upload.rs'] = self.UPLOAD
+        return base, head
+
+    def test_a_rename_exact_but_for_an_added_mod_declaration_maps_its_module(self):
+        # The model file gains `mod upload;` for its child: exact once that declaration is left out.
+        self.passes(*self.nest_model(), ' 0 widened, 0 problems',
+                    'module crate::snapshots::obs -> crate::snapshots::usage::obs',
+                    'module crate::snapshots::usage::obs -> crate::snapshots::usage::obs::upload',
+                    'facade alias crate::snapshots::obs -> crate::snapshots::usage::obs',
+                    'respelled `use` Slot in crate::snapshots: self::usage::obs::Slot -> '
+                    'self::usage::obs::upload::Slot')
+        # Near misses: the model also changes one token, or gains a blank line with the declaration.
+        unmapped = '`use` binds the old name of moved module crate::snapshots::obs without naming its mapped head ' \
+                   'path (?)'
+        self.fails(*self.nest_model(self.MODEL.format(2, self.PADDING + 'pub(in crate::snapshots) mod upload;\n')),
+                   'changed: fn total', unmapped)
+        self.fails(*self.nest_model(decl='\npub(in crate::snapshots) mod upload;\n'), unmapped)
+        # Only whole added or removed declarations are left out: not a `#[macro_use]` one, not a changed one.
+        self.fails(*self.nest_model(decl='#[macro_use]\nmod upload;\n'), unmapped)
+        self.fails(*self.nest_model(self.MODEL.format(1, self.PADDING + 'mod upload;\n').replace(
+            'mod tests;', 'pub(crate) mod tests;')), unmapped)
+
+    def test_a_phantom_mod_declaration_is_not_left_out(self):
+        # `mod ghost;` has no child file: the rename is not exact, so it maps nothing.
+        base, head = self.nest_model()
+        head['snapshots/usage/obs.rs'] = self.MODEL.format(1, self.PADDING + 'mod ghost;\n')
+        self.fails(base, head, 'unresolved mod at crates/demo/src/snapshots/usage/obs.rs',
+                   '`use` binds the old name of moved module crate::snapshots::obs without naming its mapped head '
+                   'path (?)')
+
+    def test_an_exact_copy_maps_only_when_its_source_path_was_rewritten_by_another_pair(self):
+        old = 'pub(crate) fn local() -> u8 {\n    1\n}\n' + self.PADDING
+        base = module_files('mod old;\nmod dest;\n', {'snapshots/old.rs': old, 'snapshots/dest.rs': ''})
+        copy = {'snapshots/dest.rs': 'mod new;\n', 'snapshots/dest/new.rs': old}
+        # The source stays unchanged, or is rewritten by no pair, while a copy of its content appears elsewhere.
+        for name, source in (('unchanged', {}),
+                             ('rewritten', {'snapshots/old.rs': 'pub(crate) fn other() -> u8 {\n    3\n}\n'})):
+            with self.subTest(name):
+                status, out = self.change(base, {**copy, **source})
+                self.assertEqual(status, 1, out)
+                self.assertNotIn('file map:', out)
+        # One rename and one copy of the same source: only the rename maps.
+        status, out = self.change(base, {'snapshots.rs': 'mod dest;\n', 'snapshots/old.rs': None,
+                                         'snapshots/dest.rs': 'mod new;\nmod copy;\n',
+                                         'snapshots/dest/new.rs': old, 'snapshots/dest/copy.rs': old})
+        self.assertEqual(status, 1, out)
+        self.assertIn('file map: 1 exact renames of .rs files, 1 module moves', out)
+
     def test_the_respelled_count_is_always_in_the_summary(self):
         # No file is renamed: the respelled count still shows in the main summary line.
         root = 'mod x;\nmod old;\n'

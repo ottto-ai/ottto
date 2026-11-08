@@ -258,7 +258,8 @@ have named fields rustfmt re-wrapped and a const, static or type alias may be re
 visibility, `use`/`mod` lines, path literals and wrappers change; module paths fail closed: a
 moved item's path may be respelled only through `mod` items to the same target, an existing
 `use` binding must keep its target, and a facade alias must name an exactly renamed module's new
-path; edits to listed validator files that anchor on moved code are reported) and
+path (added or removed `mod x;` lines aside); edits to listed validator files that anchor on moved
+code are reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
 `scripts/check_source_layout.py` reports how far the tree is from the target.

@@ -56,9 +56,13 @@ module). It "resolves through modules" when every step is the crate root,
 defined there (never a `use` binding, alias or glob). An item names the same
 target at head when the base item it named is paired, by this check, with an
 item in the head module; a module does when its file is an exact rename or the
-same unrenamed file. The file map is only the exact renames (`git diff -B
--M100%`, R100) of files instantiated in one module context; an edited rename
-maps nothing.
+same unrenamed file. The file map pairs files instantiated in one module
+context: an exact rename (`git diff -B -M100%`, R100); a file byte for byte equal
+once the whole out-of-line `[vis] mod x;` declarations (with their attributes,
+never `#[macro_use]`) that one side adds or removes are left out, each backed by
+a child file declared there (a child maps only by its own pair); and an exact
+copy (C100) whose source path is gone or rewritten by another pair (a copy
+whose source stays never maps). Any other edited rename maps nothing.
 
   - A moved item (its module changed) must keep what every unchanged path in it
     names. Only a path outside any macro call and attribute token tree, in a
@@ -1261,11 +1265,15 @@ def validator_edits(repo: Path, base: str, head: str) -> list[str]:
     return sorted(edits)
 
 
-def file_renames(repo: Path, base: str, head: str) -> tuple[list[tuple[str, str]], dict[str, set[str]]]:
-    """The exact (R100) renames of `.rs` files and the diff status of every path, with rewrites broken
-    (`-B -M100%`) so that a path whose content moved away and was replaced still pairs exactly."""
+def file_renames(repo: Path, base: str, head: str
+                 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str], dict[str, set[str]]]:
+    """The exact (R100) renames and exact (C100) copies of `.rs` files, the source of every other rename or
+    copy, and the diff status of every path, with rewrites broken (`-B -M100%`) so that a path whose content
+    moved away and was replaced still pairs exactly."""
     fields = rst.git(repo, "diff", "-B", "-M100%", "--name-status", "-z", base, head).split("\0")
     renames: list[tuple[str, str]] = []
+    copies: list[tuple[str, str]] = []
+    others: list[str] = []
     status: dict[str, set[str]] = {}
     at = 0
     while at + 1 < len(fields) and fields[at]:
@@ -1275,12 +1283,104 @@ def file_renames(repo: Path, base: str, head: str) -> tuple[list[tuple[str, str]
             at += 3
             status.setdefault(old, set()).add(code)
             status.setdefault(new, set()).add(code)
-            if code == "R100" and old.endswith(".rs") and new.endswith(".rs"):
-                renames.append((old, new))
+            if code in ("R100", "C100") and old.endswith(".rs") and new.endswith(".rs"):
+                (renames if code == "R100" else copies).append((old, new))
+            else:
+                others.append(old)
         else:
             status.setdefault(fields[at + 1], set()).add(code)
             at += 2
-    return renames, status
+    return renames, copies, others, status
+
+
+def mod_decl_lines(lexed: rst.Lexed) -> dict[str, tuple[int, int] | None]:
+    """Each top-level out-of-line `mod x;` of a file: its name -> the span of its whole lines, attributes and
+    docs included; None when it shares a line with other code, carries `#[macro_use]` or its name is
+    declared twice."""
+    text, spans = lexed.text, {}
+    for item in lexed.items:
+        if item.kind != "mod-decl":
+            continue
+        start = text.rfind("\n", 0, item.lead) + 1
+        stop = text.find("\n", item.end)
+        stop = len(text) if stop < 0 else stop + 1
+        whole = not text[start:item.lead].strip() and not text[item.end:stop].strip()
+        fine = whole and item.name not in spans and not any("macro_use" in attr for attr in item.attrs)
+        spans[item.name] = (start, stop) if fine else None
+    return spans
+
+
+def without_lines(text: str, spans: list[tuple[int, int]]) -> str:
+    out, at = [], 0
+    for start, stop in sorted(spans):
+        out.append(text[at:start])
+        at = stop
+    return "".join(out) + text[at:]
+
+
+def file_map(sides: tuple, exact: list[tuple[str, str]], copies: list[tuple[str, str]], others: list[str],
+             changed: list[str]) -> tuple[dict[str, str], int, int]:
+    """The file map (see the module docs), the number of its pairs that are exact only once added or removed
+    `mod x;` declarations are left out, and of exact copies."""
+    (base_source, base_tree, base_names), (head_source, head_tree, head_names) = sides
+
+    def one(names: Namespace, path: str) -> bool:
+        return len(names.contexts.get(path, ())) == 1
+
+    def children(tree: rst.Tree) -> set[tuple[str, Module]]:
+        return {(context.declared_by, context.module) for contexts in tree.contexts.values()
+                for context in contexts if context.how in ("mod", "path")}
+
+    def stripped(source: rst.Source, path: str) -> str:
+        lexed = source.lexed(path)
+        return without_lines(lexed.text, [span for span in mod_decl_lines(lexed).values() if span])
+
+    sources = [old for old, _ in exact + copies] + others
+    paired = {new for _, new in exact + copies}
+    base_files = [path for path in changed if base_source.exists(path) and one(base_names, path)
+                  and path not in sources]
+    head_files = [path for path in changed if head_source.exists(path) and one(head_names, path)
+                  and path not in paired]
+    keys: dict[str, tuple[list[str], list[str]]] = {}
+    for path in base_files:
+        keys.setdefault(stripped(base_source, path), ([], []))[0].append(path)
+    for path in head_files:
+        keys.setdefault(stripped(head_source, path), ([], []))[1].append(path)
+    base_kids, head_kids = children(base_tree), children(head_tree)
+    decl_pairs = []
+    for key, (olds, news) in keys.items():
+        if len(olds) != 1 or len(news) != 1 or olds[0] == news[0]:
+            continue
+        old, new = olds[0], news[0]
+        if (head_source.exists(old) and stripped(head_source, old) == key) or (
+                base_source.exists(new) and stripped(base_source, new) == key):
+            continue  # one side stays in place
+        was, now = base_source.lexed(old), head_source.lexed(new)
+        before, after = mod_decl_lines(was), mod_decl_lines(now)
+        removed, added = before.keys() - after.keys(), after.keys() - before.keys()
+        (old_module,), (new_module,) = base_names.contexts[old], head_names.contexts[new]
+        if not (removed or added) or any(before[name] is None or (old, old_module + (name,)) not in base_kids
+                                          for name in removed) or any(
+                after[name] is None or (new, new_module + (name,)) not in head_kids for name in added):
+            continue  # a phantom, shared-line or `#[macro_use]` declaration, or nothing left out
+        if without_lines(was.text, [before[name] for name in removed]) == without_lines(
+                now.text, [after[name] for name in added]):
+            decl_pairs.append((old, new))
+    # A copy maps only when no other rename or copy shares its source and the source path is gone or rewritten
+    # by another pair; drop failing candidates until none is left.
+    candidates = [(old, new) for old, new in copies if sources.count(old) == 1] + decl_pairs
+    while True:
+        targets = {new for _, new in exact + candidates}
+        kept = [(old, new) for old, new in candidates if not head_source.exists(old) or old in targets]
+        if kept == candidates:
+            break
+        candidates = kept
+    pairs = exact + candidates
+    targets = [new for _, new in pairs]
+    renames = {old: new for old, new in pairs if one(base_names, old) and one(head_names, new)
+               and targets.count(new) == 1}
+    return renames, sum(pair in decl_pairs for pair in renames.items()), sum(
+        pair in copies for pair in renames.items())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1309,15 +1409,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         base_source, base_tree, base_files, base_units = side(repo, base_sha, changed)
         head_source, head_tree, head_files, head_units = side(repo, head_sha, changed, base_source)
-        exact, status = file_renames(repo, base_sha, head_sha)
+        exact, copies, others, status = file_renames(repo, base_sha, head_sha)
         base_names, head_names = namespace(base_source, base_tree), namespace(head_source, head_tree)
+        renames, decl_renames, copy_renames = file_map(
+            ((base_source, base_tree, base_names), (head_source, head_tree, head_names)), exact, copies, others,
+            changed)
     except rst.SourceError as error:
         print(f"move-ledger: {error}", file=sys.stderr)
         # A report never blocks a change; an enforced check does.
         return 0 if args.report else 2
-    # The file map: exact renames of files instantiated in one module context at both commits.
-    renames = {old: new for old, new in exact
-               if len(base_names.contexts.get(old, ())) == 1 and len(head_names.contexts.get(new, ())) == 1}
     ident = Identity(base_names, head_names, renames, status, set(changed))
     check_aliases(ident)
     ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened), ident)
@@ -1339,9 +1439,11 @@ def main(argv: list[str] | None = None) -> int:
           f"{len(ledger.failures)} problems")
     module_map = sorted({(next(iter(base_names.contexts[old])), next(iter(head_names.contexts[new])))
                          for old, new in renames.items()} - {(m, m) for m in base_names.modules})
-    if exact:
-        print(f"move-ledger: file map: {len(exact)} exact renames of .rs files, {len(module_map)} module moves, "
-              f"{len(ident.facades)} facade aliases")
+    if renames:
+        extra = (f" ({decl_renames} exact once added or removed `mod` declarations are left out, {copy_renames} "
+                 "copies of a rewritten or gone path)") if decl_renames or copy_renames else ""
+        print(f"move-ledger: file map: {len(renames)} exact renames of .rs files{extra}, {len(module_map)} module "
+              f"moves, {len(ident.facades)} facade aliases")
     limit = REPORT_LIMIT if args.report else None
     for before, after in module_map[:limit]:
         print(f"  module {show(before)} -> {show(after)}")
