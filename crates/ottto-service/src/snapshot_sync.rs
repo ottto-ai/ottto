@@ -12137,36 +12137,6 @@ pub(crate) fn with_state_v2_progress_owner<T>(
 #[cfg(test)]
 pub(crate) const OLD_PROGRESS_BOUND_FOR_TEST: usize = 11_182_080;
 
-/// Test evidence: real-shaped upload progress past the former 11,182,080 B
-/// ACK custody bound, grown as the index quarantine mirror grows it (terminal
-/// refusal records). No source is given cache evidence.
-#[cfg(test)]
-pub(crate) fn above_old_bound_progress_for_test(
-    source: SnapshotSource,
-    namespace: &str,
-    generation: u64,
-) -> Vec<u8> {
-    let mut progress =
-        SnapshotUploadProgress::new(namespace.into(), snapshot_quarantine_witness(source));
-    let hex = |text: String| format!("{:x}", Sha256::digest(text.as_bytes()));
-    for n in 0.. {
-        progress.quarantine_permanent_body(
-            &hex(format!("fingerprint-{n}")),
-            &hex(format!("body-{n}")),
-            reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
-        );
-        if n % 1000 == 999 {
-            progress.generation = generation;
-            let bytes = serde_json::to_vec_pretty(&progress).unwrap();
-            if bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST {
-                validate_state_v2_original_progress(&bytes, namespace).unwrap();
-                return bytes;
-            }
-        }
-    }
-    unreachable!()
-}
-
 #[cfg(test)]
 pub(crate) fn validate_state_v2_original_progress(bytes: &[u8], namespace: &str) -> Result<()> {
     // Unknown payload slots are carried byte-exactly. Decode only the owner
