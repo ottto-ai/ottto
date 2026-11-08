@@ -114,6 +114,25 @@ impl PipelineFixture {
         }
     }
 
+    /// Freeze the ordinary census before edits so settlement tests retain
+    /// their mixed held/refused/accepted page independently of hint priority.
+    fn queue_before_append(&self) {
+        let mut index = ScanIndex::load(&self.index_path).unwrap();
+        let pending = std::fs::read_dir(&self.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_with_pending_for_test(
+            &mut index,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.root),
+            "2026-08-02T09:00:00Z",
+            183,
+            &pending,
+        );
+        index.save(&self.index_path).unwrap();
+    }
+
     pub(super) fn append(&self, session: &str, request: &str) {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -714,6 +733,7 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
         fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
     }
+    fixture.queue_before_append();
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     fixture.append(PIPELINE_REFUSED_SESSION, "req_1_2");
     // An unchanged sibling can be a semantic no-op after finalization. Make
@@ -1024,6 +1044,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
         let baseline = fixture.baseline();
         fixture.list_held(&[PIPELINE_HELD_SESSION]);
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+        fixture.queue_before_append();
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
         fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
         let upload = PipelineUpload::EntityAckRejected {
