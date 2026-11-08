@@ -237,5 +237,4 @@ impl TailSource for Claude {
 }
 
 #[cfg(test)]
-#[path = "claude_tests.rs"]
 pub(super) mod tests;

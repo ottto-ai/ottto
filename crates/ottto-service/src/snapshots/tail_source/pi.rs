@@ -167,5 +167,4 @@ impl TailSource for Pi {
 }
 
 #[cfg(test)]
-#[path = "pi_tests.rs"]
 mod tests;

@@ -42,17 +42,12 @@ crates/ottto-service/src/snapshots/state_v2/runtime.rs	path	tail_tests.rs
 crates/ottto-service/src/snapshots/state_v2/sqlite.rs	path	sqlite/fixtures.rs
 crates/ottto-service/src/snapshots/state_v2/sqlite.rs	path	sqlite/open_check_tests.rs
 crates/ottto-service/src/snapshots/state_v2/tail.rs	path	tail_value_tests.rs
-crates/ottto-service/src/snapshots/tail_source/claude.rs	path	claude_tests.rs
-crates/ottto-service/src/snapshots/tail_source/codex.rs	path	codex_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	facts_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	format_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	grown_head_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	held_original_tests.rs
-crates/ottto-service/src/snapshots/tail_source/load.rs	path	load_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	refold_tests.rs
 crates/ottto-service/src/snapshots/tail_source/load.rs	path	settlement_tests.rs
-crates/ottto-service/src/snapshots/tail_source/pi.rs	path	pi_tests.rs
-crates/ottto-service/src/snapshots/tail_source/seam.rs	path	seam_tests.rs
 crates/ottto-service/src/snapshots/tail_source/seam.rs	path	transition_tests.rs
 crates/ottto-service/src/snapshots/tail_source/settlement_tests.rs	path	oracle_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	authority_proof_correction_tests.rs
