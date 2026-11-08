@@ -31,13 +31,13 @@ pub(in crate::snapshots) fn capture(
     components: &BTreeMap<&'static str, String>,
     page: &mut Page,
 ) {
-    if source == SnapshotSource::ClaudeCode {
-        if let Some(file) = item.source_file_fingerprint.as_deref() {
-            page.entry(digest(file)).or_default().insert(
-                digest(&item.source_session_id),
-                LABELS.map(|label| components.get(label).map_or(0, |hash| prefix(hash))),
-            );
-        }
+    if let (SnapshotSource::ClaudeCode, Some(file)) =
+        (source, item.source_file_fingerprint.as_deref())
+    {
+        page.entry(digest(file)).or_default().insert(
+            digest(&item.source_session_id),
+            LABELS.map(|label| components.get(label).map_or(0, |hash| prefix(hash))),
+        );
     }
 }
 pub(in crate::snapshots) fn observe(
@@ -58,10 +58,8 @@ pub(in crate::snapshots) fn observe(
         .into_iter()
         .collect();
     let visit = |baselines: &mut Baselines| {
-        let old = baselines.insert(
-            (source.api_slug(), digest(&pending.index_key)),
-            (fingerprint.map(digest), entities.clone()),
-        );
+        let key = (source.api_slug(), digest(&pending.index_key));
+        let old = baselines.insert(key, (fingerprint.map(digest), entities.clone()));
         if !pending.refold_unchanged {
             return;
         }
@@ -88,11 +86,7 @@ pub(in crate::snapshots) fn observe(
         }
     };
     #[cfg(not(test))]
-    visit(
-        &mut BASELINES
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
+    visit(&mut BASELINES.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(test)]
     BASELINES.with(|baselines| visit(&mut baselines.borrow_mut()));
 }

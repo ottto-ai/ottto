@@ -38,9 +38,9 @@ fn finalizer_counts_only_eligible_component_moves() {
                     ));
             }
             let expected = snapshot_fingerprint(source, &item);
-            let group = snapshot_file_entity_set_hex(&BTreeSet::from([expected.clone()]));
+            let group = snapshot_file_entity_set_hex(BTreeSet::from([expected.clone()]));
             let body =
-                snapshot_file_upload_body_set_hex(&BTreeSet::from([snapshot_upload_body_witness(
+                snapshot_file_upload_body_set_hex(BTreeSet::from([snapshot_upload_body_witness(
                     &item,
                 )]));
             let mut scan = scan_source_roots_with_test_limit(
