@@ -499,19 +499,47 @@ fn assert_imported(
     bytes: &[u8],
     oracle: &SnapshotUploadProgress,
 ) {
-    assert_eq!(
-        without_generation(durable(imported)),
-        without_generation(durable(oracle)),
-        "the rows carry every JSON field"
-    );
+    // Identity placement moves to one identity row per session, stamped with
+    // the imported P; the ledger keeps only their scope.
+    let hints = |progress: &SnapshotUploadProgress| {
+        let mut value = without_generation(durable(progress));
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("accepted_identity_scope");
+        fields
+            .remove("accepted_identity_buckets")
+            .unwrap_or_default()
+    };
+    let (mut ours, theirs) = (without_generation(durable(imported)), hints(oracle));
+    assert!(hints(imported).is_null(), "no hint stays resident");
+    ours.as_object_mut()
+        .unwrap()
+        .remove("accepted_identity_scope");
+    let mut expected = without_generation(durable(oracle));
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("accepted_identity_buckets");
+    assert_eq!(ours, expected, "the rows carry every JSON field");
     assert_money_maps(imported);
-    // Identity placement stays in the ledger row: never a keyed map, never
-    // an identity row.
+    let names = theirs
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(!names.is_empty(), "identity placement to move");
+    let rows = imported.rows.as_ref().unwrap();
+    let stored = rows
+        .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
+        .unwrap();
+    for (name, hint) in theirs.as_object().unwrap() {
+        let point = &stored[name];
+        assert_eq!(point.progress_generation, 1, "stamped with the imported P");
+        assert_eq!(&point.accepted, hint, "the identity row is the JSON hint");
+    }
     let ledger = imported.clone().ledger_row().unwrap();
-    assert_eq!(
-        ledger["accepted_identity_buckets"],
-        durable(imported)["accepted_identity_buckets"]
-    );
+    assert!(ledger.get("accepted_identity_buckets").is_none());
+    assert!(ledger.get("accepted_identity_scope").is_some(), "the scope");
     for keyed in [
         "accepted_cache_states",
         "accepted_cache_heads",

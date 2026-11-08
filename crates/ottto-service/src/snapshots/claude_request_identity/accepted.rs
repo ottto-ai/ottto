@@ -7,7 +7,6 @@ use serde::{Deserializer, Serializer};
 use std::ops::Deref;
 use zeroize::Zeroizing;
 
-pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
 /// Receiver's dense identity-parts bound: serialized item bytes / 320.
@@ -77,8 +76,12 @@ pub(crate) struct AcceptedSession {
     key_epoch: [u8; 32],
     #[serde(skip)]
     key: Option<FingerprintKey>,
-    #[serde(default)]
-    last_ack: u64,
+    /// The digest of this value as its identity row last stored it; `None`
+    /// before any store. Dirty = the encoded value differs.
+    #[serde(skip)]
+    stored: Option<[u8; 32]>,
+    #[serde(default, rename = "last_ack", skip_serializing)]
+    _last_ack: Dropped,
     starts: Vec<i64>,
     shares: Vec<AcceptedShare>,
     #[serde(default)]
@@ -91,6 +94,39 @@ pub(crate) struct AcceptedSession {
     /// witnessed body re-proves them. Local diagnostics only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing: Vec<i64>,
+}
+/// A released ledger's LRU stamp: decoded and dropped, never written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Dropped;
+impl<'de> Deserialize<'de> for Dropped {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        IgnoredAny::deserialize(decoder).map(|_| Dropped)
+    }
+}
+/// Validity barriers for a destination's stored identity rows, at progress
+/// generations: a row stamped before `discard_before` or under another key
+/// epoch is not loaded; one stamped before `retained_before` loads without
+/// its retained proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityScope {
+    pub(crate) key_epoch: Option<String>,
+    pub(crate) discard_before: u64,
+    pub(crate) retained_before: u64,
+}
+impl IdentityScope {
+    pub(crate) fn is_unset(&self) -> bool {
+        self == &Self::default()
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for IdentityScope {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.key_epoch, c)
+    }
+}
+fn encoded(state: &AcceptedSession) -> Option<[u8; 32]> {
+    let bytes = serde_json::to_vec(state).ok()?;
+    Some(sha2::Sha256::digest(bytes).into())
 }
 /// Truncated keyed digests: the (bucket, row) grain and its exact proof.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -658,7 +694,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
                 let mut states = BTreeMap::new();
                 while let Some(session) = map.next_key::<String>()? {
-                    if !hash_is_valid(&session) || states.len() == MAX_SESSIONS {
+                    if !hash_is_valid(&session) {
                         map.next_value::<IgnoredAny>()?;
                         continue;
                     }
@@ -733,7 +769,7 @@ impl AcceptedBuckets {
     pub(crate) fn maximum_for_test() -> Self {
         let key = fixture_key();
         Self(
-            (0..MAX_SESSIONS)
+            (0..16)
                 .map(|session| {
                     let starts = (0..MAX_BUCKETS)
                         .map(|n| i64::MIN + n as i64)
@@ -754,7 +790,8 @@ impl AcceptedBuckets {
                         AcceptedSession {
                             key_epoch: key_epoch(&key),
                             key: Some(key.clone()),
-                            last_ack: u64::MAX,
+                            stored: None,
+                            _last_ack: Dropped,
                             proved: (0..MAX_PROVED_ROWS)
                                 .map(|n| ProvedRow {
                                     bucket: starts[n],
@@ -907,37 +944,17 @@ impl AcceptedBuckets {
             .get_mut(&session_key(key, session))
             .filter(|state| state.key_epoch == epoch)
     }
-    /// The session's entry, refreshed as the last ACK; a full ledger evicts
-    /// its least recently ACKed session (#909 LRU).
+    /// The session's entry, created on its first stored-body ACK.
     fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
         let fingerprint_key = self.1.as_ref()?;
-        let key = session_key(fingerprint_key, session);
-        let last_ack = self
+        let entry = self
             .0
-            .values()
-            .map(|state| state.last_ack)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        if !self.0.contains_key(&key) && self.0.len() == MAX_SESSIONS {
-            let oldest = self
-                .0
-                .iter()
-                .min_by_key(|(key, state)| (state.last_ack, *key))
-                .map(|(key, _)| key.clone())
-                .expect("full ledger");
-            self.0.remove(&oldest);
-            super::budget::record(&super::budget::Counts {
-                accepted_state_evicted: 1,
+            .entry(session_key(fingerprint_key, session))
+            .or_insert_with(|| AcceptedSession {
+                key_epoch: key_epoch(fingerprint_key),
+                key: Some(fingerprint_key.clone()),
                 ..Default::default()
             });
-        }
-        let entry = self.0.entry(key).or_insert_with(|| AcceptedSession {
-            key_epoch: key_epoch(fingerprint_key),
-            key: Some(fingerprint_key.clone()),
-            ..Default::default()
-        });
-        entry.last_ack = last_ack;
         Some(entry)
     }
     /// Option (ii) settlement for one stored-body entity ACK. A row enters
@@ -1009,8 +1026,7 @@ impl AcceptedBuckets {
         if buckets.len() > MAX_BUCKETS {
             return;
         }
-        // `record` normally settled (and LRU-refreshed) this ACK's session;
-        // refreshing again would only churn persisted bytes.
+        // `record` normally created this ACK's session.
         if self.session_mut(session).is_none() {
             self.session_entry(session);
         }
@@ -1102,7 +1118,69 @@ impl AcceptedBuckets {
             });
         }
     }
-    /// Copy-prefix ENABLE guard: whether a stored-body ACK
+    /// The identity row name of `session` under the bound key.
+    pub(crate) fn row_name(&self, session: &str) -> Option<String> {
+        self.1.as_ref().map(|key| session_key(key, session))
+    }
+    pub(crate) fn holds_row(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+    /// The bound key's epoch, the identity rows' scope.
+    pub(crate) fn epoch(&self) -> Option<String> {
+        self.1
+            .as_ref()
+            .map(|key| crate::hex::encode(&key_epoch(key)))
+    }
+    /// The epoch the resident hints were written under (an import's scope).
+    pub(crate) fn resident_epoch(&self) -> Option<String> {
+        let state = self.0.values().next()?;
+        Some(crate::hex::encode(&state.key_epoch))
+    }
+    /// The stored scope's key epoch changed: no hint written under another
+    /// epoch stays, resident or stored.
+    pub(crate) fn discard_resident(&mut self, rotated: bool) {
+        self.0.clear();
+        self.2 |= rotated && self.1.is_some();
+    }
+    /// A stored row this key can use: its own epoch, within every bound.
+    pub(crate) fn admissible(&self, state: &AcceptedSession) -> bool {
+        let increasing = |a: &[i64]| a.windows(2).all(|w| w[0] < w[1]);
+        self.1
+            .as_ref()
+            .is_some_and(|key| state.key_epoch == key_epoch(key))
+            && state.starts.len() <= MAX_BUCKETS
+            && state.shares.len() <= max_shares(MAX_ADVERTISED_ITEM_BYTES)
+            && state.proved.len() <= MAX_PROVED_ROWS
+            && state.missing.len() <= MAX_PENDING_MISSING
+            && increasing(&state.starts)
+            && increasing(&state.missing)
+            && state.shares.windows(2).all(|w| w[0] < w[1])
+            && (state.proved.windows(2)).all(|w| (w[0].bucket, w[0].row) < (w[1].bucket, w[1].row))
+            && (state.shares.iter()).all(|share| state.starts.binary_search(&share.bucket).is_ok())
+    }
+    /// Make a stored row resident, unless the session already is (a
+    /// resident entry is never replaced by a read). `retained_reset`: it
+    /// predates a replay change, so it loads without retained proof.
+    pub(crate) fn admit(&mut self, name: String, mut state: AcceptedSession, retained_reset: bool) {
+        state.stored = encoded(&state);
+        if retained_reset {
+            state.proved = Vec::new();
+            state.missing = Vec::new();
+        }
+        state.key = self.1.clone();
+        self.0.entry(name).or_insert(state);
+    }
+    /// Resident sessions whose encoded value differs from their stored row.
+    pub(crate) fn dirty(&self) -> Vec<(&str, &AcceptedSession)> {
+        (self.0.iter())
+            .filter(|(_, state)| state.stored.is_none() || state.stored != encoded(state))
+            .map(|(name, state)| (name.as_str(), state))
+            .collect()
+    }
+    /// Every resident session is stored: release them; reads load them again.
+    pub(crate) fn release(&mut self) {
+        self.0.clear();
+    }
     /// may have frozen `session`'s bucket at `bucket_start`. Known hints
     /// answer exactly; incomplete hints (whole buckets evicted) or an
     /// unparsable start answer yes. Without hints for the session the answer
@@ -1231,33 +1309,37 @@ mod tests {
         assert!(restored.get("synthetic").unwrap().is_empty());
     }
     #[test]
-    fn decoder_and_record_are_bounded_and_unknown_is_distinct_from_known_empty() {
+    fn decoder_and_record_keep_every_session_and_unknown_is_distinct_from_known_empty() {
         let oversized = json!((0..MAX_BUCKETS + 1).collect::<Vec<_>>());
-        let raw = (0..MAX_SESSIONS + 1)
+        let raw = (0..17)
             .map(|i| {
                 (
                     format!("{i:064x}"),
-                    json!({"key_epoch":digest_hex::encode(&key_epoch(&fixture_key())),"starts":[],"shares":[]}),
+                    json!({"key_epoch":digest_hex::encode(&key_epoch(&fixture_key())),"starts":[],"shares":[],"last_ack":i}),
                 )
             })
             .collect::<serde_json::Map<_, _>>();
         let decoded: AcceptedBuckets = serde_json::from_value(Value::Object(raw)).unwrap();
-        assert_eq!(decoded.0.len(), MAX_SESSIONS);
+        assert_eq!(decoded.0.len(), 17);
+        assert!(
+            !serde_json::to_string(&decoded)
+                .unwrap()
+                .contains("last_ack"),
+            "a released LRU stamp decodes and is never written"
+        );
         let decoded: AcceptedBuckets =
             serde_json::from_value(json!({"a".repeat(64):oversized})).unwrap();
         assert!(decoded.is_empty());
         let mut state = AcceptedBuckets::for_test();
-        for i in 0..MAX_SESSIONS + 1 {
+        for i in 0..17 {
             let mut value = body(false);
             value["source_session_id"] = json!(format!("session-{i}"));
             state.record(&value);
         }
-        assert_eq!(state.0.len(), MAX_SESSIONS);
+        assert_eq!(state.0.len(), 17);
         assert!(state.get("never-acknowledged").is_none());
-        assert_eq!(
-            state.get(&format!("session-{MAX_SESSIONS}")).unwrap().len(),
-            0
-        );
+        assert!(state.get("session-0").is_some(), "no session is evicted");
+        assert_eq!(state.get("session-16").unwrap().len(), 0);
     }
 }
 
@@ -1266,16 +1348,17 @@ mod heap_tests {
     use super::*;
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     #[test]
-    fn maximum_priority_ledger_has_a_three_mib_heap_bound() {
+    fn sixteen_session_priority_ledger_has_a_three_mib_heap_bound() {
         let state = AcceptedBuckets(
-            (0..MAX_SESSIONS)
+            (0..16)
                 .map(|n| {
                     (
                         format!("{n:064x}"),
                         AcceptedSession {
                             key_epoch: [0; 32],
                             key: None,
-                            last_ack: 0,
+                            stored: None,
+                            _last_ack: Dropped,
                             starts: (0..MAX_BUCKETS as i64).collect(),
                             shares: vec![
                                 AcceptedShare {
@@ -1315,7 +1398,7 @@ mod heap_tests {
         );
         assert_eq!(
             state.0.values().map(|state| state.len()).sum::<usize>(),
-            MAX_SESSIONS * MAX_BUCKETS
+            16 * MAX_BUCKETS
         );
     }
 }
@@ -1520,50 +1603,6 @@ mod keyed_tests {
 }
 
 #[cfg(test)]
-mod eviction_tests {
-    use super::*;
-    #[test]
-    fn last_ack_lru_survives_restart_and_counts_eviction_separately() {
-        let mut state = AcceptedBuckets::for_test();
-        let body = |session: usize| {
-            let mut body = tests::body(true);
-            body["source_session_id"] = json!(format!("lru-{session}"));
-            body
-        };
-        super::super::take_identity_counts();
-        for session in 0..MAX_SESSIONS {
-            let body = body(session);
-            state.record(&body);
-            state.record_proved(&body, true, &[]);
-        }
-        state.record(&body(0)); // refresh the oldest before restart
-        let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
-        restored.record(&body(MAX_SESSIONS));
-        restored.record_proved(&body(MAX_SESSIONS), true, &[]);
-        assert_eq!(
-            restored.get("lru-0").unwrap().proved[0].account,
-            Some([0xaa; 32])
-        );
-        assert_eq!(
-            restored
-                .0
-                .values()
-                .map(|entry| entry.proved.len())
-                .sum::<usize>(),
-            MAX_SESSIONS
-        );
-        assert!(restored.get("lru-0").is_some());
-        assert!(restored.get("lru-1").is_none());
-        assert!(restored.get(&format!("lru-{MAX_SESSIONS}")).is_some());
-        assert!(restored.get("brand-new").is_none());
-        let counts = serde_json::to_value(super::super::take_identity_counts()).unwrap();
-        assert_eq!(counts["identity_cap"]["accepted_state_evicted"], 1);
-        assert_eq!(counts["identity_cap"]["accepted_state_unknown"], 0);
-        assert_eq!(restored.0.len(), MAX_SESSIONS);
-    }
-}
-
-#[cfg(test)]
 mod retained_tests {
     use super::*;
     fn body(row: Value) -> Value {
@@ -1748,14 +1787,15 @@ mod retained_heap_tests {
     #[test]
     fn maximum_ledger_with_proved_rows_has_a_four_mib_heap_bound() {
         let state = AcceptedBuckets(
-            (0..MAX_SESSIONS)
+            (0..16)
                 .map(|n| {
                     (
                         format!("{n:064x}"),
                         AcceptedSession {
                             key_epoch: [0; 32],
                             key: None,
-                            last_ack: 0,
+                            stored: None,
+                            _last_ack: Dropped,
                             starts: (0..MAX_BUCKETS as i64).collect(),
                             shares: vec![
                                 AcceptedShare {

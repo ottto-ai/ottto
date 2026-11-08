@@ -1,8 +1,9 @@
 // Accepted identity hints for more sessions than one page holds, through the
 // native scan, identity tagging, upload/ACK and progress restart adapters.
-// The revisited session is ACKed first; later sessions are ACKed one page at
-// a time with a progress restart between pages, so every leg below reads the
-// same seeded ACK history.
+// The hints live in a published route's progress rows, one per session, and
+// each page point-loads its own sessions. The revisited session is ACKed
+// first; later sessions are ACKed one page at a time with a progress restart
+// between pages, so every leg below reads the same seeded ACK history.
 use super::claude_login_only_org_tests::{parts_conserve, placements, Placement};
 use super::state_v2_money_tests::routed;
 use super::*;
@@ -79,21 +80,58 @@ fn publish(c: &Corpus, session: &str, rows: &[crate::claude_local_otel::ClaudeLo
     c.evidence_for(session, rows, &traces);
 }
 
+/// A published Claude route: its progress rows hold the identity hints.
+/// Dropping it erases the custody.
+pub(super) struct Route {
+    session: crate::snapshots::StateV2ColdSession,
+    index: ScanIndex,
+}
+
+impl Route {
+    pub(super) fn new(c: &Corpus) -> Self {
+        let (session, index) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        Self { session, index }
+    }
+    pub(super) fn progress_path(&self) -> PathBuf {
+        snapshot_upload_progress_path(self.session.path())
+    }
+    /// The next cycle's progress load, re-keyed: the route's rows.
+    pub(super) fn load(&self) -> SnapshotUploadProgress {
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &self.index,
+            self.session.path(),
+            &self.progress_path(),
+            &format!("{:064x}", 99),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert!(progress.rows.is_some(), "routed progress rows");
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        progress
+    }
+}
+
 /// The process restart of the identity-hint owner: its progress is saved,
 /// loaded and re-keyed as the next cycle does.
-fn restarted(c: &Corpus, mut progress: SnapshotUploadProgress) -> SnapshotUploadProgress {
-    let path = c.base.join("claude-upload-progress.json");
-    progress.save(&path).unwrap();
-    let mut loaded = SnapshotUploadProgress::load(
-        &path,
-        &format!("{:064x}", 99),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    loaded
-        .accepted_identity_buckets
-        .bind_test_key(Some([0x42; 32]));
-    loaded
+fn restarted(route: &Route, mut progress: SnapshotUploadProgress) -> SnapshotUploadProgress {
+    progress.save(&route.progress_path()).unwrap();
+    route.load()
+}
+
+/// The production page step: the page's sessions' hints are point-loaded
+/// before tagging reads them.
+fn enrich(c: &Corpus, page: &mut Page, progress: &mut SnapshotUploadProgress) {
+    let sessions = page.scan.snapshots.iter();
+    progress
+        .load_identity(sessions.map(|item| item.source_session_id.as_str()))
+        .unwrap();
+    page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
 }
 
 /// `page` with only `session`'s bodies.
@@ -106,10 +144,16 @@ fn only(page: &Page, session: &str) -> Page {
     kept
 }
 
-/// One finished page of `scanner` over `index`, tagged under `ledger`.
-fn leg(c: &Corpus, scanner: &E2ScanFixture, index: ScanIndex, mut ledger: AcceptedBuckets) -> Page {
+/// One finished page of `scanner` over `index`, tagged under a fresh load of
+/// `route`'s hints (`None`: no hints).
+fn leg(c: &Corpus, scanner: &E2ScanFixture, index: ScanIndex, route: Option<&Route>) -> Page {
     let mut page = c.raw(scanner, index, PAGE * 8, true, &[]);
-    page.enrich_with(c, Some(&mut ledger));
+    match route {
+        Some(route) => enrich(c, &mut page, &mut route.load()),
+        None => {
+            page.enrich_with(c, Some(&mut AcceptedBuckets::for_test()));
+        }
+    }
     page.finish();
     page
 }
@@ -121,6 +165,7 @@ fn owner(prior: &ScanIndex) -> E2ScanFixture {
 }
 
 struct Seeded {
+    route: Route,
     c: Corpus,
     path: PathBuf,
     scanner: E2ScanFixture,
@@ -151,18 +196,16 @@ fn seed(name: &str, siblings: usize) -> Seeded {
     ];
     publish(&c, ROOT, &rows);
     let scanner = E2ScanFixture::capturing_identity();
-    let mut progress = e2_progress();
-    progress
-        .accepted_identity_buckets
-        .bind_test_key(Some([0x42; 32]));
+    let route = Route::new(&c);
+    let mut progress = route.load();
     let mut first = c.raw(&scanner, ScanIndex::default(), PAGE, true, &[]);
-    first.enrich_with(&c, Some(&mut progress.accepted_identity_buckets));
+    enrich(&c, &mut first, &mut progress);
     let acked = placements(body(&first, ROOT).expect("ROOT publishes"));
     for who in [S, A, C] {
         assert!(acked.contains_key(&own(who)), "{who:?} tagged: {acked:?}");
     }
     let mut prior = settle(&c, &ScanIndex::default(), first, &mut progress);
-    progress = restarted(&c, progress);
+    progress = restarted(&route, progress);
     let mut control = None;
     for n in 0..siblings {
         let id = sibling(n);
@@ -176,7 +219,7 @@ fn seed(name: &str, siblings: usize) -> Seeded {
     let mut acked = BTreeSet::new();
     while acked.len() < siblings {
         let mut page = c.raw(&scanner, prior.clone(), PAGE, true, &[]);
-        page.enrich_with(&c, Some(&mut progress.accepted_identity_buckets));
+        enrich(&c, &mut page, &mut progress);
         let ids = page
             .scan
             .snapshots
@@ -192,9 +235,10 @@ fn seed(name: &str, siblings: usize) -> Seeded {
             control = Some(routed(&sent, sent.upload_policy));
         }
         prior = settle(&c, &prior, page, &mut progress);
-        progress = restarted(&c, progress);
+        progress = restarted(&route, progress);
     }
     Seeded {
+        route,
         c,
         path,
         scanner,
@@ -319,20 +363,9 @@ fn revisit_case(name: &str, siblings: usize, growth: Growth) {
     with_e2(|| {
         let mut f = seed(name, siblings);
         revisit(&mut f, growth);
-        let ledger = f.progress.accepted_identity_buckets.clone();
-        let unprotected = only(
-            &leg(
-                &f.c,
-                &owner(&f.prior),
-                f.prior.clone(),
-                AcceptedBuckets::for_test(),
-            ),
-            ROOT,
-        );
-        let restored = only(
-            &leg(&f.c, &owner(&f.prior), f.prior.clone(), ledger.clone()),
-            ROOT,
-        );
+        let route = Some(&f.route);
+        let unprotected = only(&leg(&f.c, &owner(&f.prior), f.prior.clone(), None), ROOT);
+        let restored = only(&leg(&f.c, &owner(&f.prior), f.prior.clone(), route), ROOT);
         let expected = body(&unprotected, ROOT).unwrap();
         assert_revisit(body(&restored, ROOT).unwrap(), expected, growth);
         if siblings > PAGE {
@@ -340,13 +373,13 @@ fn revisit_case(name: &str, siblings: usize, growth: Growth) {
         }
         // Both owners read the same committed heads without committing; only
         // the retained owner's page is settled below.
-        let tail_page = leg(&f.c, &f.scanner, f.prior.clone(), ledger.clone());
+        let tail_page = leg(&f.c, &f.scanner, f.prior.clone(), route);
         let tail = only(&tail_page, ROOT);
         let cold_page = leg(
             &f.c,
             &E2ScanFixture::capturing_identity(),
             ScanIndex::default(),
-            ledger,
+            route,
         );
         let cold = only(&cold_page, ROOT);
         let cold_route = routed(&cold, cold.upload_policy);
@@ -418,4 +451,42 @@ fn identity_cap_unchanged_authority_control() {
 #[test]
 fn identity_cap_refused_share_start_binding_pin() {
     revisit_case("identity-cap-start-binding", 0, Growth::NextHour);
+}
+
+/// [money] An unreadable identity row loses protection for its own session
+/// only: the row is set aside and counted, the session is untracked, its
+/// re-tag is not refused (the body equals the unprotected one) with equal
+/// totals, and the tagged sibling's body stays the one it ACKed.
+#[test]
+fn identity_row_invalid_loses_only_its_session_protection() {
+    with_e2(|| {
+        let mut f = seed("identity-row-invalid", 1);
+        let name = (f.progress.accepted_identity_buckets)
+            .row_name(ROOT)
+            .unwrap();
+        crate::snapshots::state_v2::damage_identity_row_for_test(f.route.session.path(), &name);
+        revisit(&mut f, Growth::NextHour);
+        let cold = || E2ScanFixture::capturing_identity();
+        let unprotected = leg(&f.c, &cold(), ScanIndex::default(), None);
+        crate::snapshots::claude_request_identity::take_identity_counts();
+        crate::snapshots::state_v2::take_progress_set_aside_for_test();
+        let page = leg(&f.c, &cold(), ScanIndex::default(), Some(&f.route));
+        assert_eq!(
+            crate::snapshots::state_v2::take_progress_set_aside_for_test(),
+            Some(1),
+            "the invalid row is set aside"
+        );
+        let counts =
+            serde_json::to_value(crate::snapshots::claude_request_identity::take_identity_counts())
+                .unwrap();
+        let untracked =
+            &counts["identity_cap"]["accepted_state_unknown_cause"]["untracked_session"];
+        assert!(untracked.as_u64().unwrap() >= 1, "{counts}");
+        let item = body(&page, ROOT).unwrap();
+        let expected = body(&unprotected, ROOT).unwrap();
+        assert_revisit(item, expected, Growth::Unchanged);
+        let sibling = only(&page, &sibling(0));
+        let control = f.control.as_ref().expect("the tagged sibling was ACKed");
+        assert_equivalent(control, &routed(&sibling, sibling.upload_policy));
+    });
 }

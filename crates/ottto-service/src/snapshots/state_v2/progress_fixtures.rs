@@ -31,9 +31,29 @@ pub(crate) fn edit_progress_rows_for_test(
         let mut read = progress::read_progress_rows(path, owner)?;
         let mut ledger = read.ledger.expect("the route holds progress rows");
         edit(&mut read.cache_state, &mut read.cache_head, &mut ledger);
-        let page = read
-            .rows
-            .commit(owner, &read.cache_state, &read.cache_head, &ledger)?;
+        let page = read.rows.commit(
+            owner,
+            (&read.cache_state, &read.cache_head, &ledger),
+            &[] as &[(&str, ())],
+        )?;
+        assert!(matches!(page, progress::ProgressPage::Committed(_)));
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Overwrite the identity row `name` of the route at `path` with a value no
+/// hint decodes from, as one more progress page.
+pub(crate) fn damage_identity_row_for_test(path: &Path, name: &str) {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        let mut read = progress::read_progress_rows(path, owner)?;
+        let ledger = read.ledger.expect("the route holds progress rows");
+        let damaged = [(name, serde_json::json!({ "damaged": true }))];
+        let page = (read.rows).commit(
+            owner,
+            (&read.cache_state, &read.cache_head, &ledger),
+            &damaged,
+        )?;
         assert!(matches!(page, progress::ProgressPage::Committed(_)));
         Ok(())
     })

@@ -500,9 +500,62 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
 
 // Hints for more sessions than the former ledger held. The earliest session is
 // ACKed first, then `siblings` more; after a restart only the store holds its
-// state, which every consumer and scope change must still reach.
+// state, which every consumer and scope change must still reach. The hints
+// are a published route's progress rows, one per session.
 const EARLIEST: &str = "synthetic-sticky-session";
 const KEY: [u8; 32] = [0x42; 32];
+/// A published Claude route. Dropping it erases the custody, then its
+/// directory.
+struct Route {
+    session: crate::snapshots::StateV2ColdSession,
+    index: ScanIndex,
+    _dir: crate::test_scratch::ScratchDir,
+}
+impl Route {
+    fn new() -> Self {
+        let dir = crate::test_scratch::ScratchDir::canonical("identity-session-rows");
+        let (session, index) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
+            &ScanIndex::default(),
+            &dir,
+        );
+        Self {
+            session,
+            index,
+            _dir: dir,
+        }
+    }
+    fn progress_path(&self) -> PathBuf {
+        snapshot_upload_progress_path(self.session.path())
+    }
+    /// The next cycle's progress: the route's rows, keyed under `key`, and
+    /// its first page step (which applies a key change to the stored scope).
+    fn load(&self, key: Option<[u8; 32]>, retained: bool) -> SnapshotUploadProgress {
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &self.index,
+            self.session.path(),
+            &self.progress_path(),
+            &"a".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert!(progress.rows.is_some(), "routed progress rows");
+        progress.accepted_identity_buckets.bind_test_key(key);
+        progress
+            .accepted_identity_buckets
+            .set_retained_enabled(retained);
+        progress.load_identity(std::iter::empty()).unwrap();
+        progress
+    }
+}
+/// A page naming `sessions`: their stored hints are point-loaded.
+fn loaded<'p>(
+    progress: &'p mut SnapshotUploadProgress,
+    sessions: &[&str],
+) -> &'p SnapshotUploadProgress {
+    progress.load_identity(sessions.iter().copied()).unwrap();
+    progress
+}
 /// A stored-body entity ACK of `item` whose digest echoes the local witness.
 fn stored_ack(progress: &mut SnapshotUploadProgress, item: &Value) {
     let mut accepted = 0;
@@ -546,30 +599,15 @@ fn stored_ack(progress: &mut SnapshotUploadProgress, item: &Value) {
     )
     .unwrap();
 }
-/// Save at `path`, load and re-key under `key`, as the next process does.
+/// Save the route's rows, load and re-key under `key`, as the next process
+/// does.
 fn restarted(
     progress: &mut SnapshotUploadProgress,
     key: Option<[u8; 32]>,
-    path: &Path,
+    route: &Route,
 ) -> SnapshotUploadProgress {
-    progress.save(path).unwrap();
-    let mut loaded = SnapshotUploadProgress::load(
-        path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    loaded.accepted_identity_buckets.bind_test_key(key);
-    loaded
-        .accepted_identity_buckets
-        .set_retained_enabled(progress.accepted_identity_buckets.retained_enabled());
-    loaded
-}
-/// One progress file for a restart chain; the caller removes its directory.
-fn progress_path() -> PathBuf {
-    let dir = crate::test_scratch::unique_path("ottto-identity-session-cap");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("progress.json")
+    progress.save(&route.progress_path()).unwrap();
+    route.load(key, progress.accepted_identity_buckets.retained_enabled())
 }
 /// The earliest session's bucket starts and frozen share set.
 fn frozen(progress: &SnapshotUploadProgress) -> Option<Value> {
@@ -583,8 +621,8 @@ fn frozen(progress: &SnapshotUploadProgress) -> Option<Value> {
 }
 /// The earliest session's witnessed proof and frozen shares, then `siblings`
 /// tagged sessions, then a restart at `path`. Returns the earliest state as ACKed.
-fn seeded(siblings: usize, path: &Path) -> (SnapshotUploadProgress, Value) {
-    let mut progress = retained_progress();
+fn seeded(siblings: usize, route: &Route) -> (SnapshotUploadProgress, Value) {
+    let mut progress = route.load(Some(KEY), true);
     stored_ack(&mut progress, &witnessed_body());
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     let before = frozen(&progress).unwrap();
@@ -594,13 +632,13 @@ fn seeded(siblings: usize, path: &Path) -> (SnapshotUploadProgress, Value) {
         sibling["snapshot_fingerprint"] = json!(format!("{n:064x}"));
         stored_ack(&mut progress, &sibling);
     }
-    (restarted(&mut progress, Some(KEY), path), before)
+    (restarted(&mut progress, Some(KEY), route), before)
 }
 /// [behaviour] Store-only proof is superseded durably before a replacement's
 /// POST, for 17 and 736 sessions.
 fn identity_cap_store_only_proof_is_superseded_before_post_case(sessions: usize) {
-    let path = progress_path();
-    let (mut progress, _) = seeded(sessions - 1, &path);
+    let route = Route::new();
+    let (mut progress, _) = seeded(sessions - 1, &route);
     let mut replacement = witnessed_body();
     replacement["snapshot_fingerprint"] = json!("9".repeat(64));
     replacement["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"] =
@@ -630,7 +668,6 @@ fn identity_cap_store_only_proof_is_superseded_before_post_case(sessions: usize)
         },
     );
     assert!(lost.is_err());
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 #[test]
 fn identity_cap_store_only_proof_is_superseded_before_post_17() {
@@ -643,18 +680,17 @@ fn identity_cap_store_only_proof_is_superseded_before_post_736() {
 /// [behaviour] An ACK record after a restart sees the store's frozen set: a
 /// stripped body keeps the earliest session's frozen shares.
 fn identity_cap_ack_record_keeps_store_only_frozen_shares_case(sessions: usize) {
-    let path = progress_path();
-    let (mut progress, before) = seeded(sessions - 1, &path);
+    let route = Route::new();
+    let (mut progress, before) = seeded(sessions - 1, &route);
     let mut stripped = body();
     stripped["snapshot_fingerprint"] = json!("8".repeat(64));
     stripped["usage_buckets"][0]["model_usage"][0] = json!({"model":"claude-synthetic"});
     stored_ack(&mut progress, &stripped);
     assert_eq!(
-        frozen(&progress),
+        frozen(loaded(&mut progress, &[EARLIEST])),
         Some(before),
         "{sessions}: frozen set kept"
     );
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 #[test]
 fn identity_cap_ack_record_keeps_store_only_frozen_shares_17() {
@@ -667,17 +703,17 @@ fn identity_cap_ack_record_keeps_store_only_frozen_shares_736() {
 /// [behaviour] A replay-generation change reaches a session that is not
 /// resident: proof is cleared, starts and shares are kept, across a restart.
 fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_case(sessions: usize) {
-    let path = progress_path();
-    let (mut progress, before) = seeded(sessions - 1, &path);
+    let route = Route::new();
+    let (mut progress, before) = seeded(sessions - 1, &route);
     assert!(progress.prepare_historical_replay("next-generation"));
-    let progress = restarted(&mut progress, Some(KEY), &path);
+    let mut progress = restarted(&mut progress, Some(KEY), &route);
+    let progress = loaded(&mut progress, &[EARLIEST]);
     assert_eq!(
-        retained_rows(&progress),
+        retained_rows(progress),
         Some((0, 0)),
         "{sessions}: proof cleared"
     );
-    assert_eq!(frozen(&progress), Some(before), "{sessions}: shares kept");
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    assert_eq!(frozen(progress), Some(before), "{sessions}: shares kept");
 }
 #[test]
 fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_17() {
@@ -692,18 +728,18 @@ fn identity_cap_replay_change_clears_store_only_proof_and_keeps_shares_736() {
 #[test]
 fn identity_cap_key_change_rejects_store_only_rows() {
     for path in [[None, Some(KEY)], [Some([0x43; 32]), Some(KEY)]] {
-        let file = progress_path();
-        let (mut progress, _) = seeded(16, &file);
+        let route = Route::new();
+        let (mut progress, _) = seeded(16, &route);
         for key in path {
-            progress = restarted(&mut progress, key, &file);
+            progress = restarted(&mut progress, key, &route);
         }
-        assert_eq!(frozen(&progress), None, "{path:?}");
-        assert_eq!(retained_rows(&progress), None, "{path:?}");
+        let progress = loaded(&mut progress, &[EARLIEST, "synthetic-sibling-15"]);
+        assert_eq!(frozen(progress), None, "{path:?}");
+        assert_eq!(retained_rows(progress), None, "{path:?}");
         assert!(progress
             .accepted_identity_buckets
             .get("synthetic-sibling-15")
             .is_none());
-        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }
 /// [money] With option (ii) off, an ACK after a restart that omits a frozen
@@ -711,19 +747,171 @@ fn identity_cap_key_change_rejects_store_only_rows() {
 #[test]
 fn frozen_shares_survive_an_ack_omitting_their_row_after_restart() {
     let tagged = |model: &str| json!({"model":model,"evidence_ref":0,"account_identifier_hash":"a".repeat(64)});
-    let mut progress = progress();
+    let route = Route::new();
+    let mut progress = route.load(Some(KEY), false);
     let mut both = body();
     both["usage_buckets"][0]["model_usage"] =
         json!([tagged("claude-synthetic"), tagged("claude-other")]);
     stored_ack(&mut progress, &both);
     let before = frozen(&progress).unwrap();
     assert_eq!(before[1].as_array().unwrap().len(), 2, "two frozen rows");
-    let path = progress_path();
-    let mut progress = restarted(&mut progress, Some(KEY), &path);
+    let mut progress = restarted(&mut progress, Some(KEY), &route);
     let mut omitting = body();
     omitting["snapshot_fingerprint"] = json!("7".repeat(64));
     omitting["usage_buckets"][0]["model_usage"] = json!([tagged("claude-other")]);
     stored_ack(&mut progress, &omitting);
-    assert_eq!(frozen(&progress), Some(before));
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    assert_eq!(frozen(loaded(&mut progress, &[EARLIEST])), Some(before));
+}
+/// The identity rows of `sessions` as stored: (written at P, hint).
+fn stored_rows(
+    progress: &SnapshotUploadProgress,
+    sessions: &[String],
+) -> BTreeMap<String, (u64, Value)> {
+    let hints = &progress.accepted_identity_buckets;
+    let names = (sessions.iter())
+        .map(|session| hints.row_name(session).unwrap())
+        .collect::<BTreeSet<_>>();
+    let rows = progress.rows.as_ref().unwrap();
+    let points = rows
+        .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
+        .unwrap();
+    (points.into_iter())
+        .map(|(name, point)| (name, (point.progress_generation, point.accepted)))
+        .collect()
+}
+fn sibling_body(n: usize, hour: u8) -> Value {
+    let mut sibling = body();
+    sibling["source_session_id"] = json!(format!("synthetic-sibling-{n}"));
+    sibling["snapshot_fingerprint"] = json!(format!("{n:063x}{hour:x}"));
+    sibling["usage_buckets"][0]["bucket_start"] = json!(format!("2026-09-01T{hour:02}:00:00Z"));
+    sibling
+}
+/// [format] A legacy 16-session JSON ledger becomes one identity row per
+/// session in the single import transaction, with their scope, the marker
+/// and P = 1; a later page rewrites only the session it changed. (An older
+/// writer refuses the capability-6 store: the progress rows carry job.)
+#[test]
+fn identity_rows_import_splits_a_legacy_ledger_in_one_transaction() {
+    let mut legacy = retained_progress();
+    stored_ack(&mut legacy, &witnessed_body());
+    let mut sessions = vec![EARLIEST.to_owned()];
+    for n in 0..15 {
+        stored_ack(&mut legacy, &sibling_body(n, 10));
+        sessions.push(format!("synthetic-sibling-{n}"));
+    }
+    let mut json = serde_json::to_value(&legacy).unwrap();
+    let hints = json["accepted_identity_buckets"].as_object_mut().unwrap();
+    assert_eq!(hints.len(), 16);
+    for (n, hint) in hints.values_mut().enumerate() {
+        hint["last_ack"] = json!(n + 1);
+    }
+    let bytes = serde_json::to_vec(&json).unwrap();
+    let dir = crate::test_scratch::ScratchDir::canonical("identity-import-split");
+    let (session, index) = crate::snapshots::StateV2ColdSession::publish_with_progress(
+        crate::snapshots::scan_index_persistence::Source::Claude,
+        &ScanIndex::default(),
+        &dir,
+        &bytes,
+    );
+    let path = snapshot_upload_progress_path(session.path());
+    let mut progress = SnapshotUploadProgress::load_for_index(
+        &index,
+        session.path(),
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    assert_eq!(progress.generation, 1, "the import commits P 0 -> 1");
+    assert!(
+        progress.accepted_identity_buckets.is_empty(),
+        "no resident hint"
+    );
+    assert_eq!(
+        progress.accepted_identity_scope.key_epoch,
+        legacy.accepted_identity_buckets.epoch(),
+        "the scope commits with the rows"
+    );
+    let read = with_state_v2_progress_owner(session.path(), None, |owner, _| {
+        crate::snapshots::read_progress_rows(session.path(), owner)
+    })
+    .unwrap();
+    assert!(read.marker.is_some(), "the marker commits with the rows");
+    let ledger = read.ledger.unwrap();
+    assert!(ledger.get("accepted_identity_buckets").is_none());
+    assert!(ledger.get("accepted_identity_scope").is_some());
+    progress.accepted_identity_buckets.bind_test_key(Some(KEY));
+    progress
+        .accepted_identity_buckets
+        .set_retained_enabled(true);
+    let imported = stored_rows(&progress, &sessions);
+    assert_eq!(imported.len(), 16, "one row per session");
+    for name in &sessions {
+        let (generation, hint) =
+            &imported[&legacy.accepted_identity_buckets.row_name(name).unwrap()];
+        assert_eq!(*generation, 1, "stamped with the imported P");
+        assert_eq!(
+            hint,
+            &serde_json::to_value(legacy.accepted_identity_buckets.get(name).unwrap()).unwrap()
+        );
+        assert!(hint.get("last_ack").is_none(), "the LRU stamp is dropped");
+    }
+    // One session changes; the other 15 rows keep the import's bytes.
+    stored_ack(&mut progress, &sibling_body(0, 11));
+    progress.save(&path).unwrap();
+    let after = stored_rows(&progress, &sessions);
+    let changed = legacy
+        .accepted_identity_buckets
+        .row_name("synthetic-sibling-0")
+        .unwrap();
+    for (name, row) in &after {
+        if *name == changed {
+            assert_eq!(row.0, 2, "the changed session is rewritten");
+            assert_ne!(row.1, imported[name].1);
+        } else {
+            assert_eq!(row, &imported[name], "an untouched row is never rewritten");
+        }
+    }
+}
+/// [behaviour] A page commit and the pass end with no resident hint leave
+/// every identity row as it was.
+#[test]
+fn identity_rows_survive_pages_and_pass_end_with_no_resident_hint() {
+    let route = Route::new();
+    let (mut progress, _) = seeded(1, &route);
+    let sessions = [EARLIEST.to_owned(), "synthetic-sibling-0".to_owned()];
+    let before = stored_rows(&progress, &sessions);
+    assert_eq!(before.len(), 2);
+    assert!(progress.accepted_identity_buckets.is_empty());
+    progress
+        .accepted_cache_heads
+        .insert("e".repeat(64), "f".repeat(64));
+    progress.save(&route.progress_path()).unwrap();
+    progress.finish_cycle(&route.progress_path()).unwrap();
+    let after = restarted(&mut progress, Some(KEY), &route);
+    assert!(after.generation > 2, "the page committed");
+    assert_eq!(stored_rows(&after, &sessions), before);
+}
+/// [behaviour] Resident identity state is the page's sessions, not the
+/// destination's history: an ACK after a restart holds one session's hints
+/// whether 17 or 736 sessions are stored.
+#[test]
+fn identity_hints_resident_heap_does_not_grow_with_history() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    let mut heaps = Vec::new();
+    for siblings in [16, 735] {
+        let route = Route::new();
+        let (mut progress, _) = seeded(siblings, &route);
+        let mut stripped = body();
+        stripped["snapshot_fingerprint"] = json!("8".repeat(64));
+        stripped["usage_buckets"][0]["model_usage"][0] = json!({"model":"claude-synthetic"});
+        stored_ack(&mut progress, &stripped);
+        let mut counter = Counter::new(usize::MAX);
+        progress
+            .accepted_identity_buckets
+            .heap_bound(&mut counter)
+            .unwrap();
+        heaps.push(counter.bytes);
+    }
+    assert_eq!(heaps[0], heaps[1], "{heaps:?}");
 }

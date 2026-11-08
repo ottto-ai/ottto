@@ -43,7 +43,7 @@ pub(crate) use accepted::bind_session_context_key;
 pub(crate) use accepted::bind_test_session_context_key;
 pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::session_context_key_epoch;
-pub(crate) use accepted::AcceptedBuckets;
+pub(crate) use accepted::{AcceptedBuckets, AcceptedSession, IdentityScope};
 pub(crate) use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -1856,7 +1856,6 @@ fn cap_counts(
     budget::Counts {
         retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
         refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
-        accepted_state_evicted: 0,
         accepted_state_unknown: u64::from(unknown.is_some()),
         accepted_share_changed: grouping.accepted_share_changed.len() as u64,
         accepted_overflow: measurement

@@ -1953,12 +1953,27 @@ mod progress_rows {
         };
         f.published();
         let index = load_with(&f.path, false).unwrap().unwrap();
-        let outcome = commit(
-            &f,
-            &index,
-            progress::Baseline::default(),
-            &page(&["a", "b"], 1),
-        );
+        // An identity row rides the page commit, so the carry covers it too.
+        let mut points = |tx: &mut dyn Transaction, progress_generation: u64| -> Result<bool> {
+            let row = json!({ "progress_generation": progress_generation, "accepted": {} });
+            progress::put_point(tx, &"c".repeat(64), &row)?;
+            Ok(true)
+        };
+        let outcome =
+            crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+                with_progress_session(&f.path, owner, |db, identity, graph| {
+                    let page = page(&["a", "b"], 1);
+                    let baseline = progress::Baseline::default();
+                    progress::commit(
+                        db,
+                        identity,
+                        graph,
+                        &baseline,
+                        &view(&page),
+                        Some(&mut points),
+                    )
+                })
+            });
         assert!(matches!(outcome.unwrap(), progress::Outcome::Committed(_)));
         assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
         let mut expected = Json::Null;

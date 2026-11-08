@@ -189,10 +189,6 @@ pub(super) fn read_ledger<L: DeserializeOwned + Serialize>(
 /// Identity point rows for `keys` only: one keyed read per key, never the
 /// whole kind. A row that does not decode as `T` or fails `valid` is set
 /// aside: it stays in the store, out of the result, and is counted.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the identity rows' point read has no caller yet")
-)]
 pub(super) fn read_points<T: DeserializeOwned + Serialize>(
     tx: &mut dyn Transaction,
     keys: &BTreeSet<String>,
@@ -215,16 +211,37 @@ pub(super) fn read_points<T: DeserializeOwned + Serialize>(
 }
 
 /// One identity point row, written inside a progress transaction (`Points`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the identity rows' writer has no caller yet")
-)]
 pub(super) fn put_point<T: Serialize>(
     tx: &mut dyn Transaction,
     name: &str,
     value: &T,
 ) -> Result<()> {
     mapper::put(tx, &mapper::key(IDENTITY, name, 1)?, value).map(drop)
+}
+
+/// An identity row's value: the hint and the progress generation of the
+/// commit that wrote it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Point<T> {
+    pub(crate) progress_generation: u64,
+    pub(crate) accepted: T,
+}
+
+/// `Points` writing each named hint at the committing generation.
+fn put_points<T: Serialize>(
+    points: &[(&str, T)],
+) -> impl FnMut(&mut dyn Transaction, u64) -> Result<bool> + '_ {
+    move |tx, progress_generation| {
+        for (name, accepted) in points {
+            let point = Point {
+                progress_generation,
+                accepted,
+            };
+            put_point(tx, name, &point)?;
+        }
+        Ok(!points.is_empty())
+    }
 }
 
 /// The rows `page` changes against `old`: the next digests, the keys whose
@@ -620,12 +637,12 @@ impl ProgressRows {
     /// progress owner. The page COMMIT is the receipt: before it nothing is
     /// durable and the pass re-offers the exact body; Published or Ambiguous
     /// spends this hold and the caller reloads.
-    pub(crate) fn commit<S: Serialize, H: Serialize, L: Serialize>(
+    /// `points` are identity rows written in the same transaction.
+    pub(crate) fn commit<S: Serialize, H: Serialize, L: Serialize, T: Serialize>(
         &mut self,
         owner: &crate::snapshot_sync::SnapshotProgressLock,
-        cache_state: &BTreeMap<String, S>,
-        cache_head: &BTreeMap<String, H>,
-        ledger: &L,
+        (cache_state, cache_head, ledger): (&BTreeMap<String, S>, &BTreeMap<String, H>, &L),
+        points: &[(&str, T)],
     ) -> Result<ProgressPage> {
         ensure!(!self.reload, Hold::ReloadRequired);
         let page = Page {
@@ -634,8 +651,10 @@ impl ProgressRows {
             ledger,
         };
         let baseline = &self.baseline;
+        let mut put = put_points(points);
         let result = runtime::with_progress_session(&self.path, owner, |db, identity, graph| {
-            commit(db, identity, graph, baseline, &page, None)
+            let points = (!points.is_empty()).then_some(&mut put as Points<'_>);
+            commit(db, identity, graph, baseline, &page, points)
         });
         let outcome = match result {
             Ok(Outcome::Committed(next)) => {
@@ -653,16 +672,41 @@ impl ProgressRows {
         count_page(Some(&outcome));
         Ok(outcome)
     }
+
+    /// The identity rows named by `keys`, under the source progress owner:
+    /// keyed reads only. A row that does not decode or fails `valid`
+    /// stays stored, is left out and is counted in `progress_row_set_aside`.
+    pub(crate) fn read_points<T: DeserializeOwned + Serialize>(
+        &self,
+        keys: &BTreeSet<String>,
+        valid: impl Fn(&str, &T) -> bool,
+    ) -> Result<BTreeMap<String, T>> {
+        ensure!(!self.reload, Hold::ReloadRequired);
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let path = &self.path;
+        let (points, set_aside) =
+            crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+                runtime::with_progress_read(path, owner, |tx| read_points(tx, keys, &valid))
+            })?;
+        if set_aside > 0 {
+            telemetry::event("progress_row_set_aside", &set_aside);
+        }
+        Ok(points)
+    }
 }
 
 /// The one-time import of a route's JSON ledger: the keyed maps, the ledger,
-/// the marker and P 0 -> 1 in one progress transaction. `None`: another
+/// the identity rows `points`, the marker and P 0 -> 1 in one progress
+/// transaction. `None`: another
 /// import or progress already committed, and nothing was written.
-pub(crate) fn import_progress_rows<S: Serialize, H: Serialize, L: Serialize>(
+pub(crate) fn import_progress_rows<S: Serialize, H: Serialize, L: Serialize, T: Serialize>(
     index: &ScanIndex,
     index_path: &Path,
     owner: &crate::snapshot_sync::SnapshotProgressLock,
     (cache_state, cache_head, ledger): (&BTreeMap<String, S>, &BTreeMap<String, H>, &L),
+    points: &[(&str, T)],
     marker: &Marker,
 ) -> Result<Option<ProgressRows>> {
     #[cfg(test)]
@@ -673,8 +717,16 @@ pub(crate) fn import_progress_rows<S: Serialize, H: Serialize, L: Serialize>(
         cache_head,
         ledger,
     };
+    let mut put = put_points(points);
     let imported = runtime::with_progress_session(index_path, owner, |db, identity, graph| {
-        import(db, identity, graph, &page, marker, None)
+        import(
+            db,
+            identity,
+            graph,
+            &page,
+            marker,
+            Some(&mut put as Points<'_>),
+        )
     })?;
     Ok(match imported {
         Imported::Committed(baseline) => Some(ProgressRows {
