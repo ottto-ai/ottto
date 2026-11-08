@@ -214,6 +214,20 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
     assert_eq!(reopened.read_control::<u64>("generation").unwrap(), Some(1));
     sqlite::assert_mmap_for_test(&reopened);
     reopened.validate_parts().unwrap();
+    let key = raw_hold("mapped".into());
+    let bytes = vec![b'm'; PART_BYTES * 2 + 1];
+    let mut tx = reopened.begin(TxnMode::Write).unwrap();
+    let h = put(&mut tx, &key, &bytes);
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(
+        reopened.checkpoint(CheckpointMode::IdleReclaim).state,
+        CheckpointState::Complete
+    );
+    drop(reopened);
+    let mut reopened = sqlite::Sqlite::open(&tmp.path(), &identity).unwrap();
+    sqlite::assert_mmap_for_test(&reopened);
+    let mut tx = reopened.begin(TxnMode::Read).unwrap();
+    assert_eq!(value(&mut tx, &h), bytes);
 }
 
 /// [regress] owner sidecar allows sqlite init migration publication and reopen.
@@ -531,6 +545,18 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
         put(&mut tx, &key, marker.as_bytes());
     }
     assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    assert_eq!(
+        db.checkpoint(CheckpointMode::IdleReclaim).state,
+        CheckpointState::Complete
+    );
+    let before_vacuum = fs::metadata(&database).unwrap().len();
+    // Read main-file pages with mmap enabled before VACUUM shrinks that file.
+    sqlite::assert_mmap_for_test(&db);
+    let key = raw_hold("000001".into());
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let h = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &h), markers[1].as_bytes());
+    drop(tx);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     for i in 0..512 {
         let key = raw_hold(format!("{i:06}"));
@@ -552,6 +578,13 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     age_erasure(&mut db, 13 * 3600);
     db.maintenance(true).unwrap();
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
+    assert!(fs::metadata(&database).unwrap().len() < before_vacuum);
+    sqlite::assert_mmap_for_test(&db);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let h = tx.get(&key).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &h), vec![b'z'; 18]);
+    assert!(tx.get(&raw_hold("000000".into())).unwrap().is_none());
+    drop(tx);
     assert!(!backup.exists());
     assert!(!recovery.exists());
     for suffix in ["", "-wal", "-shm"] {

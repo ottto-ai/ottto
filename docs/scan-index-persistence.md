@@ -585,6 +585,10 @@ committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect.
+Custody stores and upload history allow read-only SQLite mappings up to 2147418112 bytes per database.
+The effective ceiling is read back at open; larger databases continue through ordinary reads.
+WAL/FULL, fullfsync, secure_delete and erasure maintenance retain their settings.
+A mapped-file I/O fault or external truncation can terminate the service; supervised installs restart and recover through SQLite.
 Each save or import that writes rows reports `row_cap_max`, the largest written
 row's logical bytes as a percent of its sizing target with its kind name, and
 `row_cap_alarm` at 75% or more, including above 100%, which commits and never

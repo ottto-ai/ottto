@@ -51,7 +51,7 @@ pub(in super::super) fn assert_mmap_for_test(db: &Sqlite) {
         .unwrap()
         .query_row("PRAGMA mmap_size", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(actual, 2_147_418_112);
+    assert_eq!(actual, MMAP_BYTES);
 }
 pub(in super::super) fn wal_bytes_for_test(db: &Sqlite) -> Option<u64> {
     db.wal_bytes()
@@ -100,7 +100,8 @@ pub(in super::super) struct ReaderForTest {
 pub(in super::super) fn reader_for_test(db: &Sqlite) -> ReaderForTest {
     let conn = Connection::open_with_flags(&db.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     conn.busy_timeout(BUSY).unwrap();
-    conn.execute_batch("BEGIN").unwrap();
+    conn.execute_batch(&format!("PRAGMA mmap_size={MMAP_BYTES}; BEGIN"))
+        .unwrap();
     let _: Vec<u8> = conn
         .query_row("SELECT value FROM control WHERE name='phase'", [], |r| {
             r.get(0)
