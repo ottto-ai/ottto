@@ -849,6 +849,32 @@ class AbsolutizeAccepts(Base):
                             {SRC + 'snapshots/old.rs': new}, mode='absolutize')
 
 
+    def test_formatter_reorders_use_leaves_within_each_scope(self):
+        # [regress] Nine formatted absolute-path files reorder imports or brace leaves.
+        pairs = [
+            ('use super::dest;\nuse crate::snapshots::caller;\n',
+             'use crate::snapshots::caller;\nuse crate::snapshots::dest;\n'),
+            ('use super::{dest, caller};\n',
+             'use crate::snapshots::{caller, dest};\n'),
+            ('use super::{dest::{self, Value as V}, caller};\n',
+             'use crate::snapshots::caller;\nuse crate::snapshots::dest::Value as V;\nuse crate::snapshots::dest::{self};\n'),
+            ('#[cfg(test)]\nuse super::{dest, caller};\n',
+             '#[cfg(test)]\nuse crate::snapshots::caller;\n#[cfg(test)]\nuse crate::snapshots::dest;\n'),
+            ('fn f() -> impl Sized + use<> { super::dest::here() }\n',
+             'fn f() -> impl Sized + use<> { crate::snapshots::dest::here() }\n'),
+            ('mod nested { use super::super::{dest, caller}; }\n',
+             'mod nested { use crate::snapshots::{caller, dest}; }\n'),
+            ('fn f() { use super::{dest, caller}; { use super::{dest, caller}; } }\n',
+             'fn f() { use crate::snapshots::{caller, dest}; { use crate::snapshots::{caller, dest}; } }\n'),
+            ('use super::dest;\nuse crate::snapshots::caller;\nfn f() { super::dest::here(); }\n',
+             'use crate::snapshots::caller;\nuse super::dest;\nfn f() { crate::snapshots::dest::here(); }\n'),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old):
+                self.accept(files(**{'snapshots/old.rs': old}),
+                            {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
+
 class AbsolutizeRejects(Base):
     def check_edit(self, old, new, needle, **extra):
         base = files(**{'snapshots/old.rs': old}, **extra)
@@ -868,15 +894,41 @@ class AbsolutizeRejects(Base):
         old = 'fn f() { let _ = (super::dest::here()); }\n'
         self.check_edit(old, old.replace('super::dest::here()', 'crate::snapshots::dest::here(),'), 'edited beyond')
 
-    def test_formatter_cannot_change_comments_literals_or_use_order(self):
+    def test_formatter_cannot_change_comments_or_literals(self):
         # [behaviour] Exact tokens include comments and every kind of literal.
         old = 'fn f() { super::dest::here(); /* keep */ let _ = ("a", \'x\', r#"raw"#); }\n'
         for before, after in (('keep', 'changed'), ('"a"', '"b"'), ("'x'", "'y'"), ('raw', 'new')):
             with self.subTest(before=before):
                 self.check_edit(old, old.replace('super::dest', 'crate::snapshots::dest').replace(before, after),
                                 'edited beyond')
-        self.check_edit('use super::{dest, caller};\n',
-                        'use crate::snapshots::{caller, dest};\n', 'edited beyond')
+
+    def test_formatter_preserves_use_scope_metadata_multiplicity_and_comments(self):
+        # [behaviour] Import equivalence includes scope, exact attributes and explicit aliases.
+        pairs = [
+            ('use super::dest; fn f() {}', 'fn f() { use crate::snapshots::dest; }'),
+            ('fn f() { use super::dest; } fn g() {}',
+             'fn f() {} fn g() { use crate::snapshots::dest; }'),
+            ('mod a { use super::super::dest; } mod b {}',
+             'mod a {} mod b { use crate::snapshots::dest; }'),
+            ('#[cfg(test)] use super::dest;', '#[cfg(any())] use crate::snapshots::dest;'),
+            ('#[cfg(test)] use super::dest;', '#[cfg( test )] use crate::snapshots::dest;'),
+            ('#[cfg(/* keep */test)] use super::dest;',
+             '#[cfg(/* keep */ test)] use crate::snapshots::dest;'),
+            ('pub(super) use super::dest;', 'use crate::snapshots::dest;'),
+            ('use super::dest::{self};', 'use crate::snapshots::dest;'),
+            ('use super::dest as d;', 'use crate::snapshots::dest as other;'),
+            ('use super::dest;', 'use crate::snapshots::dest as dest;'),
+            ('use super::{dest, caller};', 'use crate::snapshots::dest;'),
+            ('use super::{dest as _, dest as _};', 'use crate::snapshots::dest as _;'),
+            ('use super::dest::*;', 'use crate::snapshots::dest;'),
+            ('use super::{dest, /* anchor */ caller};',
+             'use crate::snapshots::{/* anchor */ dest, caller};'),
+            ('use super::dest; /* anchor */ use super::caller;',
+             'use crate::snapshots::dest; use crate::snapshots::caller; /* anchor */'),
+        ]
+        for old, new in pairs:
+            with self.subTest(old=old, new=new):
+                self.check_edit(old + '\n', new + '\n', 'edited beyond')
 
     def test_formatter_cannot_split_compound_operators(self):
         # [behaviour] Whitespace cannot turn short circuiting into eager evaluation.
