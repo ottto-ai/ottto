@@ -435,7 +435,7 @@ class LedgerTests(unittest.TestCase):
     def test_a_rustfmt_reflow_after_a_visibility_token_is_a_reflowed_move(self):
         status, out = self.move_long(self.WRAPPED)
         self.assertEqual(status, 0, out)
-        self.assertIn(' 1 moved, 1 reflowed, 0 respelled, 0 widened, 0 problems', out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
         self.assertIn('reflowed fn long_signature (crates/demo/src/snapshots.rs:', out)
         self.assertIn('move-only', out)
 
@@ -476,7 +476,7 @@ class LedgerTests(unittest.TestCase):
         ''')
         status, out = self.move_long(wrapped, original)
         self.assertEqual(status, 0, out)
-        self.assertIn(' 1 moved, 1 reflowed, 0 respelled, 0 widened, 0 problems', out)
+        self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
         status, out = self.move_long(wrapped.replace('T: Clone,', 'T: Clone'), original)
         self.assertEqual(status, 1, out)
         status, out = self.move_long(self.WRAPPED.replace('pub(super)', 'pub(crate)'))
@@ -553,7 +553,7 @@ class LedgerTests(unittest.TestCase):
             with self.subTest(name):
                 status, out = self.move_long(after, before)
                 self.assertEqual(status, 0, out)
-                self.assertIn(' 1 moved, 1 reflowed, 0 respelled, 0 widened, 0 problems', out)
+                self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
                 self.assertIn(f'reflowed {label} (crates/demo/src/snapshots.rs:', out)
 
     def test_struct_field_reflow_rejects_any_other_change(self):
@@ -601,7 +601,7 @@ class LedgerTests(unittest.TestCase):
             with self.subTest(after=after):
                 status, out = self.move_long(after, before)
                 self.assertEqual(status, 0, out)
-                self.assertIn(' 1 moved, 1 reflowed, 0 respelled, 0 widened, 0 problems', out)
+                self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
 
     def test_const_reflow_rejects_changed_tokens(self):
         for before, after in (
@@ -660,7 +660,7 @@ class LedgerTests(unittest.TestCase):
     def test_a_macro_rules_body_moves_byte_for_byte(self):
         status, out = self.move_long(self.MACRO, self.MACRO)
         self.assertEqual(status, 0, out)
-        self.assertIn(' 2 moved, 0 reflowed, 0 respelled, 0 widened, 0 problems', out)
+        self.assertIn(' 2 moved, 0 reflowed, 0 widened, 0 problems', out)
         # No visibility glue inside a macro body: a token on a generated fn, on a word a macro only
         # stringifies, or in the matcher, and a dropped one, all fail.
         stringified = code('''
@@ -681,138 +681,6 @@ class LedgerTests(unittest.TestCase):
                 status, out = self.move_long(after, before)
                 self.assertEqual(status, 1, out)
                 self.assertIn('changed: macro_rules macro_rules!', out)
-
-    COIN = code('''
-        //! Money totals.
-
-        #[cfg(test)]
-        mod tests;
-
-        /// Adds the fee to the value.
-        pub(crate) fn total(value: u32) -> u32 {
-            value + crate::snapshots::money::fee()
-        }
-
-        fn fee() -> u32 {
-            // One unit per call.
-            1
-        }
-
-        impl crate::snapshots::Holder {
-            fn doubled(&self) -> u32 {
-                self.value * 2
-            }
-        }
-
-        // Keeps the file long enough for git to see the rename.
-        fn first() {}
-        fn second() {}
-        fn third() {}
-    ''')
-    COIN_TESTS = 'use super::*;\n\n#[test]\nfn adds() {\n    assert_eq!(super::total(1), 2);\n}\n'
-    MONEY_FILES = ('snapshots/money.rs', 'snapshots/money/tests.rs', 'snapshots/sources.rs',
-                   'snapshots/sources/coin.rs', 'snapshots/sources/coin/tests.rs', 'snapshots/sources/money.rs',
-                   'snapshots/sources/money/tests.rs')
-
-    def move_money(self, coin, tests=COIN_TESTS, alias='pub(crate) use sources::coin as money;\n', name='coin',
-                   source=None):
-        """Commit the money module (`source`, default COIN) at base, then `git mv` it to sources/<name>.rs
-        holding `coin`, and its tests file holding `tests` (no tests module when None), with `alias` in the root."""
-        reset = {src(path): None for path in self.MONEY_FILES if (self.repo.root / src(path)).exists()}
-        self.repo.commit(reset)
-        source = source or self.COIN
-        if tests is None:
-            source, coin = (text.replace('#[cfg(test)]\nmod tests;\n\n', '') for text in (source, coin))
-        files = {src('snapshots.rs'): ROOT + 'mod money;\n', src('snapshots/money.rs'): source}
-        if tests is not None:
-            files[src('snapshots/money/tests.rs')] = self.COIN_TESTS
-        base = self.repo.commit(files)
-        (self.repo.root / src(f'snapshots/sources/{name}')).mkdir(parents=True, exist_ok=True)
-        self.repo.git('mv', src('snapshots/money.rs'), src(f'snapshots/sources/{name}.rs'))
-        head_files = {src('snapshots.rs'): ROOT + 'mod sources;\n' + alias,
-                      src('snapshots/sources.rs'): f'pub(crate) mod {name};\n',
-                      src(f'snapshots/sources/{name}.rs'): coin}
-        if tests is not None:
-            self.repo.git('mv', src('snapshots/money/tests.rs'), src(f'snapshots/sources/{name}/tests.rs'))
-            head_files[src(f'snapshots/sources/{name}/tests.rs')] = tests
-        return run(self.repo, base, self.repo.commit(head_files))
-
-    def test_a_whole_file_git_mv_with_its_mod_decl_and_facade_alias_decomposes_into_moved_items(self):
-        status, out = self.move_money(self.COIN)
-        self.assertEqual(status, 0, out)
-        self.assertIn(' 0 respelled, 0 widened, 0 problems', out)
-        self.assertIn('file map: 2 exact renames of .rs files, 2 module moves, 1 facade aliases', out)
-        self.assertIn('module crate::snapshots::money -> crate::snapshots::sources::coin', out)
-        self.assertIn('facade alias crate::snapshots::money -> crate::snapshots::sources::coin', out)
-        self.assertIn('crates/demo/src/snapshots/money.rs:6-25 fn total .. fn third (6 items) -> '
-                      'crates/demo/src/snapshots/sources/coin.rs:6-25  '
-                      '[crate::snapshots::money -> crate::snapshots::sources::coin]', out)
-        self.assertIn('[crate::snapshots::money::tests -> crate::snapshots::sources::coin::tests]', out)
-        self.assertIn('move-only', out)
-        # Without `as` when the name stays the same.
-        status, out = self.move_money(self.COIN, alias='pub(crate) use sources::money;\n', name='money')
-        self.assertEqual(status, 0, out)
-        self.assertIn('facade alias crate::snapshots::money -> crate::snapshots::sources::money', out)
-        # An edited file maps nothing, so the same alias names no mapped head path.
-        status, out = self.move_money(self.COIN.replace('snapshots::money::fee', 'snapshots::sources::money::fee'),
-                                      alias='pub(crate) use sources::money;\n', name='money')
-        self.assertEqual(status, 1, out)
-        self.assertIn('`use` binds the old name of moved module crate::snapshots::money without naming', out)
-
-    def test_a_moved_item_must_keep_what_its_unchanged_paths_name(self):
-        escaping = self.COIN.replace('value + crate', 'value + super::helper(value).len() as u32 + crate')
-        header = self.COIN.replace('impl crate::snapshots::Holder', 'impl super::Holder')
-        for name, coin, alias, expect in (
-            # Without the facade alias the old crate path names nothing at head.
-            ('no alias', self.COIN, 'pub(crate) use sources::coin;\n',
-             'path names something else after the move: fn total `crate::snapshots::money::fee`'),
-            # An unchanged escaping path now starts from the new module.
-            ('escaping super', escaping, 'pub(crate) use sources::coin as money;\n',
-             'path names something else after the move: fn total `super::helper`'),
-            ('impl header', header, 'pub(crate) use sources::coin as money;\n',
-             'path names something else after the move: impl super::Holder :: fn doubled `super::Holder`'),
-        ):
-            with self.subTest(name):
-                status, out = self.move_money(coin, alias=alias, source=coin)
-                self.assertEqual(status, 1, out)
-                self.assertIn(expect, out)
-
-    ESCAPING = (COIN.replace('value + crate', 'super::helper(value).len() as u32 + value + crate')
-                .replace('impl crate::snapshots::Holder', 'impl super::Holder'))
-    RESPELLED = (ESCAPING.replace('crate::snapshots::money::fee()', 'crate::snapshots::sources::coin::fee()')
-                 .replace('super::helper', 'super::super::helper')
-                 .replace('impl super::Holder', 'impl super::super::Holder'))
-
-    def test_module_paths_respelled_for_a_moved_module_resolve_to_the_same_items(self):
-        status, out = self.move_money(self.RESPELLED, tests=None, alias='', source=self.ESCAPING)
-        self.assertEqual(status, 0, out)
-        self.assertIn(' 0 reflowed, 2 respelled, 0 widened, 0 problems', out)
-        self.assertNotIn('file map:', out)  # the respelled file is an edited rename: it maps nothing
-        self.assertIn('respelled fn total (crates/demo/src/snapshots/money.rs:3 -> '
-                      'crates/demo/src/snapshots/sources/coin.rs:3)', out)
-        self.assertIn('respelled impl super::Holder :: fn doubled', out)
-        self.assertIn('move-only', out)
-        # Its tests file is an exact rename, but `use super::*` there names the money module, which an edited
-        # rename never maps: the glob binding fails, and so does the facade alias.
-        status, out = self.move_money(self.RESPELLED, source=self.ESCAPING)
-        self.assertEqual(status, 1, out)
-        self.assertIn('`use` binding glob in crate::snapshots::money::tests now names something else', out)
-        self.assertIn('`use` binds the old name of moved module crate::snapshots::money without naming its '
-                      'mapped head path (?)', out)
-
-    def test_a_respelled_path_must_resolve_to_the_same_moved_target(self):
-        for name, coin in (
-            ('different module', self.RESPELLED.replace('super::super::helper', 'crate::snapshots::sources::helper')),
-            ('crate path respelled relative', self.RESPELLED.replace('crate::snapshots::sources::coin::fee()',
-                                                                     'super::coin::fee()')),
-            ('impl header to another module', self.RESPELLED.replace('impl super::super::Holder',
-                                                                     'impl crate::snapshots::sources::Holder')),
-            ('changed name', self.RESPELLED.replace('super::super::helper(value)', 'super::super::second(value)')),
-        ):
-            with self.subTest(name):
-                status, out = self.move_money(coin, tests=None, alias='', source=self.ESCAPING)
-                self.assertEqual(status, 1, out)
-                self.assertIn('changed: ', out)
 
     def test_validator_edits_are_listed_and_only_for_listed_files(self):
         listed = 'crates/ottto-service/tests/support/scan_index_v201.rs'
@@ -863,8 +731,9 @@ class LedgerTests(unittest.TestCase):
 
 
 
+
 def module_files(snapshots, files):
-    """A crate whose snapshots root declares `snapshots` (mod lines) beside the given src/ files."""
+    """A crate whose snapshots root is `snapshots`, beside the given src/ files."""
     return {'lib.rs': 'pub mod snapshots;\n', 'snapshots.rs': snapshots, **files}
 
 
@@ -872,11 +741,14 @@ VALUE = 'pub(crate) fn v() -> u8 {{\n    {}\n}}\n'
 MOVED_F = 'pub(crate) fn f() -> u8 {{\n    {}\n}}\n'
 
 
-class ModulePathTests(unittest.TestCase):
-    """Module paths and `use` bindings fail closed: each counterexample fails, each control passes.
+class UseBindingTests(unittest.TestCase):
+    """`use` glue fails closed: each counterexample fails, each control passes.
 
     Shorthand: S = crate::snapshots; S::old (snapshots/old.rs) moves to S::dest::new (snapshots/dest/new.rs).
     """
+
+    SIBLINGS = {'snapshots/x.rs': VALUE.format(1), 'snapshots/z.rs': VALUE.format(2)}
+    ROOT = 'mod x;\nmod z;\n'
 
     def change(self, base, head):
         """Commit the `base` src/ files, then apply `head` (None deletes), and run the checker."""
@@ -897,274 +769,105 @@ class ModulePathTests(unittest.TestCase):
         for message in (*messages, 'move-only'):
             self.assertIn(message, out)
 
-    SIBLINGS = {'snapshots/x.rs': VALUE.format(1), 'snapshots/y.rs': VALUE.format(2),
-                'snapshots/z.rs': VALUE.format(3)}
+    def root(self, uses, body='self::x::v()'):
+        return module_files(self.ROOT + uses + MOVED_F.format(body), self.SIBLINGS)
 
-    def move_f(self, root, old_path, new_path, head_root=None, files=None, head_files=None):
-        """(base, head) that move fn f from S::old to S::dest::new, its path respelled old_path -> new_path."""
-        base = module_files('mod old;\n' + root, {**self.SIBLINGS, 'snapshots/old.rs': MOVED_F.format(old_path),
-                                                  **(files or {})})
-        head = {'snapshots.rs': 'mod dest;\n' + (root if head_root is None else head_root),
-                'snapshots/old.rs': None, 'snapshots/dest.rs': 'pub(crate) mod new;\n',
-                'snapshots/dest/new.rs': MOVED_F.format(new_path), **(head_files or {})}
+    def move_f(self, old, new):
+        """(base, head) that move S::old (fn f after the `old` text) to S::dest::new (after the `new` text)."""
+        base = module_files('mod old;\n' + self.ROOT,
+                            {**self.SIBLINGS, 'snapshots/old.rs': old + MOVED_F.format('v()')})
+        head = {'snapshots.rs': 'mod dest;\n' + self.ROOT, 'snapshots/old.rs': None,
+                'snapshots/dest.rs': 'pub(crate) mod new;\n', 'snapshots/dest/new.rs': new + MOVED_F.format('v()')}
         return base, head
 
-    def test_a_respelled_path_resolves_through_modules_to_the_same_item(self):
-        root = 'mod x;\nmod y;\nmod z;\n'
-        self.passes(*self.move_f(root, 'super::x::v()', 'super::super::x::v()'), ' 1 respelled,')
-        # A respelling to a different sibling.
-        self.fails(*self.move_f(root, 'super::x::v()', 'super::super::y::v()'), 'changed: fn f')
-        # A needless respelling: `self::` still names the moved module's own item.
-        local = {'snapshots/old.rs': MOVED_F.format('self::local()') + 'fn local() -> u8 {\n    1\n}\n'}
-        base, head = self.move_f(root, 'self::local()', 'crate::snapshots::dest::new::local()', files=local)
-        head['snapshots/dest/new.rs'] += 'fn local() -> u8 {\n    1\n}\n'
+    def test_a_path_changed_inside_a_moved_item_fails(self):
+        base, head = self.move_f('use super::x::v;\n', 'use super::super::x::v;\n')
+        self.passes(base, head, ' 1 moved,')
+        base['snapshots/old.rs'] = MOVED_F.format('super::x::v()')
+        head['snapshots/dest/new.rs'] = MOVED_F.format('super::super::x::v()')
         self.fails(base, head, 'changed: fn f')
 
-    def test_no_respelling_through_a_use_binding_and_no_repointed_alias(self):
-        # Audit (f1): the alias x is re-pointed from y to z while f respells super::x to super::super::x.
-        root = 'mod y;\nmod z;\nuse self::y as x;\n'
-        base, head = self.move_f(root, 'super::x::v()', 'super::super::x::v()',
-                                 head_root='mod y;\nmod z;\nuse self::z as x;\n')
-        self.fails(base, head, 'changed: fn f',
-                   '`use` binding x in crate::snapshots now names something else: self::y -> self::z')
-        # Even with the alias unchanged, a path through it is never respelled.
-        self.fails(*self.move_f(root, 'super::x::v()', 'super::super::x::v()'), 'changed: fn f')
-
-    def test_a_crate_path_respelling_must_name_the_moved_item(self):
-        # Audit (f2): the moved module's own item respelled to an unrelated existing module.
-        local = {'snapshots/old.rs': MOVED_F.format('crate::snapshots::old::local()')
-                 + 'fn local() -> u8 {\n    1\n}\n'}
-        base, head = self.move_f('mod y;\n', 'crate::snapshots::old::local()', 'crate::snapshots::y::v()',
-                                 files={**local, 'snapshots/y.rs': VALUE.format(2)})
-        head['snapshots/dest/new.rs'] += 'fn local() -> u8 {\n    1\n}\n'
-        self.fails(base, head, 'changed: fn f')
-        # Control: respelled to the item's new home.
-        base, head = self.move_f('', 'crate::snapshots::old::local()', 'crate::snapshots::dest::new::local()',
-                                 files=local)
-        head['snapshots/dest/new.rs'] += 'fn local() -> u8 {\n    1\n}\n'
-        self.passes(base, head, ' 1 respelled,')
-
-    PADDING = ''.join(f'fn padding_{n}() {{}}\n' for n in range(20))
-
-    def test_an_edited_rename_maps_nothing_and_items_are_judged_by_their_pairs(self):
-        def old(value):
-            return MOVED_F.format('crate::snapshots::old::local()') + f'fn local() -> u8 {{\n    {value}\n}}\n' \
-                + self.PADDING
-
-        def new(value):
-            return MOVED_F.format('crate::snapshots::dest::new::local()') \
-                + f'fn local() -> u8 {{\n    {value}\n}}\n' + self.PADDING
-        # Audit (f3): a plain edited rename (R082) fails on the edited item.
-        base, head = self.move_f('', '', '', files={'snapshots/old.rs': old(1)})
-        self.fails(base, {**head, 'snapshots/dest/new.rs': new(7)}, 'changed: fn local')
-        # Audit (f3): R082 with local swapped against a decoy: every item pairs, but f's respelled path would
-        # now reach the decoy's body; f's path names the item paired into decoy, so it fails.
-        decoy = 'fn local() -> u8 {{\n    {}\n}}\n'
-        base, head = self.move_f('mod decoy;\n', '', '', files={'snapshots/old.rs': old(1),
-                                                                 'snapshots/decoy.rs': decoy.format(2)})
-        self.fails(base, {**head, 'snapshots/dest/new.rs': new(2), 'snapshots/decoy.rs': decoy.format(1)},
-                   'changed: fn f')
-
-    PART = 'pub(crate) fn g() -> u8 {{\n    {}\n}}\n'
-
-    def test_a_file_in_more_than_one_module_context_is_never_respelled(self):
-        root = 'mod x;\n'
-        # Audit (f4) controls: a single-context include! and #[path] file may be respelled.
-        base = module_files('mod old;\n' + root, {**self.SIBLINGS, 'snapshots/old.rs': 'include!("part.rs");\n',
-                                                  'snapshots/part.rs': self.PART.format('super::x::v()')})
-        head = {'snapshots.rs': 'mod dest;\n' + root, 'snapshots/old.rs': None, 'snapshots/part.rs': None,
-                'snapshots/dest.rs': 'pub(crate) mod new;\n', 'snapshots/dest/new.rs': 'include!("part.rs");\n',
-                'snapshots/dest/part.rs': self.PART.format('super::super::x::v()')}
-        self.passes(base, head, ' 1 respelled,')
-        self.fails(base, {**head, 'snapshots/dest/part.rs': self.PART.format('super::super::y::v()')},
-                   'changed: fn g')
-        path_base = module_files('#[path = "snapshots/legacy.rs"]\nmod old;\n' + root,
-                                 {**self.SIBLINGS, 'snapshots/legacy.rs': self.PART.format('super::x::v()')})
-        path_head = {'snapshots.rs': 'mod dest;\n' + root, 'snapshots/legacy.rs': None,
-                     'snapshots/dest.rs': '#[path = "new_impl.rs"]\npub(crate) mod new;\n',
-                     'snapshots/new_impl.rs': self.PART.format('super::super::x::v()')}
-        self.passes(path_base, path_head, ' 1 respelled,')
-        # Audit (f4): the moved file is also crate::other::wrap::old through #[path]; there super::x is
-        # other::wrap::x before and other::x after.
-        other = {'lib.rs': 'pub mod snapshots;\npub mod other;\n', 'other.rs': 'pub mod wrap;\nmod x;\n',
-                 'other/x.rs': VALUE.format(3), 'other/wrap/x.rs': VALUE.format(2)}
-        wrap = '#[path = "../snapshots/old.rs"]\nmod old;\nmod x;\n'
-        base = module_files('mod old;\n' + root, {**self.SIBLINGS, **other, 'other/wrap.rs': wrap,
-                                                  'snapshots/old.rs': self.PART.format('super::x::v()')})
-        head = {'snapshots.rs': 'mod dest;\n' + root, 'snapshots/old.rs': None,
-                'snapshots/dest.rs': 'pub(crate) mod new;\n',
-                'snapshots/dest/new.rs': self.PART.format('super::super::x::v()'),
-                'other/wrap.rs': '#[path = "../snapshots/dest/new.rs"]\nmod old;\nmod x;\n'}
-        self.fails(base, head, 'changed: fn g')
-        # Audit (f4): part.rs is included from snapshots/old.rs and from other/wrap/old.rs.
-        base = module_files('mod old;\n' + root, {
-            **self.SIBLINGS, **other, 'other/wrap.rs': 'mod old;\nmod x;\n',
-            'snapshots/old.rs': 'include!("part.rs");\n', 'snapshots/part.rs': self.PART.format('super::x::v()'),
-            'other/wrap/old.rs': 'include!("../../snapshots/part.rs");\n'})
-        head = {'snapshots.rs': 'mod dest;\n' + root, 'snapshots/old.rs': None, 'snapshots/part.rs': None,
-                'snapshots/dest.rs': 'pub(crate) mod new;\n', 'snapshots/dest/new.rs': 'include!("part.rs");\n',
-                'snapshots/dest/part.rs': self.PART.format('super::super::x::v()'),
-                'other/wrap/old.rs': 'include!("../../snapshots/dest/part.rs");\n'}
-        self.fails(base, head, 'changed: fn g')
-
-    def test_no_respelling_inside_a_string_a_macro_call_or_an_attribute(self):
-        root = 'mod x;\n'
-        text = 'pub(crate) fn f() -> &\'static str {{\n    {}\n}}\n'
-        for name, before, after in (
-            ('string literal', '"super::x::v"', '"super::super::x::v"'),
-            ('macro call', 'stringify!(super::x::v)', 'stringify!(super::super::x::v)'),
-            ('macro call with brackets', 'concat![stringify!(super::x::v)]', 'concat![stringify!(super::super::x::v)]'),
-        ):
-            with self.subTest(name):
-                base, head = self.move_f(root, '', '', files={'snapshots/old.rs': text.format(before)})
-                self.fails(base, {**head, 'snapshots/dest/new.rs': text.format(after)}, 'changed: fn f')
-        attribute = '#[cfg_attr(test, derive({}))]\npub(crate) struct Probe;\n'
-        base, head = self.move_f(root, '', '', files={'snapshots/old.rs': attribute.format('super::x::Marker')})
-        self.fails(base, {**head, 'snapshots/dest/new.rs': attribute.format('super::super::x::Marker')},
-                   'changed: struct Probe')
-
-    def test_function_local_use_respelling_and_top_level_use_bindings(self):
-        root = 'mod x;\nmod y;\n'
-        body = 'pub(crate) fn f() -> u8 {{\n    use {}::{{self, v}};\n    v() + x::v()\n}}\n'
-        base, head = self.move_f(root, '', '', files={'snapshots/old.rs': body.format('super::x')})
-        # Audit (f6) control: a function-local `use` respelled to the same module.
-        self.passes(base, {**head, 'snapshots/dest/new.rs': body.format('super::super::x')}, ' 1 respelled,')
-        # A changed leaf and a glob from an unrelated module fail.
-        bad = body.format('super::super::x').replace('self, v', 'self, bad')
-        self.fails(base, {**head, 'snapshots/dest/new.rs': bad}, 'changed: fn f')
-        glob = 'pub(crate) fn f() -> u8 {{\n    use {}::*;\n    v()\n}}\n'
-        base, head = self.move_f(root, '', '', files={'snapshots/old.rs': glob.format('super::x')})
-        self.fails(base, {**head, 'snapshots/dest/new.rs': glob.format('super::super::y')}, 'changed: fn f')
-        # Top-level `use` trees: a re-pointed brace leaf, `self` alias and glob fail; added and removed are glue.
-        siblings = module_files(root, self.SIBLINGS)
+    def test_an_existing_binding_keeps_its_path_visibility_attributes_and_count(self):
+        both = '#[cfg(test)]\nuse self::x as y;\n#[cfg(not(test))]\nuse self::z as y;\n'
+        swapped = '#[cfg(not(test))]\nuse self::x as y;\n#[cfg(test)]\nuse self::z as y;\n'
         for name, before, after, message in (
-            ('brace leaf', 'use self::x::{v};\n', 'use self::y::{v};\n',
-             '`use` binding v in crate::snapshots now names something else: self::x::v -> self::y::v'),
-            ('self alias', 'use self::x::{self as w};\n', 'use self::y::{self as w};\n',
-             '`use` binding w in crate::snapshots now names something else: self::x -> self::y'),
-            ('glob', 'use self::x::*;\n', 'use self::y::*;\n',
-             '`use` binding glob in crate::snapshots now names something else: self::x -> self::y'),
+            ('cfg duplicates swapped', both, swapped,
+             'use binding changed: y in crate::snapshots (crates/demo/src/snapshots.rs:3): '
+             '#[cfg(test)] use self::x as y; #[cfg(not(test))] use self::z as y -> '
+             '#[cfg(not(test))] use self::x as y; #[cfg(test)] use self::z as y'),
+            ('cfg duplicate dropped', both, '#[cfg(test)]\nuse self::x as y;\n', 'use binding changed: y'),
+            ('cfg added', 'use self::x as y;\n', '#[cfg(test)]\nuse self::x as y;\n', 'use binding changed: y'),
+            ('re-pointed', 'use self::x as y;\n', 'use self::z as y;\n', 'use binding changed: y'),
+            ('respelled', 'use self::x as y;\n', 'use crate::snapshots::x as y;\n', 'use binding changed: y'),
+            ('widened', 'pub(in crate::snapshots) use self::x::v;\n', 'pub use self::x::v;\n',
+             'use binding changed: v in crate::snapshots (crates/demo/src/snapshots.rs:3): '
+             'pub(in crate::snapshots) use self::x::v -> pub use self::x::v'),
+            ('narrowed', 'pub(crate) use self::x::v;\n', 'use self::x::v;\n', 'use binding changed: v'),
+            ('glob attribute', 'use self::x::*;\n', '#[cfg(test)]\nuse self::x::*;\n',
+             'use binding changed: self::x::* in crate::snapshots'),
         ):
             with self.subTest(name):
-                self.fails({**siblings, 'snapshots.rs': root + before}, {'snapshots.rs': root + after}, message)
-        self.passes({**siblings, 'snapshots.rs': root + 'use self::x::v;\n'},
-                    {'snapshots.rs': root + 'use self::y::v as w;\nuse self::x::*;\n'})
-        # A same-target respelling of an existing binding passes; through a binding it fails.
-        self.passes({**siblings, 'snapshots.rs': root + 'use self::x::v;\n'},
-                    {'snapshots.rs': root + 'use crate::snapshots::x::v;\n'}, ' 1 respelled,',
-                    'respelled `use` v in crate::snapshots: self::x::v -> crate::snapshots::x::v')
-        self.fails({**siblings, 'snapshots.rs': root + 'use self::y as w;\nuse self::y::v;\n'},
-                   {'snapshots.rs': root + 'use self::y as w;\nuse self::w::v;\n'},
-                   '`use` binding v in crate::snapshots now names something else')
+                body = 'y::v()' if ' y;' in before else 'v()'
+                self.fails(self.root(before, body), self.root(after, body), message)
+        # Regrouped, added and removed bindings are glue.
+        self.passes(self.root('use self::x::v;\nuse self::z as y;\n', 'v() + y::v()'),
+                    self.root('use self::{x::v, z as y};\n', 'v() + y::v()'))
+        self.passes(self.root('use self::x::v;\n', 'v()'), self.root('use self::x::v;\nuse self::z as w;\n', 'v()'))
+        self.passes(self.root('use self::z as w;\n'), self.root(''))
 
-    CALLER = 'pub(crate) fn call() -> u8 {{\n    {}\n}}\n'
+    def test_a_binding_moved_to_another_module_may_not_reach_further(self):
+        base, head = self.move_f('use crate::snapshots::x::v;\n', 'pub(crate) use crate::snapshots::x::v;\n')
+        self.fails(base, head, 'widened: use v (crates/demo/src/snapshots/dest/new.rs:1): private in '
+                   'crate::snapshots::old -> pub(crate) in crate::snapshots::dest::new')
+        base, head = self.move_f('pub(super) use crate::snapshots::x::v;\n',
+                                 'pub(in crate::snapshots) use crate::snapshots::x::v;\n')
+        self.passes(base, head, ' 0 widened,')
 
-    def facade_move(self, alias, caller='crate::snapshots::old::local()'):
-        old = 'pub(crate) fn local() -> u8 {\n    1\n}\n' + self.PADDING
-        root = 'mod y;\nmod z;\nmod caller;\n'
-        base = module_files('mod old;\n' + root, {'snapshots/old.rs': old, 'snapshots/y.rs': 'pub(crate) mod old;\n',
-                                                  'snapshots/z.rs': 'pub(crate) fn local() -> u8 {\n    2\n}\n',
-                                                  'snapshots/y/old.rs': 'pub(crate) fn local() -> u8 {\n    2\n}\n',
-                                                  'snapshots/caller.rs': self.CALLER.format(
-                                                      'crate::snapshots::old::local()')})
-        head = {'snapshots.rs': 'mod dest;\n' + root + alias, 'snapshots/old.rs': None,
-                'snapshots/dest.rs': 'pub(crate) mod new;\n', 'snapshots/dest/new.rs': old,
-                'snapshots/caller.rs': self.CALLER.format(caller)}
-        return base, head
-
-    def test_a_facade_alias_must_name_the_moved_module(self):
-        # Audit (f7) control: the alias names the exact rename's head module.
-        self.passes(*self.facade_move('pub(crate) use self::dest::new as old;\n'),
-                    'facade alias crate::snapshots::old -> crate::snapshots::dest::new')
-        # Audit (f7): the unchanged caller would now reach z's local, or y::old's.
-        for alias in ('self::z', 'self::y::old'):
-            with self.subTest(alias):
-                self.fails(*self.facade_move(f'use {alias} as old;\n'),
-                           '`use` binds the old name of moved module crate::snapshots::old without naming its mapped '
-                           f'head path (crate::snapshots::dest::new): `{alias}`')
-        self.fails(*self.facade_move('pub(crate) use self::y::*;\n'),
-                   'glob `use self::y::*` in crates/demo/src/snapshots.rs can bind the old name of moved module '
-                   'crate::snapshots::old')
-        # An unmoved item may not respell its path to the moved module.
-        self.fails(*self.facade_move('pub(crate) use self::dest::new as old;\n',
-                                     caller='crate::snapshots::dest::new::local()'), 'changed: fn call')
-
-    MODEL = 'pub(crate) fn total() -> u8 {{\n    {}\n}}\n{}#[cfg(test)]\nmod tests;\n'
-    UPLOAD = 'pub(crate) struct Slot;\n' + ''.join(f'fn slot_{n}() {{}}\n' for n in range(20))
-
-    def nest_model(self, model=None, decl='pub(in crate::snapshots) mod upload;\n', upload=True):
-        """(base, head): S::obs (the model, with its tests file) moves to S::usage::obs, whose old content (the
-        upload state) moves to its child S::usage::obs::upload; the model gains `decl`; a facade alias keeps the
-        old root name and the root's import of the upload state is respelled."""
-        tests = 'use super::*;\n\n#[test]\nfn adds() {\n    assert_eq!(total(), 1);\n}\n'
-        base = module_files('mod obs;\nmod usage;\nuse self::usage::obs::Slot;\n', {
-            'snapshots/obs.rs': self.MODEL.format(1, self.PADDING), 'snapshots/obs/tests.rs': tests,
-            'snapshots/usage.rs': 'pub(super) mod obs;\n', 'snapshots/usage/obs.rs': self.UPLOAD})
-        head = {'snapshots.rs': 'mod usage;\nuse self::usage::obs::upload::Slot;\nuse usage::obs;\n',
-                'snapshots/obs.rs': None, 'snapshots/obs/tests.rs': None,
-                'snapshots/usage/obs.rs': model or self.MODEL.format(1, self.PADDING + decl),
-                'snapshots/usage/obs/tests.rs': tests}
-        if upload:
-            head['snapshots/usage/obs/upload.rs'] = self.UPLOAD
-        return base, head
-
-    def test_a_rename_exact_but_for_an_added_mod_declaration_maps_its_module(self):
-        # The model file gains `mod upload;` for its child: exact once that declaration is left out.
-        self.passes(*self.nest_model(), ' 0 widened, 0 problems',
-                    'module crate::snapshots::obs -> crate::snapshots::usage::obs',
-                    'module crate::snapshots::usage::obs -> crate::snapshots::usage::obs::upload',
-                    'facade alias crate::snapshots::obs -> crate::snapshots::usage::obs',
-                    'respelled `use` Slot in crate::snapshots: self::usage::obs::Slot -> '
-                    'self::usage::obs::upload::Slot')
-        # Near misses: the model also changes one token, or gains a blank line with the declaration.
-        unmapped = '`use` binds the old name of moved module crate::snapshots::obs without naming its mapped head ' \
-                   'path (?)'
-        self.fails(*self.nest_model(self.MODEL.format(2, self.PADDING + 'pub(in crate::snapshots) mod upload;\n')),
-                   'changed: fn total', unmapped)
-        self.fails(*self.nest_model(decl='\npub(in crate::snapshots) mod upload;\n'), unmapped)
-        # Only whole added or removed declarations are left out: not a `#[macro_use]` one, not a changed one.
-        self.fails(*self.nest_model(decl='#[macro_use]\nmod upload;\n'), unmapped)
-        self.fails(*self.nest_model(self.MODEL.format(1, self.PADDING + 'mod upload;\n').replace(
-            'mod tests;', 'pub(crate) mod tests;')), unmapped)
-
-    def test_a_phantom_mod_declaration_is_not_left_out(self):
-        # `mod ghost;` has no child file: the rename is not exact, so it maps nothing.
-        base, head = self.nest_model()
-        head['snapshots/usage/obs.rs'] = self.MODEL.format(1, self.PADDING + 'mod ghost;\n')
-        self.fails(base, head, 'unresolved mod at crates/demo/src/snapshots/usage/obs.rs',
-                   '`use` binds the old name of moved module crate::snapshots::obs without naming its mapped head '
-                   'path (?)')
-
-    def test_an_exact_copy_maps_only_when_its_source_path_was_rewritten_by_another_pair(self):
-        old = 'pub(crate) fn local() -> u8 {\n    1\n}\n' + self.PADDING
-        base = module_files('mod old;\nmod dest;\n', {'snapshots/old.rs': old, 'snapshots/dest.rs': ''})
-        copy = {'snapshots/dest.rs': 'mod new;\n', 'snapshots/dest/new.rs': old}
-        # The source stays unchanged, or is rewritten by no pair, while a copy of its content appears elsewhere.
-        for name, source in (('unchanged', {}),
-                             ('rewritten', {'snapshots/old.rs': 'pub(crate) fn other() -> u8 {\n    3\n}\n'})):
+    def test_a_new_glob_fails_but_the_source_glob_of_a_new_module(self):
+        base, head = self.move_f('use super::x::v;\n', 'use crate::snapshots::x::*;\nuse super::super::x::v;\n')
+        self.fails(base, head, 'new glob import: use crate::snapshots::x::* in crate::snapshots::dest::new')
+        # The split pattern: a new module imports everything from the module its items came from.
+        base = module_files(self.ROOT + 'use self::x::v;\n' + MOVED_F.format('v()'), self.SIBLINGS)
+        moved = {'snapshots.rs': 'mod dest;\n' + self.ROOT + 'use self::x::v;\n'}
+        for glob in ('crate::snapshots', 'super'):
+            with self.subTest(glob):
+                self.passes(base, {**moved, 'snapshots/dest.rs': f'use {glob}::*;\n\n' + MOVED_F.format('v()')})
+        # Any other glob beside a moved item fails, including one that can shadow a prelude name.
+        custom = {'snapshots/custom.rs': '#[allow(non_snake_case)]\npub(crate) fn Some(value: u8) -> u8 {\n'
+                                         '    value + 1\n}\n'}
+        for name, files, uses in (
+            ('unrelated', {}, 'use crate::snapshots::z::*;\n'),
+            ('prelude shadow', custom, 'use super::*;\nuse super::custom::*;\n'),
+        ):
             with self.subTest(name):
-                status, out = self.change(base, {**copy, **source})
-                self.assertEqual(status, 1, out)
-                self.assertNotIn('file map:', out)
-        # One rename and one copy of the same source: only the rename maps.
-        status, out = self.change(base, {'snapshots.rs': 'mod dest;\n', 'snapshots/old.rs': None,
-                                         'snapshots/dest.rs': 'mod new;\nmod copy;\n',
-                                         'snapshots/dest/new.rs': old, 'snapshots/dest/copy.rs': old})
-        self.assertEqual(status, 1, out)
-        self.assertIn('file map: 1 exact renames of .rs files, 1 module moves', out)
+                root = moved['snapshots.rs'] + ('mod custom;\n' if files else '')
+                self.fails({**base, **files, 'snapshots.rs': base['snapshots.rs'] + ('mod custom;\n' if files else '')},
+                           {'snapshots.rs': root, 'snapshots/dest.rs': uses + MOVED_F.format('v()')},
+                           'new glob import:')
+        # A new glob in a module that existed at base fails.
+        self.fails(self.root('use self::x::v;\n', 'v()'), self.root('use self::x::v;\nuse self::z::*;\n', 'v()'),
+                   'new glob import: use self::z::* in crate::snapshots')
 
-    def test_the_respelled_count_is_always_in_the_summary(self):
-        # No file is renamed: the respelled count still shows in the main summary line.
-        root = 'mod x;\nmod old;\n'
-        base = module_files(root, {**self.SIBLINGS, 'snapshots/old.rs': 'fn keep() {}\n\n'
-                                   + MOVED_F.format('super::x::v()')})
-        head = {'snapshots.rs': root + 'mod dest;\n', 'snapshots/old.rs': 'fn keep() {}\n',
-                'snapshots/dest.rs': 'pub(crate) mod new;\n', 'snapshots/dest/new.rs': MOVED_F.format(
-                    'super::super::x::v()')}
-        status, out = self.change(base, head)
-        self.assertEqual(status, 0, out)
-        self.assertIn(' 1 moved, 0 reflowed, 1 respelled, 0 widened, 0 problems', out)
-        self.assertNotIn('file map:', out)
+    MACRO = 'macro_rules! imports {\n    () => {\n        use crate::snapshots::x::*;\n    };\n}\nimports!();\n'
+
+    def test_a_use_added_beside_a_moved_macro_call_fails(self):
+        # A macro call can expand to a `use` this check cannot see: an explicit binding added beside it
+        # can shadow what the expansion bound (v from x becomes v from z).
+        base, head = self.move_f(self.MACRO, self.MACRO + 'use crate::snapshots::z::v;\n')
+        self.fails(base, head, 'use added beside an item-level macro call: use crate::snapshots::z::v in '
+                   'crate::snapshots::dest::new')
+        # Control: the name was bound explicitly where the items came from, so the expansion never bound it.
+        base, head = self.move_f(self.MACRO + 'use crate::snapshots::x::v;\n',
+                                 self.MACRO + 'use crate::snapshots::x::v;\n')
+        self.passes(base, head)
+        # The module the items left may re-import a name its own items defined, nothing else.
+        root = self.ROOT + self.MACRO.replace('imports', 'stays') + 'fn g() -> u8 {\n    1\n}\n'
+        base = module_files(root + MOVED_F.format('g()'), self.SIBLINGS)
+        moved = {'snapshots/dest.rs': 'use super::*;\n\n' + MOVED_F.format('g()')}
+        self.passes(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use dest::f;\n'})
+        self.fails(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use self::z::v;\n'},
+                   'use added beside an item-level macro call: use self::z::v in crate::snapshots')
+
 
 if __name__ == '__main__':
     unittest.main()
