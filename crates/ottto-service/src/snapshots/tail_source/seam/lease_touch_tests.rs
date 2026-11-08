@@ -9,7 +9,7 @@ use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::{native_cold, observe_consumed};
 use crate::snapshots::tests::manifest_index_entry;
 use crate::transcript_acquisition::{
-    birth_unix_nanos, capture_sample_reads, DurableCertificate, ReadMode,
+    birth_unix_nanos, capture_sample_reads, DurableCertificate, FullReason, ReadMode,
 };
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
