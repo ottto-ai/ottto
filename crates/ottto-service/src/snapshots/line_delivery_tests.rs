@@ -1,10 +1,12 @@
 //! LD: the physical-line hook at the one reader, the per-pass lifecycle,
 //! excluded reads, counters and the selection-identity conditions.
-use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
-use super::*;
 use crate::codex_prelude_footprint::tests::metric;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+use crate::snapshots::line_delivery::{
+    DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
+};
 use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
+use crate::snapshots::*;
 use crate::transcript_acquisition::FileObject;
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -495,7 +497,7 @@ fn skip_delivers_no_lines_and_ends_once() {
 /// no observer.
 #[test]
 fn codex_group_member_reads_call_no_observer() {
-    let (root, _) = super::codex_file_join::tests::fixture();
+    let (root, _) = crate::snapshots::codex_file_join::tests::fixture();
     let recorder = Recorder::default();
     let mut scan = OwnedSourceScan::new(
         SnapshotSource::Codex,
@@ -873,7 +875,7 @@ pub(in crate::snapshots) fn unselected_page(source: &str) -> Value {
 
 /// A file with an accepted sampled generation keeps verification rescue.
 fn rescue(files: &mut SharedMap<String, ScanIndexEntry>, path: &Path) {
-    let mut entry = super::tests::manifest_index_entry(None);
+    let mut entry = crate::snapshots::tests::manifest_index_entry(None);
     entry.set_unverified_deadline(0);
     files.insert(local_index_key(path), entry);
 }
@@ -1215,7 +1217,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         for (name, committed) in [("grown", 2), ("held", 2), ("equal", 3), ("truncated", 4)] {
             append(&path(name), b"{}\n");
             set_old(&path(name));
-            let mut entry = super::tests::manifest_index_entry(Some("final"));
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("final"));
             entry.size_bytes = committed;
             assert!(!entry.has_unverified_source());
             if recovery_overlap && name == "grown" {
@@ -1238,7 +1240,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         let cap = former_file_cap(source);
         File::create(path("big")).unwrap().set_len(cap + 1).unwrap();
         set_old(&path("big"));
-        let mut big = super::tests::manifest_index_entry(Some("final"));
+        let mut big = crate::snapshots::tests::manifest_index_entry(Some("final"));
         big.size_bytes = cap;
         index.files.insert(local_index_key(&path("big")), big);
         ensure_bounded_traversal(source, &[root.projects()], &mut index, NOW, 7);
@@ -1279,7 +1281,7 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
         // Revalidation and opened-object recheck each use their current length.
         // Restore the equal/truncated controls, retired by complete census above.
         for (name, size) in [("equal", 3), ("truncated", 4)] {
-            let mut entry = super::tests::manifest_index_entry(Some("final"));
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("final"));
             entry.size_bytes = size;
             index.files.insert(local_index_key(&path(name)), entry);
         }
@@ -1436,7 +1438,7 @@ fn codex_roster_retains_aged_indexed_growth() {
     let path = directory.join("rollout-grown.jsonl");
     append(&path, b"{}\n");
     set_old(&path);
-    let mut entry = super::tests::manifest_index_entry(None);
+    let mut entry = crate::snapshots::tests::manifest_index_entry(None);
     entry.size_bytes = 2;
     index.files.insert(local_index_key(&path), entry);
     assert!(!index
@@ -1675,7 +1677,7 @@ fn absent_account_hold_retires_without_money_or_completion_credit() {
     append(&path, &assistant_line("f4"));
     let (mut index, cold_scan, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
     assert!(!cold_scan.snapshots.is_empty());
-    let mut request = super::tests::valid_v6_batch_request();
+    let mut request = crate::snapshots::tests::valid_v6_batch_request();
     request.snapshots = cold_scan.snapshots.clone();
     request.source = SnapshotSource::ClaudeCode.api_slug().into();
     let mut cold = RouteResult::emitted(
@@ -1777,7 +1779,7 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     sampled_scan::set_test_now(Some(1_000));
     withheld_account::support::clock(&index.withheld_memo);
     for name in ["held", "old", "gone"] {
-        let mut entry = super::tests::manifest_index_entry(Some(name));
+        let mut entry = crate::snapshots::tests::manifest_index_entry(Some(name));
         // Present controls are unchanged, not grown since the committed size.
         if name != "gone" {
             entry.size_bytes = fs::metadata(file(name)).unwrap().len();

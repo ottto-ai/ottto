@@ -4,14 +4,14 @@
 //! evidence. Losing local state can only re-derive the same rule, except the
 //! disclosed index-loss residual (an old-binary-acknowledged post-cutover
 //! session whose index is lost re-derives V2).
-use super::*;
+use crate::snapshots::*;
 
 /// Compiled V2 cutover, Unix milliseconds, compared with the root origin
 /// header's `session_meta.payload.timestamp`: 2026-10-26T12:00:00Z. Sessions
 /// whose root header is at or after it, and that no Legacy writer has already
 /// acknowledged, use V2; every earlier session stays Legacy. Frozen once; never
 /// move it.
-pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: i64 = 1_793_016_000_000;
+pub(in crate::snapshots) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: i64 = 1_793_016_000_000;
 
 #[cfg(test)]
 thread_local! {
@@ -21,14 +21,14 @@ thread_local! {
 
 /// The compiled cutover.
 #[cfg(not(test))]
-pub(super) fn active_cutover_unix_ms() -> i64 {
+pub(in crate::snapshots) fn active_cutover_unix_ms() -> i64 {
     CODEX_COUNTING_V2_CUTOVER_UNIX_MS
 }
 
 /// Tests may substitute a real epoch on their own thread. Legacy fixtures
 /// must use pre-cutover headers or Legacy ACK evidence, just as production does.
 #[cfg(test)]
-pub(super) fn active_cutover_unix_ms() -> i64 {
+pub(in crate::snapshots) fn active_cutover_unix_ms() -> i64 {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
@@ -49,7 +49,7 @@ impl Drop for TestCutover {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CountingVersion {
+pub(in crate::snapshots) enum CountingVersion {
     Legacy,
     V2,
 }
@@ -61,7 +61,7 @@ crate::durable_tail_codec::durable_enum!(CountingVersion {
 /// Acknowledgement evidence already present for a session's index entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum AckEvidence {
+pub(in crate::snapshots) enum AckEvidence {
     /// No writer has published this session to this destination.
     None,
     /// A V2 writer published it; its bool travels with the ACK fields.
@@ -76,7 +76,7 @@ crate::durable_tail_codec::durable_enum!(AckEvidence {
 });
 
 impl AckEvidence {
-    pub(super) fn combine(self, other: Self) -> Self {
+    pub(in crate::snapshots) fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::LegacyAcked, _) | (_, Self::LegacyAcked) => Self::LegacyAcked,
             (Self::V2Marked, _) | (_, Self::V2Marked) => Self::V2Marked,
@@ -101,7 +101,9 @@ impl AckEvidence {
     /// entries the caller owns. Any Legacy-acknowledged entry
     /// (ACK facts without a V2 mark) forces Legacy, whatever else is marked;
     /// otherwise any V2 mark selects V2; entries without ACK facts are neutral.
-    pub(super) fn of_view<'a>(entries: impl IntoIterator<Item = &'a ScanIndexEntry>) -> Self {
+    pub(in crate::snapshots) fn of_view<'a>(
+        entries: impl IntoIterator<Item = &'a ScanIndexEntry>,
+    ) -> Self {
         let mut marked = false;
         for entry in entries {
             if entry.codex_counting_v2 {
@@ -126,14 +128,14 @@ impl AckEvidence {
 /// protected. Generation age alone proves no successful walk or absence.
 /// Current-generation Legacy evidence that might be post-cutover is retained:
 /// if no safer slot exists, refuse retirement until a later generation.
-pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
+pub(in crate::snapshots) const MAX_COUNTING_TOMBSTONES: usize = 1024;
 
 /// Diagnostic correlation only: newest 256 owners whose Legacy tombstone
 /// was removed by a not-provably-pre-cutover cap eviction. Persisted
 /// because a moved owner can be parsed on a later scan or after restart. FIFO
 /// displacement ages records; a committed live ACK absorbs them. Never read
 /// by version selection, reuse, ACK, settlement or dedup logic.
-pub(super) const MAX_EVICTED_LEGACY_OWNERS: usize = 256;
+pub(in crate::snapshots) const MAX_EVICTED_LEGACY_OWNERS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EvictedLegacyOwner {
@@ -146,12 +148,12 @@ struct EvictedLegacyOwner {
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
-pub(super) struct EvictedLegacyOwners {
+pub(in crate::snapshots) struct EvictedLegacyOwners {
     owners: VecDeque<EvictedLegacyOwner>,
 }
 
 impl EvictedLegacyOwners {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
         self.owners.is_empty()
     }
 
@@ -182,7 +184,7 @@ impl<'de> Deserialize<'de> for EvictedLegacyOwners {
 /// last Legacy carrier. Kept through failed/held parses and repeated until a
 /// committed carrier absorbs it or FIFO displacement ages it. Callers publish
 /// this receipt only after a successful, non-side-read parse finishes.
-pub(super) fn evicted_legacy_selected_v2(
+pub(in crate::snapshots) fn evicted_legacy_selected_v2(
     accumulator: &SnapshotAccumulator,
     index: &ScanIndex,
 ) -> bool {
@@ -203,7 +205,7 @@ pub(super) fn evicted_legacy_selected_v2(
 /// Called only when the finished-parse receipt is published, after side-read
 /// and failure exits. Keep the record until committed evidence or FIFO aging
 /// absorbs it; the bit survives partial checkpoints and restart.
-pub(super) fn note_evicted_legacy_v2_selection(index: &mut ScanIndex, owner: &str) {
+pub(in crate::snapshots) fn note_evicted_legacy_v2_selection(index: &mut ScanIndex, owner: &str) {
     if let Some(record) = index
         .codex_counting_evicted_legacy
         .owners
@@ -220,7 +222,7 @@ fn absorbs_evicted_legacy(evidence: AckEvidence, selected_v2: bool) -> bool {
 
 /// Drain this scan's eviction events and add current gauges to the existing
 /// local-only receipt block, including scans with bookkeeping but no parse.
-pub(super) fn take_local_receipts(
+pub(in crate::snapshots) fn take_local_receipts(
     index: &mut ScanIndex,
     receipts: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
 ) -> Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>> {
@@ -240,20 +242,20 @@ pub(super) fn take_local_receipts(
 /// than the one that parses its new path; this keeps the evidence until the
 /// owner's live entry carries it or the owner is proven absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct CountingTombstone {
-    pub(super) evidence: AckEvidence,
+pub(in crate::snapshots) struct CountingTombstone {
+    pub(in crate::snapshots) evidence: AckEvidence,
     /// `census_window_end` of the traversal generation that retired the entry.
-    pub(super) retired_in: String,
+    pub(in crate::snapshots) retired_in: String,
     /// Immutable owning-header timestamp, learned from the existing inventory.
     /// Missing in older state or after a removal before header observation.
     /// Unknown must never count as proof that an owner predates the cutover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) created_unix_ms: Option<i64>,
+    pub(in crate::snapshots) created_unix_ms: Option<i64>,
 }
 
 /// The first valid owner a complete parse proved for this entry. An invalid
 /// (corrupt or future-format) binding never masks a valid one.
-pub(super) fn proven_owner(entry: &ScanIndexEntry) -> Option<&str> {
+pub(in crate::snapshots) fn proven_owner(entry: &ScanIndexEntry) -> Option<&str> {
     [
         entry.codex_counting_owner.as_deref(),
         entry.codex_protected_owner.as_deref(),
@@ -268,7 +270,7 @@ pub(super) fn proven_owner(entry: &ScanIndexEntry) -> Option<&str> {
 /// under each filename identity, exactly as `prepare_moved_evidence` would
 /// read the entry. Returns false when the entry must stay instead: the map is
 /// full of this generation's Legacy evidence. Hash-only; no file read.
-pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool {
+pub(in crate::snapshots) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool {
     let Some(entry) = index.files.get(key) else {
         return true;
     };
@@ -380,7 +382,7 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
 /// Header completeness covers the resolved roster, not unresolved configured
 /// roots. Reuse the ordinary reconciliation health signal (which includes
 /// root-resolution failures) plus current directory witnesses. No re-listing.
-pub(super) fn absence_coverage_complete(
+pub(in crate::snapshots) fn absence_coverage_complete(
     index: &ScanIndex,
     inventory: &codex_file_join::HeaderInventory,
 ) -> bool {
@@ -404,7 +406,7 @@ pub(super) fn absence_coverage_complete(
 /// path has no timestamp in ScanIndexEntry; keep it unknown until inventoried
 /// at its new path. For conflicting aliases the latest timestamp wins, and
 /// any unknown header prevents claiming an intrinsically Legacy owner.
-pub(super) fn note_inventory_created(
+pub(in crate::snapshots) fn note_inventory_created(
     index: &mut ScanIndex,
     inventory: &codex_file_join::HeaderInventory,
 ) {
@@ -492,7 +494,7 @@ fn collect_tombstones(
 /// that inventory's existing population cap. An old unbound filename is only a
 /// conservative Legacy hint, never proof that a V2 mark belongs to this owner.
 /// Retired entries' tombstones fold in exactly as their entries would have.
-pub(super) fn prepare_moved_evidence(
+pub(in crate::snapshots) fn prepare_moved_evidence(
     index: &mut ScanIndex,
     owners: &BTreeMap<String, String>,
     absence_coverage: bool,
@@ -594,7 +596,7 @@ fn key_evidence(key: &str, index: &ScanIndex) -> AckEvidence {
     )
 }
 
-pub(super) fn members_evidence<'a>(
+pub(in crate::snapshots) fn members_evidence<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> AckEvidence {
@@ -622,7 +624,7 @@ fn entry_has_ack_evidence(entry: &ScanIndexEntry) -> bool {
 /// header can select V2: a continuation (`history_base`), a header that is
 /// not the first owned record, or an unknown/unparseable creation time is
 /// Legacy for the parse's whole life.
-pub(super) fn decide(
+pub(in crate::snapshots) fn decide(
     first_owned_record: &Value,
     evidence: AckEvidence,
     cutover_unix_ms: i64,
@@ -656,7 +658,7 @@ pub(super) fn decide(
 /// Fresh singleton parser. The restored-reduction site must instead refuse a
 /// retained reduction whose decided version this evidence would not select
 /// (B handoff H4); the group parser configures its own member view (H1).
-pub(super) fn configure_singleton(
+pub(in crate::snapshots) fn configure_singleton(
     parser: &mut OwnedJsonlParser,
     candidate: &CandidateFile,
     index: &ScanIndex,
@@ -672,7 +674,7 @@ const LEGACY_VIEW: &str = "legacy";
 
 /// The counting view of a singleton's index entry (cursor K8): what
 /// `configure_singleton` would configure now, as the cursor job records it.
-pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
+pub(in crate::snapshots) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
     let cutover = active_cutover_unix_ms();
     let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
@@ -680,7 +682,7 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
 
 /// The counting view of a joined group (cursor K8): what
 /// `configure_group_once` would configure now from every member entry.
-pub(super) fn group_view<'a>(
+pub(in crate::snapshots) fn group_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
@@ -689,7 +691,7 @@ pub(super) fn group_view<'a>(
 }
 
 /// The recorded form of an active configuration.
-pub(super) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
+pub(in crate::snapshots) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
     format!("{cutover_unix_ms}:{}", evidence.view_name())
 }
 
@@ -697,7 +699,7 @@ pub(super) fn view(evidence: AckEvidence, cutover_unix_ms: i64) -> String {
 /// reduction (`old.filter`) and a paused cursor job: the restored state
 /// continues only under the rule a parser configured now would select.
 /// Historical unconfigured reductions retain their matching unconfigured view.
-pub(super) fn reusable(
+pub(in crate::snapshots) fn reusable(
     old: Option<&codex_usage_occurrence::CodexCounting>,
     fresh: Option<&codex_usage_occurrence::CodexCounting>,
 ) -> bool {
@@ -710,7 +712,10 @@ pub(super) fn reusable(
 
 /// `reusable` against a `singleton_view` instead of a configured parser. An
 /// unrecognised view never continues.
-pub(super) fn reusable_under_view(accumulator: &SnapshotAccumulator, view: &str) -> bool {
+pub(in crate::snapshots) fn reusable_under_view(
+    accumulator: &SnapshotAccumulator,
+    view: &str,
+) -> bool {
     let fresh = if view == LEGACY_VIEW {
         None
     } else {
@@ -731,7 +736,7 @@ pub(super) fn reusable_under_view(accumulator: &SnapshotAccumulator, view: &str)
 }
 
 /// A joined group's member evidence.
-pub(super) fn group_evidence<'a>(
+pub(in crate::snapshots) fn group_evidence<'a>(
     entries: impl IntoIterator<Item = &'a ScanIndexEntry>,
 ) -> AckEvidence {
     AckEvidence::of_view(entries)
@@ -740,14 +745,17 @@ pub(super) fn group_evidence<'a>(
 /// Joined-group replay parser: configured once, from the group's evidence,
 /// on its fresh accumulator. The accumulator carried across members is never
 /// reconfigured, so no member resets V2 state mid-session.
-pub(super) fn configure_group_once(accumulator: &mut SnapshotAccumulator, evidence: AckEvidence) {
+pub(in crate::snapshots) fn configure_group_once(
+    accumulator: &mut SnapshotAccumulator,
+    evidence: AckEvidence,
+) {
     let cutover = active_cutover_unix_ms();
     if accumulator.codex_counting.is_none() {
         configure(accumulator, evidence, Some(cutover));
     }
 }
 
-pub(super) fn configure(
+pub(in crate::snapshots) fn configure(
     accumulator: &mut SnapshotAccumulator,
     evidence: AckEvidence,
     cutover_unix_ms: Option<i64>,

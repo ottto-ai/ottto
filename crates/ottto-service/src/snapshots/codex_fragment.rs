@@ -1,21 +1,21 @@
 //! RAM-only binding of the cursor's certified prefix + observed EOF fragment.
 //! A length difference alone never creates this evidence or grants a Skip.
-use super::*;
+use crate::snapshots::*;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Stamp {
+pub(in crate::snapshots) struct Stamp {
     content: sampled_scan::codex_cursor::ContentStamp,
     birth: u64,
 }
 crate::heap_layout_bound::fields!(Stamp; content, birth);
 impl Stamp {
-    pub(super) fn candidate(candidate: &CandidateFile) -> Option<Self> {
+    pub(in crate::snapshots) fn candidate(candidate: &CandidateFile) -> Option<Self> {
         (candidate.fingerprint_birth_nanos != 0).then_some(Self {
             content: sampled_scan::codex_cursor::OpenStamp::candidate(candidate)?.content_stamp(),
             birth: candidate.fingerprint_birth_nanos,
         })
     }
-    pub(super) fn metadata(metadata: &fs::Metadata) -> Option<Self> {
+    pub(in crate::snapshots) fn metadata(metadata: &fs::Metadata) -> Option<Self> {
         let birth = metadata.created().ok().and_then(unix_nanos)?;
         (birth != 0).then_some(Self {
             content: sampled_scan::codex_cursor::OpenStamp::of(metadata).content_stamp(),
@@ -35,19 +35,24 @@ crate::heap_layout_bound::fields!(BoundFragment; offset, stamp);
 impl BoundFragment {
     /// Called only after the cursor actually withheld an EOF record, with a
     /// retained reduction and a certificate sealed at exactly `offset`.
-    pub(super) fn bind(candidate: &CandidateFile, offset: u64) -> Option<Self> {
+    pub(in crate::snapshots) fn bind(candidate: &CandidateFile, offset: u64) -> Option<Self> {
         (offset < candidate.size_bytes).then_some(Self {
             offset,
             stamp: Stamp::candidate(candidate)?,
         })
     }
-    pub(super) fn matches(&self, committed: u64, len: u64, stamp: Option<Stamp>) -> bool {
+    pub(in crate::snapshots) fn matches(
+        &self,
+        committed: u64,
+        len: u64,
+        stamp: Option<Stamp>,
+    ) -> bool {
         committed == self.offset
             && len == self.stamp.content.extent()
             && stamp.is_some_and(|stamp| self.stamp.same_content(&stamp))
     }
 }
-pub(super) fn grown(entry: &ScanIndexEntry, len: u64, stamp: Option<Stamp>) -> bool {
+pub(in crate::snapshots) fn grown(entry: &ScanIndexEntry, len: u64, stamp: Option<Stamp>) -> bool {
     len > entry.size_bytes
         && !entry
             .codex_fragment
@@ -57,13 +62,13 @@ pub(super) fn grown(entry: &ScanIndexEntry, len: u64, stamp: Option<Stamp>) -> b
 
 /// Actual native body range, captured before completion consumes the plan.
 /// No source verification or acquisition decision is derived from this metric.
-pub(super) struct TailRead {
-    pub(super) mode: crate::transcript_acquisition::ReadMode,
-    pub(super) start: u64,
-    pub(super) end: u64,
-    pub(super) terminated_end: u64,
+pub(in crate::snapshots) struct TailRead {
+    pub(in crate::snapshots) mode: crate::transcript_acquisition::ReadMode,
+    pub(in crate::snapshots) start: u64,
+    pub(in crate::snapshots) end: u64,
+    pub(in crate::snapshots) terminated_end: u64,
 }
-pub(super) fn note_tail_repeat(
+pub(in crate::snapshots) fn note_tail_repeat(
     entry: &ScanIndexEntry,
     candidate: &CandidateFile,
     read: TailRead,

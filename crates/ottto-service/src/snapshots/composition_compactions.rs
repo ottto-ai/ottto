@@ -1,6 +1,8 @@
 //! Small, resumable compaction history for the incremental composition reader.
 
-use super::{paired_claude_legacy_compactions, ClaudeCompactionKind, ClaudeCompactionObservation};
+use crate::snapshots::{
+    paired_claude_legacy_compactions, ClaudeCompactionKind, ClaudeCompactionObservation,
+};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
