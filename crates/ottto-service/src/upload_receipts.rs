@@ -28,8 +28,8 @@ const UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION: u16 = 1;
 const UPLOAD_RECEIPTS_RESPONSE_SCHEMA: &str = "ottto.upload_receipts.v1";
 const ID_PREFIX_LEN: usize = 12;
 const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
-/// The ring import reads the whole file; a larger file stays where it is.
-const MAX_RING_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+/// The most the legacy ring writers stored; their readers quarantined more.
+const MAX_RING_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
 /// After a failed open or write, attempts skip the history this long so an
 /// unwritable or locked file never slows an upload.
 const REOPEN_AFTER: Duration = Duration::from_secs(60);
@@ -54,10 +54,21 @@ struct History {
     retry_after: BTreeMap<PathBuf, Instant>,
 }
 
+/// The legacy ring, each row left as its borrowed JSON text so no row is
+/// decoded into a generic value tree.
 #[derive(Debug, Deserialize)]
-struct RingFile {
+struct RingFile<'a> {
     schema_version: u16,
-    receipts: Vec<serde_json::Value>,
+    #[serde(borrow)]
+    receipts: Vec<&'a serde_json::value::RawValue>,
+}
+
+/// The private part of one ring row. Decoded apart from the public part so
+/// that unknown fields are skipped, never buffered (as `flatten` would).
+#[derive(Debug, Deserialize)]
+struct RingEvidence {
+    #[serde(default)]
+    validated_evidence: Option<ValidatedReceiptEvidence>,
 }
 
 // Internal disk fields never enter the public protocol DTO or diagnostics reader.
@@ -995,41 +1006,47 @@ fn import_ring(state_dir: &Path, store: &mut Store) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_RING_IMPORT_BYTES,
-        "upload_receipt_ring_unimportable"
-    );
-    let ring = std::fs::read(&path)
-        .context("read upload receipt ring")
-        .and_then(|bytes| {
-            serde_json::from_slice::<RingFile>(&bytes).context("parse upload receipt ring")
-        });
-    let ring = match ring {
+    anyhow::ensure!(metadata.is_file(), "upload_receipt_ring_unimportable");
+    if metadata.len() > MAX_RING_IMPORT_BYTES {
+        quarantine_corrupt_file(&path);
+        return Ok(());
+    }
+    // Peak memory is the file plus the encoded rows: each row is decoded
+    // typed from its own bytes, encoded, and dropped.
+    let bytes = std::fs::read(&path).context("read upload receipt ring")?;
+    let ring = match serde_json::from_slice::<RingFile<'_>>(&bytes) {
         Ok(ring) if ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION => ring,
         Ok(_) | Err(_) => {
             quarantine_corrupt_file(&path);
             return Ok(());
         }
     };
-    let rows = ring
-        .receipts
-        .into_iter()
-        .filter_map(|row| serde_json::from_value::<PersistedReceipt>(row).ok())
-        .map(|receipt| {
-            let entity_count = receipt
-                .validated_evidence
-                .as_ref()
-                .map(|evidence| evidence.total_entities)
-                .unwrap_or_else(|| {
-                    let public = &receipt.public;
-                    public.accepted_entities.len()
-                        + public.unchanged_entities.len()
-                        + public.conflict_entities.len()
-                        + public.rejected_entities.len()
-                });
-            encode(&receipt, entity_count as u64)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::with_capacity(ring.receipts.len());
+    for raw in ring.receipts {
+        let (Ok(public), Ok(private)) = (
+            serde_json::from_str::<UploadReceiptV1>(raw.get()),
+            serde_json::from_str::<RingEvidence>(raw.get()),
+        ) else {
+            continue;
+        };
+        let entity_count = private
+            .validated_evidence
+            .as_ref()
+            .map(|evidence| evidence.total_entities)
+            .unwrap_or(
+                public.accepted_entities.len()
+                    + public.unchanged_entities.len()
+                    + public.conflict_entities.len()
+                    + public.rejected_entities.len(),
+            );
+        rows.push(encode(
+            &PersistedReceipt {
+                public,
+                validated_evidence: private.validated_evidence,
+            },
+            entity_count as u64,
+        )?);
+    }
     store.import_ring(&rows)?;
     std::fs::remove_file(&path)?;
     Ok(())

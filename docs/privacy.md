@@ -135,7 +135,8 @@ historical revision.
 Snapshot upload receipts, one per batch attempt, live in an owner-only local
 SQLite file. Each new receipt removes receipts older than 30 days in the same
 write, except each source's newest receipt, which stays whatever its age.
-Removed rows are zeroed in place. A request-specific validated ACK may retain a
+Removed rows are zeroed in the file once SQLite next checkpoints its write-ahead
+log. A request-specific validated ACK may retain a
 private content-free annotation with full semantic fingerprints, body-witness
 versions and hashes, one-way session and destination identifiers, hashed
 accepted-head or conflict-challenge references, occurrence counts, uploaded

@@ -1103,8 +1103,10 @@ days in the same write, except each source's newest receipt, which is kept
 whatever its age so a source that stopped uploading still shows its last
 attempt. Nothing else deletes receipts and no timer runs; a wall-clock jump
 backward keeps receipts longer, and one forward expires them early (each
-source's newest still stays). The file is not compacted: freed space is zeroed
-and reused, so it stays near its 30-day size. A history write that fails is
+source's newest still stays). The file is not compacted: removed rows are
+zeroed once SQLite next checkpoints its write-ahead log (after about 1,000
+pages of writes), and their space is reused, so the file stays near its 30-day
+size. A history write that fails is
 logged once and never holds, slows or retries an upload; the attempt is then
 missing from the history. The receipt ring file earlier releases kept is
 imported once, oldest first, and then removed.

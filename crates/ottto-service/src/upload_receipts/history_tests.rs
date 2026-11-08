@@ -2,6 +2,7 @@ use super::*;
 use crate::snapshots::state_v2::upload_history::{QUERIES_FOR_TEST, RETENTION_NS};
 use crate::test_scratch::ScratchDir;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 
 const DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 const T0: i64 = 1_790_000_000 * 1_000_000_000;
@@ -441,6 +442,38 @@ fn ring_import_is_lossless_deduped_and_survives_interruption() {
 }
 
 #[test]
+fn ring_import_decodes_rows_without_amplification() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Under the old 4 MiB ring bound, a generic value tree of this row would
+    // take tens of MiB; typed per-row decoding skips the unknown field.
+    let dir = temp_dir();
+    let mut row = ring_row(OffsetDateTime::now_utc(), SourceKind::Pi, 1).to_string();
+    row.pop();
+    row.push_str(",\"unrecognized_extension\":[");
+    row.push_str(&"\"\",".repeat(900_000));
+    row.push_str("\"\"]}");
+    let body = format!("{{\"schema_version\":1,\"receipts\":[{row}]}}");
+    assert!(body.len() < 4 * 1024 * 1024);
+    std::fs::write(upload_receipts_path(&dir), &body).unwrap();
+    let (page, allocation) =
+        crate::retry_allocation_probe::measure(|| read(&dir, 500, None, None).unwrap());
+    eprintln!(
+        "ring_import bytes={} requested_peak={} usable_peak={}",
+        body.len(),
+        allocation.requested_peak,
+        allocation.usable_peak
+    );
+    assert_eq!(page.receipts.len(), 1);
+    assert!(
+        allocation.requested_peak < body.len() + 1024 * 1024,
+        "{allocation:?}"
+    );
+    assert!(!upload_receipts_path(&dir).exists());
+}
+
+#[test]
 fn imported_rows_past_30_days_expire_at_the_next_append_except_the_newest() {
     let dir = temp_dir();
     let old = OffsetDateTime::now_utc() - time::Duration::days(40);
@@ -474,6 +507,7 @@ fn a_locked_or_unwritable_history_never_holds_or_slows_an_upload() {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(sidecar_path(&upload_history_path(&dir), ".owner"))
         .unwrap();
     assert_eq!(
