@@ -2894,8 +2894,8 @@ fn pi_live_retry_admits_a_shed_that_keeps_every_entry() {
     );
 }
 
-/// [money] A mode-only change reads nothing, an mtime-only change reads Full,
-/// and later growth restores and Tails, each equal to cold Full.
+/// [money] A mode-only change reads nothing, a certified backdated mtime move
+/// restores unchanged, and later growth Tails, each equal to cold Full.
 #[test]
 fn pi_acquisition_metadata_changes() {
     pi_row!("pi_acquisition_metadata_changes");
@@ -2932,7 +2932,7 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         next,
-        PiPageExpect::modes((1, 0, 0), (1, 0, 0)),
+        PiPageExpect::modes((0, 0, 1), (0, 0, 1)),
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(

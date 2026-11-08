@@ -153,7 +153,15 @@ presence for probes.
   session facts (title, first prompt, workspace, opening settings; Codex also stores its agent
   label and prelude) among them: no transcript byte is
   read back for content. A refusal is a counted Full; only a newer build's
-  head holds. Codex checks its ownership-affecting sidecar binding before reusing a head; changed
+  head holds. An equal-size mtime move at or before the indexed read's nonzero ctime can
+  restore from that read's certificate when size and stored mtime bind it to the entry,
+  births are known and equal, and both bounded sample digests match. This removes a
+  whole-file read for retention touches; ordinary later writes still read Full. A first
+  touch after a long gap can still read Full; steady reuse depends on the lease cadence
+  remaining within its backdate interval. Source fingerprints include metadata and
+  bounded content samples, rather than a whole-file digest. Freshness debt clears only
+  through the existing receipt proof on a later listing.
+  Codex checks its ownership-affecting sidecar binding before reusing a head; changed
   ownership evidence reconstructs through the counted Full path. Pi stores its usage ledger,
   totals and fork state on the same Tail seam. Each pass removes the
   retired restart-record directory beside a scan index (`sampled_scan/retired_records.rs`): counted,
