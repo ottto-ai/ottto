@@ -46,7 +46,7 @@ crate::local_resource_diagnostics::process_static!(fn with_identity_incomplete_h
 
 fn add_identity_incomplete_hold_total(slot: usize, count: u64) {
     with_identity_incomplete_holds(|totals| {
-        let _ = totals[slot].fetch_update(
+        let _ = totals[slot].try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |total| Some(total.saturating_add(count)),
