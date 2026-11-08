@@ -141,13 +141,32 @@ fn lease_touch_requires_the_certificates_own_known_birth_and_read() {
     let (route, path, key) = seed::<Claude>(|c, e| {
         c.birth_nanos += 1;
         e.opened_birth_nanos = c.birth_nanos;
+        // APFS clamps birth to the seed's first mtime. Keep the bound
+        // certificate mtime distinct so touching to birth really moves it.
+        c.modified.0 += 1;
+        e.modified_unix_seconds += 1;
+        *e.modified_unix_nanos.as_mut().unwrap() += 1_000_000_000;
     });
     let birth = birth_unix_nanos(&std::fs::metadata(&path).unwrap());
     touch(&path, UNIX_EPOCH + Duration::from_nanos(birth));
-    assert!(matches!(
-        loaded::<Claude>(&route, &path, &key),
-        Load::Cold(Some(FullReason::SameSizeEdit))
+    let metadata = std::fs::metadata(&path).unwrap();
+    let entry = &route.index.files[&key];
+    assert_ne!(
+        metadata.modified().unwrap(),
+        UNIX_EPOCH + Duration::from_nanos(entry.modified_unix_nanos.unwrap())
+    );
+    assert!(crate::transcript_acquisition::birth_clamped(
+        entry.opened_birth_nanos,
+        birth,
+        &metadata
     ));
+    assert!(birth <= entry.opened_changed_nanos);
+    match loaded::<Claude>(&route, &path, &key) {
+        Load::Cold(Some(FullReason::SameSizeEdit)) => {}
+        Load::Cold(reason) => panic!("clamped birth returned Cold({reason:?})"),
+        Load::Reused(..) => panic!("clamped birth returned Reused"),
+        Load::Held => panic!("clamped birth returned Held"),
+    }
 }
 
 /// [behaviour] A first touch outside the bound and an ordinary later write still read Full.
