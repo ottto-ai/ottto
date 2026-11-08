@@ -361,3 +361,7 @@ mod bad_record_tests;
 #[cfg(test)]
 #[path = "fresh_destination_tests.rs"]
 mod fresh_destination_tests;
+
+#[cfg(test)]
+#[path = "lease_touch_tests.rs"]
+mod lease_touch_tests;
