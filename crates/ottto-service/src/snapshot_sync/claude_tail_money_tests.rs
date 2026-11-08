@@ -850,10 +850,7 @@ fn child_own_late_row_uploads_once() {
         c.evidence(&rows, &[]);
         let mut next = finish_resumed(&c, resumed_page(&c, &scanner, warm.index));
         assert_eq!(posted_sessions(&next), BTreeSet::from([child]));
-        assert_ne!(
-            snapshot_upload_body_witness(&next.scan.snapshots[0]),
-            snapshot_upload_body_witness(&before)
-        );
+        assert_ne!(canonical(&next.scan.snapshots[0]), canonical(&before));
         assert_ne!(
             next.scan.snapshots[0].snapshot_fingerprint,
             before.snapshot_fingerprint
@@ -908,24 +905,36 @@ fn resumed_prefix_sidecar_receipt() {
         return;
     }
     with_e2(|| {
-        use super::state_v2_money_tests::{routed, tagged_api, tagged_api_for};
+        use super::state_v2_money_tests::{routed, tagged_api};
         use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent;
         let (mut c, _) = receipt_family(name);
         let root = c.root(
             ROOT,
-            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 30)),
+            &(line(ROOT, "r1", AT, 10)
+                + &line(ROOT, "r2", AT, 30)
+                + &line(ROOT, "gap", "2026-08-02T07:30:10Z", 7)),
         );
         input_clock(&root);
-        let gap = c.root(COPY, &line(COPY, "gap", AT, 7));
-        input_clock(&gap);
-        c.evidence_for(COPY, &[tagged_api_for(COPY, "gap", 7, None)], &[]);
+        let mut gap = tagged_api("gap", 7, None);
+        gap.observed_at = "2026-08-02T07:30:10Z".into();
+        gap.fingerprint.clear();
+        gap.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&gap).unwrap())
+        );
         let mut rows = family_rows();
         rows[0] = tagged_api("r1", 10, Some(&"a".repeat(64)));
         rows.extend([
             tagged_api("r2", 30, Some(&"b".repeat(64))),
             tagged_api("side", 5, Some(&"b".repeat(64))),
+            gap,
         ]);
-        let traces = [trace("r1", ""), trace("r2", ""), trace("side", "")];
+        let traces = [
+            trace("r1", ""),
+            trace("r2", ""),
+            trace("side", ""),
+            trace("gap", ""),
+        ];
         c.evidence(&rows, &traces);
         let disk = Disk::new(&c);
         let scanner = E2ScanFixture::capturing_identity();
@@ -938,14 +947,12 @@ fn resumed_prefix_sidecar_receipt() {
             .find(|item| item.source_session_id == ROOT)
             .unwrap();
         assert_eq!(
-            root.request_count, 3,
-            "two transcript requests and a side call"
+            root.request_count, 4,
+            "three transcript requests and a side call"
         );
-        let model_rows = warm
-            .scan
-            .snapshots
+        let model_rows = root
+            .usage_buckets
             .iter()
-            .flat_map(|item| &item.usage_buckets)
             .flat_map(|bucket| &bucket.model_usage)
             .collect::<Vec<_>>();
         let accounts = model_rows
