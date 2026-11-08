@@ -467,5 +467,4 @@ mod refold_tests;
 #[path = "settlement_tests.rs"]
 mod settlement_tests;
 #[cfg(test)]
-#[path = "load_tests.rs"]
 mod tests;
