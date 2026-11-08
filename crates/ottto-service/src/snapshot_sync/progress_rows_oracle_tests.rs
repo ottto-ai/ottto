@@ -274,6 +274,7 @@ fn assert_imported(
 #[serial]
 fn progress_rows_route_equals_cold_full_across_restart_and_append() {
     with_e2(|| {
+        let mut settled = Vec::new();
         for source in [SOURCE, SnapshotSource::Codex, SnapshotSource::Pi] {
             let (c, paths) = native_corpus_in(
                 corpus(&format!("progress-rows-route-{}", source.api_slug())),
@@ -332,7 +333,11 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
             let (index, restored) = load(source, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
             assert_quiet(source, &c, index);
-            assert_rows_custody(path, &restored);
+            settled.push((path.to_owned(), restored, session, c));
+        }
+        // Storage last: every source's money half has run first.
+        for (path, restored, _, _) in &settled {
+            assert_rows_custody(path, restored);
         }
     });
 }
