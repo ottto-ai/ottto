@@ -6392,6 +6392,10 @@ fn load_source_checkpoints(
         // preserve the pass's measurements rather than start another pass.
         crate::snapshots::state_v2_pass_start();
     }
+    if !custody {
+        // A busy progress owner refuses the pass before any v1 containment.
+        drop(SnapshotProgressLock::acquire(progress_path)?);
+    }
     let (index, origin) =
         ScanIndex::load_for_snapshot_source_with_custody(index_path, source, support_dir, custody)?;
     crate::snapshots::state_v2_before_collection(&index)?;

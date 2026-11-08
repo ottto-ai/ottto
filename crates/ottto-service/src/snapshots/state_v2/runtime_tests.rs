@@ -498,13 +498,13 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
 fn newly_adopted_import_can_save_without_an_intervening_load() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    // Use the real inventory/import/publication path so import seals the
-    // external progress receipt through the production mapper.
+    // Use the real inventory/import/publication path: publication writes no
+    // progress receipt; upload progress moves in on its own first load.
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
     after_v1_locked(&f.path, &mut index).unwrap();
     assert!(index.v2().persistence_v2.is_some());
-    assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
+    assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
     assert_eq!(index.generation, 1);
     let runtime = index.v2().persistence_v2.clone().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());

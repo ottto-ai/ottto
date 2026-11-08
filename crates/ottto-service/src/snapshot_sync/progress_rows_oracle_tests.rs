@@ -880,18 +880,25 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
 
             let (index, mut progress) = load(SOURCE, &c, path).unwrap();
             assert_graph_behind_ledger(&index, &progress);
+            let reloaded = progress.generation;
             let mut page = native_page(SOURCE, &c, index, 100, true);
             let (status, again) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             if published_arm {
-                assert_eq!(progress.generation, before + 1, "the durable page");
+                assert_eq!(reloaded, before + 1, "the durable page");
+                assert_eq!(progress.generation, before + 1, "nothing more to commit");
                 assert!(
                     again.batches.is_empty(),
                     "committed ACKs are not re-offered"
                 );
                 assert_eq!(without_generation(durable(&progress)), acked);
             } else {
-                assert_eq!(progress.generation, before + 5, "the committed CAS");
+                assert_eq!(reloaded, before + 5, "the reload reads the committed CAS");
+                assert_eq!(
+                    progress.generation,
+                    before + 6,
+                    "the re-offered page commits on it"
+                );
                 assert_eq!(
                     again.batches, first.batches,
                     "the exact bytes are re-offered"
