@@ -552,8 +552,10 @@ fn query_plans_use_the_rowid_and_named_indexes() {
             .conn_for_test()
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap();
+        // Plans do not depend on the values; bind every parameter as NULL.
+        let nulls = vec![rusqlite::types::Null; statement.parameter_count()];
         statement
-            .query_map([], |r| r.get::<_, String>(3))
+            .query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()

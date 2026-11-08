@@ -271,27 +271,32 @@ impl Store {
             (None, Some(_)) => PAGE_SOURCE,
             (None, None) => PAGE,
         };
-        let mut statement = self.conn.prepare_cached(sql)?;
-        let mut rows = match (filter.since_ns, filter.source) {
-            (Some(since), source) => statement.query(params![before, limit, source, since])?,
-            (None, Some(source)) => statement.query(params![before, limit, source])?,
-            (None, None) => statement.query(params![before, limit])?,
-        };
         let mut page = Page {
             rows: Vec::new(),
             examined: 0,
             last_seq: None,
         };
-        while let Some(row) = rows.next()? {
-            let seq: i64 = row.get(0)?;
-            page.examined += 1;
-            page.last_seq = Some(seq);
-            // A row that fails verification is skipped; the cursor still
-            // moves past it.
-            if let Some(json) = verified(row) {
-                page.rows.push((seq, json));
+        {
+            let mut statement = self.conn.prepare_cached(sql)?;
+            let mut rows = match (filter.since_ns, filter.source) {
+                (Some(since), source) => statement.query(params![before, limit, source, since])?,
+                (None, Some(source)) => statement.query(params![before, limit, source])?,
+                (None, None) => statement.query(params![before, limit])?,
+            };
+            while let Some(row) = rows.next()? {
+                let seq: i64 = row.get(0)?;
+                page.examined += 1;
+                page.last_seq = Some(seq);
+                // A row that fails verification is skipped; the cursor still
+                // moves past it.
+                if let Some(json) = verified(row) {
+                    page.rows.push((seq, json));
+                }
             }
         }
+        // Reading pages is rare; release the pages it cached instead of
+        // keeping them resident beside the small append working set.
+        self.conn.execute_batch("PRAGMA shrink_memory")?;
         Ok(page)
     }
 
