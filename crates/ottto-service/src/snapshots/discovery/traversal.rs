@@ -511,7 +511,7 @@ pub(in crate::snapshots) fn pace_listing_owed(
     };
     let fresh = |at: &u64| now < at.saturating_add(LISTING_OWED_PACE_SECONDS);
     let paced = &mut traversal.listing_owed_requeued_unix_seconds;
-    if paced.get(key).is_some_and(&fresh) {
+    if paced.get(key).is_some_and(fresh) {
         return false;
     }
     paced.retain(|_, at| fresh(at));

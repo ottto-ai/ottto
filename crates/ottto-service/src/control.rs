@@ -32603,7 +32603,7 @@ X-API-Key = "otel_redacted"
             let original = pending.claim_commit.clone().unwrap();
             authority(&mut pending).canonical_snapshot_namespace = None;
             edit(&mut pending, &mut prior);
-            let prior = Some(&prior).filter(|_| row != "no prior");
+            let prior = (row != "no prior").then_some(&prior);
             continue_prior_snapshot_namespace(&mut pending, prior);
             // A claim the commit validator refuses cannot promote at all.
             let commit = pending.claim_commit.get_or_insert_with(|| original.clone());

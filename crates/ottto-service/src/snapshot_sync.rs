@@ -21187,8 +21187,7 @@ mod tests {
                 },
             )
             .expect("report terminal manifest withdrawal");
-            let request = captured.lock().expect("captured requests")[1].clone();
-            request
+            captured.lock().expect("captured requests")[1].clone()
         };
 
         for request in [

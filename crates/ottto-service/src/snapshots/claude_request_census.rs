@@ -2773,7 +2773,7 @@ pub(super) fn decode_persistence_census<R: std::io::Read>(
     use std::io::Read;
     let mut first = [0];
     reader.read_exact(&mut first)?;
-    anyhow::ensure!(first == [b'{'], "census map required");
+    anyhow::ensure!(first == *b"{", "census map required");
     let mut decoder =
         serde_json::Deserializer::from_reader(std::io::Cursor::new(first).chain(reader));
     let (census, dropped) = decoder.deserialize_map(CensusVisitor)?;

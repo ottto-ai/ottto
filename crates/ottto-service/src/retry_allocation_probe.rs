@@ -201,6 +201,10 @@ mod process {
         phase_peak: usize,
         buckets: [usize; BUCKETS],
     }
+    #[allow(
+        clippy::large_const_arrays,
+        reason = "only the two static tables below are initialized from it, at compile time"
+    )]
     const IDLE: Audit = Audit {
         active: false,
         overflow: false,
