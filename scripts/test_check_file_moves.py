@@ -874,6 +874,26 @@ class AbsolutizeAccepts(Base):
                 self.accept(files(**{'snapshots/old.rs': old}),
                             {SRC + 'snapshots/old.rs': new}, mode='absolutize')
 
+    def test_documented_uses_stay_anchored_while_other_scopes_reorder(self):
+        # [regress] Doc ownership freezes only the containing import scope.
+        for doc in ('/// d', '/** d */', '#[doc = "d"]'):
+            old = (f'{doc}\nuse super::dest;\nuse super::caller;\n'
+                   'fn f() { use super::{dest, caller}; }\n')
+            new = old.replace('super::', 'crate::snapshots::').replace(
+                '{dest, caller}', '{caller, dest}')
+            with self.subTest(doc=doc):
+                self.accept(files(**{'snapshots/old.rs': old}),
+                            {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
+    def test_unchanged_macro_tokens_with_reordered_uses(self):
+        # [regress] Opaque macro bytes need not prevent ordinary import reordering.
+        old = ('use super::dest;\nuse super::caller;\n'
+               'macro_rules! m { () => { use a::{b, c}; }; }\n')
+        new = old.replace('use super::dest;\nuse super::caller;',
+                          'use crate::snapshots::caller;\nuse crate::snapshots::dest;')
+        self.accept(files(**{'snapshots/old.rs': old}),
+                    {SRC + 'snapshots/old.rs': new}, mode='absolutize')
+
 
 class AbsolutizeRejects(Base):
     def check_edit(self, old, new, needle, **extra):
@@ -893,6 +913,40 @@ class AbsolutizeRejects(Base):
                         'edited beyond')
         old = 'fn f() { let _ = (super::dest::here()); }\n'
         self.check_edit(old, old.replace('super::dest::here()', 'crate::snapshots::dest::here(),'), 'edited beyond')
+
+    def test_macro_token_tree_bytes_cannot_reflow(self):
+        # [regress] Macro spacing changes stringify output and literal arm selection.
+        pairs = [('stringify!(a+b)', 'stringify!(a + b)'),
+                 ('pick!(1.0)', 'pick!(1 . 0)')]
+        pairs += [(f'pick!({literal}suffix)', f'pick!({literal} suffix)')
+                  for literal in ('"s"', 'b"s"', 'r#"s"#', 'br#"s"#', "'s'", "b's'")]
+        pairs += [(f'stringify!{a}a+b{b}', f'stringify!{a}a + b{b}')
+                  for a, b in (('[', ']'), ('{', '}'))]
+        definitions = ('macro_rules! pick { ($n:literal)=>{1}; '
+                       '($n:literal . $m:literal)=>{2}; ($n:literal suffix)=>{3}; }\n')
+        for before, after in pairs:
+            old = definitions + f'fn f() {{ super::dest::here(); let _ = {before}; }}\n'
+            new = old.replace('super::dest', 'crate::snapshots::dest').replace(before, after)
+            with self.subTest(before=before):
+                self.check_edit(old, new, 'macro token tree bytes differ')
+        old = 'macro_rules! m { () => { 1 }; }\nfn f() { super::dest::here(); }\n'
+        new = old.replace('super::dest', 'crate::snapshots::dest').replace('{ 1 }', '{1}')
+        self.check_edit(old, new, 'macro token tree bytes differ')
+
+    def test_documented_use_cannot_change_doc_owner(self):
+        # [regress] Reordering an import can reassign its doc to an import or function.
+        for doc in ('/// d', '/** d */', '#[doc = "d"]'):
+            pairs = [
+                (f'{doc}\nuse super::dest;\nuse super::caller;\n',
+                 f'{doc}\nuse crate::snapshots::caller;\nuse crate::snapshots::dest;\n'),
+                (f'{doc}\nuse super::dest; fn g() {{}}\n',
+                 f'{doc}\nfn g() {{}} use crate::snapshots::dest;\n'),
+                (f'use super::{{dest, caller}};\n{doc}\nuse super::dest as d;\n',
+                 f'use crate::snapshots::{{caller, dest}};\n{doc}\nuse crate::snapshots::dest as d;\n'),
+            ]
+            for old, new in pairs:
+                with self.subTest(doc=doc, new=new):
+                    self.check_edit(old, new, 'edited beyond')
 
     def test_formatter_cannot_change_comments_or_literals(self):
         # [behaviour] Exact tokens include comments and every kind of literal.

@@ -2360,6 +2360,7 @@ def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
     Original token indices retain every replacement precondition and location
     check. Comments inside an import keep that import in the ordinary stream;
     other comments prevent imports crossing them. Attributes compare as bytes.
+    A documented import freezes import order throughout its brace scope.
     """
     code = code_index(lx)
     at = {i: p for p, i in enumerate(code)}
@@ -2396,7 +2397,16 @@ def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
         item = rst.Item("use", "use", lx.tokens[first].start, lx.tokens[first].start,
                         lx.tokens[last].end, 0, first_token=first, last_token=last)
         attrs = tuple(raw_attrs(lx, item))
-        imports[first] = (last, [prefix + leaf + [last] for leaf in leaves], attrs, comments)
+        leading = first - 1
+        documented = False
+        while leading >= 0 and lx.tokens[leading].kind in TRIVIA:
+            documented |= lx.tokens[leading].kind == "doc"
+            leading -= 1
+        documented |= any(
+            name == "doc" for i in prefix if lx.is_punct(i, "#")
+            for name, _ in attr_entries(lx, attr_bracket(lx, i))
+        )
+        imports[first] = (last, [prefix + leaf + [last] for leaf in leaves], attrs, comments, documented)
 
     chains = {first: (last, n) for first, last, n, _ in super_chains(lx)}
 
@@ -2422,20 +2432,23 @@ def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
                 p += 1
         return tuple(out)
 
-    groups, removed, inventory = defaultdict(list), set(), Counter()
+    groups, removed, inventory = defaultdict(list), defaultdict(set), Counter()
+    frozen = set()
     stack, children, barriers = [()], defaultdict(int), defaultdict(int)
     i = 0
     while i < len(lx.tokens):
         scope = stack[-1]
         if i in imports:
-            last, leaves, attrs, comments = imports[i]
+            last, leaves, attrs, comments, documented = imports[i]
+            if documented:
+                frozen.add(scope)
             for leaf in leaves:
                 normalized = (attrs, key(leaf))
                 inventory[((scope, barriers[scope]), normalized)] += 1
                 if not comments:
                     groups[(scope, barriers[scope])].append((normalized, leaf))
             if not comments:
-                removed.update(range(i, last + 1))
+                removed[scope].update(range(i, last + 1))
             barriers[scope] += comments
             i = last + 1
             continue
@@ -2452,10 +2465,13 @@ def _absolutize_use_stream(lx: rst.Lexed, module: tuple[str, ...]):
         i += 1
     stream = []
     for scope, leaves in sorted(groups.items()):
+        if scope[0] in frozen:
+            continue
         for _normalized, indices in sorted(leaves, key=lambda leaf: (
                 leaf[0], tuple(_absolutize_token(lx.text, lx.tokens, i) for i in leaf[1]))):
             stream.extend(indices)
-    stream.extend(i for i in _absolutize_tokens(lx) if i not in removed)
+    skipped = {i for scope, indices in removed.items() if scope not in frozen for i in indices}
+    stream.extend(i for i in _absolutize_tokens(lx) if i not in skipped)
     return stream, inventory
 
 
@@ -2534,6 +2550,14 @@ def _absolutize_file(path: str, module: tuple[str, ...], old: rst.Lexed, new: rs
         b, count = b + len(expected_tokens), len(set(replaced))
     if a != len(old_stream) or b != len(new_stream):
         result.fail(f"{path}: edited beyond replacing `super` chains (at the end of the file)")
+    # Rust macro token trees observe spacing and literal boundaries that the
+    # shared MOVE lexer deliberately does not model. Freeze their source bytes.
+    def macro_bytes(lx):
+        return [lx.text[lx.tokens[first].start:lx.tokens[last].end]
+                for first, last, what in shape_of(lx).opaque if what.endswith("!")]
+
+    if macro_bytes(old) != macro_bytes(new):
+        result.fail(f"{path}: edited beyond replacing `super` chains (macro token tree bytes differ)")
     _absolutize_attrs(path, old, info, replaced, macro_defs, aliases, result)
     return count
 
