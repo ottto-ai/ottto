@@ -803,7 +803,7 @@ def _check_move(repo, base_sha, head_sha, changes, base, head, result) -> None:
             if not dst.endswith(".rs"):
                 continue
             lx = head.lexed(dst)
-            context = rst.file_context(dst, ())
+            context = rst.file_context(dst, (), "mod")
             folder = posixpath.join(context.directory, context.relative or "")
             matches = []
             for src in sorted(set(deleted) - set(pairs)):

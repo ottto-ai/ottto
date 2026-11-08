@@ -96,6 +96,8 @@ def files(**overrides):
     }
     for name, text in overrides.items():
         tree[SRC + name] = text
+        if text is None:
+            del tree[SRC + name]
     return tree
 
 
