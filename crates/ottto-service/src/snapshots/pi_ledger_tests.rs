@@ -1,7 +1,7 @@
 //! Pi's pure usage reducers and ledger shape: the fork cutoff and its heap
 //! bound. Moved from the retired Pi record codec's tests; these never needed
 //! the codec.
-use super::*;
+use crate::snapshots::*;
 use serde_json::Value;
 
 const FORK_TIME: &str = "2026-10-27T06:00:00.000000001Z";

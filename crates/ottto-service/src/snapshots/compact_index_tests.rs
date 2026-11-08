@@ -2,8 +2,8 @@
 // every reader accepts both the older pretty files and the compact ones, and
 // the restart hold admission is measured on the exact bytes the save writes.
 // Synthetic fixtures only.
-use super::lenient_decode_tests::raw_slot;
-use super::*;
+use crate::snapshots::lenient_decode_tests::raw_slot;
+use crate::snapshots::*;
 use std::io::Cursor;
 
 /// The shape of a live Claude index: per-file entries, fingerprints and

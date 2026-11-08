@@ -1,5 +1,5 @@
 //! One dispatch table for admitted sources.
-use super::*;
+use crate::snapshots::*;
 
 /// Sources admitted by the durable property table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

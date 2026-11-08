@@ -1,9 +1,9 @@
-use super::*;
-pub(super) const INVENTORY: usize = 0;
-pub(super) const CREATED: usize = 1;
-pub(super) const ABSENT: usize = 3;
-pub(super) const GROUP: usize = 4;
-pub(super) const PARSER: usize = 5;
+use crate::snapshots::*;
+pub(in crate::snapshots) const INVENTORY: usize = 0;
+pub(in crate::snapshots) const CREATED: usize = 1;
+pub(in crate::snapshots) const ABSENT: usize = 3;
+pub(in crate::snapshots) const GROUP: usize = 4;
+pub(in crate::snapshots) const PARSER: usize = 5;
 const N: usize = PARSER + 1;
 const NAMES: &str = "inventory_hold created_thread_proof parent_unresolvable protected_absent other_group_receipt_legacy other_parser archive_owed";
 pub(crate) type Summary = ([usize; N + 2], [usize; 3]);
@@ -16,27 +16,27 @@ pub(crate) struct Counts {
     observation: [usize; 2], // generation marker, diagnostic resets; process-only
 }
 impl Counts {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
         self.contributions == [0; N + 2]
     }
     fn reset(&mut self) {
         self.contributions = [0; N + 2];
         self.observation[1] = self.observation[1].saturating_add(1);
     }
-    pub(super) fn page(&mut self, started: Option<u64>) -> Self {
+    pub(in crate::snapshots) fn page(&mut self, started: Option<u64>) -> Self {
         self.observation[0] = usize::try_from(started.unwrap_or(0)).unwrap_or(0);
         Self {
             observation: [self.observation[0], 0],
             ..Self::default()
         }
     }
-    pub(super) fn add(&mut self, cause: usize, count: usize) {
+    pub(in crate::snapshots) fn add(&mut self, cause: usize, count: usize) {
         match self.contributions[cause].checked_add(count) {
             Some(n) => self.contributions[cause] = n,
             None => self.reset(),
         }
     }
-    pub(super) fn merge(&mut self, page: &Self) {
+    pub(in crate::snapshots) fn merge(&mut self, page: &Self) {
         self.observation[1] = self.observation[1].saturating_add(page.observation[1]);
         for (i, count) in page.contributions.iter().enumerate() {
             self.add(i, *count);

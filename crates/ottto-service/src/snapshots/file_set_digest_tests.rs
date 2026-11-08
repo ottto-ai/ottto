@@ -2,7 +2,7 @@
 //! `last_snapshot_fingerprint` / `last_upload_body_witness` values and every
 //! reader that compares them depend on this exact encoding, so a change here
 //! is an on-disk format change, not a refactor.
-use super::*;
+use crate::snapshots::*;
 
 /// Finalization's encoding before the shared helpers existed, kept verbatim
 /// as the reference the pinned values were taken from.

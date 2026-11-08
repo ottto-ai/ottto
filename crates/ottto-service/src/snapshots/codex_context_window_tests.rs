@@ -1,6 +1,6 @@
 //! Codex `model_context_window` paired with each context watermark.
 //! Synthetic fixtures only; no content comes from a provider account.
-use super::*;
+use crate::snapshots::*;
 
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

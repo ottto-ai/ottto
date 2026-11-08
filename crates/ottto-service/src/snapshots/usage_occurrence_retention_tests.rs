@@ -1,6 +1,6 @@
 //! Page-retained Claude usage occurrences: identical selectors are shared, and
 //! every occurrence still exposes exactly its own response's selector.
-use super::*;
+use crate::snapshots::*;
 use serde_json::json;
 use std::io::Write;
 
