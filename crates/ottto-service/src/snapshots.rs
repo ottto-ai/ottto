@@ -132,7 +132,7 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
-mod g7_debt;
+use upload::freshness_debt as g7_debt;
 pub(crate) mod money_freshness;
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
