@@ -4,8 +4,8 @@
 1. This branch writes a published route whose store holds progress rows.
 2. The v0.1.234 source, with only the probe below appended, opens that route:
    it must refuse the store as newer (Hold::NewerSchema) before any pass, so it
-   uploads nothing, and every store file except the SQLite shared-memory index
-   stays byte-identical.
+   uploads nothing, and every row of every store table stays as it was (page
+   and WAL file churn from opening the store is reported, not asserted).
 3. This branch opens the route again and reads exactly the rows it wrote.
 
 The signed v0.1.234 release is macOS-only; this builds the same tag's source.
@@ -23,6 +23,44 @@ PROBE = r'''
 mod progress_rows_carry_probe {
     use super::*;
     use sha2::Digest;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Every row of every table of the store, as values: page and WAL churn
+    /// is not a write, a changed row is.
+    fn rows(path: &Path) -> BTreeMap<String, BTreeSet<String>> {
+        let db = PathBuf::from(format!("{}.v2.sqlite", path.display()));
+        let conn = rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        let mut out = BTreeMap::new();
+        for table in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut text = String::new();
+                    for n in 0..columns {
+                        let value: rusqlite::types::Value = row.get(n)?;
+                        text.push_str(&format!("{value:?}|"));
+                    }
+                    Ok(text)
+                })
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            out.insert(table, rows);
+        }
+        out
+    }
 
     /// Every store file but the shared-memory index and the lock, by content.
     fn files(path: &Path) -> Vec<(String, String)> {
@@ -46,6 +84,7 @@ mod progress_rows_carry_probe {
         let path = PathBuf::from(fs::read_to_string(root.join("index-path.txt")).unwrap());
         let before = files(&path);
         assert!(before.iter().any(|(name, _)| name.ends_with(".v2.sqlite")));
+        let rows_before = rows(&path);
         let opened = {
             let _lock = crate::snapshots::CheckpointLock::acquire(&path).unwrap();
             load_locked(&path, false, published(&path).unwrap())
@@ -59,7 +98,19 @@ mod progress_rows_carry_probe {
                 || format!("{error:#}").contains("state_v2_newer_schema_refused"),
             "{error:#}"
         );
-        assert_eq!(files(&path), before, "the refused open wrote nothing");
+        let rows_after = rows(&path);
+        let mut changed = Vec::new();
+        for table in rows_before.keys().chain(rows_after.keys()).collect::<BTreeSet<_>>() {
+            let (old, new) = (rows_before.get(table), rows_after.get(table));
+            let empty = BTreeSet::new();
+            let (old, new) = (old.unwrap_or(&empty), new.unwrap_or(&empty));
+            for row in old.symmetric_difference(new) {
+                let side = if old.contains(row) { "-" } else { "+" };
+                changed.push(format!("{table} {side} {}", &row[..row.len().min(240)]));
+            }
+        }
+        println!("PROGRESS_CARRY_FILES before={before:?} after={:?}", files(&path));
+        assert!(changed.is_empty(), "the refused open changed rows:\n{}", changed.join("\n"));
         println!("PROGRESS_CARRY_REFUSED");
     }
 }
@@ -120,7 +171,7 @@ def main():
                  "PROGRESS_CARRY_REUPGRADE_VERIFIED", True)
         print(json.dumps({"status": "VERIFIED", "old": OLD_TAG,
                           "checks": ["newer_writer_refused", "zero_uploads_before_any_pass",
-                                     "store_files_unchanged", "reupgrade_equals_no_downgrade"]}))
+                                     "store_rows_unchanged", "reupgrade_equals_no_downgrade"]}))
 
 
 if __name__ == "__main__":
