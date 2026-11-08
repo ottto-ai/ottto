@@ -586,58 +586,26 @@ class LedgerTests(unittest.TestCase):
         self.assertIn('1 reflowed', out)
         self.assertIn('widened: struct Index', out)
 
-    def test_const_static_and_type_rewrapped_after_a_visibility_token_are_reflowed(self):
-        for before, after in (
-            ('const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);\n',
-             'pub(super) const BUSY_TIMEOUT: std::time::Duration =\n    std::time::Duration::from_secs(5);\n'),
-            ('/// Effort tiers.\nconst EFFORT_TIERS: &[&str] = &["low", "medium", "high", "xhigh", "max"];\n',
-             '/// Effort tiers.\npub(in crate::snapshots) const EFFORT_TIERS: &[&str] =\n'
-             '    &["low", "medium", "high", "xhigh", "max"];\n'),
-            ('static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());\n',
-             'pub(super) static SEEN: std::sync::Mutex<Vec<u64>> =\n    std::sync::Mutex::new(Vec::new());\n'),
-            ('type Ledger<R = crate::snapshots::Holder> = std::collections::BTreeMap<String, R>;\n',
-             'pub(super) type Ledger<R = crate::snapshots::Holder> =\n    std::collections::BTreeMap<String, R>;\n'),
-        ):
-            with self.subTest(after=after):
-                status, out = self.move_long(after, before)
-                self.assertEqual(status, 0, out)
-                self.assertIn(' 1 moved, 1 reflowed, 0 widened, 0 problems', out)
-
-    def test_const_reflow_rejects_changed_tokens(self):
-        for before, after in (
-            # A changed literal, an added trailing comma, a macro call and a second visibility token.
-            ('const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);\n',
-             'pub(super) const BUSY_TIMEOUT: std::time::Duration =\n    std::time::Duration::from_secs(6);\n'),
-            ('const TIERS: &[&str] = &["low", "max"];\n', 'pub(super) const TIERS: &[&str] =\n    &["low", "max",];\n'),
-            ('const NAME: &str = concat!("a", "b");\n', 'pub(super) const NAME: &str =\n    concat!("a", "b");\n'),
-            ('const N: u8 = { struct P { a: u8 } 1 };\n',
-             'pub(super) const N: u8 =\n    { struct P { pub a: u8 } 1 };\n'),
-            # A changed type and a changed cfg attribute.
-            ('const LIMIT: u8 = 1;\n', 'pub(super) const LIMIT: u16 =\n    1;\n'),
-            ('#[cfg(test)]\nconst LIMIT: u8 = 1;\n', '#[cfg(unix)]\npub(super) const LIMIT: u8 =\n    1;\n'),
-        ):
-            with self.subTest(after=after):
-                status, out = self.move_long(after, before)
-                self.assertEqual(status, 1, out)
-                self.assertIn(' 0 reflowed,', out)
-
     def test_a_number_literal_is_one_token_in_a_reflow(self):
-        # A float, an exponent, hex, a suffixed integer and a suffixed float re-wrapped whole are reflowed.
+        # [regress] Numeric boundaries remain exact on the existing fn/struct reflow surfaces.
         for value in ('1.0', '1e-3', '2.5E+10', '0x1F', '1_000u64', '1.0f32', '1.'):
             with self.subTest(value=value):
-                status, out = self.move_long(f'pub(super) const VALUE: f64 =\n    {value};\n',
-                                             f'const VALUE: f64 = {value};\n')
+                before = f'fn f(value: [u8; {value}]) {{}}\n'
+                after = f'pub(super) fn f(\n    value: [u8; {value}],\n) {{}}\n'
+                status, out = self.move_long(after, before)
                 self.assertEqual(status, 0, out)
                 self.assertIn(' 1 moved, 1 reflowed,', out)
-        # Whitespace inside a number literal changes its tokens: not a reflow.
         for before, after in (('1.0', '1 . 0'), ('1.0', '1 .0'), ('1e-3', '1e - 3'), ('1.0f32', '1. 0f32'),
-                              ('1.5', '1 .5')):
-            with self.subTest(after=after):
-                status, out = self.move_long(f'pub(super) const VALUE: f64 =\n    {after};\n',
-                                             f'const VALUE: f64 = {before};\n')
-                self.assertEqual(status, 1, out)
-                self.assertIn(' 0 reflowed,', out)
-                self.assertIn('changed: const VALUE', out)
+                              ('1.5', '1 .5'), ('0x1F', '0x 1F'), ('1_000u64', '1_000 u64'), ('1.', '1 .')):
+            for kind in ('fn', 'struct'):
+                with self.subTest(after=after, kind=kind):
+                    old = (f'fn f(value: [u8; {before}]) {{}}\n' if kind == 'fn' else
+                           f'struct T {{ value: [u8; {before}], }}\n')
+                    new = (f'pub(super) fn f(\n    value: [u8; {after}],\n) {{}}\n' if kind == 'fn' else
+                           f'pub(super) struct T {{\n    value: [u8; {after}],\n}}\n')
+                    status, out = self.move_long(new, old)
+                    self.assertEqual(status, 1, out)
+                    self.assertIn(' 0 reflowed,', out)
 
     MACRO = code('''
         macro_rules! scan_result {
@@ -823,7 +791,7 @@ class UseBindingTests(unittest.TestCase):
                                  'pub(in crate::snapshots) use crate::snapshots::x::v;\n')
         self.passes(base, head, ' 0 widened,')
 
-    def test_a_new_glob_fails_but_the_source_glob_of_a_new_module(self):
+    def test_every_new_glob_in_a_module_with_moved_items_fails(self):
         base, head = self.move_f('use super::x::v;\n', 'use crate::snapshots::x::*;\nuse super::super::x::v;\n')
         self.fails(base, head, 'new glob import: use crate::snapshots::x::* in crate::snapshots::dest::new')
         # The split pattern: a new module imports everything from the module its items came from.
@@ -831,7 +799,8 @@ class UseBindingTests(unittest.TestCase):
         moved = {'snapshots.rs': 'mod dest;\n' + self.ROOT + 'use self::x::v;\n'}
         for glob in ('crate::snapshots', 'super'):
             with self.subTest(glob):
-                self.passes(base, {**moved, 'snapshots/dest.rs': f'use {glob}::*;\n\n' + MOVED_F.format('v()')})
+                self.fails(base, {**moved, 'snapshots/dest.rs': f'use {glob}::*;\n\n' + MOVED_F.format('v()')},
+                           'new glob import:')
         # Any other glob beside a moved item fails, including one that can shadow a prelude name.
         custom = {'snapshots/custom.rs': '#[allow(non_snake_case)]\npub(crate) fn Some(value: u8) -> u8 {\n'
                                          '    value + 1\n}\n'}
@@ -844,9 +813,13 @@ class UseBindingTests(unittest.TestCase):
                 self.fails({**base, **files, 'snapshots.rs': base['snapshots.rs'] + ('mod custom;\n' if files else '')},
                            {'snapshots.rs': root, 'snapshots/dest.rs': uses + MOVED_F.format('v()')},
                            'new glob import:')
-        # A new glob in a module that existed at base fails.
+        # A new glob in a module that existed at base fails, even without a move.
         self.fails(self.root('use self::x::v;\n', 'v()'), self.root('use self::x::v;\nuse self::z::*;\n', 'v()'),
                    'new glob import: use self::z::* in crate::snapshots')
+        base['snapshots/dest.rs'] = ''
+        base['snapshots.rs'] = 'mod dest;\n' + base['snapshots.rs']
+        self.fails(base, {**moved, 'snapshots/dest.rs': 'use super::*;\n' + MOVED_F.format('v()')},
+                   'new glob import: use super::* in crate::snapshots::dest')
 
     MACRO = 'macro_rules! imports {\n    () => {\n        use crate::snapshots::x::*;\n    };\n}\nimports!();\n'
 
@@ -856,17 +829,74 @@ class UseBindingTests(unittest.TestCase):
         base, head = self.move_f(self.MACRO, self.MACRO + 'use crate::snapshots::z::v;\n')
         self.fails(base, head, 'use added beside an item-level macro call: use crate::snapshots::z::v in '
                    'crate::snapshots::dest::new')
-        # Control: the name was bound explicitly where the items came from, so the expansion never bound it.
+        # A name bound explicitly at the source grants no exception beside a macro.
         base, head = self.move_f(self.MACRO + 'use crate::snapshots::x::v;\n',
                                  self.MACRO + 'use crate::snapshots::x::v;\n')
-        self.passes(base, head)
-        # The module the items left may re-import a name its own items defined, nothing else.
+        self.fails(base, head, 'use added beside an item-level macro call:')
+        # A name previously defined by an item grants no exception either.
         root = self.ROOT + self.MACRO.replace('imports', 'stays') + 'fn g() -> u8 {\n    1\n}\n'
         base = module_files(root + MOVED_F.format('g()'), self.SIBLINGS)
         moved = {'snapshots/dest.rs': 'use super::*;\n\n' + MOVED_F.format('g()')}
-        self.passes(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use dest::f;\n'})
+        self.fails(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use dest::f;\n'},
+                   'use added beside an item-level macro call:')
         self.fails(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use self::z::v;\n'},
                    'use added beside an item-level macro call: use self::z::v in crate::snapshots')
+
+    def test_source_globs_cannot_prove_a_binding_kept_its_identity(self):
+        # [regress] A source glob can inherit a newly shadowed value, prelude name or facade.
+        for name, body, extra in (
+            ('value', 'v()', 'use self::z::v;\n'),
+            ('prelude', 'Some(1).unwrap_or(0)', 'use self::custom::Some;\n'),
+            ('facade', 'v()', 'use self::z as old;\n'),
+        ):
+            with self.subTest(name):
+                siblings = {**self.SIBLINGS, 'snapshots/custom.rs':
+                            '#[allow(non_snake_case)]\npub(crate) fn Some(_: u8) -> Option<u8> { None }\n'}
+                if name == 'facade':
+                    base = module_files(self.ROOT + 'mod old;\nmod custom;\n',
+                                        {**siblings, 'snapshots/old.rs': VALUE.format(1) + MOVED_F.format(body)})
+                    head = {'snapshots.rs': self.ROOT + 'mod dest;\nmod custom;\n' + extra,
+                            'snapshots/old.rs': None, 'snapshots/dest.rs':
+                            'use crate::snapshots::old::*;\n' + MOVED_F.format(body),
+                            'snapshots/elsewhere.rs': VALUE.format(1)}
+                    head['snapshots.rs'] += 'mod elsewhere;\n'
+                else:
+                    root = self.ROOT + 'mod custom;\nuse self::x::*;\n'
+                    base = module_files(root + MOVED_F.format(body), siblings)
+                    head = {'snapshots.rs': root + 'mod dest;\n' + extra,
+                            'snapshots/dest.rs': 'use super::*;\n' + MOVED_F.format(body)}
+                self.fails(base, head, 'new glob import:')
+
+    def test_macro_names_do_not_prove_an_added_binding_is_safe(self):
+        # [regress] Source binding, moved definition, disabled value and type namespace grant no exception.
+        base, head = self.move_f(self.MACRO + 'use crate::snapshots::x::v;\n',
+                                 self.MACRO + 'use crate::snapshots::z::v;\n')
+        self.fails(base, head, 'use added beside an item-level macro call:')
+        for definition in ('fn v() -> u8 { 1 }\n', '#[cfg(any())]\nfn v() -> u8 { 1 }\n', 'trait v {}\n'):
+            with self.subTest(definition=definition):
+                root = self.ROOT + self.MACRO
+                base = module_files(root + definition + MOVED_F.format('v()'), self.SIBLINGS)
+                head = {'snapshots.rs': root + 'mod dest;\nuse self::z::v;\n' + MOVED_F.format('v()'),
+                        'snapshots/dest.rs': definition}
+                self.fails(base, head, 'use added beside an item-level macro call:')
+
+    def test_binding_attributes_preserve_original_literal_bytes(self):
+        # [regress] Global whitespace squash must not erase a cfg string, char or raw literal change.
+        for before, after in (('"a  b"', '"a b"'), ('r#"a  b"#', 'r#"a b"#'), ("'\t'", "' '")):
+            with self.subTest(before=before):
+                uses = f'#[cfg(flavor={before})]\nuse self::x as y;\n#[cfg(not(flavor={before}))]\nuse self::z as y;\n'
+                changed = uses.replace(before, after)
+                self.fails(self.root(uses, 'y::v()'), self.root(changed, 'y::v()'), 'use binding changed: y')
+                # Both an inline and an outlined parent contribute their original attributes.
+                for outlined in (False, True):
+                    base = module_files(f'#[cfg(flavor={before})]\nmod old' + (';\n' if outlined else
+                                        ' {\nuse super::x as y;\n}\n') + self.ROOT,
+                                        {**self.SIBLINGS, **({'snapshots/old.rs': 'use super::x as y;\n'}
+                                                           if outlined else {})})
+                    head = {'snapshots.rs': base['snapshots.rs'].replace(before, after)}
+                    self.fails(base, head, 'use binding changed: y')
+        self.passes(self.root('#[cfg(flavor="a  b")]\nuse self::x as y;\n', 'y::v()'),
+                    self.root('#[cfg(flavor="a  b")]\n\nuse self::x as y;\n', 'y::v()'))
 
 
 if __name__ == '__main__':

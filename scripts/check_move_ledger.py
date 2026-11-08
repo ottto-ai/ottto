@@ -18,10 +18,10 @@ across files. Before comparing, only these glue classes are reversed:
   (e) the indentation an item loses when an inline module becomes a file.
 
 Then every base item must equal exactly one head item byte for byte (comments,
-attributes, cfgs), and items that land in one file keep their base order. Three
+attributes, cfgs), and items that land in one file keep their base order. Two
 exceptions cover what rustfmt re-wraps once a visibility token makes a line too
 long; each still matches, listed as `reflowed`, only if the part that may
-re-wrap (the fn signature, the whole struct, the whole const/static/type item)
+re-wrap (the fn signature or the whole struct)
 holds no `!` (a macro can see token boundaries this lexer does not keep):
 
   - a `fn` whose text before `fn` and whose body, from its opening `{`, are
@@ -32,12 +32,9 @@ holds no `!` (a macro can see token boundaries this lexer does not keep):
   - a struct with named fields whose text is byte for byte equal outside its
     field declarations (from each field name to its `,`), when each field's
     tokens are equal with whitespace dropped; a visibility token may stand only
-    at the start of a field or before `struct`, and is judged per field;
-  - a `const`, `static` or `type` item whose text before its keyword is byte
-    for byte equal and whose only visibility token is the item-level one, when
-    its tokens from the keyword on are equal with whitespace dropped.
+    at the start of a field or before `struct`, and is judged per field.
 
-In all three, literals and comments stay exact, a number literal (`1.0`, `1e-3`,
+In both, literals and comments stay exact, a number literal (`1.0`, `1e-3`,
 `0x1F`, `1_000u64`, `1.0f32`) is one token, and whitespace between two
 punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
 item must match byte for byte. An item must sit under the same module
@@ -53,15 +50,15 @@ checked; adding, deleting or retyping one of them is checked as usual.
 
   - a name bound at base and at head must keep the same bindings: the same
     path, visibility and attributes (its own and its module's), the same number
-    of times (cfg-duplicated bindings are compared one to one);
-  - a binding that moves to another module may not reach further than before;
-  - a new glob fails, except `use <module>::*` in a module that is new at head
-    and receives moved items from <module>;
-  - a module that holds an item-level macro call and has moved items may add
-    only that glob and bindings of names its own items defined at base or, for
-    a new module, names every module its items came from defined or bound at
-    base (a macro can expand to `use` items this check cannot see; an item or
-    explicit binding already shadowed them);
+    of times (cfg-duplicated bindings are compared one to one); attributes
+    preserve original string, char and raw literal bytes, normalizing only
+    whitespace between tokens;
+  - an added binding matching removed target/attribute twins in other modules
+    fails if every candidate would reach further than before;
+  - every added glob in an existing module or a module with moved items fails;
+  - every added explicit binding beside an item-level macro call in a module
+    with moved items fails (a macro can expand to `use` items this check cannot
+    see);
   - other added and removed bindings are glue; a `use` item this check cannot
     read fails.
 
@@ -70,6 +67,13 @@ Visibility must stay equivalent: an item private in module M may become
 a module subtree that moves intact stays `pub(super)`; `pub` and `pub(crate)`
 stay as they are. A visibility that reaches further than before is a widened
 row and fails unless that item is named with --allow-widened.
+
+Known limits inherited from the base checker, not proven by this checker:
+escaping `super` paths with whitespace/comments (including function-local
+imports), `#[path]` declaration swaps, replacement items in retained old modules,
+and re-export identity (including moved imports with changed text/cfg or
+ambiguous source twins). Acceptance is a syntactic move check, not a semantic
+equivalence proof. Binding reach checks only add failures to the base checks.
 
 Exit status: 0 when the change is move-only (or with --report), 1 when it is
 not, 2 on a usage or setup error.
@@ -89,7 +93,6 @@ from pathlib import Path
 import rust_source_tree as rst
 
 GLUE = {"use", "mod-decl", "include", "inner-doc"}
-HEADER_REFLOW = ("const", "static", "type")
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 REPORT_LIMIT = 50
 # Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
@@ -201,7 +204,7 @@ def reflow(unit: Unit) -> tuple[tuple, list[tuple[int, str]]] | None:
     pass. Two units with equal keys are a reflowed move; the visibility rows are keyed by place (0 for
     the item, 1.. for each struct field) instead of text offset, which the re-wrap shifts. Any `!` means
     no pass: a macro call can see token boundaries this lexer does not keep."""
-    if unit.kind not in ("fn", "struct", *HEADER_REFLOW):
+    if unit.kind not in ("fn", "struct"):
         return None
     code = code_tokens(unit.text)
     keyword = next((index for index, (kind, piece, _, _) in enumerate(code)
@@ -213,18 +216,7 @@ def reflow(unit: Unit) -> tuple[tuple, list[tuple[int, str]]] | None:
         return None
     if unit.kind == "fn":
         return fn_reflow(unit, code, keyword, items)
-    if unit.kind in HEADER_REFLOW:
-        return header_reflow(unit, code, keyword, items)
     return struct_reflow(unit, code, keyword, items)
-
-
-def header_reflow(unit: Unit, code: Code, keyword: int, items: list[int]):
-    """A const, static or type item whose text before its keyword is byte for byte equal; from the keyword
-    on only whitespace may differ, and its only visibility token is the item-level one."""
-    if len(unit.vis) != len(items) or any(piece == "!" and kind == "punct" for kind, piece, _, _ in code):
-        return None
-    key = (unit.container, unit.text[:code[keyword][3]], layout_free(code, keyword, len(code)))
-    return key, [(0, token) for _, token in unit.vis]
 
 
 def fn_reflow(unit: Unit, code: Code, fn_at: int, items: list[int]):
@@ -673,23 +665,49 @@ Binding = tuple[str, str, tuple[str, ...]]  # (path, ending `::*` for a glob; vi
 
 @dataclass
 class Uses:
-    """One commit's `use` bindings and item names per module, over the checked files."""
+    """One commit's `use` bindings per module, over the checked files."""
 
     bound: dict[Module, dict[str, list[tuple[Binding, str]]]] = field(default_factory=dict)  # name -> (.., file:line)
-    defined: dict[Module, set[str]] = field(default_factory=dict)
     unread: list[str] = field(default_factory=list)  # file:line of each `use` item this cannot read
 
 
-NOT_DEFINING = {"comment", "macro", "macro_rules", "impl", "include", "inner-doc", "inner-attr", "unknown"}
+class BindingLexed(rst.Lexed):
+    """Original attribute text: normalize whitespace tokens, never literal contents."""
+
+    def _squash(self, start: int, end: int) -> str:
+        text = self.text[start:end]
+        return "".join(" " if token.kind == "ws" else text[token.start:token.end]
+                       for token in rst.tokenize(text)).strip()
+
+
+class BindingSource(rst.Source):
+    """Reuse the source and module walker with literal-preserving binding metadata.
+
+    Item matching still uses the original source/tree, unchanged from the base checker.
+    """
+
+    def __init__(self, source: rst.Source):
+        self.source = source
+        self._lexed: dict[str, BindingLexed] = {}
+
+    def exists(self, path: str) -> bool:
+        return self.source.exists(path)
+
+    def lexed(self, path: str) -> BindingLexed:
+        if path not in self._lexed:
+            self._lexed[path] = BindingLexed(self.source.read(path), path)
+        return self._lexed[path]
 
 
 def uses_of(source: rst.Source, tree: rst.Tree, files: list[str]) -> Uses:
     uses = Uses()
+    source = BindingSource(source)
+    tree = rst.build_tree(source, [context for contexts in tree.contexts.values()
+                                   for context in contexts if context.how == "root"])
 
     def walk(lexed: rst.Lexed, path: str, items: list[rst.Item], module: Module, chain: frozenset[str]) -> None:
         for item in items:
             if item.kind == "mod" and item.members is not None:
-                uses.defined.setdefault(module, set()).add(item.name)
                 walk(lexed, path, item.members, module + (item.name,), chain | rst.module_attrs(item.attrs))
             elif item.kind in ("use", "extern-crate"):
                 where = f"{path}:{lexed.line(item.lead)}"
@@ -705,8 +723,6 @@ def uses_of(source: rst.Source, tree: rst.Tree, files: list[str]) -> Uses:
                                use_visibility(lexed, item), attrs)
                     uses.bound.setdefault(module, {}).setdefault(text if name == "*" else name, []).append(
                         (binding, where))
-            elif item.kind not in NOT_DEFINING:
-                uses.defined.setdefault(module, set()).add(item.name)
 
     for path in files:
         contexts = tree.contexts.get(path, [])
@@ -799,18 +815,6 @@ def use_bindings(text: str) -> list[tuple[str, tuple[str, ...]]] | None:
     return out if pieces[stop] == ";" and stop == len(code) - 1 else None
 
 
-def glob_module(glob: str, module: Module) -> Module:
-    """The module a `<path>::*` glob written in `module` imports from."""
-    parts = glob.split("::")[:-1]
-    here = list(module)
-    if parts and parts[0] == "crate":
-        here, parts = list(module[:1]), parts[1:]
-    while parts and parts[0] in ("super", "self"):
-        if parts.pop(0) == "super":
-            here = here[:-1]
-    return tuple(here + parts)
-
-
 def shown(bindings: list[Binding]) -> str:
     return "; ".join(" ".join(filter(None, (*attrs, vis, "use", path))) for path, vis, attrs in bindings) or "none"
 
@@ -821,11 +825,9 @@ def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module]
     for side_name, uses in (("base", base), ("head", head)):
         for where in uses.unread:
             ledger.failures.append(f"cannot read the `use` item at {where} ({side_name})")
-    sources: dict[Module, set[Module]] = {}
     touched: set[Module] = set()
     for old, new in ledger.pairs:
         if old.module is not None and new.module is not None and old.module != new.module:
-            sources.setdefault(new.module, set()).add(old.module)
             touched |= {old.module, new.module}
     macros = {unit.module for unit in head_units if unit.kind == "macro"}
     removed: dict[str, list[tuple[Module, Binding]]] = {}
@@ -845,13 +847,10 @@ def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module]
                                            f"{shown(before)} -> {shown(after)}")
                 continue
             if name.endswith("::*"):
-                if module in base_modules or glob_module(name, module) not in sources.get(module, ()):
+                if module in base_modules or module in touched:
                     ledger.failures.append(f"new glob import: {shown(after)} in {show(module)} ({where})")
                 continue
-            if module in touched and module in macros and not (
-                    name in base.defined.get(module, ()) if module in base_modules else sources.get(module) and all(
-                        name in base.defined.get(source, ()) or name in base.bound.get(source, {})
-                        for source in sources[module])):
+            if module in touched and module in macros:
                 ledger.failures.append(f"use added beside an item-level macro call: {shown(after)} in "
                                        f"{show(module)} ({where})")
             for path, vis, attrs in after:

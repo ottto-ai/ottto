@@ -253,11 +253,11 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 - `tests/`: tests that span stages; test data under `tests/fixtures/`.
 
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
-except that a fn with an unchanged body may have a signature rustfmt re-wrapped, a struct may
-have named fields rustfmt re-wrapped and a const, static or type alias may be re-wrapped; only
-visibility, `use`/`mod` lines, path literals and wrappers change; a `use` binding kept by name
-keeps its path, visibility and attributes, and a new glob fails unless a new module imports the
-module its items came from; edits to listed validator files that anchor on moved code are
+except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
+change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
+multiplicity; modules with moved items reject every added glob and every added explicit binding
+beside an item-level macro call; edits to listed validator files that anchor on moved code are
 reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
