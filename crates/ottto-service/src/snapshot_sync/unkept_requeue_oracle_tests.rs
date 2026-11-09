@@ -1087,8 +1087,14 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 if fp != *faulted {
                     assert!(!sender.accepted_fingerprints.contains(faulted));
                     assert!(!sender.accepted_body_witnesses.contains_key(faulted));
-                } else {
-                    assert_eq!(&witness, body, "same fingerprint, same body");
+                } else if witness != *body {
+                    // Same semantic fingerprint, different body: credit is for the exact
+                    // (fingerprint, body) pair just ACKed, never for the refused bytes.
+                    assert_ne!(
+                        sender.accepted_body_witnesses.get(faulted),
+                        Some(body),
+                        "the refused body never gets credit"
+                    );
                 }
                 // (iii) The refused record is cleared or superseded in the
                 // next durable checkpoint: no RetryPending for this entity.
