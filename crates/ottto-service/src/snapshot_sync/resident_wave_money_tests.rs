@@ -481,7 +481,15 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
                 .unwrap();
             let mut actual =
                 RouteResult::emitted(Mode::Ram, SnapshotSource::ClaudeCode, wire, &offered);
-            actual.accepted = wide.route.accepted.clone();
+            let body = &wide.route.snapshots[held];
+            let fp = body["snapshot_fingerprint"].as_str().unwrap();
+            actual.accepted.insert(
+                held.clone(),
+                Accepted {
+                    body: body.clone(),
+                    witness: progress.accepted_body_witnesses[fp].clone(),
+                },
+            );
             canonical_entities(&mut actual);
             let mut expected = cold.clone();
             expected
