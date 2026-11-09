@@ -85,5 +85,4 @@ pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String 
 }
 crate::heap_layout_bound::fields!(Counts; contributions, observation);
 #[cfg(test)]
-#[path = "ownership_diagnostics_tests.rs"]
 mod tests;

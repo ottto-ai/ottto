@@ -156,5 +156,4 @@ pub(in crate::snapshots) struct Counts {
 }
 
 #[cfg(test)]
-#[path = "money_freshness_tests.rs"]
 mod tests;
