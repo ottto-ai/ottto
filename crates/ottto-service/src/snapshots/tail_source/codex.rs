@@ -676,5 +676,4 @@ pub(super) fn shape_layout(s: &mut crate::durable_tail_codec::Shape) {
 }
 
 #[cfg(test)]
-#[path = "codex_tests.rs"]
 pub(in crate::snapshots) mod tests;

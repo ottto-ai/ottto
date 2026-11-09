@@ -553,7 +553,7 @@ pub(in crate::snapshots) fn claude_api_cache_creation(
     };
     if interpreted.is_none() {
         with_claude_api_cache_creation_rejections(|counter| {
-            let _ = counter.fetch_update(
+            let _ = counter.try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |count| count.checked_add(1),

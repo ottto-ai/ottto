@@ -13,39 +13,39 @@
 #[cfg(test)]
 mod rss_test_support;
 
-use super::codex_counting_version::{self, AckEvidence, CountingVersion};
-use super::*;
 use crate::codex_scan_diagnostics::CountingV2Receipts;
 use crate::owned_heap::OwnedMap;
+use crate::snapshots::codex_counting_version::{self, AckEvidence, CountingVersion};
+use crate::snapshots::*;
 
 /// Counting-contract row cap for one open turn's staged UI money. Changing it
 /// is a new counting version. Overflow publishes the staged rows and marks the
 /// turn `ui_published`; it never depends on memory pressure.
-pub(super) const MAX_PENDING_ROWS: usize = 64;
+pub(in crate::snapshots) const MAX_PENDING_ROWS: usize = 64;
 /// Counting-contract content cap for one staged row: the byte length of every
 /// string it holds (bucket, row identity, selector context/sources, activity
 /// times). A larger row takes the same deterministic overflow path, so the
 /// staged state has a schema bound without a resource-dependent decision.
-pub(super) const MAX_PENDING_ROW_CONTENT_BYTES: usize = 4096;
+pub(in crate::snapshots) const MAX_PENDING_ROW_CONTENT_BYTES: usize = 4096;
 const MAX_TURN_ID_BYTES: usize = 128;
 /// Recently closed turn ids kept for closure finality. A native or a
 /// `task_started` for one of them can never reopen native authority.
-pub(super) const MAX_CLOSED_TURN_IDS: usize = 64;
+pub(in crate::snapshots) const MAX_CLOSED_TURN_IDS: usize = 64;
 /// Counting-contract size of the per-session filter of EVERY closed turn id:
 /// 8 KiB, four bit positions per id from SHA-256 (no process
 /// seed), so membership is a pure function of the record prefix. It has no
 /// false negatives; a hit outside the exact ring is unconfirmed (a reopen
 /// beyond 64 closures, or a false positive) and only zeroes natives.
-pub(super) const CLOSED_TURN_FILTER_BYTES: usize = 8 * 1024;
+pub(in crate::snapshots) const CLOSED_TURN_FILTER_BYTES: usize = 8 * 1024;
 const CLOSED_TURN_FILTER_HASHES: usize = 4;
 const CLOSED_TURN_FILTER_WORDS: usize = CLOSED_TURN_FILTER_BYTES / 8;
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 
 /// `input, cached_input, cache_write_input, output, reasoning_output, total`.
-pub(super) type T6 = [u64; 6];
+pub(in crate::snapshots) type T6 = [u64; 6];
 
 #[derive(Clone)]
-pub(super) struct CodexCounting {
+pub(in crate::snapshots) struct CodexCounting {
     evidence: AckEvidence,
     cutover_unix_ms: Option<i64>,
     version: Option<CountingVersion>,
@@ -56,7 +56,7 @@ pub(super) struct CodexCounting {
 }
 
 impl CodexCounting {
-    pub(super) fn new(evidence: AckEvidence, cutover_unix_ms: Option<i64>) -> Self {
+    pub(in crate::snapshots) fn new(evidence: AckEvidence, cutover_unix_ms: Option<i64>) -> Self {
         Self {
             evidence,
             cutover_unix_ms,
@@ -71,13 +71,13 @@ impl CodexCounting {
         not(test),
         allow(dead_code, reason = "no consumer yet: activation gate")
     )]
-    pub(super) fn counters(&self) -> Option<&OccurrenceCounters> {
+    pub(in crate::snapshots) fn counters(&self) -> Option<&OccurrenceCounters> {
         self.reducer.as_ref().map(|reducer| &reducer.counters)
     }
 
     /// UI money staged in a still-open UI-only turn: visible local debt,
     /// never published on a timer.
-    pub(super) fn open_turn_ui_pending(&self) -> Option<(u64, UsageTotals)> {
+    pub(in crate::snapshots) fn open_turn_ui_pending(&self) -> Option<(u64, UsageTotals)> {
         let turn = self.reducer.as_ref()?.turn.as_ref()?;
         let mut usage = UsageTotals::default();
         for row in turn.pending.values() {
@@ -90,7 +90,7 @@ impl CodexCounting {
 
     /// Adds this parse's receipts and open-turn debt to the scan's local
     /// diagnostics. A Legacy decision adds only its repeat drops.
-    pub(super) fn fold_receipts(&self, into: &mut CountingV2Receipts) {
+    pub(in crate::snapshots) fn fold_receipts(&self, into: &mut CountingV2Receipts) {
         let Some(reducer) = self.reducer.as_deref() else {
             return;
         };
@@ -200,7 +200,7 @@ impl CodexCounting {
 
     /// A retained reduction may continue under fresh evidence only when that
     /// evidence would have selected the same rule (B handoff H4).
-    pub(super) fn reusable_under(&self, fresh: &CodexCounting) -> bool {
+    pub(in crate::snapshots) fn reusable_under(&self, fresh: &CodexCounting) -> bool {
         self.cutover_unix_ms == fresh.cutover_unix_ms
             && match self.version {
                 None => self.evidence == fresh.evidence,
@@ -278,35 +278,35 @@ struct PendingRow {
 /// Local receipts. Usage sums are six-dimension vectors; UI sums use
 /// `input + output` as their total.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct OccurrenceCounters {
-    pub(super) native_counted: u64,
-    pub(super) native_not_authority: u64,
-    pub(super) native_restated: u64,
-    pub(super) native_inside_holed_coverage: u64,
-    pub(super) native_inside_holed_coverage_usage: T6,
-    pub(super) native_chain_gap: u64,
-    pub(super) native_chain_overlap: u64,
-    pub(super) native_chain_overlap_covered: T6,
-    pub(super) native_epoch_reset: u64,
-    pub(super) native_conflict: u64,
-    pub(super) native_outside_open_turn: u64,
-    pub(super) native_outside_open_turn_usage: T6,
-    pub(super) native_after_turn_closed: u64,
-    pub(super) native_after_turn_closed_usage: T6,
-    pub(super) native_after_ui_flush: u64,
-    pub(super) native_after_ui_flush_usage: T6,
-    pub(super) ui_equal_total_repeat: u64,
-    pub(super) ui_equal_total_repeat_usage: T6,
-    pub(super) ui_in_native_turn_not_counted: u64,
-    pub(super) ui_in_native_turn_not_counted_usage: T6,
-    pub(super) ui_in_unbound_span: u64,
-    pub(super) v2_cumulative_base_uncounted: u64,
-    pub(super) v2_cumulative_base_uncounted_usage: T6,
-    pub(super) turn_closure_mismatch: u64,
-    pub(super) turn_reopened: u64,
-    pub(super) closed_filter_hit_unconfirmed: u64,
-    pub(super) closed_filter_hit_unconfirmed_native_usage: T6,
-    pub(super) pending_overflow_flushes: u64,
+pub(in crate::snapshots) struct OccurrenceCounters {
+    pub(in crate::snapshots) native_counted: u64,
+    pub(in crate::snapshots) native_not_authority: u64,
+    pub(in crate::snapshots) native_restated: u64,
+    pub(in crate::snapshots) native_inside_holed_coverage: u64,
+    pub(in crate::snapshots) native_inside_holed_coverage_usage: T6,
+    pub(in crate::snapshots) native_chain_gap: u64,
+    pub(in crate::snapshots) native_chain_overlap: u64,
+    pub(in crate::snapshots) native_chain_overlap_covered: T6,
+    pub(in crate::snapshots) native_epoch_reset: u64,
+    pub(in crate::snapshots) native_conflict: u64,
+    pub(in crate::snapshots) native_outside_open_turn: u64,
+    pub(in crate::snapshots) native_outside_open_turn_usage: T6,
+    pub(in crate::snapshots) native_after_turn_closed: u64,
+    pub(in crate::snapshots) native_after_turn_closed_usage: T6,
+    pub(in crate::snapshots) native_after_ui_flush: u64,
+    pub(in crate::snapshots) native_after_ui_flush_usage: T6,
+    pub(in crate::snapshots) ui_equal_total_repeat: u64,
+    pub(in crate::snapshots) ui_equal_total_repeat_usage: T6,
+    pub(in crate::snapshots) ui_in_native_turn_not_counted: u64,
+    pub(in crate::snapshots) ui_in_native_turn_not_counted_usage: T6,
+    pub(in crate::snapshots) ui_in_unbound_span: u64,
+    pub(in crate::snapshots) v2_cumulative_base_uncounted: u64,
+    pub(in crate::snapshots) v2_cumulative_base_uncounted_usage: T6,
+    pub(in crate::snapshots) turn_closure_mismatch: u64,
+    pub(in crate::snapshots) turn_reopened: u64,
+    pub(in crate::snapshots) closed_filter_hit_unconfirmed: u64,
+    pub(in crate::snapshots) closed_filter_hit_unconfirmed_native_usage: T6,
+    pub(in crate::snapshots) pending_overflow_flushes: u64,
 }
 
 struct NativeRecord {
@@ -622,7 +622,7 @@ impl OccurrenceReducer {
 }
 
 impl SnapshotAccumulator {
-    pub(super) fn codex_counting_v2(&self) -> bool {
+    pub(in crate::snapshots) fn codex_counting_v2(&self) -> bool {
         self.codex_counting
             .as_ref()
             .is_some_and(|counting| counting.version == Some(CountingVersion::V2))
@@ -634,7 +634,7 @@ impl SnapshotAccumulator {
 
     /// Runs for every owned Codex line before the shared UI usage path. The
     /// first owned record fixes the session's counting version.
-    pub(super) fn observe_codex_counting_line(
+    pub(in crate::snapshots) fn observe_codex_counting_line(
         &mut self,
         value: &Value,
         timestamp: Option<&str>,
@@ -888,7 +888,7 @@ impl SnapshotAccumulator {
     /// `last` (published, staged or native-turn) so the existing tier/curve
     /// consumers keep their meaning; repeats and exact duplicates are `None`.
     #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
-    pub(super) fn set_codex_v2_cumulative_usage(
+    pub(in crate::snapshots) fn set_codex_v2_cumulative_usage(
         &mut self,
         model: Option<String>,
         usage: UsageTotals,
@@ -961,7 +961,7 @@ impl SnapshotAccumulator {
     /// is nothing to repeat. `may_drop` is false for a line dated before the
     /// forward date: it counts and is not a counted drop, but its tuple is
     /// still noted.
-    pub(super) fn codex_legacy_ui_repeat(
+    pub(in crate::snapshots) fn codex_legacy_ui_repeat(
         &mut self,
         last: Option<UsageTotals>,
         total: UsageTotals,
@@ -981,7 +981,7 @@ impl SnapshotAccumulator {
 
     /// Shared admission decision, with no publication/staging. `false` is
     /// the unbound span admitted before the bound equal-total repeat filter.
-    pub(super) fn decide_codex_usage(
+    pub(in crate::snapshots) fn decide_codex_usage(
         &mut self,
         model: Option<String>,
         usage: UsageTotals,
@@ -1196,7 +1196,7 @@ fn pending_row_content_bytes(
 /// Heap charge of the fixed reducer state at its id caps: the boxed reducer,
 /// two response ids, the open turn id, the closed-turn ring and the filter.
 #[cfg(test)]
-pub(super) const fn max_fixed_heap_bytes() -> usize {
+pub(in crate::snapshots) const fn max_fixed_heap_bytes() -> usize {
     std::mem::size_of::<OccurrenceReducer>()
         + std::mem::align_of::<OccurrenceReducer>()
         + 2 * MAX_RESPONSE_ID_BYTES
@@ -1209,7 +1209,7 @@ pub(super) const fn max_fixed_heap_bytes() -> usize {
 /// Requested-layout charge of a maximal staged turn: 64 rows at the content
 /// cap, each with full selector maps, plus the outer row map's nodes.
 #[cfg(test)]
-pub(super) const fn max_pending_heap_bytes() -> usize {
+pub(in crate::snapshots) const fn max_pending_heap_bytes() -> usize {
     const fn nodes(entries: usize, key: usize, value: usize) -> usize {
         (entries + 1) * (256 + 12 * std::mem::size_of::<usize>() + 11 * (key + value))
     }

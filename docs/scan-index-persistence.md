@@ -502,8 +502,8 @@ exact bytes were written. A save whose serialized ledger equals the bytes alread
 on disk writes neither file and claims no generation: under the progress lock, the
 current receipt must still seal those bytes, and only the directory sync is
 retried. Sources not on state v2 do not create companions.
-The diagnostic `upload_receipts` ring is bounded and truncated; it cannot authorize
-recovery or substitute for a missing exact receipt.
+The diagnostic upload history (`ottto receipts`) is truncated per row and expires
+after 30 days; it cannot authorize recovery or substitute for a missing exact receipt.
 
 For **receipt-first** crashes, replay the newest companion before applying any
 source-DB handoff. Only its exact predecessor or replacement is accepted; replay
@@ -600,6 +600,10 @@ committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect.
+Custody stores and upload history allow read-only SQLite mappings up to 2147418112 bytes per database.
+The effective ceiling is read back at open; larger databases continue through ordinary reads.
+WAL/FULL, fullfsync, secure_delete and erasure maintenance retain their settings.
+A mapped-file I/O fault or external truncation can terminate the service; supervised installs restart and recover through SQLite.
 Each save or import that writes rows reports `row_cap_max`, the largest written
 row's logical bytes as a percent of its sizing target with its kind name, and
 `row_cap_alarm` at 75% or more, including above 100%, which commits and never

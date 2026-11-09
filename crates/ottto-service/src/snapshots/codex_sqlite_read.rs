@@ -391,7 +391,7 @@ static GUARD_IO: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
 
 /// A method that calls the base file object's own method.
 macro_rules! pass_through {
-    ($name:ident, $method:ident, ($($arg:ident: $ty:ty),*), $missing:expr) => {
+    ($name:ident, $method:ident, ($($arg:ident: $ty:ty),*), $missing:expr_2021) => {
         unsafe extern "C" fn $name(file: *mut ffi::sqlite3_file, $($arg: $ty),*) -> c_int {
             let inner = inner_file(file);
             // SAFETY: SQLite calls a file's methods only after its open

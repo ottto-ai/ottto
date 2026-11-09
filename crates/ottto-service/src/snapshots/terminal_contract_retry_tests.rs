@@ -1,4 +1,4 @@
-use super::*;
+use crate::snapshots::*;
 use terminal_contract_retry::with_contract;
 
 fn terminal(source: SnapshotSource) -> SnapshotQuarantineRecord {

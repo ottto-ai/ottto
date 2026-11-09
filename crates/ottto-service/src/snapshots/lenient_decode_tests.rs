@@ -633,7 +633,6 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
         );
     }
 }
-
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
@@ -665,6 +664,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     .unwrap();
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
+        refold_unchanged: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
@@ -702,7 +702,7 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
     file.write_all(&prefix[..prefix.len() - 1]).unwrap();
     let field = b",\"claude_request_census\":";
     file.write_all(field).unwrap();
-    for byte in [b'[', b']'] {
+    for byte in *b"[]" {
         let block = [byte; 8192];
         if byte == b']' {
             file.write_all(b"0").unwrap();

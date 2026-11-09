@@ -442,7 +442,7 @@ pub fn run_context_composition_worker() -> Result<()> {
 fn set_utility_qos() {
     #[cfg(target_os = "macos")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
         }
         const QOS_CLASS_UTILITY: u32 = 0x11;
@@ -1266,7 +1266,7 @@ pub(super) fn run_source(
 pub(super) fn release_memory() {
     #[cfg(target_os = "macos")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
         // SAFETY: a null zone requests relief from all system malloc zones.

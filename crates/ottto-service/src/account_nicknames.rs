@@ -585,7 +585,7 @@ mod tests {
         }
         let scratch = crate::test_scratch::ScratchDir::new("nicknames");
         let root = scratch.as_ref();
-        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root);
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root) };
         let account = serde_json::from_value(serde_json::json!({
             "state":"connected", "user":{"id":"user-one","email":"synthetic@example.invalid"},
             "organization":{"id":"org-one","name":"Synthetic"},
@@ -633,7 +633,7 @@ mod tests {
         let reclaimed = generation().unwrap();
         apply_upload(Some(&reclaimed), Some(&[]));
         assert_eq!(read().connected, Some(true));
-        std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+        unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
     }
 }
 

@@ -31,8 +31,8 @@ CLEAN = {
     f'{SRC}/snapshots.rs': '//! Snapshots.\n\nmod state_v2;\nmod wire;\nmod tests;\n',
     f'{SRC}/snapshots/wire.rs': '//! Wire.\n\nmod frame;\n',
     f'{SRC}/snapshots/wire/frame.rs': '//! Frames.\n',
-    f'{SRC}/snapshots/tests.rs': 'mod frame_tests;\n',
-    f'{SRC}/snapshots/tests/frame_tests.rs': 'fn t() {}\n',
+    f'{SRC}/snapshots/tests.rs': 'mod frame;\n\n#[test]\nfn hub() {}\n',
+    f'{SRC}/snapshots/tests/frame.rs': '#[test]\nfn t() {}\n',
     f'{SRC}/snapshots/tests/fixtures/frame.json': '{}\n',
     f'{SRC}/snapshots/state_v2.rs': '//! State.\n\nmod sqlite;\n',
     f'{SRC}/snapshots/state_v2/sqlite.rs': '//! SQLite.\n',
@@ -83,7 +83,8 @@ class LayoutTests(unittest.TestCase):
     def test_a_clean_tree_reports_nothing_and_exits_zero(self):
         status, found, out = self.findings()
         self.assertEqual((status, found), (0, []), out)
-        self.assertIn('size 0, tree 0, budget 0, path-include 0, names 0, header 0, stutter 0', out)
+        self.assertIn('size 0, tree 0, budget 0, path-include 0, names 0, header 0, stutter 0, tests 0, '
+                      'isolation 0, test-stem 0', out)
         self.assertIn('report only', out)
 
     def test_size_needs_a_row_and_the_ceilings_only_fall(self):
@@ -127,12 +128,14 @@ class LayoutTests(unittest.TestCase):
         files[f'{SRC}/snapshots/wire.rs'] = '//! Wire.\n\nmod frame;\n' + ''.join(f'mod f{i:02};\n' for i in range(25))
         files[f'{SRC}/snapshots/wire/frame.rs'] = '//! Frames.\n\nmod a;\n'
         files[f'{SRC}/snapshots/wire/frame/a.rs'] = '//! A.\n\nmod b;\n'
-        files[f'{SRC}/snapshots/wire/frame/a/b.rs'] = '//! B.\n'
+        # Three directories below snapshots/ (like sources/claude/census/x.rs) is within budget.
+        files[f'{SRC}/snapshots/wire/frame/a/b.rs'] = '//! B.\n\nmod c;\n'
+        files[f'{SRC}/snapshots/wire/frame/a/b/c.rs'] = '//! C.\n'
         self.write(files)
         _, found, _ = self.findings()
         self.assertEqual([f for f in found if f.startswith('budget')], [
             'budget: snapshots/wire: 27 entries, over 25',
-            'budget: snapshots/wire/frame/a/b.rs: module depth 4, over 3',
+            'budget: snapshots/wire/frame/a/b/c.rs: module depth 4, over 3',
         ])
 
     def test_path_and_include_need_a_row_and_the_list_only_shrinks(self):
@@ -181,6 +184,54 @@ class LayoutTests(unittest.TestCase):
             'names: snapshots/e2_retry.rs: coded stem e2',
             'names: snapshots/shared_value.rs: generic stem shared',
             'stutter: snapshots/wire/wire_codec.rs: name starts with its directory name wire',
+        ])
+
+    def test_tests_only_in_tests_rs_or_a_tests_dir(self):
+        self.write({
+            f'{SRC}/snapshots/wire.rs': ('//! Wire.\n\nmod frame;\nmod tests;\n\n'
+                                         '#[cfg(test)]\nmod inline {\n    #[test]\n    fn a() {}\n\n'
+                                         '    #[tokio::test]\n    async fn b() {}\n}\n'),
+            # Comments, strings and `#[cfg(test)]` are not tests.
+            f'{SRC}/snapshots/wire/frame.rs': ('//! Frames.\n\n// #[test]\nconst S: &str = "#[test]";\n\n'
+                                               '#[cfg(test)]\nmod tests;\n'),
+            f'{SRC}/snapshots/wire/frame/tests.rs': '#[test]\nfn c() {}\n',
+            f'{SRC}/snapshots/wire/tests.rs': '#[test]\nfn d() {}\n',
+        })
+        _, found, _ = self.findings()
+        self.assertEqual([f for f in found if f.startswith('tests')], [
+            'tests: snapshots/wire.rs: 2 #[test] outside tests.rs and tests/',
+        ])
+
+    def test_isolation_keeps_each_source_to_its_own_paths(self):
+        self.write({
+            f'{SRC}/snapshots.rs': CLEAN[f'{SRC}/snapshots.rs'] + 'mod sources;\nmod scan;\n',
+            f'{SRC}/snapshots/sources.rs': '//! Sources.\n\nmod claude;\nmod codex;\n',
+            f'{SRC}/snapshots/sources/claude.rs': ('//! Claude.\n\nmod census;\n\n'
+                                                  'use crate::snapshots::sources::codex::Line;\n'),
+            # Its own source, comments and strings are fine.
+            f'{SRC}/snapshots/sources/claude/census.rs': ('//! Census.\n\n'
+                                                         'use crate::snapshots::sources::claude::Row;\n'
+                                                         '// sources::codex::Line\nconst S: &str = "sources::pi";\n'),
+            f'{SRC}/snapshots/sources/codex.rs': ('//! Codex.\n\nfn f() {\n    sources::claude::row();\n'
+                                                 '    sources::pi::row();\n    sources::claude::other();\n}\n'),
+            # Outside a source dir any source may be named.
+            f'{SRC}/snapshots/scan.rs': '//! Scan.\n\nuse super::sources::codex::Line;\n',
+        })
+        _, found, _ = self.findings()
+        self.assertEqual([f for f in found if f.startswith('isolation')], [
+            'isolation: snapshots/sources/claude.rs: names sources::codex on line(s) 5',
+            'isolation: snapshots/sources/codex.rs: names sources::claude on line(s) 4, 6',
+            'isolation: snapshots/sources/codex.rs: names sources::pi on line(s) 5',
+        ])
+
+    def test_test_stem_flags_files_ending_in_tests(self):
+        self.write({
+            f'{SRC}/snapshots/wire.rs': '//! Wire.\n\nmod frame;\nmod frame_tests;\n',
+            f'{SRC}/snapshots/wire/frame_tests.rs': 'fn t() {}\n',
+        })
+        _, found, _ = self.findings()
+        self.assertEqual([f for f in found if f.startswith('test-stem')], [
+            'test-stem: snapshots/wire/frame_tests.rs: stem ends in _tests; use tests.rs or tests/<topic>.rs',
         ])
 
     def test_enforce_fails_only_on_named_rules(self):

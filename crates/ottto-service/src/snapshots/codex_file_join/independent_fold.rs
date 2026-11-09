@@ -24,7 +24,7 @@ pub(super) fn parser(
 }
 
 macro_rules! counts {
-    ($into:expr, $from:expr) => {{
+    ($into:expr_2021, $from:expr_2021) => {{
         $into.input_tokens = $from.input_tokens;
         $into.output_tokens = $from.output_tokens;
         $into.cache_read_tokens = $from.cache_read_tokens;

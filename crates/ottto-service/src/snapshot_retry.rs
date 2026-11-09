@@ -17,8 +17,9 @@ pub(crate) const STATE_NODES: usize = 8192;
 pub(crate) fn state_shape(bytes: &[u8]) -> Result<()> {
     shape_nodes(bytes, STATE_NODES).map(|_| ())
 }
-/// Count outgoing nodes once for oldest-row eviction. No decoded container is
-/// constructed; the serialized byte limit already bounds this traversal.
+/// Count a value's nodes without constructing a decoded container; the
+/// serialized byte limit already bounds this traversal.
+#[cfg(test)]
 pub(crate) fn state_nodes(bytes: &[u8]) -> Result<usize> {
     shape_nodes(bytes, bytes.len())
 }

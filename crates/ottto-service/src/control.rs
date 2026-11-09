@@ -1066,14 +1066,13 @@ fn handle_command(
             limit,
             since,
             source,
+            before,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            if limit == 0
-                || usize::from(limit) > crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
-            {
+            if limit == 0 || usize::from(limit) > crate::upload_receipts::UPLOAD_RECEIPT_PAGE_SIZE {
                 return Err(LocalApiError::InvalidRequest(format!(
                     "receipts limit must be between 1 and {}",
-                    crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
+                    crate::upload_receipts::UPLOAD_RECEIPT_PAGE_SIZE
                 )));
             }
             if let Some(value) = since.as_deref() {
@@ -1085,11 +1084,12 @@ fn handle_command(
                     })?;
             }
             to_value(
-                crate::upload_receipts::read(
+                crate::upload_receipts::read_page(
                     &default_support_dir(),
                     limit,
                     since.as_deref(),
                     source,
+                    before,
                 )
                 .map_err(|_| {
                     LocalApiError::LocalOperationFailed(
@@ -18839,14 +18839,14 @@ for line in sys.stdin:
 
         fn set_os(key: &'static str, value: OsString) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         /// Temporarily unset an env var, restoring it (or its absence) on drop.
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
-            std::env::remove_var(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -18854,9 +18854,9 @@ for line in sys.stdin:
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -20074,7 +20074,7 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn handles_authenticated_receipts_request_from_private_ring() {
-        let support_root = telemetry_key_store_root("receipts-control");
+        let support_root = control_test_root("receipts-control");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         crate::upload_receipts::append_transport_error(&support_root, SourceKind::Codex, 3)
@@ -20091,6 +20091,7 @@ for line in sys.stdin:
                     limit: 10,
                     since: None,
                     source: Some(SourceKind::Codex),
+                    before: None,
                 },
             },
         );
@@ -32602,7 +32603,7 @@ X-API-Key = "otel_redacted"
             let original = pending.claim_commit.clone().unwrap();
             authority(&mut pending).canonical_snapshot_namespace = None;
             edit(&mut pending, &mut prior);
-            let prior = Some(&prior).filter(|_| row != "no prior");
+            let prior = (row != "no prior").then_some(&prior);
             continue_prior_snapshot_namespace(&mut pending, prior);
             // A claim the commit validator refuses cannot promote at all.
             let commit = pending.claim_commit.get_or_insert_with(|| original.clone());

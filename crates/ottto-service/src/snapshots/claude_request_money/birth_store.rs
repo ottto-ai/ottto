@@ -515,7 +515,7 @@ impl BirthStore {
     pub(crate) fn observations(
         &self,
         session: &str,
-    ) -> impl Iterator<Item = (LocationKey, i128)> + '_ {
+    ) -> impl Iterator<Item = (LocationKey, i128)> + '_ + use<'_> {
         self.get(session).into_iter().flat_map(|s| {
             s.4.iter()
                 .filter_map(|&(p, b, _, _)| (b != 0).then_some((p, i128::from(b))))

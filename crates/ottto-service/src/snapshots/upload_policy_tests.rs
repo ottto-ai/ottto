@@ -1,5 +1,5 @@
 //! Snapshot lane of the upload filter, checked on the serialized wire body.
-use super::*;
+use crate::snapshots::*;
 use crate::upload_policy::{apply_upload_policy_v1, HIDDEN_MCP_NAME};
 
 const NAME: &str = "SENTINEL-NAME";
@@ -61,7 +61,7 @@ fn seeded_summary() -> SnapshotActivitySummary {
 }
 
 fn seeded() -> SnapshotItem {
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.session_display_name = Some(TITLE.to_string());
     item.session_display_name_source = Some("fixture".to_string());
     item.workspace_display_label = Some(WORKSPACE.to_string());

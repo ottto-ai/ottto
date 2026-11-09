@@ -18,6 +18,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   whose length grew past its saved size is never dropped from discovery because of its age. A file
   never read, last modified more than 60 days before the walk, is not read for the first time;
   a file already read, owed or queued keeps the walk's window.
+  Each listing gives hint priority to indexed files whose listing stamp changed since their
+  last read, promoting queued files in place. Unchanged census files, including owed files,
+  keep their ordinary queue order. Existing selection budgets and read gates still apply.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
@@ -254,10 +257,25 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
 except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
-have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and
-wrappers change; edits to listed validator files that anchor on moved code are reported) and
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
+change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
+multiplicity; modules with moved items reject every added glob and every added explicit binding
+beside an item-level macro call; edits to listed validator files that anchor on moved code are
+reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
+Whole-file moves are checked with `scripts/check_file_moves.py move` (a module file and every
+file below it move byte for byte; only the old parent's `mod` line, one facade alias at the old
+name and the new parent's `mod` line change; no `super` path in a moved file reaches outside its
+subtree), after an optional change checked with `scripts/check_file_moves.py absolutize` that only
+replaces such `super` paths with the `crate::` path they denote. Both modes are built for
+accidental changes by trusted authors and fail on what they cannot reason about (include edges
+into moved files, unlisted derives, attributes and item-level macros, allowlisted names rebound
+anywhere in the crate, macros reached through `use .. as` aliases or `$m!` forwarding, location
+macros, glob importers that see the new name, globs whose private items change with the move,
+unknown Cargo targets, old-path strings after decoding escapes and normalizing separators and
+case) and print their limits: implicit log targets, panic locations, approved derives assumed
+context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
 
 ## Never drop data

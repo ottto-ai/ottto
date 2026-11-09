@@ -10,7 +10,8 @@ across files. Before comparing, only these glue classes are reversed:
   (a) visibility tokens (`pub`, `pub(..)`) on item, field, method and
       `thread_local!` static lines; not inside `macro_rules!`;
   (b) whole `use` / `pub(..) use` items, `mod x;` items and item-level
-      `include!(..);` items, with their attributes, and `//!` file docs;
+      `include!(..);` items, with their attributes, and `//!` file docs; a
+      `use` item only under the binding rules below;
   (c) the path literal inside `#[path = ".."]`, `include!`, `include_str!` and
       `include_bytes!`;
   (d) the `impl X {` / `}` and inline `mod x {` / `}` wrappers;
@@ -19,9 +20,9 @@ across files. Before comparing, only these glue classes are reversed:
 Then every base item must equal exactly one head item byte for byte (comments,
 attributes, cfgs), and items that land in one file keep their base order. Two
 exceptions cover what rustfmt re-wraps once a visibility token makes a line too
-long; both still match, listed as `reflowed`, only if the part that may
-re-wrap (the fn signature, the whole struct) holds no `!` (a macro can see token
-boundaries this lexer does not keep):
+long; each still matches, listed as `reflowed`, only if the part that may
+re-wrap (the fn signature or the whole struct)
+holds no `!` (a macro can see token boundaries this lexer does not keep):
 
   - a `fn` whose text before `fn` and whose body, from its opening `{`, are
     byte for byte equal and whose only visibility token is the item-level one
@@ -33,9 +34,12 @@ boundaries this lexer does not keep):
     tokens are equal with whitespace dropped; a visibility token may stand only
     at the start of a field or before `struct`, and is judged per field.
 
-In both, literals and comments stay exact and whitespace between two
+In both, literals and comments stay exact, a number literal (`1.0`, `1e-3`,
+`0x1F`, `1_000u64`, `1.0f32`) is one token, and whitespace between two
 punctuation tokens that could join (`& &` vs `&&`) still counts. Every other
-item must match byte for byte. An item must sit under the same module
+item must match byte for byte. Pairing and its checks stay as in the base
+checker; numeric validation only rejects those pairs, never selects new ones.
+An item must sit under the same module
 attributes (`#[cfg(..)]` and the like), may only lose nesting, and every path
 literal must resolve, from its new file, to a target with the same bytes.
 A module's own `#[rustfmt::skip]` is left out of its attributes: a rustfmt tool
@@ -44,11 +48,34 @@ attribute changes formatting only, never the compiled item (an item's own
 In-place edits of the regular files in VALIDATOR_EDITS are listed and not
 checked; adding, deleting or retyping one of them is checked as usual.
 
+`use` bindings, per module (a glob counts as a binding of `<path>::*`):
+
+  - a name bound at base and at head must keep the same bindings: the same
+    path, visibility and attributes (its own and its module's), the same number
+    of times (cfg-duplicated bindings are compared one to one); attributes
+    preserve original string, char and raw literal bytes, normalizing only
+    whitespace between tokens;
+  - an added binding matching removed target/attribute twins in other modules
+    fails if every candidate would reach further than before;
+  - every added glob in an existing module or a module with moved items fails;
+  - every added explicit binding beside an item-level macro call in a module
+    with moved items fails (a macro can expand to `use` items this check cannot
+    see);
+  - other added and removed bindings are glue; a `use` item this check cannot
+    read fails.
+
 Visibility must stay equivalent: an item private in module M may become
 `pub(super)` in a direct child of M or `pub(in M)` deeper; a `pub(super)` inside
 a module subtree that moves intact stays `pub(super)`; `pub` and `pub(crate)`
 stay as they are. A visibility that reaches further than before is a widened
 row and fails unless that item is named with --allow-widened.
+
+Known limits inherited from the base checker, not proven by this checker:
+escaping `super` paths with whitespace/comments (including function-local
+imports), `#[path]` declaration swaps, replacement items in retained old modules,
+and re-export identity (including moved imports with changed text/cfg or
+ambiguous source twins). Acceptance is a syntactic move check, not a semantic
+equivalence proof. Binding reach checks only add failures to the base checks.
 
 Exit status: 0 when the change is move-only (or with --report), 1 when it is
 not, 2 on a usage or setup error.
@@ -118,10 +145,32 @@ JOINLESS = set("()[]{},;")
 Code = list[tuple[str, str, bool, int]]  # (kind, text, whitespace before it, offset) per non-whitespace token
 
 
-def code_tokens(text: str) -> Code:
+# A Rust number literal from its first digit: a float's `.digits` (or a bare `1.` before anything but `.`
+# or a name), an exponent with its sign, and a suffix. Hex, octal and binary literals end at the suffix.
+NUMBER = re.compile(r"[0-9][0-9_]*(?:\.[0-9][0-9_]*|\.(?![.\w]))?(?:[eE][+-]?[0-9_]*[0-9][0-9_]*)?\w*")
+
+
+def code_tokens(text: str, join_numbers: bool = True) -> Code:
+    """Non-whitespace tokens; a number literal the lexer splits at `.`, `+` or `-` is one token here."""
     tokens = rst.tokenize(text)
-    return [(token.kind, text[token.start:token.end], index > 0 and tokens[index - 1].kind == "ws", token.start)
-            for index, token in enumerate(tokens) if token.kind != "ws"]
+    out: Code = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        end, after = token.end, index + 1
+        if join_numbers and token.kind == "num":
+            found = NUMBER.match(text, token.start)
+            stop = found.end() if found else token.end
+            probe = index
+            while probe < len(tokens) and tokens[probe].end < stop:
+                probe += 1
+            if probe < len(tokens) and tokens[probe].end == stop:
+                end, after = stop, probe + 1
+        if token.kind != "ws":
+            out.append((token.kind, text[token.start:end], index > 0 and tokens[index - 1].kind == "ws",
+                        token.start))
+        index = after
+    return out
 
 
 def depth_at(code: Code, offset: int) -> int:
@@ -152,14 +201,14 @@ def layout_free(code: Code, first: int, stop: int, drop: set[int] = frozenset())
     return tuple(out)
 
 
-def reflow(unit: Unit) -> tuple[tuple, list[tuple[int, str]]] | None:
+def reflow(unit: Unit, join_numbers: bool = True) -> tuple[tuple, list[tuple[int, str]]] | None:
     """(key, visibility) of a rustfmt re-wrap (see the module docs), or None when `unit` gets no reflow
     pass. Two units with equal keys are a reflowed move; the visibility rows are keyed by place (0 for
     the item, 1.. for each struct field) instead of text offset, which the re-wrap shifts. Any `!` means
     no pass: a macro call can see token boundaries this lexer does not keep."""
     if unit.kind not in ("fn", "struct"):
         return None
-    code = code_tokens(unit.text)
+    code = code_tokens(unit.text, join_numbers)
     keyword = next((index for index, (kind, piece, _, _) in enumerate(code)
                     if kind == "ident" and piece == unit.kind and depth_at(code, code[index][3]) == 0), None)
     if keyword is None:
@@ -524,12 +573,19 @@ def module_moves(pairs: list[tuple[Unit, Unit]], head_modules: set[tuple[str, ..
 
 
 def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]],
-          allow_widened: set[str]) -> Ledger:
+          allow_widened: set[str], uses: tuple[Uses, Uses] | None = None,
+          base_modules: set[tuple[str, ...]] = frozenset()) -> Ledger:
     ledger = Ledger()
     pairs, lost, gained = match_units(base, head)
     # A unit with no reflow pass gets a key of its own, so it never pairs.
-    reflow_of = {id(unit): reflow(unit) or ((id(unit),), unit.vis) for unit in lost + gained}
+    # Keep the base checker's pairing exactly: a finer number key must never repair a bad
+    # same-file/duplicate pairing and thereby erase one of the base checker's failures.
+    reflow_of = {id(unit): reflow(unit, join_numbers=False) or ((id(unit),), unit.vis) for unit in lost + gained}
     reflowed, lost, gained = match_units(lost, gained, key=lambda unit: reflow_of[id(unit)][0])
+    strict = {id(unit): reflow(unit) for pair in reflowed for unit in pair}
+    numeric_changes = [(old, new) for old, new in reflowed
+                       if strict[id(old)] is None or strict[id(new)] is None
+                       or strict[id(old)][0] != strict[id(new)][0]]
     # A re-wrap shifts text offsets, so reflowed units compare visibility by place instead.
     ledger.reflowed = [(replace(old, vis=reflow_of[id(old)][1]), replace(new, vis=reflow_of[id(new)][1]))
                        for old, new in reflowed]
@@ -555,6 +611,14 @@ def check(base: list[Unit], head: list[Unit], head_modules: set[tuple[str, ...]]
                     f"order changed in {new_file}: {after[0].label} ({after[0].where()}) now follows "
                     f"{before[0].label} ({before[0].where()})")
                 break
+    if uses is not None:
+        check_uses(ledger, *uses, base_modules, head, moves)
+    # All base checks above have run on the original pairs. Numeric validation only adds failures;
+    # discard rejected pairs from the printed ledger afterward, never re-pair them.
+    explain_differences(ledger, [old for old, _ in numeric_changes], [new for _, new in numeric_changes])
+    rejected = {(old.file, old.seq) for old, _ in numeric_changes}
+    ledger.reflowed = [(old, new) for old, new in ledger.reflowed if (old.file, old.seq) not in rejected]
+    ledger.pairs = [(old, new) for old, new in ledger.pairs if (old.file, old.seq) not in rejected]
     return ledger
 
 
@@ -577,12 +641,7 @@ def check_visibility(ledger: Ledger, old: Unit, new: Unit, moves: dict, allow_wi
     old_vis, new_vis = dict(old.vis), dict(new.vis)
     for offset in sorted(set(old_vis) | set(new_vis)):
         before, after = old_vis.get(offset, ""), new_vis.get(offset, "")
-        reach = scope(before, old.module)
-        for cut in range(len(reach), 0, -1):
-            if reach[:cut] in moves:
-                reach = moves[reach[:cut]] + reach[cut:]
-                break
-        now = scope(after, new.module)
+        reach, now = reaches(before, old.module, after, new.module, moves)
         if now[:len(reach)] == reach:
             if before != after and now != reach:
                 ledger.notes.append(f"narrowed: {old.label} {before or 'private'} -> {after or 'private'}")
@@ -594,6 +653,228 @@ def check_visibility(ledger: Ledger, old: Unit, new: Unit, moves: dict, allow_wi
         else:
             ledger.widened.append(row)
             ledger.failures.append(row)
+
+
+def reaches(before: str, old_module: tuple[str, ...], after: str, new_module: tuple[str, ...], moves: dict
+            ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(the base reach, mapped through whole-module moves, and the head reach) of a visibility token."""
+    reach = scope(before, old_module)
+    for cut in range(len(reach), 0, -1):
+        if reach[:cut] in moves:
+            reach = moves[reach[:cut]] + reach[cut:]
+            break
+    return reach, scope(after, new_module)
+
+
+def widens(before: str, old_module: tuple[str, ...], after: str, new_module: tuple[str, ...], moves: dict) -> bool:
+    reach, now = reaches(before, old_module, after, new_module, moves)
+    return now[:len(reach)] != reach
+
+
+# ---------------------------------------------------------------- `use` bindings (glue class (b))
+
+Module = tuple[str, ...]
+Binding = tuple[str, str, tuple[str, ...]]  # (path, ending `::*` for a glob; visibility; attributes)
+
+
+@dataclass
+class Uses:
+    """One commit's `use` bindings per module, over the checked files."""
+
+    bound: dict[Module, dict[str, list[tuple[Binding, str]]]] = field(default_factory=dict)  # name -> (.., file:line)
+    unread: list[str] = field(default_factory=list)  # file:line of each `use` item this cannot read
+
+
+class BindingLexed(rst.Lexed):
+    """Original attribute text: normalize whitespace tokens, never literal contents."""
+
+    def _squash(self, start: int, end: int) -> str:
+        text = self.text[start:end]
+        return "".join(" " if token.kind == "ws" else text[token.start:token.end]
+                       for token in rst.tokenize(text)).strip()
+
+
+class BindingSource(rst.Source):
+    """Reuse the source and module walker with literal-preserving binding metadata.
+
+    Item matching still uses the original source/tree, unchanged from the base checker.
+    """
+
+    def __init__(self, source: rst.Source):
+        self.source = source
+        self._lexed: dict[str, BindingLexed] = {}
+
+    def exists(self, path: str) -> bool:
+        return self.source.exists(path)
+
+    def lexed(self, path: str) -> BindingLexed:
+        if path not in self._lexed:
+            self._lexed[path] = BindingLexed(self.source.read(path), path)
+        return self._lexed[path]
+
+
+def uses_of(source: rst.Source, tree: rst.Tree, files: list[str]) -> Uses:
+    uses = Uses()
+    source = BindingSource(source)
+    tree = rst.build_tree(source, [context for contexts in tree.contexts.values()
+                                   for context in contexts if context.how == "root"])
+
+    def walk(lexed: rst.Lexed, path: str, items: list[rst.Item], module: Module, chain: frozenset[str]) -> None:
+        for item in items:
+            if item.kind == "mod" and item.members is not None:
+                walk(lexed, path, item.members, module + (item.name,), chain | rst.module_attrs(item.attrs))
+            elif item.kind in ("use", "extern-crate"):
+                where = f"{path}:{lexed.line(item.lead)}"
+                found = use_bindings(lexed.text[item.lead:item.end])
+                if found is None:
+                    uses.unread.append(where)
+                    continue
+                attrs = tuple(item.attrs) + tuple(sorted(attr for attr in chain
+                                                         if re.sub(r"\s+", "", attr) not in FORMATTING_MODULE_ATTRS))
+                for name, target in found:
+                    text = "::".join(target).replace("::::", "::") + ("::*" if name == "*" else "")
+                    binding = (text if name in ("*", target[-1]) else f"{text} as {name}",
+                               use_visibility(lexed, item), attrs)
+                    uses.bound.setdefault(module, {}).setdefault(text if name == "*" else name, []).append(
+                        (binding, where))
+
+    for path in files:
+        contexts = tree.contexts.get(path, [])
+        context = next((c for c in contexts if c.module[0] == "crate"), contexts[0] if contexts else None)
+        if context is not None:
+            lexed = source.lexed(path)
+            walk(lexed, path, lexed.items, context.module, context.chain)
+    return uses
+
+
+def use_visibility(lexed: rst.Lexed, item: rst.Item) -> str:
+    index = lexed.next_code(item.first_token, item.last_token + 1)
+    while lexed.is_punct(index, "#"):
+        index = lexed.next_code(lexed.match[lexed.next_code(index + 1)] + 1)
+    if not lexed.is_ident(index, "pub"):
+        return ""
+    return squash(lexed.text[lexed.tokens[index].start:lexed.tokens[lexed.skip_vis(index) - 1].end])
+
+
+def use_bindings(text: str) -> list[tuple[str, tuple[str, ...]]] | None:
+    """(bound name, or "*" for a glob, and path) for each name a `use` or `extern crate` item binds; None
+    when its shape is not understood. A `self` leaf binds its parent's name; `as _` binds nothing."""
+    code = [(kind, piece) for kind, piece, _, _ in code_tokens(text) if kind not in ("comment", "doc")]
+    pieces = [piece for _, piece in code] + ["", ""]
+    depth, at = 0, None
+    for index, (kind, piece) in enumerate(code):
+        if kind == "punct":
+            depth += (piece in "([{") - (piece in ")]}")
+        elif depth == 0 and kind == "ident" and piece in ("use", "extern"):
+            at = index
+            break
+    if at is None:
+        return None
+    out: list[tuple[str, tuple[str, ...]]] = []
+
+    def ident(index: int) -> bool:
+        return index < len(code) and code[index][0] == "ident"
+
+    def tree(index: int, prefix: tuple[str, ...]) -> int:
+        path = list(prefix)
+        if pieces[index] == ":" and pieces[index + 1] == ":":
+            path.append("::")
+            index += 2
+        while True:
+            if pieces[index] == "*":
+                out.append(("*", tuple(path)))
+                return index + 1
+            if pieces[index] == "{":
+                index += 1
+                while pieces[index] != "}":
+                    index = tree(index, tuple(path))
+                    if pieces[index] == ",":
+                        index += 1
+                    elif pieces[index] != "}":
+                        raise ValueError(index)
+                return index + 1
+            if not ident(index):
+                raise ValueError(index)
+            path.append(pieces[index])
+            index += 1
+            if pieces[index] == ":" and pieces[index + 1] == ":":
+                index += 2
+                continue
+            name = path[-1]
+            if pieces[index] == "as":
+                if not ident(index + 1):
+                    raise ValueError(index)
+                name, index = pieces[index + 1], index + 2
+            if path[-1] == "self":
+                path.pop()
+                if not path:
+                    raise ValueError(index)
+                name = path[-1] if name == "self" else name
+            if name != "_":
+                out.append((name, tuple(path)))
+            return index
+
+    try:
+        if pieces[at] == "extern":
+            if pieces[at + 1] != "crate" or not ident(at + 2):
+                return None
+            name, stop = pieces[at + 2], at + 3
+            if pieces[stop] == "as" and ident(stop + 1):
+                name, stop = pieces[stop + 1], stop + 2
+            out = [] if name == "_" else [(name, ("::", pieces[at + 2]))]
+        else:
+            stop = tree(at + 1, ())
+    except ValueError:
+        return None
+    return out if pieces[stop] == ";" and stop == len(code) - 1 else None
+
+
+def shown(bindings: list[Binding]) -> str:
+    return "; ".join(" ".join(filter(None, (*attrs, vis, "use", path))) for path, vis, attrs in bindings) or "none"
+
+
+def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module], head_units: list[Unit],
+               moves: dict) -> None:
+    """Class (b) for `use` items (see the module docs)."""
+    for side_name, uses in (("base", base), ("head", head)):
+        for where in uses.unread:
+            ledger.failures.append(f"cannot read the `use` item at {where} ({side_name})")
+    touched: set[Module] = set()
+    for old, new in ledger.pairs:
+        if old.module is not None and new.module is not None and old.module != new.module:
+            touched |= {old.module, new.module}
+    macros = {unit.module for unit in head_units if unit.kind == "macro"}
+    removed: dict[str, list[tuple[Module, Binding]]] = {}
+    for module, names in base.bound.items():
+        for name, entries in names.items():
+            if name not in head.bound.get(module, {}):
+                removed.setdefault(name, []).extend((module, binding) for binding, _ in entries)
+    for module, names in sorted(head.bound.items()):
+        before_names = base.bound.get(module, {})
+        for name, entries in sorted(names.items()):
+            where = entries[0][1]
+            after = sorted(binding for binding, _ in entries)
+            if name in before_names:
+                before = sorted(binding for binding, _ in before_names[name])
+                if before != after:
+                    ledger.failures.append(f"use binding changed: {name} in {show(module)} ({where}): "
+                                           f"{shown(before)} -> {shown(after)}")
+                continue
+            if name.endswith("::*"):
+                if module in base_modules or module in touched:
+                    ledger.failures.append(f"new glob import: {shown(after)} in {show(module)} ({where})")
+                continue
+            if module in touched and module in macros:
+                ledger.failures.append(f"use added beside an item-level macro call: {shown(after)} in "
+                                       f"{show(module)} ({where})")
+            for path, vis, attrs in after:
+                was = [(old, binding[1]) for old, binding in removed.get(name, [])
+                       if old != module and binding[0] == path and binding[2] == attrs]
+                if was and all(widens(before, old, vis, module, moves) for old, before in was):
+                    row = (f"widened: use {name} ({where}): {was[0][1] or 'private'} in {show(was[0][0])} -> "
+                           f"{vis or 'private'} in {show(module)}")
+                    ledger.widened.append(row)
+                    ledger.failures.append(row)
 
 
 def allowed(old: Unit, new: Unit, names: set[str]) -> bool:
@@ -678,7 +959,7 @@ def side(repo: Path, rev: str, changed: list[str], other: rst.GitSource | None =
         tree.links += part.links
     files = scope_files(source, tree, changed)
     units = [unit for path in files for unit in units_of(source, tree, path)]
-    return source, tree, files, units
+    return source, tree, files, units, uses_of(source, tree, files)
 
 
 def validator_edits(repo: Path, base: str, head: str) -> list[str]:
@@ -717,13 +998,14 @@ def main(argv: list[str] | None = None) -> int:
         if not changed:
             print("move-ledger: nothing to check")
             return 0
-        base_source, _, base_files, base_units = side(repo, base_sha, changed)
-        head_source, head_tree, head_files, head_units = side(repo, head_sha, changed, base_source)
+        base_source, base_tree, base_files, base_units, base_uses = side(repo, base_sha, changed)
+        head_source, head_tree, head_files, head_units, head_uses = side(repo, head_sha, changed, base_source)
     except rst.SourceError as error:
         print(f"move-ledger: {error}", file=sys.stderr)
         # A report never blocks a change; an enforced check does.
         return 0 if args.report else 2
-    ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened))
+    ledger = check(base_units, head_units, head_tree.modules, set(args.allow_widened), (base_uses, head_uses),
+                   base_tree.modules)
     for path in head_files:
         if path in changed and path not in head_tree.contexts:
             ledger.failures.append(f"not reachable by mod: {path}")

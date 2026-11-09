@@ -2,42 +2,42 @@
 //! `freshness_alarm` is each source's persisted per-file debt (`g7_debt`) under
 //! `debt`, aggregated at each root walk's end, so it survives restarts.
 //! `Counts` are count-only Claude gauges over the bounded FirstPending stamps.
-use super::g7_debt::{Report, Roster, Walk};
-use super::SnapshotSource;
+use crate::snapshots::g7_debt::{Report, Roster, Walk};
+use crate::snapshots::SnapshotSource;
 use serde::Serialize;
 
-pub(super) const ALARM_AFTER: u64 = 6 * 60 * 60;
+pub(in crate::snapshots) const ALARM_AFTER: u64 = 6 * 60 * 60;
 
 /// One root walk's fold. A walk spans passes and every pass reloads the index,
 /// so the fold stays in this process until the walk ends. The debt it counts
 /// is durable: only a restart mid-walk loses the pages already walked.
 #[derive(Debug)]
-pub(super) struct WalkFold {
+pub(in crate::snapshots) struct WalkFold {
     authority_terminal_files: u64,
     authority_terminal_oldest_age_s: u64,
-    pub(super) debt: Walk,
+    pub(in crate::snapshots) debt: Walk,
 }
 impl WalkFold {
-    pub(super) const EMPTY: Self = Self {
+    pub(in crate::snapshots) const EMPTY: Self = Self {
         authority_terminal_files: 0,
         authority_terminal_oldest_age_s: 0,
         debt: Walk::EMPTY,
     };
 
-    pub(super) fn resume(source: SnapshotSource) -> Self {
+    pub(in crate::snapshots) fn resume(source: SnapshotSource) -> Self {
         with_walks(|walks| std::mem::replace(&mut walks.folds[source as usize], Self::EMPTY))
     }
 
     /// An authority-terminal file with debt has real unuploaded growth that no
     /// read can reach, so it carries its own label too.
-    pub(super) fn authority_terminal_file(&mut self, age_s: u64) {
+    pub(in crate::snapshots) fn authority_terminal_file(&mut self, age_s: u64) {
         self.authority_terminal_files += 1;
         self.authority_terminal_oldest_age_s = self.authority_terminal_oldest_age_s.max(age_s);
     }
 
     /// `debt`: the walk's aggregate, `None` for a graph with no Tail store.
     /// A walk's end replaces the source's retirement roster.
-    pub(super) fn page_end(
+    pub(in crate::snapshots) fn page_end(
         mut self,
         source: SnapshotSource,
         walk_ended: bool,
@@ -76,7 +76,7 @@ const NO_WALKS: Walks = Walks {
 /// The one gate for deleting by absence: the source's last root walk began
 /// in this process and listed every root with no walk issue. Its roster, and
 /// whether that walk's one backlog run is still due (claimed by this call).
-pub(super) fn index_current_since_start(
+pub(in crate::snapshots) fn index_current_since_start(
     source: SnapshotSource,
 ) -> Option<(std::sync::Arc<Roster>, bool)> {
     with_walks(|walks| {
@@ -110,18 +110,18 @@ fn with_walks<T>(body: impl FnOnce(&mut Walks) -> T) -> T {
 }
 
 #[cfg(test)]
-pub(crate) use super::g7_debt::walk_ended_for_test;
+pub(crate) use crate::snapshots::g7_debt::walk_ended_for_test;
 
 /// A restart forgets every walk in progress and every aggregate.
 #[cfg(test)]
-pub(super) fn restart_for_test() {
+pub(in crate::snapshots) fn restart_for_test() {
     with_walks(|walks| *walks = NO_WALKS);
 }
 
 /// Unknown debt alarms: it never reads as fresh. So does any authority-terminal
 /// file, at any age, until its debt settles.
 fn emit(source: SnapshotSource, fold: &WalkFold, basis: &'static str, debt: Option<&Report>) {
-    let now_ms = super::sampled_scan::now_seconds().saturating_mul(1000);
+    let now_ms = crate::snapshots::sampled_scan::now_seconds().saturating_mul(1000);
     crate::local_resource_diagnostics::traversal_point(
         "freshness_alarm",
         source.api_slug(),
@@ -144,17 +144,16 @@ pub(crate) fn report_failed_pass(source: SnapshotSource) {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub(super) struct Counts {
-    pub(super) ages_are_process_local_lower_bounds: bool,
-    pub(super) skipped_untracked_entries: u64,
+pub(in crate::snapshots) struct Counts {
+    pub(in crate::snapshots) ages_are_process_local_lower_bounds: bool,
+    pub(in crate::snapshots) skipped_untracked_entries: u64,
     /// No indexed scan and not a replay: separate from indexed held work.
-    pub(super) discovered_unread_tracked_files: u64,
-    pub(super) discovered_unread_untracked_entries: u64,
-    pub(super) oldest_discovered_unread_age_seconds: u64,
-    pub(super) discovered_unread_over_24h_tracked_files: u64,
-    pub(super) indexed_or_replay_tracked_files: u64,
+    pub(in crate::snapshots) discovered_unread_tracked_files: u64,
+    pub(in crate::snapshots) discovered_unread_untracked_entries: u64,
+    pub(in crate::snapshots) oldest_discovered_unread_age_seconds: u64,
+    pub(in crate::snapshots) discovered_unread_over_24h_tracked_files: u64,
+    pub(in crate::snapshots) indexed_or_replay_tracked_files: u64,
 }
 
 #[cfg(test)]
-#[path = "money_freshness_tests.rs"]
 mod tests;
