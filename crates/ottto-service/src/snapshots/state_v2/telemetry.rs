@@ -107,11 +107,12 @@ fn tail_event(name: &'static str, value: &impl Serialize, fold: impl FnOnce(&mut
         stats.latest.insert(name, value);
     }
 }
-/// One Tail read transaction's wall time in milliseconds.
-pub(super) fn tail_load(ms: u128) {
+/// One completed Tail read transaction's wall time and reduction page bytes.
+pub(super) fn tail_load(ms: u128, bytes: u64) {
     tail_event("tail_load_tx_ms", &ms, |tail| {
         let ms = u64::try_from(ms).unwrap_or(u64::MAX);
         tail.loads += 1;
+        tail.load_bytes_sum = tail.load_bytes_sum.saturating_add(bytes);
         tail.load_ms_sum = tail.load_ms_sum.saturating_add(ms);
         tail.load_ms_max = tail.load_ms_max.max(ms);
     });
@@ -302,6 +303,7 @@ struct Decoded {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct TailPass {
     loads: u64,
+    load_bytes_sum: u64,
     load_ms_sum: u64,
     load_ms_max: u64,
     stage_reports: u64,
@@ -765,8 +767,8 @@ mod ops_tests {
             )
         });
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            for ms in [3, 0, 10] {
-                tail_load(ms);
+            for (ms, bytes) in [(3, 10), (0, 0), (10, 100)] {
+                tail_load(ms, bytes);
             }
             tail_stage(2, 100, 100);
             tail_stage(5, 40, 100);
@@ -782,7 +784,7 @@ mod ops_tests {
         assert_eq!(
             rows[0]["tail_per_pass"],
             serde_json::json!({
-                "loads": 3, "load_ms_sum": 13, "load_ms_max": 10,
+                "loads": 3, "load_bytes_sum": 110, "load_ms_sum": 13, "load_ms_max": 10,
                 "stage_reports": 2, "stage_files_max": 5, "stage_bytes_max": 100,
             })
         );
@@ -797,7 +799,7 @@ mod ops_tests {
     fn tail_rows_outside_a_pass_print_the_full_row() {
         let previous = PASS.with(|pass| std::mem::take(&mut *pass.borrow_mut()));
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            tail_load(7);
+            tail_load(7, 10);
             tail_stage(1, 2, 3);
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);

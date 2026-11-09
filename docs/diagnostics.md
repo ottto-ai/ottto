@@ -83,7 +83,7 @@ its last instance. Outside a pass, each change prints the full snapshot at once.
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
-| `tail_per_pass.{loads,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Tail read transactions since the pass started, their summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
+| `tail_per_pass.{loads,load_bytes_sum,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Completed Tail read transactions since the pass started, their summed decoded reduction-page bytes (excluding heads and revisions), summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
@@ -456,6 +456,15 @@ they reset at process start and never decide anything.
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
 | `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
 | `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
+
+Each existing `native_collection_page` row also carries scalar
+`counts.tail_loads` and `counts.tail_load_bytes`: successful Tail hits on that
+native page and the sum of their decoded reduction-page bytes (the same bytes
+as `tail_db_load_bytes.page`, excluding heads and revisions). Both are zero
+when there are no hits, drain to zero after each page, and are separate for
+Claude, Codex and Pi. Use these per-page fields for page memory models;
+`tail_per_pass.load_bytes_sum` instead follows the existing completed read
+transactions, including a transaction whose later reduction validation fails.
 
 `tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
 directory beside a scan index. Each pass removes the record directory alone
