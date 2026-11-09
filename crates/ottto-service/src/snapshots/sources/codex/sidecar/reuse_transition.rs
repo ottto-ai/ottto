@@ -16,7 +16,7 @@ pub(super) fn seed_sidecars(c: &Corpus) -> rusqlite::Connection {
 }
 
 /// [money] Cached sidecars feed the native Tail, restore, restart-between-pages,
-/// binary-witness upgrade, real post-ACK placement and quiet-restart routes.
+/// compatible binary upgrade, real post-ACK placement and quiet-restart routes.
 #[test]
 fn codex_sidecar_reuse_transition() {
     let _lock = DECODER_TEST_LOCK
@@ -118,13 +118,9 @@ fn codex_sidecar_reuse_transition() {
     ] {
         let mut restored = ScanIndex::load(session.path()).unwrap();
         e2_pipeline_scan_fixture::age_listing_for_test(&mut restored);
-        if label == "upgrade" {
-            restored
-                .active_quarantine_witness
-                .as_mut()
-                .unwrap()
-                .collector_version = "0.1.239".into();
-        }
+        // This unit keeps the persisted format unchanged. The compatible
+        // binary-upgrade arm starts a new process owner from the saved index;
+        // no native sidecar facts can cross that process boundary.
         let (working, scan, ..) = run(restored, owner.clone());
         let d = scan.local_codex_diagnostics.as_ref().unwrap();
         assert_eq!(
