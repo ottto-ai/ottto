@@ -222,8 +222,6 @@ pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
-mod first_read_tests;
-#[cfg(test)]
 mod held_audit_restore_tests;
 pub(crate) mod line_delivery;
 #[cfg(test)]
