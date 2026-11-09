@@ -637,13 +637,26 @@ impl HeaderInventory {
             let current = open_candidate_beneath_root(&candidate)?.metadata()?;
             let stamp = FileStamp::capture(current.clone())?;
             // One securely acquired physical witness for both durable and RAM facts.
-            let joined_archive = if codex_archive_path(&candidate.path)
+            // Durable facts keep precedence; each later source runs only when
+            // every earlier one missed. A lookup error fails the member only
+            // when no source produced facts, with the first error as before.
+            let (mut lookups, mut errors, mut failed) = (0, 0, None);
+            let mut settle = |found: Result<Option<CachedHeader>>| {
+                lookups += 1;
+                found.unwrap_or_else(|error| {
+                    errors += 1;
+                    failed.get_or_insert(error);
+                    None
+                })
+            };
+            let joined_archive = (codex_archive_path(&candidate.path)
                 && index.files.get(&key).is_some_and(|entry| {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
-                }) {
-                state_v2::load_head(index, &key, 1)?
-                    .filter(|head| {
+                }))
+            .then(|| {
+                settle(state_v2::load_head(index, &key, 1).map(|head| {
+                    head.filter(|head| {
                         head.common
                             .inventory
                             .as_ref()
@@ -658,28 +671,31 @@ impl HeaderInventory {
                             read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
                         })
                     })
-            } else {
-                None
-            };
-            let durable = joined_archive.or(index
-                .codex_physical_matches(&key, &current)?
-                .filter(|(matched, _)| *matched)
-                .and_then(|(_, head)| {
-                    let facts = head.common.inventory.as_ref();
-                    let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
-                        tail_source::codex::header_facts(head.revision, &head.body)
-                            .ok()?
-                            .1
-                    })?;
-                    Some(CachedHeader {
-                        stamp: stamp.clone(),
-                        owner,
-                        created_unix_ms: facts.and_then(|facts| facts.created_unix_ms),
-                        read_bytes: facts.map_or(0, |facts| {
-                            usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
-                        }),
-                    })
-                }));
+                }))
+            })
+            .flatten();
+            let durable = joined_archive.or_else(|| {
+                settle(index.codex_physical_matches(&key, &current).map(|matched| {
+                    matched
+                        .filter(|(matched, _)| *matched)
+                        .and_then(|(_, head)| {
+                            let facts = head.common.inventory.as_ref();
+                            let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
+                                tail_source::codex::header_facts(head.revision, &head.body)
+                                    .ok()?
+                                    .1
+                            })?;
+                            Some(CachedHeader {
+                                stamp: stamp.clone(),
+                                owner,
+                                created_unix_ms: facts.and_then(|facts| facts.created_unix_ms),
+                                read_bytes: facts.map_or(0, |facts| {
+                                    usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
+                                }),
+                            })
+                        })
+                }))
+            });
             let reused = durable
                 .or_else(|| {
                     let cached = cache?
@@ -694,6 +710,13 @@ impl HeaderInventory {
                     self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
                     (facts, metadata_witness(&current))
                 });
+            if let Some(cache) = cache {
+                let reused = reused.as_ref().map(|(facts, _)| facts.read_bytes);
+                cache.note_header_lookups(lookups, reused.map_or(0, |_| errors), reused);
+            }
+            if let (None, Some(error)) = (&reused, failed) {
+                return Err(error);
+            }
             let (facts, witness) = match reused {
                 Some(header) => header,
                 None => {
@@ -5563,6 +5586,143 @@ pub(in crate::snapshots) mod header_cache_tests {
         READ_CALLS.with(|calls| assert_eq!(calls.get(), 1));
         assert_eq!(facts(&reread), facts(&cold));
         fs::remove_dir_all(root).unwrap();
+    }
+    const ORDER_OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    /// One archive member whose accepted joined entry holds staged durable
+    /// facts on a live session. Staged facts carry no created time; the
+    /// header's own time is known only to a native read.
+    fn joined_archive() -> (PathBuf, crate::snapshots::StateV2ColdSession, ScanIndex) {
+        let root = crate::test_scratch::unique_path("ottto-codex-header-order");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let header = json!({"type":"session_meta","timestamp":"2026-10-01T10:00:00Z",
+            "payload":{"id":ORDER_OWNER,"timestamp":"2026-10-01T10:00:00Z"}});
+        let archive = sessions.join("a.jsonl.zst");
+        let bytes = zstd::stream::encode_all(format!("{header}\n").as_bytes(), 1).unwrap();
+        fs::write(&archive, bytes).unwrap();
+        let key = local_index_key(&archive);
+        let native = page(
+            &root,
+            &BTreeSet::from([key.clone()]),
+            &Arc::new(sampled_scan::SharedCache::default()),
+        );
+        assert_eq!(native.headers[0].owner, ORDER_OWNER);
+        assert_eq!(native.headers[0].created_unix_ms, Some(1_790_848_800_000));
+        let state = root.join("state");
+        crate::test_scratch::create_private_dir(&state).unwrap();
+        let (session, mut index) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Codex,
+            &ScanIndex::default(),
+            &state,
+        );
+        let accept = |index: &mut ScanIndex| {
+            let fingerprint = "e".repeat(64);
+            index.files.insert(
+                key.clone(),
+                ScanIndexEntry {
+                    last_snapshot_fingerprint: Some(fingerprint.clone()),
+                    codex_joined_member_set: Some("joined".into()),
+                    codex_counting_owner: Some(codex_protected_owner(ORDER_OWNER).into()),
+                    ..Default::default()
+                },
+            );
+            index
+                .file_snapshot_fingerprints
+                .insert(key.clone(), BTreeSet::from([fingerprint.clone()]));
+            index.accepted_snapshot_fingerprints.insert(fingerprint);
+        };
+        accept(&mut index);
+        stage_independent_inventory(&index, &[native.headers[0].candidate.clone()], ORDER_OWNER)
+            .unwrap();
+        let mut index = session.save_reload(&mut index);
+        accept(&mut index);
+        let staged = state_v2::load_head(&index, &key, 1).unwrap().unwrap();
+        assert_eq!(staged.common.inventory.unwrap().created_unix_ms, None);
+        (root, session, index)
+    }
+    /// One inventory over `root`'s sessions on `index`; the durable head
+    /// lookups it ran. `fail` fails that 1-based lookup.
+    fn ordered(
+        root: &Path,
+        index: &mut ScanIndex,
+        cache: &Arc<sampled_scan::SharedCache>,
+        fail: Option<usize>,
+    ) -> (HeaderInventory, usize) {
+        let sessions = root.join("sessions");
+        let mut census = DirectoryCensus::new();
+        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let paths = BTreeSet::from([local_index_key(&sessions.join("a.jsonl.zst"))]);
+        let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&census));
+        state_v2::LOAD_HEAD_CALLS.set((0, fail));
+        while !inventory.step_selected(
+            &CodexTitleMetadata::default(),
+            index,
+            &BTreeMap::new(),
+            Some(cache),
+        ) {}
+        let calls = state_v2::LOAD_HEAD_CALLS.get().0;
+        state_v2::LOAD_HEAD_CALLS.set((0, None));
+        (inventory, calls)
+    }
+    /// [regress] Durable header facts keep precedence over the RAM cache and
+    /// are looked up lazily. A joined-archive hit ran the physical-match head
+    /// lookup as well (2 lookups), and that lookup's error failed the member.
+    /// Now it runs 1 and a later error is never reached. Owner and created
+    /// time stay the durable ones, even with the header's time in RAM. An
+    /// error with no hit still fails; one followed by a RAM hit is dropped.
+    #[test]
+    fn joined_archive_hit_runs_one_durable_lookup_and_keeps_durable_facts() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+        let (root, session, mut index) = joined_archive();
+        let durable = vec![(
+            local_index_key(&root.join("sessions/a.jsonl.zst")),
+            ORDER_OWNER.to_owned(),
+            None,
+        )];
+        let cold = Arc::new(sampled_scan::SharedCache::default());
+        let warm = Arc::new(sampled_scan::SharedCache::default());
+        page(&root, &paths_of(&root), &warm);
+        for (cache, warmed) in [(&cold, false), (&warm, true)] {
+            for fail in [None, Some(2)] {
+                let (inventory, calls) = ordered(&root, &mut index, cache, fail);
+                assert_eq!(calls, 1, "warm {warmed}, fail {fail:?}");
+                assert!(inventory.complete, "warm {warmed}, fail {fail:?}");
+                assert_eq!(facts(&inventory), durable, "warm {warmed}, fail {fail:?}");
+                assert_eq!(inventory.reuse_hits, 1);
+                assert_eq!(inventory.read_bytes, 0);
+            }
+        }
+        let counted = cold.counters_for_test();
+        assert_eq!(counted.header_durable_lookups, 2);
+        assert_eq!(counted.header_reuse_hits, 2);
+        assert_eq!(counted.header_lookup_errors_deferred, 0);
+        // No source has facts: the joined lookup's error fails as before.
+        let (failed, _) = ordered(&root, &mut index, &cold, Some(1));
+        assert!(!failed.complete);
+        assert_eq!(failed.refused.len(), 1);
+        assert!(failed.headers.is_empty());
+        assert_eq!(cold.counters_for_test().header_lookup_errors_deferred, 0);
+        // RAM has the exact object's facts: that error is dropped and counted.
+        let before = warm.counters_for_test();
+        let (dropped, calls) = ordered(&root, &mut index, &warm, Some(1));
+        assert_eq!(calls, 2);
+        assert!(dropped.complete);
+        assert_eq!(dropped.headers[0].owner, ORDER_OWNER);
+        assert_eq!(dropped.headers[0].created_unix_ms, Some(1_790_848_800_000));
+        let after = warm.counters_for_test();
+        assert_eq!(
+            after.header_durable_lookups - before.header_durable_lookups,
+            2
+        );
+        assert_eq!(
+            after.header_lookup_errors_deferred - before.header_lookup_errors_deferred,
+            1
+        );
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn paths_of(root: &Path) -> BTreeSet<String> {
+        BTreeSet::from([local_index_key(&root.join("sessions/a.jsonl.zst"))])
     }
     #[cfg(unix)]
     #[test]

@@ -2991,6 +2991,24 @@ impl SharedCache {
             }
         });
     }
+    /// One header inventory step's lookups, and its reuse's avoided bytes.
+    pub(in crate::snapshots) fn note_header_lookups(
+        &self,
+        lookups: u64,
+        deferred: u64,
+        reused: Option<usize>,
+    ) {
+        self.with_cursor(|cursor| {
+            let counters = &mut cursor.counters;
+            counters.header_durable_lookups += lookups;
+            counters.header_lookup_errors_deferred += deferred;
+            if let Some(bytes) = reused {
+                counters.header_reuse_hits += 1;
+                counters.header_bytes_avoided =
+                    counters.header_bytes_avoided.saturating_add(bytes as u64);
+            }
+        });
+    }
     /// The cursor lock, marked held (`CursorHeld`) for `run`.
     pub(in crate::snapshots) fn with_cursor<T>(
         &self,

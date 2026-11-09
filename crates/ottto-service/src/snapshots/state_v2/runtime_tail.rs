@@ -147,6 +147,12 @@ pub(in crate::snapshots) fn erase_tail(
     }
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    /// This test thread's `load_head` calls, and the 1-based call that fails.
+    pub(in crate::snapshots) static LOAD_HEAD_CALLS: std::cell::Cell<(usize, Option<usize>)> =
+        const { std::cell::Cell::new((0, None)) };
+}
 /// One file's committed head, on the graph's authenticated session; no page is
 /// visited. A future revision holds; a lower one is the caller's to decide.
 pub(in crate::snapshots) fn load_head(
@@ -154,6 +160,12 @@ pub(in crate::snapshots) fn load_head(
     key: &str,
     revision: u32,
 ) -> Result<Option<TailHead>> {
+    #[cfg(test)]
+    {
+        let (calls, fail) = LOAD_HEAD_CALLS.get();
+        LOAD_HEAD_CALLS.set((calls + 1, fail));
+        ensure!(fail != Some(calls + 1), "injected load_head failure");
+    }
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })

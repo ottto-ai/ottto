@@ -62,8 +62,6 @@ pub(crate) use sqlite::history as upload_history;
 pub(crate) use sqlite::sidecar as sqlite_sidecar;
 mod tail;
 use kinds::KindCx;
-#[cfg(test)]
-pub(in crate::snapshots) use runtime::tail_route::staged_head_for_test;
 #[allow(
     unused_imports,
     reason = "the acquisition cutover consumes this staged route"
@@ -73,6 +71,8 @@ pub(in crate::snapshots) use runtime::tail_route::{
     observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys,
     tail_route_path, tail_set_aside, unstage_tail,
 };
+#[cfg(test)]
+pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
     unused_imports,

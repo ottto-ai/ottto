@@ -180,6 +180,14 @@ macro_rules! codex_cursor_events {
             memo_hits,
             memo_records,
             parked_hits,
+            /// Durable header-fact lookups the Codex header inventory ran.
+            header_durable_lookups,
+            /// Lookup errors dropped because another source produced facts.
+            header_lookup_errors_deferred,
+            /// Header facts reused without a native header read.
+            header_reuse_hits,
+            /// Header bytes those reuses did not read.
+            header_bytes_avoided,
         }
     };
 }
@@ -3293,11 +3301,11 @@ mod tests {
         );
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
-            // Fixed page gate totals and the Full/Tail byte split extend this
-            // local diagnostic record only; upload/finish records and all
-            // runtime resource caps stay unchanged.
+            // Fixed page gate totals, the Full/Tail byte split and the Codex
+            // header lookup counts extend this local diagnostic record only;
+            // upload/finish records and all runtime resource caps stay unchanged.
             let limit = if record["stage"] == "native_collection_page" {
-                4160
+                4320
             } else {
                 2048
             };
