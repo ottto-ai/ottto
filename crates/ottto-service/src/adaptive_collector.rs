@@ -160,7 +160,9 @@ impl SourceCadence {
         if self.disabled {
             return;
         }
-        self.clear_continuation();
+        if self.ordinary_pacing.is_some() {
+            self.clear_continuation();
+        }
         self.last_scan_at = Some(now);
         self.consecutive_failures = 0;
         if uploaded_count > 0 {
@@ -180,7 +182,9 @@ impl SourceCadence {
         if self.disabled {
             return;
         }
-        self.clear_continuation();
+        if self.ordinary_pacing.is_some() {
+            self.clear_continuation();
+        }
         self.last_scan_at = Some(now);
         self.consecutive_failures += 1;
         self.state = LocalCollectorState::Failing;
