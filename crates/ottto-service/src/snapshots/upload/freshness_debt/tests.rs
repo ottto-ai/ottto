@@ -484,6 +484,68 @@ fn roster_only_for_a_complete_walk_without_issues() {
     assert_eq!(roster(Some(5), false, true), None, "walk issue");
 }
 
+/// [regress] The page clock is read before its listing. A file written during
+/// the listing has a later mtime than that clock, but not than the clock at its
+/// stat: its age is known, not unknown, and alone it raises no alarm. An mtime
+/// past the clock at the stat is still a regressed clock: unknown age, alarm.
+#[test]
+fn a_file_written_during_the_listing_has_a_known_age() {
+    for store in STORES {
+        for (written_after_begin, known) in [(5, true), (30, false)] {
+            let mut f = Fixture::new(store, "g7-written-during-listing");
+            let path = f.file("live.jsonl", 40);
+            let begin = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(begin + written_after_begin),
+                )
+                .unwrap();
+            ensure_bounded_traversal(
+                f.source,
+                std::slice::from_ref(&f.root),
+                &mut f.index,
+                "2026-10-30T00:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+            );
+            let traversal = f.index.traversal.clone().unwrap();
+            let mut fold = WalkFold::EMPTY;
+            sampled_scan::set_test_now(Some(begin));
+            let mut page = Page::begin(f.source, &f.index, &traversal, true, &mut fold);
+            // The stat, 10 s into the listing.
+            sampled_scan::set_test_now(Some(begin + 10));
+            let metadata = std::fs::metadata(&path).unwrap();
+            page.listed(
+                &f.index,
+                Listing {
+                    path: &path,
+                    metadata: &metadata,
+                    in_window: true,
+                },
+            );
+            sampled_scan::set_test_now(None);
+            let report = page.end(&mut f.index, true).expect("the walk ends");
+            let fields = report.fields(begin * 1000);
+            assert_eq!(fields["outstanding_files"], 1, "{store:?}");
+            assert_eq!(fields["oldest_age_s"].is_u64(), known, "{store:?}");
+            assert_eq!(fields["alarm"], !known, "{store:?} {written_after_begin}");
+            assert_eq!(fields["unknown_age_files"], u64::from(!known), "{store:?}");
+            f.save();
+            let revisions = committed(&f.index, &path);
+            assert_eq!(revisions.len(), 1);
+            let first = revisions.values().next().unwrap().first_change_at;
+            let expected = known.then_some((begin + written_after_begin) * 1000);
+            assert_eq!(first, expected, "{store:?}");
+            f.close();
+        }
+    }
+}
+
 /// How the receiver answered a folded Codex body.
 #[derive(Clone, Copy, Debug)]
 enum FoldAck {
