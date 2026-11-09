@@ -415,12 +415,7 @@ impl TailStage {
     fn report(&mut self) {
         let bytes = self.bytes();
         self.peak_bytes = self.peak_bytes.max(bytes);
-        telemetry::event(
-            "tail_stage",
-            &serde_json::json!({
-                "files": self.files.len(), "bytes": bytes, "peak_bytes": self.peak_bytes
-            }),
-        );
+        telemetry::tail_stage(self.files.len(), bytes, self.peak_bytes);
     }
 }
 

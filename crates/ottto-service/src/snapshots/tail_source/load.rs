@@ -283,6 +283,7 @@ pub(super) fn load<S: TailSource>(
             counters::bump(source, "tail_db_loads", "hit");
             counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
             counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
+            crate::local_resource_diagnostics::tail_loaded(source.api_slug(), hit.page_bytes);
             return Load::Reused(hit.retained, base);
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
