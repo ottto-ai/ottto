@@ -14,6 +14,7 @@ struct Wave {
     pages: usize,
     reads: usize,
     deferred: usize,
+    chunked_deferrals: usize,
     complete: bool,
     receipts: BTreeMap<String, Value>,
 }
@@ -118,6 +119,7 @@ fn drain_from(
         .bind_test_key(Some([0x42; 32]));
     let mut routes = Vec::new();
     let mut deferred = 0;
+    let mut chunked_deferrals = 0;
     let mut reads = 0;
     let mut pages = 0;
     let mut complete = false;
@@ -127,7 +129,12 @@ fn drain_from(
         reads += page.scan.scanned_file_count;
         deferred += usize::from(page.scan.charge_deferred);
         complete = page.scan.census_complete;
+        let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
         page.enrich(c);
+        chunked_deferrals += usize::from(
+            page.scan.charge_deferred
+                && crate::snapshot_sync::evidence_chunks_for_test() - chunks_before > 1,
+        );
         page.finish();
         let sent = under_required_cas(&page.scan.snapshots, &progress);
         let (status, batches, _) = upload(&sent, &mut progress, ack);
@@ -225,9 +232,57 @@ fn drain_from(
         pages,
         reads,
         deferred,
+        chunked_deferrals,
         complete,
         receipts,
     }
+}
+
+/// [money] A resident-deferred page also packs its admitted families into
+/// evidence chunks. Its saved drain equals one wide page enriched as one chunk.
+#[test]
+fn resident_deferred_packed_evidence_matches_one_page_one_chunk() {
+    if !supported("resident-packed-evidence") {
+        return;
+    }
+    with_e2(|| {
+        let (c, _) = evidence_chunk_tests::three_family_page("resident-packed-evidence");
+        for path in c.births.keys() {
+            input_clock(path);
+        }
+        let wide = evidence_chunk_tests::isolated(|| {
+            crate::snapshot_sync::ONE_EVIDENCE_CHUNK.with(|one| {
+                let previous = one.replace(true);
+                let wide = drain(&c, f64::INFINITY, false);
+                one.set(previous);
+                wide
+            })
+        });
+        let small = evidence_chunk_tests::isolated(|| drain(&c, 0.15, true));
+        assert_eq!(wide.pages, 1);
+        assert!(small.pages > 1 && small.deferred > 0);
+        assert!(
+            small.chunked_deferrals > 0,
+            "the same page must be both resident-deferred and packed into multiple chunks"
+        );
+        assert_eq!(wide.reads, 3);
+        assert_eq!(small.reads, wide.reads, "no extra physical read");
+        money_oracle::assert_equivalent(&wide.route, &small.route);
+        money_oracle::assert_no_smaller_reemit(
+            wide.route.snapshots.keys().next().unwrap(),
+            &wide.route,
+            &small.route,
+            &wide.route,
+            false,
+        );
+        assert_eq!(small.receipts, wide.receipts);
+        assert_eq!(small.route.accepted, wide.route.accepted);
+        assert_eq!(
+            small.progress.accepted_identity_buckets,
+            wide.progress.accepted_identity_buckets
+        );
+        assert!(wide.complete && small.complete);
+    });
 }
 
 fn corpus_with_family(name: &str) -> Corpus {

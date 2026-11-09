@@ -243,7 +243,7 @@ const SMALLER: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
 /// Three unrelated roots on one page: BIG with six paired requests, SMALL and
 /// SMALLER with two each. Returns the corpus and its scanner.
-fn three_family_page(name: &str) -> (Corpus, E2ScanFixture) {
+pub(super) fn three_family_page(name: &str) -> (Corpus, E2ScanFixture) {
     let mut c = Corpus::new(name);
     for (session, requests) in [(BIG, 6), (SMALL, 2), (SMALLER, 2)] {
         let ids = (0..requests)
