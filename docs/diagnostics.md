@@ -1408,6 +1408,14 @@ Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
 reset it.
 
+Claude Desktop census restarts emit a `bounded_traversal_transition` record with
+`event: restarting` and `reason: sidecar_census_restart` before discarding an existing
+checkpoint. It carries the old `index_generation`, `window_unix_seconds`,
+`pending_directories` and `pending_candidates`; no record is emitted without a prior
+checkpoint. This is distinct from `retiring` and does not count as census completion.
+The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
+feeds its error state or an alert.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes

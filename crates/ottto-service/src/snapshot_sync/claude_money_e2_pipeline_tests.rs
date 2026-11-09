@@ -5518,3 +5518,5 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
         assert_eq!(settled.claude_copy_removals.get(key), recorded.as_slice());
     });
 }
+
+mod desktop_depth_tests;

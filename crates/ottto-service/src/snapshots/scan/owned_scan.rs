@@ -496,6 +496,9 @@ impl OwnedSourceScan {
             // now so sidecar additions/removals are folded into each affected
             // file fingerprint before a terminal manifest can publish. Actual identity
             // census loss also revisits consumed pages once to retract completeness.
+            if let Some(traversal) = index.traversal.as_ref() {
+                traversal_transition::restarting(source, index.generation, traversal);
+            }
             index.traversal = None;
         }
         // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
