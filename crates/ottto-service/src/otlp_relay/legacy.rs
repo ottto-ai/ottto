@@ -3,6 +3,8 @@ use super::*;
 use crate::agent_configs::claude_managed_settings;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{mpsc, Arc, LazyLock, OnceLock, RwLock};
@@ -44,7 +46,42 @@ struct Admission {
 #[derive(Clone)]
 struct Endpoint {
     sender: mpsc::Sender<Command>,
+    #[cfg(unix)]
+    wake: Arc<UnixStream>,
     admission: Arc<Admission>,
+}
+
+impl Endpoint {
+    #[cfg(unix)]
+    fn channel(
+        admission: Arc<Admission>,
+    ) -> io::Result<(Self, mpsc::Receiver<Command>, UnixStream)> {
+        let (wake, reader) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        reader.set_nonblocking(true)?;
+        let (sender, receiver) = mpsc::channel();
+        Ok((
+            Self {
+                sender,
+                wake: Arc::new(wake),
+                admission,
+            },
+            receiver,
+            reader,
+        ))
+    }
+
+    fn send(&self, command: Command) -> Result<()> {
+        self.sender.send(command)?;
+        #[cfg(unix)]
+        match (&*self.wake).write(&[1]) {
+            Ok(1) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err(anyhow!("legacy relay wake closed")),
+        }
+        Ok(())
+    }
 }
 
 static SUPERVISOR: OnceLock<Endpoint> = OnceLock::new();
@@ -491,6 +528,8 @@ struct Supervisor {
     activity_dirty: bool,
     #[cfg(test)]
     fail_save: std::cell::Cell<bool>,
+    #[cfg(all(test, unix))]
+    waiting: Option<mpsc::Sender<()>>,
 }
 
 impl Supervisor {
@@ -516,6 +555,8 @@ impl Supervisor {
             activity_dirty: false,
             #[cfg(test)]
             fail_save: std::cell::Cell::new(false),
+            #[cfg(all(test, unix))]
+            waiting: None,
         })
     }
 
@@ -836,6 +877,105 @@ impl Supervisor {
         }
     }
 
+    #[cfg(unix)]
+    fn drain_commands(
+        &mut self,
+        mut wake: impl Read,
+        receiver: &mpsc::Receiver<Command>,
+    ) -> Result<bool> {
+        // Drain bytes BEFORE commands: a sender enqueues before signalling.
+        // A command arriving during this drain is therefore seen below even
+        // when its byte was consumed by the same drain.
+        let mut bytes = [0; 64];
+        loop {
+            match wake.read(&mut bytes) {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        loop {
+            match receiver.try_recv() {
+                Ok(command) => self.handle_command(command)?,
+                Err(mpsc::TryRecvError::Empty) => return Ok(true),
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(false),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_events(
+        &mut self,
+        wake: &mut UnixStream,
+        receiver: &mpsc::Receiver<Command>,
+        next_tick: u64,
+        next_health: &mut Instant,
+    ) -> Result<bool> {
+        let now = Instant::now();
+        if now >= *next_health {
+            // Backoff must not defer fd-loss detection. Reuse the release
+            // identity check and accept failure fencing without accepting a
+            // connection early on a resource-starved listener.
+            let broken: Vec<_> = self
+                .open
+                .iter()
+                .filter_map(|(&port, open)| {
+                    let listener = open.listener.as_ref().expect("owned listener");
+                    (listener.local_addr().ok() != open.bound_addr || !is_listening(listener))
+                        .then_some(port)
+                })
+                .collect();
+            for port in broken {
+                self.accept_failed(port, now, &io::Error::from_raw_os_error(libc::ENOTSOCK));
+            }
+            // Absolute cadence: traffic, commands and retry wakes never move
+            // the deadline forward. Skip elapsed ticks after a long suspension.
+            while *next_health <= now {
+                *next_health += Duration::from_secs(1);
+            }
+        }
+        let mut timeout = Duration::from_secs(next_tick.saturating_sub(now_seconds()));
+        if !self.open.is_empty() {
+            timeout = timeout.min(next_health.saturating_duration_since(now));
+        }
+        let mut fds = vec![libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        for open in self.open.values() {
+            if open.accepts.ready(now) {
+                fds.push(libc::pollfd {
+                    fd: open.listener.as_ref().expect("owned listener").as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            } else if let Some(retry) = open.accepts.retry_at {
+                timeout = timeout.min(retry.saturating_duration_since(now));
+            }
+        }
+        let timeout_ms = timeout
+            .as_millis()
+            .saturating_add(u128::from(!timeout.is_zero()))
+            .min(libc::c_int::MAX as u128) as libc::c_int;
+        #[cfg(test)]
+        if let Some(waiting) = &self.waiting {
+            let _ = waiting.send(());
+        }
+        // SAFETY: fds owns exactly fds.len() initialized pollfd entries.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+        self.drain_commands(wake, receiver)
+    }
+
+    #[cfg(not(unix))]
     fn wait_duration(&self, now: u64, next_tick: u64) -> Duration {
         let until_tick = Duration::from_secs(next_tick.saturating_sub(now));
         if self.open.is_empty() {
@@ -872,9 +1012,7 @@ impl Supervisor {
 /// A missing/failed compatibility supervisor never prevents primary binding.
 fn send_and_wait(endpoint: &Endpoint, command: impl FnOnce(mpsc::SyncSender<()>) -> Command) {
     let (ack, done) = mpsc::sync_channel(0);
-    if endpoint.sender.send(command(ack)).is_ok()
-        && done.recv_timeout(Duration::from_secs(2)).is_err()
-    {
+    if endpoint.send(command(ack)).is_ok() && done.recv_timeout(Duration::from_secs(2)).is_err() {
         relay_log!("legacy OTLP supervisor acknowledgement timed out");
     }
 }
@@ -901,6 +1039,9 @@ pub(crate) fn revoke_now() {
 #[cfg(test)]
 pub(crate) fn count_revokes(run: impl FnOnce()) -> u64 {
     let admission = Arc::new(Admission::default());
+    #[cfg(unix)]
+    let (endpoint, _, _) = Endpoint::channel(admission.clone()).unwrap();
+    #[cfg(not(unix))]
     let endpoint = Endpoint {
         sender: mpsc::channel().0,
         admission: admission.clone(),
@@ -912,21 +1053,33 @@ pub(crate) fn count_revokes(run: impl FnOnce()) -> u64 {
 }
 
 pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<AtomicU16>) {
-    let (sender, receiver) = mpsc::channel();
     let admission = Arc::new(Admission::default());
-    if SUPERVISOR
-        .set(Endpoint {
-            sender,
-            admission: admission.clone(),
-        })
-        .is_err()
-    {
+    #[cfg(unix)]
+    let (endpoint, receiver, mut wake) = match Endpoint::channel(admission.clone()) {
+        Ok(channel) => channel,
+        Err(error) => {
+            relay_log!("could not create legacy OTLP command wake: {error}");
+            return;
+        }
+    };
+    #[cfg(not(unix))]
+    let (endpoint, receiver) = {
+        let (sender, receiver) = mpsc::channel();
+        (
+            Endpoint {
+                sender,
+                admission: admission.clone(),
+            },
+            receiver,
+        )
+    };
+    if SUPERVISOR.set(endpoint).is_err() {
         return;
     }
     let result = thread::Builder::new()
         .name("ottto-legacy-otlp".into())
         .spawn(move || {
-            let run = || -> Result<()> {
+            let mut run = || -> Result<()> {
                 let support_dir = ottto_core::default_support_dir();
                 let mut supervisor = Supervisor::load(
                     support_dir.join("legacy-relay-ports.json"),
@@ -937,6 +1090,8 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                 let uid = current_uid();
                 let candidates = candidate_relay_ports(uid);
                 let mut next_tick = 0;
+                #[cfg(unix)]
+                let mut next_health = Instant::now() + Duration::from_secs(1);
                 loop {
                     let now = now_seconds();
                     if now >= next_tick {
@@ -975,8 +1130,18 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                             Some(activity),
                         );
                     });
-                    let timeout = supervisor.wait_duration(now_seconds(), next_tick);
-                    match receiver.recv_timeout(timeout) {
+                    #[cfg(unix)]
+                    if !supervisor.wait_for_events(
+                        &mut wake,
+                        &receiver,
+                        next_tick,
+                        &mut next_health,
+                    )? {
+                        return Ok(());
+                    }
+                    #[cfg(not(unix))]
+                    match receiver.recv_timeout(supervisor.wait_duration(now_seconds(), next_tick))
+                    {
                         Ok(command) => supervisor.handle_command(command)?,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
