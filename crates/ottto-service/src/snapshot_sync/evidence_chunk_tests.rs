@@ -433,7 +433,9 @@ fn chunked_evidence_equals_one_chunk() {
 /// page as one chunk (and the whole-corpus fold) differ only in ROOT's
 /// context posture; with it matched, bodies, holds, accepted buckets, wire
 /// bytes, totals, placement, the post-ACK ledger and re-emission are equal on
-/// every pass, non-terminal and terminal, across the fixture's store reloads.
+/// both sweeps, across the fixture's store reloads. A limit of five reads the
+/// five roots as one terminal page per sweep; the same sweep without the
+/// shared id covers non-terminal pages at limit three above.
 #[test]
 fn multi_root_ids_change_only_the_context_posture() {
     CONTEXT_ONLY.with(|diverged| diverged.set(Some(0)));
@@ -444,7 +446,7 @@ fn multi_root_ids_change_only_the_context_posture() {
         "the observed posture difference is reproduced: {diverged:?}"
     );
     assert!(
-        checks.chunked > 0 && checks.non_terminal > 0 && checks.terminal > 0,
-        "packed pages compared on non-terminal and terminal passes: {checks:?}"
+        checks.chunked == 2 && checks.terminal == 2,
+        "both sweeps compare a packed terminal page: {checks:?}"
     );
 }
