@@ -5,10 +5,10 @@
 //! root's rows gives: the same rows, the same sorted root order, the same
 //! first refusal.
 
-use super::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
-use super::claude_request_census::claude_request_hash;
-use super::{ClaudeLegacyRequestOwners, ScanIndex, SnapshotItem};
 use crate::claude_local_otel::{ClaudeLocalOtelEvidence, ClaudeTraceOwnershipEvidence};
+use crate::snapshots::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
+use crate::snapshots::claude_request_census::claude_request_hash;
+use crate::snapshots::{ClaudeLegacyRequestOwners, ScanIndex, SnapshotItem};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A tripwire row whose session is not its sidecar root: no single owner.
@@ -83,7 +83,7 @@ impl EvidenceScope {
             .filter_map(|item| {
                 let parent = item.claude_money.as_deref()?.fork_parent()?;
                 Some((
-                    super::claude_snapshot_family_root_ref(item).to_owned(),
+                    crate::snapshots::claude_snapshot_family_root_ref(item).to_owned(),
                     parent.to_owned(),
                 ))
             })
@@ -125,8 +125,8 @@ impl EvidenceScope {
         let mut wanted = items
             .iter()
             .flat_map(|item| {
-                let root = super::claude_snapshot_family_root_ref(item);
-                super::claude_request_money::e2::item_request_ids(item)
+                let root = crate::snapshots::claude_snapshot_family_root_ref(item);
+                crate::snapshots::claude_request_money::e2::item_request_ids(item)
                     .filter(move |id| !own.contains(&(root, id.as_str())))
                     .map(|id| claude_request_hash(id))
                     .collect::<Vec<_>>()
@@ -195,7 +195,7 @@ impl CrossRootEvidence {
             request_roots: RequestRootJoins::new(
                 items
                     .iter()
-                    .flat_map(super::claude_request_money::e2::item_request_ids),
+                    .flat_map(crate::snapshots::claude_request_money::e2::item_request_ids),
             ),
             legacy_request_owners: ClaudeLegacyRequestOwners::default(),
             tripwire_rows: Vec::new(),
@@ -283,7 +283,7 @@ impl CrossRootEvidence {
             }));
     }
 
-    pub(super) fn tripwire(
+    pub(in crate::snapshots) fn tripwire(
         &self,
         items: &[SnapshotItem],
         max_requests: usize,

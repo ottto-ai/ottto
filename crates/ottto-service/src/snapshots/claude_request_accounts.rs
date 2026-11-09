@@ -1,18 +1,18 @@
 //! Versioned own-request account qualification, independent of family accounting.
 //! No observations or coverage witnesses are added to persistent local state.
 
-use super::{
-    claude_snapshot_request_id_hashes, set_claude_account_hash, snapshot_fingerprint, SnapshotItem,
-    SnapshotSource,
-};
 use crate::claude_local_otel::{
     ClaudeIdentityDisposition, ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport,
     ClaudeTraceOwnershipEvidence, ClaudeTraceOwnershipLoadReport,
 };
+use crate::snapshots::{
+    claude_snapshot_request_id_hashes, set_claude_account_hash, snapshot_fingerprint, SnapshotItem,
+    SnapshotSource,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const COMPLETE: &str = "claude_code_jsonl:own_request_account:v1";
-pub(super) const MIXED: &str = "claude_code_jsonl:own_request_account_mixed:v1";
+pub(in crate::snapshots) const MIXED: &str = "claude_code_jsonl:own_request_account_mixed:v1";
 pub(crate) const UNKNOWN: &str = "claude_code_jsonl:own_request_account_unknown:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub(crate) struct MixedUploads {
 fn bound_body(item: &SnapshotItem) -> (String, String) {
     (
         item.snapshot_fingerprint.clone(),
-        super::snapshot_upload_body_witness(item),
+        crate::snapshots::snapshot_upload_body_witness(item),
     )
 }
 
@@ -53,16 +53,16 @@ fn is_bound_body(bound: Option<&(String, String)>, item: &SnapshotItem) -> bool 
     bound.is_some_and(|(semantic, body)| {
         item.snapshot_fingerprint == *semantic
             && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
-            && super::snapshot_upload_body_witness(item) == *body
+            && crate::snapshots::snapshot_upload_body_witness(item) == *body
     })
 }
 
 impl MixedUploads {
     pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
         #[cfg(not(test))]
-        let identity_collector = super::claude_request_identity::COLLECTOR;
+        let identity_collector = crate::snapshots::claude_request_identity::COLLECTOR;
         #[cfg(test)]
-        let identity_collector = super::claude_request_identity::cycle_contract(true);
+        let identity_collector = crate::snapshots::claude_request_identity::cycle_contract(true);
         if item.provenance.collector == identity_collector {
             self.request_identity
                 .insert(item.source_session_id.clone(), bound_body(item));
@@ -71,8 +71,10 @@ impl MixedUploads {
 
     /// Call before the `e2` fold is released: it names the unhealthy reason.
     pub(crate) fn admit_unhealthy_unknown(&mut self, item: &SnapshotItem) {
-        if let Some(cleared) = super::claude_request_identity::unhealthy_cleared_account(item) {
-            if super::exact_session_account_hash(item).is_none() {
+        if let Some(cleared) =
+            crate::snapshots::claude_request_identity::unhealthy_cleared_account(item)
+        {
+            if crate::snapshots::exact_session_account_hash(item).is_none() {
                 self.unhealthy_unknown.insert(
                     item.source_session_id.clone(),
                     (bound_body(item), cleared.to_owned()),
@@ -81,24 +83,28 @@ impl MixedUploads {
         }
     }
 
-    pub(super) fn permits_request_identity(&self, item: &SnapshotItem) -> bool {
+    pub(in crate::snapshots) fn permits_request_identity(&self, item: &SnapshotItem) -> bool {
         #[cfg(not(test))]
-        let identity_collector = super::claude_request_identity::COLLECTOR;
+        let identity_collector = crate::snapshots::claude_request_identity::COLLECTOR;
         #[cfg(test)]
-        let identity_collector = super::claude_request_identity::cycle_contract(true);
+        let identity_collector = crate::snapshots::claude_request_identity::cycle_contract(true);
         item.provenance.collector == identity_collector
             && is_bound_body(self.request_identity.get(&item.source_session_id), item)
     }
 
     /// Only the hold the clear itself created: main uploads a body whose
     /// account is the owner's, and keeps holding any other.
-    pub(super) fn permits_unhealthy_unknown(&self, item: &SnapshotItem, owner: &str) -> bool {
+    pub(in crate::snapshots) fn permits_unhealthy_unknown(
+        &self,
+        item: &SnapshotItem,
+        owner: &str,
+    ) -> bool {
         self.unhealthy_unknown
             .get(&item.source_session_id)
             .is_some_and(|(bound, cleared)| cleared == owner && is_bound_body(Some(bound), item))
     }
 
-    pub(super) fn permits(&self, item: &SnapshotItem) -> bool {
+    pub(in crate::snapshots) fn permits(&self, item: &SnapshotItem) -> bool {
         item.provenance.collector == MIXED
             && is_bound_body(self.bodies.get(&item.source_session_id), item)
     }
@@ -126,7 +132,7 @@ pub(crate) fn apply_with_originals(
     snapshots: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
-    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+    originals: &BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
 ) -> Qualification {
     let mut requests = BTreeMap::new();
     for (root, rows) in &api.evidence {
@@ -155,8 +161,8 @@ pub(crate) fn apply_with_shared_index(
     snapshots: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
-    originals: &BTreeMap<String, super::SessionAccountEvidence>,
-    evidence: &super::claude_request_identity::ScanEvidence<'_>,
+    originals: &BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
+    evidence: &crate::snapshots::claude_request_identity::ScanEvidence<'_>,
 ) -> Qualification {
     qualify_all(
         snapshots,
@@ -174,7 +180,7 @@ fn qualify_all(
     trace: &ClaudeTraceOwnershipLoadReport,
     requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
-    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+    originals: &BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
 ) -> Qualification {
     let healthy = api.health.is_complete() && trace.is_complete();
     let mut result = Qualification::default();
@@ -278,7 +284,7 @@ fn qualify_all(
 
 // Preserve each original instant while using the backend's UTC wire spelling
 // for lifecycle fields. This changes no timestamp source or semantic hash epoch.
-pub(super) fn normalize_activity(item: &mut SnapshotItem) -> bool {
+pub(in crate::snapshots) fn normalize_activity(item: &mut SnapshotItem) -> bool {
     let mut changed = false;
     for value in [
         &mut item.source_started_at,
@@ -287,7 +293,7 @@ pub(super) fn normalize_activity(item: &mut SnapshotItem) -> bool {
     ] {
         if let Some((_, normalized)) = value
             .as_deref()
-            .and_then(super::activity_bucket_from_timestamp)
+            .and_then(crate::snapshots::activity_bucket_from_timestamp)
         {
             if value.as_deref() != Some(normalized.as_str()) {
                 *value = Some(normalized);
@@ -317,7 +323,7 @@ fn original_event_clocks_complete(item: &SnapshotItem) -> bool {
         let Some((hour, time)) = occurrence
             .timestamp
             .as_deref()
-            .and_then(super::activity_bucket_from_timestamp)
+            .and_then(crate::snapshots::activity_bucket_from_timestamp)
         else {
             return false;
         };
@@ -325,10 +331,10 @@ fn original_event_clocks_complete(item: &SnapshotItem) -> bool {
             .entry(hour)
             .or_insert((0, time.clone(), time.clone()));
         entry.0 += 1;
-        if super::timestamp_is_before(&time, &entry.1) {
+        if crate::snapshots::timestamp_is_before(&time, &entry.1) {
             entry.1 = time.clone();
         }
-        if super::timestamp_is_after(&time, &entry.2) {
+        if crate::snapshots::timestamp_is_after(&time, &entry.2) {
             entry.2 = time;
         }
     }
@@ -352,17 +358,17 @@ fn qualify_mixed(
     item: &SnapshotItem,
     requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
-    original_before_enrichment: Option<&super::SessionAccountEvidence>,
+    original_before_enrichment: Option<&crate::snapshots::SessionAccountEvidence>,
 ) -> bool {
     let root = item.source_session_id.as_str();
     let Some(original) = original_before_enrichment.or(item.session_account_evidence.as_ref())
     else {
         return false;
     };
-    if !super::codex_identity_is_uuid_shaped(root)
+    if !crate::snapshots::codex_identity_is_uuid_shaped(root)
         || root != root.to_ascii_lowercase()
         || item.usage_accounting_contract.as_deref() != Some("session_exclusive_reported_usage:v1")
-        || super::validate_snapshot_item(0, item).is_err()
+        || crate::snapshots::validate_snapshot_item(0, item).is_err()
         || original.provider != "anthropic"
         || original.identity_hash_scheme != "provider-sha256:v1"
         || original.evidence_source != "claude_desktop_original:v1"
@@ -370,11 +376,11 @@ fn qualify_mixed(
         || !original
             .account_identifier_hash
             .as_deref()
-            .is_some_and(super::claude_request_identity::hash_is_valid)
+            .is_some_and(crate::snapshots::claude_request_identity::hash_is_valid)
         || !original
             .provider_workspace_hash
             .as_deref()
-            .is_some_and(super::claude_request_identity::hash_is_valid)
+            .is_some_and(crate::snapshots::claude_request_identity::hash_is_valid)
         || item.model_usage.is_empty()
         || item.usage_buckets.is_empty()
         || item
@@ -418,7 +424,7 @@ fn qualify_mixed(
         })
 }
 
-pub(super) fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
+pub(in crate::snapshots) fn local_subscription(row: &crate::snapshots::SnapshotModelUsage) -> bool {
     matches!(row.auth_mode.as_deref(), None | Some("oauth"))
         && matches!(row.billing_channel.as_deref(), None | Some("subscription"))
         && matches!(row.billing_provider.as_deref(), None | Some("anthropic"))
@@ -438,7 +444,9 @@ fn qualify<'a>(
         root
     } else {
         let root = item.source_session_id.as_str();
-        if !super::codex_identity_is_uuid_shaped(root) || root != root.to_ascii_lowercase() {
+        if !crate::snapshots::codex_identity_is_uuid_shaped(root)
+            || root != root.to_ascii_lowercase()
+        {
             return Err(Coverage::UnprovedRequestOwner);
         }
         root
@@ -512,15 +520,18 @@ fn request_accounts<'a>(
             .get(&(root, request.as_str()))
             .and_then(|entry| *entry)
             .ok_or(Coverage::MissingRequests)?;
-        let hash = super::claude_request_identity::valid_login(row, root)
+        let hash = crate::snapshots::claude_request_identity::valid_login(row, root)
             .ok_or(Coverage::InvalidAccountEvidence)?;
         accounts.insert(hash);
         let owner = owners
             .get(&(root, request.as_str()))
             .and_then(|entry| *entry)
             .ok_or(Coverage::UnprovedRequestOwner)?;
-        if super::claude_request_identity::owner_is_foreign(owner, root, &item.source_session_id)
-            || owner.client_request_id != row.client_request_id
+        if crate::snapshots::claude_request_identity::owner_is_foreign(
+            owner,
+            root,
+            &item.source_session_id,
+        ) || owner.client_request_id != row.client_request_id
         {
             return Err(Coverage::UnprovedRequestOwner);
         }

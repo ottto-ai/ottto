@@ -32,8 +32,8 @@
 //! retry reads the database as a snapshot. A `-wal` without its `-shm` also
 //! fails CANTOPEN.
 
-use super::state_v2::{sidecar, sqlite_uri};
 use crate::codex_scan_diagnostics::LoaderStage;
+use crate::snapshots::state_v2::{sidecar, sqlite_uri};
 use crate::transcript_acquisition::FileStamp;
 use anyhow::{Context, Result};
 use rusqlite::{ffi, Connection, OpenFlags};
