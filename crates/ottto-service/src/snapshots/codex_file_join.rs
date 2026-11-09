@@ -5591,8 +5591,13 @@ pub(in crate::snapshots) mod header_cache_tests {
     /// One archive member whose accepted joined entry holds staged durable
     /// facts on a live session. Staged facts carry no created time; the
     /// header's own time is known only to a native read.
-    fn joined_archive() -> (PathBuf, crate::snapshots::StateV2ColdSession, ScanIndex) {
-        let root = crate::test_scratch::unique_path("ottto-codex-header-order");
+    fn joined_archive() -> (
+        crate::test_scratch::ScratchDir,
+        crate::snapshots::StateV2ColdSession,
+        ScanIndex,
+    ) {
+        // State v2 refuses a store under a symlinked or shared ancestor.
+        let root = crate::test_scratch::ScratchDir::canonical("codex-header-order");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let header = json!({"type":"session_meta","timestamp":"2026-10-01T10:00:00Z",
@@ -5719,7 +5724,7 @@ pub(in crate::snapshots) mod header_cache_tests {
             1
         );
         drop(session);
-        fs::remove_dir_all(root).unwrap();
+        drop(root);
     }
     fn paths_of(root: &Path) -> BTreeSet<String> {
         BTreeSet::from([local_index_key(&root.join("sessions/a.jsonl.zst"))])

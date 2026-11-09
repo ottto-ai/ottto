@@ -180,7 +180,7 @@ macro_rules! codex_cursor_events {
             memo_hits,
             memo_records,
             parked_hits,
-            /// Durable header-fact lookups the Codex header inventory ran.
+            /// Durable header-fact lookups the Codex header inventory tried.
             header_durable_lookups,
             /// Lookup errors dropped because another source produced facts.
             header_lookup_errors_deferred,
