@@ -110,11 +110,7 @@ impl PendingTail {
     /// The PRE seam: encode into the local buffer only.
     pub(in crate::snapshots) fn encode(&mut self, view: &PreFinalization<'_>) {
         let (encoded, resident_bytes) = (self.encode)(view, self);
-        self.resident_bytes = if encoded.is_ok() {
-            resident_bytes
-        } else {
-            u64::MAX
-        };
+        self.resident_bytes = resident_bytes;
         self.encoded = Some(encoded);
     }
 

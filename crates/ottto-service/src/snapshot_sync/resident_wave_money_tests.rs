@@ -422,46 +422,19 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
             let refused_entity = offered.last().unwrap().source_session_id.clone();
             let before = progress.accepted_body_witnesses.clone();
             let (_, wire, _) = upload(&offered, &mut progress, |batch| {
-                let mut response = ack(batch)?;
-                match refusal {
-                    "not_stored" => {
-                        response.unchanged_entities =
-                            std::mem::take(&mut response.accepted_entities);
-                        for entity in &mut response.unchanged_entities {
-                            entity.unchanged_basis = Some("usage_identical".into());
-                        }
+                let mut response = ack_with_disposition(batch, refusal)?;
+                if refusal == "partial" {
+                    if let Some(at) = response
+                        .accepted_entities
+                        .iter()
+                        .position(|e| e.source_session_id == refused_entity)
+                    {
+                        let mut refused = response.accepted_entities.remove(at);
+                        response.accepted -= 1;
+                        response.sessions_reconciled -= 1;
+                        refused.head_challenge = refused.head_etag.take().map(|_| "c".repeat(64));
+                        response.conflict_entities.push(refused);
                     }
-                    "refused" => {
-                        response.rejected_entities =
-                            std::mem::take(&mut response.accepted_entities)
-                                .into_iter()
-                                .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
-                                    source_session_id: entity.source_session_id,
-                                    snapshot_fingerprint: entity.snapshot_fingerprint,
-                                    occurrence_count: entity.occurrence_count,
-                                    reason: "usage_accounting_authority_downgrade".into(),
-                                    detail: "synthetic refusal".into(),
-                                    permanent: true,
-                                })
-                                .collect();
-                        response.accepted = 0;
-                        response.sessions_reconciled = 0;
-                    }
-                    "partial" => {
-                        if let Some(at) = response
-                            .accepted_entities
-                            .iter()
-                            .position(|e| e.source_session_id == refused_entity)
-                        {
-                            let mut refused = response.accepted_entities.remove(at);
-                            response.accepted -= 1;
-                            response.sessions_reconciled -= 1;
-                            refused.head_challenge =
-                                refused.head_etag.take().map(|_| "c".repeat(64));
-                            response.conflict_entities.push(refused);
-                        }
-                    }
-                    _ => {}
                 }
                 Ok(response)
             });

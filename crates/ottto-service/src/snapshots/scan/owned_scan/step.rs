@@ -1087,19 +1087,8 @@ impl OwnedSourceScan {
                     if !history_upgrade.resident_can_start() {
                         let mut members = group.members;
                         members.extend(codex_join_groups.drain(..).flat_map(|g| g.members));
-                        history_upgrade.charge_deferred += members.len();
-                        page_selection(
-                            source.api_slug(),
-                            PageSelection::ChargeDeferred,
-                            members.len() as u64,
-                        );
-                        scan::owned_scan::requeue_members(
-                            index,
-                            &selected_flags,
-                            members.iter().filter(|member| {
-                                selected_flags.contains_key(&local_index_key(&member.path))
-                            }),
-                        );
+                        members.extend(identified_candidates.drain(..));
+                        identified_candidates = members.into();
                         history_upgrade.defer_resident(
                             source,
                             index,

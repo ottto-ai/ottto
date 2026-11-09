@@ -69,20 +69,20 @@ pub(in crate::snapshots) fn load_candidate(
     )
 }
 
-/// Full reduction pages, including unchanged pages and non-publishing finishes.
+/// Successfully encoded reduction pages, including unchanged and non-publishing finishes.
 /// Temporary encoded pages are dropped collection by collection.
 pub(in crate::snapshots) fn resident_bytes(
     source: SnapshotSource,
     acc: &SnapshotAccumulator,
 ) -> u64 {
     fn size<S: TailSource>(acc: &SnapshotAccumulator) -> u64 {
-        S::collections().iter().fold(0u64, |total, spec| {
-            S::encode_pages(acc, spec.collection).map_or(u64::MAX, |pages| {
-                pages.iter().fold(total, |sum, (_, bytes)| {
-                    sum.saturating_add(bytes.len() as u64)
-                })
+        S::collections()
+            .iter()
+            .filter_map(|spec| S::encode_pages(acc, spec.collection).ok())
+            .flatten()
+            .fold(0u64, |sum, (_, bytes)| {
+                sum.saturating_add(bytes.len() as u64)
             })
-        })
     }
     with_codec!(source, S => size::<S>(acc))
 }
