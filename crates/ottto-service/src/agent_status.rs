@@ -23232,6 +23232,28 @@ for line in sys.stdin:
         (root, home)
     }
 
+    /// [behaviour] A reaped child's cached status prevents a later PID kill.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_child_kill_preserves_cached_exit() {
+        let (root, _) = cli_meta_fixture("cli-meta-child-exit");
+        let binary = root.join("codex");
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut command = Command::new(binary);
+        let mut child =
+            crate::local_resource_diagnostics::cli_children::spawn(&mut command).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+        assert_eq!(
+            child.kill().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(child.wait().unwrap(), status);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// [behaviour] Metadata input stamps, setup reads and age invalidate reuse.
     #[cfg(unix)]
     #[test]

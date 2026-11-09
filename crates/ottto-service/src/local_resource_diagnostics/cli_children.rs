@@ -87,6 +87,18 @@ impl MeasuredChild {
         self.inner
     }
 
+    pub(crate) fn kill(&mut self) -> io::Result<()> {
+        // wait4 reaped the PID without filling std::Child's private cache.
+        // Preserve Child::kill's already-exited guard before delegating.
+        if self.status.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process already exited",
+            ));
+        }
+        self.inner.kill()
+    }
+
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.reap(false)
     }
