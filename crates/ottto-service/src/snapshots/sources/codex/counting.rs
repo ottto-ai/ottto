@@ -2,3 +2,4 @@
 
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
+pub(crate) mod version;
