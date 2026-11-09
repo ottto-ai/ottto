@@ -622,6 +622,15 @@ impl HistoryPage {
         let root = super::claude_index_path_member_ref(&candidate.path)
             .filter(|member| forced.contains(member.root))
             .map(|member| member.root.to_owned());
+        // Originals belong to an unadmitted unit only. Once admitted, a
+        // later split of an ordinary family must not requeue an earlier read.
+        self.forced_pending_entries.retain(|entry| {
+            entry.path != candidate.path
+                && !root.as_ref().is_some_and(|root| {
+                    super::claude_index_path_member_ref(&entry.path)
+                        .is_some_and(|member| member.root == root)
+                })
+        });
         let twins = super::claude_index_path_member_ref(&candidate.path).and_then(|member| {
             self.twin_index
                 .get()
