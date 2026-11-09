@@ -159,6 +159,12 @@ Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi
 model listings remain uncached because their output depends on Pi config/auth.
+
+The status read of each source's active-session reconciliation uses the same
+helper, keyed by its cache file. Every local request builds status, so the
+parsed reconciliation is reused while the file stamp is unchanged; a reconcile
+always replaces the file, and the next read parses it again.
+
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
 
