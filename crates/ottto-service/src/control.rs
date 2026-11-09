@@ -1117,8 +1117,8 @@ fn handle_command(
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::AgentStatusCached { source } => {
-            // The usual authorization helper builds general status (disk IO).
-            // This command authenticates directly against the in-memory token.
+            // Unlike the usual authorization helper, this skips the daemon-state
+            // poison check: the cached read uses no daemon state.
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
                 RequestAuthorization::TrustedCompanionApp => {}
@@ -3778,13 +3778,10 @@ fn require_authorized_local_client(
 ) -> Result<(), LocalApiError> {
     match authorization {
         RequestAuthorization::Token(token) => {
-            daemon.status(token)?;
-            Ok(())
+            daemon.control_token.authorize(token)?;
+            daemon.require_usable_state()
         }
-        RequestAuthorization::TrustedCompanionApp => {
-            daemon.status_for_trusted_client()?;
-            Ok(())
-        }
+        RequestAuthorization::TrustedCompanionApp => daemon.require_usable_state(),
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
 }
@@ -24576,6 +24573,61 @@ for line in sys.stdin:
         let other = daemon_effective_uid().wrapping_add(1);
         let peer = LocalClientPeer::from_pid_and_euid(Some(std::process::id()), Some(other));
         assert!(!companion_peer_is_trusted(Some(&peer)));
+    }
+
+    #[test]
+    fn auth_only_command_keeps_trust_and_poisoned_state_refusals() {
+        let daemon = daemon();
+        let command = || LocalControlCommand::SessionLaunchStatus {
+            schema_version: 1,
+            launch_id: "synthetic".into(),
+        };
+        let request = |peer| {
+            let request = LocalControlRequest {
+                request_id: "auth-only".into(),
+                protocol_version: ottto_protocol::SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: command(),
+            };
+            handle_request_with_peer(&daemon, request, peer)
+        };
+        assert!(request(Some(LocalClientPeer::trusted_for_tests())).ok);
+        assert_eq!(
+            request(None).error.expect("error").code,
+            CliErrorCode::LocalClientNotTrusted
+        );
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = daemon.inner.lock().expect("daemon state");
+            panic!("poison the daemon state");
+        }));
+        assert!(poison.is_err());
+        let run = |authorization| {
+            handle_command(
+                &daemon,
+                authorization,
+                command(),
+                InstallOwner::Unknown,
+                None,
+                false,
+            )
+        };
+        // The token check still runs before the poisoned-state refusal.
+        assert!(matches!(
+            run(RequestAuthorization::Token("wrong-token".into())),
+            Err(LocalApiError::Unauthorized)
+        ));
+        for authorization in [
+            RequestAuthorization::Token("token".into()),
+            RequestAuthorization::TrustedCompanionApp,
+        ] {
+            assert!(matches!(
+                run(authorization),
+                Err(LocalApiError::StatePoisoned)
+            ));
+        }
     }
 
     /// The requirement an internal build resolves to, and the one QA writes

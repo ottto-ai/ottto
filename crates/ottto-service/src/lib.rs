@@ -601,6 +601,11 @@ impl LocalDaemon {
         self.status_for_authorized_client()
     }
 
+    /// Keeps the poisoned-state refusal of the local authorization step.
+    pub(crate) fn require_usable_state(&self) -> Result<(), LocalApiError> {
+        self.state().map(drop)
+    }
+
     /// Allocation-free stop fence for an optional delivery-only turn.
     pub(crate) fn snapshot_retry_running(&self) -> Result<bool, LocalApiError> {
         Ok(self.state()?.running)
