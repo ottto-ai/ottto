@@ -1644,6 +1644,13 @@ struct SnapshotUploadProgress {
         skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
     )]
     accepted_identity_buckets: crate::snapshots::claude_request_identity::AcceptedBuckets,
+    /// Routed progress: the stored identity rows' barriers. The hints
+    /// themselves are rows of their own, loaded per page.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::snapshots::claude_request_identity::IdentityScope::is_unset"
+    )]
+    accepted_identity_scope: crate::snapshots::claude_request_identity::IdentityScope,
     #[serde(default)]
     accepted_cache_heads: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1727,6 +1734,7 @@ impl SnapshotUploadProgress {
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
             accepted_identity_buckets: Default::default(),
+            accepted_identity_scope: Default::default(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
             head_conflict_challenges: BTreeMap::new(),
@@ -2436,6 +2444,9 @@ impl SnapshotUploadProgress {
         }
         self.historical_replay_generation = Some(generation.to_string());
         self.accepted_identity_buckets.clear_retained();
+        if self.rows.is_some() && !self.accepted_identity_scope.is_unset() {
+            self.accepted_identity_scope.retained_before = self.generation.saturating_add(1);
+        }
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
         self.accepted_body_contexts.clear();
@@ -2628,6 +2639,12 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
+        if value["provenance"]["collector"].as_str()
+            == Some(crate::snapshots::claude_request_identity::COLLECTOR)
+        {
+            // Record must see the stored frozen set.
+            self.load_identity([session])?;
+        }
         self.accepted_identity_buckets.record(&value);
         // `cache_state_ack:v1`: ACK validation refuses a cache-bearing stored
         // ref whose digest differs from this body's witness unless its echoed
@@ -7539,6 +7556,9 @@ fn finish_sync_source(
             &index,
             machine_id,
         );
+        upload_progress.load_identity(
+            (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
+        )?;
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
@@ -10125,6 +10145,9 @@ where
             .note_attempt(fingerprint(item), bytes);
     }
     let mut replaced_retained_proof = false;
+    if !progress.accepted_identity_scope.is_unset() {
+        progress.load_identity(batch.iter().filter_map(session_id))?;
+    }
     // Only proof the ledger holds can be replaced, whatever the capability.
     if progress.accepted_identity_buckets.has_retained() {
         for item in &batch {
@@ -22061,6 +22084,10 @@ mod tests {
             include!("snapshot_sync/claude_login_only_org_tests.rs");
         }
         #[cfg(unix)]
+        mod accepted_identity_cap_tests {
+            include!("snapshot_sync/accepted_identity_cap_tests.rs");
+        }
+        #[cfg(unix)]
         mod claude_org_line_money_tests {
             include!("snapshot_sync/claude_org_line_money_tests.rs");
         }
@@ -24043,7 +24070,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

@@ -2807,10 +2807,8 @@ fn advertised_cap_retags_previously_stripped_accepted_body() {
     assert_eq!(counts["identity_cap"]["refused_new_buckets"], 0);
     ledger.record(&serde_json::to_value(&second).unwrap());
     assert_eq!(ledger.get(&second.source_session_id).unwrap().len(), 400);
-    let mut expected_ledger = serde_json::to_value(&ledger).unwrap();
-    for session in expected_ledger.as_object_mut().unwrap().values_mut() {
-        session["last_ack"] = json!(session["last_ack"].as_u64().unwrap() + 1);
-    }
+    // Re-recording the same shares leaves the ledger as it is.
+    let expected_ledger = serde_json::to_value(&ledger).unwrap();
     let mut third = original;
     identity::apply_with_reserved_bytes_for_test(&mut third, &proof, &ledger, 0, Some(2_097_152))
         .unwrap();

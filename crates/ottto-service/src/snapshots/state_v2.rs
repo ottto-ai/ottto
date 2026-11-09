@@ -21,8 +21,9 @@ mod runtime;
 pub(crate) use runtime::release_collection_page_limit_for_test;
 #[cfg(test)]
 pub(crate) use runtime::{
-    before_progress_import_for_test, claim_growth_for_test, drop_progress_ledger_chunk_for_test,
-    edit_progress_rows_for_test, fail_next_progress_commit_for_test, import_progress_rows_for_test,
+    before_progress_import_for_test, claim_growth_for_test, damage_identity_row_for_test,
+    drop_progress_ledger_chunk_for_test, edit_progress_rows_for_test,
+    fail_next_progress_commit_for_test, import_progress_rows_for_test,
     lose_next_progress_commit_reply_for_test, take_progress_pages_for_test,
     take_progress_set_aside_for_test,
 };
@@ -599,7 +600,7 @@ impl StorageLimits {
 // Upload progress as keyed rows, for the source's progress owner.
 pub(crate) use progress::{
     import_progress_rows, read_progress_ledger, read_progress_rows, Marker as ProgressMarker,
-    ProgressPage, ProgressRead, ProgressRows,
+    Point as ProgressPoint, ProgressPage, ProgressRead, ProgressRows,
 };
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
 pub(super) use runtime::before_collection;
