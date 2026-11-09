@@ -21,11 +21,39 @@ fn resident_wave_shape_defers_before_three_b_of_refolds() {
     }
     let fixture = E2ScanFixture::with_identity_capture(false);
     let roots = [root];
-    let mut index = ScanIndex::default();
+    let state = home.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let (session, mut index) = StateV2ColdSession::publish(
+        scan_index_persistence::Source::Pi,
+        &ScanIndex::default(),
+        &state,
+    );
+    let route = session.path().to_owned();
+    fixture.on_committed_route(&route);
+    index.activate_upload_context("resident-wave".into());
     for _ in 0..100 {
-        let (next, page, _) =
+        let (next, mut page, _) =
             fixture.scan_other_page(SnapshotSource::Pi, &roots, &home, index, true, 1000, &[]);
         index = next;
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut page, &mut index);
+        let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(SnapshotSource::Pi);
+        ledger.deliver(&page.snapshots);
+        assert!(page.snapshots.iter().all(|item| ledger.settled(item)));
+        index.record_accepted_snapshot_fingerprints(
+            &page
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &page.snapshots,
+            &e2_pipeline_scan_fixture::exact_acks_for_test(&page.snapshots),
+        );
+        index.save(&route).unwrap();
+        index = ScanIndex::load(&route).unwrap();
+        index.activate_upload_context("resident-wave".into());
         if page.census_complete {
             break;
         }
@@ -37,10 +65,6 @@ fn resident_wave_shape_defers_before_three_b_of_refolds() {
     index.traversal = None;
     let (index, page, modes) =
         fixture.scan_other_page(SnapshotSource::Pi, &roots, &home, index, true, n + 1, &[]);
-    assert_eq!(
-        modes.0, 0,
-        "unchanged transcripts re-fold from their stored Tail"
-    );
     let q = page.scanned_file_count as f64 * FILE_CHARGE;
     let deferred = index
         .traversal
@@ -51,6 +75,10 @@ fn resident_wave_shape_defers_before_three_b_of_refolds() {
     assert!(
         !page.census_complete,
         "deferred first-read membership holds census"
+    );
+    assert_eq!(
+        modes.0, 0,
+        "unchanged transcripts re-fold from their stored Tail"
     );
     fs::remove_dir_all(home).unwrap();
 }
