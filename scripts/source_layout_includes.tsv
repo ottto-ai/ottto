@@ -10,7 +10,6 @@ crates/ottto-service/src/snapshots.rs	path	snapshots/source_session_id_tests.rs
 crates/ottto-service/src/snapshots/account_pending_retention_tests.rs	include	account_pending_decoder_0_1_201.rs
 crates/ottto-service/src/snapshots/census_p2_kept_tests.rs	include	provider_envelope_experiment_tests.rs
 crates/ottto-service/src/snapshots/census_p2_kept_tests.rs	include	witness_reconstruct_scope_tests.rs
-crates/ottto-service/src/snapshots/claude_copy_prefix_reread/tests.rs	path	proof_recovery_tests.rs
 crates/ottto-service/src/snapshots/claude_request_identity_tests.rs	include	claude_request_identity_retained_tests.rs
 crates/ottto-service/src/snapshots/claude_request_identity_tests.rs	include	claude_request_identity_window_tests.rs
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_activity_clock_tests.rs
@@ -20,8 +19,6 @@ crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_pipeline_o
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_tests.rs
 crates/ottto-service/src/snapshots/claude_request_money/e2_holder_redrift_tests.rs	path	e2_copy_route_tests.rs
 crates/ottto-service/src/snapshots/codex_file_join/group_job.rs	path	group_job_tests.rs
-crates/ottto-service/src/snapshots/money_freshness.rs	path	money_freshness_tests.rs
-crates/ottto-service/src/snapshots/ownership_diagnostics.rs	path	ownership_diagnostics_tests.rs
 crates/ottto-service/src/snapshots/privacy_flip_tests.rs	path	privacy_flip_tail_tests.rs
 crates/ottto-service/src/snapshots/sampled_scan.rs	path	claude_sidecar_reduction_tests.rs
 crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs	path	codex_cursor_tests.rs
