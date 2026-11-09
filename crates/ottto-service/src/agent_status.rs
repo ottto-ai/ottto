@@ -20110,7 +20110,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
 
 #[cfg(test)]
