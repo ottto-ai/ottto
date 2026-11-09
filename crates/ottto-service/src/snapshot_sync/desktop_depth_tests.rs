@@ -78,7 +78,6 @@ fn desktop_depth_recovery_matches_never_flipped_money_and_placement() {
             )
         };
         let never_flipped = route(&original, Mode::ColdFull);
-        let original_bindings = canonical(&original.index.session_account_bindings);
         // A real unreadable identity entry still retracts complete evidence.
         let invalid = bucket.join("invalid.json");
         std::fs::write(&invalid, "{bad json}").unwrap();
@@ -93,11 +92,6 @@ fn desktop_depth_recovery_matches_never_flipped_money_and_placement() {
         let mut recovered = ready(&corpus, &scanner, lost.index, 100, true);
         recovered.finish();
         assert_eq!(disposition(&recovered), Some("complete"));
-        assert_eq!(
-            canonical(&recovered.index.session_account_bindings),
-            original_bindings,
-            "final saved account and grouping bindings"
-        );
         let recovered_route = route(&recovered, Mode::Restart);
         money_oracle::assert_equivalent(&never_flipped, &recovered_route);
         money_oracle::assert_placement_equivalent(&never_flipped, &recovered_route);

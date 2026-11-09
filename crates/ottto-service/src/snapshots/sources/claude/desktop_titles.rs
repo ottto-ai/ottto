@@ -1164,4 +1164,4 @@ crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 
 #[cfg(test)]
-mod depth_tests;
+mod tests;
