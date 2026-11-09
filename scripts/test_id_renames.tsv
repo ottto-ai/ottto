@@ -1,4 +1,7 @@
 target	old_test	new_test
+crates/ottto-service/src/lib.rs	snapshots::pi_ledger_tests::every_pi_usage_shape_passes_the_same_clock_gate	snapshots::sources::pi::tests::ledger::every_pi_usage_shape_passes_the_same_clock_gate
+crates/ottto-service/src/lib.rs	snapshots::pi_ledger_tests::fork_copies_before_the_header_skip_usage_but_at_and_after_count	snapshots::sources::pi::tests::ledger::fork_copies_before_the_header_skip_usage_but_at_and_after_count
+crates/ottto-service/src/lib.rs	snapshots::pi_ledger_tests::fork_heap_bound_charges_inline_box_allocation	snapshots::sources::pi::tests::ledger::fork_heap_bound_charges_inline_box_allocation
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::chain_keeps_adjacent_slots_and_episode_anchor	snapshots::usage::cache_observations::tests::chain_keeps_adjacent_slots_and_episode_anchor
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::restart_update_and_retraction_keep_identity	snapshots::usage::cache_observations::tests::restart_update_and_retraction_keep_identity
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::cold_start_model_switch_and_suffix_growth	snapshots::usage::cache_observations::tests::cold_start_model_switch_and_suffix_growth
