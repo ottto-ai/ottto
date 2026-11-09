@@ -298,14 +298,12 @@ impl Page {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
             let chunks = crate::snapshot_sync::evidence_chunks_for_test() - chunks_before;
             unobserved(|| {
-                checks.compare(
+                checks.compare_references(
                     terminal,
-                    (&whole, whole_accepted.as_ref(), whole_reads),
-                    (self, accepted.as_deref(), reads),
-                );
-                checks.compare_chunked(
-                    terminal,
-                    (&one, one_accepted.as_ref(), one_reads),
+                    [
+                        (&whole, whole_accepted.as_ref(), whole_reads),
+                        (&one, one_accepted.as_ref(), one_reads),
+                    ],
                     (self, accepted.as_deref(), reads),
                     chunks,
                 );
