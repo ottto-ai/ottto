@@ -73,7 +73,6 @@ impl Fixture {
         kinds::populate(&index, &mut tx, &mut cx).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
         db.finish_import().unwrap();
-        super::super::ack::ProgressRecovery::seal_import(identity.clone(), 1, &path, None).unwrap();
         fence::publish(&path, &identity, &mut false).unwrap();
         Self {
             support,
@@ -366,8 +365,6 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     );
     let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &old);
     guard().unwrap();
-    let receipt = super::super::ack::ProgressRecovery::for_index(&old, &f.path).unwrap();
-    assert!(receipt.is_some());
     old.historical_replay_generation = Some("synthetic-next-context".into());
     old.save(&f.path).unwrap();
     assert!(
@@ -420,13 +417,19 @@ fn progress_page_follows_the_claim_lineage() {
         sampled_audit::own_growth_claim_generation(&pass, &f.path),
         Some(pass.generation + 1)
     );
+    let (states, heads) = (
+        BTreeMap::from([("s".to_string(), 1_u64)]),
+        BTreeMap::<String, u64>::new(),
+    );
     let page = progress::Page {
-        cache_state: BTreeMap::from([("s".to_string(), 1_u64)]),
-        cache_head: BTreeMap::<String, u64>::new(),
-        ledger: 1_u64,
+        cache_state: &states,
+        cache_head: &heads,
+        ledger: &1_u64,
     };
     let outcome = crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
-        commit_progress_locked(&f.path, &pass, owner, progress::Baseline::default(), &page)
+        with_progress_session(&f.path, owner, |db, identity, graph| {
+            progress::commit(db, identity, graph, &Default::default(), &page, None)
+        })
     })
     .unwrap();
     assert!(matches!(outcome, progress::Outcome::Committed(_)));
