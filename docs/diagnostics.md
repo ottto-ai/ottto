@@ -379,6 +379,42 @@ independently measured matching process. Never subtract or sum overlapping
 windows or infer allocation ownership: the finish window contains its batch-call
 windows.
 
+Between-pass owners emit the same version 2 `local_resources` stage records
+once per completed work unit, including returned errors, at their existing
+work/event cadence. No new timer, thread, history or footprint sampler is opened.
+The stable stage names and boundaries are:
+
+| Stage | Work unit |
+|---|---|
+| `offpass_agent_status` | Admitted shared status collection/publication pass (all sources). |
+| `offpass_codex_quota` | Scheduled saved-quota round. |
+| `offpass_account_check` | Admitted account-fingerprint read between scan slices. |
+| `offpass_watcher` | Received debounced watcher batch, excluding receiver wait. |
+| `offpass_hint` | Received hint folded into source cadence. |
+| `offpass_collector_checkin` | Collector check-in across enabled sources. |
+| `offpass_local_health` | Local health projection upload. |
+| `offpass_control_socket`, `offpass_control_xpc` | Accepted control request, including request I/O. |
+| `offpass_network_transition` | Received route message or pending debounce work, excluding idle timeouts/read waits. |
+| `offpass_telemetry` | Accepted relay connection, including request I/O, decode and forwarding. |
+| `offpass_legacy_relay` | Existing legacy relay supervision tick, including approval/reconciliation. |
+| `offpass_mcp_inventory` | Inventory harvest across granted sources. |
+| `offpass_context_footprint` | Shared Claude/Codex context harvest. |
+| `offpass_context_composition` | Parent composition wake, including worker wait and health report. |
+| `offpass_cloud_sessions` | Cloud session collection cycle. |
+| `offpass_daily_reference` | Provider daily-reference cycle. |
+
+These rows add `counts.cpu_user_us` and `counts.cpu_sys_us`: self-process
+user/system CPU deltas in microseconds, `null` when unavailable or regressing.
+`observation.wall_elapsed_us` remains wall microseconds for the work unit.
+The `offpass_` prefix selects these CPU-only windows in `StageWindow`; ordinary
+in-pass fields and counts remain unchanged. `source` is the existing source
+slug for source-bound work and `unknown` for shared/mixed work. Off-pass names
+identify owners that run independently of scan passes; they can overlap a pass
+or each other. CPU includes concurrent process work and excludes children;
+never sum these overlapping windows or treat worker wait time as child CPU.
+Idle accept polls, legacy accept polls and route read waits are not measured as
+separate work units. Panics emit no row, matching other stage windows.
+
 `footprint_samples_over_400` counts the successful samples in that same measure
 above 400 MiB (419,430,400 bytes), a reporting line only: nothing reads it to
 change behavior. Time above the line is about this count × 50 ms (the start
@@ -2098,9 +2134,11 @@ a later stripped/refused ACK cannot bless a new authority or missing presence.
 Restoration still requires current held proof. An always-missing sibling row
 has no accepted tagged fingerprint and is not spuriously refused.
 
-Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
-Each share record occupies 80 inline bytes on the requested 64-bit layout;
-the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
+Limits are 5,000 starts and 1,536 share-presence records per session; sessions
+are not capped. On a routed destination each session's hints are one
+`progress.identity` row, read for the page's sessions before use and released
+after each durable save. Each share record occupies 80 inline bytes on the
+requested 64-bit layout; one maximal session is below 256 KiB. Whole buckets are
 evicted from the hint ledger at the share limit, never partial share sets;
 `accepted_state_unknown` counts attempts using incomplete or missing state.
 Eviction, timestamp-only migration and older-decoder loss degrade to currently
@@ -2187,16 +2225,15 @@ proves is a counted refusal; the replacement's ACK replaces it.
 A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
 body's marked rows, so a later revision re-tags them through the same
 allocator. A destination namespace or historical replay generation change
-clears all proved rows, as do key rotation and session eviction (the class L
-last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+clears all proved rows, as does key rotation. Limits: 1,024 proved rows per session, persisted as
 versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
 only). Each proved record also stores the proving revision's optional row-level
 account hash (class H, bounded and erased with the session). Login markers resend
 that ACK-bound hash for grain only; parts markers have no hash. Old records without
 hash provenance fail closed to fresh tags. Markers require contract 6
 (`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
-Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
-requested-layout maximum below 4 MiB.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap one session's hints stay below 512 KiB of JSON and
+256 KiB of requested layout.
 
 Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
 `retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`

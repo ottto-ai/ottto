@@ -8,6 +8,7 @@
 //! memory to derive content-free observations.
 
 use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
+use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::FileLock;
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
@@ -4215,6 +4216,7 @@ fn collect_composed_cloud_sessions_once(
     active_transport: &mut ActiveCloudSessionTransport,
     now: OffsetDateTime,
 ) -> CloudSessionCycleOutcome {
+    let _stage = StageWindow::begin("codex", "offpass_cloud_sessions");
     let accounts = FileAccountStore::default();
     let devices = FileDeviceStore::default();
     let connections = FileConnectionStore::default();

@@ -13,6 +13,8 @@
 //! independent of error families, streaks, and rate-limit windows — so the
 //! next upload cycle starts from fresh connections.
 
+#[cfg(target_os = "macos")]
+use crate::local_resource_diagnostics::StageWindow;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::time::{Duration, Instant};
 
@@ -86,11 +88,14 @@ impl RouteSocket {
         let rc = unsafe { libc::poll(&mut pollfd, 1, timeout) };
         if rc < 0 {
             let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
                 return Err(error);
             }
         }
-        // Timeout/EINTR return to the observer's absolute-deadline check.
+        // Timeout/EINTR/EAGAIN return to the observer's absolute-deadline check.
         Ok(())
     }
 
@@ -158,9 +163,6 @@ fn observe_route_messages(
     let mut last_rebuild_at: Option<Instant> = None;
     let mut readable = false;
     loop {
-        if transition_ready(&mut pending_since, &mut last_rebuild_at, Instant::now()) {
-            rebuild();
-        }
         let deadline = pending_since.map(|since| since + TRANSITION_QUIET_PERIOD);
         let result = if readable {
             Ok(())
@@ -181,12 +183,19 @@ fn observe_route_messages(
             }
         };
         readable = message.is_some();
+        // Measure wake handling and rebuild work, never the blocking readiness wait.
+        #[cfg(target_os = "macos")]
+        let _stage = (message.is_some() || pending_since.is_some())
+            .then(|| StageWindow::begin("unknown", "offpass_network_transition"));
         if let Some(length) = message {
             if is_transition(&buffer[..length]) {
                 // Quiet-period debounce: each new message re-arms the timer so
                 // the rebuild lands after the flurry settles.
                 pending_since = Some(Instant::now());
             }
+        }
+        if transition_ready(&mut pending_since, &mut last_rebuild_at, Instant::now()) {
+            rebuild();
         }
     }
 }

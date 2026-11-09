@@ -53,6 +53,8 @@ extern "C" fn handle_xpc_request(
     peer_euid: libc::uid_t,
     context: *mut c_void,
 ) -> *mut c_char {
+    let _stage =
+        crate::local_resource_diagnostics::StageWindow::begin("unknown", "offpass_control_xpc");
     if request_json.is_null() || context.is_null() {
         crate::control_plane_health::record_request_error();
         return null_response();

@@ -1,3 +1,4 @@
+use crate::local_resource_diagnostics::StageWindow;
 use crate::snapshots::{paths_from_events, SnapshotSource};
 use anyhow::Result;
 use notify::event::{EventKind, ModifyKind};
@@ -278,6 +279,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
     let configured_roots = roots.clone();
     std::thread::spawn(move || {
         while let Ok(result) = raw_rx.recv() {
+            let _stage = StageWindow::begin("unknown", "offpass_watcher");
             // A backend watcher error means the event stream is no longer a
             // complete witness. The periodic durable scan must finish one
             // explicitly dirty generation and then a clean generation before

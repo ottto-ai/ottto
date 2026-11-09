@@ -1,5 +1,6 @@
 use crate::control::handle_request;
 use crate::local_resource_diagnostics::cache_lifecycle::{record as refused, Event};
+use crate::local_resource_diagnostics::StageWindow;
 use crate::snapshot_client::load_snapshot_device_credentials;
 use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
@@ -743,6 +744,7 @@ fn handle_client(
     daemon: LocalDaemon,
     legacy_activity: Option<legacy::Activity>,
 ) -> Result<()> {
+    let _stage = StageWindow::begin(source.api_slug(), "offpass_telemetry");
     handle_client_at(
         stream,
         source,
