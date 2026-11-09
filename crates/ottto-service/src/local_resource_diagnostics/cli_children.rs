@@ -27,14 +27,12 @@ pub(super) struct Counts {
 pub(super) fn snapshot() -> Vec<Counts> {
     ARGV.iter()
         .enumerate()
-        .filter_map(|(i, argv)| {
-            let starts = with_totals(|totals| totals[0][i].load(Relaxed));
-            (starts != 0).then(|| Counts {
-                argv,
-                starts,
-                cpu_us: with_totals(|totals| totals[1][i].load(Relaxed)),
-            })
+        .map(|(i, argv)| Counts {
+            argv,
+            starts: with_totals(|totals| totals[0][i].load(Relaxed)),
+            cpu_us: with_totals(|totals| totals[1][i].load(Relaxed)),
         })
+        .filter(|counts| counts.starts != 0)
         .collect()
 }
 
@@ -62,8 +60,7 @@ pub(crate) fn spawn(command: &mut Command) -> io::Result<MeasuredChild> {
     let binary = std::path::Path::new(command.get_program())
         .file_name()
         .and_then(|s| s.to_str());
-    let args: Vec<_> = command.get_args().collect();
-    let has = |value: &str| args.iter().any(|arg| *arg == value);
+    let has = |value: &str| command.get_args().any(|arg| arg == value);
     let class = match binary {
         Some("codex") if has("login") && has("status") => Some(0),
         Some("codex") if has("debug") && has("models") && has("--bundled") => Some(1),
@@ -100,6 +97,14 @@ impl MeasuredChild {
     }
     fn reap(&mut self, blocking: bool) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
+            return Ok(self.status);
+        }
+        if self.class.is_none() {
+            self.status = if blocking {
+                Some(self.inner.wait()?)
+            } else {
+                self.inner.try_wait()?
+            };
             return Ok(self.status);
         }
         #[cfg(unix)]

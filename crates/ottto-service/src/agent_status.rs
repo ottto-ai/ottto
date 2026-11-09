@@ -23483,19 +23483,38 @@ for line in sys.stdin:
         let (root, home) = cli_meta_fixture("cli-meta-hit");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
-        for _ in 0..2 {
-            let (snapshot, _, _) = collect_codex_status_for_home(
-                "2026-08-26T00:00:00Z".to_string(),
-                "2026-08-26T00:15:00Z".to_string(),
-                &home,
-                CodexHomeTrust::ProviderDefault,
-                CodexLoginRefresh::Never,
-                CodexQuotaRead::Saved,
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            crate::local_resource_diagnostics::source_prepare(
+                "codex",
+                || {
+                    for _ in 0..2 {
+                        let (snapshot, _, _) = collect_codex_status_for_home(
+                            "2026-08-26T00:00:00Z".to_string(),
+                            "2026-08-26T00:15:00Z".to_string(),
+                            &home,
+                            CodexHomeTrust::ProviderDefault,
+                            CodexLoginRefresh::Never,
+                            CodexQuotaRead::Saved,
+                        );
+                        assert_eq!(
+                            snapshot.account.unwrap().login_state,
+                            AgentLoginState::SignedIn
+                        );
+                    }
+                },
+                |_| false,
             );
-            assert_eq!(
-                snapshot.account.unwrap().login_state,
-                AgentLoginState::SignedIn
-            );
+        });
+        let children = rows.last().unwrap()["observation"]["cli_children"]
+            .as_array()
+            .unwrap();
+        for argv in ["codex login status", "codex debug models --bundled"] {
+            let counts = children
+                .iter()
+                .find(|counts| counts["argv"] == argv)
+                .unwrap();
+            assert_eq!(counts["starts"], 1, "{argv}");
+            assert!(counts["cpu_us"].as_u64().unwrap() > 0, "{argv} child CPU");
         }
         assert_eq!(
             fs::read_to_string(home.join("starts"))
