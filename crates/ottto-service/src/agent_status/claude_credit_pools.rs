@@ -303,8 +303,8 @@ fn is_window_key(key: &str) -> bool {
     key == "five_hour" || key == "seven_day" || key.starts_with("seven_day_")
 }
 
-/// Every top-level object with a numeric `limit_dollars` is a one-time dollar
-/// pool (contract v2.2 §11.3): `iguana_necktie`, `amber_ladder`,
+/// Every top-level object with a readable `limit_dollars` amount is a one-time
+/// dollar pool (contract v2.2 §11.3): `iguana_necktie`, `amber_ladder`,
 /// `wattle_ember`, ... `resets_at` on these pools is an expiry, not a cycle.
 /// Null pools, pools whose expiry passed before the read, and the
 /// percent-only `cinder_cove` are skipped.
@@ -323,15 +323,14 @@ fn claude_one_time_credits(
         .filter(|key| !is_window_key(key) && key.as_str() != CLAUDE_PERCENT_ONLY_POOL)
         .filter_map(|key| {
             let pool = object.get(key)?.as_object()?;
-            pool.get("limit_dollars")
-                .filter(|value| super::credit_amount_input::is_number(value))?;
+            let limit_cents = super::claude_oauth_money_cents(pool.get("limit_dollars"))?;
             // The codename becomes the pool's `limit_id`; the model refuses a
             // codename that is not a closed code shape (or is secret-shaped),
             // and the pool is skipped with that refusal's diagnostic.
             let (balance, refused) = match one_time_credit(
                 key,
                 string_field(pool, "label"),
-                super::claude_oauth_money_cents(pool.get("limit_dollars")),
+                Some(limit_cents),
                 super::claude_oauth_money_cents(pool.get("used_dollars")),
                 super::claude_oauth_money_cents(pool.get("remaining_dollars")),
                 time_field(pool, "resets_at"),
@@ -1037,7 +1036,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::agent_status::credit_amount_input::{decode, CreditBody};
+    use crate::agent_status::credit_amount_input::{decode, usage_body, CreditBody};
 
     // Synthetic bodies shaped like the redacted real plain and saved-reset
     // variant responses (account/org/grant ids are invented).
@@ -1058,15 +1057,10 @@ mod tests {
         })
     }
 
-    /// A synthetic body as the provider response decode reads it.
-    fn decoded(body: Value) -> Value {
-        decode(&body.to_string(), CreditBody::ClaudeUsage).expect("usage body")
-    }
-
     /// Plain read of a Max account: the $250 one-time pool, an expired pool,
     /// a percent-only pool, usage credits off.
     fn plain_max_body() -> Value {
-        decoded(json!({
+        usage_body(json!({
             "five_hour": window(0, None),
             "seven_day": window(100, Some("2026-10-10T05:00:00.377761+00:00")),
             "seven_day_opus": null,
@@ -1103,7 +1097,7 @@ mod tests {
     }
 
     fn variant_body(cedar: Value) -> Value {
-        decoded(json!({
+        usage_body(json!({
             "five_hour": window(38, Some("2026-10-04T20:20:00.508208+00:00")),
             "seven_day": window(100, Some("2026-10-08T17:00:00.508227+00:00")),
             "iguana_necktie": pool(250.0, 0.0, 250.0, "2026-11-05T07:59:00+00:00"),
@@ -2382,8 +2376,14 @@ mod tests {
             .join("../../fixtures/agent-status/quota-contract-v2.2")
     }
 
+    /// A fixture file; a provider body is read as the response decode reads it.
     fn fixture(path: &str) -> Value {
-        serde_json::from_slice(&std::fs::read(fixture_dir().join(path)).unwrap()).unwrap()
+        let text = std::fs::read_to_string(fixture_dir().join(path)).unwrap();
+        if path.starts_with("provider/") {
+            decode(&text, CreditBody::ClaudeUsage).unwrap()
+        } else {
+            serde_json::from_str(&text).unwrap()
+        }
     }
 
     /// The emitted balances without the fields stamped outside the adapter:

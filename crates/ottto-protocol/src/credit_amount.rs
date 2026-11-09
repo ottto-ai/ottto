@@ -94,27 +94,21 @@ impl Serialize for CreditAmount {
 }
 
 /// The one exact decimal scaler: `text` × 10^`shift`, rounded half-even to an
-/// integer. `text` is an unsigned decimal (`12`, `0.40`, `1.5e3`); surrounding
-/// whitespace is ignored. A sign, any other shape, or a result above `u64`
-/// gives `None`.
+/// integer. `text` is an unsigned plain decimal (`12`, `0.40`); surrounding
+/// whitespace is ignored. A sign, an exponent, any other shape, or a result
+/// above `u64` gives `None`.
 pub fn scale_decimal(text: &str, shift: i64) -> Option<u64> {
     let text = text.trim();
-    let (mantissa, exponent) = match text.find(['e', 'E']) {
-        Some(at) => (&text[..at], text[at + 1..].parse::<i64>().ok()?),
-        None => (text, 0),
-    };
-    let (whole, fraction) = match mantissa.split_once('.') {
+    let (whole, fraction) = match text.split_once('.') {
         Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
         Some(_) => return None,
-        None => (mantissa, ""),
+        None => (text, ""),
     };
     let digits = whole.bytes().chain(fraction.bytes());
     if whole.is_empty() || !digits.clone().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let exponent = exponent
-        .checked_add(shift)?
-        .checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let exponent = shift.checked_sub(i64::try_from(fraction.len()).ok()?)?;
     scale_digits(digits, whole.len() + fraction.len(), exponent)
 }
 
@@ -142,9 +136,6 @@ fn scale_digits(digits: impl Iterator<Item = u8>, count: usize, exponent: i64) -
         }
     }
     for _ in 0..exponent.max(0) {
-        if value == 0 {
-            break;
-        }
         value = value.checked_mul(10)?;
     }
     if first_dropped > 5 || (first_dropped == 5 && (tail || value % 2 == 1)) {

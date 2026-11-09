@@ -6,8 +6,8 @@
 //! usage, and a Codex app-server message) decode through [`decode`], which
 //! re-reads the credit subtrees from the raw text and keeps each fractional
 //! number there as its exact lexeme, a JSON string. Every credit amount is then
-//! read through [`amount`] / [`amount_at`] (Claude money: the adapter's
-//! `claude_oauth_money_cents`) into the one scaler of
+//! read through [`scaled`] (native units: [`amount_at`]; Claude money: the
+//! adapter's `claude_oauth_money_cents`) into the one scaler of
 //! [`ottto_protocol::CreditAmount`]; a float that bypassed [`decode`] is
 //! refused rather than rounded.
 //!
@@ -94,25 +94,25 @@ fn keep_lexemes(value: &mut Value, raw: &RawValue, walk: Walk) {
     }
 }
 
-/// A native-unit amount: an integer JSON number or a decimal string. A float
-/// number (one that did not come through [`decode`]) is absent.
-fn amount(value: &Value) -> Option<CreditAmount> {
+/// An integer JSON number or a decimal string × 10^`shift`, through the one
+/// exact scaler. A float number (one that did not come through [`decode`]) is
+/// absent.
+pub(super) fn scaled(value: &Value, shift: i64) -> Option<u64> {
     match value {
-        Value::Number(number) => CreditAmount::whole(number.as_u64()?),
-        Value::String(text) => CreditAmount::from_decimal(text),
+        Value::Number(number) => ottto_protocol::scale_minor(number.as_u64()?, shift),
+        Value::String(text) => ottto_protocol::scale_decimal(text, shift),
         _ => None,
     }
 }
 
-/// The amount at the first of `keys` that holds a valid one.
+/// The native-unit amount at the first of `keys` that holds a valid one.
 pub(super) fn amount_at(value: &Value, keys: &[&str]) -> Option<CreditAmount> {
-    keys.iter().find_map(|key| amount(value.get(*key)?))
+    keys.iter()
+        .find_map(|key| scaled(value.get(*key)?, 6).map(CreditAmount::from_micros))
 }
 
-/// Whether `value` is a number, or a number's lexeme kept by [`decode`].
-pub(super) fn is_number(value: &Value) -> bool {
-    value.is_number()
-        || value
-            .as_str()
-            .is_some_and(|text| serde_json::from_str::<serde_json::Number>(text).is_ok())
+/// A synthetic provider usage body as the response decode reads it.
+#[cfg(test)]
+pub(super) fn usage_body(body: Value) -> Value {
+    decode(&body.to_string(), CreditBody::ClaudeUsage).expect("usage body")
 }

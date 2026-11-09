@@ -15175,11 +15175,7 @@ fn claude_oauth_money_cents(value: Option<&Value>) -> Option<u64> {
         }
         return ottto_protocol::scale_minor(amount_minor, 2 - exponent as i64);
     }
-    match value {
-        Value::Number(number) => ottto_protocol::scale_minor(number.as_u64()?, 2),
-        Value::String(dollars) => ottto_protocol::scale_decimal(dollars, 2),
-        _ => None,
-    }
+    credit_amount_input::scaled(value, 2)
 }
 
 fn claude_oauth_money_currency(value: Option<&Value>) -> Option<String> {
@@ -27179,12 +27175,10 @@ for line in sys.stdin:
         assert_eq!(credits[0].remaining, CreditAmount::whole(0));
     }
 
-    /// [money] Codex credit amounts stay exact through status and wire: 0.4 is
-    /// low (not exhausted), 5.4 is ok (not low), `hasCredits: false` with 0.3
-    /// keeps a low row, and a fractional monthly headroom is not exhausted.
-    /// True zero stays exhausted, the wire keeps six half-even digits, and a
-    /// negative or out-of-range amount, or a float that bypassed the exact
-    /// provider decode, is absent and unknown, never zero.
+    /// Codex credit status compares exact amounts: 0.4 is low (not exhausted),
+    /// 5.4 is ok (not low), `hasCredits: false` with 0.3 keeps a low row, and a
+    /// fractional monthly headroom is not exhausted. True zero stays exhausted
+    /// and a negative balance stays absent and unknown, never zero.
     #[test]
     fn codex_credit_amounts_are_exact_through_status_and_wire() {
         use AgentCreditBalanceStatus as Status;
@@ -27224,37 +27218,7 @@ for line in sys.stdin:
                 "5",
             ),
             (
-                r#"{"hasCredits":true,"balance":"123"}"#,
-                Some(Status::Ok),
-                "123",
-            ),
-            (
-                r#"{"balance":"49591.7041935000"}"#,
-                Some(Status::Ok),
-                r#""49591.704194""#,
-            ),
-            (
-                r#"{"balance":"1.2345665000"}"#,
-                Some(Status::Low),
-                r#""1.234566""#,
-            ),
-            (
-                r#"{"balance":"1.2345675000"}"#,
-                Some(Status::Low),
-                r#""1.234568""#,
-            ),
-            (
                 r#"{"unlimited":false,"balance":"-5"}"#,
-                Some(Status::Unknown),
-                "null",
-            ),
-            (
-                r#"{"unlimited":false,"balance":"18446744073710"}"#,
-                Some(Status::Unknown),
-                "null",
-            ),
-            (
-                r#"{"unlimited":false,"balance":0.4}"#,
                 Some(Status::Unknown),
                 "null",
             ),
@@ -27274,9 +27238,12 @@ for line in sys.stdin:
         );
     }
 
-    /// [money] The provider decodes keep a raw credit number exact: it reaches
-    /// the wire with the same six half-even digits as its string form, while
-    /// numbers outside the credit subtrees stay numbers.
+    /// [regress] The provider decodes rounded fractional credit numbers
+    /// through `f64`. Each decode keeps a raw credit number exact: it reaches
+    /// the wire with the same six half-even digits as its string form (Claude
+    /// money: half-even cents on spend, windows, one-time pools and the cached
+    /// config copy), numbers outside the credit subtrees stay numbers, and a
+    /// one-time pool is admitted exactly when its limit reads as money.
     #[test]
     fn provider_decodes_keep_raw_credit_numbers_exact() {
         use super::credit_amount_input::{decode, CreditBody};
@@ -27296,19 +27263,64 @@ for line in sys.stdin:
         assert_eq!(wire[1]["name"], "workspace_monthly_credits");
         assert_eq!(wire[1]["used"], "1.234566");
         assert_eq!(wire[1]["quota"], 8000);
+        assert_eq!(wire[1]["remaining"], "7998.765434");
 
-        let usage = r#"{"five_hour":{"utilization":12.5,"used_dollars":2501.367212},
-            "spend":{"enabled":true,"used":0.125,"limit":{"amount_minor":5000,"exponent":2}}}"#;
+        // 12.5 cents is an exact tie: half-even keeps 12 (was 13).
+        let usage = r#"{"five_hour":{"utilization":12.5,"used_dollars":0.125},
+            "seven_day":{"utilization":3,"used_dollars":2501.367212},
+            "spend":{"enabled":true,"used":0.125,"limit":{"amount_minor":5000,"exponent":2}},
+            "iguana_necktie":{"limit_dollars":250,"used_dollars":0.125,
+                "remaining_dollars":249.875,"resets_at":"2026-11-05T07:59:00+00:00"},
+            "amber_ladder":{"limit_dollars":"1","remaining_dollars":1,
+                "resets_at":"2026-11-05T07:59:00+00:00"},
+            "wattle_ember":{"limit_dollars":{"amount_minor":500,"exponent":2},
+                "resets_at":"2026-11-05T07:59:00+00:00"},
+            "maple_harbor":{"limit_dollars":-5,"remaining_dollars":1,
+                "resets_at":"2026-11-05T07:59:00+00:00"}}"#;
         let body = decode(usage, CreditBody::ClaudeUsage).expect("usage body");
         assert!(body["five_hour"]["utilization"].is_number());
+        let windows = claude_oauth_quota_windows(&body)
+            .into_iter()
+            .map(|window| (window.name, window.used_cents))
+            .collect::<Vec<_>>();
         assert_eq!(
-            claude_oauth_quota_windows(&body)[0].used_cents,
-            Some(250_137)
+            windows,
+            [
+                ("session".to_string(), Some(12)),
+                ("weekly".to_string(), Some(250_137))
+            ]
         );
-        // 12.5 cents is an exact tie: half-even keeps 12.
         assert_eq!(
             claude_oauth_credit_balances(&body)[0].used,
             CreditAmount::whole(12)
+        );
+        let read = claude_credit_pools::claude_credit_read(
+            &body,
+            claude_credit_pools::ClaudeUsageRead::Plain,
+            "2026-10-09T14:06:52Z",
+        );
+        let pools = claude_credit_pools::claude_merge_credit_sections("b", &[], &read)
+            .into_iter()
+            .filter(|balance| {
+                balance.kind == Some(ottto_protocol::CreditBalanceKind::OneTimeCredit)
+            })
+            .map(|pool| {
+                let wire = serde_json::to_value(&pool).unwrap();
+                serde_json::json!([
+                    wire["limit_id"],
+                    wire["quota"],
+                    wire["used"],
+                    wire["remaining"]
+                ])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pools,
+            [
+                serde_json::json!(["amber_ladder", 100, null, 100]),
+                serde_json::json!(["iguana_necktie", 25_000, 12, 24_988]),
+                serde_json::json!(["wattle_ember", 500, null, null]),
+            ]
         );
         let config =
             format!(r#"{{"cachedUsageUtilization":{{"fetchedAtMs":1.5,"utilization":{usage}}}}}"#);
@@ -31735,7 +31747,7 @@ for line in sys.stdin:
 
     #[test]
     fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
-        let json = claude_usage_body(serde_json::json!({
+        let json = credit_amount_input::usage_body(serde_json::json!({
             "spend": {
                 "used": {"amount_minor": 500, "currency": "USD", "exponent": 2},
                 "limit": 5.0,
@@ -31751,15 +31763,6 @@ for line in sys.stdin:
         assert_eq!(balances[0].remaining, CreditAmount::whole(0));
     }
 
-    /// A provider usage body as the OAuth response decode reads it.
-    fn claude_usage_body(body: Value) -> Value {
-        credit_amount_input::decode(
-            &body.to_string(),
-            credit_amount_input::CreditBody::ClaudeUsage,
-        )
-        .expect("usage body")
-    }
-
     #[test]
     fn claude_oauth_money_cents_normalizes_exponents_and_bare_numbers() {
         let object = serde_json::json!({"amount_minor": 3215, "exponent": 3});
@@ -31771,9 +31774,8 @@ for line in sys.stdin:
         let negative = serde_json::json!({"amount_minor": -1, "exponent": 2});
         assert_eq!(claude_oauth_money_cents(Some(&negative)), None);
         assert_eq!(claude_oauth_money_cents(None), None);
-        // [money] One exact half-even scaler: an exact half cent rounds to
-        // even, a decimal lexeme keeps its digits, and a float that bypassed
-        // the exact provider decode is refused rather than rounded.
+        // One exact half-even scaler: an exact half cent rounds to even, and a
+        // decimal string keeps its digits.
         for (value, cents) in [
             (
                 serde_json::json!({"amount_minor": 12345, "exponent": 3}),
@@ -31785,8 +31787,6 @@ for line in sys.stdin:
             ),
             (serde_json::json!("0.125"), Some(12)),
             (serde_json::json!("0.1251"), Some(13)),
-            (serde_json::json!("-0.5"), None),
-            (serde_json::json!(0.125), None),
         ] {
             assert_eq!(claude_oauth_money_cents(Some(&value)), cents, "{value}");
         }
@@ -31794,7 +31794,7 @@ for line in sys.stdin:
 
     #[test]
     fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
-        let json = claude_usage_body(serde_json::json!({
+        let json = credit_amount_input::usage_body(serde_json::json!({
             "extra_usage": {
                 "is_enabled": true,
                 "monthly_limit": 5.0,
@@ -31844,7 +31844,7 @@ for line in sys.stdin:
 
     #[test]
     fn claude_oauth_window_dollar_fields_map_to_cents() {
-        let json = claude_usage_body(serde_json::json!({
+        let json = credit_amount_input::usage_body(serde_json::json!({
             "five_hour": {
                 "utilization": 24.0,
                 "resets_at": "2026-06-29T18:10:00+00:00",

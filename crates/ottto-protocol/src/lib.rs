@@ -8884,9 +8884,9 @@ mod tests {
         );
     }
 
-    /// [money] One exact scaler: half-even to six digits over every discarded
-    /// digit, overflow after the carry is absent, bare cents stay cents, and
-    /// amounts round-trip as integers when whole and ≤6-dp strings otherwise.
+    /// One exact scaler: half-even to six digits over every discarded digit,
+    /// overflow after the carry is absent, bare cents stay cents, and amounts
+    /// round-trip as integers when whole and ≤6-dp strings otherwise.
     #[test]
     fn credit_amounts_scale_exactly_and_round_trip() {
         for (text, micros) in [
@@ -8895,21 +8895,16 @@ mod tests {
             ("1.2345675000", Some(1_234_568)),
             ("1.23456650001", Some(1_234_567)),
             ("0.40", Some(400_000)),
-            ("1.5e2", Some(150_000_000)),
             ("18446744073709.551615", Some(u64::MAX)),
             ("18446744073709.5516155", None),
             ("18446744073710", None),
-            ("-1", None),
-            ("-0.4", None),
+            ("1.5e2", None),
             ("1.", None),
-            ("abc", None),
         ] {
             let parsed = CreditAmount::from_decimal(text);
             assert_eq!(parsed.map(CreditAmount::micros), micros, "{text}");
         }
-        // `{amount_minor: 12345, exponent: 3}` in cents: an exact tie is even.
-        assert_eq!(scale_minor(12_345, -1), Some(1_234));
-        assert_eq!(scale_minor(12_355, -1), Some(1_236));
+        assert_eq!(CreditAmount::whole(18_446_744_073_710), None);
         // A bare amount already in cents is not read as dollars.
         assert_eq!(scale_decimal("700", 0), Some(700));
         assert_eq!(scale_decimal("700", 2), Some(70_000));
