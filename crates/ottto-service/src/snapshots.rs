@@ -103,6 +103,8 @@ pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
+#[cfg(test)]
+pub(crate) use claude_context_file_birth::with_remembered_tripwire_restored_for_test;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -211,6 +213,8 @@ pub(crate) use scan::durable_sources;
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
 mod held_audit_restore_tests;
+#[cfg(test)]
+mod resident_wave_tests;
 pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
 use scan::lines::delivery::tests as line_delivery_tests;
@@ -520,8 +524,8 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
-/// RAM-only receipt inputs from existing traversal/admission state. No census
-/// decision, durable field, or scheduling change is made by this projection.
+/// RAM-only traversal/admission observations for receipts and ordinary pacing.
+/// This projection changes no census decision or durable field.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CensusStatus {
     pub pending_work: bool,
@@ -555,6 +559,9 @@ pub struct SourceScanResult {
     pub discovered_file_count: usize,
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
+    pub(crate) charge_deferred: bool,
+    /// Selection filled the effective AIMD file allowance before family deferrals.
+    pub(crate) page_file_limit_hit: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -1464,12 +1471,14 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
-#[cfg(test)]
-pub(crate) use claude_reemission_exclusions::restart_claude_reemission_stop_for_test;
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
     note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) use claude_reemission_exclusions::{
+    restart_claude_reemission_stop_for_test, with_claude_reemission_stop_restored_for_test,
 };
 
 #[cfg(test)]

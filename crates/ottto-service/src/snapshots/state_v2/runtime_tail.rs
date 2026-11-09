@@ -177,10 +177,20 @@ pub(in crate::snapshots) fn load_tail(
     mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
+    let mut bytes = 0u64;
     read_txn_at(index, |tx, stamp| {
-        super::super::tail::load_pages(tx, key.as_bytes(), head, stamp.0, &mut visit)
+        super::super::tail::load_pages(
+            tx,
+            key.as_bytes(),
+            head,
+            stamp.0,
+            &mut |collection, page, value: Vec<u8>| {
+                bytes = bytes.saturating_add(value.len() as u64);
+                visit(collection, page, value)
+            },
+        )
     })?;
-    telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
+    telemetry::tail_load(started.elapsed().as_millis(), bytes);
     Ok(())
 }
 /// `head`'s revisions by id, one short read transaction; same outcomes as

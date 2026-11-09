@@ -1712,10 +1712,7 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
                             .codex_freshness_yield,
                         fresh
                     );
-                    assert_eq!(
-                        selected.codex_selected_flags.len(),
-                        if fresh { 4 } else { 3 }
-                    );
+                    assert_eq!(selected.selected_flags.len(), if fresh { 4 } else { 3 });
                     if fresh {
                         assert_eq!(
                             selected.identified_candidates.front().unwrap().path,

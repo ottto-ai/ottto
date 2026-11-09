@@ -15,23 +15,18 @@
 
 #[cfg(target_os = "macos")]
 use crate::local_resource_diagnostics::StageWindow;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::time::{Duration, Instant};
 
 /// Rebuild only after the routing table has been quiet this long: transitions
 /// arrive as message flurries, and rebuilding mid-flurry could pool a socket
 /// on a network state that is still changing.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const TRANSITION_QUIET_PERIOD: Duration = Duration::from_secs(3);
 /// Never force-rebuild more often than this; dropping idle pools is cheap but
 /// a flapping interface must not thrash them continuously.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const TRANSITION_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(30);
-/// Blocking-read timeout on the routing socket, doubling as the debounce
-/// tick so a quiet period is noticed without further route messages.
-#[cfg(target_os = "macos")]
-const ROUTE_SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// Spawn the observer thread. Non-macOS builds are a no-op (the trigger —
 /// macOS network-transition handling of long-running processes — does not
 /// exist elsewhere, and `PF_ROUTE` is BSD-specific).
@@ -47,13 +42,14 @@ pub fn spawn_network_transition_observer() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 struct RouteSocket {
     fd: libc::c_int,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 impl RouteSocket {
+    #[cfg(target_os = "macos")]
     fn open() -> anyhow::Result<Self> {
         // SAFETY: plain socket(2); the fd is owned by RouteSocket and closed
         // on drop.
@@ -64,33 +60,46 @@ impl RouteSocket {
                 std::io::Error::last_os_error()
             ));
         }
-        let timeout = libc::timeval {
-            tv_sec: ROUTE_SOCKET_READ_TIMEOUT.as_secs() as libc::time_t,
-            tv_usec: 0,
-        };
-        // SAFETY: fd is a valid socket we just opened; timeval is a plain
-        // stack value of the documented size.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &timeout as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
+        // SAFETY: fd is the socket just opened here, initially with no status flags.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
         if rc != 0 {
             let error = std::io::Error::last_os_error();
             // SAFETY: fd is open and owned here.
             unsafe { libc::close(fd) };
             return Err(anyhow::anyhow!(
-                "configure PF_ROUTE socket read timeout failed: {error}"
+                "configure nonblocking PF_ROUTE socket failed: {error}"
             ));
         }
         Ok(Self { fd })
     }
 
-    /// One routing message, `Ok(None)` on the read-timeout tick.
+    fn wait_readable(&self, deadline: Option<Instant>) -> std::io::Result<()> {
+        let timeout = deadline.map_or(-1, |at| {
+            at.saturating_duration_since(Instant::now())
+                .as_nanos()
+                .div_ceil(1_000_000) as libc::c_int
+        });
+        let mut pollfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd is live and nfds matches its single entry.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                return Err(error);
+            }
+        }
+        // Timeout/EINTR/EAGAIN return to the observer's absolute-deadline check.
+        Ok(())
+    }
+
+    /// One routing message, `Ok(None)` when interrupted or fully drained.
     fn read_message(&self, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
         // SAFETY: fd is a valid open socket; the buffer pointer/length come
         // from a live mutable slice.
@@ -118,7 +127,7 @@ impl RouteSocket {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 impl Drop for RouteSocket {
     fn drop(&mut self) {
         // SAFETY: fd is owned by this struct and still open.
@@ -128,14 +137,40 @@ impl Drop for RouteSocket {
 
 #[cfg(target_os = "macos")]
 fn observe_route_socket(socket: RouteSocket) {
+    observe_route_messages(socket, is_transition_message, || {
+        crate::net_resilience::force_rebuild_upstream_agents(
+            "a macOS network transition (interface/address change)",
+        );
+        // Sleep/wake and restored network state are a lazy catch-up
+        // opportunity. The coalesced collection worker is independent of the transcript
+        // sync lock; consent/off-switch and the durable per-slot claim remain
+        // the final command boundaries.
+        crate::agent_status_refresh::request_all();
+    });
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn observe_route_messages(
+    socket: RouteSocket,
+    is_transition: impl Fn(&[u8]) -> bool,
+    mut rebuild: impl FnMut(),
+) {
     // Route messages are bounded well below this (rt_msghdr + a few
     // sockaddrs); a short read of an oversized message just truncates
     // payload we never parse.
     let mut buffer = [0_u8; 2048];
     let mut pending_since: Option<Instant> = None;
     let mut last_rebuild_at: Option<Instant> = None;
+    let mut readable = false;
     loop {
-        let message = match socket.read_message(&mut buffer) {
+        let deadline = pending_since.map(|since| since + TRANSITION_QUIET_PERIOD);
+        let result = if readable {
+            Ok(())
+        } else {
+            socket.wait_readable(deadline)
+        };
+
+        let message = match result.and_then(|()| socket.read_message(&mut buffer)) {
             Ok(message) => message,
             Err(error) => {
                 // Without the socket the proactive layer is gone, but the
@@ -147,38 +182,44 @@ fn observe_route_socket(socket: RouteSocket) {
                 return;
             }
         };
-        let now = Instant::now();
+        readable = message.is_some();
+        // Measure wake handling and rebuild work, never the blocking readiness wait.
+        #[cfg(target_os = "macos")]
         let _stage = (message.is_some() || pending_since.is_some())
             .then(|| StageWindow::begin("unknown", "offpass_network_transition"));
         if let Some(length) = message {
-            if is_transition_message(&buffer[..length]) {
+            if is_transition(&buffer[..length]) {
                 // Quiet-period debounce: each new message re-arms the timer so
                 // the rebuild lands after the flurry settles.
-                pending_since = Some(now);
+                pending_since = Some(Instant::now());
             }
         }
-        let Some(since) = pending_since else {
-            continue;
-        };
-        if now.saturating_duration_since(since) < TRANSITION_QUIET_PERIOD {
-            continue;
+        if transition_ready(&mut pending_since, &mut last_rebuild_at, Instant::now()) {
+            rebuild();
         }
-        pending_since = None;
-        let rebuilt_recently = last_rebuild_at
-            .is_some_and(|at| now.saturating_duration_since(at) < TRANSITION_REBUILD_MIN_INTERVAL);
-        if rebuilt_recently {
-            continue;
-        }
-        last_rebuild_at = Some(now);
-        crate::net_resilience::force_rebuild_upstream_agents(
-            "a macOS network transition (interface/address change)",
-        );
-        // Sleep/wake and restored network state are a lazy catch-up
-        // opportunity. The coalesced collection worker is independent of the transcript
-        // sync lock; consent/off-switch and the durable per-slot claim remain
-        // the final command boundaries.
-        crate::agent_status_refresh::request_all();
     }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn transition_ready(
+    pending_since: &mut Option<Instant>,
+    last_rebuild_at: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(since) = *pending_since else {
+        return false;
+    };
+    if now.saturating_duration_since(since) < TRANSITION_QUIET_PERIOD {
+        return false;
+    }
+    *pending_since = None;
+    let rebuilt_recently = last_rebuild_at
+        .is_some_and(|at| now.saturating_duration_since(at) < TRANSITION_REBUILD_MIN_INTERVAL);
+    if rebuilt_recently {
+        return false;
+    }
+    *last_rebuild_at = Some(now);
+    true
 }
 
 /// Whether one raw `PF_ROUTE` message signals a network transition worth a
@@ -239,5 +280,141 @@ mod tests {
         // socket on the platform it targets.
         let socket = RouteSocket::open().expect("PF_ROUTE socket opens");
         assert!(socket.fd >= 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod readiness_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{atomic::AtomicBool, atomic::Ordering, mpsc, Arc};
+
+    /// [behaviour] An idle indefinite wait wakes on fd readiness.
+    #[test]
+    fn idle_wait_wakes_on_readiness() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let socket = RouteSocket {
+            fd: reader.into_raw_fd(),
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            socket.wait_readable(None).unwrap();
+            let mut byte = [0];
+            ready_tx
+                .send(socket.read_message(&mut byte).unwrap())
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            ready_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        peer.write_all(&[1]).unwrap();
+        let ready = ready_rx.recv_timeout(Duration::from_millis(500));
+        // Unblocks the waiter if the read never arrived. On macOS this fails
+        // with ENOTCONN once the waiter has already closed its end.
+        let _ = peer.shutdown(std::net::Shutdown::Both);
+        waiter.join().unwrap();
+        assert_eq!(ready.unwrap(), Some(1));
+    }
+
+    /// [behaviour] Quiet fires without another message, re-arms only for relevant
+    /// messages, survives continuous chatter and discards suppressed transitions.
+    #[test]
+    fn quiet_deadline_and_rebuild_suppression() {
+        for chatter in [false, true] {
+            let (mut peer, reader) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let socket = RouteSocket {
+                fd: reader.into_raw_fd(),
+            };
+            let (seen_tx, seen_rx) = mpsc::channel();
+            let (rebuilt_tx, rebuilt_rx) = mpsc::channel();
+            let observer = std::thread::spawn(move || {
+                observe_route_messages(
+                    socket,
+                    |message| {
+                        let relevant = message.contains(&1);
+                        if relevant {
+                            seen_tx.send(Instant::now()).unwrap();
+                        }
+                        relevant
+                    },
+                    || {
+                        rebuilt_tx.send(Instant::now()).unwrap();
+                    },
+                );
+            });
+            peer.write_all(&[1]).unwrap();
+            let first = seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let initial = rebuilt_rx.recv_timeout(Duration::from_secs(1));
+            peer.write_all(&[1]).unwrap();
+            let rearmed = seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = chatter.then(|| {
+                let mut writer = peer.try_clone().unwrap();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if writer.write_all(&[0; 2048]).is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+            let old_deadline = rebuilt_rx.recv_timeout(
+                (first + TRANSITION_QUIET_PERIOD).saturating_duration_since(Instant::now()),
+            );
+            let rebuilt = rebuilt_rx.recv_timeout(Duration::from_secs(3));
+            stop.store(true, Ordering::Relaxed);
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            if let Some(writer) = writer {
+                writer.join().unwrap();
+            }
+            observer.join().unwrap();
+            assert!(matches!(initial, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(matches!(old_deadline, Err(mpsc::RecvTimeoutError::Timeout)));
+            let rebuilt = rebuilt.unwrap();
+            assert!(rebuilt >= rearmed + TRANSITION_QUIET_PERIOD);
+            assert!(rebuilt < rearmed + Duration::from_secs(5));
+        }
+
+        let start = Instant::now();
+        let mut pending = Some(start);
+        let mut last = None;
+        assert!(!transition_ready(
+            &mut pending,
+            &mut last,
+            start + Duration::from_secs(2)
+        ));
+        assert!(transition_ready(
+            &mut pending,
+            &mut last,
+            start + Duration::from_secs(3)
+        ));
+        pending = Some(start + Duration::from_secs(4));
+        assert!(!transition_ready(
+            &mut pending,
+            &mut last,
+            start + Duration::from_secs(7)
+        ));
+        assert!(pending.is_none());
+        // Suppressed work is discarded, not queued at the 30-second boundary.
+        assert!(!transition_ready(
+            &mut pending,
+            &mut last,
+            start + Duration::from_secs(33)
+        ));
+        pending = Some(start + Duration::from_secs(30));
+        assert!(transition_ready(
+            &mut pending,
+            &mut last,
+            start + Duration::from_secs(33)
+        ));
     }
 }

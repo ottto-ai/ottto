@@ -52,6 +52,38 @@ pub(super) const PACING: ContinuationPacing = ContinuationPacing {
     idle_per_work: 9,
 };
 
+/// Ordinary resident-paced passes reuse cadence requests, without the cursor's
+/// contention cutoff: each pass repeats prepare and commits its queued work.
+pub(super) const PACED_AC: ContinuationPacing = ContinuationPacing {
+    min_gap: Duration::from_secs(30),
+    idle_per_work: 0,
+};
+pub(super) const PACED_BATTERY: ContinuationPacing = ContinuationPacing {
+    min_gap: Duration::from_secs(180),
+    idle_per_work: 0,
+};
+fn resident_pacing(power: PlatformState) -> Option<ContinuationPacing> {
+    match power {
+        PlatformState::Allowed => Some(PACED_AC),
+        PlatformState::Battery => Some(PACED_BATTERY),
+        PlatformState::Refused | PlatformState::Unknown => None,
+    }
+}
+pub(super) fn resident_background() -> Option<MacPlatformSignals> {
+    resident_pacing(MacPlatformSignals::default().power())?;
+    MacPlatformSignals::background()
+}
+pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
+    scan.charge_deferred || (scan.page_file_limit_hit && scan.census_status.pending_work)
+}
+pub(super) fn request_resident_scan(source: SnapshotSource) {
+    if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
+        with_source_cadence(source, |cadence| {
+            cadence.request_paced_scan(Instant::now(), Duration::ZERO, pacing)
+        });
+    }
+}
+
 /// A page whose measured work exceeds this is read as contention (a loaded
 /// machine, a slow disk or a long lock wait): the next page waits for the
 /// ordinary cadence instead. It is also the page's cooperative deadline; an
@@ -176,11 +208,12 @@ pub(super) trait CursorContinuation {
     ) -> PageEnd;
 }
 
-/// A platform answer. Anything but `Allowed` falls back to the ordinary
-/// cadence.
+/// Cursor pages require `Allowed`; resident-paced ordinary passes also
+/// accept `Battery`. Refused and unknown power keep the ordinary cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlatformState {
     Allowed,
+    Battery,
     Refused,
     Unknown,
 }
@@ -204,6 +237,7 @@ pub(crate) struct MacPlatformSignals {
 fn power_state(answer: i32) -> PlatformState {
     match answer {
         1 => PlatformState::Allowed,
+        2 => PlatformState::Battery,
         0 => PlatformState::Refused,
         _ => PlatformState::Unknown,
     }
@@ -535,10 +569,10 @@ fn lock_slot(
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// No continuation: neither the ticket nor the cadence request survives.
+/// Clear the cursor ticket and its request; a resident-paced ordinary request survives.
 fn clear(cadence: &mut impl CadenceAccess, slot: &Mutex<Option<ContinuationTicket>>) {
     *lock_slot(slot) = None;
-    cadence.cadence(SourceCadence::clear_continuation);
+    cadence.cadence(SourceCadence::clear_cursor_continuation);
 }
 
 /// What the sync loop does next.
@@ -577,6 +611,9 @@ pub(super) trait LoopHost {
     /// for the ordinary cycle now.
     fn wait(&mut self, wait: Duration) -> bool;
     fn pending(&mut self) -> Option<(Instant, Duration)>;
+    fn paced_due(&mut self) -> Option<Instant> {
+        None
+    }
     /// One continuation page, which should end by `deadline`.
     fn page(&mut self, deadline: Instant) -> Outcome;
 }
@@ -590,7 +627,8 @@ pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Durati
     loop {
         let now = host.now();
         let pending = host.pending();
-        match plan_wake(now, deadline, pending) {
+        let ordinary_deadline = host.paced_due().map_or(deadline, |due| due.min(deadline));
+        match plan_wake(now, ordinary_deadline, pending) {
             Wake::Ordinary(wait) => {
                 host.wait(wait);
                 return;
@@ -599,7 +637,7 @@ pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Durati
                 if host.wait(wait) {
                     return;
                 }
-                let outcome = host.page(deadline);
+                let outcome = host.page(ordinary_deadline);
                 if matches!(outcome, Outcome::Failed) {
                     eprintln!(
                         "local snapshot continuation page ended: {}",
@@ -739,6 +777,13 @@ pub(super) fn after_ordinary_codex_page(
     started: Option<Instant>,
     finished_ok: bool,
 ) {
+    if with_source_cadence(SnapshotSource::Codex, |cadence| {
+        cadence.paced_scan_due().is_some()
+    }) == Some(true)
+    {
+        clear(&mut CodexCadence, &TICKET);
+        return;
+    }
     let finished = Instant::now();
     let ticket = finished_ok
         .then_some(ticket)
@@ -759,6 +804,7 @@ pub(super) fn after_ordinary_codex_page(
 
 /// An ordinary Codex pass failed: no continuation follows it.
 pub(super) fn after_ordinary_codex_failure() {
+    with_source_cadence(SnapshotSource::Codex, SourceCadence::clear_continuation);
     clear(&mut CodexCadence, &TICKET);
 }
 

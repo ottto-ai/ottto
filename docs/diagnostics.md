@@ -67,10 +67,19 @@ enable the resource probes; Codex and Pi keep their existing measurements.
 While a Claude pass runs on the scanning thread, each event below (`save_span`,
 `hold`, `growth_claim_refused`, ...) prints its own row with only the changed
 field, `{"latest": {"<name>": <value>}}`, so every save and hold stays countable.
-Stage windows, memory checkpoints, retained heap and save-work samples print
-nothing mid-pass; the pass-end row (after `post_pass_plateau`) carries the full
-snapshot with every field below. A same-name window repeated in one pass shows
-its last instance. Outside a pass, each change prints the full snapshot at once.
+Tail loads (`tail_load_tx_ms`) and stage reports (`tail_stage`) are the
+exception: mid-pass they print no row and only fold into `tail_per_pass`, so
+their per-event order inside a pass is not printed; read `tail_per_pass`, not
+sums of `latest.tail_*`. The baseline gauges (`baseline_age_s` and
+`baseline_14day_escalation_alarm`) also update `latest` without one-key rows
+inside a pass. Stage windows, memory checkpoints, retained heap and save-work
+samples print nothing mid-pass; the pass-end row (after `post_pass_plateau`)
+always carries the full snapshot with every field below, once per pass even
+when `latest` is unchanged. A same-name window repeated in one pass shows its
+last instance. Outside a pass, events still print the full snapshot at once.
+Other samples omit the full snapshot when `latest` equals the last printed
+snapshot's `latest`; fresh stage-memory samples always print, preserving
+memory, CPU and page-fault measurements regardless of `latest` equality.
 
 | Field | Measurement |
 | --- | --- |
@@ -80,6 +89,7 @@ its last instance. Outside a pass, each change prints the full snapshot at once.
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
+| `tail_per_pass.{loads,load_bytes_sum,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Completed Tail read transactions since the pass started, their summed decoded reduction-page bytes (excluding heads and revisions), summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
@@ -427,7 +437,12 @@ and finish, so compare its peak with theirs but never subtract or sum them.
 
 Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
-sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
+sidecar read and fold, and contains `evidence_read` then `evidence_fold`. The
+page's families run in packed chunks (next-fit in page order; the batch size
+is the page's largest family by side-file bytes), and `evidence_read`,
+`evidence_fold` and the records inside them repeat once per chunk; the count
+of `evidence_read` records before a `claude_local_evidence` record is the
+page's chunk count.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
 final sort) are summed over roots into one record each per pass, with
@@ -438,7 +453,8 @@ Inside `evidence_fold`, one footprint record per step, in order and without
 counts: `evidence_side_calls` (side calls and the read holds),
 `evidence_identity_index`, `evidence_reported_usage`, `evidence_reconcile`
 (request accounts and activity staging), `evidence_finish_page`,
-`evidence_identity_tags`, `evidence_qualification` and `evidence_census_health`.
+`evidence_identity_tags` and `evidence_qualification`; then, once per page,
+`evidence_census_health`.
 Of the three outer footprint records, only `evidence_read` has counts: one
 `evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
 bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
@@ -446,7 +462,10 @@ after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
 footprint at the first two points; the third is `stage_end_footprint_bytes`),
 `kept_rows` (API plus trace rows the pass keeps for the fold),
 `largest_root_rows` with `largest_root_kept` (the root with the most rows and
-whether the pass kept it), and `legacy_owners` (legacy request owners). Compare
+whether the pass kept it), `legacy_owners` (legacy request owners), and
+`groups` with `side_file_bytes` (the chunk's families and their side-file
+bytes, `null` when a size could not be read). `kept_rows` is the chunk's; the
+page total is the sum over its chunks. Compare
 deltas between the points only; footprint also charges memory the allocator
 does not report.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record
@@ -489,6 +508,15 @@ they reset at process start and never decide anything.
 | `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
 | `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
 
+Each existing `native_collection_page` row also carries scalar
+`counts.tail_loads` and `counts.tail_load_bytes`: successful Tail hits on that
+native page and the sum of their decoded reduction-page bytes (the same bytes
+as `tail_db_load_bytes.page`, excluding heads and revisions). Both are zero
+when there are no hits, drain to zero after each page, and are separate for
+Claude, Codex and Pi. Use these per-page fields for page memory models;
+`tail_per_pass.load_bytes_sum` instead follows the existing completed read
+transactions, including a transaction whose later reduction validation fails.
+
 `tail_legacy_dir{removed,failed}` reports removal of a retired restart-record
 directory beside a scan index. Each pass removes the record directory alone
 under the writer lock and syncs the parent. A failed removal is counted in
@@ -513,7 +541,7 @@ disappearing: where a failure stayed possible, its new counter is named.
 | `rederive_head_bytes`, `rederive_named_lines`, `rederive_line_bytes` | Retired: title, first prompt, workspace and opening settings are stored session facts (`tail.page.session_facts`), so a load reads no transcript byte for them |
 | `bytes_read`, `records_read`, `guard_*_bytes`, `*_verify_bytes`, `context.sample_bytes` | `completed_guard_bytes` |
 | Sampled native bytes | `completed_native_bytes`, `completed_full_native_bytes`, `tail_bootstrap_full` |
-| `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage`, `tail_stage_dropped`, `tail_publish{dropped}` |
+| `not_persisted`, `ineligible`, `certificate_refused`, `write_deferred`, `active_bound`, `budget_refused`, `rederive_budget`, `peak_body_bytes`, `near_cap` | Retired: no budget, record or admission. `tail_stage` (in a pass: `tail_per_pass.stage_*`), `tail_stage_dropped`, `tail_publish{dropped}` |
 | `disk_records`, `disk_bytes`, `max_record_bytes`, `bytes_written`, `records_written`, `records_clean`, `batches`, `native_flushes`, `peak_codec_bytes`, `store_bytes_alarm` | Retired with `.rec`; `tail_apply`, `store_growth`, `wal_size_alarm` at database level, with no source label on engine statistics |
 | `retail_*`, `stale_full`, `pace_anomaly`, `pace_evicted`, `upgrade_missing_full`, `d3`, `restore_pending_quiet` | Retired with their mechanisms |
 | `store_disabled`, `t14_*`, `mode_repaired`, `stale_record_refused`, `temp_*`, `resource_pause*`, `memo_evicted`, `receipt_*`, `uninventoried_records`, `owed_overflow_discovery_only`, `native_stage_skipped`, `restore_unavailable_*` | Retired, `.rec` mechanics. A corrupt row is `tail_reconstruct{corrupt}`; the database owner's mode is the store's own |
@@ -1093,15 +1121,18 @@ redacted-placeholder rule.
 
 ## Service Log Rotation
 
-Each time the service starts, before it serves, it checks the file its stderr
-writes to. When that file is at least 64 MiB, it is renamed in place to
+Each time the service starts, before it serves, and after each sync cycle
+while it runs, it checks the file its stderr writes to. When that file is at
+least 64 MiB, it is renamed in place to
 `<stem>.<YYYYMMDDTHHMMSSZ>.log` (UTC rotation time), for example
 `ottto-service.err.20261105T142358Z.log`, and a new empty file takes the
 original name. Archives matching exactly that pattern are deleted once older
 than 7 days, but the newest 2 are always kept; the live file and any other
-name are never touched. Rotation happens only at startup, so a long-running
-service keeps appending to its live file until the next start. To read the
-full history, read the archives in name order, then the live file. A terminal,
+name are never touched. Pruning runs at every start and, while running,
+right after each rotation. While running, only the file stderr wrote to at
+startup rotates: if no new file can be opened after a rename, stderr keeps
+writing to that archive until the next start, and the archive is not
+rotated again. To read the full history, read the archives in name order, then the live file. A terminal,
 `/dev/null` or pipe on stderr is left alone.
 
 ## What To Share
@@ -1259,6 +1290,9 @@ fails a provider call, and a line it cannot write promptly is dropped.
 
 ## Claude Relay Endpoint Mismatch
 
+- `relay_bind_failed`: immediate source warning — Claude telemetry listener unavailable; restart Ottto, then Verify.
+- `relay_listener_failed`: source warning after 60 seconds failed — Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto.
+
 When the relay is connected but approved Claude telemetry settings name a
 different loopback port, `ottto doctor` reports both ports. `ottto status --json`
 and `ottto doctor --json` expose `relay.last_error.code` as
@@ -1376,6 +1410,14 @@ decisions for Rejected pages with non-progressing, restorable local holds.
 Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
 reset it.
+
+Claude Desktop census restarts emit a `bounded_traversal_transition` record with
+`event: restarting` and `reason: sidecar_census_restart` before discarding an existing
+checkpoint. It carries the old `index_generation`, `window_unix_seconds`,
+`pending_directories` and `pending_candidates`; no record is emitted without a prior
+checkpoint. This is distinct from `retiring` and does not count as census completion.
+The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
+feeds its error state or an alert.
 
 ## Prior Held Family Observation
 

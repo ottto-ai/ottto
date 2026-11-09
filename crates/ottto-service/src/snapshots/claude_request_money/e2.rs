@@ -1113,6 +1113,10 @@ impl FileFold {
     pub(crate) fn fork_parent(&self) -> Option<&str> {
         self.fork_parent.as_deref()
     }
+    /// This file's own location key, when it has one.
+    pub(crate) fn location_key(&self) -> Option<LocationKey> {
+        self.location.map(|located| located.0)
+    }
 
     pub(crate) fn is_skipped(&self, sequence: u64) -> bool {
         let at = self.skipped.partition_point(|(_, end)| *end <= sequence);
@@ -1692,7 +1696,7 @@ fn reported_key(
 }
 
 /// Family members of the page by root, as item indices.
-fn page_families(items: &[SnapshotItem]) -> BTreeMap<String, Vec<usize>> {
+pub(crate) fn page_families(items: &[SnapshotItem]) -> BTreeMap<String, Vec<usize>> {
     let mut families = BTreeMap::<String, Vec<usize>>::new();
     for (index, item) in items.iter().enumerate() {
         let root = claude_snapshot_family_root_ref(item);

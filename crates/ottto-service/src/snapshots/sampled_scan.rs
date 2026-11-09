@@ -74,6 +74,7 @@ impl CapPace {
 
 pub(crate) struct SharedCache {
     sidecars: Mutex<BTreeMap<String, crate::snapshots::sources::codex::sidecar::SidecarFacts>>,
+    desktop_titles: Mutex<super::sources::claude::desktop_titles::DesktopTitleFacts>,
     pub(crate) withheld_memo: withheld_account::Memo,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -93,6 +94,7 @@ impl Default for SharedCache {
     fn default() -> Self {
         Self {
             sidecars: Mutex::default(),
+            desktop_titles: Mutex::default(),
             withheld_memo: Default::default(),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
@@ -115,6 +117,7 @@ impl HeapLayoutBound for SharedCache {
         self.withheld_memo.heap_bound(c)?;
         self.cursor.heap_bound(c)?;
         self.sidecars.heap_bound(c)?;
+        self.desktop_titles.heap_bound(c)?;
         c.add(self.root_reservation())
     }
 }
@@ -136,6 +139,25 @@ impl SharedCache {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope.0.clone(), facts);
+        result
+    }
+
+    /// Move facts out for the sweep so no shared lock spans listing or reads.
+    pub(in crate::snapshots) fn with_desktop_titles<T>(
+        &self,
+        load: impl FnOnce(&mut super::sources::claude::desktop_titles::DesktopTitleFacts) -> T,
+    ) -> T {
+        let mut facts = std::mem::take(
+            &mut *self
+                .desktop_titles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let result = load(&mut facts);
+        *self
+            .desktop_titles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = facts;
         result
     }
 }
@@ -213,8 +235,9 @@ pub(super) struct Active {
     /// tiers and re-reads the file from its start (D168 `tier_prefix_replay`).
     pub(super) tier_prefix_replay: bool,
     pub(super) census_base_bound: bool,
+    pub(super) resident_loaded_bytes: u64,
 }
-crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound);
+crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound, resident_loaded_bytes);
 
 impl Context {
     #[inline(never)]
@@ -602,6 +625,7 @@ mod cache_lifecycle_tests {
         cache.cursor.heap_bound(&mut parts).unwrap();
         cache.withheld_memo.heap_bound(&mut parts).unwrap();
         cache.sidecars.heap_bound(&mut parts).unwrap();
+        cache.desktop_titles.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
             OFF_MAIN_SHARED_BYTES

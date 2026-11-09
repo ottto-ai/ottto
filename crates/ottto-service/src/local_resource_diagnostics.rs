@@ -664,12 +664,13 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 6;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 8;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
 const FORCED_SEED_START: usize = USAGE_GAP_START + 4;
-const UNSELECTED_REASONS: usize = FORCED_SEED_START + FORCED_SEEDS;
+const TAIL_LOAD_START: usize = FORCED_SEED_START + FORCED_SEEDS;
+const UNSELECTED_REASONS: usize = TAIL_LOAD_START + 2;
 process_static!(
     /// Claude, Codex, Pi x reason, drained by that source's page line.
     fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -721,19 +722,30 @@ pub(crate) enum PageSelection {
     /// closure for forced roots names (those added and those on the page).
     ForcedFamilyRoots,
     ForcedFamilyMembersPulled,
+    ChargeDeferred,
+    ChargeEstimate,
 }
 pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
     source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
         slot.fetch_add(amount, Relaxed)
     });
 }
-const PAGE_SELECTION: [(&str, usize); 6] = [
+/// One successful Tail hit on this native page; bytes are the loaded
+/// reduction pages (`tail_db_load_bytes.page`), excluding the head.
+pub(crate) fn tail_loaded(source: &str, bytes: u64) {
+    for (slot, amount) in [(TAIL_LOAD_START, 1), (TAIL_LOAD_START + 1, bytes)] {
+        source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
+    }
+}
+const PAGE_SELECTION: [(&str, usize); 8] = [
     ("selected", PAGE_SELECTION_START),
     ("owed_selected", PAGE_SELECTION_START + 1),
     ("skipped", PAGE_SELECTION_START + 2),
     ("deferred_roots", PAGE_SELECTION_START + 3),
     ("forced_family_roots", PAGE_SELECTION_START + 4),
     ("forced_family_members_pulled", PAGE_SELECTION_START + 5),
+    ("charge_deferred", PAGE_SELECTION_START + 6),
+    ("charge_estimate", PAGE_SELECTION_START + 7),
 ];
 /// Claude twins that force their family in (one seed each), by the twin's own
 /// `CandidateParseReason`, `other` for a Parse without one, or
@@ -1155,6 +1167,8 @@ impl Probe {
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             page_selection: BTreeMap<&'static str, u64>,
+            tail_loads: u64,
+            tail_load_bytes: u64,
             #[serde(flatten)]
             file_reads: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -1204,6 +1218,8 @@ impl Probe {
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             page_selection: drain(source, &PAGE_SELECTION),
+            tail_loads: source_count(source, TAIL_LOAD_START, |n| n.swap(0, Relaxed)),
+            tail_load_bytes: source_count(source, TAIL_LOAD_START + 1, |n| n.swap(0, Relaxed)),
             file_reads: drain(source, &FILE_READS),
             hold_wake: drain(
                 source,
@@ -1391,7 +1407,9 @@ pub(crate) struct StageWindow {
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
 /// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
-/// keeps, the largest root's rows with its keep bit, and legacy owners.
+/// keeps, the largest root's rows with its keep bit, and legacy owners; and
+/// the evidence chunk's families and their side-file bytes (`None`: a size
+/// could not be read).
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct EvidenceMem {
     in_use_bytes: [Option<u64>; 3],
@@ -1400,9 +1418,18 @@ pub(crate) struct EvidenceMem {
     largest_root_rows: usize,
     largest_root_kept: bool,
     pub(crate) legacy_owners: usize,
+    groups: usize,
+    side_file_bytes: Option<u64>,
 }
 crate::heap_layout_bound::no_heap!(true; EvidenceMem);
 impl EvidenceMem {
+    pub(crate) fn of_chunk(groups: usize, side_file_bytes: Option<u64>) -> Self {
+        Self {
+            groups,
+            side_file_bytes,
+            ..Self::default()
+        }
+    }
     /// Checkpoint 0 = A, 1 = B, 2 = C.
     pub(crate) fn sample(&mut self, at: usize) {
         self.in_use_bytes[at] = footprint::malloc_in_use();
@@ -1852,6 +1879,11 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
 pub fn rotate_service_log_at_startup() {
     #[cfg(unix)]
     stderr_rotation::rotate_at_startup();
+}
+/// Rotates a service log that reached the startup threshold while running.
+pub(crate) fn rotate_service_log_if_due() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_while_running();
 }
 
 /// Content-free allocator launch configuration, called once before serving.
@@ -2794,6 +2826,47 @@ mod tests {
                 "footprint_sample_failures",
             ] {
                 assert!(row.get(field).is_none());
+            }
+        }
+    }
+
+    /// [behaviour] Each native page sums successful Tail loads and reduction
+    /// page bytes for its own source, then drains both scalars.
+    #[test]
+    fn tail_load_counts_reset_per_native_page() {
+        let (_, records) = capture(|| {
+            for source in ["claude_code", "codex", "pi"] {
+                tail_loaded(source, 11);
+                tail_loaded(source, 29);
+            }
+            for source in ["claude_code", "codex", "pi"] {
+                for bytes in [None, Some(7), None] {
+                    let probe = Probe::page();
+                    if let Some(bytes) = bytes {
+                        tail_loaded(source, bytes);
+                    }
+                    probe.collection(
+                        source,
+                        CollectionCounts {
+                            scanned_files: 0,
+                            semantic_noops: 0,
+                            sampled_acquisition: None,
+                            full_causes: Default::default(),
+                        },
+                    );
+                }
+            }
+        });
+        let pages: Vec<_> = records
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect();
+        assert_eq!(pages.len(), 9);
+        for (pages, source) in pages.chunks_exact(3).zip(["claude_code", "codex", "pi"]) {
+            for (page, (loads, bytes)) in pages.iter().zip([(2, 40), (1, 7), (0, 0)]) {
+                assert_eq!(page["source"], source);
+                assert_eq!(page["counts"]["tail_loads"], loads);
+                assert_eq!(page["counts"]["tail_load_bytes"], bytes);
             }
         }
     }

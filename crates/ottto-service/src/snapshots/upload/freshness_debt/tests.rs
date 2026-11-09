@@ -878,3 +878,177 @@ pub(crate) fn assert_file_receipt_retires_debt(
     );
     f.close();
 }
+
+/// Commits a Codex Tail head for `path` whose certificate is the same object
+/// at an older `length` and mtime: a read that published the entry and its
+/// receipt without staging a sampled Tail left it behind.
+#[cfg(unix)]
+fn stale_codex_head(f: &mut Fixture, path: &Path, length: u64) {
+    use crate::durable_tail_codec::{Durable, Enc, HDigest};
+    use std::os::unix::fs::MetadataExt;
+    let live = std::fs::metadata(path).unwrap();
+    let certificate = crate::transcript_acquisition::DurableCertificate {
+        device: live.dev(),
+        inode: live.ino(),
+        length,
+        modified: (live.mtime() - 600, live.mtime_nsec()),
+        birth_nanos: 0,
+        sealed_offset: length,
+        sample_len: 0,
+        head_sha256: [0; 32],
+        boundary_sha256: [0; 32],
+        verified_unix_seconds: 0,
+        audit_debt_unix_seconds: None,
+    };
+    // The head identity, then its certificate.
+    let head = Enc::count_write(1 << 16, |e| {
+        [7u8; 32].put_h(e, "HeadIdentity.binding")?;
+        false.put(e)?;
+        [0u8; 32].put_h(e, "HeadIdentity.key_epoch")?;
+        certificate.put(e)
+    })
+    .unwrap();
+    assert_eq!(
+        crate::snapshots::tail_source::certified_certificate(&head)
+            .unwrap()
+            .length,
+        length
+    );
+    let route = state_v2::tail_route_path(&f.index).unwrap().unwrap();
+    let staged = state_v2::StagedFile {
+        revision: crate::snapshots::tail_source::reduction_revision(SnapshotSource::Codex),
+        head,
+        ..Default::default()
+    };
+    state_v2::stage_tail(&route, &local_index_key(path), staged).unwrap();
+    f.save();
+}
+
+/// [regress] A Codex read published the entry and its exact receipt, but the
+/// committed head kept an older certificate. The entry stamp equal to the
+/// listing is the stamp the receipt binds: nothing is owed, and repeated walks
+/// add no revision. Another entry stamp still owes the whole file.
+#[cfg(unix)]
+#[test]
+fn codex_entry_stamp_settles_debt_past_an_older_head_certificate() {
+    for entry_matches in [true, false] {
+        let mut f = Fixture::new(Source::Codex, "g7-codex-older-head");
+        let file = f.file("rollout.jsonl", 100);
+        age(&file, 9 * HOUR);
+        let key = local_index_key(&file);
+        let mut stored = entry(&file);
+        stored.codex_counting_owner = Some("owner".into());
+        if !entry_matches {
+            stored.modified_unix_nanos = stored.modified_unix_nanos.map(|ns| ns - 1_000_000_000);
+            stored.modified_unix_seconds -= 1;
+        }
+        f.index.files.insert(key.clone(), stored);
+        stale_codex_head(&mut f, &file, 60);
+        let live = std::fs::metadata(&file).unwrap();
+        assert!(
+            !f.index.listing_stamp_matches(&file, &live),
+            "the head decides"
+        );
+        assert_eq!(
+            f.index.files[&key].same_listing_stamp_as(&live),
+            entry_matches
+        );
+        for _ in 0..2 {
+            accept(f.source, &mut f.index, &file);
+            let debt = f.walk()["debt"].clone();
+            f.save();
+            let owed = committed(&f.index, &file);
+            if entry_matches {
+                assert_eq!(debt["outstanding_files"], 0);
+                assert_eq!(debt["over_6h_files"], 0);
+                assert!(owed.is_empty(), "no revision is added");
+            } else {
+                assert_eq!(debt["outstanding_files"], 1);
+                assert_eq!(debt["unread_bytes"], 100);
+                assert_eq!(owed.len(), 1);
+                let whole = Extent::Raw { start: 0, end: 100 };
+                assert_eq!(owed.values().next().unwrap().extent, whole);
+            }
+        }
+        f.close();
+    }
+}
+
+/// [regress] A held-back Codex fragment: the entry records only the certified
+/// prefix and its fragment binding matches the listing, while the head keeps
+/// its certificate at that prefix. The fragment's bytes stay owed.
+#[cfg(unix)]
+#[test]
+fn codex_held_back_fragment_stays_owed_past_the_prefix() {
+    use std::os::unix::fs::MetadataExt;
+    const OFFSET: u64 = 60;
+    let mut f = Fixture::new(Source::Codex, "g7-codex-fragment");
+    let file = f.file("rollout.jsonl", 100);
+    age(&file, 9 * HOUR);
+    let key = local_index_key(&file);
+    let live = std::fs::metadata(&file).unwrap();
+    let mut stored = entry(&file);
+    stored.size_bytes = OFFSET;
+    stored.codex_counting_owner = Some("owner".into());
+    f.index.files.insert(key.clone(), stored);
+    stale_codex_head(&mut f, &file, OFFSET);
+    // The binding is RAM-only: set after the save.
+    let mut candidate = crate::snapshots::tail_source::codex::tests::candidate(&file);
+    candidate.physical_identity = Some([live.dev(), live.ino()]);
+    candidate.modified_unix_nanos = live.modified().ok().and_then(unix_nanos).unwrap();
+    candidate.fingerprint_birth_nanos = live
+        .created()
+        .ok()
+        .and_then(unix_nanos)
+        .expect("known object birth");
+    let fragment = crate::snapshots::codex_fragment::BoundFragment::bind(&candidate, OFFSET)
+        .expect("a bound fragment");
+    f.index.files.get_mut(&key).unwrap().codex_fragment = Some(Box::new(fragment));
+    assert!(
+        !f.index.listing_stamp_matches(&file, &live),
+        "the head decides"
+    );
+    assert!(
+        f.index.files[&key].same_listing_stamp_as(&live),
+        "the fragment matches"
+    );
+    accept(f.source, &mut f.index, &file);
+    let debt = f.walk()["debt"].clone();
+    assert_eq!(debt["outstanding_files"], 1);
+    assert_eq!(debt["unread_bytes"], 100 - OFFSET);
+    f.save();
+    let owed = committed(&f.index, &file);
+    assert_eq!(owed.len(), 1);
+    let revision = owed.values().next().unwrap();
+    let suffix = Extent::Raw {
+        start: OFFSET,
+        end: 100,
+    };
+    assert_eq!(revision.extent, suffix);
+    assert!(revision.reason_bits & UNREAD != 0);
+    f.close();
+}
+
+/// [behaviour] Claude has no head certificate branch: a matching entry stamp
+/// with its receipt owes nothing, another stamp owes the whole file.
+#[test]
+fn claude_entry_stamp_debt_is_unchanged() {
+    for entry_matches in [true, false] {
+        let mut f = Fixture::new(Source::Claude, "g7-claude-entry-stamp");
+        let file = f.file("session.jsonl", 100);
+        age(&file, 9 * HOUR);
+        let mut stored = entry(&file);
+        if !entry_matches {
+            stored.modified_unix_nanos = stored.modified_unix_nanos.map(|ns| ns - 1_000_000_000);
+            stored.modified_unix_seconds -= 1;
+        }
+        f.index.files.insert(local_index_key(&file), stored);
+        accept(f.source, &mut f.index, &file);
+        let debt = f.walk()["debt"].clone();
+        assert_eq!(debt["outstanding_files"], u64::from(!entry_matches));
+        assert_eq!(debt["unread_bytes"], if entry_matches { 0 } else { 100 });
+        f.save();
+        assert_eq!(committed(&f.index, &file).is_empty(), entry_matches);
+        f.close();
+    }
+}

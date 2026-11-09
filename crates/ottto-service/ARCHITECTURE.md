@@ -143,6 +143,14 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+Claude Desktop title sweeps keep compact parsed session facts in the shared RAM
+cache while each regular file's device, inode, length and nanosecond mtime match.
+Every eligible sweep still lists the store, evicts unlisted facts and reconstructs
+account and original identity from the current path. Failed loads are never kept;
+loading holds no cache lock. Census, refusal, pruning and retry rules are unchanged,
+and callers without a shared cache load cold. The status lane keeps its separate
+Desktop metadata cache.
+
 ## Codex sidecar facts
 
 The process-owned transcript cache retains complete Codex home facts in RAM,
@@ -176,6 +184,12 @@ Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi
 model listings remain uncached because their output depends on Pi config/auth.
+
+The status read of each source's active-session reconciliation uses the same
+helper, keyed by its cache file. Every local request builds status, so the
+parsed reconciliation is reused while the file stamp is unchanged; a reconcile
+always replaces the file, and the next read parses it again.
+
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
 
@@ -217,6 +231,11 @@ child CPU totals; arguments, paths and command output are never included.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
   reconstructing them. No historical sessions are selected just to enrich metadata.
+- Claude Desktop store discovery reads ordinary directories at any depth, retaining
+  symlink rejection and the per-scan entry budget. Its identity census token enters a
+  session fingerprint only when that session carries original Desktop identity evidence.
+  Titles, account evidence and spawn lineage keep their independent fingerprint inputs.
+  A census restart records the discarded checkpoint before starting a replacement walk.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full audit credit or upload acceptance.
@@ -249,6 +268,16 @@ released afterwards; whole-state copies are avoided because the allocator keeps 
   Otherwise its answer is Unknown.
 - Memory is measured as `phys_footprint` for the whole process (see the resource fields in
   [docs/diagnostics.md](../../docs/diagnostics.md)).
+
+Native pages also use a soft 230 MiB resident charge target. A completion charges the larger
+of loaded Tail bytes and full encoded reduction pages, plus a per-file estimate. Files, path
+twins, forced families and Codex join groups finish as indivisible units; an oversize first
+unit always progresses. Remaining selected work returns to the saved traversal with its original
+flags. This paces work without dropping data or claiming a hard process-memory bound. A saved
+resident deferral, or a selection that filled its file allowance while source work remains queued,
+requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
+Mode off. Unknown power and Low Power Mode retain ordinary cadence.
+Prepare, finish, server minima, upload backoff and background QoS still apply.
 
 ## SQLite
 

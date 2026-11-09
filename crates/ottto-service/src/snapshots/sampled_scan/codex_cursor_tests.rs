@@ -2927,7 +2927,7 @@ fn fresh_sessions_bypass_owed_rereads_within_two_pages() {
         let queued = index.traversal.as_ref().unwrap().pending_candidates.len();
         cache.with_cursor(|cursor| cursor.headers.clear());
         let selected = selected_page(&fixture, &cache, index, &collected_at(7), &hints);
-        assert_eq!(selected.codex_selected_flags[&key], (false, true));
+        assert_eq!(selected.selected_flags[&key], (false, true));
         let (next, ridden) = finish_published(selected);
         index = next;
         assert_eq!(published_ids(&ridden), BTreeSet::from([NEW]));
@@ -3039,7 +3039,7 @@ fn queued_ordinary_work_gets_a_turn_between_fresh_and_census_turns() {
                 &collected_at(page),
                 &[fixture.file(SESSION)],
             );
-            let flags = selected.codex_selected_flags.clone();
+            let flags = selected.selected_flags.clone();
             let (index, _) = finish_published_within(selected, 10_000, || {
                 format!("page {page}, selected {flags:?}")
             });
@@ -3219,7 +3219,7 @@ fn four_path_page(fixture: &ScanRoot, mut index: ScanIndex, page: u64) -> OwnedS
 }
 
 fn selected_keys(scan: &OwnedSourceScan) -> BTreeSet<String> {
-    scan.codex_selected_flags.keys().cloned().collect()
+    scan.selected_flags.keys().cloned().collect()
 }
 
 fn keys<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> BTreeSet<String> {
@@ -3271,7 +3271,7 @@ fn spare_fresh_capacity_takes_census_fifo_and_preserves_deferred_flags() {
                     .collect::<Vec<_>>();
                 assert_eq!(order, [vec![fresh.clone()], cold[..3].to_vec()].concat());
                 assert_eq!(order.len(), order.iter().collect::<BTreeSet<_>>().len());
-                let flags = selected.codex_selected_flags.clone();
+                let flags = selected.selected_flags.clone();
                 let ((mut next, first), consumed) = observe_consumed(|| finish_published(selected));
                 assert!(next.traversal.as_ref().unwrap().codex_freshness_yield);
                 if small && compressed {
@@ -3374,10 +3374,7 @@ fn non_census_relist_selects_and_certifies_queued_files() {
             let mut selected = four_path_page(&fixture, index, 0)
                 .with_sampled_acquisition(cache.clone(), Scope("cursor-fixture".into()));
             let blocked = members.contains(&true);
-            assert_eq!(
-                selected.codex_selected_flags.len(),
-                if blocked { 0 } else { 4 }
-            );
+            assert_eq!(selected.selected_flags.len(), if blocked { 0 } else { 4 });
             assert_eq!(
                 codex_frozen_census_valid(selected.index.traversal.as_ref().unwrap()),
                 !blocked
@@ -3387,7 +3384,7 @@ fn non_census_relist_selects_and_certifies_queued_files() {
                 while !inventory.step_selected(
                     &selected.codex_title_metadata,
                     &mut selected.index,
-                    &selected.codex_selected_flags,
+                    &selected.selected_flags,
                     Some(&cache),
                 ) {}
                 let affected = inventory.affected_owners();
@@ -3413,7 +3410,7 @@ fn a_fresh_page_reads_plain_sessions_ahead_of_an_archive_backlog() {
     let selected = four_path_page(&fixture, index, 1);
     assert_eq!(selected_keys(&selected), keys(&archives[..4]));
     assert!(selected
-        .codex_selected_flags
+        .selected_flags
         .values()
         .all(|flags| *flags == (true, true)));
 
@@ -3424,7 +3421,7 @@ fn a_fresh_page_reads_plain_sessions_ahead_of_an_archive_backlog() {
         keys(plains.iter().chain(&archives[..3]))
     );
     assert!(selected
-        .codex_selected_flags
+        .selected_flags
         .values()
         .all(|flags| *flags == (true, true)));
     assert!(
@@ -7006,6 +7003,7 @@ fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
     cache.cursor.heap_bound(&mut parts).unwrap();
     cache.withheld_memo.heap_bound(&mut parts).unwrap();
     cache.sidecars.heap_bound(&mut parts).unwrap();
+    cache.desktop_titles.heap_bound(&mut parts).unwrap();
     assert_eq!(
         whole.bytes,
         shared_root + align_of::<SharedCache>() + 2 * size_of::<usize>() + parts.bytes

@@ -198,6 +198,8 @@ pub(crate) fn lineage_parentless_while_incomplete(files: u64) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct DesktopMetadata {
     #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) desktop_store_body_reads: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) inventory_restarts: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) source_revision_body_rereads: u64,
@@ -215,6 +217,9 @@ impl DesktopMetadata {
         *self == Self::default()
     }
     fn merge(&mut self, other: Self) {
+        self.desktop_store_body_reads = self
+            .desktop_store_body_reads
+            .saturating_add(other.desktop_store_body_reads);
         self.inventory_restarts = self
             .inventory_restarts
             .saturating_add(other.inventory_restarts);
@@ -251,6 +256,12 @@ pub(crate) fn desktop_revision_body_read(legacy: bool) {
         } else {
             &mut counts.desktop_metadata.source_revision_body_rereads
         };
+        *n = n.saturating_add(1);
+    });
+}
+pub(crate) fn desktop_store_body_read() {
+    update(|counts| {
+        let n = &mut counts.desktop_metadata.desktop_store_body_reads;
         *n = n.saturating_add(1);
     });
 }
