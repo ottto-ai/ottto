@@ -143,6 +143,24 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+## Codex sidecar facts
+
+The process-owned transcript cache retains complete Codex home facts in RAM,
+using the shared file stamp for the resolved SQLite main file and its WAL.
+Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
+completeness and path fingerprints. Roster changes, changed inputs and partial
+loads reload the complete title group. Changed thread databases use one
+streaming census with independent staging for title, usage and created rows.
+Raw title equality uses an optional digest; a SHA midstate preserves the exact
+existing fingerprint bytes after the merged title prefix is known.
+
+Recent log facts use one read transaction for maximum id, new matches and
+retained-row existence checks. Both log locations remain independent, expired
+rows leave the union and a larger time window reloads it. The existing capped
+result remains incomplete and is never retained. Facts and cursors are never
+persisted; restarting the process fully loads them again. Existing terminal
+scan diagnostics include per-input reuse/reload counts and log delta rows.
+
 ## CLI status metadata
 
 Codex login state and bundled model metadata are cached in RAM per home while the
