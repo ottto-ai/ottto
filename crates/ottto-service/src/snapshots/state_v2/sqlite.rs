@@ -714,9 +714,12 @@ impl Sqlite {
         super::telemetry::event("hold", &"none");
         Ok(store)
     }
-    /// Every check `open` can refuse, under an owner lock the caller holds.
-    /// The erasure swap also runs it on its copy, with an expected generation
-    /// and a forced quick_check, before that copy can replace the store.
+    /// The shared database/connection validation (identity, generation,
+    /// schema, writer capability, limits, WAL mode, quick_check), under an
+    /// owner lock the caller holds. `open`'s outer checks (format, parent
+    /// privacy, the owner lock) are not re-run here. The erasure swap also
+    /// runs it on its copy, with an expected generation and a forced
+    /// quick_check, before that copy can replace the store.
     pub(super) fn open_locked(
         path: &Path,
         identity: &super::Identity,

@@ -1,9 +1,10 @@
 //! Erasure by VACUUM INTO and a validated swap: one table of source × fault
 //! point. Synthetic stores only; CI runs these.
+use super::tail::{Collection, CollectionMeta, Shape, StagedFile, TailStage};
 use super::*;
 use crate::snapshots::scan_index_persistence::Source;
 use crate::test_scratch::ScratchDir;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -11,10 +12,92 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const REMNANTS: [&str; 4] = [".vacuum", ".vacuum-journal", ".vacuum-wal", ".vacuum-shm"];
 const EPOCH: u64 = 7;
-/// Controls the dump compares; the rest are maintenance bookkeeping.
-const KEPT: [&str; 3] = ["identity", "generation", "limits"];
+/// Rows the shared fixture must hold for the dump to cover them.
+const SEEDED: [&str; 9] = [
+    "tail.head",
+    "tail.page.responses",
+    "progress.cache_state",
+    "progress.cache_head",
+    "progress.ledger",
+    "progress.identity",
+    "progress_generation",
+    "progress_import",
+    "field_presence",
+];
 
-/// A published-name store for `source` with erasure debt, and its identity.
+/// Maintenance and erasure controls an attempt legitimately writes. Every
+/// other row compares, logical controls included.
+fn bookkeeping(name: &str) -> bool {
+    name == "phase"
+        || ["erasure_", "reference_", "store_growth"]
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Tail pages, upload progress and its accepted (ACK) ledger and identity
+/// rows, through the production Tail-only and progress-import writers.
+fn seed_tail_and_progress(db: &mut sqlite::Sqlite, identity: &Identity) {
+    type Json = serde_json::Value;
+    let graph = db.read_control::<u64>("generation").unwrap().unwrap();
+    let meta = CollectionMeta {
+        shape: Shape::Slot,
+        elements_per_page: 8,
+        elements: 16,
+    };
+    let page = |n: u64| {
+        (
+            (Collection::Responses, n),
+            format!("tail page {n}").into_bytes(),
+        )
+    };
+    let mut stage = TailStage::default();
+    stage.stage(
+        "/synthetic/vacuum/tail.jsonl",
+        StagedFile {
+            revision: 1,
+            head: b"synthetic tail head".to_vec(),
+            collections: [(Collection::Responses, meta)].into(),
+            pages: [page(0), page(1)].into(),
+            ..Default::default()
+        },
+    );
+    super::tail::commit_exit(db, identity, graph, &stage).unwrap();
+    let one = |value: Json| BTreeMap::from([("request-1".to_owned(), value)]);
+    let (states, heads) = (
+        one(serde_json::json!("accepted")),
+        one(serde_json::json!("h1")),
+    );
+    // Several chunk rows: the test chunk size is 256 bytes.
+    let fingerprints: BTreeMap<String, String> = (0..16)
+        .map(|n| (format!("fp-{n}"), "a".repeat(40)))
+        .collect();
+    let ledger = serde_json::json!({"schema_version": 3,
+        "accepted_snapshot_fingerprints": fingerprints, "accepted_row_count": 16});
+    let mut points = |tx: &mut dyn Transaction, progress_generation: u64| -> Result<bool> {
+        let point = serde_json::json!({"progress_generation": progress_generation,
+            "accepted": {"key_epoch": 1}});
+        super::progress::put_point(tx, "bucket-1", &point)?;
+        Ok(true)
+    };
+    let page = super::progress::Page {
+        cache_state: &states,
+        cache_head: &heads,
+        ledger: &ledger,
+    };
+    let marker = super::progress::Marker {
+        sha256: "b".repeat(64),
+        generation: 1,
+    };
+    let imported =
+        super::progress::import(db, identity, graph + 1, &page, &marker, Some(&mut points));
+    assert!(matches!(
+        imported.unwrap(),
+        super::progress::Imported::Committed(_)
+    ));
+}
+
+/// A published-name store for `source` with graph, Tail and progress rows
+/// and erasure debt, and its identity.
 fn store(source: Source, dir: &Path) -> (sqlite::Sqlite, PathBuf, Identity) {
     let build = super::codex_on_tests::fixtures()
         .into_iter()
@@ -27,6 +110,18 @@ fn store(source: Source, dir: &Path) -> (sqlite::Sqlite, PathBuf, Identity) {
     let path = dir.join("state.v2.sqlite");
     fs::rename(&import, &path).unwrap();
     let mut db = sqlite::Sqlite::open(&path, &identity).unwrap();
+    seed_tail_and_progress(&mut db, &identity);
+    let names: BTreeSet<String> = dump(&mut db)
+        .into_iter()
+        .filter_map(|(h, _)| match h.key {
+            RowKey::Record { kind, .. } => Some(kind.name().to_owned()),
+            RowKey::Meta(name) => Some(name),
+            RowKey::RequestSet(_) => None,
+        })
+        .collect();
+    for name in SEEDED {
+        assert!(names.contains(name), "{source:?}: no {name} row");
+    }
     db.control("erasure_pending", &EPOCH).unwrap();
     (db, path, identity)
 }
@@ -37,8 +132,8 @@ fn attempt(db: &mut sqlite::Sqlite) -> Result<()> {
     db.control("erasure_attempt", &(now - 7200))?;
     db.maintenance(true)
 }
-/// Every row and value except maintenance controls, after the part and
-/// header audits.
+/// Every row and value except maintenance and erasure bookkeeping, after the
+/// part and header audits.
 fn dump(db: &mut sqlite::Sqlite) -> Vec<(Header, Vec<u8>)> {
     db.validate_parts().unwrap();
     db.audit_headers().unwrap();
@@ -52,7 +147,7 @@ fn dump(db: &mut sqlite::Sqlite) -> Vec<(Header, Vec<u8>)> {
             let Some(last) = page.last() else { break };
             after = Some(last.key.clone());
             for h in page {
-                if matches!(&h.key, RowKey::Meta(n) if !KEPT.contains(&n.as_str())) {
+                if matches!(&h.key, RowKey::Meta(n) if bookkeeping(n)) {
                     continue;
                 }
                 let mut value = Vec::new();
@@ -78,9 +173,10 @@ fn pending(db: &sqlite::Sqlite) -> Option<u64> {
     db.read_control::<u64>("erasure_pending").unwrap()
 }
 
-/// A later load cold-opens `path`: the rows, identity and debt are as before
-/// the fault. The next attempt completes, removes every remnant and publishes
-/// a new WAL-mode inode that a cold open accepts with the same rows.
+/// A later load cold-opens `path` (the faulted store is already dropped): the
+/// rows, identity and debt are as before the fault. The next attempt
+/// completes, removes every remnant and publishes a new WAL-mode inode that a
+/// cold open accepts with the same rows.
 fn next_attempt(path: &Path, identity: &Identity, before: &[(Header, Vec<u8>)], row: &str) {
     let inode = ino(path);
     let mut db = sqlite::Sqlite::open(path, identity).unwrap();
@@ -104,14 +200,17 @@ fn next_attempt(path: &Path, identity: &Identity, before: &[(Header, Vec<u8>)], 
     assert_eq!(dump(&mut db), before, "{row}: rows after the swap");
 }
 
-/// [behaviour] Each source × fault point keeps the rows, identity and debt;
+/// [behaviour] Each source × fault point keeps the rows (graph, Tail, upload
+/// progress and its accepted ledger, logical controls), identity and debt;
 /// grants no completion; and the next attempt removes the remnant, completes
-/// and publishes a file a cold open accepts. Crash windows replay a copy of
-/// the directory taken at the fault; in-process faults continue the store.
+/// and publishes a file a cold open accepts. The faulted store is dropped
+/// first, so every retry runs on a freshly opened store. Every row except
+/// `reopen` also retries on a directory copy taken at the fault.
 #[test]
 fn erasure_swap_faults_keep_custody_for_every_source() {
     // (row, seam, post-close: the store must reload)
-    // `close` is W2 too: the copy is validated and the store not yet closed.
+    // `close` is W2: the seam fails just before `Connection::close` (not a
+    // real close error), with the copy validated and the store still open.
     const ROWS: [(&str, Option<&str>, bool); 7] = [
         ("W1", None, false),
         ("W2b", Some("W2b"), false),
@@ -150,6 +249,7 @@ fn erasure_swap_faults_keep_custody_for_every_source() {
                             // A stale copy WAL must never reach the store name.
                             "W2b" => fs::write(sqlite::sidecar(tmp, "-wal"), b"stale").unwrap(),
                             // The rename is done; the reopen is refused once.
+                            // No crash image: it returns before the copy.
                             "reopen" => {
                                 let path = tmp.with_extension("");
                                 fs::set_permissions(path, fs::Permissions::from_mode(0o644))

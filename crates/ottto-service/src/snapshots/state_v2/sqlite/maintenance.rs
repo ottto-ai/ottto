@@ -385,8 +385,10 @@ impl Sqlite {
         }
         Ok(truncated)
     }
-    /// Build the erasure copy and run every check `open` can refuse on it,
-    /// against the `live` generation. The live store is only read.
+    /// Build the erasure copy and run the shared database/connection
+    /// validation on it (`open_locked`), against the `live` generation. The
+    /// outer checks are held from the live open, not re-run. The live store is
+    /// only read.
     fn vacuum_copy(&self, tmp: &Path, id: &Identity, live: u64, work: Duration) -> Result<()> {
         // Dropped on return: no descriptor on the copy outlives SQLite's locks.
         let file = fence::create_private(tmp)?;

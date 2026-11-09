@@ -65,8 +65,10 @@ and its start time in that same transaction. Later removals preserve the oldest
 deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale text
 may remain in gaps in live pages. Completion requires a successful TRUNCATE with
 a measured zero-length WAL, then a `VACUUM INTO` copy that holds only live
-records, converted to WAL and passing every check a store open applies plus
-`quick_check`. The old connection closes, its WAL and shared-memory files are
+records, converted to WAL and passing the shared database/connection validation
+(identity, generation, schema, writer capability, limits, WAL mode,
+`quick_check`). The outer checks (format, parent privacy, the owner lock) are
+held from the live open and are not re-run. The old connection closes, its WAL and shared-memory files are
 removed, and the copy is renamed over the store between two directory syncs.
 A durable metadata-only clear follows. No SQLite connection to the old file
 survives the rename.
