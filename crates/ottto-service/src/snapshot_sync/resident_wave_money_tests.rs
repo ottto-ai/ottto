@@ -454,11 +454,14 @@ fn resident_wave_source_changed_tail_refolds_match_one_page() {
             });
         let (small, s_bytes) =
             crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
-                drain_from(&c, 0.05, true, small_seed.index, small_seed.progress)
+                drain_from(&c, 0.087_100_1, true, small_seed.index, small_seed.progress)
             });
         assert_eq!((w_bytes, s_bytes), (0, 0));
         assert_eq!(wide.pages, 1);
-        assert!(small.pages >= 3 && small.deferred > 0);
+        assert!(
+            small.pages >= 5 && small.deferred > 0,
+            "Tail reduction pages must charge beyond c_f"
+        );
         money_oracle::assert_equivalent(&wide.route, &small.route);
         money_oracle::assert_no_smaller_reemit(
             ROOT,

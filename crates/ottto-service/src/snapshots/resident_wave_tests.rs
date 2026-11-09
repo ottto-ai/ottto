@@ -300,9 +300,16 @@ fn resident_wave_codex_join_group_straddles_budget_and_pi_drains() {
             }
         }
         let (wide_index, wide, w_pages) = collect_source_wave(source, &root, f64::INFINITY);
-        let (small_index, small, s_pages) = collect_source_wave(source, &root, 0.05);
+        let (small_index, small, s_pages) =
+            collect_source_wave(source, &root, FILE_CHARGE + 0.000_000_1);
         assert_eq!(w_pages, 1);
         assert!(s_pages >= 2);
+        if source == SnapshotSource::Pi {
+            assert_eq!(
+                s_pages, 6,
+                "cold reductions, not only c_f, must charge the shared seam"
+            );
+        }
         assert_eq!(wide.scanned_file_count, small.scanned_file_count);
         assert_eq!(
             wide.scanned_file_count,
