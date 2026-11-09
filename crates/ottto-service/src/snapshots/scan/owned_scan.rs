@@ -467,7 +467,14 @@ impl OwnedSourceScan {
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
         let mut claude_title_metadata = if source == SnapshotSource::ClaudeCode {
-            ClaudeTitleMetadata::load_from_roots_with_index(roots, index, collected_at)
+            let mut load = |facts: &mut _| {
+                ClaudeTitleMetadata::load_from_roots_reusing(roots, index, collected_at, facts)
+            };
+            if let Some((cache, _)) = carry_cache {
+                cache.with_desktop_titles(load)
+            } else {
+                load(&mut Default::default())
+            }
         } else {
             ClaudeTitleMetadata::default()
         };
