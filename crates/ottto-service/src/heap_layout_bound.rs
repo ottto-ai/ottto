@@ -129,6 +129,7 @@ scalar!(
     f64,
     serde::de::IgnoredAny,
     std::time::Instant,
+    ottto_protocol::CreditAmount,
     ()
 );
 impl HeapLayoutBound for String {

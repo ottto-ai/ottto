@@ -1940,7 +1940,7 @@ mod tests {
                 name: "credits".to_string(),
                 freshness: AgentQuotaWindowFreshness::Fresh,
                 observed_at: Some(observed_at.to_string()),
-                remaining: Some(7),
+                remaining: ottto_protocol::CreditAmount::whole(7),
                 ..Default::default()
             }],
             account: Some(AgentAccountStatus {

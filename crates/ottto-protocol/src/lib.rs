@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use zeroize::Zeroize;
 
+mod credit_amount;
 mod session_launch;
+pub use credit_amount::{scale_decimal, scale_minor, CreditAmount};
 pub use session_launch::*;
 
 pub const PROTOCOL_VERSION: u16 = 15;
@@ -1863,12 +1865,26 @@ pub struct AgentCreditBalance {
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_identifier_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub used: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota: Option<u64>,
+    /// Amounts in the balance's native unit (`unit`), exact to six fractional
+    /// digits: a whole amount is a JSON integer, a fraction a decimal string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub remaining: Option<CreditAmount>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub used: Option<CreditAmount>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub quota: Option<CreditAmount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlimited: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6689,7 +6705,7 @@ mod tests {
                     freshness: AgentQuotaWindowFreshness::Fresh,
                     account_identifier_hash: Some("a".repeat(64)),
                     organization_identifier_hash: Some("b".repeat(64)),
-                    remaining: Some(1234),
+                    remaining: CreditAmount::whole(1234),
                     ..Default::default()
                 }],
             }),
@@ -7241,7 +7257,7 @@ mod tests {
                 freshness: AgentQuotaWindowFreshness::Fresh,
                 unit: AgentCreditBalanceUnit::Credits,
                 account_label: Some("ron@example.com".to_string()),
-                remaining: Some(0),
+                remaining: Some(CreditAmount::ZERO),
                 used: None,
                 quota: None,
                 unlimited: Some(false),
@@ -7366,7 +7382,10 @@ mod tests {
             Some("abc123hash")
         );
         assert_eq!(snapshot.credit_balances[0].account_label, None);
-        assert_eq!(snapshot.credit_balances[0].remaining, Some(0));
+        assert_eq!(
+            snapshot.credit_balances[0].remaining,
+            Some(CreditAmount::ZERO)
+        );
         // Safe provider metadata survives redaction; the spend-cap flag forwards.
         assert_eq!(
             snapshot.credit_balances[0].spend_control_reached,
@@ -8850,7 +8869,7 @@ mod tests {
         let minimal = AgentCreditBalance {
             name: "reset_bank".to_string(),
             unit: AgentCreditBalanceUnit::Resets,
-            remaining: Some(2),
+            remaining: CreditAmount::whole(2),
             ..Default::default()
         };
         assert_eq!(
@@ -8865,13 +8884,72 @@ mod tests {
         );
     }
 
+    /// [money] One exact scaler: half-even to six digits over every discarded
+    /// digit, overflow after the carry is absent, bare cents stay cents, and
+    /// amounts round-trip as integers when whole and ≤6-dp strings otherwise.
+    #[test]
+    fn credit_amounts_scale_exactly_and_round_trip() {
+        for (text, micros) in [
+            ("49591.7041935000", Some(49_591_704_194)),
+            ("1.2345665000", Some(1_234_566)),
+            ("1.2345675000", Some(1_234_568)),
+            ("1.23456650001", Some(1_234_567)),
+            ("0.40", Some(400_000)),
+            ("1.5e2", Some(150_000_000)),
+            ("18446744073709.551615", Some(u64::MAX)),
+            ("18446744073709.5516155", None),
+            ("18446744073710", None),
+            ("-1", None),
+            ("-0.4", None),
+            ("1.", None),
+            ("abc", None),
+        ] {
+            let parsed = CreditAmount::from_decimal(text);
+            assert_eq!(parsed.map(CreditAmount::micros), micros, "{text}");
+        }
+        // `{amount_minor: 12345, exponent: 3}` in cents: an exact tie is even.
+        assert_eq!(scale_minor(12_345, -1), Some(1_234));
+        assert_eq!(scale_minor(12_355, -1), Some(1_236));
+        // A bare amount already in cents is not read as dollars.
+        assert_eq!(scale_decimal("700", 0), Some(700));
+        assert_eq!(scale_decimal("700", 2), Some(70_000));
+
+        for (amount, wire) in [
+            (CreditAmount::whole(123), "123"),
+            (Some(CreditAmount::ZERO), "0"),
+            (CreditAmount::from_decimal("0.40"), r#""0.4""#),
+            (
+                CreditAmount::from_decimal("49591.7041935"),
+                r#""49591.704194""#,
+            ),
+        ] {
+            let balance = AgentCreditBalance {
+                remaining: amount,
+                ..Default::default()
+            };
+            let body = serde_json::to_string(&balance).unwrap();
+            assert!(body.contains(&format!(r#""remaining":{wire}"#)), "{body}");
+            let back: AgentCreditBalance = serde_json::from_str(&body).unwrap();
+            assert_eq!(back.remaining, amount);
+        }
+        // An older daemon's integer decodes; a bad amount drops only itself.
+        let old: AgentCreditBalance = serde_json::from_str(
+            r#"{"name":"credits","status":"ok","freshness":"fresh","remaining":12,"used":-5,"quota":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.remaining, old.used, old.quota),
+            (CreditAmount::whole(12), None, None)
+        );
+    }
+
     fn v22_credit_balance() -> AgentCreditBalance {
         AgentCreditBalance {
             name: "reset_bank".to_string(),
             status: AgentCreditBalanceStatus::Ok,
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Resets,
-            remaining: Some(1),
+            remaining: CreditAmount::whole(1),
             observed_at: Some("2026-10-01T12:00:00Z".to_string()),
             enabled: Some(false),
             disabled_reason: Some("out_of_credits".to_string()),
@@ -9008,7 +9086,7 @@ mod tests {
     #[test]
     fn grants_unavailable_cause_is_dropped_from_every_other_shape() {
         let shapes: [BalanceShape; 8] = [
-            ("remaining", |b| b.remaining = Some(0)),
+            ("remaining", |b| b.remaining = Some(CreditAmount::ZERO)),
             ("grant_count", |b| b.grant_count = Some(0)),
             ("grants", |b| b.grants = Some(Vec::new())),
             ("complete", |b| {

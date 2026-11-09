@@ -138,7 +138,7 @@ mod tests {
             name: "credits".to_string(),
             freshness: AgentQuotaWindowFreshness::Fresh,
             observed_at: Some(observed_at.to_string()),
-            remaining: Some(120),
+            remaining: ottto_protocol::CreditAmount::whole(120),
             ..Default::default()
         }
     }

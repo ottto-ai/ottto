@@ -324,7 +324,7 @@ fn claude_one_time_credits(
         .filter_map(|key| {
             let pool = object.get(key)?.as_object()?;
             pool.get("limit_dollars")
-                .filter(|value| value.is_number())?;
+                .filter(|value| super::credit_amount_input::is_number(value))?;
             // The codename becomes the pool's `limit_id`; the model refuses a
             // codename that is not a closed code shape (or is secret-shaped),
             // and the pool is skipped with that refusal's diagnostic.
@@ -1032,8 +1032,12 @@ pub(super) fn claude_passive_reading_usable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ottto_protocol::{AgentCreditBalanceStatus, CreditGrantStatus, CreditGrantsState};
+    use ottto_protocol::{
+        AgentCreditBalanceStatus, CreditAmount, CreditGrantStatus, CreditGrantsState,
+    };
     use serde_json::json;
+
+    use crate::agent_status::credit_amount_input::{decode, CreditBody};
 
     // Synthetic bodies shaped like the redacted real plain and saved-reset
     // variant responses (account/org/grant ids are invented).
@@ -1054,10 +1058,15 @@ mod tests {
         })
     }
 
+    /// A synthetic body as the provider response decode reads it.
+    fn decoded(body: Value) -> Value {
+        decode(&body.to_string(), CreditBody::ClaudeUsage).expect("usage body")
+    }
+
     /// Plain read of a Max account: the $250 one-time pool, an expired pool,
     /// a percent-only pool, usage credits off.
     fn plain_max_body() -> Value {
-        json!({
+        decoded(json!({
             "five_hour": window(0, None),
             "seven_day": window(100, Some("2026-10-10T05:00:00.377761+00:00")),
             "seven_day_opus": null,
@@ -1080,7 +1089,7 @@ mod tests {
                 "limit": null, "percent": 0, "severity": "normal", "enabled": false,
                 "disabled_reason": null, "cap": null, "balance": null
             }
-        })
+        }))
     }
 
     fn cedar_grant(id: &str, label: &str, resets_left: u64, usable_now: bool) -> Value {
@@ -1094,14 +1103,14 @@ mod tests {
     }
 
     fn variant_body(cedar: Value) -> Value {
-        json!({
+        decoded(json!({
             "five_hour": window(38, Some("2026-10-04T20:20:00.508208+00:00")),
             "seven_day": window(100, Some("2026-10-08T17:00:00.508227+00:00")),
             "iguana_necktie": pool(250.0, 0.0, 250.0, "2026-11-05T07:59:00+00:00"),
             "cedar_ember": cedar,
             "extra_usage": null,
             "spend": null
-        })
+        }))
     }
 
     fn cedar_team() -> Value {
@@ -1156,9 +1165,9 @@ mod tests {
         assert_eq!(credit.limit_id.as_deref(), Some("iguana_necktie"));
         assert_eq!(credit.unit, AgentCreditBalanceUnit::Usd);
         assert_eq!(credit.currency.as_deref(), Some("USD"));
-        assert_eq!(credit.quota, Some(25_000));
-        assert_eq!(credit.used, Some(0));
-        assert_eq!(credit.remaining, Some(25_000));
+        assert_eq!(credit.quota, CreditAmount::whole(25_000));
+        assert_eq!(credit.used, CreditAmount::whole(0));
+        assert_eq!(credit.remaining, CreditAmount::whole(25_000));
         assert_eq!(credit.expires_at.as_deref(), Some("2026-11-05T07:59:00Z"));
         assert_eq!(credit.resets_at, None);
         assert_eq!(credit.enabled, None);
@@ -1191,7 +1200,7 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].limit_id.as_deref(), Some("wattle_ember"));
         assert_eq!(pools[0].title.as_deref(), Some("Promo credit"));
-        assert_eq!(pools[0].remaining, Some(1_800));
+        assert_eq!(pools[0].remaining, CreditAmount::whole(1_800));
     }
 
     #[test]
@@ -1237,7 +1246,7 @@ mod tests {
         assert_eq!(balance.grant_count, Some(1));
         assert_eq!(balance.grants_observed_at.as_deref(), Some(READ_AT));
         assert_eq!(balance.observed_at.as_deref(), Some(READ_AT));
-        assert_eq!(balance.remaining, Some(0));
+        assert_eq!(balance.remaining, CreditAmount::whole(0));
         assert_eq!(balance.status, AgentCreditBalanceStatus::Exhausted);
         assert_eq!(balance.eligible, Some(true));
         assert_eq!(balance.at_limit, Some(false));
@@ -1383,7 +1392,7 @@ mod tests {
         assert_reader_unavailable(&saved(&blind_no_list), "surface");
         assert_reader_unavailable(&saved(&resent), "surface");
         assert_eq!(saved(&back).grants_unavailable_cause, None);
-        assert_eq!(saved(&back).remaining, Some(1));
+        assert_eq!(saved(&back).remaining, CreditAmount::whole(1));
         assert_eq!(saved(&readiness_only).grants_unavailable_cause, None);
         // An older daemon stored the blind answer as a complete, empty list:
         // re-sent and served in the §11.10 shape.
@@ -1392,7 +1401,7 @@ mod tests {
         older.grants = Some(Vec::new());
         older.grants_state = Some(CreditGrantsState::Complete);
         older.grant_count = Some(0);
-        older.remaining = Some(0);
+        older.remaining = Some(CreditAmount::ZERO);
         older.grants_observed_at = Some(READ_AT.to_string());
         older.status = AgentCreditBalanceStatus::Exhausted;
         let resent = claude_merge_credit_sections("b", &[older.clone()], &plain);
@@ -1653,7 +1662,7 @@ mod tests {
             .find(|b| b.kind == Some(CreditBalanceKind::SavedResets))
             .unwrap();
         assert_eq!(replaced.grants_observed_at.as_deref(), Some(t3));
-        assert_eq!(replaced.remaining, Some(0));
+        assert_eq!(replaced.remaining, CreditAmount::whole(0));
     }
 
     /// The model owns the codename check: a pool whose codename is not a code,
