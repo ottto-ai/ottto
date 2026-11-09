@@ -5252,6 +5252,7 @@ fn sync_once_with_retry(
         crate::source_rotation::PARKED_BUDGET,
     );
     crate::net_resilience::note_sync_cycle_transport(transport_cycle);
+    crate::local_resource_diagnostics::rotate_service_log_if_due();
     if !failed_sources.is_empty() {
         return Err(SourcesFailed(failed_sources).into());
     }

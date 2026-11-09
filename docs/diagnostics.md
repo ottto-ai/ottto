@@ -1061,15 +1061,18 @@ redacted-placeholder rule.
 
 ## Service Log Rotation
 
-Each time the service starts, before it serves, it checks the file its stderr
-writes to. When that file is at least 64 MiB, it is renamed in place to
+Each time the service starts, before it serves, and after each sync cycle
+while it runs, it checks the file its stderr writes to. When that file is at
+least 64 MiB, it is renamed in place to
 `<stem>.<YYYYMMDDTHHMMSSZ>.log` (UTC rotation time), for example
 `ottto-service.err.20261105T142358Z.log`, and a new empty file takes the
 original name. Archives matching exactly that pattern are deleted once older
 than 7 days, but the newest 2 are always kept; the live file and any other
-name are never touched. Rotation happens only at startup, so a long-running
-service keeps appending to its live file until the next start. To read the
-full history, read the archives in name order, then the live file. A terminal,
+name are never touched. Pruning runs at every start and, while running,
+right after each rotation. While running, only the file stderr wrote to at
+startup rotates: if no new file can be opened after a rename, stderr keeps
+writing to that archive until the next start, and the archive is not
+rotated again. To read the full history, read the archives in name order, then the live file. A terminal,
 `/dev/null` or pipe on stderr is left alone.
 
 ## What To Share

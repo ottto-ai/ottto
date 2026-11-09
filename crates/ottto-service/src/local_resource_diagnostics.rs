@@ -1827,6 +1827,11 @@ pub fn rotate_service_log_at_startup() {
     #[cfg(unix)]
     stderr_rotation::rotate_at_startup();
 }
+/// Rotates a service log that reached the startup threshold while running.
+pub(crate) fn rotate_service_log_if_due() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_while_running();
+}
 
 /// Content-free allocator launch configuration, called once before serving.
 pub fn log_startup_resources() {

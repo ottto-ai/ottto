@@ -1,17 +1,20 @@
-//! Startup-only rotation of the service log that stderr writes to.
+//! Rotation of the service log that stderr writes to.
 //!
-//! Runs once, while the state lock is held and before the service serves.
-//! When fd 2 is a regular file of at least [`ROTATE_AT_BYTES`], the file is
+//! Runs at startup, while the state lock is held and before the service
+//! serves, and again after each sync cycle while it runs. When fd 2 is a regular file of at least [`ROTATE_AT_BYTES`], the file is
 //! renamed to `<stem>.<YYYYMMDDTHHMMSSZ>.log` (UTC rotation time) in the same
 //! directory and a fresh file at the original path takes over fd 2. Archives
 //! of exactly that pattern older than [`KEEP_FOR`] are then deleted, except
 //! the newest [`KEEP_NEWEST`]. A terminal, `/dev/null` or pipe on fd 2 is left
 //! alone. A failure before the rename keeps stderr as it was; if the reopen
 //! fails after the rename, stderr keeps writing to the archive until the next
-//! start and pruning is skipped. Nothing is lost.
+//! start and pruning is skipped. Nothing is lost. While running, only the
+//! path fd 2 named at startup rotates, so such an archive is never rotated
+//! again, and pruning follows only a rotation.
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 const ROTATE_AT_BYTES: u64 = 64 * 1024 * 1024;
@@ -19,8 +22,23 @@ const KEEP_FOR: Duration = Duration::days(7);
 const KEEP_NEWEST: usize = 2;
 const STAMP: &str = "[year][month][day]T[hour][minute][second]Z";
 
+/// The path fd 2 wrote to at startup; unset when it was not a regular file.
+static STARTUP_LOG: OnceLock<PathBuf> = OnceLock::new();
+
 pub(super) fn rotate_at_startup() {
-    rotate(libc::STDERR_FILENO, OffsetDateTime::now_utc());
+    if let Some(live) = rotate(libc::STDERR_FILENO, OffsetDateTime::now_utc(), None) {
+        let _ = STARTUP_LOG.set(live);
+    }
+}
+
+pub(super) fn rotate_while_running() {
+    if let Some(startup) = STARTUP_LOG.get() {
+        rotate(
+            libc::STDERR_FILENO,
+            OffsetDateTime::now_utc(),
+            Some(startup),
+        );
+    }
 }
 
 fn rotation_due(size: u64) -> bool {
@@ -39,27 +57,33 @@ fn archives_to_delete(now: OffsetDateTime, archives: &[OffsetDateTime]) -> Vec<u
         .collect()
 }
 
-fn rotate(fd: RawFd, now: OffsetDateTime) {
+/// `startup`: while running, the path fd named at startup. Returns the path
+/// fd writes to when that path still names it.
+fn rotate(fd: RawFd, now: OffsetDateTime, startup: Option<&Path>) -> Option<PathBuf> {
     // Borrowed, never closed here.
     // SAFETY: `fd` stays open for the call; ManuallyDrop skips the close.
     let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    let Ok(metadata) = file.metadata() else {
-        return;
-    };
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
-        return;
+        return None;
     }
-    let Some(live) = fd_path(fd) else {
-        return;
-    };
+    let live = fd_path(fd)?;
+    // An archive left on fd by a failed reopen is not the startup log.
+    if startup.is_some_and(|startup| startup != live) {
+        return None;
+    }
     // The path must still name the file fd writes to.
     match std::fs::metadata(&live) {
         Ok(at_path) if (at_path.dev(), at_path.ino()) == (metadata.dev(), metadata.ino()) => {}
-        _ => return,
+        _ => return None,
     }
-    if let Err(error) = rotate_and_prune(fd, &live, &metadata, now) {
-        eprintln!("service log rotation/prune: {error}");
+    // While running, pruning follows only a rotation.
+    if startup.is_none() || rotation_due(metadata.len()) {
+        if let Err(error) = rotate_and_prune(fd, &live, &metadata, now) {
+            eprintln!("service log rotation/prune: {error}");
+        }
     }
+    Some(live)
 }
 
 fn rotate_and_prune(
@@ -238,7 +262,7 @@ mod tests {
             std::fs::write(dir.join(name), b"").unwrap();
         }
 
-        rotate(file.as_raw_fd(), at("20261105T142358Z"));
+        rotate(file.as_raw_fd(), at("20261105T142358Z"), None);
         file.write_all(b"after\n").unwrap();
 
         let archive = dir.join("svc.err.20261105T142358Z.log");
@@ -269,8 +293,56 @@ mod tests {
         );
 
         // A small live file is left alone.
-        rotate(file.as_raw_fd(), at("20261105T150000Z"));
+        rotate(file.as_raw_fd(), at("20261105T150000Z"), None);
         assert_eq!(std::fs::read(&live).unwrap(), b"after\n");
+    }
+
+    /// [behaviour] While running, the startup log rotates once it reaches the
+    /// threshold and the new file takes over the fd.
+    #[test]
+    fn rotates_the_startup_log_while_running() {
+        let dir = crate::test_scratch::ScratchDir::new("stderr-rotation-running");
+        let live = dir.join("svc.err.log");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&live)
+            .unwrap();
+        let startup = rotate(file.as_raw_fd(), at("20261105T120000Z"), None).unwrap();
+        file.set_len(ROTATE_AT_BYTES).unwrap();
+
+        rotate(file.as_raw_fd(), at("20261105T142358Z"), Some(&startup));
+        file.write_all(b"after\n").unwrap();
+
+        let archive = dir.join("svc.err.20261105T142358Z.log");
+        assert_eq!(std::fs::metadata(&archive).unwrap().len(), ROTATE_AT_BYTES);
+        assert_eq!(std::fs::read(&live).unwrap(), b"after\n");
+    }
+
+    /// [regress] An archive still on the fd after a failed reopen is not
+    /// rotated again into a name pruning never matches.
+    #[test]
+    fn an_archive_on_the_fd_is_not_rotated_again() {
+        let dir = crate::test_scratch::ScratchDir::new("stderr-rotation-archive");
+        let live = dir.join("svc.err.log");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&live)
+            .unwrap();
+        let startup = rotate(file.as_raw_fd(), at("20261105T120000Z"), None).unwrap();
+        // As if the reopen after this rename had failed.
+        let archive = dir.join("svc.err.20261105T130000Z.log");
+        std::fs::rename(&live, &archive).unwrap();
+        file.set_len(ROTATE_AT_BYTES).unwrap();
+
+        rotate(file.as_raw_fd(), at("20261105T142358Z"), Some(&startup));
+
+        let names: Vec<String> = std::fs::read_dir(&*dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["svc.err.20261105T130000Z.log"]);
     }
 
     #[test]
@@ -279,7 +351,7 @@ mod tests {
             .write(true)
             .open("/dev/null")
             .unwrap();
-        rotate(null.as_raw_fd(), at("20261105T142358Z"));
+        rotate(null.as_raw_fd(), at("20261105T142358Z"), None);
         assert!(Path::new("/dev/null").exists());
     }
 }
