@@ -12,6 +12,7 @@ use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
 };
+use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, ActivityHintResponse, RelayTokenAuthorizationRejected,
@@ -241,6 +242,7 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let codex_preludes = Arc::clone(&daemon.codex_preludes);
     let inputs = daemon.footprint_cwds.inputs();
     let mut harvest = move |[claude, codex]: [bool; 2]| {
+        let _stage = StageWindow::begin("unknown", "offpass_context_footprint");
         let claude = claude.then(|| harvest_all_once(&home, &support_dir, &projection));
         // Codex session starts share this thread: no extra background job.
         if let Some(Err(error)) = codex.then(|| {

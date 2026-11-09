@@ -103,6 +103,8 @@ pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
+#[cfg(test)]
+pub(crate) use claude_context_file_birth::with_remembered_tripwire_restored_for_test;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -1469,12 +1471,14 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
-#[cfg(test)]
-pub(crate) use claude_reemission_exclusions::restart_claude_reemission_stop_for_test;
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
     note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) use claude_reemission_exclusions::{
+    restart_claude_reemission_stop_for_test, with_claude_reemission_stop_restored_for_test,
 };
 
 #[cfg(test)]

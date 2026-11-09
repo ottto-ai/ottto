@@ -120,6 +120,86 @@ impl FileStamp {
     }
 }
 
+/// A metadata-only witness. Symlinks and other nonregular entries are not
+/// reusable sources; absence is distinct from an unreadable source.
+#[derive(Clone)]
+pub(crate) enum SourceStamp {
+    Absent,
+    File(FileStamp),
+}
+
+impl SourceStamp {
+    pub(crate) fn capture_file(path: &std::path::Path) -> io::Result<Self> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => FileStamp::capture(metadata).map(Self::File),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::Absent),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::File(a), Self::File(b)) => a.same_content(b),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) trait ContentStamp {
+    fn same(&self, other: &Self) -> bool;
+}
+impl ContentStamp for SourceStamp {
+    fn same(&self, other: &Self) -> bool {
+        self.same(other)
+    }
+}
+impl<const N: usize> ContentStamp for [SourceStamp; N] {
+    fn same(&self, other: &Self) -> bool {
+        self.iter().zip(other).all(|(a, b)| a.same(b))
+    }
+}
+
+/// RAM-only complete facts. A failed capture or load invalidates prior facts;
+/// a source that changes during loading is returned but never kept.
+pub(crate) struct StampedFacts<K, F, S = SourceStamp> {
+    pub(crate) kept: std::collections::BTreeMap<K, (S, F)>,
+}
+impl<K, F, S> Default for StampedFacts<K, F, S> {
+    fn default() -> Self {
+        Self {
+            kept: Default::default(),
+        }
+    }
+}
+impl<K: Ord, F: Clone, S: ContentStamp> StampedFacts<K, F, S> {
+    pub(crate) fn reuse_or_load<E>(
+        &mut self,
+        key: K,
+        mut capture: impl FnMut() -> io::Result<S>,
+        load: impl FnOnce() -> Result<F, E>,
+    ) -> Result<F, E> {
+        let before = capture();
+        if let (Ok(before), Some((stamp, facts))) = (&before, self.kept.get(&key)) {
+            if before.same(stamp) {
+                return Ok(facts.clone());
+            }
+        }
+        self.kept.remove(&key);
+        let facts = load()?;
+        if let (Ok(before), Ok(after)) = (before, capture()) {
+            if before.same(&after) {
+                self.kept.insert(key, (after, facts.clone()));
+            }
+        }
+        Ok(facts)
+    }
+
+    pub(crate) fn retain_listed(&mut self, listed: &std::collections::BTreeSet<K>) {
+        self.kept.retain(|key, _| listed.contains(key));
+    }
+}
+
 /// LD: an opened object's RAM-only identity, never a path, persisted field or
 /// proof authority. A reused inode can alias an old entry.
 /// Ordering is for deterministic tie-breaks only.

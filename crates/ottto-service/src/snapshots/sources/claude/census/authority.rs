@@ -188,6 +188,36 @@ impl ClaudeUsageAuthorityDisposition {
         self.quarantined_source_session_ids.extend(session_ids);
     }
 
+    /// Adds one evidence chunk's disposition to its page's. Chunks hold whole,
+    /// disjoint families: session sets and maps union, counts add. The caller
+    /// puts `copy_invalidated` back in page order.
+    pub(crate) fn absorb(&mut self, chunk: Self) {
+        let Self {
+            context_file_birth,
+            quarantined_source_session_ids,
+            account_deferred_source_session_ids,
+            request_owned_hold_reasons,
+            mixed_uploads,
+            request_groupings,
+            copy_invalidated,
+            #[cfg(test)]
+            posture_admissions,
+        } = chunk;
+        self.context_file_birth.absorb(context_file_birth);
+        self.quarantined_source_session_ids
+            .extend(quarantined_source_session_ids);
+        self.account_deferred_source_session_ids
+            .extend(account_deferred_source_session_ids);
+        for (reason, count) in request_owned_hold_reasons {
+            *self.request_owned_hold_reasons.entry(reason).or_default() += count;
+        }
+        self.mixed_uploads.absorb(mixed_uploads);
+        self.request_groupings.extend(request_groupings);
+        self.copy_invalidated.extend(copy_invalidated);
+        #[cfg(test)]
+        self.posture_admissions.extend(posture_admissions);
+    }
+
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
         self.account_deferred_source_session_ids
             .extend(session_ids.iter().cloned());

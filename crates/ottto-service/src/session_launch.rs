@@ -577,8 +577,7 @@ fn supported_version(
     if let Some(path) = path {
         command.env("PATH", path);
     }
-    let mut child = command
-        .spawn()
+    let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command)
         .map_err(|_| block(Reason::CliVersionUnsupported))?;
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();

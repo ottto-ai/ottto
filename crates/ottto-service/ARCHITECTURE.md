@@ -143,6 +143,25 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+## CLI status metadata
+
+Codex login state and bundled model metadata are cached in RAM per home while the
+canonical CLI binary, `auth.json` and `config.toml` file stamps match, for at most
+60 minutes. Stamp capture uses metadata only. Missing auth, nonregular inputs,
+failed commands and inputs changed during loading are never kept. Setup reads
+bypass reuse and refresh successful facts. Only the full status listing evicts
+removed homes; account-screen reads never evict other homes.
+
+Login is reused only when this pass's fresh auth read supplies email, plan,
+subscription product and billing channel. Otherwise CLI account fields are read
+fresh and merged exactly as before. The cache retains only the login enum.
+Cached login facts contain no account, email, plan or identity. Auth-file and
+provider identity reads and config-model application keep their ordinary freshness.
+Claude version detection uses the same helper with only its binary stamp. Pi
+model listings remain uncached because their output depends on Pi config/auth.
+Existing resource records carry fixed command classes, child starts and per-PID
+child CPU totals; arguments, paths and command output are never included.
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
