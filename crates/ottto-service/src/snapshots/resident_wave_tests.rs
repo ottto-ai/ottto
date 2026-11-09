@@ -422,3 +422,132 @@ fn resident_deferral_preserves_hu_nonmember_and_first_read_census_semantics() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+/// [money] The constructor consumes an unselected census member for an
+/// index-only quarantine seed. Deferring that whole family restores the exact
+/// consumed entry, never invents root membership, then reads each member once.
+#[test]
+fn resident_zero_selected_quarantine_restores_the_real_closure_entry() {
+    let (home, root, index) = claude_history_upgrade_tests::families("resident-zero-seed", 2);
+    let at = "2026-08-23T18:40:00Z";
+    let family = "bbbbbbbb-cccc-4ddd-8eee-000000000001";
+    let other = root.join("bbbbbbbb-cccc-4ddd-8eee-000000000000.jsonl");
+    let child = root
+        .join(family)
+        .join("subagents/agent-0000000000000001.jsonl");
+    let root_file = root.join(format!("{family}.jsonl"));
+    let mut index = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+        0,
+        None,
+        &[],
+        false,
+    )
+    .index;
+    let walk = index.traversal.as_mut().unwrap();
+    assert!(walk.pending_directories.is_empty());
+    walk.pending_candidates
+        .retain(|entry| entry.path == other || entry.path == child);
+    walk.pending_candidates
+        .make_contiguous()
+        .sort_by_key(|entry| entry.path != other);
+    for entry in &mut walk.pending_candidates {
+        entry.census_member = true;
+        entry.watcher_hint = entry.path == child;
+    }
+    assert_eq!(walk.pending_candidates.len(), 2);
+    let original = walk
+        .pending_candidates
+        .iter()
+        .find(|entry| entry.path == child)
+        .unwrap()
+        .clone();
+    let root_revision = index.files[&local_index_key(&root_file)]
+        .source_file_fingerprint
+        .clone();
+    index.claude_usage_authority_quarantine.insert(
+        family.into(),
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
+            proven_witness_fingerprint: "e".repeat(64),
+            member_source_file_fingerprints: [(family.into(), root_revision)].into(),
+            failed_reconstruction_count: 1,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            retry_after_unix_seconds: u64::MAX,
+            proof_correction: None,
+        },
+    );
+    index
+        .files
+        .get_mut(&local_index_key(&other))
+        .unwrap()
+        .source_file_fingerprint = "source-changed".into();
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+        1,
+        None,
+        &[],
+        false,
+    );
+    assert!(scan.forced_claude_family_reparses.contains(family));
+    assert!(
+        scan.selected_flags
+            .keys()
+            .all(|key| claude_index_path_member_ref(Path::new(key))
+                .is_none_or(|member| member.root != family)),
+        "zero family members selected"
+    );
+    assert!(
+        !scan
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|p| p.path == child),
+        "the real closure consumed the pending member"
+    );
+    let (index, page) = claude_history_upgrade::with_resident_budget(0.05, || loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { index, scan } => break (index, scan),
+        }
+    });
+    assert_eq!(page.scanned_file_count, 1);
+    assert!(page.charge_deferred && !page.census_complete);
+    let pending = &index.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.front(), Some(&original));
+    assert!(!pending.iter().any(|p| p.path == root_file));
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+        100,
+        None,
+        &[],
+        false,
+    );
+    let page = claude_history_upgrade::with_resident_budget(0.05, || loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { scan, .. } => break scan,
+        }
+    });
+    assert_eq!(
+        page.scanned_file_count, 2,
+        "each forced member read exactly once on admission"
+    );
+    fs::remove_dir_all(home).unwrap();
+}
