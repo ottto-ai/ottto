@@ -168,3 +168,132 @@ fn codex_sidecar_reuse_transition() {
     assert_quiet_on(&c, index, &accepted, cache);
     println!("CODEX_SIDECAR_REUSE_ORACLE quiet_restart ok");
 }
+
+/// [money] Cached sidecars preserve held/no-smaller and independent-owner progress.
+#[test]
+fn sidecar_reuse_inventory_refusal_isolates_only_proven_dependants() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("b"));
+    c.write(GAP, None);
+    let _sidecars = seed_sidecars(&c);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let (working, first, _, _, _) = page(&c, prior.clone(), cache.clone());
+    let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+    let accepted = route(&index, &first, posts);
+    append(&c.path(OTHER), &turn(3));
+    let sibling = c.sessions.join(format!("rollout-copy-{MAIN}.jsonl.zst"));
+    // A complete first frame proves owner MAIN; corrupt body bytes in a
+    // later frame fail only when acquisition advances past that header.
+    let good_header = zstd::stream::encode_all(header(MAIN, Some("a")).as_bytes(), 1).unwrap();
+    let mut damaged = good_header;
+    damaged.extend_from_slice(b"not another zstd frame");
+    fs::write(&sibling, damaged).unwrap();
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let before = index.clone();
+    let (working, held_scan, _, _, _) = page(&c, index, cache.clone());
+    assert_eq!(
+        held_scan
+            .local_codex_diagnostics
+            .as_ref()
+            .unwrap()
+            .state_titles
+            .reused_roots,
+        1
+    );
+    assert!(held_scan
+        .snapshots
+        .iter()
+        .all(|s| s.source_session_id != MAIN));
+    assert!(held_scan
+        .snapshots
+        .iter()
+        .any(|s| s.source_session_id == OTHER));
+    let (mut index, posts) = working.checkpoint_with_captured_posts(&held_scan, &before, "accept");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        index.files[&local_index_key(&c.path(MAIN))].last_upload_body_witness,
+        before.files[&local_index_key(&c.path(MAIN))].last_upload_body_witness
+    );
+    assert!(!index
+        .confirmed_empty_files
+        .contains(&local_index_key(&sibling)));
+    // The transient failed companion disappears; the original object's
+    // ordinary append supplies the next usage. Compressed grouped replay is
+    // deliberately unsupported, so recovery uses the existing singleton path.
+    fs::remove_file(&sibling).unwrap();
+    append(&c.path(MAIN), &turn(3));
+    let (_, cold, _, _, _) = page(
+        &c,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
+    assert!(
+        cold.snapshots
+            .iter()
+            .any(|item| item.source_session_id == MAIN),
+        "the repaired cold owner must be admitted before testing its recovery"
+    );
+    let mut cold_b = cold.clone();
+    cold_b.snapshots.retain(|s| {
+        held_scan
+            .snapshots
+            .iter()
+            .any(|actual| actual.source_session_id == s.source_session_id)
+    });
+    let captured_b = route(&index, &held_scan, posts);
+    money_oracle::assert_equivalent(&emitted(&index, &cold_b), &captured_b);
+    // Compare the held owner alone: Codex's extra tier/token evidence is
+    // collected per offered set, so test healthy B independently above.
+    let mut cold_a = cold.clone();
+    cold_a.snapshots.retain(|s| s.source_session_id == MAIN);
+    let mut held_a = held_scan.clone();
+    held_a.snapshots.clear();
+    let mut held = emitted(&index, &held_a);
+    held.accepted = accepted.accepted.clone();
+    money_oracle::assert_held(MAIN, &accepted, &held, &emitted(&index, &cold_a));
+    money_oracle::assert_no_smaller_reemit(MAIN, &accepted, &held, &emitted(&index, &cold_a), true);
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let before = index.clone();
+    let (working, recovered, _, _, _) =
+        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+    assert_eq!(
+        recovered
+            .snapshots
+            .iter()
+            .filter(|s| s.source_session_id == MAIN)
+            .count(),
+        1
+    );
+    let (index, posts) = working.checkpoint_with_captured_posts(&recovered, &before, "accept");
+    assert_eq!(posts.len(), 1);
+    let mut cold_a = cold;
+    cold_a.snapshots.retain(|s| {
+        recovered
+            .snapshots
+            .iter()
+            .any(|a| a.source_session_id == s.source_session_id)
+    });
+    money_oracle::assert_equivalent(&emitted(&index, &cold_a), &route(&index, &recovered, posts));
+    let (mut index, _) = assert_quiet(&c, index, &accepted);
+    // Unknown headers remain a wildcard, including a misleading owner name.
+    fs::write(&sibling, b"unknown header").unwrap();
+    append(&c.path(OTHER), &turn(4));
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let (_, unknown, _, _, _) = page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
+    assert!(
+        unknown.snapshots.is_empty(),
+        "unknown owner cannot prove another owner unique"
+    );
+    drop(session);
+    println!("CODEX_SIDECAR_REUSE_ORACLE held_no_smaller ok");
+}

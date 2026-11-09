@@ -568,14 +568,16 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     c.write(OTHER, Some("b"));
     c.write(SIDE, Some("b"));
     c.write(GAP, None);
-    let _sidecars = sidecar_reuse_transition::seed_sidecars(&c);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
     let (session, prior) = StateV2ColdSession::publish(
         Source::Codex,
         &ScanIndex::default(),
         &c.scratch.join("state"),
     );
-    let (working, first, _, _, _) = page(&c, prior.clone(), cache.clone());
+    let (working, first, _, _, _) = page(
+        &c,
+        prior.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    );
     let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
     let accepted = route(&index, &first, posts);
     append(&c.path(OTHER), &turn(3));
@@ -588,16 +590,8 @@ fn inventory_refusal_isolates_only_proven_dependants() {
     fs::write(&sibling, damaged).unwrap();
     e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
     let before = index.clone();
-    let (working, held_scan, _, _, _) = page(&c, index, cache.clone());
-    assert_eq!(
-        held_scan
-            .local_codex_diagnostics
-            .as_ref()
-            .unwrap()
-            .state_titles
-            .reused_roots,
-        1
-    );
+    let (working, held_scan, _, _, _) =
+        page(&c, index, Arc::new(sampled_scan::SharedCache::default()));
     assert!(held_scan
         .snapshots
         .iter()

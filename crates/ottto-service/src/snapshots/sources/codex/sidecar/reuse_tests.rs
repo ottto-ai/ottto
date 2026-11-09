@@ -264,6 +264,15 @@ fn sidecar_state_transitions_match_fresh() {
     fs::hard_link(b.0.join("state_5.sqlite"), b.0.join("hardlink")).unwrap();
     assert!(SourceStamp::capture_sqlite(&b.0.join("state_5.sqlite")).is_none());
     assert!(!parity(&mut facts, &roots, std::slice::from_ref(&path)).state_census_incomplete);
+    assert!(facts.homes.kept.is_empty(), "a partial group holds no RAM");
+    let repeated = parity(&mut facts, &roots, std::slice::from_ref(&path));
+    assert_eq!(repeated.local_diagnostics.state_titles.reloaded_roots, 2);
+    assert!(facts.homes.kept.is_empty());
+    fs::remove_file(b.0.join("hardlink")).unwrap();
+    parity(&mut facts, &roots, std::slice::from_ref(&path));
+    assert_eq!(facts.homes.kept.len(), 2);
+    let repaired = parity(&mut facts, &roots, std::slice::from_ref(&path));
+    assert_eq!(repaired.local_diagnostics.state_titles.reused_roots, 2);
 }
 
 /// [money] Compact digest and clone/continue keep the legacy byte stream;

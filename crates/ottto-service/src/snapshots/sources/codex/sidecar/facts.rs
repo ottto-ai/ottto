@@ -96,6 +96,11 @@ impl SidecarFacts {
                     );
                 }
             }
+            // A partial group can never be reused; do not retain or charge
+            // its otherwise-cacheable homes while another input declines.
+            if self.homes.kept.len() != listed.len() {
+                self.homes.kept.clear();
+            }
             self.charge_homes();
         }
         metadata
