@@ -23047,6 +23047,44 @@ for line in sys.stdin:
         (root, home)
     }
 
+    /// [regress] Repeated status collection must not spawn unchanged CLI metadata.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_cache_hit_skips_spawn() {
+        let (root, home) = synthetic_codex_collector_home("cli-meta-hit", 0o600);
+        let binary = root.join("codex");
+        let script = fs::read_to_string(&binary).unwrap().replace(
+            "import sys", "import sys, os\nif sys.argv[1:] in ([\"login\", \"status\"], [\"debug\", \"models\", \"--bundled\"]):\n    with open(os.path.join(os.environ[\"CODEX_HOME\"], \"starts\"), \"a\") as f: f.write(\"start\\n\")"
+        ).replace("synthetic-model", "gpt-5");
+        fs::write(&binary, script).unwrap();
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        for _ in 0..2 {
+            let (snapshot, _, _) = collect_codex_status_for_home(
+                "2026-08-26T00:00:00Z".to_string(),
+                "2026-08-26T00:15:00Z".to_string(),
+                &home,
+                CodexHomeTrust::ProviderDefault,
+                CodexLoginRefresh::Never,
+                CodexQuotaRead::Saved,
+            );
+            assert_eq!(
+                snapshot.account.unwrap().login_state,
+                AgentLoginState::SignedIn
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "unchanged login/models must spawn once each"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
