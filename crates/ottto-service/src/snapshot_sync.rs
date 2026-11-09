@@ -20098,6 +20098,68 @@ mod tests {
         }
     }
 
+    mod census_ownership_tests {
+        use super::*;
+
+        /// [regress] Settled ownership does not block a draining census; an
+        /// additional account-deferred hold still blocks through the shared gate.
+        #[test]
+        #[serial(source_manifests)]
+        fn draining_census_blocks_only_unsettled_ownership() {
+            let _source_manifests = SourceManifestTestGuard::new();
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Codex,
+                SnapshotSource::Pi,
+            ] {
+                for deferred_hold in [false, true] {
+                    let index = if deferred_hold {
+                        claude_index_with(serde_json::json!({
+                            "claude_account_deferred_holds": {"/opaque/deferred.jsonl": "deferred-source"},
+                        }))
+                    } else {
+                        ScanIndex::default()
+                    };
+                    let mut counts = SyncCounts::for_policy(183);
+                    counts.ownership_incomplete_file_count = 1;
+                    counts.terminal_ownership_incomplete_file_count = 1;
+                    counts.skipped_file_count_due_to_limit = 7;
+                    counts.census_status.pending_work = true;
+                    counts.census_status.reconciliation_incomplete = true;
+                    let receipt = captured_terminal_receipt_for_source_under_hint(
+                        source,
+                        counts.with_snapshot_terminal_counts(&index),
+                        CollectorState::Success,
+                        TerminalManifestSource::Withdraw,
+                        183,
+                        RESIDUE_ADMITTING_HINT,
+                    );
+                    assert_eq!(
+                        receipt["last_error_code"],
+                        if deferred_hold {
+                            "census_blocked"
+                        } else {
+                            "census_incomplete"
+                        }
+                    );
+                    assert_eq!(
+                        receipt.get("last_census_block_cause"),
+                        deferred_hold
+                            .then(|| serde_json::json!("ownership_incomplete"))
+                            .as_ref()
+                    );
+                    assert_eq!(receipt["last_census_complete"], false);
+                    assert_eq!(receipt["last_census_pending_file_count"], 7);
+                    assert_eq!(
+                        receipt["last_ownership_incomplete_file_count"],
+                        1 + u64::from(deferred_hold)
+                    );
+                    assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+                }
+            }
+        }
+    }
+
     /// The codex witness once its residue settles (ottto#399): a COMPLETED
     /// census whose every nonzero loss class equals its terminal counterpart,
     /// with the witness reported as counts only.
