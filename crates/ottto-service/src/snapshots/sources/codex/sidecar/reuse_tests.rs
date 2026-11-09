@@ -93,8 +93,6 @@ const ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001";
 fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[PathBuf]) {
     macro_rules! equal { ($($field:ident),* $(,)?) => { $(assert_eq!(a.$field, b.$field, stringify!($field));)* }; }
     equal!(
-        root_suppressed_threads,
-        root_suppressed_extents,
         state_threads,
         rollout_extents,
         state_created_threads,
@@ -426,8 +424,13 @@ fn logs_cursor_matches_fresh_selected_rows() {
     let capped = log_parity(&f.roots(), 0, &mut facts);
     assert!(capped.incomplete);
     assert!(!capped.is_priority_turn("outside-prefix"));
-    assert!(!facts.logs.contains_key(&paths[0]));
+    assert!(facts.logs.contains_key(&paths[0]));
+    assert!(log_parity(&f.roots(), 0, &mut facts).incomplete);
     db.execute_batch("DELETE FROM logs WHERE id>1").unwrap();
+    assert!(log_parity(&f.roots(), 0, &mut facts).is_priority_turn("outside-prefix"));
+    // The original body-only loader can still read a non-cursor schema.
+    db.execute_batch("ALTER TABLE logs RENAME COLUMN id TO old_id")
+        .unwrap();
     assert!(log_parity(&f.roots(), 0, &mut facts).is_priority_turn("outside-prefix"));
 }
 

@@ -22,10 +22,6 @@ pub(in crate::snapshots) struct CodexTitleMetadata {
     /// File-binding evidence stays with the home that supplied it. A merged
     /// usage high-water mark must never seed another copy's creation proof.
     pub(in crate::snapshots) root_sidecars: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
-    /// Per-pass eligibility preserves the old loader's conflict-filtered
-    /// physical-home view without mutating the shared raw home facts.
-    root_suppressed_threads: BTreeMap<PathBuf, BTreeSet<String>>,
-    root_suppressed_extents: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
@@ -328,26 +324,6 @@ impl CodexTitleMetadata {
                 .iter()
                 .map(|(root, home)| (root.clone(), Arc::new(sidecar(home))))
                 .collect(),
-            root_suppressed_threads: self
-                .root_suppressed_threads
-                .iter()
-                .map(|(root, suppressed)| {
-                    (
-                        root.clone(),
-                        suppressed.intersection(&ids).cloned().collect(),
-                    )
-                })
-                .collect(),
-            root_suppressed_extents: self
-                .root_suppressed_extents
-                .iter()
-                .map(|(root, suppressed)| {
-                    (
-                        root.clone(),
-                        suppressed.intersection(&ids).cloned().collect(),
-                    )
-                })
-                .collect(),
             state_created_threads: self
                 .state_created_threads
                 .intersection(&ids)
@@ -388,25 +364,15 @@ impl CodexTitleMetadata {
         identity: &str,
         path: &Path,
     ) -> (Option<&CodexStateThread>, Option<CodexRolloutExtent>) {
-        if let Some((root, sidecar)) = self
+        if let Some((_, sidecar)) = self
             .root_sidecars
             .iter()
             .filter(|(root, _)| path.starts_with(root))
             .max_by_key(|(root, _)| root.components().count())
         {
             return (
-                (!self
-                    .root_suppressed_threads
-                    .get(root)
-                    .is_some_and(|ids| ids.contains(identity)))
-                .then(|| sidecar.threads.get(identity).map(|row| &**row))
-                .flatten(),
-                (!self
-                    .root_suppressed_extents
-                    .get(root)
-                    .is_some_and(|ids| ids.contains(identity)))
-                .then(|| sidecar.extents.get(identity).copied())
-                .flatten(),
+                sidecar.threads.get(identity).map(|row| &**row),
+                sidecar.extents.get(identity).copied(),
             );
         }
         (
@@ -584,7 +550,7 @@ impl CodexTitleMetadata {
         let mut metadata = Self::default();
         let mut legacy_sidecar_parts = Vec::new();
         let mut parentless_ineligible = BTreeSet::new();
-        for (codex_dir, root_sidecar) in homes {
+        for (codex_dir, mut root_sidecar) in homes {
             for input in [
                 "config.toml",
                 "state_5.sqlite",
@@ -602,6 +568,8 @@ impl CodexTitleMetadata {
                 &raw.titles,
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
+                false,
+                true,
             );
             metadata.local_diagnostics.state_titles.merge_root(
                 &raw.evidence[0],
@@ -618,17 +586,6 @@ impl CodexTitleMetadata {
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
-            let suppressed = root_sidecar
-                .threads
-                .keys()
-                .filter(|id| !threads.contains_key(*id))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if !suppressed.is_empty() {
-                metadata
-                    .root_suppressed_threads
-                    .insert(codex_dir.clone(), suppressed);
-            }
             codex_root_copies::merge_threads(&mut metadata, &codex_dir, &threads);
             metadata.local_diagnostics.state_threads.merge_root(
                 &raw.evidence[1],
@@ -671,17 +628,6 @@ impl CodexTitleMetadata {
             let conflicts_before = metadata.identity_conflicts.len();
             let mut extents = BTreeMap::new();
             let _ = apply_extents(&raw.history, &mut extents, &mut metadata.identity_conflicts);
-            let suppressed = root_sidecar
-                .extents
-                .keys()
-                .filter(|id| !extents.contains_key(*id))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if !suppressed.is_empty() {
-                metadata
-                    .root_suppressed_extents
-                    .insert(codex_dir.clone(), suppressed);
-            }
             codex_root_copies::merge_extents(&mut metadata, &extents);
             metadata.local_diagnostics.rollout_extents.merge_root(
                 &raw.evidence[3],
@@ -698,30 +644,13 @@ impl CodexTitleMetadata {
                 metadata.sidecar_census_incomplete = true;
             }
             let conflicts_before = metadata.identity_conflicts.len();
-            let mut parsed = BTreeMap::new();
-            let mut aliases = BTreeMap::new();
-            for (raw_id, title) in &raw.index {
-                let id = record_codex_identity_key(
-                    &mut aliases,
-                    &mut metadata.identity_conflicts,
-                    raw_id,
-                );
-                if metadata.identity_conflicts.contains(&id) {
-                    parsed.remove(&id);
-                    metadata.titles.remove(&id);
-                } else {
-                    insert_codex_sidecar_title(
-                        &mut parsed,
-                        id,
-                        title.clone(),
-                        "session_index",
-                        true,
-                    );
-                }
-            }
-            if raw.evidence[4].failed_roots == 0 {
-                metadata.titles.extend(parsed);
-            }
+            apply_titles(
+                &raw.index,
+                &mut metadata.titles,
+                &mut metadata.identity_conflicts,
+                true,
+                raw.evidence[4].failed_roots == 0,
+            );
             metadata.local_diagnostics.session_index.merge_root(
                 &raw.evidence[4],
                 metadata.identity_conflicts.len() != conflicts_before,
@@ -735,6 +664,13 @@ impl CodexTitleMetadata {
             }
             if metadata.identity_conflicts.len() != conflicts_before {
                 metadata.sidecar_census_incomplete = true;
+            }
+            // Fresh homes acquire their existing physical-home view during
+            // the ordered merge. Reused groups are complete and unchanged,
+            // so this view is already identical; conflicts are never retained.
+            if let Some(home) = Arc::get_mut(&mut root_sidecar) {
+                home.threads = threads;
+                home.extents = extents;
             }
             metadata.root_sidecars.insert(codex_dir, root_sidecar);
         }
@@ -960,39 +896,66 @@ fn load_codex_logs2_priority_turns_counted(
     ) else {
         return (false, 0);
     };
-    let Ok((turns, complete, read)) = connection.read(|connection| {
-        // Only `response.create` request rows carry the *requested* service_tier.
-        // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
-        // then filters to the sparse request rows (hundreds, not the full table).
-        let mut statement = connection.prepare(
-            "SELECT feedback_log_body FROM logs \
-             WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
-             ORDER BY ts DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
-            |row| row.get::<_, String>(0),
-        )?;
-        let mut complete = true;
-        let mut read = 0_u64;
-        let mut turns = Vec::new();
-        for body in rows {
-            let Ok(body) = body else {
-                complete = false;
-                continue;
-            };
-            read += 1;
-            turns.extend(codex_logs2_priority_turn_from_body(&body));
-        }
-        if read == CODEX_LOGS2_MAX_ROWS as u64 {
-            CapCounts::record("codex", 3, 1);
-        }
-        Ok((turns, complete, read))
-    }) else {
+    let mut turns = BTreeSet::new();
+    let result = connection.read(|connection| {
+        read_codex_logs2_priority_turns(connection, since_epoch, None, "", |_, turn| {
+            turns.extend(turn);
+            Ok(true)
+        })
+    });
+    let Ok((complete, read)) = result else {
         return (false, 0);
     };
     priority_turns.extend(turns);
-    (complete && read < CODEX_LOGS2_MAX_ROWS as u64, read)
+    (complete, read)
+}
+
+/// One query/decode owner for the original ts-DESC selection and cursor deltas.
+/// The visitor may stop a delta when the original selection must be reloaded.
+fn read_codex_logs2_priority_turns(
+    connection: &Connection,
+    since: i64,
+    after_id: Option<i64>,
+    identity_columns: &str,
+    mut visit: impl FnMut(&rusqlite::Row<'_>, Option<String>) -> rusqlite::Result<bool>,
+) -> Result<(bool, u64)> {
+    // Only response.create request rows carry the requested service_tier.
+    let selection = if after_id.is_some() {
+        "AND id > ?2"
+    } else {
+        "ORDER BY ts DESC LIMIT ?2"
+    };
+    let sql = format!(
+        "SELECT feedback_log_body{identity_columns} FROM logs \
+         WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' {selection}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(
+        rusqlite::params![since, after_id.unwrap_or(CODEX_LOGS2_MAX_ROWS)],
+        |row| {
+            Ok(visit(
+                row,
+                codex_logs2_priority_turn_from_body(&row.get::<_, String>(0)?),
+            ))
+        },
+    )?;
+    let (mut complete, mut read) = (true, 0_u64);
+    for row in rows {
+        match row {
+            Ok(keep_reading) => {
+                read += 1;
+                if !keep_reading? {
+                    break;
+                }
+            }
+            Err(_) => complete = false,
+        }
+    }
+    if after_id.is_none() && read == CODEX_LOGS2_MAX_ROWS as u64 {
+        CapCounts::record("codex", 3, 1);
+        complete = false;
+    }
+    Ok((complete, read))
 }
 
 /// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
@@ -1052,16 +1015,28 @@ fn apply_titles(
     loaded: &[(String, Option<String>)],
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
     identity_conflicts: &mut BTreeSet<String>,
+    overwrite: bool,
+    complete: bool,
 ) {
+    // The session index stages titles atomically while alias conflicts still
+    // remove earlier titles on failure, as in the original index loader.
+    let mut parsed = if overwrite {
+        BTreeMap::new()
+    } else {
+        std::mem::take(titles)
+    };
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
-        if identity_conflicts.contains(id.as_str()) {
-            titles.remove(id.as_str());
-            continue;
+        let id = record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id);
+        if identity_conflicts.contains(&id) {
+            parsed.remove(&id);
+            titles.remove(&id);
+        } else {
+            insert_codex_sidecar_title(&mut parsed, id, title.clone(), "session_index", overwrite);
         }
-        insert_codex_sidecar_title(titles, id, title.clone(), "session_index", false);
+    }
+    if complete {
+        titles.extend(parsed);
     }
 }
 
@@ -1276,7 +1251,7 @@ pub(in crate::snapshots) fn load_codex_rollout_extents(
     if !path.exists() {
         return Ok(());
     }
-    let connection = open_codex_sidecar_database(path, open)?;
+    let connection = open_codex_sidecar_database(path, open, None)?;
     let rows = connection.read(facts::history_rows)?;
     apply_extents(&rows, rollout_extents, identity_conflicts)
 }
@@ -1378,13 +1353,24 @@ const CODEX_SIDECAR_OPEN_BACKOFF: std::time::Duration = std::time::Duration::fro
 fn open_codex_sidecar_database(
     path: &Path,
     open: &mut SidecarOpenCounts,
+    mut before: Option<&SourceStamp>,
 ) -> Result<codex_sqlite_read::CodexSqliteRead> {
     let connection = retry_transient_sqlite(&mut open.retries, || {
-        codex_sqlite_read::CodexSqliteRead::open(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            CODEX_SIDECAR_BUSY_TIMEOUT,
-        )
+        // Only the first attempt can reuse the caller's capture. A retry uses
+        // today's fresh routing, including its schema probe and no kept stamp.
+        match before.take() {
+            Some(before) => codex_sqlite_read::CodexSqliteRead::open_stamped(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
+                Some(before),
+            ),
+            None => codex_sqlite_read::CodexSqliteRead::open(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
+            ),
+        }
     })?;
     if connection.is_snapshot() {
         open.snapshots = open.snapshots.saturating_add(1);
@@ -1530,7 +1516,7 @@ crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, compact_title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, root_suppressed_threads, root_suppressed_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
+crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 
 #[cfg(test)]
