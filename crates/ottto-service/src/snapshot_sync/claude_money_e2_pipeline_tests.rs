@@ -720,6 +720,77 @@ fn streamed_evidence_equals_whole_corpus() {
     );
 }
 
+const BIG: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+const SMALL: &str = "7338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+const SMALLER: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+/// Three unrelated roots on one page: BIG with six paired requests, SMALL and
+/// SMALLER with two each. Returns the corpus and its scanner.
+fn three_family_page(name: &str) -> (Corpus, E2ScanFixture) {
+    let mut c = Corpus::new(name);
+    for (session, requests) in [(BIG, 6), (SMALL, 2), (SMALLER, 2)] {
+        let ids = (0..requests)
+            .map(|at| format!("{}-{at}", &session[..4]))
+            .collect::<Vec<_>>();
+        c.root(
+            session,
+            &ids.iter()
+                .map(|id| line(session, id, AT, 10))
+                .collect::<String>(),
+        );
+        c.evidence_for(
+            session,
+            &ids.iter()
+                .map(|id| api_for(session, id, 10, 100))
+                .collect::<Vec<_>>(),
+            &ids.iter()
+                .map(|id| trace_for(session, id, ""))
+                .collect::<Vec<_>>(),
+        );
+    }
+    (c, E2ScanFixture::default())
+}
+
+/// [behaviour] The evidence stage holds one group of whole families' rows at
+/// a time, not the page's: on a page of three unrelated roots the most rows
+/// any evidence read keeps is the largest family's (BIG: 6 API + 6 trace
+/// rows), and every root's rows are still read once.
+#[test]
+fn evidence_keeps_the_largest_group_not_the_page() {
+    with_e2(|| {
+        let (c, scanner) = three_family_page("e2-evidence-largest-group");
+        let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+        assert_eq!(
+            page.scan.snapshots.len(),
+            3,
+            "one page holds all three roots"
+        );
+        let (_, records) = crate::local_resource_diagnostics::capture(|| page.enrich(&c));
+        let kept = records
+            .iter()
+            .filter(|record| record["stage"] == "evidence_read")
+            .map(|record| {
+                record["counts"]["evidence_mem"]["kept_rows"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept.iter().sum::<u64>(),
+            20,
+            "every root's rows, once: {kept:?}"
+        );
+        assert_eq!(
+            kept.iter().max(),
+            Some(&12),
+            "the most rows kept at once is the largest group's, not the page sum: {kept:?}"
+        );
+        assert_eq!(page.stats.api_evidence_row_count, 10);
+        assert_eq!(page.stats.trace_evidence_row_count, 10);
+        assert_eq!(page.stats.complete_sidecar_root_count, 3);
+    });
+}
+
 fn twin(p: &Page) -> Page {
     Page {
         cache: p.cache.clone(),
