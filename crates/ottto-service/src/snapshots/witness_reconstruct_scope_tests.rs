@@ -223,9 +223,9 @@ fn posture_withheld(items: &[SnapshotItem]) -> serde_json::Value {
 }
 
 /// [money] An idle subagent whose own index entry is verified at its census
-/// revision no longer clears its family's context posture. An unverified
-/// entry, a fingerprint mismatch or no entry still clears it, and the cache
-/// rows stay on the strict in-batch rule.
+/// revision no longer clears its family's context posture. A matching ordinary
+/// unverified entry also binds; a fingerprint mismatch or no entry still
+/// clears it, and the cache rows stay on the strict in-batch rule.
 #[test]
 fn idle_verified_member_keeps_family_context_posture() {
     let mut withheld = BTreeMap::new();
@@ -282,7 +282,7 @@ fn idle_verified_member_keeps_family_context_posture() {
         );
 
         let child = &items[1];
-        let kept = matches!(case, "none" | "verified");
+        let kept = matches!(case, "none" | "verified" | "unverified");
         assert_eq!(
             context_posture(child),
             if kept {
