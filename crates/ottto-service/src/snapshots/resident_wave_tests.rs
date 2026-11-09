@@ -230,12 +230,42 @@ fn collect_source_wave(
     let mut pages = 0;
     let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(source);
     for _ in 0..32 {
+        let prior = index.clone();
         let (mut next, mut scan, _) = claude_history_upgrade::with_resident_budget(budget, || {
             fixture.scan_other_page(source, &[root.to_owned()], root, index, true, 100, &[])
         });
         finalize_scan_after_policy(source, &mut scan, &mut next);
         ledger.deliver(&scan.snapshots);
         assert!(scan.snapshots.iter().all(|item| ledger.settled(item)));
+        scan.finish_codex_capture_boundary(&mut next);
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        next.record_accepted_snapshot_fingerprints(&accepted);
+        e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut next,
+            &scan.snapshots,
+            &e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
+        );
+        next = next.committable_subset(&prior, &accepted, &BTreeMap::new());
+        // Native Codex aliases settle every physical member but share one
+        // wire body. Match the uploader's identity dedup, checking the proof.
+        let mut emitted = BTreeMap::new();
+        scan.snapshots.retain(|item| {
+            let witness = snapshot_upload_body_witness(item);
+            if let Some(prior) = emitted.get(&item.snapshot_fingerprint) {
+                assert_eq!(
+                    prior, &witness,
+                    "only exact native aliases share an upload identity"
+                );
+                false
+            } else {
+                emitted.insert(item.snapshot_fingerprint.clone(), witness);
+                true
+            }
+        });
         pages += 1;
         let complete = scan.census_complete;
         if let Some(all) = aggregate.as_mut() {
