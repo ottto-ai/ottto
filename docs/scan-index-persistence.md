@@ -96,9 +96,9 @@ clock uses the same conservative overdue posture, rather than postponing purge.
 Privacy work precedes optional daily reference verification.
 
 Admission requires available space of at least the larger of the main file
-length and the logical database size, including pages still in WAL, plus the
-current WAL length. An additional 1 GiB is reserved; unknown space refuses the
-attempt. The copy has a configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
+length and the logical database size, including pages still in WAL. An
+additional 1 GiB is reserved; unknown space refuses the attempt. The WAL length
+is not added: the TRUNCATE before the copy proves it empty. The copy has a configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
 plus the existing bounded busy wait. Failed attempts increase the next work
 allowance geometrically, capped at 60 seconds per attempt. This is interruptible
 work, not a hard latency guarantee. Failures back off inside the remaining deadline;

@@ -331,11 +331,10 @@ impl Sqlite {
             pages.checked_mul(size).context("state_v2_vacuum_space")
         })()
         .ok();
+        // One copy: the TRUNCATE below proves an empty WAL before copying.
         let required = logical
             .zip(fs::metadata(&self.path).ok().map(|m| m.len()))
-            .zip(self.wal_bytes())
-            .and_then(|((logical, file), wal)| logical.max(file).checked_add(wal))
-            .and_then(|n| n.checked_add(1024 * 1024 * 1024));
+            .and_then(|(logical, file)| logical.max(file).checked_add(1024 * 1024 * 1024));
         let available = (self.purge_policy.space)(&self.path);
         self.stats.free_space_required_bytes = required;
         self.stats.free_space_available_bytes = available;
@@ -396,10 +395,10 @@ impl Sqlite {
             Ok(self.conn()?.execute("VACUUM INTO ?1", [name])?)
         })?;
         // The copy has a rollback journal; the store is a WAL database.
+        // `open_locked` refuses any mode but WAL.
         let raw = Connection::open(tmp)?;
-        let mode: String = raw.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        raw.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         raw.close().map_err(|(_, error)| error)?;
-        ensure!(mode == "wal", "state_v2_journal_refused");
         let (conn, _owner) = Sqlite::open_locked(tmp, id, Some(live), true)?;
         conn.close().map_err(|(_, error)| error)?;
         swap_point("W2b", tmp)?;

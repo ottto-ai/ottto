@@ -121,8 +121,13 @@ The retained-history goal is a store heap of at most 56 MiB and a reduction over
 90% from the 630 MiB baseline, with finish peak below 164 MiB. Whole-process
 steady RSS is a gauge, not that retained-history acceptance criterion.
 
-Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim; purge means
-VACUUM plus TRUNCATE. Commit outcome arrays are ordered committed, not published,
+Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim. The purge slot
+counts the TRUNCATE before each erasure copy, plus one failure when an attempt
+stops before that TRUNCATE (for example the space refusal). A copy or swap
+failure after a complete TRUNCATE counts in `vacuum_failures` and
+`erasure_vacuum_failed`, not in that slot. `erasure_vacuum.bytes` adds the
+pre-attempt main-file length of each attempt whose copy was published; `runs`
+counts durable completions. Commit outcome arrays are ordered committed, not published,
 published after error, ambiguous. Backend counters reset with the connection;
 process distributions reset with the process. The pending generation, oldest
 erasure time and attempt/failure pacing persist in the DB. No paths, keys, raw

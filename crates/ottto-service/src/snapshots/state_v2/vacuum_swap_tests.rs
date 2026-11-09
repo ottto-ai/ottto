@@ -104,17 +104,17 @@ fn next_attempt(path: &Path, identity: &Identity, before: &[(Header, Vec<u8>)], 
     assert_eq!(dump(&mut db), before, "{row}: rows after the swap");
 }
 
-/// [regress] Each source × fault point keeps the rows, identity and debt;
+/// [behaviour] Each source × fault point keeps the rows, identity and debt;
 /// grants no completion; and the next attempt removes the remnant, completes
 /// and publishes a file a cold open accepts. Crash windows replay a copy of
 /// the directory taken at the fault; in-process faults continue the store.
 #[test]
 fn erasure_swap_faults_keep_custody_for_every_source() {
     // (row, seam, post-close: the store must reload)
-    const ROWS: [(&str, Option<&str>, bool); 8] = [
+    // `close` is W2 too: the copy is validated and the store not yet closed.
+    const ROWS: [(&str, Option<&str>, bool); 7] = [
         ("W1", None, false),
         ("W2b", Some("W2b"), false),
-        ("W2", Some("close"), true),
         ("close", Some("close"), true),
         ("W3", Some("W3"), true),
         ("W4", Some("W4"), true),
@@ -158,9 +158,7 @@ fn erasure_swap_faults_keep_custody_for_every_source() {
                             }
                             _ => {}
                         }
-                        if name != "close" {
-                            copy_dir(tmp.parent().unwrap(), &to);
-                        }
+                        copy_dir(tmp.parent().unwrap(), &to);
                         anyhow::ensure!(name == "W2b", "test: fault at {name}");
                         Ok(())
                     });
@@ -189,14 +187,13 @@ fn erasure_swap_faults_keep_custody_for_every_source() {
     }
 }
 
-/// [regress] Space admission is one copy plus the WAL plus 1 GiB, not two
-/// copies.
+/// [behaviour] Space admission is one copy plus 1 GiB, not two copies.
 #[test]
-fn erasure_swap_admits_one_copy_plus_wal_and_reserve() {
+fn erasure_swap_admits_one_copy_plus_reserve() {
     const GIB: u64 = 1 << 30;
     let dir = ScratchDir::canonical("vacuum-swap-space");
     let (mut db, path, _) = store(Source::Claude, &dir);
-    // A complete idle TRUNCATE leaves no WAL: the copy needs file + 1 GiB.
+    // After a complete idle TRUNCATE the logical size is the file size.
     let idle = db.checkpoint(CheckpointMode::IdleReclaim);
     assert_eq!(idle.state, CheckpointState::Complete);
     sqlite::set_space_reader(
@@ -215,7 +212,7 @@ fn erasure_swap_admits_one_copy_plus_wal_and_reserve() {
     assert_eq!(admitted.state, CheckpointState::Complete);
 }
 
-/// [regress] A busy TRUNCATE fails before any copy exists; the separate
+/// [behaviour] A busy TRUNCATE fails before any copy exists; the separate
 /// upload history file is never touched.
 #[test]
 fn erasure_swap_busy_truncate_fails_before_the_copy() {
