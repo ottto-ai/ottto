@@ -92,7 +92,7 @@ pub(crate) use usage::cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
 mod change_reason;
-mod claude_context_file_birth;
+use sources::claude::context_file_birth as claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
 mod upload_context_receipt;
@@ -179,11 +179,7 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
-#[cfg(test)]
-mod claude_response_compaction_tests;
-mod claude_response_records;
-#[cfg(test)]
-mod claude_thinking_tokens_tests;
+use sources::claude::response_records as claude_response_records;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -228,8 +224,6 @@ mod source_erasure_tests;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
-#[cfg(test)]
-mod usage_occurrence_retention_tests;
 pub(crate) use sources::claude::account::withheld as withheld_account;
 #[cfg(test)]
 mod withheld_owner_charge_tests;
