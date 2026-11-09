@@ -70,10 +70,16 @@ field, `{"latest": {"<name>": <value>}}`, so every save and hold stays countable
 Tail loads (`tail_load_tx_ms`) and stage reports (`tail_stage`) are the
 exception: mid-pass they print no row and only fold into `tail_per_pass`, so
 their per-event order inside a pass is not printed; read `tail_per_pass`, not
-sums of `latest.tail_*`. Stage windows, memory checkpoints, retained heap and
-save-work samples print nothing mid-pass; the pass-end row (after `post_pass_plateau`) carries the full
-snapshot with every field below. A same-name window repeated in one pass shows
-its last instance. Outside a pass, each change prints the full snapshot at once.
+sums of `latest.tail_*`. The baseline gauges (`baseline_age_s` and
+`baseline_14day_escalation_alarm`) also update `latest` without one-key rows
+inside a pass. Stage windows, memory checkpoints, retained heap and save-work
+samples print nothing mid-pass; the pass-end row (after `post_pass_plateau`)
+always carries the full snapshot with every field below, once per pass even
+when `latest` is unchanged. A same-name window repeated in one pass shows its
+last instance. Outside a pass, events still print the full snapshot at once.
+Other samples omit the full snapshot when `latest` equals the last printed
+snapshot's `latest`; fresh stage-memory samples always print, preserving
+memory, CPU and page-fault measurements regardless of `latest` equality.
 
 | Field | Measurement |
 | --- | --- |

@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 #[derive(Default, Serialize)]
 struct Stats {
     latest: BTreeMap<&'static str, serde_json::Value>,
+    #[serde(skip)]
+    last_printed_latest: Option<BTreeMap<&'static str, serde_json::Value>>,
     cpu_per_pass_us: Distribution,
     save_dirty_rows: Distribution,
     save_dirty_bytes: Distribution,
@@ -69,24 +71,31 @@ pub(super) fn event(name: &'static str, value: &impl Serialize) {
         if let Ok(value) = &value {
             stats.latest.insert(name, value.clone());
         }
-        // In a pass, each event still prints, but only its own value.
+        // Baseline gauges already ride the pass-end latest snapshot.
         if in_pass() {
             if let Ok(value) = value {
+                if matches!(name, "baseline_age_s" | "baseline_14day_escalation_alarm") {
+                    return;
+                }
                 crate::local_resource_diagnostics::claude_state_v2(&serde_json::json!({
                     "latest": { name: value }
                 }));
             }
         } else {
-            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+            print_snapshot(&mut stats);
         }
     }
 }
-/// Window, memory, heap and save-work samples taken in this thread's pass fold
-/// into the one full row `plateau` prints; outside a pass they print at once.
-fn publish(stats: &Stats) {
-    if !in_pass() {
-        crate::local_resource_diagnostics::claude_state_v2(stats);
+/// Samples in this thread's pass fold into its full plateau row. Outside a
+/// pass, omit unchanged latest snapshots except for fresh memory measurements.
+fn publish(stats: &mut Stats, memory_sample: bool) {
+    if !in_pass() && (memory_sample || stats.last_printed_latest.as_ref() != Some(&stats.latest)) {
+        print_snapshot(stats);
     }
+}
+fn print_snapshot(stats: &mut Stats) {
+    crate::local_resource_diagnostics::claude_state_v2(&*stats);
+    stats.last_printed_latest = Some(stats.latest.clone());
 }
 fn in_pass() -> bool {
     PASS.with(|pass| pass.borrow().active)
@@ -199,7 +208,7 @@ impl Stage {
                     },
                 );
             }
-            publish(&stats);
+            publish(&mut stats, matches!(self.kind, Kind::Save | Kind::Hydrate));
         }
     }
 }
@@ -356,7 +365,7 @@ pub(in super::super) fn phase(name: &'static str) {
 fn record_memory(name: &'static str, window: MemoryWindow) {
     if let Ok(mut stats) = stats().lock() {
         stats.stage_memory.insert(name, window);
-        publish(&stats);
+        publish(&mut stats, true);
     }
 }
 
@@ -404,7 +413,7 @@ pub(in super::super) fn plateau() {
                 .and_then(|(a, b)| b.checked_sub(a));
             stats.decoded_per_pass = pass.decoded;
             stats.tail_per_pass = std::mem::take(&mut pass.tail);
-            crate::local_resource_diagnostics::claude_state_v2(&*stats);
+            print_snapshot(&mut stats);
         }
         pass.active = false;
         pass.started = false;
@@ -445,7 +454,7 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
     let observation = retained_heap(index);
     if let Ok(mut stats) = stats().lock() {
         stats.retained_heap_bytes.insert(owner, observation);
-        publish(&stats);
+        publish(&mut stats, false);
     }
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
@@ -527,7 +536,7 @@ impl Drop for Window {
                     ..Default::default()
                 },
             );
-            publish(&stats);
+            publish(&mut stats, true);
         }
     }
 }
@@ -555,7 +564,7 @@ pub(super) fn save_work(rows: u64, bytes: u64) {
     if let Ok(mut stats) = stats().lock() {
         stats.save_dirty_rows.observe(rows);
         stats.save_dirty_bytes.observe(bytes);
-        publish(&stats);
+        publish(&mut stats, false);
     }
     row_cap_save();
 }
@@ -699,7 +708,7 @@ mod ops_tests {
 
     /// [behaviour] In a pass, an event prints a row with only its own value
     /// and stage, memory and save-work samples print nothing until the one
-    /// full pass-end row; outside a pass every change prints the full row.
+    /// full pass-end row; outside a pass an event prints the full row.
     #[test]
     fn pass_samples_fold_into_the_pass_end_row() {
         let previous = PASS.with(|pass| {
@@ -722,7 +731,6 @@ mod ops_tests {
         });
         let (_, outside) = crate::local_resource_diagnostics::capture(|| {
             event("hold", &"none");
-            save_work(1, 1);
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
         let rows = |records: Vec<serde_json::Value>| {
@@ -746,10 +754,81 @@ mod ops_tests {
         assert!(full["stage_memory"].is_object() && full["latest"].is_object());
         assert!(full["save_dirty_rows"]["max"].is_u64());
         let outside = rows(outside);
-        assert_eq!(outside.len(), 2, "{outside:?}");
+        assert_eq!(outside.len(), 1, "{outside:?}");
         assert!(outside
             .iter()
             .all(|row| row["stage_memory"].is_object() && row["save_dirty_rows"]["max"].is_u64()));
+    }
+
+    /// [behaviour] Outside a pass, unchanged publishes print nothing; a
+    /// changed latest prints once even if only non-latest samples follow.
+    #[test]
+    fn unchanged_outside_publish_is_suppressed() {
+        let previous = PASS.with(|pass| std::mem::take(&mut *pass.borrow_mut()));
+        let mut stats = Stats::default();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            publish(&mut stats, false);
+            publish(&mut stats, false);
+            stats.latest.insert("synthetic", serde_json::json!(1));
+            publish(&mut stats, false);
+            stats.save_dirty_rows.observe(3);
+            publish(&mut stats, false);
+        });
+        PASS.with(|pass| *pass.borrow_mut() = previous);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0]["counts"]["latest"], serde_json::json!({}));
+        assert_eq!(
+            records[1]["counts"]["latest"],
+            serde_json::json!({"synthetic": 1})
+        );
+    }
+
+    /// [behaviour] Fresh stage-memory samples and one end row per pass print
+    /// even when latest has not changed since the preceding full snapshot.
+    #[test]
+    fn memory_and_pass_end_rows_are_never_suppressed() {
+        let previous = PASS.with(|pass| std::mem::take(&mut *pass.borrow_mut()));
+        let mut stats = Stats::default();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            for name in ["prepare", "acquire", "select", "hydrate", "finish"] {
+                stats.stage_memory.insert(name, MemoryWindow::default());
+                publish(&mut stats, true);
+                publish(&mut stats, true);
+            }
+            for _ in 0..2 {
+                pass_start();
+                plateau();
+                plateau(); // A completed pass cannot emit a second end row.
+            }
+        });
+        PASS.with(|pass| *pass.borrow_mut() = previous);
+        assert_eq!(records.len(), 12, "{records:?}");
+        for record in &records[..10] {
+            assert_eq!(record["counts"]["latest"], serde_json::json!({}));
+            assert!(record["counts"]["stage_memory"]["prepare"]["current"].is_object());
+        }
+        for record in &records[10..] {
+            assert!(record["counts"]["stage_memory"]["post_pass_plateau"].is_object());
+        }
+    }
+
+    /// [behaviour] Baseline gauges update latest without one-key rows in a
+    /// pass; the pass-end snapshot still carries both measurements.
+    #[test]
+    fn baseline_gauges_only_print_in_the_pass_end_snapshot() {
+        let previous = PASS.with(|pass| std::mem::take(&mut *pass.borrow_mut()));
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            pass_start();
+            baseline(Path::new("/synthetic-missing-baseline/scan-index.json"));
+            plateau();
+        });
+        PASS.with(|pass| *pass.borrow_mut() = previous);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let latest = records[0]["counts"]["latest"].as_object().unwrap();
+        for name in ["baseline_age_s", "baseline_14day_escalation_alarm"] {
+            assert!(latest.contains_key(name));
+        }
+        assert!(records[0]["counts"]["stage_memory"].is_object());
     }
 
     /// [behaviour] In a pass, Tail loads and stages print no row of their own;
