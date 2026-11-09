@@ -10,7 +10,7 @@ const FILE_CHARGE: f64 = 0.0871;
 /// selected files finish in one page, retaining more than B + one unit.
 #[test]
 fn resident_wave_shape_defers_before_three_b_of_refolds() {
-    let home = tests::temp_dir("resident-wave-shape");
+    let home = crate::test_scratch::unique_path("resident-wave-shape");
     let root = home.join("transcripts");
     fs::create_dir_all(&root).unwrap();
     let n = (3.0 * B / FILE_CHARGE).ceil() as usize;
