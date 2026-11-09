@@ -532,9 +532,9 @@ fn a_file_written_during_the_listing_has_a_known_age() {
             let report = page.end(&mut f.index, true).expect("the walk ends");
             let fields = report.fields(begin * 1000);
             assert_eq!(fields["outstanding_files"], 1, "{store:?}");
-            assert_eq!(fields["unknown_age_files"], u64::from(!known), "{store:?}");
             assert_eq!(fields["oldest_age_s"].is_u64(), known, "{store:?}");
             assert_eq!(fields["alarm"], !known, "{store:?} {written_after_begin}");
+            assert_eq!(fields["unknown_age_files"], u64::from(!known), "{store:?}");
             f.save();
             let revisions = committed(&f.index, &path);
             assert_eq!(revisions.len(), 1);
