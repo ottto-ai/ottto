@@ -57,6 +57,7 @@
 //! home's login is the one it was read under, so it never moves to another
 //! login. A reading carries identity hashes only.
 
+use crate::local_resource_diagnostics::StageWindow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1697,6 +1698,7 @@ pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
 
 /// [`scheduled_round`], with when the next round has something to do.
 fn scheduled_round_due(support_dir: &Path, now: u64) -> ScheduledRound {
+    let _stage = StageWindow::begin("codex", "offpass_codex_quota");
     crate::codex_sign_in::end_stale_run();
     let settings = quota_refresh_settings();
     if !settings.background_quota_refresh_allowed() {

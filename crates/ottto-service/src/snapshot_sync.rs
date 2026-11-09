@@ -1,3 +1,4 @@
+use crate::local_resource_diagnostics::StageWindow;
 #[cfg(test)]
 use crate::snapshots::snapshot_quarantine_witness;
 #[cfg(test)]
@@ -4882,6 +4883,7 @@ fn collect_file_activity_with_retry(
         match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
             None => std::thread::sleep(slice),
             Some(Ok(event)) => {
+                let _stage = StageWindow::begin(event.source.api_slug(), "offpass_hint");
                 with_source_cadence(event.source, |cadence| {
                     cadence.record_file_event(Instant::now())
                 });
@@ -4927,6 +4929,7 @@ impl ClaudeAccountSwitchProbe {
         }) {
             return false;
         }
+        let _stage = StageWindow::begin("unknown", "offpass_account_check");
         self.checked_at = Some(now);
         let Some(current) = read() else {
             return false;
@@ -5650,6 +5653,7 @@ pub(crate) fn retained_with_withheld(
 }
 
 pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
+    let _stage = StageWindow::begin("unknown", "offpass_local_health");
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -11722,6 +11726,7 @@ pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
 }
 
 fn collector_checkin_once() -> Result<()> {
+    let _stage = StageWindow::begin("unknown", "offpass_collector_checkin");
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
