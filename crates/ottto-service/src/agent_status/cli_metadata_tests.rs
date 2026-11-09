@@ -413,4 +413,3 @@ fn cli_metadata_cache_hit_skips_spawn() {
     );
     fs::remove_dir_all(root).unwrap();
 }
-
