@@ -552,6 +552,21 @@ checkpoints and generation advance together. Restart planning, preflight and
 fsynced staging precede BEGIN. The restart owner receives `post_commit` only after
 an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 
+Every graph commit advances the graph generation G. Owner-local upload-progress
+commits advance `progress_generation` instead (absent reads as 0): the same
+finalizer compares it, stamps the current writer capability and commits, and moves
+no graph row, erasure epoch or Tail state, so G and the graph session's stamp stay
+valid. A COMMIT error reopens and classifies from the committed CAS row of the same
+kind of commit. Progress rows (`progress.cache_state`, `progress.cache_head`,
+`progress.identity`, `progress.ledger`) have no private-path extraction, so
+replacing or deleting one never owes erasure. The graph's catalogue walk reads one
+bounded header page per progress kind it meets and resumes after that kind's last
+possible key; the graph baseline never names them and the graph hydrate never loads
+them. The ledger row sizes against the 64 MiB value bound, as the whole traversal
+fields do. A progress refusal that leaves nothing durable keeps the graph session
+current; a published or ambiguous COMMIT reloads it. No production path writes these
+rows yet.
+
 If restart staging excludes any file, the complete save is discarded and the
 committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement
 or owned-start census from that attempt is published.

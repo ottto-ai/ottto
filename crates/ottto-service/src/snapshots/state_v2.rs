@@ -46,6 +46,7 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod mapper;
+mod progress;
 mod sqlite;
 pub(crate) use sqlite::history as upload_history;
 #[cfg(test)]
@@ -372,10 +373,14 @@ fn value_target(key: &RowKey) -> u64 {
         RowKey::Record { kind, .. } if kind.name().starts_with("raw_hold.") => VALUE_BYTES,
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
-        // The two whole fields that exceed 1 MiB on real stores share the
-        // value bound, so a large row commits instead of refusing its save.
+        // The two whole fields that exceed 1 MiB on real stores, and the
+        // upload-progress ledger, share the value bound, so a large row
+        // commits without a standing alarm.
         RowKey::Record { kind, .. }
-            if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
+            if matches!(
+                kind.name(),
+                "scan_state.traversal" | "v1_field.birth_store" | "progress.ledger"
+            ) =>
         {
             VALUE_BYTES
         }
@@ -560,6 +565,7 @@ fn control_name(name: &str) -> bool {
             | "repair_commitment"
             | "field_presence"
             | "limits"
+            | "progress_generation"
     )
 }
 

@@ -399,6 +399,39 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     );
 }
 
+/// [behaviour] A claim-only growth save earlier in the pass moves the session
+/// to the claim's G; a progress page from the pass's index authenticates at
+/// that lineage instead of refusing as a stale graph.
+#[test]
+fn progress_page_follows_the_claim_lineage() {
+    let f = Fixture::new();
+    let mut claim = f.load();
+    let pass = claim.clone();
+    claim
+        .v2_mut()
+        .growth_retention
+        .insert(f.key.clone(), debt(Some(NOW)));
+    claim.save_growth_claim(&f.path).unwrap();
+    {
+        let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path, claim.generation).unwrap();
+    }
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&pass, &f.path),
+        Some(pass.generation + 1)
+    );
+    let page = progress::Page {
+        cache_state: BTreeMap::from([("s".to_string(), 1_u64)]),
+        cache_head: BTreeMap::<String, u64>::new(),
+        ledger: 1_u64,
+    };
+    let outcome = crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+        commit_progress_locked(&f.path, &pass, owner, progress::Baseline::default(), &page)
+    })
+    .unwrap();
+    assert!(matches!(outcome, progress::Outcome::Committed(_)));
+}
+
 /// One growth Full claim through selection admission. Also reports whether
 /// no committed graph was hydrated: a reused-session hydrate takes the tripwire.
 fn admit_without_hydrate(

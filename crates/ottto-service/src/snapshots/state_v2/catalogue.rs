@@ -176,6 +176,7 @@ pub(super) enum Group {
     Accounts,
     Census,
     Tail,
+    Progress,
 }
 /// The closed record catalogue. Accepting a stored kind implies its mapper.
 pub(super) const OWNED: &[(&str, Group)] = scan_index_fields!(owned);
@@ -188,6 +189,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (4, "tail store"),
     (5, "folder login ledger + tail revision + head envelope"),
     (6, "upload context proof stamps one row per entity"),
+    (7, "upload progress rows"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
@@ -219,6 +221,18 @@ pub(super) const TAIL_KINDS: &[&str] = &[
 pub(super) const TAIL_LAYOUT: u32 = 4;
 /// Tail kinds added after the Tail store, each at its own layout.
 const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];
+/// Owner-local upload progress: closed kinds owned by `progress.rs`, committed
+/// by their own `progress_generation`, never by the graph's. No `ScanIndex`
+/// field, never a row of `enumerate` or a graph baseline, and no private-path
+/// extraction. Kept sorted and adjacent for readability; the graph walk steps
+/// over each kind on its own, so correctness does not depend on adjacency.
+pub(super) const PROGRESS_KINDS: &[&str] = &[
+    "progress.cache_head",
+    "progress.cache_state",
+    "progress.identity",
+    "progress.ledger",
+];
+pub(super) const PROGRESS_LAYOUT: u32 = 7;
 pub(super) fn introduced(kind: &str) -> Result<u32> {
     LAYOUTS
         .iter()
@@ -226,6 +240,7 @@ pub(super) fn introduced(kind: &str) -> Result<u32> {
         .map(|(_, _, layout)| *layout)
         .or_else(|| TAIL_LATER.iter().find(|(k, _)| *k == kind).map(|(_, l)| *l))
         .or_else(|| TAIL_KINDS.contains(&kind).then_some(TAIL_LAYOUT))
+        .or_else(|| PROGRESS_KINDS.contains(&kind).then_some(PROGRESS_LAYOUT))
         .ok_or_else(|| anyhow::anyhow!("state_v2_unmapped_kind"))
 }
 /// Before layout controls existed, this authenticated inventory contained every
@@ -249,6 +264,7 @@ pub(super) fn group(kind: &str) -> Option<Group> {
         .find(|(owned, _)| *owned == kind)
         .map(|(_, group)| *group)
         .or_else(|| TAIL_KINDS.contains(&kind).then_some(Group::Tail))
+        .or_else(|| PROGRESS_KINDS.contains(&kind).then_some(Group::Progress))
 }
 pub(super) fn accepts(kind: &str) -> bool {
     group(kind).is_some() || RESERVED.contains(&kind)
@@ -374,5 +390,26 @@ mod tests {
         assert!(TAIL_KINDS
             .iter()
             .all(|kind| !OWNED.iter().any(|o| o.0 == *kind)));
+    }
+    /// [format] the progress kinds are one sorted, adjacent range at their
+    /// own layout: no graph, Tail or reserved kind sorts inside it.
+    #[test]
+    fn progress_kinds_are_one_contiguous_range() {
+        assert!(PROGRESS_KINDS.windows(2).all(|pair| pair[0] < pair[1]));
+        let (first, last) = (PROGRESS_KINDS[0], PROGRESS_KINDS[PROGRESS_KINDS.len() - 1]);
+        let others = OWNED.iter().map(|o| o.0).chain(TAIL_KINDS.iter().copied());
+        for kind in others.chain(RESERVED.iter().copied()) {
+            assert!(kind < first || kind > last, "{kind}");
+            assert!(!kind.starts_with("progress."), "{kind}");
+        }
+        assert!(LAYOUTS_HISTORY
+            .iter()
+            .any(|(layout, _)| *layout == PROGRESS_LAYOUT));
+        for kind in PROGRESS_KINDS {
+            assert_eq!(group(kind), Some(Group::Progress));
+            assert_eq!(introduced(kind).unwrap(), PROGRESS_LAYOUT);
+            assert!(!retired(kind));
+        }
+        assert_eq!(group("progress.future"), None);
     }
 }

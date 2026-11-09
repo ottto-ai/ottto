@@ -87,6 +87,8 @@ pub(in super::super) struct MaintenanceStats {
     pub(super) dirty_rows_per_save: u64,
     pub(super) max_value_bytes: u64,
     pub(super) record_rows: u64,
+    /// Upload-progress rows: counted apart from `record_rows`, no alarm.
+    pub(super) progress_rows: u64,
     pub(super) file_rows: u64,
     pub(super) records_alarm: bool,
     pub(super) files_alarm: bool,
