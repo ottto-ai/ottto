@@ -22,6 +22,10 @@ pub(in crate::snapshots) struct CodexTitleMetadata {
     /// File-binding evidence stays with the home that supplied it. A merged
     /// usage high-water mark must never seed another copy's creation proof.
     pub(in crate::snapshots) root_sidecars: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
+    /// Per-pass eligibility preserves the old loader's conflict-filtered
+    /// physical-home view without mutating the shared raw home facts.
+    root_suppressed_threads: BTreeMap<PathBuf, BTreeSet<String>>,
+    root_suppressed_extents: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
@@ -324,6 +328,26 @@ impl CodexTitleMetadata {
                 .iter()
                 .map(|(root, home)| (root.clone(), Arc::new(sidecar(home))))
                 .collect(),
+            root_suppressed_threads: self
+                .root_suppressed_threads
+                .iter()
+                .map(|(root, suppressed)| {
+                    (
+                        root.clone(),
+                        suppressed.intersection(&ids).cloned().collect(),
+                    )
+                })
+                .collect(),
+            root_suppressed_extents: self
+                .root_suppressed_extents
+                .iter()
+                .map(|(root, suppressed)| {
+                    (
+                        root.clone(),
+                        suppressed.intersection(&ids).cloned().collect(),
+                    )
+                })
+                .collect(),
             state_created_threads: self
                 .state_created_threads
                 .intersection(&ids)
@@ -364,15 +388,25 @@ impl CodexTitleMetadata {
         identity: &str,
         path: &Path,
     ) -> (Option<&CodexStateThread>, Option<CodexRolloutExtent>) {
-        if let Some((_, sidecar)) = self
+        if let Some((root, sidecar)) = self
             .root_sidecars
             .iter()
             .filter(|(root, _)| path.starts_with(root))
             .max_by_key(|(root, _)| root.components().count())
         {
             return (
-                sidecar.threads.get(identity).map(|row| &**row),
-                sidecar.extents.get(identity).copied(),
+                (!self
+                    .root_suppressed_threads
+                    .get(root)
+                    .is_some_and(|ids| ids.contains(identity)))
+                .then(|| sidecar.threads.get(identity).map(|row| &**row))
+                .flatten(),
+                (!self
+                    .root_suppressed_extents
+                    .get(root)
+                    .is_some_and(|ids| ids.contains(identity)))
+                .then(|| sidecar.extents.get(identity).copied())
+                .flatten(),
             );
         }
         (
@@ -584,6 +618,17 @@ impl CodexTitleMetadata {
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
+            let suppressed = root_sidecar
+                .threads
+                .keys()
+                .filter(|id| !threads.contains_key(*id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !suppressed.is_empty() {
+                metadata
+                    .root_suppressed_threads
+                    .insert(codex_dir.clone(), suppressed);
+            }
             codex_root_copies::merge_threads(&mut metadata, &codex_dir, &threads);
             metadata.local_diagnostics.state_threads.merge_root(
                 &raw.evidence[1],
@@ -626,6 +671,17 @@ impl CodexTitleMetadata {
             let conflicts_before = metadata.identity_conflicts.len();
             let mut extents = BTreeMap::new();
             let _ = apply_extents(&raw.history, &mut extents, &mut metadata.identity_conflicts);
+            let suppressed = root_sidecar
+                .extents
+                .keys()
+                .filter(|id| !extents.contains_key(*id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !suppressed.is_empty() {
+                metadata
+                    .root_suppressed_extents
+                    .insert(codex_dir.clone(), suppressed);
+            }
             codex_root_copies::merge_extents(&mut metadata, &extents);
             metadata.local_diagnostics.rollout_extents.merge_root(
                 &raw.evidence[3],
@@ -853,6 +909,7 @@ const CODEX_LOGS2_WINDOW_PAD_DAYS: u64 = 1;
 const CODEX_LOGS2_MAX_WINDOW_DAYS: u64 = 14;
 
 impl CodexTurnTraceMap {
+    #[cfg(test)]
     pub(in crate::snapshots) fn load_from_roots(
         roots: &[PathBuf],
         backfill_window_days: u64,
@@ -1204,6 +1261,7 @@ fn saturating_count_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn load_codex_rollout_extents(
     path: &Path,
     open: &mut SidecarOpenCounts,
@@ -1467,7 +1525,7 @@ crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, compact_title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
+crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, root_suppressed_threads, root_suppressed_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 
 #[cfg(test)]

@@ -185,18 +185,16 @@ fn open(
     before: Option<&SourceStamp>,
     counts: &mut SidecarOpenCounts,
 ) -> Result<codex_sqlite_read::CodexSqliteRead> {
-    let read = retry_transient_sqlite(&mut counts.retries, || match before {
-        Some(before) => codex_sqlite_read::CodexSqliteRead::open_stamped(
+    let Some(before) = before else {
+        return open_codex_sidecar_database(path, counts);
+    };
+    let read = retry_transient_sqlite(&mut counts.retries, || {
+        codex_sqlite_read::CodexSqliteRead::open_stamped(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             CODEX_SIDECAR_BUSY_TIMEOUT,
             Some(before),
-        ),
-        None => codex_sqlite_read::CodexSqliteRead::open(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            CODEX_SIDECAR_BUSY_TIMEOUT,
-        ),
+        )
     })?;
     if read.is_snapshot() {
         counts.snapshots = counts.snapshots.saturating_add(1);

@@ -141,7 +141,7 @@ fn read(
             let mut statement = db.prepare("SELECT feedback_log_body FROM logs WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' ORDER BY ts DESC LIMIT ?2")?;
             let rows = statement.query_map(rusqlite::params![since, CODEX_LOGS2_MAX_ROWS], |row| row.get::<_, String>(0))?;
             let mut turns = BTreeSet::new();
-            for body in rows { if let Ok(body) = body { turns.extend(codex_logs2_priority_turn_from_body(&body)); } }
+            for body in rows.flatten() { turns.extend(codex_logs2_priority_turn_from_body(&body)); }
             CapCounts::record("codex", 3, 1);
             return Ok((BTreeMap::new(), turns, watermark, false, reused, delta));
         }

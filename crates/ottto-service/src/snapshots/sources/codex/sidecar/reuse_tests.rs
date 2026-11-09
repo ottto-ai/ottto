@@ -64,6 +64,8 @@ const ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001";
 fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[PathBuf]) {
     macro_rules! equal { ($($field:ident),* $(,)?) => { $(assert_eq!(a.$field, b.$field, stringify!($field));)* }; }
     equal!(
+        root_suppressed_threads,
+        root_suppressed_extents,
         state_threads,
         rollout_extents,
         state_created_threads,
