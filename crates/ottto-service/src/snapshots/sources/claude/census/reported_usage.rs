@@ -196,11 +196,11 @@ fn apply_claude_reported_usage_with_index_and_rows(
         .filter(|revision| !revision.is_empty())
         .collect::<BTreeSet<_>>();
     // `own_entry` gates context posture only (display): a record also binds
-    // to its own index entry when that entry is verified at the record's
-    // revision, so an idle member outside this batch keeps its family's
-    // posture. A quiet retire counts as verified here: the fingerprint must
-    // still match. Usage rebuild, demotion holds and cache rows keep the
-    // in-batch rule.
+    // to its own index entry at the record's revision, including an ordinary
+    // unverified Tail read, so an idle member outside this batch keeps its
+    // family's posture. The record must still be complete and current, and
+    // its fingerprint must match. Usage rebuild, demotion holds and cache
+    // rows keep the in-batch rule.
     let census_roots = |own_entry: bool| {
         index
             .claude_request_census
@@ -216,8 +216,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
                             item.source_file_fingerprint.as_deref().is_some_and(bound)
                         }) || own_entry
                             && index.files.get(key.as_str()).is_some_and(|entry| {
-                                !entry.has_unverified_source()
-                                    && bound(entry.source_file_fingerprint.as_str())
+                                bound(entry.source_file_fingerprint.as_str())
                             })))
             })
             .map(|(key, _)| key)
