@@ -19740,6 +19740,28 @@ mod tests {
     /// a complete census on every heartbeat) nor `true` (which would assert one
     /// it never measured) — it must send nothing. The terminal path, which did
     /// run the census, still states the measured value in both directions.
+    /// [regress] Sidecar hit/reload counters reach the existing emitted scan row.
+    #[test]
+    fn sidecar_reuse_counters_reach_emitted_row() {
+        let scan = SourceScanResult {
+            local_codex_diagnostics: Some(CodexScanDiagnostics::default()),
+            ..Default::default()
+        };
+        let row = SyncCounts::from_scan_result(&scan, 0, 30).terminal_census_line("codex");
+        for field in [
+            "state_5_reused=0",
+            "state_5_reloaded=0",
+            "thread_history_1_reused=0",
+            "thread_history_1_reloaded=0",
+            "session_index_reused=0",
+            "session_index_reloaded=0",
+            "logs_2_delta_rows=0",
+            "absent_roots=0",
+        ] {
+            assert!(row.contains(field), "missing emitted field: {field}");
+        }
+    }
+
     #[test]
     #[serial(source_manifests)]
     fn only_a_scan_result_puts_census_completeness_on_the_wire() {

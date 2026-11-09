@@ -1526,3 +1526,6 @@ crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
+
+#[cfg(test)]
+mod reuse_tests;
