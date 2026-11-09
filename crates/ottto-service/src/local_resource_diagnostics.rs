@@ -182,8 +182,6 @@ macro_rules! codex_cursor_events {
             parked_hits,
             /// Durable header-fact lookups the Codex header inventory tried.
             header_durable_lookups,
-            /// Lookup errors dropped because another source produced facts.
-            header_lookup_errors_deferred,
             /// Header facts reused without a native header read.
             header_reuse_hits,
             /// Header bytes those reuses did not read.

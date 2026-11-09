@@ -191,6 +191,11 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if let Some(context) = sampling.as_ref() {
+                        // The inventory's lookups count in this scan's window;
+                        // the page clock still ticks at `note_page`.
+                        codex_page.open_window(&context.cache);
+                    }
                     if !inventory.step_selected(
                         &codex_title_metadata,
                         index,
