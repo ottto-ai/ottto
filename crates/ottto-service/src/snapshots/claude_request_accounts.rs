@@ -58,6 +58,18 @@ fn is_bound_body(bound: Option<&(String, String)>, item: &SnapshotItem) -> bool 
 }
 
 impl MixedUploads {
+    /// Adds another evidence chunk's admitted bodies (disjoint sessions).
+    pub(crate) fn absorb(&mut self, chunk: Self) {
+        let Self {
+            bodies,
+            request_identity,
+            unhealthy_unknown,
+        } = chunk;
+        self.bodies.extend(bodies);
+        self.request_identity.extend(request_identity);
+        self.unhealthy_unknown.extend(unhealthy_unknown);
+    }
+
     pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
         #[cfg(not(test))]
         let identity_collector = super::claude_request_identity::COLLECTOR;

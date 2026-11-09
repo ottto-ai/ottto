@@ -9195,6 +9195,103 @@ fn whole_corpus_evidence() -> bool {
     false
 }
 
+// Test seam for the chunked-evidence equality arm: its reference runs the
+// whole page as one evidence chunk.
+#[cfg(test)]
+thread_local! {
+    static ONE_EVIDENCE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Packed evidence chunks run on this thread (reference arms excluded),
+    /// so a fixture can assert its packing.
+    static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Evidence chunks run on this thread so far.
+#[cfg(test)]
+pub(crate) fn evidence_chunks_for_test() -> usize {
+    EVIDENCE_CHUNKS.with(std::cell::Cell::get)
+}
+
+/// The whole page in one evidence chunk: the test references only.
+fn one_evidence_chunk() -> bool {
+    #[cfg(test)]
+    if ONE_EVIDENCE_CHUNK.with(std::cell::Cell::get)
+        || whole_corpus_evidence()
+        || REFERENCE_ROOTS.with(|roots| roots.borrow().is_some())
+    {
+        return true;
+    }
+    false
+}
+
+/// Next-fit packing of the page's evidence groups, in page order, into the
+/// chunks the evidence body runs once each: a chunk closes before a group
+/// would take its side-file bytes past the page's largest group. A group is
+/// never split. The batch size is that largest group: no constant, cap or
+/// timer. Sizes come from file metadata; no side file is opened.
+fn pack_claude_evidence_groups(
+    support_dir: &Path,
+    groups: Vec<(Vec<usize>, BTreeSet<String>)>,
+) -> Vec<Vec<usize>> {
+    if one_evidence_chunk() || groups.len() < 2 {
+        let mut page = groups
+            .into_iter()
+            .flat_map(|(slots, _)| slots)
+            .collect::<Vec<_>>();
+        page.sort_unstable();
+        return vec![page];
+    }
+    let sized = groups
+        .into_iter()
+        .map(|(slots, roots)| {
+            let bytes = roots
+                .iter()
+                .filter_map(|root| {
+                    crate::claude_local_otel::telemetry_pair_bytes(
+                        support_dir,
+                        &crate::claude_local_otel::telemetry_stem(root),
+                    )
+                    .ok()
+                    .flatten()
+                })
+                .fold(0, u64::saturating_add);
+            (slots, bytes)
+        })
+        .collect::<Vec<_>>();
+    let batch = sized.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
+    let mut chunks = Vec::<Vec<usize>>::new();
+    let mut used = 0_u64;
+    for (slots, bytes) in sized {
+        match chunks.last_mut() {
+            Some(chunk) if used.saturating_add(bytes) <= batch => chunk.extend(slots),
+            _ => {
+                chunks.push(slots);
+                used = 0;
+            }
+        }
+        used = used.saturating_add(bytes);
+    }
+    for chunk in &mut chunks {
+        chunk.sort_unstable();
+    }
+    chunks
+}
+
+/// What every evidence chunk of one page shares: the page's original
+/// carriers, read before any chunk runs, and the pass's counters.
+struct ClaudeEvidencePage<'p> {
+    originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
+    request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
+    stats: ClaudeLocalEvidenceStats,
+    /// Roots already counted this pass: a scope root that a later chunk reads
+    /// again counts once (its bytes still show as re-read).
+    counted_roots: BTreeSet<String>,
+}
+
+/// The evidence stage over one page: the page is split into groups of whole
+/// families (`EvidenceScope::item_groups`), packed into chunks, and the
+/// evidence body runs once per chunk, so only one chunk's rows are resident
+/// at a time. The copy decisions, original carriers, census health and the
+/// release of emitted folds run once over the page.
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9206,7 +9303,6 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
     let originals = scan_result
@@ -9222,12 +9318,14 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         crate::snapshots::claude_request_identity::capture_request_owned_originals(
             &scan_result.snapshots,
         );
-    let session_ids = claude_evidence_session_ids(&scan_result.snapshots)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let mut stats = ClaudeLocalEvidenceStats {
-        requested_session_count: session_ids.len(),
-        ..Default::default()
+    let mut page = ClaudeEvidencePage {
+        originals: &originals,
+        request_owned_originals: &request_owned_originals,
+        stats: ClaudeLocalEvidenceStats {
+            requested_session_count: claude_evidence_session_ids(&scan_result.snapshots).len(),
+            ..Default::default()
+        },
+        counted_roots: BTreeSet::new(),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9241,12 +9339,173 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         accepted_identity_buckets,
     )
     .apply(index);
-    // Footprint windows only: the whole evidence stage, its sidecar read and
-    // its fold. Local diagnostics; no behaviour or wire change.
+    // Footprint window of the whole stage, once per page; each chunk's read,
+    // fold and step windows nest inside it. Local diagnostics only.
     let evidence_window = crate::local_resource_diagnostics::StageWindow::begin(
         "claude_code",
         "claude_local_evidence",
     );
+    let chunks = pack_claude_evidence_groups(
+        support_dir,
+        crate::snapshots::claude_cross_root_evidence::EvidenceScope::item_groups(
+            &scan_result.snapshots,
+            index,
+            &fork_parents,
+        ),
+    );
+    #[cfg(test)]
+    if !one_evidence_chunk() {
+        EVIDENCE_CHUNKS.with(|count| count.set(count.get() + chunks.len()));
+    }
+    // Each session's first page slot: chunk outputs go back in page order.
+    let first_slot = (scan_result.snapshots.iter().enumerate().rev())
+        .map(|(slot, item)| (item.source_session_id.clone(), slot))
+        .collect::<BTreeMap<_, _>>();
+    let mut slots = std::mem::take(&mut scan_result.snapshots)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let mut restored = (0..slots.len())
+        .map(|_| None)
+        .collect::<Vec<Option<SnapshotItem>>>();
+    let location =
+        |item: &SnapshotItem| (item.claude_money.as_deref()).and_then(|fold| fold.location_key());
+    let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    for chunk in chunks {
+        scan_result.snapshots = (chunk.iter())
+            .map(|&slot| slots[slot].take().expect("each slot is in one chunk"))
+            .collect();
+        let keys = (scan_result.snapshots.iter())
+            .map(|item| (item.source_session_id.clone(), location(item)))
+            .collect::<Vec<_>>();
+        let roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let chunk_fork_parents = (fork_parents.iter())
+            .filter(|(root, _)| roots.contains(root))
+            .cloned()
+            .collect();
+        disposition.absorb(apply_claude_local_evidence_chunk(
+            support_dir,
+            scan_result,
+            index,
+            accepted_identity_buckets,
+            wire_budget,
+            &mut page,
+            chunk_fork_parents,
+        ));
+        // The body only removes items (index unavailable, or an emitted
+        // session's later path twins), keeping the rest in order: each
+        // survivor goes back to its slot; a removed slot stays empty.
+        let mut survivors = std::mem::take(&mut scan_result.snapshots)
+            .into_iter()
+            .peekable();
+        for (&slot, (session, located)) in chunk.iter().zip(&keys) {
+            if survivors.peek().is_some_and(|item| {
+                item.source_session_id == *session && location(item) == *located
+            }) {
+                restored[slot] = survivors.next();
+            }
+        }
+        debug_assert!(
+            survivors.next().is_none(),
+            "the evidence body only removes items"
+        );
+    }
+    scan_result.snapshots = restored.into_iter().flatten().collect();
+    disposition
+        .copy_invalidated
+        .sort_by_key(|row| first_slot.get(row.session()).copied());
+    let ClaudeEvidencePage { mut stats, .. } = page;
+    for item in &scan_result.snapshots {
+        if !item.source_session_id.contains("_agent-") {
+            match item.provenance.collector.as_str() {
+                crate::snapshots::claude_request_accounts::COMPLETE => {
+                    stats.own_request_complete_root_count += 1
+                }
+                crate::snapshots::claude_request_accounts::UNKNOWN => {
+                    stats.own_request_unknown_root_count += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    stats.identity_complete_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_identity_complete)
+        .count();
+    stats.request_index_complete_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_request_index_complete)
+        .count();
+    stats.explicit_owned_start_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_owned_start_proven)
+        .count();
+    stats.session_exclusive_reported_usage_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        })
+        .count();
+    stats.request_census = scan_result.claude_request_census_shadow;
+    stats.context_file_birth = disposition.context_file_birth.clone();
+    let window = crate::local_resource_diagnostics::StageWindow::begin(
+        "claude_code",
+        "evidence_census_health",
+    );
+    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    drop(window);
+    if census_withheld {
+        // These revisions were fully readable, but uploading them would demote
+        // a previously proven usage authority. Keep the census non-terminal
+        // until a complete family pass reconstructs the exact witness. The
+        // debt alone does not mark the sweep unsettled (path-(a) bridge): each
+        // held revision settles or blocks on its own page, and full completion
+        // stays pending while any RetryPending family remains.
+        scan_result.census_complete = false;
+        scan_result.scan_cap_hit = true;
+    }
+    // All local consumers (finalizer, identity, account qualification and the
+    // optional shadow) have finished. Release native inputs only for emitted
+    // `e2` bodies before upload clones/checkpoints.
+    // Held and legacy bodies retain their inputs for their existing owners.
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
+        &scan_result.snapshots,
+    );
+    for item in &mut scan_result.snapshots {
+        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
+            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
+        }
+    }
+    drop(evidence_window);
+    (disposition, census_withheld, stats)
+}
+
+/// The evidence body over one chunk of whole families (`scan_result`'s
+/// snapshots): the API read and attach, the strict per-root read of the
+/// chunk's scope and the fold steps through account qualification. It counts
+/// into the page's stats and returns the chunk's disposition.
+fn apply_claude_local_evidence_chunk(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    page: &mut ClaudeEvidencePage<'_>,
+    fork_parents: Vec<(String, String)>,
+) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+    let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
+    let (originals, request_owned_originals) = (page.originals, page.request_owned_originals);
+    let stats = &mut page.stats;
+    let session_ids = claude_evidence_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let mut read_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
     let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
@@ -9308,7 +9567,12 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         None => scope,
     };
     let usage_roots = scope.roots().cloned().collect::<Vec<_>>();
-    stats.candidate_root_count = usage_roots.len();
+    // A root counts on its first read in the pass only.
+    let fresh = (usage_roots.iter())
+        .filter(|root| page.counted_roots.insert((*root).clone()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    stats.candidate_root_count += fresh.len();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
@@ -9347,7 +9611,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             paired
         })
         .collect::<Vec<_>>();
-    stats.paired_sidecar_root_count = usage_roots.len();
+    stats.paired_sidecar_root_count += usage_roots
+        .iter()
+        .filter(|root| fresh.contains(*root))
+        .count();
 
     // Release all non-paired rows before moving the selected roots into the
     // usage aggregate.
@@ -9388,6 +9655,12 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
+        let mut reread = ClaudeLocalEvidenceStats::default();
+        let stats = if fresh.contains(&root_session_id) {
+            &mut *stats
+        } else {
+            &mut reread
+        };
         let (mut api, mut trace) = decode_window.time(|| {
             let api = api_read.take_strict_report(support_dir, &root_session_id);
             let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
@@ -9512,7 +9785,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &mut scan_result.snapshots,
             &trace_discarded_roots,
         );
-        stats.trace_discard_deferred_items = deferred;
+        stats.trace_discard_deferred_items += deferred;
         unfolded
     };
     drop(window);
@@ -9531,7 +9804,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         };
         evidence
             .with_trace_discarded_roots(trace_discarded_roots)
-            .with_native_originals(&originals)
+            .with_native_originals(originals)
             .with_accepted_buckets(accepted_identity_buckets)
             .with_wire_budget(wire_budget)
     });
@@ -9562,7 +9835,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         crate::snapshots::claude_request_identity::stage_request_owned_activity(
             &scan_result.snapshots,
             evidence,
-            &request_owned_originals,
+            request_owned_originals,
         )
     });
     drop(window);
@@ -9636,14 +9909,14 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &mut scan_result.snapshots,
             &api_report,
             &trace_report,
-            &originals,
+            originals,
             evidence,
         ),
         None => crate::snapshots::claude_request_accounts::apply_with_originals(
             &mut scan_result.snapshots,
             &api_report,
             &trace_report,
-            &originals,
+            originals,
         ),
     };
     drop(window);
@@ -9653,19 +9926,6 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     drop(api_report);
     drop(trace_report);
     let _account_coverage = qualification.coverage;
-    for item in &scan_result.snapshots {
-        if !item.source_session_id.contains("_agent-") {
-            match item.provenance.collector.as_str() {
-                crate::snapshots::claude_request_accounts::COMPLETE => {
-                    stats.own_request_complete_root_count += 1
-                }
-                crate::snapshots::claude_request_accounts::UNKNOWN => {
-                    stats.own_request_unknown_root_count += 1
-                }
-                _ => {}
-            }
-        }
-    }
     disposition.mixed_uploads = qualification.mixed;
     // Request identity is not the session owner: admit only this scan's
     // exact contract-5 bodies, never rewriting a retained owner.
@@ -9675,59 +9935,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         disposition.mixed_uploads.admit_request_identity(item);
         disposition.mixed_uploads.admit_unhealthy_unknown(item);
     }
-    stats.identity_complete_session_count = scan_result
-        .snapshots
-        .iter()
-        .filter(|item| item.claude_context_curve_identity_complete)
-        .count();
-    stats.request_index_complete_session_count = scan_result
-        .snapshots
-        .iter()
-        .filter(|item| item.claude_context_curve_request_index_complete)
-        .count();
-    stats.explicit_owned_start_session_count = scan_result
-        .snapshots
-        .iter()
-        .filter(|item| item.claude_context_curve_owned_start_proven)
-        .count();
-    stats.session_exclusive_reported_usage_count = scan_result
-        .snapshots
-        .iter()
-        .filter(|item| {
-            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
-        })
-        .count();
-    stats.request_census = scan_result.claude_request_census_shadow;
-    stats.context_file_birth = disposition.context_file_birth.clone();
-    let window = step("evidence_census_health");
-    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
-    drop(window);
-    if census_withheld {
-        // These revisions were fully readable, but uploading them would demote
-        // a previously proven usage authority. Keep the census non-terminal
-        // until a complete family pass reconstructs the exact witness. The
-        // debt alone does not mark the sweep unsettled (path-(a) bridge): each
-        // held revision settles or blocks on its own page, and full completion
-        // stays pending while any RetryPending family remains.
-        scan_result.census_complete = false;
-        scan_result.scan_cap_hit = true;
-    }
-    // All local consumers (finalizer, identity, account qualification and the
-    // optional shadow) have finished. Release native inputs only for emitted
-    // `e2` bodies before upload clones/checkpoints.
-    // Held and legacy bodies retain their inputs for their existing owners.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
-    }
     drop(fold_window);
-    drop(evidence_window);
-    (disposition, census_withheld, stats)
+    disposition
 }
 
 #[derive(Debug, PartialEq, Eq)]

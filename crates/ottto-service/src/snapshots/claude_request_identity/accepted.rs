@@ -60,6 +60,14 @@ pub(crate) enum UnknownCause {
     /// Hints exist but whole buckets were evicted at the share limit.
     Incomplete,
 }
+
+impl super::CopyInvalidation {
+    /// The session whose body treats this row as never accepted.
+    pub(crate) fn session(&self) -> &str {
+        &self.session
+    }
+}
+
 #[cfg(test)]
 fn fixture_key() -> FingerprintKey {
     FingerprintKey(Zeroizing::new([0x42; 32]))

@@ -90,6 +90,101 @@ impl EvidenceScope {
             .collect()
     }
 
+    /// The page's evidence groups, ordered by first slot: whole families that
+    /// an evidence pass over one group answers exactly as over the page. Two
+    /// families join when one reads a root the other is known by: a root
+    /// spelling, a session id, an owner root, a parent or root reference, a
+    /// named fork parent or a witness's legacy owner (transitively). Each
+    /// group has its slots in ascending order and the roots its rows sit
+    /// under. Roots no page family is known by (census holders, off-page
+    /// parents and owners) stay read-only scope roots of every group naming
+    /// them.
+    pub(crate) fn item_groups(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        fork_parents: &[(String, String)],
+    ) -> Vec<(Vec<usize>, BTreeSet<String>)> {
+        let families = crate::snapshots::claude_request_money::e2::page_families(items)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut parent = (0..families.len()).collect::<Vec<_>>();
+        fn find(parent: &mut [usize], mut at: usize) -> usize {
+            while parent[at] != at {
+                parent[at] = parent[parent[at]];
+                at = parent[at];
+            }
+            at
+        }
+        fn join(parent: &mut [usize], a: usize, b: usize) {
+            let (a, b) = (find(parent, a), find(parent, b));
+            parent[a.max(b)] = a.min(b);
+        }
+        // The roots each family is known by; a root two families share joins
+        // them.
+        let mut known = BTreeMap::<&str, usize>::new();
+        let mut roots = vec![BTreeSet::<String>::new(); families.len()];
+        for (family, (root, slots)) in families.iter().enumerate() {
+            roots[family].insert(root.clone());
+            for &slot in slots {
+                let item = &items[slot];
+                roots[family].extend(
+                    crate::snapshots::claude_request_identity::owner_root(item).map(str::to_owned),
+                );
+                for name in [Some(root.as_str()), Some(item.source_session_id.as_str())]
+                    .into_iter()
+                    .chain([crate::snapshots::claude_request_identity::owner_root(item)])
+                    .flatten()
+                {
+                    if let Some(&other) = known.get(name) {
+                        join(&mut parent, family, other);
+                    } else {
+                        known.insert(name, family);
+                    }
+                }
+            }
+        }
+        // What the pass reads for a family beyond the roots it is known by.
+        for (family, (root, slots)) in families.iter().enumerate() {
+            let references = slots.iter().flat_map(|&slot| {
+                items[slot]
+                    .attribution_facts
+                    .iter()
+                    .filter(|fact| {
+                        matches!(
+                            fact.field.as_str(),
+                            "parent_session_ref" | "root_session_ref"
+                        )
+                    })
+                    .map(|fact| fact.value.as_str())
+            });
+            let parents = fork_parents
+                .iter()
+                .filter(|(child, _)| child == root)
+                .map(|(_, parent)| parent.as_str());
+            let owners = roots[family]
+                .iter()
+                .filter_map(|kept| index.claude_usage_family_witnesses.get(kept))
+                .flat_map(|witness| witness.legacy_owner_roots.iter().map(String::as_str));
+            for read in references.chain(parents).chain(owners) {
+                if let Some(&other) = known.get(read) {
+                    join(&mut parent, family, other);
+                }
+            }
+        }
+        let mut groups = BTreeMap::<usize, (Vec<usize>, BTreeSet<String>)>::new();
+        for (family, ((_, slots), family_roots)) in families.into_iter().zip(roots).enumerate() {
+            let group = groups.entry(find(&mut parent, family)).or_default();
+            group.0.extend(slots);
+            group.1.extend(family_roots);
+        }
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        for (slots, _) in &mut groups {
+            slots.sort_unstable();
+        }
+        groups.sort_unstable_by_key(|(slots, _)| slots[0]);
+        groups
+    }
+
     /// `kept`: the page's own roots, read with their witnesses' legacy owners
     /// and named fork parents. `api`: the page's API read, by root. One census
     /// walk over every folder, with no deadline (in memory, no I/O), adds the

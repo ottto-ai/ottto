@@ -3116,8 +3116,10 @@ mod tests {
                 .count(),
             1
         );
-        // Each fold step has one footprint record, closed in order after the
-        // read and before the fold window that contains it.
+        // Each fold step of the (one) evidence chunk has one footprint record,
+        // closed in order after the read and before the fold window that
+        // contains it; census health runs once per page, after every chunk,
+        // inside the page's stage window.
         let fold_steps = [
             "evidence_read",
             "evidence_side_calls",
@@ -3127,8 +3129,8 @@ mod tests {
             "evidence_finish_page",
             "evidence_identity_tags",
             "evidence_qualification",
-            "evidence_census_health",
             "evidence_fold",
+            "evidence_census_health",
             "claude_local_evidence",
         ];
         let stages = records

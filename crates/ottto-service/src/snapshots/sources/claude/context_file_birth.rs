@@ -904,6 +904,7 @@ where
 /// veto must not lapse just because a later page did not load the rows: the
 /// vetoed (file, fingerprint) keeps withholding until the file changes. A
 /// restart forgets; the next fold that loads the rows vetoes again.
+#[derive(Clone)]
 pub(crate) struct ClaudeRememberedTripwire {
     /// In-process path hash to the hash of the file fingerprint at the veto.
     vetoed: BTreeMap<u64, u64>,
@@ -950,15 +951,39 @@ impl ClaudeRememberedTripwire {
     }
 }
 
+#[cfg(not(test))]
 static REMEMBERED_TRIPWIRE: Mutex<ClaudeRememberedTripwire> =
     Mutex::new(ClaudeRememberedTripwire::new(MAX_REMEMBERED_TRIPWIRE_FILES));
+
+// Tests keep one memory per thread, like the other process state, so a
+// reference fold can be isolated from the fold it is compared with.
+#[cfg(test)]
+thread_local! {
+    static REMEMBERED_TRIPWIRE: &'static Mutex<ClaudeRememberedTripwire> = Box::leak(Box::new(
+        Mutex::new(ClaudeRememberedTripwire::new(MAX_REMEMBERED_TRIPWIRE_FILES)),
+    ));
+}
 
 /// The process-lifetime veto memory, held for one fold.
 pub(in crate::snapshots) fn remembered_tripwire(
 ) -> std::sync::MutexGuard<'static, ClaudeRememberedTripwire> {
-    REMEMBERED_TRIPWIRE
+    #[cfg(not(test))]
+    let memory = &REMEMBERED_TRIPWIRE;
+    #[cfg(test)]
+    let memory = REMEMBERED_TRIPWIRE.with(|memory| *memory);
+    memory
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Test seam: runs `body`, then puts this thread's veto memory back as it
+/// was, so a reference fold leaves no veto behind.
+#[cfg(test)]
+pub(crate) fn with_remembered_tripwire_restored_for_test<T>(body: impl FnOnce() -> T) -> T {
+    let before = remembered_tripwire().clone();
+    let result = body();
+    *remembered_tripwire() = before;
+    result
 }
 
 /// Content-free counters for one fold. Local only: logged on their own line
@@ -1017,6 +1042,34 @@ impl ClaudeContextBasisCounts {
             }
         };
         *counter += 1;
+    }
+
+    fn absorb(&mut self, other: &Self) {
+        let Self {
+            tagged_record_count,
+            file_birth_rule_session_count,
+            telemetry_confirmed_session_count,
+            withheld_unknown_birth_session_count,
+            withheld_untimed_record_session_count,
+            withheld_all_copied_session_count,
+            withheld_multi_file_session_count,
+            withheld_tripwire_session_count,
+            withheld_tripwire_remembered_session_count,
+            withheld_evidence_bound_session_count,
+            partially_pre_birth_session_count,
+        } = *other;
+        self.tagged_record_count = self.tagged_record_count.saturating_add(tagged_record_count);
+        self.file_birth_rule_session_count += file_birth_rule_session_count;
+        self.telemetry_confirmed_session_count += telemetry_confirmed_session_count;
+        self.withheld_unknown_birth_session_count += withheld_unknown_birth_session_count;
+        self.withheld_untimed_record_session_count += withheld_untimed_record_session_count;
+        self.withheld_all_copied_session_count += withheld_all_copied_session_count;
+        self.withheld_multi_file_session_count += withheld_multi_file_session_count;
+        self.withheld_tripwire_session_count += withheld_tripwire_session_count;
+        self.withheld_tripwire_remembered_session_count +=
+            withheld_tripwire_remembered_session_count;
+        self.withheld_evidence_bound_session_count += withheld_evidence_bound_session_count;
+        self.partially_pre_birth_session_count += partially_pre_birth_session_count;
     }
 }
 
@@ -1093,6 +1146,51 @@ impl ClaudeContextFileBirthCounts {
             .entry(key.to_string())
             .or_default()
             .record(outcome, tagged, partially);
+    }
+
+    /// Adds one evidence chunk's fold counts to its page's: fieldwise sums,
+    /// per version under the same key bound, and the overflow bit OR'd.
+    pub(crate) fn absorb(&mut self, chunk: Self) {
+        let Self {
+            total,
+            by_claude_code_version,
+            demotion_quarantined_session_count,
+            contractless_scalars_witness_present_session_count,
+            contractless_scalars_witness_missing_session_count,
+            remembered_veto_overflowed,
+            id_less_response_before_compaction_count,
+            id_less_response_after_compaction_count,
+            local_context_points_work_refused_session_count,
+        } = chunk;
+        self.total.absorb(&total);
+        for (version, counts) in by_claude_code_version {
+            let key = if self.by_claude_code_version.contains_key(&version)
+                || self.by_claude_code_version.len() < MAX_CONTEXT_BASIS_VERSION_KEYS
+            {
+                version
+            } else {
+                "other".to_owned()
+            };
+            self.by_claude_code_version
+                .entry(key)
+                .or_default()
+                .absorb(&counts);
+        }
+        self.demotion_quarantined_session_count += demotion_quarantined_session_count;
+        self.contractless_scalars_witness_present_session_count +=
+            contractless_scalars_witness_present_session_count;
+        self.contractless_scalars_witness_missing_session_count +=
+            contractless_scalars_witness_missing_session_count;
+        self.remembered_veto_overflowed |= remembered_veto_overflowed;
+        self.id_less_response_before_compaction_count = self
+            .id_less_response_before_compaction_count
+            .saturating_add(id_less_response_before_compaction_count);
+        self.id_less_response_after_compaction_count = self
+            .id_less_response_after_compaction_count
+            .saturating_add(id_less_response_after_compaction_count);
+        self.local_context_points_work_refused_session_count = self
+            .local_context_points_work_refused_session_count
+            .saturating_add(local_context_points_work_refused_session_count);
     }
 
     /// Count one body the fold left without the v1 contract (R9).
