@@ -309,23 +309,53 @@ fn resident_wave_final_acked_money_and_saved_deferral_restart_are_equal() {
                 .unwrap()
                 >= 3
         );
+        let placement = serde_json::to_string(&wide.route.snapshots[ROOT]["model_usage"]).unwrap();
+        assert!(
+            placement.contains(&"1".repeat(64)) && placement.contains(&"2".repeat(64)),
+            "two tagged accounts and a switch"
+        );
+        assert!(
+            wide.route.snapshots[&format!("{ROOT}_agent-000")]["request_count"]
+                .as_u64()
+                .unwrap()
+                >= 2,
+            "the split child owns its native response and side call"
+        );
+        // Existing quiet-roster fixture: every saved deferral has drained first.
+        // Save the metadata-only settled roster, then restart from that save.
+        let mut quiet_index = restarted.index;
+        quiet_index.activate_upload_context("e2-synthetic-destination".into());
+        quiet_index.activate_effective_upload_body_witness_revision(3);
+        quiet_index.adopt_effective_upload_body_witness_revision_monotonically();
+        quiet_index.load_claude_reemission_exclusions(&c.support);
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+            &mut quiet_index,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&c.root),
+            "2026-08-02T08:00:00Z",
+            183,
+        );
+        let quiet_index = c.reload(&mut quiet_index);
         let scanner = E2ScanFixture::capturing_identity();
         scanner.on_committed_route(
-            &crate::snapshots::e2_pipeline_scan_fixture::route_of(&restarted.index).unwrap(),
+            &crate::snapshots::e2_pipeline_scan_fixture::route_of(&quiet_index).unwrap(),
         );
-        let (mut quiet, consumed) =
-            crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
-                c.raw(&scanner, restarted.index, 100, true, &[])
+        // Plain Claude files use the same observed object/parser byte seams.
+        let ((quiet, batches), io) =
+            crate::snapshots::sampled_scan::transition_fixture::observe_codex_quiet(|| {
+                let mut quiet = c.raw(&scanner, quiet_index, 100, true, &[]);
+                quiet.enrich(&c);
+                quiet.finish();
+                let (status, batches, _) =
+                    upload(&quiet.scan.snapshots, &mut restarted.progress.clone(), ack);
+                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+                assert!(batches.is_empty());
+                (quiet, batches)
             });
-        quiet.enrich(&c);
-        quiet.finish();
-        let (status, batches, _) =
-            upload(&quiet.scan.snapshots, &mut restarted.progress.clone(), ack);
-        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        assert!(batches.is_empty());
         let mut result =
             RouteResult::emitted(Mode::Restart, SnapshotSource::ClaudeCode, batches, &[]);
-        result.io.consumed = consumed;
+        result.io = io;
+        result.modes = quiet.modes;
         money_oracle::assert_quiet_restart_zero_bytes(&result);
     });
 }
