@@ -146,14 +146,15 @@ Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,
 `erasure_resume_refusals`, `erasure_late_completions`, and
 `erasure_vacuum.{runs,bytes,seconds}`. Fixed failure reasons appear in
 `erasure_vacuum_failed`, including busy, timeout, disk_full, space_or_io,
-backup_io, own_lock, external_lock, lock_io, engine and truncate. The process events
+backup_io, swap_io, own_lock, external_lock, lock_io, engine and truncate. The process events
 `erasure_deadline_breach` and `erasure_late_completion_alarm` alert overdue debt
 and late success respectively. Attempt/failure/deferred counts, `vacuum_latency_ms`,
 `vacuum_wal_peak_bytes`, and free-space available/required/admission gauges describe
 maintenance work. A pending age is null when no obligation exists or its clock
 is unavailable; `erasure_overdue` distinguishes conservative clock handling.
-Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
-by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+Debt clears only after a successful TRUNCATE with a measured empty WAL, a
+validated `VACUUM INTO` copy renamed over the store, and a durable epoch-matching
+metadata clear. See [the store policy](scan-index-persistence.md).
 
 Source health uses `index_retrying` and "local index busy, retrying" for typed
 reload, migration and save-pressure holds. These do not increment

@@ -2,11 +2,10 @@
 
 ## State-v2 store
 
-State-v2 is the Claude scan-index store. A daemon load that names its support
-directory converts a Claude v1 index to it, publishes a durable fence and uses the
-store from then on. A load without a support directory (unit tests, tools) stays
-on v1 unless the store is already published. Codex and Pi keep the reader and
-legacy-write behavior below.
+State-v2 is the scan-index store for Claude, Codex and Pi. A daemon load that
+names its support directory converts the source's v1 index to it, publishes a
+durable fence and uses the store from then on. A load without a support directory
+(unit tests, tools) stays on v1 unless the store is already published.
 
 Its format-1 schema uses four physical tables: control, records, shared_values
 and value_chunks. Typed per-kind headers project bounded selection fields;
@@ -64,8 +63,13 @@ limits and VACUUM work budgets retain their existing bounds and refusal behavior
 Removing potentially private keys or values marks the first pending generation
 and its start time in that same transaction. Later removals preserve the oldest
 deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale text
-may remain in gaps in live pages. Completion requires in-place VACUUM, successful
-TRUNCATE with a measured zero-length WAL, and a durable metadata-only clear.
+may remain in gaps in live pages. Completion requires a successful TRUNCATE with
+a measured zero-length WAL, then a `VACUUM INTO` copy that holds only live
+records, converted to WAL and passing every check a store open applies plus
+`quick_check`. The old connection closes, its WAL and shared-memory files are
+removed, and the copy is renamed over the store between two directory syncs.
+A durable metadata-only clear follows. No SQLite connection to the old file
+survives the rename.
 
 SOURCE wording: "Deleted private text is not readable through Ottto's store files within 24 h of deletion while the Mac is awake and has enough free disk. If that is not possible, it is erased at the first moment the Mac is awake with enough disk, before normal collection resumes, and the late erasure is counted and alerted."
 
@@ -82,8 +86,8 @@ the remaining deadline. Successful runs normally have a 24-hour cadence, which
 yields to the forced maintenance pause and overdue recovery.
 
 Preparation and every acquisition continuation check maintenance before normal
-collection. After sleep or space recovery, overdue VACUUM plus verified TRUNCATE,
-run at the recovery boundary before collection resumes, overriding retry and
+collection. After sleep or space recovery, overdue erasure (verified TRUNCATE,
+copy and publication), run at the recovery boundary before collection resumes, overriding retry and
 successful-run cooldowns. Recovery has at most two consecutive bounded attempts;
 if they fail, collection continues with debt and the overdue alarm retained,
 and retries resume with pacing. An ordinary failed idle attempt does not arm this
@@ -91,19 +95,23 @@ recovery boundary. Previously committed data remains committed. A missing or reg
 clock uses the same conservative overdue posture, rather than postponing purge.
 Privacy work precedes optional daily reference verification.
 
-Admission requires available space of at least twice the larger of the main
-file length and the logical database size, including pages still in WAL.
-An additional 1 GiB is reserved; unknown space refuses the attempt. VACUUM has a
-configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
+Admission requires available space of at least the larger of the main file
+length and the logical database size, including pages still in WAL, plus the
+current WAL length. An additional 1 GiB is reserved; unknown space refuses the
+attempt. The copy has a configurable VM work budget (2 seconds minimum, with 20 ms per MiB plus 2 seconds)
 plus the existing bounded busy wait. Failed attempts increase the next work
 allowance geometrically, capped at 60 seconds per attempt. This is interruptible
 work, not a hard latency guarantee. Failures back off inside the remaining deadline;
-overdue retries back off up to five minutes. Debt clears only after success. Its WAL may grow approximately with database size; the 64 MiB WAL
-alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
+overdue retries back off up to five minutes. Debt clears only after success. A
+failure before the old connection closes deletes the copy and leaves the store
+untouched; a later failure reopens the store by its current name, as a reload
+does. The copy does not grow the store's WAL; the 64 MiB WAL alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
 still require platform qualification before routing or enabling conversion.
 
-Verified completion covers the current DB/WAL/SHM and the removed migration
-backup. The retained read-only v1 baseline is an explicit policy exception:
+Verified completion covers the current DB/WAL/SHM, the removed migration
+backup and any erasure copy an interrupted attempt left (`.vacuum` and its
+journal, WAL and shared-memory files; `vacuum_remnant_inventory`), which the
+next attempt deletes first. The retained read-only v1 baseline is an explicit policy exception:
 it is never used to resurrect a forgotten file, and its 14-day hard age raises
 an escalation alarm. Uninstall deletes the DB/WAL/SHM, v1-readonly and private
 remnants under its existing cleanup owner; source removal and forget keep them. Temporary remnants and external restart records have

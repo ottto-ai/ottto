@@ -287,3 +287,29 @@ pub(super) fn after_commit(path: &Path, cas: Cas) -> Result<()> {
     anyhow::ensure!(!armed, "test: the COMMIT reply was lost");
     Ok(())
 }
+
+type SwapHook = (&'static str, Box<dyn FnOnce(&Path) -> Result<()>>);
+thread_local! {
+    static SWAP_FAULT: std::cell::RefCell<Option<SwapHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// When the next erasure swap reaches `point` (W2b, close, W3 or W4), run
+/// `hook` once on its copy's path; an error fails the swap there.
+pub(in super::super) fn on_swap(
+    point: &'static str,
+    hook: impl FnOnce(&Path) -> Result<()> + 'static,
+) {
+    SWAP_FAULT.with(|armed| *armed.borrow_mut() = Some((point, Box::new(hook))));
+}
+pub(super) fn swap_point(point: &str, tmp: &Path) -> Result<()> {
+    let hook = SWAP_FAULT.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let hit = armed.as_ref().is_some_and(|(at, _)| *at == point);
+        if hit {
+            armed.take()
+        } else {
+            None
+        }
+    });
+    hook.map_or(Ok(()), |(_, hook)| hook(tmp))
+}

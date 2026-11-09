@@ -612,6 +612,8 @@ mod money_fault_tests;
 #[cfg(test)]
 pub(super) mod money_test_support;
 #[cfg(test)]
+mod vacuum_swap_tests;
+#[cfg(test)]
 pub(crate) use runtime::{
     seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
     tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,

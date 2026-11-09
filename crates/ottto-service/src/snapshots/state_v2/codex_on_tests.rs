@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-type FixtureRow = (Source, fn() -> ScanIndex);
-fn fixtures() -> [FixtureRow; 3] {
+pub(super) type FixtureRow = (Source, fn() -> ScanIndex);
+pub(super) fn fixtures() -> [FixtureRow; 3] {
     [
         (Source::Claude, kinds::tests::fixture),
         (Source::Codex, codex_fixture),

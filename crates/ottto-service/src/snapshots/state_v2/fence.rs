@@ -48,6 +48,7 @@ pub(super) enum Cleanup {
     SourceOnly,
     Unpublished,
     ObsoleteBackup,
+    SwapRemnant,
 }
 /// One inventory drives orphan cleanup, explicit erasure and erasure gauges.
 /// Publication must be excluded before deleting any unpublished artifact.
@@ -65,6 +66,14 @@ pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
     // Cleanup-only names: no writer or recovery/adoption path remains.
     (".v2.sqlite.migration-backup", Cleanup::ObsoleteBackup, None),
     (".v2-recovery", Cleanup::ObsoleteBackup, None),
+    (
+        ".v2.sqlite.vacuum",
+        Cleanup::SwapRemnant,
+        Some("vacuum_remnant_inventory"),
+    ),
+    (".v2.sqlite.vacuum-journal", Cleanup::SwapRemnant, None),
+    (".v2.sqlite.vacuum-wal", Cleanup::SwapRemnant, None),
+    (".v2.sqlite.vacuum-shm", Cleanup::SwapRemnant, None),
     (
         ".v2.sqlite.import",
         Cleanup::Unpublished,
@@ -86,11 +95,12 @@ pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
     ),
 ];
 
-/// Old backup copies still carry private-text debt after their writers are
-/// removed. Delete and fsync them before maintenance clears that obligation.
+/// Old backup copies and erasure copies still carry private-text debt after
+/// their writers are removed. Delete and fsync them before maintenance clears
+/// that obligation.
 pub(super) fn purge_obsolete_backups(path: &Path) -> Result<()> {
     for (suffix, cleanup, _) in ARTIFACTS {
-        if *cleanup == Cleanup::ObsoleteBackup {
+        if matches!(cleanup, Cleanup::ObsoleteBackup | Cleanup::SwapRemnant) {
             remove_artifact(&sibling(path, suffix))?;
         }
     }
