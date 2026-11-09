@@ -241,7 +241,7 @@ mod transcript_acquisition_tests;
 mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
-pub(crate) mod withheld_account;
+pub(crate) use sources::claude::account::withheld as withheld_account;
 #[cfg(test)]
 mod withheld_owner_charge_tests;
 use crate::local_resource_diagnostics::CodexZstCause;
