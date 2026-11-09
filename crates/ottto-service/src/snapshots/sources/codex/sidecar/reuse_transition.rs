@@ -1,11 +1,17 @@
 // Extends the existing native archive/transition fixture and stored-body ACK driver.
 pub(super) fn seed_sidecars(c: &Corpus) -> rusqlite::Connection {
     let home = c.sessions.parent().unwrap();
-    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    let source = c.scratch.join("sidecar-writer.sqlite");
+    let db = rusqlite::Connection::open(&source).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, archived INTEGER, created_at INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT, thread_source TEXT, first_user_message TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)").unwrap();
     for id in [MAIN, OTHER, SIDE, GAP] {
         db.execute("INSERT INTO threads VALUES (?1, 'Fixture title', 1, 0, 1791363600, 1791363600, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![id, c.path(id).to_str().unwrap()]).unwrap();
     }
+    crate::snapshots::codex_sqlite_read::tests::copy_database(
+        &source,
+        &home.join("state_5.sqlite"),
+        true,
+    );
     db
 }
 
@@ -26,11 +32,16 @@ fn codex_sidecar_reuse_transition() {
         c.write(id, account);
     }
     let _db = seed_sidecars(&c);
-    let logs =
-        rusqlite::Connection::open(c.sessions.parent().unwrap().join("logs_2.sqlite")).unwrap();
+    let log_source = c.scratch.join("logs-writer.sqlite");
+    let logs = rusqlite::Connection::open(&log_source).unwrap();
     logs.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, feedback_log_body TEXT)").unwrap();
     let now = unix_seconds(SystemTime::now()).unwrap() as i64;
     logs.execute("INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)", rusqlite::params![now, "turn{turn.id=priority-control}: websocket request: {\"type\":\"response.create\",\"service_tier\":\"priority\"}"]).unwrap();
+    crate::snapshots::codex_sqlite_read::tests::copy_database(
+        &log_source,
+        &c.sessions.parent().unwrap().join("logs_2.sqlite"),
+        true,
+    );
     assert!(
         CodexTurnTraceMap::load_from_roots(&c.roots(), BACKFILL_WINDOW_DAYS)
             .is_priority_turn("priority-control")

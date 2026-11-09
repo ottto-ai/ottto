@@ -194,6 +194,7 @@ impl CodexSqliteRead {
             );
             *self.after.borrow_mut() = after;
             return if self.snapshot.is_some() && (!stable || !idle) {
+                self.stable.set(false);
                 Err(moved())
             } else {
                 Ok(())
@@ -596,7 +597,7 @@ unsafe extern "C" fn io_shm_unmap(file: *mut ffi::sqlite3_file, _delete: c_int) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::snapshots) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -630,6 +631,25 @@ mod tests {
             .collect();
         let metadata = fs::metadata(dir).expect("stat home");
         (entries, (metadata.mtime(), metadata.mtime_nsec()))
+    }
+
+    /// A synthetic provider WAL image, with no process-local writable SHM
+    /// mapping at the read path. Same-process writer mappings are deliberately
+    /// refused by the production guard; the existing guard fixture copies
+    /// these three files for that reason too.
+    pub(in crate::snapshots) fn copy_database(source: &Path, target: &Path, replace: bool) {
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let from = sidecar(source, suffix);
+            let to = sidecar(target, suffix);
+            if replace || !from.exists() {
+                let _ = fs::remove_file(&to);
+            }
+            if from.exists() {
+                fs::set_permissions(&from, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::copy(from, to).unwrap();
+            }
+        }
     }
 
     fn wal_database(path: &Path, value: i64) -> Connection {

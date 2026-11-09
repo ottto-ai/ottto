@@ -601,6 +601,7 @@ mod cache_lifecycle_tests {
         let mut parts = Counter::new(usize::MAX);
         cache.cursor.heap_bound(&mut parts).unwrap();
         cache.withheld_memo.heap_bound(&mut parts).unwrap();
+        cache.sidecars.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
             OFF_MAIN_SHARED_BYTES

@@ -92,6 +92,11 @@ impl SidecarFacts {
         }
         let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
         metadata.compact_titles();
+        if metadata.state_census_incomplete || metadata.sidecar_census_incomplete {
+            for witness in after.values_mut() {
+                *witness = None;
+            }
+        }
         if !reuse {
             for (home, facts) in &metadata.root_sidecars {
                 let first = Cell::new(true);
@@ -188,13 +193,24 @@ fn open(
     let Some(before) = before else {
         return open_codex_sidecar_database(path, counts);
     };
+    let mut first = true;
     let read = retry_transient_sqlite(&mut counts.retries, || {
-        codex_sqlite_read::CodexSqliteRead::open_stamped(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            CODEX_SIDECAR_BUSY_TIMEOUT,
-            Some(before),
-        )
+        if std::mem::take(&mut first) {
+            codex_sqlite_read::CodexSqliteRead::open_stamped(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
+                Some(before),
+            )
+        } else {
+            // Retry with today's fresh routing after a transient open/probe
+            // failure. The plain entry returns no reusable after witness.
+            codex_sqlite_read::CodexSqliteRead::open(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                CODEX_SIDECAR_BUSY_TIMEOUT,
+            )
+        }
     })?;
     if read.is_snapshot() {
         counts.snapshots = counts.snapshots.saturating_add(1);
@@ -289,6 +305,11 @@ fn load_home(
         &mut BTreeSet::new(),
         &mut IdentityConflictTaxonomy::default(),
     );
+    for outcome in &mut raw.evidence[..3] {
+        outcome.absent_roots = u32::from(matches!(&after[0], Some(SourceStamp::Absent)));
+    }
+    raw.evidence[3].absent_roots = u32::from(matches!(&after[1], Some(SourceStamp::Absent)));
+    raw.evidence[4].absent_roots = u32::from(matches!(&after[2], Some(SourceStamp::Absent)));
     let complete = raw.evidence.iter().all(|outcome| outcome.failed_roots == 0);
     let witness = complete
         .then(|| Some([after[0].take()?, after[1].take()?, after[2].take()?]))

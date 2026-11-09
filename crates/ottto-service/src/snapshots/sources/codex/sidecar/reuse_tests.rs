@@ -1,6 +1,27 @@
 //! Synthetic sidecar reuse and fresh-load parity, through the scan constructor.
 use super::*;
 
+thread_local! {
+    static STAGED: std::cell::RefCell<BTreeMap<PathBuf, SourceStamp>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+fn sync_input(home: &Path, input: &str) {
+    let source = home.join("writer").join(input);
+    let now = SourceStamp::capture_sqlite(&source).expect("synthetic writer witness");
+    STAGED.with(|staged| {
+        let mut staged = staged.borrow_mut();
+        if staged.get(&source).is_some_and(|old| old.same(&now)) { return; }
+        let replace = !matches!((staged.get(&source), &now),
+            (Some(SourceStamp::Sqlite { main: old, .. }), SourceStamp::Sqlite { main: now, .. }) if old.same_object(now));
+        codex_sqlite_read::tests::copy_database(&source, &home.join(input), replace);
+        staged.insert(source, now);
+    });
+}
+fn sync_home(home: &Path) {
+    for input in ["state_5.sqlite", "thread_history_1.sqlite"] {
+        sync_input(home, input);
+    }
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -9,8 +30,11 @@ impl Fixture {
             ottto_core::generate_control_token().unwrap()
         ));
         fs::create_dir_all(home.join("sessions")).unwrap();
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+        fs::create_dir_all(home.join("writer")).unwrap();
+        let db = Connection::open(home.join("writer/state_5.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, archived INTEGER, created_at INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT, thread_source TEXT, first_user_message TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);").unwrap();
+        drop(db);
+        sync_home(&home);
         Self(home)
     }
     fn roots(&self) -> Vec<PathBuf> {
@@ -39,6 +63,11 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        STAGED.with(|staged| {
+            staged
+                .borrow_mut()
+                .retain(|path, _| !path.starts_with(&self.0))
+        });
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -118,6 +147,13 @@ fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[Path
     }
 }
 fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> CodexTitleMetadata {
+    for home in roots
+        .iter()
+        .filter_map(|root| root.parent())
+        .collect::<BTreeSet<_>>()
+    {
+        sync_home(home);
+    }
     let mut reused = CodexTitleMetadata::load_reused(roots, facts);
     let mut fresh = CodexTitleMetadata::load_from_roots(roots);
     let index = ScanIndex::default();
@@ -127,7 +163,7 @@ fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> Cod
     reused
 }
 fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
-    let db = Connection::open(fixture.0.join("state_5.sqlite")).unwrap();
+    let db = Connection::open(fixture.0.join("writer/state_5.sqlite")).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
     let path = fixture
         .0
@@ -184,7 +220,7 @@ fn sidecar_state_transitions_match_fresh() {
     for sql in ["UPDATE threads SET rollout_path='moved', updated_at=updated_at+1", "UPDATE threads SET thread_source='agent_created_thread', first_user_message=''", "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')", "DELETE FROM thread_spawn_edges", "INSERT INTO threads SELECT upper(id), title, tokens_used, archived, created_at, updated_at, model, rollout_path, thread_source, first_user_message FROM threads", "DELETE FROM threads WHERE id != lower(id)"] {
         db.execute_batch(sql).unwrap(); parity(&mut facts, &roots, std::slice::from_ref(&path));
     }
-    let history = Connection::open(a.0.join("thread_history_1.sqlite")).unwrap();
+    let history = Connection::open(a.0.join("writer/thread_history_1.sqlite")).unwrap();
     history.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER)").unwrap();
     for sql in [
         format!(
@@ -198,9 +234,17 @@ fn sidecar_state_transitions_match_fresh() {
     }
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     parity(&mut facts, &roots, std::slice::from_ref(&path));
+    db.execute_batch("UPDATE threads SET tokens_used=tokens_used+1; PRAGMA wal_checkpoint(RESTART); UPDATE threads SET tokens_used=tokens_used+1").unwrap();
+    parity(&mut facts, &roots, std::slice::from_ref(&path));
     drop(db);
     parity(&mut facts, &roots, std::slice::from_ref(&path));
-    let db = Connection::open(b.0.join("state_5.sqlite")).unwrap();
+    let parked = b.0.join("state-old.sqlite");
+    fs::rename(b.0.join("state_5.sqlite"), &parked).unwrap();
+    let missing = parity(&mut facts, &roots, std::slice::from_ref(&path));
+    assert_eq!(missing.local_diagnostics.state_titles.absent_roots, 1);
+    fs::rename(parked, b.0.join("state_5.sqlite")).unwrap();
+    parity(&mut facts, &roots, std::slice::from_ref(&path));
+    let db = Connection::open(b.0.join("writer/state_5.sqlite")).unwrap();
     db.execute_batch("PRAGMA journal_mode=DELETE; ALTER TABLE thread_spawn_edges RENAME TO old_edges; CREATE TABLE thread_spawn_edges (parent_thread_id BLOB, child_thread_id TEXT); INSERT INTO thread_spawn_edges VALUES (x'ff', 'child')").unwrap();
     let q4_failed = parity(&mut facts, &roots, std::slice::from_ref(&path));
     assert!(
@@ -284,6 +328,15 @@ fn priority(turn: &str) -> String {
     format!("turn{{turn.id={turn}}}: websocket request: {{\"type\":\"response.create\",\"service_tier\":\"priority\"}}")
 }
 fn log_parity(roots: &[PathBuf], since: i64, facts: &mut SidecarFacts) -> CodexTurnTraceMap {
+    for home in roots
+        .iter()
+        .filter_map(|root| root.parent())
+        .collect::<BTreeSet<_>>()
+    {
+        for input in ["logs_2.sqlite", "sqlite/logs_2.sqlite"] {
+            sync_input(home, input);
+        }
+    }
     let (reused, _) = logs_cursor::load(roots, since, facts);
     let mut fresh = CodexTurnTraceMap {
         since_epoch: since,
@@ -314,8 +367,13 @@ fn log_parity(roots: &[PathBuf], since: i64, facts: &mut SidecarFacts) -> CodexT
 fn logs_cursor_matches_fresh_selected_rows() {
     let f = Fixture::new();
     fs::create_dir(f.0.join("sqlite")).unwrap();
+    fs::create_dir(f.0.join("writer/sqlite")).unwrap();
     let paths = [f.0.join("logs_2.sqlite"), f.0.join("sqlite/logs_2.sqlite")];
-    let writers = paths.iter().map(|path| {
+    let writer_paths = [
+        f.0.join("writer/logs_2.sqlite"),
+        f.0.join("writer/sqlite/logs_2.sqlite"),
+    ];
+    let writers = writer_paths.iter().map(|path| {
         let db = Connection::open(path).unwrap();
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, feedback_log_body TEXT); CREATE INDEX idx_logs_ts ON logs(ts)").unwrap(); db
     }).collect::<Vec<_>>();
@@ -355,8 +413,8 @@ fn logs_cursor_matches_fresh_selected_rows() {
     log_parity(&f.roots(), 0, &mut facts);
     // Replacing a file with a lower sequence cannot retain the old watermark.
     drop(writers);
-    fs::rename(&paths[0], f.0.join("old-logs.sqlite")).unwrap();
-    let db = Connection::open(&paths[0]).unwrap();
+    fs::rename(&writer_paths[0], f.0.join("old-logs.sqlite")).unwrap();
+    let db = Connection::open(&writer_paths[0]).unwrap();
     db.execute_batch("CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, feedback_log_body TEXT)").unwrap();
     db.execute(
         "INSERT INTO logs (ts, feedback_log_body) VALUES (1, ?1)",
@@ -395,6 +453,29 @@ fn subcensus_failures_are_isolated() {
                 || failed.local_diagnostics.state_threads.completed_roots > 0
         );
     }
+}
+
+/// [money] Per-pass conflict suppression keeps the old physical-home view,
+/// while the resident home still owns its raw row for the next pass.
+#[test]
+fn alias_conflict_keeps_legacy_physical_fingerprint() {
+    let f = Fixture::new();
+    let (db, path) = seed(&f);
+    db.execute("INSERT INTO threads VALUES (?1, 'Alias title', 0, 0, NULL, NULL, NULL, NULL, 'user', NULL)", [ID.to_uppercase()]).unwrap();
+    sync_home(&f.0);
+    let metadata = CodexTitleMetadata::load_from_roots(&f.roots());
+    assert!(metadata.identity_conflicts.contains(ID));
+    assert_eq!(metadata.thread_extent_for_path(ID, &path), (None, None));
+    let mut legacy = CodexTitleMetadata::default();
+    legacy.identity_conflicts.insert(ID.into());
+    assert_eq!(
+        metadata.path_sidecar_fingerprint(&path),
+        legacy.path_sidecar_fingerprint(&path)
+    );
+    assert_eq!(
+        metadata.path_reduction_fingerprint(&path),
+        legacy.path_reduction_fingerprint(&path)
+    );
 }
 
 /// [behaviour] WAL routing keeps absence distinct from empty, while facts

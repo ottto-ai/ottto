@@ -77,8 +77,9 @@ pub(super) fn load(
             Err(_) => {
                 // A capture or incremental failure cannot downgrade a fresh
                 // read that today's loader can still complete.
-                let complete =
-                    load_codex_logs2_priority_turns(&path, since, &mut map.priority_turns);
+                let (complete, rows) =
+                    load_codex_logs2_priority_turns_counted(&path, since, &mut map.priority_turns);
+                evidence.delta_rows = evidence.delta_rows.saturating_add(rows);
                 map.incomplete |= !complete;
                 evidence.reloaded_roots = evidence.reloaded_roots.saturating_add(1);
                 if complete {
@@ -149,7 +150,10 @@ fn read(
         Ok((kept, turns, watermark, true, reused, delta))
     }))?;
     let cursor = if complete {
-        read.after_stamp().map(|stamp| LogCursor {
+        let stamp = read
+            .after_stamp()
+            .ok_or_else(|| anyhow::anyhow!("unstable logs acquisition"))?;
+        Some(LogCursor {
             stamp,
             watermark,
             since,

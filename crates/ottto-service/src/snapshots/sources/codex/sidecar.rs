@@ -596,7 +596,7 @@ impl CodexTitleMetadata {
             metadata.legacy_config_file_present |= codex_dir.join("config.toml").is_file();
             let raw = &root_sidecar.raw;
             let key = local_index_key(&codex_dir);
-            let absent = !codex_dir.join("state_5.sqlite").exists();
+            let absent = raw.evidence[0].absent_roots > 0;
             let state_conflicts_before = metadata.identity_conflicts.len();
             apply_titles(
                 &raw.titles,
@@ -688,7 +688,7 @@ impl CodexTitleMetadata {
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
                 reused,
-                !codex_dir.join("thread_history_1.sqlite").exists(),
+                raw.evidence[3].absent_roots > 0,
             );
             if raw.evidence[3].failed_roots > 0 {
                 metadata.sidecar_census_incomplete = true;
@@ -727,7 +727,7 @@ impl CodexTitleMetadata {
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
                 reused,
-                !codex_dir.join("session_index.jsonl").exists(),
+                raw.evidence[4].absent_roots > 0,
             );
             if raw.evidence[4].failed_roots > 0 {
                 metadata.sidecar_census_incomplete = true;
@@ -940,20 +940,25 @@ fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
 
 /// False when a present DB could not be read completely (open, prepare,
 /// query or row error, or the row cap reached); a missing DB is complete.
-fn load_codex_logs2_priority_turns(
+#[cfg(test)]
+fn load_codex_logs2_priority_turns(path: &Path, since: i64, turns: &mut BTreeSet<String>) -> bool {
+    load_codex_logs2_priority_turns_counted(path, since, turns).0
+}
+
+fn load_codex_logs2_priority_turns_counted(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-) -> bool {
+) -> (bool, u64) {
     if !path.exists() {
-        return true;
+        return (true, 0);
     }
     let Ok(connection) = codex_sqlite_read::CodexSqliteRead::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
         std::time::Duration::from_millis(CODEX_LOGS2_BUSY_TIMEOUT_MS),
     ) else {
-        return false;
+        return (false, 0);
     };
     let Ok((turns, complete, read)) = connection.read(|connection| {
         // Only `response.create` request rows carry the *requested* service_tier.
@@ -984,10 +989,10 @@ fn load_codex_logs2_priority_turns(
         }
         Ok((turns, complete, read))
     }) else {
-        return false;
+        return (false, 0);
     };
     priority_turns.extend(turns);
-    complete && read < CODEX_LOGS2_MAX_ROWS as u64
+    (complete && read < CODEX_LOGS2_MAX_ROWS as u64, read)
 }
 
 /// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
@@ -1238,13 +1243,13 @@ pub(in crate::snapshots) fn codex_state_thread_field_diffs(
 ) -> StateRowFieldDiffs {
     let CodexStateThread {
         title: _,
+        compact_title: _,
         tokens_used,
         archived,
         created_at,
         updated_at,
         model,
         rollout_path,
-        ..
     } = existing;
     StateRowFieldDiffs {
         title: u32::from(existing.title_digest() != incoming.title_digest()),
