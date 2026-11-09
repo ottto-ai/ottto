@@ -3337,7 +3337,11 @@ fn cli_binary_stamp(binary: &str) -> std::io::Result<crate::transcript_acquisiti
 fn codex_cli_meta(
     home: &Path,
     allow_legacy_oauth: bool,
-) -> (Result<AgentLoginState, CommandOutput>, AgentModelStatus) {
+) -> (
+    Result<AgentLoginState, CommandOutput>,
+    AgentModelStatus,
+    Option<AgentAccountStatus>,
+) {
     use crate::transcript_acquisition::SourceStamp;
     let mut fresh = None;
     let result = cli_meta(
@@ -3369,24 +3373,29 @@ fn codex_cli_meta(
                 COMMAND_TIMEOUT,
                 allow_legacy_oauth,
             );
-            let parsed_login =
-                parse_codex_account_text(&login.stdout).map(|account| account.login_state);
+            let parsed_account = parse_codex_account_text(&login.stdout);
+            // Legacy/custom CLI text can carry identity or plan fields. Keep
+            // that entire read fresh rather than caching or dropping them.
+            let cacheable_login = parsed_account
+                .as_ref()
+                .filter(|account| account.email.is_none() && account.plan_type.is_none())
+                .map(|account| account.login_state.clone());
             let parsed_models = collect_codex_model_status_from_output(&models);
             let valid = login.command_found
                 && login.success
                 && login.status_code == Some(0)
-                && parsed_login.is_some()
+                && cacheable_login.is_some()
                 && models.command_found
                 && models.success
                 && models.status_code == Some(0)
                 && !parsed_models.available_models.is_empty();
             if valid {
                 Ok(CodexCliMeta {
-                    login: parsed_login.unwrap(),
+                    login: cacheable_login.unwrap(),
                     models: parsed_models,
                 })
             } else {
-                fresh = Some((login, parsed_login, parsed_models));
+                fresh = Some((login, parsed_account, parsed_models));
                 Err(())
             }
         },
@@ -3394,17 +3403,19 @@ fn codex_cli_meta(
         crate::provider_calls::current_trigger() == Some(crate::provider_calls::Trigger::Setup),
     );
     match result {
-        Ok(meta) => (Ok(meta.login), meta.models),
+        Ok(meta) => (Ok(meta.login), meta.models, None),
         Err(()) => {
             let (output, parsed, models) = fresh.expect("loader returned uncached outputs");
-            (
-                if output.command_found && output.success {
-                    parsed.ok_or(output)
-                } else {
-                    Err(output)
-                },
-                models,
-            )
+            let fresh_account = if output.command_found && output.success {
+                parsed
+            } else {
+                None
+            };
+            let login = fresh_account
+                .as_ref()
+                .map(|account| account.login_state.clone())
+                .ok_or(output);
+            (login, models, fresh_account)
         }
     }
 }
@@ -3470,12 +3481,16 @@ fn collect_codex_status_for_home(
         ..unsupported_account("openai")
     });
 
-    let (login, mut model_status) = codex_cli_meta(codex_home, allow_legacy_oauth);
+    let (login, mut model_status, fresh_login_account) =
+        codex_cli_meta(codex_home, allow_legacy_oauth);
     match login {
         Ok(login_state) => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliText;
             snapshot.status = AgentStatusState::Available;
             if let Some(account) = &mut snapshot.account {
+                if login_state == AgentLoginState::SignedIn {
+                    account.billing_channel = Some("subscription".to_string());
+                }
                 account.login_state = login_state;
                 account.auth_method = Some("oauth".to_string());
                 account.confidence = AgentStatusConfidence::Medium;
@@ -3502,6 +3517,9 @@ fn collect_codex_status_for_home(
             }
         }
         Err(_) => {}
+    }
+    if let Some(account) = fresh_login_account {
+        snapshot.account = Some(account);
     }
     match read_codex_auth_account_at(codex_home, home_trust) {
         Ok(Some(auth_account)) => {
@@ -23367,6 +23385,52 @@ for line in sys.stdin:
             assert_eq!(runs, 2, "timeout={timeout}");
             assert!(cache.lock().unwrap().kept.is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] Identity-bearing CLI text retains its fresh legacy fallback.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_identity_text_stays_fresh() {
+        let (root, home) = cli_meta_fixture("cli-meta-identity");
+        let binary = root.join("codex");
+        let script = fs::read_to_string(&binary)
+            .unwrap()
+            .replace("Logged in", "Logged in owner@example.invalid pro");
+        fs::write(binary, script).unwrap();
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        // Existing auth-file reads still run; empty local auth makes the legacy
+        // CLI fallback observable without providing identity from the cache.
+        fs::write(home.join("auth.json"), "{}").unwrap();
+        for _ in 0..2 {
+            let (snapshot, _, _) = collect_codex_status_for_home(
+                "2026-08-26T00:00:00Z".to_string(),
+                "2026-08-26T00:15:00Z".to_string(),
+                &home,
+                CodexHomeTrust::ProviderDefault,
+                CodexLoginRefresh::Never,
+                CodexQuotaRead::Saved,
+            );
+            let account = snapshot.account.unwrap();
+            assert_eq!(account.email.as_deref(), Some("owner@example.invalid"));
+            assert_eq!(account.plan_type.as_deref(), Some("pro"));
+            assert!(!CODEX_CLI_META
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .kept
+                .contains_key(&home));
+        }
+        assert_eq!(
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
