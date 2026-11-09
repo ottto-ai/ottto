@@ -1392,6 +1392,67 @@ fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
     assert_eq!(w.network.get(), 0);
 }
 
+/// [behaviour] A full file selection paces queued work through the same power
+/// gates as a resident deferral; a drained or underfull selection adds no wake.
+#[test]
+fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    let home = crate::test_scratch::private_dir("file-limit-pacing")
+        .canonicalize()
+        .unwrap();
+    let now = Instant::now();
+    for (case, (files, power, gap)) in [
+        (3_usize, PlatformState::Allowed, Some(30)),
+        (3, PlatformState::Battery, Some(180)),
+        (2, PlatformState::Allowed, None),
+        (1, PlatformState::Allowed, None),
+        (3, power_state(0), None), // Low Power Mode on AC or battery.
+        (3, PlatformState::Unknown, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = home.join(case.to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        for file in 0..files {
+            std::fs::write(
+                root.join(format!("session-{file}.jsonl")),
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1793088001000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+            )
+            .unwrap();
+        }
+        let (_, scan, _) = E2ScanFixture::default().scan_other_page(
+            SnapshotSource::Pi,
+            &[root],
+            &home,
+            ScanIndex::default(),
+            true,
+            2,
+            &[],
+        );
+        assert_eq!(scan.backfill_file_limit, 2);
+        assert_eq!(scan.scanned_file_count, files.min(2));
+        assert_eq!(scan.page_file_limit_hit, files >= 2);
+        assert_eq!(scan.census_status.pending_work, files > 2);
+        assert!(
+            !scan.charge_deferred,
+            "the file allowance is the only trigger"
+        );
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        if resident_scan_requested(&scan)
+            && let Some(pacing) = resident_pacing(power)
+        {
+            assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing));
+        }
+        assert_eq!(
+            cadence.paced_scan_due(),
+            gap.map(|gap| now + Duration::from_secs(gap))
+        );
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
 /// [behaviour] A resident wake starts another ordinary pass, releases the
 /// sync lock while waiting, and adds no wake after a quiet successful drain.
 #[test]

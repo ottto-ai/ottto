@@ -100,6 +100,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) audit_now: u64,
     pub(in crate::snapshots) backfill_window_days: u64,
     pub(in crate::snapshots) file_limit: usize,
+    pub(in crate::snapshots) page_file_limit_hit: bool,
     /// This scan's sync cycle holds a contract-5 permit.
     pub(in crate::snapshots) claude_request_identity_capture: bool,
     pub(in crate::snapshots) claude_effort_support_dir: Option<PathBuf>,
@@ -331,6 +332,7 @@ impl OwnedSourceScan {
             audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
+            page_file_limit_hit: false,
             claude_request_identity_capture: false,
             claude_effort_support_dir: None,
             claude_title_metadata: Default::default(),
@@ -782,6 +784,7 @@ impl OwnedSourceScan {
             };
             pending_paths.push(candidate);
         }
+        let page_file_limit_hit = file_limit > 0 && pending_paths.len() >= file_limit;
         if source == SnapshotSource::Codex {
             // G1 (fix 2): the same selection, read census members first. The
             // reserved census member and every other first read are charged
@@ -1192,6 +1195,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
             codex_title_metadata,

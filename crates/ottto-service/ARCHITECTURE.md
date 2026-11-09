@@ -219,8 +219,9 @@ of loaded Tail bytes and full encoded reduction pages, plus a per-file estimate.
 twins, forced families and Codex join groups finish as indivisible units; an oversize first
 unit always progresses. Remaining selected work returns to the saved traversal with its original
 flags. This paces work without dropping data or claiming a hard process-memory bound. A saved
-resident deferral requests another ordinary pass after 30 seconds on AC or 180 seconds on
-battery with Low Power Mode off. Unknown power and Low Power Mode retain ordinary cadence.
+resident deferral, or a selection that filled its file allowance while source work remains queued,
+requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
+Mode off. Unknown power and Low Power Mode retain ordinary cadence.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 
 ## SQLite

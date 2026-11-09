@@ -121,6 +121,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
@@ -3476,6 +3477,7 @@ impl OwnedSourceScan {
                 let scan = SourceScanResult {
                     census_status,
                     charge_deferred: history_upgrade.charge_deferred > 0,
+                    page_file_limit_hit,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -4808,6 +4810,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,

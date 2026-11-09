@@ -8765,7 +8765,7 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
-    if scan_result.charge_deferred {
+    if continuation::resident_scan_requested(&scan_result) {
         continuation::request_resident_scan(source);
     }
 

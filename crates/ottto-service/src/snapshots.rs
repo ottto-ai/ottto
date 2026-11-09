@@ -522,8 +522,8 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
-/// RAM-only receipt inputs from existing traversal/admission state. No census
-/// decision, durable field, or scheduling change is made by this projection.
+/// RAM-only traversal/admission observations for receipts and ordinary pacing.
+/// This projection changes no census decision or durable field.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CensusStatus {
     pub pending_work: bool,
@@ -558,6 +558,8 @@ pub struct SourceScanResult {
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
     pub(crate) charge_deferred: bool,
+    /// Selection filled the effective AIMD file allowance before family deferrals.
+    pub(crate) page_file_limit_hit: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,

@@ -73,6 +73,9 @@ pub(super) fn resident_background() -> Option<MacPlatformSignals> {
     resident_pacing(MacPlatformSignals::default().power())?;
     MacPlatformSignals::background()
 }
+pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
+    scan.charge_deferred || (scan.page_file_limit_hit && scan.census_status.pending_work)
+}
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
         with_source_cadence(source, |cadence| {
