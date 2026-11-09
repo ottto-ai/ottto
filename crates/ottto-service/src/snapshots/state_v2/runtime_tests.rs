@@ -1129,9 +1129,9 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
 }
 
 /// [regress] The store itself may demand a reload outside any save: its
-/// erasure COMMIT was refused. The next load reopens it at the durable
-/// generation instead of failing on the refused stamp read, and the erasure
-/// debt survives (never marked complete).
+/// erasure swap failed after closing the connection. The next load reopens it
+/// at the durable generation instead of failing on the refused stamp read, and
+/// the erasure debt survives (never marked complete).
 #[test]
 fn store_reload_demand_outside_a_save_reopens_on_next_load() {
     let f = Fixture::new();
@@ -1140,7 +1140,7 @@ fn store_reload_demand_outside_a_save_reopens_on_next_load() {
     with_session_db(&index, |db| {
         db.control("erasure_pending", &G).unwrap();
         db.control("erasure_since", &0_u64).unwrap();
-        sqlite::fence_commit_writing(db, "erasure_purged_epoch");
+        sqlite::on_swap("W3", |_| anyhow::bail!("test: rename refused"));
         assert!(db.maintenance(true).is_err());
         assert!(db.reload_required());
     });

@@ -217,22 +217,18 @@ fn erasure_swap_space_busy_and_history() {
     sqlite::set_space_reader(&mut db, Some(|p| Some(fs::metadata(p).ok()?.len() + GIB)));
     let admitted = db.checkpoint(CheckpointMode::Purge);
     assert_eq!(admitted.state, CheckpointState::Complete);
-    // A reader inside the WAL keeps TRUNCATE from resetting it.
+    // Another writer keeps TRUNCATE from completing.
     sqlite::set_space_reader(&mut db, None);
     db.control("erasure_pending", &EPOCH).unwrap();
-    let reader = rusqlite::Connection::open(&path).unwrap();
-    reader.execute_batch("BEGIN").unwrap();
-    let rows: i64 = reader
-        .query_row("SELECT count(*) FROM control", [], |r| r.get(0))
-        .unwrap();
-    assert!(rows > 0);
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let busy = db.checkpoint(CheckpointMode::Purge);
     assert_eq!(busy.state, CheckpointState::Busy);
     assert!(!sqlite::sidecar(&path, ".vacuum").exists());
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["erasure_vacuum_failed"]["busy"], 1);
     assert_eq!(stats["vacuum_failures"], 0);
-    drop(reader);
+    drop(writer);
     assert_eq!(fs::read(&history).unwrap(), b"history rows");
     assert_eq!(ino(&history), history_inode);
 }
