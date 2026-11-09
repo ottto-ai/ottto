@@ -89,12 +89,13 @@ macro_rules! process_state {
 }
 
 pub(crate) use usage::cache_observations;
-#[cfg(test)]
-pub(crate) mod cache_overcap_tests;
+
 use scan::read_cause as change_reason;
 use sources::claude::context_file_birth as claude_context_file_birth;
+#[cfg(test)]
+pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
 pub(crate) mod claude_cross_root_evidence;
-mod upload_context_read;
+use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
@@ -102,8 +103,6 @@ pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
-#[cfg(test)]
-mod upload_policy_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -132,7 +131,8 @@ mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
 use upload::freshness_debt as g7_debt;
-pub(crate) mod money_freshness;
+pub(crate) use upload::money_freshness;
+
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 mod shared_value;
@@ -462,9 +462,7 @@ include!("snapshots/load_containment.rs");
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
-pub(crate) mod terminal_contract_retry;
-#[cfg(test)]
-mod terminal_contract_retry_tests;
+pub(crate) use upload::terminal_contract_retry;
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
