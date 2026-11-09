@@ -450,8 +450,15 @@ impl OwnedSourceScan {
         index.context_read_counts = Default::default();
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
-        let codex_title_metadata = if source == SnapshotSource::Codex {
-            let mut metadata = CodexTitleMetadata::load_from_roots(roots);
+        let mut codex_title_metadata = if source == SnapshotSource::Codex {
+            let mut metadata = carry_cache.map_or_else(
+                || CodexTitleMetadata::load_from_roots(roots),
+                |(cache, scope)| {
+                    cache.with_codex_sidecars(scope, |facts| {
+                        CodexTitleMetadata::load_reused(roots, facts)
+                    })
+                },
+            );
             metadata.scope_created_thread_census(index, roots);
             metadata
         } else {
@@ -499,10 +506,26 @@ impl OwnedSourceScan {
         // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
         // it read-only across every session file via Arc.
         let codex_turn_traces = (source == SnapshotSource::Codex).then(|| {
-            Arc::new(CodexTurnTraceMap::load_from_roots(
-                roots,
-                backfill_window_days,
-            ))
+            let (traces, evidence) = carry_cache.map_or_else(
+                || {
+                    crate::snapshots::sources::codex::sidecar::load_traces(
+                        roots,
+                        backfill_window_days,
+                        &mut Default::default(),
+                    )
+                },
+                |(cache, scope)| {
+                    cache.with_codex_sidecars(scope, |facts| {
+                        crate::snapshots::sources::codex::sidecar::load_traces(
+                            roots,
+                            backfill_window_days,
+                            facts,
+                        )
+                    })
+                },
+            );
+            codex_title_metadata.local_diagnostics.logs_2 = evidence;
+            Arc::new(traces)
         });
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);

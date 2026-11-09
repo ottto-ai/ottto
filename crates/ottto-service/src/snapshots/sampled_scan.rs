@@ -73,6 +73,7 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    sidecars: Mutex<BTreeMap<String, crate::snapshots::sources::codex::sidecar::SidecarFacts>>,
     pub(crate) withheld_memo: withheld_account::Memo,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -91,6 +92,7 @@ pub(crate) struct SharedCache {
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            sidecars: Mutex::default(),
             withheld_memo: Default::default(),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
@@ -112,7 +114,29 @@ impl HeapLayoutBound for SharedCache {
         // Its optional entries are priced separately by the rotation owner.
         self.withheld_memo.heap_bound(c)?;
         self.cursor.heap_bound(c)?;
+        self.sidecars.heap_bound(c)?;
         c.add(self.root_reservation())
+    }
+}
+impl SharedCache {
+    /// Move the caller's facts out while doing I/O; no shared lock spans reads.
+    pub(in crate::snapshots) fn with_codex_sidecars<T>(
+        &self,
+        scope: &Scope,
+        load: impl FnOnce(&mut crate::snapshots::sources::codex::sidecar::SidecarFacts) -> T,
+    ) -> T {
+        let mut facts = self
+            .sidecars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&scope.0)
+            .unwrap_or_default();
+        let result = load(&mut facts);
+        self.sidecars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope.0.clone(), facts);
+        result
     }
 }
 #[cfg(test)]

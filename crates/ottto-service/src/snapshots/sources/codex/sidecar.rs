@@ -3,6 +3,11 @@
 //! rollout-extent rows, and the per-turn priority trace map.
 
 use crate::snapshots::*;
+use crate::transcript_acquisition::{ContentStamp, SourceStamp, StampedFacts};
+
+pub(in crate::snapshots) mod facts;
+mod logs_cursor;
+pub(in crate::snapshots) use facts::SidecarFacts;
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::snapshots) struct CodexTitleMetadata {
@@ -16,7 +21,7 @@ pub(in crate::snapshots) struct CodexTitleMetadata {
     pub(in crate::snapshots) rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
     /// usage high-water mark must never seed another copy's creation proof.
-    pub(in crate::snapshots) root_sidecars: BTreeMap<PathBuf, codex_root_copies::RootSidecar>,
+    pub(in crate::snapshots) root_sidecars: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
     /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
@@ -75,15 +80,76 @@ pub(in crate::snapshots) struct CodexTitleCandidate {
     pub(in crate::snapshots) source: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(in crate::snapshots) struct CodexStateThread {
     pub(in crate::snapshots) title: Option<String>,
+    pub(in crate::snapshots) compact_title: Option<Arc<TitlePrefix>>,
     pub(in crate::snapshots) tokens_used: u64,
     pub(in crate::snapshots) archived: bool,
     pub(in crate::snapshots) created_at: Option<String>,
     pub(in crate::snapshots) updated_at: Option<String>,
     pub(in crate::snapshots) model: Option<String>,
     pub(in crate::snapshots) rollout_path: Option<String>,
+}
+
+pub(in crate::snapshots) struct TitlePrefix {
+    raw_digest: Option<[u8; 32]>,
+    prefix: Sha256,
+}
+impl std::fmt::Debug for TitlePrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TitlePrefix")
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for TitlePrefix {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+impl CodexStateThread {
+    pub(in crate::snapshots) fn title_digest(&self) -> Option<[u8; 32]> {
+        self.compact_title.as_ref().map_or_else(
+            || {
+                self.title
+                    .as_ref()
+                    .map(|title| Sha256::digest(title.as_bytes()).into())
+            },
+            |title| title.raw_digest,
+        )
+    }
+}
+impl PartialEq for CodexStateThread {
+    fn eq(&self, other: &Self) -> bool {
+        self.title_digest() == other.title_digest()
+            && self.tokens_used == other.tokens_used
+            && self.archived == other.archived
+            && self.created_at == other.created_at
+            && self.updated_at == other.updated_at
+            && self.model == other.model
+            && self.rollout_path == other.rollout_path
+    }
+}
+impl Eq for CodexStateThread {}
+
+fn title_prefix(
+    id: &str,
+    created: bool,
+    title: Option<&CodexTitleCandidate>,
+    raw: Option<&str>,
+) -> Sha256 {
+    let mut digest = Sha256::new();
+    for part in [
+        "codex_session_sidecar:v4",
+        id,
+        if created { "agent_created_thread" } else { "" },
+        title.map_or("", |title| &title.title),
+        title.map_or("", |title| &title.source),
+        raw.unwrap_or(""),
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    digest
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -246,6 +312,7 @@ impl CodexTitleMetadata {
         let sidecar = |sidecar: &codex_root_copies::RootSidecar| codex_root_copies::RootSidecar {
             threads: rows(&sidecar.threads, &ids),
             extents: rows(&sidecar.extents, &ids),
+            ..Default::default()
         };
         Self {
             local_diagnostics: Default::default(),
@@ -255,7 +322,7 @@ impl CodexTitleMetadata {
             root_sidecars: self
                 .root_sidecars
                 .iter()
-                .map(|(root, home)| (root.clone(), sidecar(home)))
+                .map(|(root, home)| (root.clone(), Arc::new(sidecar(home))))
                 .collect(),
             state_created_threads: self
                 .state_created_threads
@@ -340,22 +407,23 @@ impl CodexTitleMetadata {
         let decoration = (!reduction_only).then_some(thread).flatten();
         let extent = (!reduction_only).then_some(extent).flatten();
         let family = self.family_position(source_session_id.as_str());
-        let fingerprint = sha256_hex(&[
-            "codex_session_sidecar:v4",
-            source_session_id.as_str(),
-            if self
-                .state_created_threads
-                .contains(source_session_id.as_str())
-            {
-                "agent_created_thread"
-            } else {
-                ""
-            },
-            title.map(|value| value.title.as_str()).unwrap_or(""),
-            title.map(|value| value.source.as_str()).unwrap_or(""),
-            decoration
-                .and_then(|value| value.title.as_deref())
-                .unwrap_or(""),
+        let mut digest = if !reduction_only {
+            thread
+                .and_then(|row| row.compact_title.as_ref())
+                .map(|title| title.prefix.clone())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            title_prefix(
+                source_session_id.as_str(),
+                self.state_created_threads
+                    .contains(source_session_id.as_str()),
+                title,
+                decoration.and_then(|row| row.title.as_deref()),
+            )
+        });
+        for part in [
             &decoration
                 .map(|value| value.tokens_used)
                 .unwrap_or_default()
@@ -413,7 +481,11 @@ impl CodexTitleMetadata {
                 .map(|(_, _, depth)| *depth)
                 .unwrap_or_default()
                 .to_string(),
-        ]);
+        ] {
+            digest.update(part.as_bytes());
+            digest.update([0]);
+        }
+        let fingerprint = format!("{:x}", digest.finalize());
         // A per-home row can stay byte-identical while another home's row
         // creates a collision. Invalidate paused ownership decisions as well
         // as fresh parsing; census flags alone are not cursor dependencies.
@@ -424,82 +496,125 @@ impl CodexTitleMetadata {
         }
     }
 
+    fn compact_titles(&mut self) {
+        for sidecar in self.root_sidecars.values_mut() {
+            let Some(home) = Arc::get_mut(sidecar) else {
+                continue;
+            };
+            for (raw_id, row) in &mut home.raw.threads {
+                if row.compact_title.is_some() {
+                    continue;
+                }
+                let id = resolve_codex_identity(raw_id);
+                let compact_title = Arc::new(TitlePrefix {
+                    raw_digest: row.title_digest(),
+                    prefix: title_prefix(
+                        &id,
+                        self.state_created_threads.contains(&id),
+                        self.titles.get(&id),
+                        row.title.as_deref(),
+                    ),
+                });
+                let compact = Shared::from(CodexStateThread {
+                    title: None,
+                    compact_title: Some(compact_title),
+                    tokens_used: row.tokens_used,
+                    archived: row.archived,
+                    created_at: row.created_at.clone(),
+                    updated_at: row.updated_at.clone(),
+                    model: row.model.clone(),
+                    rollout_path: row.rollout_path.clone(),
+                });
+                for map in [&mut home.threads, &mut self.state_threads] {
+                    if map.get(&id).is_some_and(|old| Shared::ptr_eq(old, row)) {
+                        map.insert(id.clone(), compact.clone());
+                    }
+                }
+                *row = compact;
+            }
+        }
+    }
+
     pub(in crate::snapshots) fn load_from_roots(roots: &[PathBuf]) -> Self {
+        SidecarFacts::default().load(roots)
+    }
+
+    pub(in crate::snapshots) fn load_reused(roots: &[PathBuf], facts: &mut SidecarFacts) -> Self {
+        facts.load(roots)
+    }
+
+    fn merge_roots(
+        homes: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
+        reused: bool,
+    ) -> Self {
         let mut metadata = Self::default();
         let mut legacy_sidecar_parts = Vec::new();
         let mut parentless_ineligible = BTreeSet::new();
-        let mut codex_dirs = BTreeSet::new();
-        for root in roots {
-            if let Some(parent) = root.parent() {
-                codex_dirs.insert(parent.to_path_buf());
+        for (codex_dir, root_sidecar) in homes {
+            for input in [
+                "config.toml",
+                "state_5.sqlite",
+                "thread_history_1.sqlite",
+                "session_index.jsonl",
+            ] {
+                legacy_sidecar_parts.push(sidecar_stat_fingerprint(&codex_dir.join(input)));
             }
-        }
-
-        for codex_dir in codex_dirs {
-            let config_path = codex_dir.join("config.toml");
-            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&config_path));
-            metadata.legacy_config_file_present |= config_path.is_file();
-
-            let state_path = codex_dir.join("state_5.sqlite");
-            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
+            metadata.legacy_config_file_present |= codex_dir.join("config.toml").is_file();
+            let raw = &root_sidecar.raw;
+            let key = local_index_key(&codex_dir);
+            let absent = !codex_dir.join("state_5.sqlite").exists();
             let state_conflicts_before = metadata.identity_conflicts.len();
-            let mut open = SidecarOpenCounts::default();
-            let title_census = load_codex_sqlite_titles(
-                &state_path,
-                &mut open,
+            apply_titles(
+                &raw.titles,
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.state_titles.observe_root(
-                &title_census,
-                open,
+            metadata.local_diagnostics.state_titles.merge_root(
+                &raw.evidence[0],
                 metadata.identity_conflicts.len() != state_conflicts_before,
-                local_index_key(&codex_dir).as_str(),
+                &key,
+                reused,
+                absent,
             );
-            let thread_conflicts_before = metadata.identity_conflicts.len();
-            let mut root_sidecar = codex_root_copies::RootSidecar::default();
-            let mut open = SidecarOpenCounts::default();
-            let state_census = load_codex_sqlite_state_threads(
-                &state_path,
-                &mut open,
-                &mut root_sidecar.threads,
+            let conflicts_before = metadata.identity_conflicts.len();
+            let mut threads = BTreeMap::new();
+            apply_threads(
+                &raw.threads,
+                &mut threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
-            codex_root_copies::merge_threads(&mut metadata, &codex_dir, &root_sidecar.threads);
-            metadata.local_diagnostics.state_threads.observe_root(
-                &state_census,
-                open,
-                metadata.identity_conflicts.len() != thread_conflicts_before,
-                local_index_key(&codex_dir).as_str(),
+            codex_root_copies::merge_threads(&mut metadata, &codex_dir, &threads);
+            metadata.local_diagnostics.state_threads.merge_root(
+                &raw.evidence[1],
+                metadata.identity_conflicts.len() != conflicts_before,
+                &key,
+                reused,
+                absent,
             );
-            let spawn_conflicts_before = metadata.identity_conflicts.len();
-            let mut open = SidecarOpenCounts::default();
-            let spawn_census = load_codex_sqlite_spawn_edges(
-                &state_path,
-                &mut open,
-                &mut metadata.state_created_threads,
-                &mut metadata.spawn_parents,
-                &mut metadata.spawn_parent_conflicts,
-                &mut metadata.identity_conflicts,
+            let conflicts_before = metadata.identity_conflicts.len();
+            apply_spawn(
+                &raw.created,
+                raw.edges.as_deref(),
+                raw.edges_complete,
+                &mut metadata,
                 &mut parentless_ineligible,
             );
-            metadata.local_diagnostics.spawn_edges.observe_root(
-                &spawn_census,
-                open,
-                metadata.identity_conflicts.len() != spawn_conflicts_before,
-                local_index_key(&codex_dir).as_str(),
+            metadata.local_diagnostics.spawn_edges.merge_root(
+                &raw.evidence[2],
+                metadata.identity_conflicts.len() != conflicts_before,
+                &key,
+                reused,
+                absent,
             );
-            let title_census_incomplete = title_census.is_err();
-            let state_census_incomplete = state_census.is_err();
-            let spawn_census_incomplete = spawn_census.is_err();
-            if title_census_incomplete || state_census_incomplete || spawn_census_incomplete {
+            let state_incomplete = raw.evidence[..3].iter().any(|e| e.failed_roots > 0);
+            if state_incomplete {
                 metadata.state_census_incomplete = true;
                 metadata.sidecar_census_incomplete = true;
                 metadata.state_census_unscoped_incomplete = true;
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
-            if spawn_census_incomplete {
+            if raw.evidence[2].failed_roots > 0 {
                 metadata
                     .created_thread_census_failed_homes
                     .insert(codex_dir.clone());
@@ -508,56 +623,64 @@ impl CodexTitleMetadata {
                 metadata.state_census_incomplete = true;
                 metadata.sidecar_census_incomplete = true;
             }
-
-            let history_path = codex_dir.join("thread_history_1.sqlite");
-            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
-            let history_conflicts_before = metadata.identity_conflicts.len();
-            let mut open = SidecarOpenCounts::default();
-            let history_census = load_codex_rollout_extents(
-                &history_path,
-                &mut open,
-                &mut root_sidecar.extents,
-                &mut metadata.identity_conflicts,
+            let conflicts_before = metadata.identity_conflicts.len();
+            let mut extents = BTreeMap::new();
+            let _ = apply_extents(&raw.history, &mut extents, &mut metadata.identity_conflicts);
+            codex_root_copies::merge_extents(&mut metadata, &extents);
+            metadata.local_diagnostics.rollout_extents.merge_root(
+                &raw.evidence[3],
+                metadata.identity_conflicts.len() != conflicts_before,
+                &key,
+                reused,
+                !codex_dir.join("thread_history_1.sqlite").exists(),
             );
-            codex_root_copies::merge_extents(&mut metadata, &root_sidecar.extents);
-            metadata.local_diagnostics.rollout_extents.observe_root(
-                &history_census,
-                open,
-                metadata.identity_conflicts.len() != history_conflicts_before,
-                local_index_key(&codex_dir).as_str(),
-            );
-            if history_census.is_err() {
+            if raw.evidence[3].failed_roots > 0 {
                 metadata.sidecar_census_incomplete = true;
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
-            if metadata.identity_conflicts.len() != history_conflicts_before {
+            if metadata.identity_conflicts.len() != conflicts_before {
                 metadata.sidecar_census_incomplete = true;
             }
-
-            metadata
-                .root_sidecars
-                .insert(codex_dir.clone(), root_sidecar);
-            let index_path = codex_dir.join("session_index.jsonl");
-            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
-            let index_conflicts_before = metadata.identity_conflicts.len();
-            let index_census = load_codex_session_index_titles(
-                &index_path,
-                &mut metadata.titles,
-                &mut metadata.identity_conflicts,
+            let conflicts_before = metadata.identity_conflicts.len();
+            let mut parsed = BTreeMap::new();
+            let mut aliases = BTreeMap::new();
+            for (raw_id, title) in &raw.index {
+                let id = record_codex_identity_key(
+                    &mut aliases,
+                    &mut metadata.identity_conflicts,
+                    raw_id,
+                );
+                if metadata.identity_conflicts.contains(&id) {
+                    parsed.remove(&id);
+                    metadata.titles.remove(&id);
+                } else {
+                    insert_codex_sidecar_title(
+                        &mut parsed,
+                        id,
+                        title.clone(),
+                        "session_index",
+                        true,
+                    );
+                }
+            }
+            if raw.evidence[4].failed_roots == 0 {
+                metadata.titles.extend(parsed);
+            }
+            metadata.local_diagnostics.session_index.merge_root(
+                &raw.evidence[4],
+                metadata.identity_conflicts.len() != conflicts_before,
+                &key,
+                reused,
+                !codex_dir.join("session_index.jsonl").exists(),
             );
-            metadata.local_diagnostics.session_index.observe_root(
-                &index_census,
-                SidecarOpenCounts::default(),
-                metadata.identity_conflicts.len() != index_conflicts_before,
-                local_index_key(&codex_dir).as_str(),
-            );
-            if index_census.is_err() {
+            if raw.evidence[4].failed_roots > 0 {
                 metadata.sidecar_census_incomplete = true;
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
-            if metadata.identity_conflicts.len() != index_conflicts_before {
+            if metadata.identity_conflicts.len() != conflicts_before {
                 metadata.sidecar_census_incomplete = true;
             }
+            metadata.root_sidecars.insert(codex_dir, root_sidecar);
         }
         // Unresolvable lineage evidence blocks only parentless admission. A
         // parent recorded by any home wins, and an id without a parent never
@@ -734,31 +857,19 @@ impl CodexTurnTraceMap {
         roots: &[PathBuf],
         backfill_window_days: u64,
     ) -> Self {
-        let mut map = Self::default();
-        let mut codex_dirs = BTreeSet::new();
-        for root in roots {
-            if let Some(parent) = root.parent() {
-                codex_dirs.insert(parent.to_path_buf());
-            }
-        }
-        let since_epoch = codex_logs2_since_epoch(backfill_window_days);
-        map.since_epoch = since_epoch;
-        for codex_dir in codex_dirs {
-            // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
-            // exists on some installs. Read whichever is present.
-            for db_path in [
-                codex_dir.join("logs_2.sqlite"),
-                codex_dir.join("sqlite").join("logs_2.sqlite"),
-            ] {
-                map.incomplete |= !load_codex_logs2_priority_turns(
-                    &db_path,
-                    since_epoch,
-                    &mut map.priority_turns,
-                );
-            }
-        }
-        map
+        load_traces(roots, backfill_window_days, &mut SidecarFacts::default()).0
     }
+}
+
+pub(in crate::snapshots) fn load_traces(
+    roots: &[PathBuf],
+    days: u64,
+    facts: &mut SidecarFacts,
+) -> (
+    CodexTurnTraceMap,
+    crate::codex_scan_diagnostics::LoaderEvidence,
+) {
+    logs_cursor::load(roots, codex_logs2_since_epoch(days), facts)
 }
 
 fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
@@ -875,68 +986,11 @@ fn codex_logs2_span_field(prefix: &str, key: &str) -> Option<String> {
     None
 }
 
-fn load_codex_session_index_titles(
-    path: &Path,
+fn apply_titles(
+    loaded: &[(String, Option<String>)],
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
     identity_conflicts: &mut BTreeSet<String>,
-) -> Result<()> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("open Codex session index"),
-    };
-    let mut parsed = BTreeMap::new();
-    let mut raw_ids_by_key = BTreeMap::new();
-    let mut invalid_shape = false;
-    let report = read_bounded_jsonl_lines(BufReader::new(file), |value| {
-        let Some(id) = codex_identity_at(value, &["id"]) else {
-            invalid_shape = true;
-            return;
-        };
-        let id = record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, id.as_str());
-        if identity_conflicts.contains(id.as_str()) {
-            parsed.remove(id.as_str());
-            titles.remove(id.as_str());
-            return;
-        }
-        insert_codex_sidecar_title(
-            &mut parsed,
-            id,
-            string_at(value, &["thread_name"])
-                .or_else(|| string_at(value, &["title"]))
-                .or_else(|| string_at(value, &["name"])),
-            "session_index",
-            true,
-        );
-    })
-    .context("read Codex session index")?;
-    if !report.complete() || invalid_shape {
-        return Err(anyhow::Error::new(IncompleteShape)
-            .context("Codex session index census was incomplete"));
-    }
-    titles.extend(parsed);
-    Ok(())
-}
-
-fn load_codex_sqlite_titles(
-    path: &Path,
-    open: &mut SidecarOpenCounts,
-    titles: &mut BTreeMap<String, CodexTitleCandidate>,
-    identity_conflicts: &mut BTreeSet<String>,
-) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection =
-        open_codex_sidecar_database(path, open).context("open Codex title database")?;
-    let loaded = connection.read(|connection| {
-        census_rows(
-            connection,
-            "SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''",
-            "Codex title census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-    })?;
+) {
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
         let id =
@@ -945,70 +999,21 @@ fn load_codex_sqlite_titles(
             titles.remove(id.as_str());
             continue;
         }
-        insert_codex_sidecar_title(titles, id, Some(title), "session_index", false);
+        insert_codex_sidecar_title(titles, id, title.clone(), "session_index", false);
     }
-    Ok(())
 }
 
-fn load_codex_sqlite_state_threads(
-    path: &Path,
-    open: &mut SidecarOpenCounts,
+fn apply_threads(
+    rows: &[(String, Shared<CodexStateThread>)],
     state_threads: &mut BTreeMap<String, Shared<CodexStateThread>>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
-) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection =
-        open_codex_sidecar_database(path, open).context("open Codex state database")?;
-    let rows = connection.read(|connection| {
-        let columns = sqlite_table_columns(connection, "threads")?;
-        if !columns.contains("id") || !columns.contains("tokens_used") {
-            return Err(anyhow::Error::new(IncompleteShape)
-                .context("Codex state database is missing required thread census columns"));
-        }
-
-        let sql = format!(
-            "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
-            sqlite_select_expr(&columns, "title", "NULL"),
-            sqlite_select_expr(&columns, "tokens_used", "0"),
-            sqlite_select_expr(&columns, "archived", "0"),
-            sqlite_select_expr(&columns, "created_at", "NULL"),
-            sqlite_select_expr(&columns, "updated_at", "NULL"),
-            sqlite_select_expr(&columns, "created_at_ms", "NULL"),
-            sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
-            sqlite_select_expr(&columns, "model", "NULL"),
-            sqlite_select_expr(&columns, "rollout_path", "NULL"),
-        );
-        census_rows(connection, &sql, "Codex state thread census", |row| {
-            let id: String = row.get(0)?;
-            let title: Option<String> = row.get(1)?;
-            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-            let archived = row.get::<_, i64>(3)? != 0;
-            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-            let model: Option<String> = row.get(8)?;
-            let rollout_path: Option<String> = row.get(9)?;
-            Ok((
-                id,
-                CodexStateThread {
-                    title,
-                    tokens_used,
-                    archived,
-                    created_at,
-                    updated_at,
-                    model,
-                    rollout_path,
-                },
-            ))
-        })
-    })?;
+) {
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, thread) in rows {
         // One allocation per row; every later map holds a handle to it.
-        let thread = Shared::from(thread);
+        let thread = thread.clone();
         let conflicts_before = identity_conflicts.len();
         let id =
             record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
@@ -1041,79 +1046,13 @@ fn load_codex_sqlite_state_threads(
             identity_conflicts.insert(id);
         }
     }
-    Ok(())
 }
 
-/// One unit per differing field. Exhaustive so a new row field must be
-/// classified before it can take part in the row comparison above.
-pub(in crate::snapshots) fn codex_state_thread_field_diffs(
-    existing: &CodexStateThread,
-    incoming: &CodexStateThread,
-) -> StateRowFieldDiffs {
-    let CodexStateThread {
-        title,
-        tokens_used,
-        archived,
-        created_at,
-        updated_at,
-        model,
-        rollout_path,
-    } = existing;
-    StateRowFieldDiffs {
-        title: u32::from(*title != incoming.title),
-        tokens_used: u32::from(*tokens_used != incoming.tokens_used),
-        archived: u32::from(*archived != incoming.archived),
-        created_at: u32::from(*created_at != incoming.created_at),
-        updated_at: u32::from(*updated_at != incoming.updated_at),
-        model: u32::from(*model != incoming.model),
-        rollout_path: u32::from(*rollout_path != incoming.rollout_path),
-    }
-}
-
-fn saturating_count_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
-}
-
-pub(in crate::snapshots) fn load_codex_rollout_extents(
-    path: &Path,
-    open: &mut SidecarOpenCounts,
+fn apply_extents(
+    rows: &[(String, i64, i64)],
     rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection =
-        open_codex_sidecar_database(path, open).context("open Codex thread-history database")?;
-    let Some(rows) = connection.read(|connection| {
-        let columns = sqlite_table_columns(connection, "thread_history_projection_state")?;
-        if columns.is_empty() {
-            return Ok(None);
-        }
-        if !columns.contains("thread_id")
-            || !columns.contains("next_rollout_byte_offset")
-            || !columns.contains("next_rollout_ordinal")
-        {
-            return Err(anyhow::Error::new(IncompleteShape)
-                .context("Codex thread-history database has an incomplete projection schema"));
-        }
-        census_rows(
-            connection,
-            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
-             FROM thread_history_projection_state",
-            "Codex rollout-extent census",
-            |row| {
-                let thread_id: String = row.get(0)?;
-                let next_byte_offset: i64 = row.get(1)?;
-                let next_ordinal: i64 = row.get(2)?;
-                Ok((thread_id, next_byte_offset, next_ordinal))
-            },
-        )
-        .map(Some)
-    })?
-    else {
-        return Ok(());
-    };
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_thread_id, next_byte_offset, next_ordinal) in rows {
@@ -1128,8 +1067,9 @@ pub(in crate::snapshots) fn load_codex_rollout_extents(
             continue;
         }
         let next_byte_offset =
-            u64::try_from(next_byte_offset).context("negative Codex rollout byte offset")?;
-        let next_ordinal = u64::try_from(next_ordinal).context("negative Codex rollout ordinal")?;
+            u64::try_from(*next_byte_offset).context("negative Codex rollout byte offset")?;
+        let next_ordinal =
+            u64::try_from(*next_ordinal).context("negative Codex rollout ordinal")?;
         let extent = CodexRolloutExtent {
             next_byte_offset,
             next_ordinal,
@@ -1155,47 +1095,17 @@ pub(in crate::snapshots) fn load_codex_rollout_extents(
     Ok(())
 }
 
-/// `parentless_ineligible` collects ids whose lineage evidence exists but could
-/// not be resolved here (delegation text the strict parser refused, an unknown
-/// `first_user_message`, a malformed edge row, or no edge table). The caller
-/// applies it only after every home is loaded, and only to ids that still have
-/// no parent, so it can never remove a parent recorded elsewhere.
-fn load_codex_sqlite_spawn_edges(
-    path: &Path,
-    open: &mut SidecarOpenCounts,
-    state_created_threads: &mut BTreeSet<String>,
-    spawn_parents: &mut BTreeMap<String, String>,
-    spawn_parent_conflicts: &mut BTreeSet<String>,
-    identity_conflicts: &mut BTreeSet<String>,
+fn apply_spawn(
+    rows: &[(String, Option<String>)],
+    edges: Option<&[(String, String)]>,
+    edges_complete: bool,
+    metadata: &mut CodexTitleMetadata,
     parentless_ineligible: &mut BTreeSet<String>,
-) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection =
-        open_codex_sidecar_database(path, open).context("open Codex spawn-edge database")?;
-
-    // Newer Codex Desktop builds can create a child task without populating
-    // `thread_spawn_edges`. The equivalent provider-native relationship lives
-    // in the child row. Only the exact machine-owned source kind and wrapper
-    // are eligible: ordinary user prompt text must never manufacture lineage.
-    let rows = connection.read(|connection| {
-        let thread_columns = sqlite_table_columns(connection, "threads")?;
-        for required in ["id", "thread_source", "first_user_message"] {
-            if !thread_columns.contains(required) {
-                return Err(anyhow::Error::new(IncompleteShape).context(format!(
-                    "Codex state database is missing required created-thread census column {required}"
-                )));
-            }
-        }
-        census_rows(
-            connection,
-            "SELECT id, first_user_message FROM threads \
-             WHERE thread_source = 'agent_created_thread'",
-            "Codex created-thread census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-    })?;
+) {
+    let state_created_threads = &mut metadata.state_created_threads;
+    let spawn_parents = &mut metadata.spawn_parents;
+    let spawn_parent_conflicts = &mut metadata.spawn_parent_conflicts;
+    let identity_conflicts = &mut metadata.identity_conflicts;
     let mut raw_created_ids_by_key = BTreeMap::new();
     let mut created_in_database = Vec::new();
     for (raw_child, first_user_message) in rows {
@@ -1227,23 +1137,12 @@ fn load_codex_sqlite_spawn_edges(
         }
     }
 
-    let Some(loaded) = connection.read(|connection| {
-        let columns = sqlite_table_columns(connection, "thread_spawn_edges")?;
-        if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
-            return Ok(None);
-        }
-        census_rows(
-            connection,
-            "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges",
-            "Codex spawn-edge census",
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map(Some)
-    })?
-    else {
-        // Without the edge table, a missing edge is not evidence of no parent.
+    if !edges_complete {
+        return;
+    }
+    let Some(loaded) = edges else {
         parentless_ineligible.extend(created_in_database);
-        return Ok(());
+        return;
     };
     let mut raw_parent_ids_by_key = BTreeMap::new();
     let mut raw_child_ids_by_key = BTreeMap::new();
@@ -1272,7 +1171,51 @@ fn load_codex_sqlite_spawn_edges(
             parentless_ineligible.insert(child);
         }
     }
-    Ok(())
+}
+
+/// One unit per differing field. Exhaustive so a new row field must be
+/// classified before it can take part in the row comparison above.
+pub(in crate::snapshots) fn codex_state_thread_field_diffs(
+    existing: &CodexStateThread,
+    incoming: &CodexStateThread,
+) -> StateRowFieldDiffs {
+    let CodexStateThread {
+        title: _,
+        tokens_used,
+        archived,
+        created_at,
+        updated_at,
+        model,
+        rollout_path,
+        ..
+    } = existing;
+    StateRowFieldDiffs {
+        title: u32::from(existing.title_digest() != incoming.title_digest()),
+        tokens_used: u32::from(*tokens_used != incoming.tokens_used),
+        archived: u32::from(*archived != incoming.archived),
+        created_at: u32::from(*created_at != incoming.created_at),
+        updated_at: u32::from(*updated_at != incoming.updated_at),
+        model: u32::from(*model != incoming.model),
+        rollout_path: u32::from(*rollout_path != incoming.rollout_path),
+    }
+}
+
+fn saturating_count_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+pub(in crate::snapshots) fn load_codex_rollout_extents(
+    path: &Path,
+    open: &mut SidecarOpenCounts,
+    rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
+    identity_conflicts: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = open_codex_sidecar_database(path, open)?;
+    let rows = connection.read(facts::history_rows)?;
+    apply_extents(&rows, rollout_extents, identity_conflicts)
 }
 
 /// Any delegation wrapper text, wherever it appears and in any case, is
@@ -1522,7 +1465,7 @@ crate::durable_tail_codec::durable_struct!(CodexPathSidecarCandidate {
     N projected_next_ordinal: Option<u64>,
 });
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
-crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
+crate::heap_layout_bound::fields!(CodexStateThread; title, compact_title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);

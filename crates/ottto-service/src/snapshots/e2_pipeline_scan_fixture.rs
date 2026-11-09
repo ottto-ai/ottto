@@ -542,7 +542,8 @@ impl E2ScanFixture {
         index.activate_effective_upload_body_witness_revision(
             crate::snapshot_sync::effective_upload_body_witness_revision(source),
         );
-        let mut scan = OwnedSourceScan::new(
+        let (scope, _) = scan_binding(source);
+        let mut scan = OwnedSourceScan::new_with_recovery_priority(
             source,
             roots,
             index,
@@ -552,9 +553,12 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
+            &mut ListingRequest::default(),
+            false,
+            &[],
+            sampled.then_some((self.cache.as_ref(), &scope)),
         );
         if sampled {
-            let (scope, _) = scan_binding(source);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         if let Some(versions) = self.versions.as_ref() {

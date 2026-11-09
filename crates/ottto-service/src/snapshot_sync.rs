@@ -4288,6 +4288,7 @@ struct SyncCounts {
     census_residue_index_key_count: u64,
     census_residue_archived_rollout_count: u64,
     uploaded_count: u64,
+    sidecar_reads: Option<CodexScanDiagnostics>,
 }
 
 /// How the loss a completed cycle discloses reads on its terminal receipt.
@@ -4417,6 +4418,7 @@ impl SyncCounts {
             census_residue_archived_rollout_count: scan_result.census_residue_archived_rollout_count
                 as u64,
             uploaded_count,
+            sidecar_reads: scan_result.local_codex_diagnostics,
         }
     }
 
@@ -4441,6 +4443,13 @@ impl SyncCounts {
         );
         if source == "codex" {
             line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+            if let Some(d) = self.sidecar_reads {
+                line.push_str(&format!(" state_5_reused={} state_5_reloaded={} thread_history_1_reused={} thread_history_1_reloaded={} session_index_reused={} session_index_reloaded={} logs_2_reused={} logs_2_reloaded={} logs_2_delta_rows={} absent_roots={}",
+                    d.state_titles.reused_roots, d.state_titles.reloaded_roots,
+                    d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
+                    d.session_index.reused_roots, d.session_index.reloaded_roots,
+                    d.logs_2.reused_roots, d.logs_2.reloaded_roots, d.logs_2.delta_rows, d.state_titles.absent_roots));
+            }
         }
         line
     }
@@ -12606,7 +12615,7 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{
     archive_upload_checkpoint, assert_archive_debt_preserves_replay_progress,
-    codex_transition_cold_batches,
+    codex_transition_acked_route, codex_transition_cold_batches,
 };
 
 #[cfg(test)]
@@ -19743,7 +19752,7 @@ mod tests {
     /// [regress] Sidecar hit/reload counters reach the existing emitted scan row.
     #[test]
     fn sidecar_reuse_counters_reach_emitted_row() {
-        let scan = crate::snapshots::scan_source_roots(
+        let mut scan = crate::snapshots::scan_source_roots(
             SnapshotSource::Codex,
             &[],
             &mut ScanIndex::default(),
@@ -19763,6 +19772,24 @@ mod tests {
             "absent_roots=0",
         ] {
             assert!(row.contains(field), "missing emitted field: {field}");
+        }
+        let d = scan.local_codex_diagnostics.as_mut().unwrap();
+        d.state_titles.reused_roots = 7;
+        d.state_titles.reloaded_roots = 9;
+        d.state_titles.absent_roots = 3;
+        d.rollout_extents.reused_roots = 2;
+        d.session_index.reloaded_roots = 4;
+        d.logs_2.delta_rows = 11;
+        let row = SyncCounts::from_scan_result(&scan, 0, 30).terminal_census_line("codex");
+        for field in [
+            "state_5_reused=7",
+            "state_5_reloaded=9",
+            "thread_history_1_reused=2",
+            "session_index_reloaded=4",
+            "logs_2_delta_rows=11",
+            "absent_roots=3",
+        ] {
+            assert!(row.contains(field), "missing emitted value: {field}");
         }
     }
 

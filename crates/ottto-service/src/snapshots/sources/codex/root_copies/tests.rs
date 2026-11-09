@@ -351,10 +351,11 @@ fn dominant_projection_does_not_hide_incompatible_older_copies_in_any_order() {
             merge_extents(&mut metadata, &extents);
             metadata.root_sidecars.insert(
                 PathBuf::from(format!("home-{n}")),
-                RootSidecar {
+                Arc::new(RootSidecar {
                     threads: BTreeMap::new(),
                     extents,
-                },
+                    ..Default::default()
+                }),
             );
         }
         assert!(
@@ -384,10 +385,11 @@ fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
         merge_threads(&mut metadata, root, &threads);
         metadata.root_sidecars.insert(
             root.to_path_buf(),
-            RootSidecar {
+            Arc::new(RootSidecar {
                 threads,
                 extents: BTreeMap::new(),
-            },
+                ..Default::default()
+            }),
         );
     }
     assert!(metadata.identity_conflicts.is_empty());
@@ -452,16 +454,18 @@ fn selected_state_row_shares_its_home_row_and_keeps_fingerprint_bytes() {
             updated_at: Some("2026-11-07T10:05:00Z".to_string()),
             model: Some("gpt-5.2".to_string()),
             rollout_path: Some(path),
+            ..Default::default()
         }),
     )]);
     let mut metadata = CodexTitleMetadata::default();
     merge_threads(&mut metadata, home, &threads);
     metadata.root_sidecars.insert(
         home.to_path_buf(),
-        RootSidecar {
+        Arc::new(RootSidecar {
             threads,
             extents: BTreeMap::new(),
-        },
+            ..Default::default()
+        }),
     );
     assert!(Shared::ptr_eq(
         &metadata.state_threads[id],

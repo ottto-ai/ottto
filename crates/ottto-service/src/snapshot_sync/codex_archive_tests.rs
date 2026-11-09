@@ -25,8 +25,14 @@ fn codex_transition_batch(items: Vec<SnapshotItem>) -> Vec<u8> {
 /// Cold and restored drivers both use the ordinary uploader's native ordering
 /// and batch envelope. No transcript read, remote POST or persisted ACK here.
 pub(crate) fn codex_transition_cold_batches(items: &[SnapshotItem]) -> Vec<Vec<u8>> {
+    codex_transition_upload(items).0
+}
+
+fn codex_transition_upload(items: &[SnapshotItem]) -> (Vec<Vec<u8>>, SnapshotUploadProgress) {
     let mut posts = Vec::new();
     let mut progress = test_upload_progress();
+    progress.accepted_identity_buckets =
+        crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
     let result = upload_resumable_batches_with_body_witness(
         items,
         &unique_poison_scope(),
@@ -42,7 +48,35 @@ pub(crate) fn codex_transition_cold_batches(items: &[SnapshotItem]) -> Vec<Vec<u
     )
     .unwrap();
     assert_eq!(result, ResumableUploadResult::Completed);
-    posts
+    (posts, progress)
+}
+
+pub(crate) fn codex_transition_acked_route(
+    index: &ScanIndex,
+    scan: &SourceScanResult,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    use crate::snapshots::sampled_scan::transition_fixture::{self as fixture, RouteResult};
+    let (posts, progress) = codex_transition_upload(&scan.snapshots);
+    let ledger = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                serde_json::to_value(
+                    progress
+                        .accepted_identity_buckets
+                        .get(&item.source_session_id),
+                )
+                .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut route = RouteResult::emitted(mode, SnapshotSource::Codex, posts, &scan.snapshots);
+    route.codex_evidence = fixture::codex_evidence(index, scan);
+    route.accepted_identity_buckets = Some(serde_json::json!(ledger));
+    route
 }
 
 impl ScanIndex {
