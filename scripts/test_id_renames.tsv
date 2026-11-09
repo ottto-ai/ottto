@@ -4,6 +4,9 @@ crates/ottto-service/src/lib.rs	snapshots::pi_ledger_tests::fork_copies_before_t
 crates/ottto-service/src/lib.rs	snapshots::pi_ledger_tests::fork_heap_bound_charges_inline_box_allocation	snapshots::sources::pi::tests::ledger::fork_heap_bound_charges_inline_box_allocation
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::chain_keeps_adjacent_slots_and_episode_anchor	snapshots::usage::cache_observations::tests::chain_keeps_adjacent_slots_and_episode_anchor
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::restart_update_and_retraction_keep_identity	snapshots::usage::cache_observations::tests::restart_update_and_retraction_keep_identity
+crates/ottto-service/src/lib.rs	snapshots::first_read_tests::first_read_bound_admits_only_files_with_read_evidence	snapshots::discovery::tests::first_read::first_read_bound_admits_only_files_with_read_evidence
+crates/ottto-service/src/lib.rs	snapshots::first_read_tests::listed_then_aged_file_is_still_read_and_settles	snapshots::discovery::tests::first_read::listed_then_aged_file_is_still_read_and_settles
+crates/ottto-service/src/lib.rs	snapshots::first_read_tests::skipped_session_that_grows_takes_one_first_read	snapshots::discovery::tests::first_read::skipped_session_that_grows_takes_one_first_read
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::cold_start_model_switch_and_suffix_growth	snapshots::usage::cache_observations::tests::cold_start_model_switch_and_suffix_growth
 crates/ottto-service/src/lib.rs	snapshots::cache_observations::tests::canonical_codex_retains_presence_and_zero	snapshots::usage::cache_observations::tests::canonical_codex_retains_presence_and_zero
 crates/ottto-service/src/lib.rs	snapshots::withheld_account::tests::absence_sequence_resets_on_presence_substitution_or_uncertainty	snapshots::sources::claude::account::withheld::tests::absence_sequence_resets_on_presence_substitution_or_uncertainty
