@@ -39,8 +39,9 @@ impl StreamedChecks {
     }
 
     /// The expected multi-root difference: ROOT's body may differ in its
-    /// context posture only (`CONTEXT_FIELDS`); with that posture (and the
-    /// exact-body binding of its admitted request identity) made equal,
+    /// context posture only (`CONTEXT_FIELDS`); with that posture (its
+    /// file-birth verdict and the exact-body binding of its admitted request
+    /// identity) made equal,
     /// bodies, holds, accepted buckets, wire bytes, totals, placement, the
     /// post-ACK ledger and re-emission are equal.
     fn compare_context_only(
@@ -58,6 +59,7 @@ impl StreamedChecks {
         };
         assert_eq!(sessions(reference), sessions(packed), "the same bodies");
         let mut neutral = twin(reference);
+        let mut matched = Vec::new();
         for (item, packed) in neutral
             .scan
             .snapshots
@@ -83,6 +85,7 @@ impl StreamedChecks {
             if !paths.is_empty() {
                 assert_eq!(item.source_session_id, ROOT, "only ROOT's posture differs");
                 CONTEXT_ONLY.with(|diverged| diverged.set(diverged.get().map(|n| n + 1)));
+                matched.push(item.source_session_id.clone());
                 match_context_posture(item, packed);
                 // The admitted request identity binds the exact body.
                 neutral
@@ -90,6 +93,15 @@ impl StreamedChecks {
                     .mixed_uploads
                     .admit_request_identity(item);
             }
+        }
+        // And the file-birth verdict that posture came from.
+        for session in matched {
+            let admission = packed.disposition.posture_admissions.get(&session).cloned();
+            let admissions = &mut neutral.disposition.posture_admissions;
+            match admission {
+                Some(admission) => admissions.insert(session, admission),
+                None => admissions.remove(&session),
+            };
         }
         assert_eq!(
             canonical(&neutral.scan.snapshots),
