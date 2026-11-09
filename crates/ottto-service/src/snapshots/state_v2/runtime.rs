@@ -335,17 +335,10 @@ fn load_with_custody(
                         // The image read must be the stamp this session holds:
                         // after a commit from elsewhere neither its baseline
                         // nor its lineage is adopted; reopen below.
-                        let image = hydrate_image(
-                            &mut session.db,
-                            &identity,
-                            stamp,
-                            path,
-                            binding.source,
-                            |index, db| {
-                                ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-                                Ok((db.stamp()? == stamp).then_some(stamp))
-                            },
-                        )?;
+                        let image = hydrate_image(&mut session.db, binding.source, |index, db| {
+                            ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                            Ok((db.stamp()? == stamp).then_some(stamp))
+                        })?;
                         if let Some((mut index, cx, digests, _)) = image {
                             session.cx = cx;
                             adopt(state, digests, &session.cx);
@@ -364,19 +357,12 @@ fn load_with_custody(
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
             let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
-            let stamp = db.stamp().context("state_v2_open_stamp")?;
-            let image = hydrate_image(
-                &mut db,
-                &identity,
-                stamp,
-                path,
-                binding.source,
-                |index, db| {
-                    let stamp = db.stamp().context("state_v2_open_stamp")?;
-                    ensure!(index.generation == stamp.0, Hold::DbUnavailable);
-                    Ok(Some(stamp))
-                },
-            )?;
+            db.stamp().context("state_v2_open_stamp")?;
+            let image = hydrate_image(&mut db, binding.source, |index, db| {
+                let stamp = db.stamp().context("state_v2_open_stamp")?;
+                ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                Ok(Some(stamp))
+            })?;
             // The reopen check always passes; a stale image fails above.
             let (mut index, cx, digests, stamp) = image.ok_or(Hold::DbUnavailable)?;
             db.audit_headers().context("state_v2_open_audit_headers")?;
@@ -452,15 +438,9 @@ type Image = (ScanIndex, KindCx, kinds::Baseline, (u64, u64));
 /// means the image is stale and nothing from it may be adopted.
 fn hydrate_image(
     db: &mut sqlite::Sqlite,
-    identity: &Identity,
-    stamp: (u64, u64),
-    path: &Path,
     source: super::super::scan_index_persistence::Source,
     fresh: impl FnOnce(&ScanIndex, &sqlite::Sqlite) -> Result<Option<(u64, u64)>>,
 ) -> Result<Option<Image>> {
-    super::ack::ProgressRecovery::recover_route(identity, stamp.0, path)
-        .context("state_v2_open_recover")?;
-    telemetry::hydrate_checkpoint("hydrate_after_ack", 0, None);
     let (mut index, mut cx) = import::hydrate_context(db).context("state_v2_open_hydrate")?;
     telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
     #[cfg(test)]
@@ -531,11 +511,8 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         }
         let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
         let result = (|| -> Result<KindCx> {
-            let original = state.original.as_mut().ok_or(Pause::Mismatch)?;
+            let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
             original.unchanged()?;
-            // Progress locking belongs to the actual conversion attempt,
-            // never the read-only inventory or a paused conversion.
-            original.capture_progress(path)?;
             telemetry::event(
                 "orphan_removed",
                 &fence::cleanup_unpublished(path, state.latched)?,
@@ -550,7 +527,6 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
                 fence_generation: generation,
             };
             let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
-            let identity = original.retry_identity(identity)?;
             original.preserve(path)?;
             telemetry::baseline(path);
             let import = fence::sibling(path, ".v2.sqlite.import");
@@ -601,7 +577,6 @@ pub(in super::super) fn save_locked(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
-    progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
     custody: bool,
 ) -> Result<bool> {
     if binding(path).is_none() {
@@ -633,7 +608,7 @@ pub(in super::super) fn save_locked(
         if claim_generation.is_some() {
             index.generation = previous.generation;
         }
-        recovered_write(path, progress_owner, &id, session, |session| {
+        typed_write(session, |session| {
             session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
             let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
             // A commit published the stage; otherwise it waits for the next
@@ -723,25 +698,14 @@ fn with_save_session<T>(
     result
 }
 
-/// Progress recovery under the source owner, then the write. A failed write
-/// reports the store's typed hold.
-fn recovered_write<T>(
-    path: &Path,
-    progress_owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
-    identity: &Identity,
+/// A graph write under the session. It takes no progress owner: that lock
+/// orders before CheckpointLock and the session. A failed write reports the
+/// store's typed hold.
+fn typed_write<T>(
     session: &mut Session,
     write: impl FnOnce(&mut Session) -> Result<T>,
 ) -> Result<T> {
-    let result =
-        crate::snapshot_sync::with_state_v2_progress_owner(path, progress_owner, |owner, _| {
-            super::ack::ProgressRecovery::recover_route_locked(
-                identity,
-                session.stamp.0,
-                path,
-                owner,
-            )?;
-            write(session)
-        });
+    let result = write(session);
     if result.is_err() {
         if let Some(hold) = session.db.save_failure() {
             return Err(hold.into());
@@ -770,7 +734,7 @@ pub(in super::super) fn claim_growth_locked(
     ensure!(runtime.is_some(), Hold::ReloadRequired);
     let _save_window = telemetry::Window::begin("save");
     with_save_session(path, runtime, expected, |state, session, id| {
-        recovered_write(path, None, &id, session, |session| {
+        typed_write(session, |session| {
             #[cfg(test)]
             if tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take) {
                 let tx = session.db.begin(TxnMode::Write)?;
@@ -846,6 +810,63 @@ fn growth_claim_txn(
     }
     Ok((true, rows))
 }
+/// The route's live session for upload progress, under the caller's source
+/// progress owner, then CheckpointLock, then the route and session locks. The
+/// session authenticates at its own current graph stamp: a pass's own graph
+/// commits (a save, a partial checkpoint, a growth claim) advance that stamp
+/// with them, so only a foreign writer makes progress reload. `write` gets the
+/// session's store, identity and graph G; G must not move under it.
+pub(super) fn with_progress_session<T>(
+    path: &Path,
+    owner: &crate::snapshot_sync::SnapshotProgressLock,
+    write: impl FnOnce(&mut sqlite::Sqlite, &Identity, u64) -> Result<T>,
+) -> Result<T> {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
+        progress_session_locked(path, write)
+    })
+}
+/// `with_progress_session` once the source progress owner is held.
+fn progress_session_locked<T>(
+    path: &Path,
+    write: impl FnOnce(&mut sqlite::Sqlite, &Identity, u64) -> Result<T>,
+) -> Result<T> {
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    let runtime =
+        with_state(path, |state| Ok(state.current.clone()))?.ok_or(Hold::ReloadRequired)?;
+    let graph = runtime
+        .session
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .as_ref()
+        .map(|session| session.stamp.0)
+        .ok_or(Hold::ReloadRequired)?;
+    // A progress commit leaves G and this connection's data_version as they
+    // are, so the session's stamp stays valid after it.
+    with_save_session(path, Some(runtime), graph, |_, session, id| {
+        write(&mut session.db, &id, session.stamp.0)
+    })?
+    .ok_or_else(|| Hold::ReloadRequired.into())
+}
+/// A read of the route's live session store, under the caller's source
+/// progress owner.
+pub(super) fn with_progress_read<T>(
+    path: &Path,
+    owner: &crate::snapshot_sync::SnapshotProgressLock,
+    read: impl FnOnce(&mut dyn Transaction) -> Result<T>,
+) -> Result<T> {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
+        let runtime =
+            with_state(path, |state| Ok(state.current.clone()))?.ok_or(Hold::ReloadRequired)?;
+        let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let mut tx = session.db.begin(TxnMode::Read)?;
+        read(&mut tx)
+    })
+}
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
     if binding(path).is_none() || !route_needed(path, published(path)?)? {
         return Ok(());
@@ -871,9 +892,9 @@ pub(in super::super) fn guard_external(
     guard_current(path, runtime, graph_generation, true)
 }
 
-/// Local receipt binding before collection: a save-pressure hold must not stop
-/// the held pass that retries the save. Lock, reload, fence and generation
-/// checks still apply; uploads keep `guard_external` at each external boundary.
+/// A local guard that ignores a save-pressure hold. Lock, reload, fence and
+/// generation checks still apply.
+#[cfg(test)]
 pub(in super::super) fn guard_local(
     path: &Path,
     runtime: Option<&Arc<Runtime>>,
@@ -963,6 +984,12 @@ pub(crate) fn release_collection_page_limit_for_test(index: &ScanIndex) {
     })
     .unwrap();
 }
+
+#[cfg(test)]
+#[path = "progress_fixtures.rs"]
+mod progress_fixtures;
+#[cfg(test)]
+pub(crate) use progress_fixtures::*;
 
 pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
     let Some(_) = &index.v2().persistence_v2 else {
@@ -1093,11 +1120,6 @@ fn erasure_inventory(path: &Path) -> Result<()> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
-        }
-        if class == "ack_receipt_inventory" {
-            let (failed_count, failed_bytes) = super::ack::failed_import_inventory(path)?;
-            count = count.saturating_add(failed_count);
-            bytes = bytes.saturating_add(failed_bytes);
         }
         telemetry::event(
             class,

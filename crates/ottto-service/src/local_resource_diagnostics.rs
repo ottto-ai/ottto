@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cli_children;
 pub(crate) mod jsonl;
 
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
@@ -668,7 +669,8 @@ const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
 const FORCED_SEED_START: usize = USAGE_GAP_START + 4;
-const UNSELECTED_REASONS: usize = FORCED_SEED_START + FORCED_SEEDS;
+const TAIL_LOAD_START: usize = FORCED_SEED_START + FORCED_SEEDS;
+const UNSELECTED_REASONS: usize = TAIL_LOAD_START + 2;
 process_static!(
     /// Claude, Codex, Pi x reason, drained by that source's page line.
     fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -725,6 +727,13 @@ pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
     source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
         slot.fetch_add(amount, Relaxed)
     });
+}
+/// One successful Tail hit on this native page; bytes are the loaded
+/// reduction pages (`tail_db_load_bytes.page`), excluding the head.
+pub(crate) fn tail_loaded(source: &str, bytes: u64) {
+    for (slot, amount) in [(TAIL_LOAD_START, 1), (TAIL_LOAD_START + 1, bytes)] {
+        source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
+    }
 }
 const PAGE_SELECTION: [(&str, usize); 6] = [
     ("selected", PAGE_SELECTION_START),
@@ -1154,6 +1163,8 @@ impl Probe {
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             page_selection: BTreeMap<&'static str, u64>,
+            tail_loads: u64,
+            tail_load_bytes: u64,
             #[serde(flatten)]
             file_reads: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -1203,6 +1214,8 @@ impl Probe {
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             page_selection: drain(source, &PAGE_SELECTION),
+            tail_loads: source_count(source, TAIL_LOAD_START, |n| n.swap(0, Relaxed)),
+            tail_load_bytes: source_count(source, TAIL_LOAD_START + 1, |n| n.swap(0, Relaxed)),
             file_reads: drain(source, &FILE_READS),
             hold_wake: drain(
                 source,
@@ -1283,6 +1296,8 @@ struct Observation {
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
     footprint: footprint::Observation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cli_children: Vec<cli_children::Counts>,
 }
 impl Observation {
     /// A zero-window event: a timestamp and no resource measurements.
@@ -1297,6 +1312,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             footprint: Default::default(),
+            cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -1373,8 +1389,8 @@ fn source_finish_inner<T>(
     drop(window);
     result
 }
-/// Named footprint window inside a source stage. One record with empty counts
-/// when dropped normally; unwinding emits nothing, like `source_finish`.
+/// Named stage window, emitted on normal drop; unwinding emits nothing.
+/// `offpass_` stages add CPU split scalars and do not start footprint sampling.
 pub(crate) struct StageWindow {
     stage: &'static str,
     source: Source,
@@ -1382,11 +1398,14 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
+    offpass_cpu: Option<Option<StateV2Cpu>>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
 /// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
-/// keeps, the largest root's rows with its keep bit, and legacy owners.
+/// keeps, the largest root's rows with its keep bit, and legacy owners; and
+/// the evidence chunk's families and their side-file bytes (`None`: a size
+/// could not be read).
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct EvidenceMem {
     in_use_bytes: [Option<u64>; 3],
@@ -1395,9 +1414,18 @@ pub(crate) struct EvidenceMem {
     largest_root_rows: usize,
     largest_root_kept: bool,
     pub(crate) legacy_owners: usize,
+    groups: usize,
+    side_file_bytes: Option<u64>,
 }
 crate::heap_layout_bound::no_heap!(true; EvidenceMem);
 impl EvidenceMem {
+    pub(crate) fn of_chunk(groups: usize, side_file_bytes: Option<u64>) -> Self {
+        Self {
+            groups,
+            side_file_bytes,
+            ..Self::default()
+        }
+    }
     /// Checkpoint 0 = A, 1 = B, 2 = C.
     pub(crate) fn sample(&mut self, at: usize) {
         self.in_use_bytes[at] = footprint::malloc_in_use();
@@ -1420,13 +1448,15 @@ impl StageWindow {
         self.evidence_mem = Some(mem);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        let offpass = stage.starts_with("offpass_");
         Self {
             stage,
             source: Source::from_slug(source),
             probe: Probe::start(),
-            footprint: footprint::Stage::begin(),
+            footprint: (!offpass).then(footprint::Stage::begin).flatten(),
             jsonl: None,
             evidence_mem: None,
+            offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1442,7 +1472,21 @@ impl Drop for StageWindow {
             return;
         }
         #[derive(Serialize)]
+        struct Cpu {
+            cpu_user_us: Option<u64>,
+            cpu_sys_us: Option<u64>,
+        }
+        let cpu = self.offpass_cpu.map(|before| {
+            let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
+            Cpu {
+                cpu_user_us: samples.and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
+                cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+            }
+        });
+        #[derive(Serialize)]
         struct Counts {
+            #[serde(flatten)]
+            cpu: Option<Cpu>,
             // Zero exposure is stored as None and stays off the record.
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
@@ -1456,8 +1500,13 @@ impl Drop for StageWindow {
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            observation: if self.offpass_cpu.is_some() {
+                self.probe.observation()
+            } else {
+                self.probe.stage_observation(self.footprint.as_ref())
+            },
             counts: Counts {
+                cpu,
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
@@ -1826,6 +1875,11 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
 pub fn rotate_service_log_at_startup() {
     #[cfg(unix)]
     stderr_rotation::rotate_at_startup();
+}
+/// Rotates a service log that reached the startup threshold while running.
+pub(crate) fn rotate_service_log_if_due() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_while_running();
 }
 
 /// Content-free allocator launch configuration, called once before serving.
@@ -2698,6 +2752,33 @@ mod tests {
         }
     }
 
+    /// [behaviour] A completed off-pass work unit uses the existing stage carrier.
+    #[test]
+    fn offpass_work_reports_cpu_split_and_wall_without_footprint_sampling() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, rows) = capture(|| {
+                let _stage = StageWindow::begin(source, "offpass_agent_status");
+                Ok::<_, anyhow::Error>(17)
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["stage"], "offpass_agent_status");
+            assert_eq!(row["source"], source);
+            assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            for field in ["cpu_user_us", "cpu_sys_us"] {
+                assert!(row["counts"].get(field).is_some());
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                assert!(row["counts"][field].is_u64());
+            }
+            assert!(row["observation"].get("footprint_samples").is_none());
+            assert!(row["observation"]
+                .get("footprint_sample_failures")
+                .is_none());
+        }
+    }
+
     #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
@@ -2714,6 +2795,7 @@ mod tests {
             assert_eq!(records[1]["stage"], "source_prepare");
             for record in records {
                 assert_eq!(record["source"], source);
+                assert_eq!(record["counts"], serde_json::json!({}));
                 assert!(record["observation"]["footprint_sample_failures"].is_u64());
                 let row = &record["observation"];
                 if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
@@ -2740,6 +2822,47 @@ mod tests {
                 "footprint_sample_failures",
             ] {
                 assert!(row.get(field).is_none());
+            }
+        }
+    }
+
+    /// [behaviour] Each native page sums successful Tail loads and reduction
+    /// page bytes for its own source, then drains both scalars.
+    #[test]
+    fn tail_load_counts_reset_per_native_page() {
+        let (_, records) = capture(|| {
+            for source in ["claude_code", "codex", "pi"] {
+                tail_loaded(source, 11);
+                tail_loaded(source, 29);
+            }
+            for source in ["claude_code", "codex", "pi"] {
+                for bytes in [None, Some(7), None] {
+                    let probe = Probe::page();
+                    if let Some(bytes) = bytes {
+                        tail_loaded(source, bytes);
+                    }
+                    probe.collection(
+                        source,
+                        CollectionCounts {
+                            scanned_files: 0,
+                            semantic_noops: 0,
+                            sampled_acquisition: None,
+                            full_causes: Default::default(),
+                        },
+                    );
+                }
+            }
+        });
+        let pages: Vec<_> = records
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect();
+        assert_eq!(pages.len(), 9);
+        for (pages, source) in pages.chunks_exact(3).zip(["claude_code", "codex", "pi"]) {
+            for (page, (loads, bytes)) in pages.iter().zip([(2, 40), (1, 7), (0, 0)]) {
+                assert_eq!(page["source"], source);
+                assert_eq!(page["counts"]["tail_loads"], loads);
+                assert_eq!(page["counts"]["tail_load_bytes"], bytes);
             }
         }
     }

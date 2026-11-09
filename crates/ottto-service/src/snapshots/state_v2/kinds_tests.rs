@@ -1730,3 +1730,41 @@ fn corrupt_retired_row_does_not_fail_load() {
     assert_eq!(restored.generation, 2);
     assert_eq!(cx.retired, BTreeSet::from(rows));
 }
+
+/// [format] Upload-progress rows live outside the graph: a graph save that
+/// deletes graph rows never deletes or rewrites them, and the graph hydrate
+/// restores the graph alone.
+#[test]
+fn graph_save_keeps_progress_rows_outside_the_graph() {
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let rows = [
+        mapper::key("progress.cache_state", "", 0).unwrap(),
+        mapper::key("progress.cache_state", "session-a", 1).unwrap(),
+        mapper::key("progress.cache_head", "", 0).unwrap(),
+        mapper::key("progress.identity", "session-a", 1).unwrap(),
+        mapper::key("progress.ledger", "", 1).unwrap(),
+    ];
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    for key in &rows {
+        mapper::put(&mut tx, key, &serde_json::json!({"offset": 7})).unwrap();
+    }
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    let headers = |db: &mut sqlite::Sqlite| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        rows.iter()
+            .map(|key| tx.get(key).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let before = headers(&mut db);
+    assert!(before.iter().all(Option::is_some));
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (current, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let mut next = current.clone();
+    assert!(!next.files.is_empty());
+    next.files.clear();
+    next.historical_replay_generation = Some("after-progress".into());
+    save_graph(&mut db, &identity, &current, &mut next, &mut cx).unwrap();
+    assert_eq!(headers(&mut db), before);
+    assert_persisted(&mut db, &next);
+}

@@ -19,15 +19,25 @@ mod import;
 mod runtime;
 #[cfg(test)]
 pub(crate) use runtime::release_collection_page_limit_for_test;
+#[cfg(test)]
+pub(crate) use runtime::{
+    before_progress_import_for_test, claim_growth_for_test, damage_identity_row_for_test,
+    drop_progress_ledger_chunk_for_test, edit_progress_rows_for_test,
+    fail_next_progress_commit_for_test, import_progress_rows_for_test,
+    lose_next_progress_commit_reply_for_test, take_progress_pages_for_test,
+    take_progress_set_aside_for_test,
+};
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
+#[cfg(test)]
+pub(super) use runtime::guard_local;
 #[cfg(any(test, target_os = "macos"))]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, guard_local,
-    idle, load_locked, published, recovery_save_guard, runtime_path, save_locked,
+    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, idle,
+    load_locked, published, recovery_save_guard, runtime_path, save_locked,
 };
 mod catalogue;
 mod codec;
@@ -46,6 +56,7 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod mapper;
+mod progress;
 mod sqlite;
 pub(crate) use sqlite::history as upload_history;
 #[cfg(test)]
@@ -373,7 +384,7 @@ fn value_target(key: &RowKey) -> u64 {
         // Tail fragments logical values well below this physical row limit.
         key if tail::owned(key) => VALUE_BYTES,
         // The two whole fields that exceed 1 MiB on real stores share the
-        // value bound, so a large row commits instead of refusing its save.
+        // value bound, so a large row commits without a standing alarm.
         RowKey::Record { kind, .. }
             if matches!(kind.name(), "scan_state.traversal" | "v1_field.birth_store") =>
         {
@@ -560,6 +571,8 @@ fn control_name(name: &str) -> bool {
             | "repair_commitment"
             | "field_presence"
             | "limits"
+            | "progress_generation"
+            | "progress_import"
     )
 }
 
@@ -584,8 +597,11 @@ impl StorageLimits {
     }
 }
 
-// ACK recovery owns no routing or import decisions.
-pub(crate) mod ack;
+// Upload progress as keyed rows, for the source's progress owner.
+pub(crate) use progress::{
+    import_progress_rows, read_progress_ledger, read_progress_rows, Marker as ProgressMarker,
+    Point as ProgressPoint, ProgressPage, ProgressRead, ProgressRows,
+};
 // OPS-only maintenance and counts/bytes/times diagnostics seams.
 pub(super) use runtime::before_collection;
 

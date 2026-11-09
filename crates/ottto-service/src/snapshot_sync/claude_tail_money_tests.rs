@@ -2719,17 +2719,18 @@ fn pi_downgrade_then_reupgrade() {
     pi_lifecycle_case("pi_downgrade_then_reupgrade");
 }
 
-/// The route's progress, bound to its ACK receipts as the daemon loads it.
+/// The route's progress, as the daemon loads it for this index.
 #[cfg(unix)]
 fn pi_route_progress(disk: &Disk, index: &ScanIndex) -> SnapshotUploadProgress {
-    SnapshotUploadProgress::load_with_recovery(
+    SnapshotUploadProgress::load_for_index(
+        index,
+        &disk.route,
         &snapshot_upload_progress_path(&disk.route),
         disk.route
             .parent()
             .and_then(|dir| dir.file_name()?.to_str())
             .unwrap(),
         snapshot_quarantine_witness(SnapshotSource::Pi),
-        crate::snapshots::ProgressRecovery::for_index(index, &disk.route).unwrap(),
     )
     .unwrap()
 }

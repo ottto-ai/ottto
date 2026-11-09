@@ -30,7 +30,7 @@ pub(in crate::snapshots) fn carry_tail(
                 }
             };
             let moved = state.tail.carry_observation(to, &carry)?;
-            recovered_write(&path, None, &id, session, |session| {
+            typed_write(session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
                 session.cx.tail = Some(moved);
                 let digests =
@@ -177,10 +177,20 @@ pub(in crate::snapshots) fn load_tail(
     mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
+    let mut bytes = 0u64;
     read_txn_at(index, |tx, stamp| {
-        super::super::tail::load_pages(tx, key.as_bytes(), head, stamp.0, &mut visit)
+        super::super::tail::load_pages(
+            tx,
+            key.as_bytes(),
+            head,
+            stamp.0,
+            &mut |collection, page, value: Vec<u8>| {
+                bytes = bytes.saturating_add(value.len() as u64);
+                visit(collection, page, value)
+            },
+        )
     })?;
-    telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
+    telemetry::tail_load(started.elapsed().as_millis(), bytes);
     Ok(())
 }
 /// `head`'s revisions by id, one short read transaction; same outcomes as
@@ -256,7 +266,7 @@ fn exit_commit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
         .0;
     let _save_window = telemetry::Window::begin("save");
     with_save_session(path, Some(runtime), expected, |state, session, id| {
-        recovered_write(path, None, &id, session, |session| {
+        typed_write(session, |session| {
             super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail)?;
             session.stamp = session.db.stamp()?;
             state.save_digests = None;

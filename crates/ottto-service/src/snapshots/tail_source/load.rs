@@ -283,6 +283,7 @@ pub(super) fn load<S: TailSource>(
             counters::bump(source, "tail_db_loads", "hit");
             counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
             counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
+            crate::local_resource_diagnostics::tail_loaded(source.api_slug(), hit.page_bytes);
             return Load::Reused(hit.retained, base);
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
@@ -320,12 +321,11 @@ pub(super) fn load<S: TailSource>(
                 // key in the same pass cancels the retirement.
                 let _ = state_v2::retire_tail(route, [key.to_owned()]);
             }
-            let outcome = if cause == ReconstructCause::KeyEpoch {
-                "miss"
-            } else {
-                "error"
-            };
-            (outcome, Some(cause.label()), Load::Cold(None))
+            (
+                reconstruct_outcome(cause),
+                Some(cause.label()),
+                Load::Cold(None),
+            )
         }
     };
     if let Some(cause) = reconstruct {
@@ -343,6 +343,19 @@ pub(super) fn load<S: TailSource>(
     }
     counters::bump(source, "tail_db_loads", outcome);
     load
+}
+
+/// A reconstruction's `tail_db_loads` outcome. A key rotation is a miss. A
+/// Codex head whose stored sidecar binding differs from the live one is its
+/// own outcome, apart from failures.
+fn reconstruct_outcome(cause: ReconstructCause) -> &'static str {
+    match cause {
+        ReconstructCause::KeyEpoch => "miss",
+        ReconstructCause::Incompatible(super::codex::INCOMPATIBLE_SIDECAR_BINDING) => {
+            "sidecar_binding"
+        }
+        _ => "error",
+    }
 }
 
 /// The stored reduction, its base and the bytes read, or why not. The

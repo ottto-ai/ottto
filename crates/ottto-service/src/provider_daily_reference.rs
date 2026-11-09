@@ -26,6 +26,7 @@
 //!   upload and stores nothing from an unadmitted build.
 
 use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
+use crate::local_resource_diagnostics::StageWindow;
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
@@ -3369,6 +3370,7 @@ pub enum CollectorStartup {
 /// no local work beyond one file read and never touches the account, device,
 /// connection, credential, or keychain state.
 pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
+    let _stage = StageWindow::begin("codex", "offpass_daily_reference");
     let collector = Collector::default();
     if collector.network_disabled() {
         collector.state.clear();

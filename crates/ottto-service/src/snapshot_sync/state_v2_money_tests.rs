@@ -512,12 +512,6 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
         let bytes = serde_json::to_vec(&progress).unwrap();
         let progress_path = c.base.join("claude_code-upload-progress.json");
         ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
-        let recovery = crate::snapshots::ProgressRecovery::synthetic(
-            &c.base.join("index"),
-            &"a".repeat(64),
-            warm.index.generation,
-        );
-        recovery.adopt_synthetic(Some(&bytes));
         let v2 = crate::snapshots::state_v2_money_roundtrip(
             &warm.index,
             &c.base
@@ -525,7 +519,6 @@ fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload()
                 .unwrap()
                 .join("accepted.v2.sqlite.import"),
         );
-        recovery.recover(&progress_path).unwrap();
         assert_eq!(
             std::fs::read(&progress_path).unwrap(),
             bytes,

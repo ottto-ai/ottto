@@ -131,7 +131,7 @@ pub(in crate::snapshots::tail_source) fn route_for(source: Source) -> Route {
 impl Route {
     pub(in crate::snapshots::tail_source) fn save(&mut self, claim_only: bool) {
         let custody = state_v2::published(&self.path).unwrap();
-        state_v2::save_locked(&self.path, &mut self.index, claim_only, None, custody).unwrap();
+        state_v2::save_locked(&self.path, &mut self.index, claim_only, custody).unwrap();
     }
     pub(in crate::snapshots::tail_source) fn head(&self, key: &str) -> Option<TailHead> {
         state_v2::load_head(&self.index, key, Claude::REDUCTION_REVISION).unwrap()

@@ -35,7 +35,15 @@ fn native_corpus(source: SnapshotSource) -> (Corpus, Vec<PathBuf>) {
 }
 
 fn native_corpus_of(source: SnapshotSource, sessions: &[&str]) -> (Corpus, Vec<PathBuf>) {
-    let mut c = corpus("unkept-native-oracle");
+    native_corpus_in(corpus("unkept-native-oracle"), source, sessions)
+}
+
+/// `sessions` as native `source` transcripts under the fresh corpus `c`.
+fn native_corpus_in(
+    mut c: Corpus,
+    source: SnapshotSource,
+    sessions: &[&str],
+) -> (Corpus, Vec<PathBuf>) {
     let paths = sessions
         .iter()
         .map(|session| {
@@ -124,12 +132,24 @@ fn send(
     progress: &mut SnapshotUploadProgress,
     respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
-    let (status, batches, _) = upload_source_under(
+    send_with(source, page, progress, respond, |_| Ok(()))
+}
+
+/// `send` with the caller's progress persistence after each ACK.
+fn send_with(
+    source: SnapshotSource,
+    page: &Page,
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> (Result<ResumableUploadResult>, RouteResult) {
+    let (status, batches, _) = upload_source_persisting(
         source,
         SnapshotUploadPolicy::default(),
         &page.scan.snapshots,
         progress,
         respond,
+        persist,
     );
     let sent = batches
         .iter()
@@ -155,6 +175,12 @@ fn send(
         route.codex_evidence = fixture::codex_evidence(&page.index, &page.scan);
     }
     route.modes = page.modes;
+    if source == SnapshotSource::ClaudeCode {
+        // Routed progress holds hints as rows: the page's sessions load them.
+        // A spent hold (the page must reload) keeps its resident hints.
+        let sessions = page.scan.snapshots.iter();
+        let _ = progress.load_identity(sessions.map(|item| item.source_session_id.as_str()));
+    }
     route.accepted_identity_buckets = Some(
         serde_json::to_value(
             page.scan
@@ -188,12 +214,6 @@ fn checkpoint(
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
-    if progress.ack_recovery.is_none() {
-        progress.ack_recovery =
-            crate::snapshots::ProgressRecovery::for_index(&page.committed, index_path)
-                .unwrap()
-                .map(Box::new);
-    }
     progress.save(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,
@@ -1087,8 +1107,14 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 if fp != *faulted {
                     assert!(!sender.accepted_fingerprints.contains(faulted));
                     assert!(!sender.accepted_body_witnesses.contains_key(faulted));
-                } else {
-                    assert_eq!(&witness, body, "same fingerprint, same body");
+                } else if witness != *body {
+                    // Same semantic fingerprint, different body: credit is for the exact
+                    // (fingerprint, body) pair just ACKed, never for the refused bytes.
+                    assert_ne!(
+                        sender.accepted_body_witnesses.get(faulted),
+                        Some(body),
+                        "the refused body never gets credit"
+                    );
                 }
                 // (iii) The refused record is cleared or superseded in the
                 // next durable checkpoint: no RetryPending for this entity.
@@ -1139,65 +1165,48 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                 money_oracle::entity_differences(&cold, &final_route, &mut differences);
                 assert!(differences.is_empty(), "{}", differences.join("\n"));
 
-                // The due refused-body retry currently omits these opening
-                // and context fields. Pin that separate gap to this entity:
-                // every other field and every sibling must still match.
+                // The retry now carries admitted context posture. Only cache
+                // observations remain a pinned gap behind the strict money gate;
+                // every other field and every sibling must equal the cold body.
                 let (entity, _, _) = retried.as_ref().expect("refused entity retried");
                 assert_eq!(entity, ROOT);
                 let mut expected = cold.snapshots.clone();
                 let body = expected.get_mut(entity).unwrap();
                 let actual = &final_route.snapshots[entity];
-                assert!(body.get("context_posture_withheld").is_none());
-                assert_eq!(actual["context_posture_withheld"], "unknown_birth");
-                body.as_object_mut().unwrap().insert(
-                    "context_posture_withheld".into(),
-                    serde_json::json!("unknown_birth"),
+                // Name every remaining omission in one failure so the native CI
+                // fixture verifies the shrinking gap without hiding restored fields.
+                let omitted = [
+                    "/cache_observations",
+                    "/compaction_count",
+                    "/first_own_request_at",
+                    "/first_turn_context_tokens",
+                    "/last_turn_context_tokens",
+                    "/peak_context_fill_tokens",
+                    "/session_start/first_request_cache_read_tokens",
+                    "/session_start/first_request_cache_write_1h_tokens",
+                    "/session_start/first_request_cache_write_5m_tokens",
+                    "/session_start/first_request_uncached_input_tokens",
+                    "/session_start/opening_file_overflow",
+                    "/session_start/opening_output_tokens",
+                    "/session_start/opening_request_count",
+                    "/session_start/opening_tool_calls",
+                    "/session_start/opening_truncated_outputs",
+                    "/session_start/request_2_context_tokens",
+                    "/session_start/request_3_context_tokens",
+                ]
+                .into_iter()
+                .filter(|path| actual.pointer(path).is_none())
+                .collect::<Vec<_>>();
+                assert_eq!(
+                    omitted,
+                    ["/cache_observations"],
+                    "remaining retry omissions"
                 );
-                for field in [
-                    "cache_observations",
-                    "compaction_count",
-                    "first_own_request_at",
-                    "first_turn_context_tokens",
-                    "last_turn_context_tokens",
-                    "peak_context_fill_tokens",
-                ] {
-                    assert!(body.as_object_mut().unwrap().remove(field).is_some());
-                    assert!(actual.get(field).is_none(), "retry omits {field}");
-                }
-                for field in [
-                    "first_request_cache_read_tokens",
-                    "first_request_cache_write_1h_tokens",
-                    "first_request_cache_write_5m_tokens",
-                    "first_request_uncached_input_tokens",
-                    "opening_file_overflow",
-                    "opening_output_tokens",
-                    "opening_request_count",
-                    "opening_tool_calls",
-                    "opening_truncated_outputs",
-                    "request_2_context_tokens",
-                    "request_3_context_tokens",
-                ] {
-                    assert!(body["session_start"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove(field)
-                        .is_some());
-                    assert!(actual["session_start"].get(field).is_none());
-                }
-                // Only the fingerprints derived from the omitted context
-                // differ; emitted() already validates the semantic envelope.
-                for path in [
-                    "/snapshot_fingerprint",
-                    "/semantic_envelope/component_hashes/context_posture",
-                    "/semantic_envelope/content_hash",
-                    "/semantic_envelope/revision_hash",
-                    "/semantic_envelope/revision_v2_hash",
-                ] {
-                    let expected = body.pointer_mut(path).unwrap();
-                    let actual = actual.pointer(path).unwrap();
-                    assert_ne!(&*expected, actual, "omitted context changes {path}");
-                    *expected = actual.clone();
-                }
+                assert!(body
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cache_observations")
+                    .is_some());
                 assert_eq!(expected, final_route.snapshots, "only the pinned omissions");
             } else {
                 money_oracle::assert_equivalent(&cold, &final_route);
@@ -1205,3 +1214,6 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
         }
     });
 }
+
+#[path = "progress_rows_oracle_tests.rs"]
+mod progress_rows_oracle_tests;

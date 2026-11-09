@@ -89,12 +89,13 @@ macro_rules! process_state {
 }
 
 pub(crate) use usage::cache_observations;
-#[cfg(test)]
-pub(crate) mod cache_overcap_tests;
+
 use scan::read_cause as change_reason;
 use sources::claude::context_file_birth as claude_context_file_birth;
+#[cfg(test)]
+pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
 pub(crate) mod claude_cross_root_evidence;
-mod upload_context_read;
+use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
@@ -103,7 +104,7 @@ pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 #[cfg(test)]
-mod upload_policy_tests;
+pub(crate) use claude_context_file_birth::with_remembered_tripwire_restored_for_test;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -132,7 +133,8 @@ mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
 use upload::freshness_debt as g7_debt;
-pub(crate) mod money_freshness;
+pub(crate) use upload::money_freshness;
+
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 mod shared_value;
@@ -462,9 +464,7 @@ include!("snapshots/load_containment.rs");
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
-pub(crate) mod terminal_contract_retry;
-#[cfg(test)]
-mod terminal_contract_retry_tests;
+pub(crate) use upload::terminal_contract_retry;
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -1466,12 +1466,14 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
-#[cfg(test)]
-pub(crate) use claude_reemission_exclusions::restart_claude_reemission_stop_for_test;
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
     note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) use claude_reemission_exclusions::{
+    restart_claude_reemission_stop_for_test, with_claude_reemission_stop_restored_for_test,
 };
 
 #[cfg(test)]
@@ -2326,8 +2328,11 @@ fn open_and_identify_scan_candidate(
     )
 }
 
-// Opaque v2-only companion for the unchanged upload-progress store.
-pub(crate) use state_v2::ack::{ProgressRecovery, ProgressSeal};
+// The upload-progress rows of a routed source.
+pub(crate) use state_v2::{
+    import_progress_rows, read_progress_ledger, read_progress_rows, ProgressMarker, ProgressPage,
+    ProgressPoint, ProgressRead, ProgressRows,
+};
 // OPS diagnostics bridges; the private storage module stays private.
 pub(crate) use state_v2::state_v2_growth_retention_active;
 pub(crate) fn state_v2_pass_start() {

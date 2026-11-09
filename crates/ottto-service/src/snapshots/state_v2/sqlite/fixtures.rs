@@ -220,3 +220,70 @@ pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
 pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
     db.stats.dirty_rows_per_save
 }
+
+type ReopenHook = Box<dyn FnOnce(&Path)>;
+thread_local! {
+    static BEFORE_REOPEN: std::cell::RefCell<Option<ReopenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Run the armed hook once, after a COMMIT error closed the connection and
+/// before the finalizer reopens it to classify the outcome.
+pub(super) fn before_reopen(path: &Path) {
+    if let Some(hook) = BEFORE_REOPEN.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
+}
+/// Once the next COMMIT error closes the connection, another connection
+/// commits `name` = `value`, as a racing or partly durable writer would.
+pub(in super::super) fn on_reopen_write_control(name: &'static str, value: u64) {
+    BEFORE_REOPEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(BUSY).unwrap();
+            let bytes = control_json(&value).unwrap();
+            conn.execute(
+                "INSERT INTO control(name,value_version,value,row_checksum) VALUES(?1,1,?2,?3) ON CONFLICT(name) DO UPDATE SET value=excluded.value,row_checksum=excluded.row_checksum",
+                params![name, bytes, control_checksum(name, 1, &bytes).to_vec()],
+            )
+            .unwrap();
+        }));
+    });
+}
+/// (graph record rows, progress rows, records alarm) as the store counts them.
+pub(in super::super) fn row_counts_for_test(db: &Sqlite) -> (u64, u64, bool) {
+    let s = &db.stats;
+    (s.record_rows, s.progress_rows, s.records_alarm)
+}
+pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
+    db.stats.record_rows = rows;
+}
+pub(in super::super) fn writer_capability_for_test() -> u64 {
+    migrations::WRITER_CAPABILITY
+}
+
+thread_local! {
+    static LOSE_COMMIT_REPLY: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// The next progress COMMIT on the store at `path` becomes durable, then
+/// reports an error, as a lost reply would: the finalizer must classify it
+/// Published from the reopened store.
+pub(in super::super) fn lose_next_progress_commit_reply(db: &Sqlite) {
+    let path = db.path.clone();
+    LOSE_COMMIT_REPLY.with(|armed| *armed.borrow_mut() = Some(path));
+}
+pub(super) fn after_commit(path: &Path, cas: Cas) -> Result<()> {
+    if !matches!(cas, Cas::Progress { .. }) {
+        return Ok(());
+    }
+    let armed = LOSE_COMMIT_REPLY.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let hit = armed.as_deref() == Some(path);
+        if hit {
+            *armed = None;
+        }
+        hit
+    });
+    anyhow::ensure!(!armed, "test: the COMMIT reply was lost");
+    Ok(())
+}
