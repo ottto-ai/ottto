@@ -291,15 +291,9 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                     .keys()
                     .filter_map(
                         |id| progress.accepted_identity_buckets.get(id).map(|buckets| {
-                            let mut buckets = serde_json::to_value(buckets).unwrap();
-                            // last_ack is a global LRU sequence: the prior ACK
-                            // and retry history differ from a cold Full. As in
-                            // advertised_cap_retags_previously_stripped_accepted_body,
-                            // re-ACKs may change it without changing money or shares.
-                            let last_ack = buckets.as_object_mut().unwrap().remove("last_ack");
-                            assert!(last_ack
-                                .and_then(|value| value.as_u64())
-                                .is_some_and(|ack| ack > 0));
+                            let buckets = serde_json::to_value(buckets).unwrap();
+                            // No ACK-order stamp: re-ACKs change only shares.
+                            assert!(buckets.get("last_ack").is_none());
                             (id.clone(), buckets)
                         })
                     )

@@ -72,8 +72,14 @@ fn load(
 }
 
 /// Every durable progress field, as the ledger and both maps hold them.
+/// Resident identity hints are a page's working set; their rows are durable.
 fn durable(progress: &SnapshotUploadProgress) -> Value {
-    serde_json::to_value(progress).unwrap()
+    let mut value = serde_json::to_value(progress).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("accepted_identity_buckets");
+    value
 }
 
 fn without_generation(mut value: Value) -> Value {
@@ -88,6 +94,8 @@ struct Receiver {
     bodies: BTreeMap<String, String>,
     credit: BTreeMap<String, u64>,
     duplicates: usize,
+    /// The identity hints each ACK's production save held, by row name.
+    acked_hints: BTreeMap<String, Value>,
 }
 
 impl Receiver {
@@ -120,13 +128,57 @@ fn send_to(
     receiver: &mut Receiver,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
     let path = progress_path(index_path);
-    send_with(
+    let mut hints = BTreeMap::new();
+    let sent = send_with(
         source,
         page,
         progress,
         |batch| receiver.respond(batch),
-        |progress| progress.save(&path),
-    )
+        |progress| {
+            let resident = serde_json::to_value(&progress.accepted_identity_buckets)?;
+            hints.extend(serde_json::from_value::<BTreeMap<String, Value>>(resident)?);
+            progress.save(&path)
+        },
+    );
+    receiver.acked_hints.extend(hints);
+    sent
+}
+
+/// The stored identity rows of the hints `receiver` saw ACKed, as hints:
+/// each row's progress generation is dropped and an absent row is omitted.
+fn stored_hints(progress: &SnapshotUploadProgress, receiver: &Receiver) -> BTreeMap<String, Value> {
+    let names = receiver
+        .acked_hints
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let rows = progress.rows.as_ref().expect("a routed progress");
+    let points = rows
+        .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
+        .unwrap();
+    points
+        .into_iter()
+        .map(|(name, point)| (name, point.accepted))
+        .collect()
+}
+
+/// The identity rows hold exactly the ACKed hints; a Claude route has some.
+fn assert_identity_rows(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    receiver: &Receiver,
+    context: &str,
+) {
+    assert_eq!(
+        source == SnapshotSource::ClaudeCode,
+        !receiver.acked_hints.is_empty(),
+        "{source:?} {context}: Claude ACKs record identity hints"
+    );
+    assert_eq!(
+        stored_hints(progress, receiver),
+        receiver.acked_hints,
+        "{source:?} {context}: the identity rows hold the ACKed hints"
+    );
 }
 
 /// The production pass end after an exact ACK: the page's ledger, then the
@@ -168,7 +220,7 @@ fn assert_quiet(source: SnapshotSource, c: &Corpus, index: ScanIndex) -> Page {
         bytes, 0,
         "{source:?}: settled restart consumes no transcript"
     );
-    if source == SOURCE {
+    if source == SnapshotSource::ClaudeCode {
         assert!(samples.is_empty());
         let mut control = accept(source, &quiet);
         control.mode = Mode::Restart;
@@ -185,9 +237,22 @@ fn assert_quiet(source: SnapshotSource, c: &Corpus, index: ScanIndex) -> Page {
 }
 
 /// The post-ACK placement ledger of `sessions`, as `send` observes it.
-fn placement(progress: &SnapshotUploadProgress, sessions: impl Iterator<Item = String>) -> Value {
+/// Identity placement of `sessions`; a routed Claude progress loads their
+/// hint rows first.
+fn placement(
+    source: SnapshotSource,
+    progress: &mut SnapshotUploadProgress,
+    sessions: impl Iterator<Item = String>,
+) -> Value {
+    let sessions = sessions.collect::<Vec<_>>();
+    if source == SnapshotSource::ClaudeCode {
+        progress
+            .load_identity(sessions.iter().map(String::as_str))
+            .unwrap();
+    }
     serde_json::to_value(
         sessions
+            .into_iter()
             .map(|session| {
                 let buckets = progress.accepted_identity_buckets.get(&session);
                 (session, serde_json::to_value(buckets).unwrap())
@@ -499,19 +564,49 @@ fn assert_imported(
     bytes: &[u8],
     oracle: &SnapshotUploadProgress,
 ) {
+    // Identity placement moves to one identity row per session, stamped with
+    // the imported P; the ledger keeps only their scope.
+    let theirs = serde_json::to_value(&oracle.accepted_identity_buckets).unwrap();
+    assert!(
+        imported.accepted_identity_buckets.is_empty(),
+        "no resident hint"
+    );
+    let mut ours = without_generation(durable(imported));
+    ours.as_object_mut()
+        .unwrap()
+        .remove("accepted_identity_scope");
     assert_eq!(
-        without_generation(durable(imported)),
+        ours,
         without_generation(durable(oracle)),
         "the rows carry every JSON field"
     );
-    assert_money_maps(imported);
-    // Identity placement stays in the ledger: never a keyed map, never
-    // an identity row.
+    let mut loaded = imported.clone();
+    loaded
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    loaded
+        .load_identity(["progress-rows-switch", "progress-rows-side-call"])
+        .unwrap();
+    assert_money_maps(&loaded);
+    let names = theirs
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(!names.is_empty(), "identity placement to move");
+    let store = imported.rows.as_ref().unwrap();
+    let stored = store
+        .read_points::<crate::snapshots::ProgressPoint<Value>>(&names, |_, _| true)
+        .unwrap();
+    for (name, hint) in theirs.as_object().unwrap() {
+        let point = &stored[name];
+        assert_eq!(point.progress_generation, 1, "stamped with the imported P");
+        assert_eq!(&point.accepted, hint, "the identity row is the JSON hint");
+    }
     let ledger = imported.clone().ledger_row().unwrap();
-    assert_eq!(
-        ledger["accepted_identity_buckets"],
-        durable(imported)["accepted_identity_buckets"]
-    );
+    assert!(ledger.get("accepted_identity_buckets").is_none());
+    assert!(ledger.get("accepted_identity_scope").is_some(), "the scope");
     for keyed in [
         "accepted_cache_states",
         "accepted_cache_heads",
@@ -586,6 +681,7 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
                 ram,
                 "{source:?}: restart restores the ledger"
             );
+            assert_identity_rows(source, &restored, &receiver, "restart");
             let quiet = assert_quiet(source, &c, index);
 
             for (path, session) in paths.iter().zip(SESSIONS) {
@@ -609,6 +705,7 @@ fn progress_rows_route_equals_cold_full_across_restart_and_append() {
             drop(page);
             let (index, restored) = load(source, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
+            assert_identity_rows(source, &restored, &receiver, "append restart");
             assert_quiet(source, &c, index);
             settled.push((path.to_owned(), restored, session, c));
         }
@@ -703,8 +800,11 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                         "{source:?}: {entity} emitted on both pages"
                     );
                 }
-                both.accepted_identity_buckets =
-                    Some(placement(&progress, both.snapshots.keys().cloned()));
+                both.accepted_identity_buckets = Some(placement(
+                    source,
+                    &mut progress,
+                    both.snapshots.keys().cloned(),
+                ));
                 let mut differences = Vec::new();
                 money_oracle::entity_differences(&cold, &both, &mut differences);
                 assert!(differences.is_empty(), "{}", differences.join("\n"));
@@ -714,6 +814,7 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                 drop(second);
                 let (index, restored) = load(source, &c, path).unwrap();
                 assert_eq!(durable(&restored), ram);
+                assert_identity_rows(source, &restored, &receiver, "both pages");
                 assert_quiet(source, &c, index);
                 second_pages.push((page_two, path.to_owned(), restored, session, c));
             }
@@ -801,6 +902,10 @@ fn progress_rows_commit_error_keeps_ram_and_retry_writes_every_row() {
                     "RAM keeps the dirty rows"
                 );
                 assert_eq!(row_digests(path), before, "NotPublished leaves every row");
+                assert!(
+                    stored_hints(&progress, &receiver).is_empty(),
+                    "{source:?}: NotPublished writes no identity row"
+                );
                 let credit = receiver.credit.clone();
 
                 if same_ram {
@@ -833,6 +938,7 @@ fn progress_rows_commit_error_keeps_ram_and_retry_writes_every_row() {
                 drop(page);
                 let (index, restored) = load(source, &c, path).unwrap();
                 assert_eq!(durable(&restored), ram, "the retry wrote every row");
+                assert_identity_rows(source, &restored, &receiver, "NotPublished retry");
                 assert_quiet(source, &c, index);
                 assert_rows_custody(path, &restored);
             }
@@ -880,6 +986,16 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
 
             let (index, mut progress) = load(SOURCE, &c, path).unwrap();
             assert_graph_behind_ledger(&index, &progress);
+            if published_arm {
+                assert_identity_rows(SOURCE, &progress, &receiver, "Published reload");
+            } else {
+                // The page did not land: its hints are absent (untracked
+                // until the next ACK records them again).
+                assert!(
+                    stored_hints(&progress, &receiver).is_empty(),
+                    "Ambiguous reload holds no identity row of the page"
+                );
+            }
             let reloaded = progress.generation;
             let mut page = native_page(SOURCE, &c, index, 100, true);
             let (status, again) = send_to(SOURCE, &page, &mut progress, path, &mut receiver);
@@ -914,6 +1030,7 @@ fn progress_rows_published_or_ambiguous_commit_reloads_and_reoffers_exactly() {
             drop(page);
             let (index, restored) = load(SOURCE, &c, path).unwrap();
             assert_eq!(durable(&restored), ram);
+            assert_identity_rows(SOURCE, &restored, &receiver, "settled");
             assert_quiet(SOURCE, &c, index);
             assert_rows_custody(path, &restored);
         }
@@ -1084,6 +1201,13 @@ fn progress_rows_import_carries_the_pre_publication_json_ledger() {
                     durable(&imported),
                     "restart reads the rows"
                 );
+                let mut restored = restored;
+                restored
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
+                restored
+                    .load_identity(["progress-rows-switch", "progress-rows-side-call"])
+                    .unwrap();
                 assert_money_maps(&restored);
                 assert_quiet(source, &c, index);
             }
@@ -1181,7 +1305,7 @@ fn progress_rows_import_marker_purges_leftovers_unread() {
         let (c, _) = native_corpus_in(corpus("progress-rows-competing-import"), SOURCE, &SESSIONS);
         let (session, _, oracle) = published_with_json_ledger(SOURCE, &c, None);
         let path = session.path();
-        let mut competitor = durable(&oracle);
+        let mut competitor = serde_json::to_value(&oracle).unwrap();
         competitor["generation"] = json!(41);
         competitor["accepted_cache_heads"][cache_session_key("progress-rows-competitor")] =
             json!("f".repeat(64));
@@ -1241,7 +1365,7 @@ fn progress_rows_import_keeps_the_pending_ack_of_legacy_custody() {
             let path = session.path();
             let identity = control(&store(path), "identity").expect("a published identity");
             let (expected, imported_bytes) = if receipt_arm {
-                let mut next = durable(&oracle);
+                let mut next = serde_json::to_value(&oracle).unwrap();
                 next["generation"] = json!(oracle.generation + 1);
                 next["accepted_cache_heads"][cache_session_key("progress-rows-pending")] =
                     json!("a1".repeat(32));
@@ -1366,6 +1490,10 @@ fn progress_rows_damaged_cache_row_is_set_aside_and_the_next_upload_is_full() {
                 assert_leftovers_purged(path);
             }
             let mut expected = healthy.clone();
+            if import {
+                // The import adds the identity rows' scope to the ledger.
+                expected.accepted_identity_scope = progress.accepted_identity_scope.clone();
+            }
             if state {
                 expected.accepted_cache_states.remove(&key);
             } else {

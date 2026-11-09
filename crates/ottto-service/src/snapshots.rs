@@ -2331,7 +2331,7 @@ fn open_and_identify_scan_candidate(
 // The upload-progress rows of a routed source.
 pub(crate) use state_v2::{
     import_progress_rows, read_progress_ledger, read_progress_rows, ProgressMarker, ProgressPage,
-    ProgressRead, ProgressRows,
+    ProgressPoint, ProgressRead, ProgressRows,
 };
 // OPS diagnostics bridges; the private storage module stays private.
 pub(crate) use state_v2::state_v2_growth_retention_active;

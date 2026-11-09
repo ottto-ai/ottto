@@ -2107,9 +2107,11 @@ a later stripped/refused ACK cannot bless a new authority or missing presence.
 Restoration still requires current held proof. An always-missing sibling row
 has no accepted tagged fingerprint and is not spuriously refused.
 
-Limits are 16 sessions, 5,000 starts and 1,536 share-presence records per session.
-Each share record occupies 80 inline bytes on the requested 64-bit layout;
-the maximum requested-layout fixture is 2,628,072 bytes (below 3 MiB). Whole buckets are
+Limits are 5,000 starts and 1,536 share-presence records per session; sessions
+are not capped. On a routed destination each session's hints are one
+`progress.identity` row, read for the page's sessions before use and released
+after each durable save. Each share record occupies 80 inline bytes on the
+requested 64-bit layout; one maximal session is below 256 KiB. Whole buckets are
 evicted from the hint ledger at the share limit, never partial share sets;
 `accepted_state_unknown` counts attempts using incomplete or missing state.
 Eviction, timestamp-only migration and older-decoder loss degrade to currently
@@ -2196,16 +2198,15 @@ proves is a counted refusal; the replacement's ACK replaces it.
 A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
 body's marked rows, so a later revision re-tags them through the same
 allocator. A destination namespace or historical replay generation change
-clears all proved rows, as do key rotation and session eviction (the class L
-last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+clears all proved rows, as does key rotation. Limits: 1,024 proved rows per session, persisted as
 versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
 only). Each proved record also stores the proving revision's optional row-level
 account hash (class H, bounded and erased with the session). Login markers resend
 that ACK-bound hash for grain only; parts markers have no hash. Old records without
 hash provenance fail closed to fresh tags. Markers require contract 6
 (`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
-Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
-requested-layout maximum below 4 MiB.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap one session's hints stay below 512 KiB of JSON and
+256 KiB of requested layout.
 
 Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
 `retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
