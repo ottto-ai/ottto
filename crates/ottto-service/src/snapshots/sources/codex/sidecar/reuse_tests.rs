@@ -413,12 +413,26 @@ fn sqlite_witness_routes_and_refuses_moved_snapshot() {
     fs::write(f.0.join("state_5.sqlite-wal"), []).unwrap();
     let empty = SourceStamp::capture_sqlite(&path).unwrap();
     assert!(before.same(&empty));
-    assert!(matches!(empty, SourceStamp::Sqlite { wal: crate::transcript_acquisition::SqliteWal::Empty, .. }));
-    assert!(read.read(|_| Ok(())).is_err()); assert!(read.after_stamp().is_none());
+    assert!(matches!(
+        empty,
+        SourceStamp::Sqlite {
+            wal: crate::transcript_acquisition::SqliteWal::Empty,
+            ..
+        }
+    ));
+    assert!(read.read(|_| Ok(())).is_err());
+    assert!(read.after_stamp().is_none());
     fs::remove_file(f.0.join("state_5.sqlite-wal")).unwrap();
     let mut kept = StampedFacts::default();
-    let value: Result<_> = kept.reuse_or_load(0, || SourceStamp::capture_sqlite(&path).ok_or_else(|| std::io::Error::other("noncacheable")), || {
-        let db = Connection::open(&path)?; db.execute_batch("CREATE TABLE changed (n INTEGER)")?; Ok(7)
-    });
-    assert_eq!(value.unwrap(), 7); assert!(kept.kept.is_empty());
+    let value: Result<_> = kept.reuse_or_load(
+        0,
+        || SourceStamp::capture_sqlite(&path).ok_or_else(|| std::io::Error::other("noncacheable")),
+        || {
+            let db = Connection::open(&path)?;
+            db.execute_batch("CREATE TABLE changed (n INTEGER)")?;
+            Ok(7)
+        },
+    );
+    assert_eq!(value.unwrap(), 7);
+    assert!(kept.kept.is_empty());
 }
