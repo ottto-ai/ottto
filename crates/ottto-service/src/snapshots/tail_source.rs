@@ -18,7 +18,6 @@ pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
-pub(in crate::snapshots) mod refold_moved;
 pub(in crate::snapshots) mod seam;
 
 /// Every source's Tail codec: `$s` names the source's codec type inside
