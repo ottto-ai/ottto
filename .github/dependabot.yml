@@ -26,6 +26,31 @@ updates:
           - "*"
     commit-message:
       prefix: deps(runtime)
+    ignore:
+      # held: hash/output formatting changes; usage identity hashes need a dedicated reviewed migration
+      - dependency-name: sha2
+        versions: [">=0.11"]
+      - dependency-name: hmac
+        versions: [">=0.13"]
+      # held: newer Unicode tables change derived keys and filtering
+      - dependency-name: unicode-normalization
+        versions: [">0.1.25"]
+      # held: newer Unicode tables change nickname validation
+      - dependency-name: unicode-general-category
+        versions: [">=0.7"]
+      # held: one base64 in the lock; plist releases after 1.10.0 require base64 0.23
+      - dependency-name: base64
+        versions: [">=0.23"]
+      - dependency-name: plist
+        versions: [">1.10.0"]
+      # held: breaking API changes need a dedicated migration
+      - dependency-name: ureq
+        versions: [">=3"]
+      - dependency-name: toml_edit
+        versions: [">=0.23"]
+      # held: event dedup behaviour change
+      - dependency-name: notify-debouncer-full
+        versions: [">=0.7"]
 
   - package-ecosystem: cargo
     directory: /crates
@@ -40,3 +65,7 @@ updates:
           - "*"
     commit-message:
       prefix: deps(connectors)
+    ignore:
+      # held: moves together with the runtime workspace in one reviewed migration
+      - dependency-name: sha2
+        versions: [">=0.11"]
