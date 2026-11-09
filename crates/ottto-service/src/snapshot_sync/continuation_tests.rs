@@ -1391,3 +1391,59 @@ fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
     assert!(matches!(outcome, Outcome::Skipped(Skip::Platform)));
     assert_eq!(w.network.get(), 0);
 }
+
+/// [behaviour] A resident wake starts another ordinary pass, releases the
+/// sync lock while waiting, and adds no wake after a quiet successful drain.
+#[test]
+fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
+    struct OrdinaryLoop {
+        now: Instant,
+        cadence: SourceCadence,
+        lock: Mutex<()>,
+        waits: Vec<Duration>,
+    }
+    impl LoopHost for OrdinaryLoop {
+        fn now(&mut self) -> Instant {
+            self.now
+        }
+        fn wait(&mut self, wait: Duration) -> bool {
+            assert!(self.lock.try_lock().is_ok());
+            self.waits.push(wait);
+            self.now += wait;
+            false
+        }
+        fn pending(&mut self) -> Option<(Instant, Duration)> {
+            None
+        }
+        fn paced_due(&mut self) -> Option<Instant> {
+            self.cadence.paced_scan_due()
+        }
+        fn page(&mut self, _: Instant) -> Outcome {
+            panic!("no cursor page requested")
+        }
+    }
+    for pacing in [PACED_AC, PACED_BATTERY] {
+        let now = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        cadence.request_paced_scan(now, Duration::from_secs(103), pacing);
+        cadence.clear_cursor_continuation(); // ordinary prepare drops only a cursor.
+        assert!(cadence.continuation_due(PACING).is_none());
+        let mut host = OrdinaryLoop {
+            now,
+            cadence,
+            lock: Mutex::new(()),
+            waits: Vec::new(),
+        };
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [pacing.min_gap]);
+        assert_eq!(host.cadence.next_scan_after(host.now), Duration::ZERO);
+        host.cadence.record_scan_success(host.now, 0);
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [pacing.min_gap, SNAPSHOT_SYNC_INTERVAL]);
+        host.cadence
+            .request_paced_scan(host.now, Duration::from_secs(103), pacing);
+        host.cadence.record_scan_failure(host.now);
+        assert!(host.cadence.paced_scan_due().is_none());
+    }
+}

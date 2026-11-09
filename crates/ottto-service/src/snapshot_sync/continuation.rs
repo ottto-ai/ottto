@@ -205,8 +205,8 @@ pub(super) trait CursorContinuation {
     ) -> PageEnd;
 }
 
-/// A platform answer. Anything but `Allowed` falls back to the ordinary
-/// cadence.
+/// Cursor pages require `Allowed`; resident-paced ordinary passes also
+/// accept `Battery`. Refused and unknown power keep the ordinary cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlatformState {
     Allowed,
