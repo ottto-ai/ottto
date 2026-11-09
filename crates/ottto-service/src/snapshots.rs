@@ -223,9 +223,9 @@ pub(crate) mod durable_sources;
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
 mod held_audit_restore_tests;
-pub(crate) mod line_delivery;
+pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
-mod line_delivery_tests;
+use scan::lines::delivery::tests as line_delivery_tests;
 mod oversized_discovery;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;

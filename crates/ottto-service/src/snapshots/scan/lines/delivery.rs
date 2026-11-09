@@ -192,3 +192,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for LineDelivery {
         c.add(std::mem::size_of_val(&*self.observer).checked_add(self.declared_heap_bytes)?)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
