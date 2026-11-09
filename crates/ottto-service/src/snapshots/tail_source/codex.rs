@@ -44,7 +44,7 @@ const REQUESTS_G: u32 = 64;
 const COMPACTIONS_G: u32 = 64;
 const SLOTS_FIELD: &str = "SnapshotAccumulator.codex_dictionary_slots";
 // `install_live`'s refusals, by the check that refused, as their counter labels.
-const INCOMPATIBLE_SIDECAR_BINDING: &str = "incompatible_sidecar_binding";
+pub(super) const INCOMPATIBLE_SIDECAR_BINDING: &str = "incompatible_sidecar_binding";
 const INCOMPATIBLE_COUNTING_VERSION: &str = "incompatible_counting_version";
 const INCOMPATIBLE_PRIORITY_WITNESS: &str = "incompatible_priority_witness";
 const INCOMPATIBLE_PRIORITY_DECISION: &str = "incompatible_priority_decision";
