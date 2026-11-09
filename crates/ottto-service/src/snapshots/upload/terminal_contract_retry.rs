@@ -297,3 +297,6 @@ pub(crate) fn group_body_bytes<T>(run: impl FnOnce() -> T) -> (T, u64) {
     let bytes = GROUP_BODY_BYTES.with(|value| value.replace(None).unwrap());
     (result, bytes)
 }
+
+#[cfg(test)]
+mod tests;
