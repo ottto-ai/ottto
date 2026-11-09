@@ -95,17 +95,9 @@ fn context_posture_survives_a_split_family_refold() {
         let scanner = E2ScanFixture::capturing_identity();
         let mut seed = c.raw(&scanner, index, 100, true, &[]);
         seed.enrich(&c);
-        let mut cold_page = c.raw(
-            &E2ScanFixture::capturing_identity(),
-            ScanIndex::default(),
-            100,
-            false,
-            &[],
-        );
-        ordinary_tail_root(&mut cold_page, &root_path);
-        cold_page.enrich(&c);
-        let cold = result(&cold_page, Mode::ColdFull);
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         assert!(accounts(&cold).len() >= 2, "two placed accounts");
+        money_oracle::assert_equivalent(&cold, &result(&seed, Mode::Ram));
         let prior = commit(&session, seed);
         let trace_path = c
             .support
@@ -127,7 +119,6 @@ fn context_posture_survives_a_split_family_refold() {
         );
         ordinary_tail_root(&mut together, &root_path);
         together.enrich(&c);
-        money_oracle::assert_equivalent(&cold, &result(&together, Mode::Restart));
         let child = format!("{ROOT}_agent-000");
         assert!(
             body(&together, ROOT).is_some(),
