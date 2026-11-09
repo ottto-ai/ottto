@@ -181,6 +181,11 @@ presence for probes.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
   reconstructing them. No historical sessions are selected just to enrich metadata.
+- Claude Desktop store discovery reads ordinary directories at any depth, retaining
+  symlink rejection and the per-scan entry budget. Its identity census token enters a
+  session fingerprint only when that session carries original Desktop identity evidence.
+  Titles, account evidence and spawn lineage keep their independent fingerprint inputs.
+  A census restart records the discarded checkpoint before starting a replacement walk.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full audit credit or upload acceptance.

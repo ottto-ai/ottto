@@ -194,7 +194,7 @@ impl ClaudeTitleMetadata {
         parts.extend([
             "original_session_carrier:v1",
             &original_identity,
-            if self.original_identity_census_incomplete {
+            if self.original_identity_census_incomplete && !original_identity.is_empty() {
                 "incomplete"
             } else {
                 "complete"
