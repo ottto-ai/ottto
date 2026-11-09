@@ -18,8 +18,21 @@ struct Wave {
     receipts: BTreeMap<String, Value>,
 }
 
-fn final_view(mut routes: Vec<RouteResult>, progress: &SnapshotUploadProgress) -> RouteResult {
-    let mut result = routes.remove(0);
+fn final_view(
+    mut routes: Vec<RouteResult>,
+    progress: &SnapshotUploadProgress,
+    prior: Option<&RouteResult>,
+) -> RouteResult {
+    let mut result = if routes.is_empty() {
+        let mut result = prior
+            .expect("a quiet update needs prior accepted proof")
+            .clone();
+        result.batches.clear();
+        result.snapshots.clear();
+        result
+    } else {
+        routes.remove(0)
+    };
     for route in routes {
         for (entity, body) in route.snapshots {
             assert!(
@@ -28,6 +41,19 @@ fn final_view(mut routes: Vec<RouteResult>, progress: &SnapshotUploadProgress) -
             );
         }
         result.batches.extend(route.batches);
+    }
+    if let Some(prior) = prior {
+        for (entity, body) in &prior.snapshots {
+            if !result.snapshots.contains_key(entity) {
+                let accepted = &prior.accepted[entity];
+                let fp = body["snapshot_fingerprint"].as_str().unwrap();
+                assert_eq!(
+                    progress.accepted_body_witnesses.get(fp),
+                    Some(&accepted.witness)
+                );
+                result.snapshots.insert(entity.clone(), body.clone());
+            }
+        }
     }
     // Canonicalize only batch framing/order, after every original envelope was
     // validated against its actual typed item by RouteResult::emitted.
@@ -65,7 +91,14 @@ fn canonical_entities(result: &mut RouteResult) {
 }
 
 fn drain(c: &Corpus, budget: f64, restart: bool) -> Wave {
-    drain_from(c, budget, restart, ScanIndex::default(), e2_progress())
+    drain_from(
+        c,
+        budget,
+        restart,
+        ScanIndex::default(),
+        e2_progress(),
+        None,
+    )
 }
 
 fn drain_from(
@@ -74,6 +107,7 @@ fn drain_from(
     restart: bool,
     mut index: ScanIndex,
     mut progress: SnapshotUploadProgress,
+    prior: Option<&RouteResult>,
 ) -> Wave {
     let mut scanner = E2ScanFixture::capturing_identity();
     if let Some(route) = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index) {
@@ -98,7 +132,36 @@ fn drain_from(
         let sent = under_required_cas(&page.scan.snapshots, &progress);
         let (status, batches, _) = upload(&sent, &mut progress, ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        if !sent.is_empty() {
+        let posted = batches
+            .iter()
+            .flat_map(|bytes| {
+                let wire: Value = serde_json::from_slice(bytes).unwrap();
+                wire["snapshots"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+        for item in sent
+            .iter()
+            .filter(|item| !posted.contains(&item.snapshot_fingerprint))
+        {
+            assert_eq!(
+                progress
+                    .accepted_body_witnesses
+                    .get(&item.snapshot_fingerprint),
+                Some(&snapshot_upload_body_witness(item)),
+                "unchanged body must already have exact ACK proof"
+            );
+        }
+        let posted_items = sent
+            .iter()
+            .filter(|item| posted.contains(&item.snapshot_fingerprint))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !posted_items.is_empty() {
             routes.push(RouteResult::emitted(
                 if budget.is_infinite() {
                     Mode::ColdFull
@@ -109,7 +172,7 @@ fn drain_from(
                 },
                 SnapshotSource::ClaudeCode,
                 batches,
-                &sent,
+                &posted_items,
             ));
         }
         settle_index_after_upload(&mut page.index, &page.committed, &progress);
@@ -143,8 +206,8 @@ fn drain_from(
         }
     }
     assert!(complete, "eventual drain for finite stable work");
-    assert!(!routes.is_empty());
-    let route = final_view(routes, &progress);
+    assert!(!routes.is_empty() || prior.is_some());
+    let route = final_view(routes, &progress, prior);
     let receipts = index
         .files
         .iter()
@@ -497,11 +560,19 @@ fn resident_wave_source_changed_tail_refolds_match_one_page() {
                     false,
                     wide_seed.index,
                     wide_seed.progress,
+                    Some(&wide_seed.route),
                 )
             });
         let (small, s_bytes) =
             crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
-                drain_from(&c, 0.087_100_1, true, small_seed.index, small_seed.progress)
+                drain_from(
+                    &c,
+                    0.087_100_1,
+                    true,
+                    small_seed.index,
+                    small_seed.progress,
+                    Some(&small_seed.route),
+                )
             });
         assert_eq!((w_bytes, s_bytes), (0, 0));
         assert_eq!(wide.pages, 1);
