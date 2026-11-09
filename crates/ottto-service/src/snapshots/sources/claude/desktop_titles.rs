@@ -101,7 +101,6 @@ pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
 #[cfg(test)]
 pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 32;
 pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
 
 impl ClaudeTitleMetadata {
@@ -868,7 +867,7 @@ struct ClaudeDesktopStoreCensus {
     discovered_file_count: usize,
     unreadable_path_count: usize,
     symlink_rejected_count: usize,
-    depth_exceeded_count: usize,
+    max_depth_seen: usize,
     invalid_file_count: usize,
     entry_budget_exceeded_count: usize,
     #[serde(skip)]
@@ -880,7 +879,6 @@ impl ClaudeDesktopStoreCensus {
         self.profile_discovery_incomplete_count > 0
             || self.unreadable_path_count > 0
             || self.symlink_rejected_count > 0
-            || self.depth_exceeded_count > 0
             || self.invalid_file_count > 0
             || self.entry_budget_exceeded_count > 0
     }
@@ -960,10 +958,7 @@ fn collect_claude_desktop_session_files(
     selection: &mut BoundedPathSelection,
     census: &mut ClaudeDesktopStoreCensus,
 ) {
-    if depth > MAX_CLAUDE_DESKTOP_STORE_DEPTH {
-        census.depth_exceeded_count += 1;
-        return;
-    }
+    census.max_depth_seen = census.max_depth_seen.max(depth);
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -1167,3 +1162,6 @@ crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+
+#[cfg(test)]
+mod depth_tests;
