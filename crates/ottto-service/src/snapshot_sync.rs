@@ -19743,10 +19743,14 @@ mod tests {
     /// [regress] Sidecar hit/reload counters reach the existing emitted scan row.
     #[test]
     fn sidecar_reuse_counters_reach_emitted_row() {
-        let scan = SourceScanResult {
-            local_codex_diagnostics: Some(CodexScanDiagnostics::default()),
-            ..Default::default()
-        };
+        let scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Codex,
+            &[],
+            &mut ScanIndex::default(),
+            "2026-11-09T12:00:00Z",
+            30,
+        )
+        .unwrap();
         let row = SyncCounts::from_scan_result(&scan, 0, 30).terminal_census_line("codex");
         for field in [
             "state_5_reused=0",
