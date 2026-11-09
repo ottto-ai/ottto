@@ -13,9 +13,4 @@ ignore = [
     # >= 0.41 (advisories published 2026-06-29).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # RUSTSEC-2026-0459: libsqlite3-sys < 0.39 bundles a C SQLite with
-    # CVE-2026-119375. Temporary: the fix is rusqlite 0.41.x with
-    # libsqlite3-sys 0.39, which is in progress. Remove this entry in the
-    # same PR that makes that upgrade (advisory published 2026-11-09).
-    "RUSTSEC-2026-0459",
 ]
