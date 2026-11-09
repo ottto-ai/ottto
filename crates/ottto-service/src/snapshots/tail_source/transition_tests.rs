@@ -858,6 +858,8 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     let mut cold = Vec::new();
     let reconstructions =
         super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding");
+    let loads = |label: &'static str| super::super::counters::total("tail_db_loads", label);
+    let (binding_loads, error_loads) = (loads("sidecar_binding"), loads("error"));
     for (n, path) in paths.iter().enumerate() {
         let key = local_index_key(path);
         let mut parser = open_with(path, &after);
@@ -907,6 +909,11 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     assert_eq!(
         super::super::counters::total("tail_reconstruct", "incompatible_sidecar_binding"),
         reconstructions + 1
+    );
+    assert_eq!(
+        (loads("sidecar_binding"), loads("error")),
+        (binding_loads + 1, error_loads),
+        "a sidecar-binding reconstruct counts under its own load outcome"
     );
     assert!(
         !cold.iter().any(|item| item.source_session_id == SESSION),

@@ -1,6 +1,8 @@
 use super::*;
 use crate::snapshots::state_v2::sqlite_sidecar as sidecar;
-use crate::snapshots::state_v2::upload_history::{QUERIES_FOR_TEST, RETENTION_NS};
+use crate::snapshots::state_v2::upload_history::{
+    MMAP_BYTES_FOR_TEST, QUERIES_FOR_TEST, RETENTION_NS,
+};
 use crate::test_scratch::ScratchDir;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -22,7 +24,13 @@ fn open(dir: &Path) -> Store {
         .mode(0o700)
         .create(&snapshots)
         .unwrap();
-    Store::open(&Store::path(&snapshots)).unwrap()
+    let store = Store::open(&Store::path(&snapshots)).unwrap();
+    let actual: i64 = store
+        .conn_for_test()
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(actual, MMAP_BYTES_FOR_TEST);
+    store
 }
 
 fn row(at_ns: i64, source: SourceKind, items: usize) -> Encoded {

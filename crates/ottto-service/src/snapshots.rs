@@ -1,3 +1,5 @@
+#![deny(clippy::mod_module_files)]
+
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     RecoveryLineage, SidecarOpenCounts, StateRowFieldDiffs, UnreadableCause, UnreadableCauses,
@@ -35,15 +37,16 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
 macro_rules! discovery_retention {
-    ($index:expr, $growth:expr) => {
+    ($index:expr_2021, $growth:expr_2021) => {
         $crate::snapshots::DiscoveryRetention {
             growth: Some($growth),
             ..discovery_retention!($index)
         }
     };
-    ($index:expr) => {
+    ($index:expr_2021) => {
         $crate::snapshots::DiscoveryRetention {
             files: &$index.files,
+            confirmed_empty: &$index.confirmed_empty_files,
             account_holds: &$index.claude_account_deferred_holds,
             memo: Some(&$index.withheld_memo),
             growth: None,
@@ -58,7 +61,7 @@ macro_rules! discovery_retention {
 macro_rules! process_state {
     (
         $(#[$attr:meta])*
-        $vis:vis fn $with:ident: $ty:ty = $init:expr; clear_poison: $clear:literal
+        $vis:vis fn $with:ident: $ty:ty = $init:expr_2021; clear_poison: $clear:literal
     ) => {
         $(#[$attr])*
         $vis fn $with<T>(body: impl FnOnce(&mut $ty) -> T) -> T {
@@ -85,13 +88,14 @@ macro_rules! process_state {
     };
 }
 
-pub(crate) mod cache_observations;
+pub(crate) use usage::cache_observations;
+
+use scan::read_cause as change_reason;
+use sources::claude::context_file_birth as claude_context_file_birth;
 #[cfg(test)]
-pub(crate) mod cache_overcap_tests;
-mod change_reason;
-mod claude_context_file_birth;
+pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
 pub(crate) mod claude_cross_root_evidence;
-mod upload_context_read;
+use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
@@ -100,23 +104,22 @@ pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 #[cfg(test)]
-mod upload_policy_tests;
+pub(crate) use claude_context_file_birth::with_remembered_tripwire_restored_for_test;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
-#[cfg(test)]
-mod codex_creator_slot_tests;
-mod codex_root_copies;
-pub(crate) mod ownership_diagnostics;
+use sources::codex::root_copies as codex_root_copies;
+
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
     local_count as history_local_count, with_max_gated_claude_revision,
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use ownership_diagnostics as ownership;
+pub(crate) use scan::ownership_diagnostics;
 #[cfg(test)]
 mod admission_reoffer_window_tests;
 mod claude_family_census_shadow;
@@ -129,8 +132,9 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
-mod g7_debt;
-pub(crate) mod money_freshness;
+use upload::freshness_debt as g7_debt;
+pub(crate) use upload::money_freshness;
+
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 mod shared_value;
@@ -168,28 +172,17 @@ pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
-mod codex_context_window_tests;
-#[cfg(test)]
-mod codex_counting_lifecycle_tests;
-#[cfg(test)]
-mod codex_counting_rss_tests;
-#[cfg(test)]
 mod codex_counting_v2_tests;
-mod codex_counting_version;
-mod codex_dictionary_slots;
+use sources::codex::counting::version as codex_counting_version;
+use sources::codex::dictionary_slots as codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
-#[cfg(test)]
-mod file_set_digest_tests;
+
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
-#[cfg(test)]
-mod claude_response_compaction_tests;
-mod claude_response_records;
-#[cfg(test)]
-mod claude_thinking_tokens_tests;
+use sources::claude::response_records as claude_response_records;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -209,22 +202,20 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::LocalContextPoints;
-mod codex_fragment;
-pub(crate) mod codex_version;
+use sources::codex::eof_fragment as codex_fragment;
+pub(crate) use sources::codex::mcp_version as codex_version;
 pub(crate) mod discovery_growth;
 #[cfg(test)]
 mod discovery_growth_tests;
 #[cfg(unix)]
-pub(crate) mod durable_sources;
+pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
-mod first_read_tests;
-#[cfg(test)]
 mod held_audit_restore_tests;
-pub(crate) mod line_delivery;
+pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
-mod line_delivery_tests;
+use scan::lines::delivery::tests as line_delivery_tests;
 mod oversized_discovery;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
@@ -236,9 +227,7 @@ mod source_erasure_tests;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
-#[cfg(test)]
-mod usage_occurrence_retention_tests;
-pub(crate) mod withheld_account;
+pub(crate) use sources::claude::account::withheld as withheld_account;
 #[cfg(test)]
 mod withheld_owner_charge_tests;
 use crate::local_resource_diagnostics::CodexZstCause;
@@ -472,16 +461,10 @@ pub(crate) use sources::claude::census::authority_proof_correction::{
 };
 include!("snapshots/load_containment.rs");
 
-#[cfg(test)]
-mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
-#[cfg(test)]
-mod pi_ledger_tests;
-pub(crate) mod terminal_contract_retry;
-#[cfg(test)]
-mod terminal_contract_retry_tests;
+pub(crate) use upload::terminal_contract_retry;
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -1267,9 +1250,9 @@ use scan::lines::apply::{
 };
 use sources::claude::line::claude_cache_request_slot;
 #[cfg(test)]
-use usage::cache_observations::cache_state_within_limits;
-use usage::cache_observations::cache_wire;
-pub(crate) use usage::cache_observations::{
+use usage::cache_observations::upload::cache_state_within_limits;
+use usage::cache_observations::upload::cache_wire;
+pub(crate) use usage::cache_observations::upload::{
     cache_state_from_echo, cache_state_from_patch, prepare_cache_observations,
 };
 
@@ -1483,12 +1466,14 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
-#[cfg(test)]
-pub(crate) use claude_reemission_exclusions::restart_claude_reemission_stop_for_test;
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
     note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) use claude_reemission_exclusions::{
+    restart_claude_reemission_stop_for_test, with_claude_reemission_stop_restored_for_test,
 };
 
 #[cfg(test)]
@@ -2303,7 +2288,7 @@ pub(crate) fn state_v2_baseline_release(
 pub(crate) fn state_v2_side_effect_guard(
     path: &Path,
     index: &ScanIndex,
-) -> impl Fn() -> Result<()> {
+) -> impl Fn() -> Result<()> + use<> {
     let runtime = index.v2().persistence_v2.clone();
     // This guard belongs to this graph, not to the mutable shared connection.
     // After adopting a successful save, construct a new guard for further IO.
@@ -2343,8 +2328,11 @@ fn open_and_identify_scan_candidate(
     )
 }
 
-// Opaque v2-only companion for the unchanged upload-progress store.
-pub(crate) use state_v2::ack::{ProgressRecovery, ProgressSeal};
+// The upload-progress rows of a routed source.
+pub(crate) use state_v2::{
+    import_progress_rows, read_progress_ledger, read_progress_rows, ProgressMarker, ProgressPage,
+    ProgressPoint, ProgressRead, ProgressRows,
+};
 // OPS diagnostics bridges; the private storage module stays private.
 pub(crate) use state_v2::state_v2_growth_retention_active;
 pub(crate) fn state_v2_pass_start() {
@@ -2471,7 +2459,7 @@ pub(crate) use state_v2::{
 pub(crate) fn state_v2_recovery_save_guard(
     path: &Path,
     index: &ScanIndex,
-) -> Result<Option<impl Fn() -> Result<()>>> {
+) -> Result<Option<impl Fn() -> Result<()> + use<>>> {
     state_v2::recovery_save_guard(path, index)
 }
 

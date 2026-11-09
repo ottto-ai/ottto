@@ -3102,6 +3102,8 @@ mod tests {
         assert_eq!(mem["largest_root_rows"], 4);
         assert_eq!(mem["largest_root_kept"], true);
         assert_eq!(mem["legacy_owners"], 2);
+        assert_eq!(mem["groups"], 1);
+        assert!(mem["side_file_bytes"].as_u64().unwrap() > 0);
         let in_use = mem["in_use_bytes"].as_array().unwrap();
         assert_eq!(in_use.len(), 3);
         assert!(in_use
@@ -3116,8 +3118,10 @@ mod tests {
                 .count(),
             1
         );
-        // Each fold step has one footprint record, closed in order after the
-        // read and before the fold window that contains it.
+        // Each fold step of the (one) evidence chunk has one footprint record,
+        // closed in order after the read and before the fold window that
+        // contains it; census health runs once per page, after every chunk,
+        // inside the page's stage window.
         let fold_steps = [
             "evidence_read",
             "evidence_side_calls",
@@ -3127,8 +3131,8 @@ mod tests {
             "evidence_finish_page",
             "evidence_identity_tags",
             "evidence_qualification",
-            "evidence_census_health",
             "evidence_fold",
+            "evidence_census_health",
             "claude_local_evidence",
         ];
         let stages = records
@@ -3536,6 +3540,186 @@ mod tests {
             assert!(read.evidence.is_empty());
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// [format] Golden protobuf decode of a Claude Code `api_request` log
+    /// export. The wire bytes are written by hand, not by prost, so the test
+    /// pins what the daemon decodes from Claude's bytes (tokens, cost, model,
+    /// ids, clocks, identity) across prost upgrades. Unknown fields at several
+    /// levels, a skipped record and non-scalar attributes must not change it.
+    #[test]
+    fn protobuf_api_request_golden_decode() {
+        fn varint(mut value: u64, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push((value as u8) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+        fn len_field(tag: u64, bytes: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            varint((tag << 3) | 2, &mut out);
+            varint(bytes.len() as u64, &mut out);
+            out.extend_from_slice(bytes);
+            out
+        }
+        fn fixed64_field(tag: u64, value: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            varint((tag << 3) | 1, &mut out);
+            out.extend_from_slice(&value.to_le_bytes());
+            out
+        }
+        fn varint_field(tag: u64, value: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            varint(tag << 3, &mut out);
+            varint(value, &mut out);
+            out
+        }
+        // AnyValue oneof: 1 string, 2 bool, 3 int64, 4 double, 5 array.
+        let string = |value: &str| len_field(1, value.as_bytes());
+        let int = |value: i64| varint_field(3, value as u64);
+        let double = |value: f64| fixed64_field(4, value.to_bits());
+        // KeyValue { key: 1, value: 2 }; Resource.attributes is field 1 and
+        // LogRecord.attributes field 6.
+        let key_value = |key: &str, value: Vec<u8>| {
+            [len_field(1, key.as_bytes()), len_field(2, &value)].concat()
+        };
+        let resource_attr = |key: &str, value: Vec<u8>| len_field(1, &key_value(key, value));
+        let attr = |key: &str, value: Vec<u8>| len_field(6, &key_value(key, value));
+        let resource = len_field(
+            1,
+            &[
+                resource_attr("service.name", string("claude-code")),
+                resource_attr("service.version", string("2.1.226")),
+                resource_attr("session.id", string("sess-golden")),
+                resource_attr(
+                    "user.account_uuid",
+                    string("123E4567-E89B-12D3-A456-426614174000"),
+                ),
+                // Resource.dropped_attributes_count: unknown to the decoder.
+                varint_field(2, 3),
+            ]
+            .concat(),
+        );
+        let record_attrs = [
+            attr("model", string("claude-opus-5")),
+            attr("effort", string("XHigh")),
+            attr("request_id", string("req_golden")),
+            attr("client_request_id", string("client-golden")),
+            attr("query_source", string("main")),
+            attr("speed", string("fast")),
+            attr(
+                "organization.id",
+                string("0f8fad5b-d9cb-469f-a165-70867728950e"),
+            ),
+            attr("cost_usd", double(0.001234)),
+            attr("event.sequence", int(17)),
+            attr("input_tokens", int(1200)),
+            attr("output_tokens", int(345)),
+            attr("cache_read_tokens", int(98_765)),
+            attr("cache_creation_tokens", int(2014)),
+            attr("reasoning_tokens", int(56)),
+            attr("retry", varint_field(2, 1)),
+            attr("prompt", string("must-not-persist")),
+            attr("tools", len_field(5, &len_field(1, &string("Read")))),
+        ]
+        .concat();
+        let api_record = [
+            fixed64_field(1, 1_785_708_000_123_456_789),
+            // severity_number and severity_text: unknown to the decoder.
+            varint_field(2, 9),
+            len_field(3, b"INFO"),
+            len_field(5, &string("claude_code.api_request")),
+            record_attrs,
+            fixed64_field(11, 1_785_708_001_000_000_000),
+            // A field number no OTLP version defines.
+            len_field(99, b"future"),
+        ]
+        .concat();
+        let skipped_record = [
+            fixed64_field(1, 1_785_708_000_000_000_000),
+            len_field(5, &string("claude_code.tool_result")),
+            attr("session.id", string("sess-golden")),
+            attr("model", string("claude-opus-5")),
+        ]
+        .concat();
+        let scope_logs = [
+            // InstrumentationScope (tag 1) and schema_url (tag 3): unknown.
+            len_field(1, &len_field(1, b"com.anthropic.claude_code")),
+            len_field(2, &api_record),
+            len_field(2, &skipped_record),
+            len_field(3, b"https://opentelemetry.io/schemas/1.27.0"),
+        ]
+        .concat();
+        let body = len_field(
+            1,
+            &[resource, len_field(2, &scope_logs), len_field(3, b"schema")].concat(),
+        );
+
+        let mut rows = api_evidence_from_protobuf(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows.remove(0);
+        let hash =
+            |kind: &str, uuid: &str| ottto_core::billing_identity_hash("anthropic", kind, uuid);
+        let account = hash("account", "123e4567-e89b-12d3-a456-426614174000");
+        let organization = hash("organization", "0f8fad5b-d9cb-469f-a165-70867728950e");
+        assert!(account.is_some() && organization.is_some());
+        let expected = ClaudeLocalOtelEvidence {
+            capture_revision: API_REQUEST_CAPTURE_REVISION.into(),
+            // Derived from the fields below by serde and SHA-256, not by prost.
+            fingerprint: row.fingerprint.clone(),
+            session_id: "sess-golden".into(),
+            request_id: "req_golden".into(),
+            client_request_id: "client-golden".into(),
+            observed_at: "2026-08-02T22:00:00.123456789Z".into(),
+            model: "claude-opus-5".into(),
+            effort: "xhigh".into(),
+            query_source: "main".into(),
+            speed: "fast".into(),
+            cost_usd_micros: Some(1_234),
+            event_sequence: Some(17),
+            app_version: "2.1.226".into(),
+            input_tokens: 1200,
+            output_tokens: 345,
+            cache_read_tokens: 98_765,
+            cache_creation_tokens: 2014,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 56,
+            request_count: 1,
+            account_identity_checked: true,
+            account_identifier_hash: account.as_deref().map(Arc::from),
+            request_identity: Some(Arc::new(ClaudeRequestIdentityEvidence {
+                identity_hash_scheme: "provider-sha256:v1".into(),
+                account: ClaudeIdentityAttributeEvidence {
+                    origin: ClaudeIdentityAttributeOrigin::Resource,
+                    disposition: ClaudeIdentityDisposition::Complete,
+                    resource_hash: account.clone(),
+                    log_record_hash: None,
+                },
+                organization: ClaudeIdentityAttributeEvidence {
+                    origin: ClaudeIdentityAttributeOrigin::LogRecord,
+                    disposition: ClaudeIdentityDisposition::Complete,
+                    resource_hash: None,
+                    log_record_hash: organization.clone(),
+                },
+                disposition: ClaudeIdentityDisposition::Complete,
+            })),
+            fingerprint_check: FingerprintCheck::default(),
+        };
+        assert_eq!(row, expected);
+        let mut unhashed = row.clone();
+        unhashed.fingerprint.clear();
+        assert_eq!(
+            row.fingerprint,
+            format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&unhashed).unwrap())
+            )
+        );
+        assert!(!serde_json::to_string(&row)
+            .unwrap()
+            .contains("must-not-persist"));
     }
 }
 

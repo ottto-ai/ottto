@@ -18,14 +18,13 @@ pub(in crate::snapshots) mod codex;
 pub(in crate::snapshots) mod counters;
 pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
-pub(in crate::snapshots) mod refold_moved;
 pub(in crate::snapshots) mod seam;
 
 /// Every source's Tail codec: `$s` names the source's codec type inside
 /// `$arm`. A source joins by adding its arm here, never through its
 /// `state_v2` registry flag.
 macro_rules! with_codec {
-    ($source:expr, $s:ident => $arm:expr) => {
+    ($source:expr_2021, $s:ident => $arm:expr_2021) => {
         match $source {
             SnapshotSource::ClaudeCode => {
                 type $s = claude::Claude;
@@ -966,7 +965,7 @@ crate::durable_tail_codec::durable_struct!(SessionArtifact {
 
 macro_rules! head_fields {
     ($({ $($c:ident $f:ident : $ty:ty,)* }
-        retired { $($rc:ident $rf:ident : $rty:ty = $empty:expr => $old:ident : $shape:ty,)* })*
+        retired { $($rc:ident $rf:ident : $rty:ty = $empty:expr_2021 => $old:ident : $shape:ty,)* })*
         last { $($last_c:ident $last_f:ident : $last_ty:ty,)* }) => {
         fn put_fields(acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
             let SnapshotAccumulator { $($($f,)*)* $($last_f,)* } = acc;

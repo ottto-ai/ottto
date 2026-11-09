@@ -143,6 +143,25 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+## CLI status metadata
+
+Codex login state and bundled model metadata are cached in RAM per home while the
+canonical CLI binary, `auth.json` and `config.toml` file stamps match, for at most
+60 minutes. Stamp capture uses metadata only. Missing auth, nonregular inputs,
+failed commands and inputs changed during loading are never kept. Setup reads
+bypass reuse and refresh successful facts. Only the full status listing evicts
+removed homes; account-screen reads never evict other homes.
+
+Login is reused only when this pass's fresh auth read supplies email, plan,
+subscription product and billing channel. Otherwise CLI account fields are read
+fresh and merged exactly as before. The cache retains only the login enum.
+Cached login facts contain no account, email, plan or identity. Auth-file and
+provider identity reads and config-model application keep their ordinary freshness.
+Claude version detection uses the same helper with only its binary stamp. Pi
+model listings remain uncached because their output depends on Pi config/auth.
+Existing resource records carry fixed command classes, child starts and per-PID
+child CPU totals; arguments, paths and command output are never included.
+
 ## Stores
 
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
@@ -257,10 +276,25 @@ the target, not an enforced layout; today most code still sits in `snapshots.rs`
 
 Move-only changes are checked with `scripts/check_move_ledger.py` (every item moves byte for byte,
 except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
-have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and
-wrappers change; edits to listed validator files that anchor on moved code are reported) and
+have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
+change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
+multiplicity; modules with moved items reject every added glob and every added explicit binding
+beside an item-level macro call; edits to listed validator files that anchor on moved code are
+reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).
+Whole-file moves are checked with `scripts/check_file_moves.py move` (a module file and every
+file below it move byte for byte; only the old parent's `mod` line, one facade alias at the old
+name and the new parent's `mod` line change; no `super` path in a moved file reaches outside its
+subtree), after an optional change checked with `scripts/check_file_moves.py absolutize` that only
+replaces such `super` paths with the `crate::` path they denote. Both modes are built for
+accidental changes by trusted authors and fail on what they cannot reason about (include edges
+into moved files, unlisted derives, attributes and item-level macros, allowlisted names rebound
+anywhere in the crate, macros reached through `use .. as` aliases or `$m!` forwarding, location
+macros, glob importers that see the new name, globs whose private items change with the move,
+unknown Cargo targets, old-path strings after decoding escapes and normalizing separators and
+case) and print their limits: implicit log targets, panic locations, approved derives assumed
+context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
 
 ## Never drop data

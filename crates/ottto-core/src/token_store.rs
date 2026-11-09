@@ -986,7 +986,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("ottto-secret-fallback-test-{}", std::process::id()));
         let previous = std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV);
-        std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, &dir);
+        unsafe { std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, &dir) };
 
         let account = "setup/run:token";
         assert_eq!(secret_file_name(account), "setup_run_token");
@@ -1019,9 +1019,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         if let Some(previous) = previous {
-            std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, previous);
+            unsafe { std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, previous) };
         } else {
-            std::env::remove_var(OTTTO_SECRET_FALLBACK_DIR_ENV);
+            unsafe { std::env::remove_var(OTTTO_SECRET_FALLBACK_DIR_ENV) };
         }
     }
 

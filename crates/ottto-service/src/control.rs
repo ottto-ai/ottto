@@ -13588,7 +13588,7 @@ fn run_bounded_command(
     if let Some(login) = claude_login.as_ref() {
         crate::claude_spawn_gate::pin_claude_login(&mut command, login);
     }
-    let mut child = match command.spawn() {
+    let mut child = match crate::local_resource_diagnostics::cli_children::spawn(&mut command) {
         Ok(child) => child,
         Err(_) => {
             return SmokeResult {
@@ -13640,9 +13640,11 @@ fn run_bounded_command(
             }
             Ok(None) if start.elapsed() >= timeout => {
                 let left_running = match claude_login.as_ref() {
-                    Some(login) => {
-                        crate::claude_spawn_gate::stop_claude_child(child, login, "smoke")
-                    }
+                    Some(login) => crate::claude_spawn_gate::stop_claude_child(
+                        child.into_inner(),
+                        login,
+                        "smoke",
+                    ),
                     None => {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -18839,14 +18841,14 @@ for line in sys.stdin:
 
         fn set_os(key: &'static str, value: OsString) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         /// Temporarily unset an env var, restoring it (or its absence) on drop.
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
-            std::env::remove_var(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -18854,9 +18856,9 @@ for line in sys.stdin:
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -32603,7 +32605,7 @@ X-API-Key = "otel_redacted"
             let original = pending.claim_commit.clone().unwrap();
             authority(&mut pending).canonical_snapshot_namespace = None;
             edit(&mut pending, &mut prior);
-            let prior = Some(&prior).filter(|_| row != "no prior");
+            let prior = (row != "no prior").then_some(&prior);
             continue_prior_snapshot_namespace(&mut pending, prior);
             // A claim the commit validator refuses cannot promote at all.
             let commit = pending.claim_commit.get_or_insert_with(|| original.clone());

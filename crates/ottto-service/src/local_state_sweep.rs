@@ -806,7 +806,7 @@ fn stat_at(dir: RawFd, name: &CStr) -> std::io::Result<Identity> {
     if status != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Identity::from_stat(unsafe { &stat.assume_init() }))
+    Ok(Identity::from_stat(unsafe { stat.assume_init_ref() }))
 }
 
 fn stat_fd(fd: RawFd) -> std::io::Result<Identity> {
@@ -814,7 +814,7 @@ fn stat_fd(fd: RawFd) -> std::io::Result<Identity> {
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Identity::from_stat(unsafe { &stat.assume_init() }))
+    Ok(Identity::from_stat(unsafe { stat.assume_init_ref() }))
 }
 
 fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> std::io::Result<OwnedFd> {

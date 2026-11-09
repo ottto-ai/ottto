@@ -192,7 +192,7 @@ fn graph_saves_keep_tail_rows_until_retire_or_reset_erases_them() {
     set_aside_tail(&f.path, SIBLING, SetAsideCause::Encode).unwrap();
 
     // Claim-only saves share this path and publish nothing.
-    save_with_mode(&f.path, &mut index, true, None).unwrap();
+    save_with_mode(&f.path, &mut index, true).unwrap();
     assert_eq!(all_tail_rows(&index, FILE), 0);
     assert!(!stage_empty(&f.path));
 
@@ -533,18 +533,15 @@ fn removal_over_an_unreadable_head_sets_it_aside_and_commits() {
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "kept");
 }
 
-/// [format] The exit commit is G to G+1 behind ACK recovery; only that confirmed
-/// generation moves the session, so stale siblings refuse and a fresh load reads.
+/// [format] The exit commit is G to G+1 and writes no upload progress; only
+/// that confirmed generation moves the session, so stale siblings refuse and a
+/// fresh load reads.
 #[test]
-fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
+fn exit_commit_moves_g_and_fences_stale_siblings() {
     let f = Fixture::new();
     f.published();
     let index = load_with(&f.path, false).unwrap().unwrap();
     let mut sibling = load_with(&f.path, false).unwrap().unwrap();
-    let recovery =
-        super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None).unwrap();
-    let next = br#"{"generation":1,"accepted":"exact-body"}"#;
-    recovery.before_progress_save_bytes(None, next).unwrap();
     let progress = f.path.with_file_name(format!(
         "{}-upload-progress.json",
         f.path.file_stem().unwrap().to_str().unwrap()
@@ -574,14 +571,14 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
 
     BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
 
-    assert_eq!(fs::read(&progress).unwrap(), next, "receipt replayed first");
+    assert!(!progress.exists(), "the exit commit writes no progress");
     assert!(stage_empty(&f.path));
     with_session_db(&index, |db| {
         assert_eq!(db.stamp().unwrap().0, G + 1);
         assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(4));
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(5)
+            Some(sqlite::writer_capability_for_test())
         );
     });
     let stale = save_with(&f.path, &mut sibling).unwrap_err();
@@ -592,28 +589,6 @@ fn exit_commit_recovers_receipts_first_and_fences_stale_siblings() {
     let (head, pages) = read(&reloaded, FILE).unwrap();
     assert_eq!(head.unwrap().body, b"head");
     assert_eq!(pages[&(Collection::Responses, 0)], b"page");
-
-    // A missing receipt holds the write: no Tail row, no generation.
-    let f = Fixture::new();
-    f.published();
-    let index = load_with(&f.path, false).unwrap().unwrap();
-    let recovery =
-        super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None).unwrap();
-    recovery.before_progress_save_bytes(None, next).unwrap();
-    fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
-    stage_tail(
-        &f.path,
-        FILE,
-        staged(b"head", &[(Collection::Responses, 0, b"page")]),
-    )
-    .unwrap();
-    let release = BaselineRelease::new(&f.path, &index);
-    assert!(release.commit_tail().is_err());
-    assert!(!stage_empty(&f.path), "the owner's drop decides");
-    drop(release);
-    assert!(stage_empty(&f.path), "dropped and counted");
-    assert!(telemetry::take_thread_event_for_test("tail_stage_dropped").is_some());
-    with_session_db(&index, |db| assert_eq!(db.stamp().unwrap().0, G));
 }
 
 /// [format] An unconfirmed exit never adopts a stamp: refused stays G, and a
@@ -842,7 +817,7 @@ fn layout_four_store_exit_keeps_four_and_full_save_upgrades_to_five() {
         // Capability 3 refuses any store whose minimum is above it.
         assert_eq!(
             db.read_control::<u64>("minimum_writer_capability").unwrap(),
-            Some(5)
+            Some(sqlite::writer_capability_for_test())
         );
     });
     assert_eq!(revisions(&reloaded, FILE).len(), 1);
@@ -1202,7 +1177,7 @@ pub(crate) fn seed_tail_literals_for_test(
         ),
     )
     .unwrap();
-    save_locked(&path, &mut index, false, None, true).unwrap();
+    save_locked(&path, &mut index, false, true).unwrap();
     let wal = fs::read(sqlite::sidecar(
         &fence::sibling(&path, ".v2.sqlite"),
         "-wal",
@@ -1246,7 +1221,7 @@ pub(crate) fn seed_tail_kinds_for_test(path: &Path, index: &mut ScanIndex, canar
     .unwrap();
     observe_tail(path, FILE, observation(&[canary.as_bytes()])).unwrap();
     set_aside_tail(path, SIBLING, SetAsideCause::Encode).unwrap();
-    save_locked(path, index, false, None, true).unwrap();
+    save_locked(path, index, false, true).unwrap();
 }
 /// Rows of each Tail kind in the store behind `index`, every file.
 pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static str, usize> {

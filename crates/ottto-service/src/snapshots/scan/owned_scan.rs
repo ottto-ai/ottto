@@ -1047,14 +1047,12 @@ impl OwnedSourceScan {
             let growth_now = sampled_scan::now_seconds();
             let (paced_twins, read_twins): (Vec<_>, Vec<_>) = identified_candidates
                 .iter()
-                .filter(|candidate| {
-                    !claude_request_money::e2::selected_twin_roots(
-                        std::iter::once(candidate.path.as_path()),
-                        twin_groups,
-                    )
-                    .is_empty()
-                })
                 .filter_map(|candidate| {
+                    let (root, member) = claude_index_path_family_member(&candidate.path)?;
+                    let homes = claude_history_upgrade::path_twins(twin_groups, &member)?;
+                    Some((candidate, root, member, homes))
+                })
+                .filter_map(|(candidate, root, member, homes)| {
                     let mut twin = candidate.clone();
                     prepare_candidate_context(&mut twin);
                     // A seed: its own Parse decision, or `None` when unidentified.
@@ -1075,9 +1073,15 @@ impl OwnedSourceScan {
                     )
                     .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, audit_now));
                     seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
-                        .then_some((candidate.path.as_path(), seed.map(|(_, reason)| reason)))
+                        .then_some((
+                            candidate.path.as_path(),
+                            root,
+                            member,
+                            homes,
+                            seed.map(|(_, reason)| reason),
+                        ))
                 })
-                .partition(|(path, _)| {
+                .partition(|(path, ..)| {
                     sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
                 });
             // An identified seed of the root itself, whose other homes are
@@ -1087,27 +1091,20 @@ impl OwnedSourceScan {
             // forces the whole family, and so does any other forced cause.
             let settled = |key: &String| {
                 let path = Path::new(key);
-                std::fs::metadata(path).is_ok_and(|meta| index.listing_stamp_matches(path, &meta))
-                    && !sampled_audit::path_requires_verification(&index.files, path)
+                std::fs::metadata(path).is_ok_and(|meta| index.listing_unchanged(path, &meta))
             };
-            let mut scoped = BTreeMap::<String, bool>::new();
+            let mut scoped = BTreeMap::new();
             let mut seeds = Vec::new();
-            for (path, seed) in read_twins {
-                let Some((root, member)) = claude_index_path_family_member(path) else {
-                    continue;
-                };
+            for (path, root, member, homes, seed) in read_twins {
                 let own = local_index_key(path);
                 let root_member = member == root;
-                let homes = claude_history_upgrade::path_twins(twin_groups, &member);
                 let narrow = seed.is_some()
                     && root_member
-                    && homes.is_some_and(|homes| {
-                        homes.iter().all(|(key, _)| *key == own || settled(key))
-                    });
-                *scoped.entry(root).or_insert(true) &= narrow;
+                    && homes.iter().all(|(key, _)| *key == own || settled(key));
+                scoped.entry(root).or_insert((true, homes)).0 &= narrow;
                 seeds.push((seed, root_member));
             }
-            let (scoped, roots): (Vec<_>, Vec<_>) = scoped.into_iter().partition(|(_, n)| *n);
+            let (scoped, roots): (Vec<_>, Vec<_>) = scoped.into_iter().partition(|(_, (n, _))| *n);
             for (root, _) in &roots {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_schedule.family_roots.insert(root.clone());
@@ -1116,7 +1113,7 @@ impl OwnedSourceScan {
             let scoped = scoped
                 .into_iter()
                 .filter(|(root, _)| !forced_claude_family_reparses.contains(root))
-                .flat_map(|(root, _)| claude_history_upgrade::path_twins(twin_groups, &root))
+                .map(|(_, (_, homes))| homes)
                 .collect::<Vec<_>>();
             crate::local_resource_diagnostics::forced_family_seeds(
                 seeds,
@@ -1130,7 +1127,7 @@ impl OwnedSourceScan {
                 .collect();
             let paced_twins = paced_twins
                 .into_iter()
-                .map(|(path, _)| path.to_path_buf())
+                .map(|(path, ..)| path.to_path_buf())
                 .collect::<BTreeSet<_>>();
             identified_candidates.retain(|candidate| {
                 let paced = paced_twins.contains(&candidate.path);

@@ -1,260 +1,379 @@
-//! Cache-observation upload state: merging a patch into the accepted rows,
-//! preparing one item's patch against its acknowledged predecessor within
-//! the server's bounds, and building one session's cache wire.
-
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+//! Content-free owned-request cache evidence. Accounting remains in the usage owner.
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::snapshots::cache_observations::{self, CacheObservations, OwnedRequest};
-use crate::snapshots::SnapshotItem;
+pub(crate) fn event_id(session_ref: &str, request_ref: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::to_vec(&("session_cache_observation:v1", session_ref, request_ref))
+        .expect("identity tuple serializes");
+    format!("cache:{:x}", Sha256::digest(identity))
+}
 
-/// Refuse a malformed accepted row rather than silently dropping its bytes/row
-/// from the cumulative bound. No patch can authorize that implicit deletion.
-pub(crate) fn cache_state_from_patch(
-    previous: Option<&Value>,
-    patch: &CacheObservations,
-) -> Option<Value> {
-    let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    // A marked replacement completes from empty, on both sides of the wire.
-    if let Some(previous) = previous.filter(|_| !patch.full_replacement) {
-        for row in previous.get("observations")?.as_array()? {
-            let row =
-                serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
-            observations.insert(row.event_id.clone(), row);
-        }
-    }
-    for operation in &patch.operations {
-        match operation {
-            cache_observations::Operation::Upsert { observation } => {
-                if observation.status == "retracted" {
-                    observations.remove(&observation.event_id);
-                } else {
-                    observations.insert(observation.event_id.clone(), observation.as_ref().clone());
-                }
-            }
-            cache_observations::Operation::Retract { event_id } => {
-                observations.remove(event_id);
-            }
-        }
-    }
-    Some(
-        json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
-    )
+// Server-enforced bounds (the backend's cache observation schema): at most
+// MAX_OPERATIONS operations and MAX_PATCH_BYTES per uploaded patch, and
+// MAX_ROWS rows and MAX_STATE_BYTES per session's accepted state. The
+// detector itself keeps every row; the upload sends what these bounds admit.
+pub const MAX_OPERATIONS: usize = 64;
+pub const MAX_PATCH_BYTES: usize = 128 * 1024;
+pub const MAX_ROWS: usize = 512;
+pub const MAX_STATE_BYTES: usize = 640 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RequestSlot {
+    pub request_ref: String,
+    pub occurred_at: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub uncached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
-/// A server-echoed completed state (`cache_state_ack:v1`) rebuilt through the
-/// patch path: the echo's coverage must pass `validate`, its rows must parse,
-/// and the result must stay within the state bounds. A repeated row or a
-/// malformed omitted count changes the rebuilt state, so its witness cannot
-/// match the server's digest.
-pub(crate) fn cache_state_from_echo(echo: &Value) -> Option<Value> {
-    let empty = CacheObservations {
-        schema_version: u16::try_from(echo.get("schema_version")?.as_u64()?).ok()?,
-        operations: Vec::new(),
-        coverage: echo.get("coverage")?.as_str()?.into(),
-        omitted_observation_count: echo
-            .get("omitted_observation_count")
-            .and_then(Value::as_u64),
-        full_replacement: false,
-    };
-    let state = cache_state_from_patch(Some(echo), &empty).filter(|_| empty.validate())?;
-    cache_state_within_limits(&state).then_some(state)
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Observation {
+    pub event_id: String,
+    pub affected_request_ref: String,
+    pub episode_anchor_request_ref: Option<String>,
+    pub baseline_request_ref: Option<String>,
+    pub occurred_at: String,
+    pub observation_kind: String,
+    pub status: String,
+    pub previous: Option<RequestSlot>,
+    pub affected: RequestSlot,
+    pub immediate_next: Option<RequestSlot>,
+    pub ordering_confidence: String,
+    pub explanation_code: String,
+    pub supporting_conditions: Vec<String>,
+    pub idle_seconds: Option<u64>,
+    pub report_gap_seconds: Option<u64>,
+    pub detector_version: String,
 }
-/// Preflight the exact wire and its completion against the ACKed predecessor.
-/// Partial coverage never authorizes deletion, including after budget trimming.
-pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {
-    let Some(patch) = item.cache_observations.as_ref() else {
-        return;
-    };
-    let desired = cache_state_from_patch(None, patch).expect("no accepted rows to parse");
-    let ids = desired["observations"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["event_id"].as_str())
-        .collect::<BTreeSet<_>>();
-    let mut wire = patch.clone();
-    if patch.coverage == "complete" {
-        // Keep the established complete-patch wire order. The selected Codex
-        // patch stays in session order for the partial fallback below.
-        wire.operations.sort_by(|a, b| {
-            let a = match a {
-                cache_observations::Operation::Upsert { observation } => &observation.event_id,
-                cache_observations::Operation::Retract { event_id } => event_id,
-            };
-            let b = match b {
-                cache_observations::Operation::Upsert { observation } => &observation.event_id,
-                cache_observations::Operation::Retract { event_id } => event_id,
-            };
-            a.cmp(b)
-        });
-        // Retract only a correction: a row on a request this read saw that the
-        // detector no longer reports. A row on a request it never saw (one
-        // adopted from the server's echoed state) is kept, not retracted.
-        let seen = item
-            .cache_requests
-            .iter()
-            .map(|request| request.slot.request_ref.as_str())
-            .collect::<BTreeSet<_>>();
-        for row in prior
-            .and_then(|p| p["observations"].as_array())
-            .into_iter()
-            .flatten()
-        {
-            if let Some(id) = row["event_id"].as_str() {
-                let request = row["affected_request_ref"].as_str();
-                if !ids.contains(id) && request.is_some_and(|r| seen.contains(r)) {
-                    wire.operations
-                        .push(cache_observations::Operation::Retract {
-                            event_id: id.into(),
-                        });
-                }
-            }
-        }
-        if !wire.validate() {
-            // Over the server's per-patch bound: send only what it lacks, so
-            // the rest of a long session follows on its next upload.
-            let held = cache_rows_held(prior);
-            wire.operations
-                .retain(|operation| !cache_row_held(&held, operation));
-        }
-        let Some(state) = cache_state_from_patch(prior, &wire) else {
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        };
-        if wire.validate() && cache_state_within_limits(&state) {
-            item.cache_observations_state = Some(state);
-            item.cache_observations = Some(wire);
-            return;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Operation {
+    Upsert { observation: Box<Observation> },
+    Retract { event_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheObservations {
+    pub schema_version: u16,
+    pub operations: Vec<Operation>,
+    pub coverage: String,
+    pub omitted_observation_count: Option<u64>,
+    /// Transport-only: the receiver completes this patch from empty. Set only
+    /// on a negotiated head-CAS answer; false is omitted (legacy bytes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_replacement: bool,
+}
+
+impl CacheObservations {
+    /// No rows, with an exact omitted count or none when it is unknown.
+    pub(crate) fn partial(omitted_observation_count: Option<u64>) -> Self {
+        Self {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "partial".into(),
+            omitted_observation_count,
+            full_replacement: false,
         }
     }
 
-    // Preserve all accepted evidence on partial/refused corrections. A prior ID
-    // outside the selected prefix prevents an exact missing-observation count.
-    let prior_is_prefix = prior
-        .and_then(|p| p["observations"].as_array())
-        .into_iter()
-        .flatten()
-        .all(|row| row["event_id"].as_str().is_some_and(|id| ids.contains(id)));
-    let overflow = if prior_is_prefix {
-        if patch.coverage == "complete" {
-            Some(0)
-        } else {
-            patch.omitted_observation_count
-        }
-    } else {
-        None
-    };
-    wire = patch.clone();
-    wire.coverage = "partial".into();
-    let held = cache_rows_held(prior);
-    wire.operations.retain(|operation| {
-        matches!(operation,
-        cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
-            && !cache_row_held(&held, operation)
-    });
-    // The earliest rows the server lacks, at most one patch's worth; later
-    // rows follow on the next upload.
-    wire.operations.truncate(cache_observations::MAX_OPERATIONS);
-    loop {
-        let Some(mut state) = cache_state_from_patch(prior, &wire) else {
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        };
-        let present = state["observations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|row| row["event_id"].as_str())
-            .collect::<BTreeSet<_>>();
-        let missing = ids.difference(&present).count() as u64;
-        wire.omitted_observation_count = overflow.and_then(|count| count.checked_add(missing));
-        state["omitted_observation_count"] = json!(wire.omitted_observation_count);
-        if wire.validate() && cache_state_within_limits(&state) {
-            item.cache_observations_state = Some(state);
-            item.cache_observations = Some(wire);
-            return;
-        }
-        // Removing a shrinking replacement can INCREASE completed bytes. Always
-        // recompute the actual merge; do not assume monotonic sizes.
-        if wire.operations.pop().is_none() {
-            // Withholding preserves accepted evidence, including possibly stale
-            // server coverage="complete": no cache metadata reaches the server.
-            // The Claude-only reread diagnostics do not count this upload refusal.
-            item.cache_observations = None;
-            item.cache_observations_state = None;
-            return;
-        }
+    pub fn validate(&self) -> bool {
+        let mut ids = BTreeSet::new();
+        self.schema_version == 1
+            && matches!(self.coverage.as_str(), "complete" | "partial" | "unknown")
+            && (self.omitted_observation_count.unwrap_or(0) == 0 || self.coverage == "partial")
+            && self.operations.len() <= MAX_OPERATIONS
+            && self.operations.iter().all(|operation| {
+                ids.insert(match operation {
+                    Operation::Upsert { observation } => &observation.event_id,
+                    Operation::Retract { event_id } => event_id,
+                })
+            })
+            && serde_json::to_value(self).is_ok_and(|value| {
+                crate::canonical_json::canonicalize(&value)
+                    .is_ok_and(|bytes| bytes.len() <= MAX_PATCH_BYTES)
+            })
     }
 }
-/// The accepted rows by event id. An unreadable row is left out, so its
-/// replacement is sent.
-fn cache_rows_held(prior: Option<&Value>) -> BTreeMap<String, cache_observations::Observation> {
-    prior
-        .and_then(|prior| prior["observations"].as_array())
+
+/// Local-only metadata; request identity never depends on these mutable facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OwnedRequest {
+    pub slot: RequestSlot,
+    pub ordering: String,
+    pub compaction_before: bool,
+    pub configuration_changed: bool,
+    pub configuration_witness: Option<String>,
+    pub idle_seconds: Option<u64>,
+}
+
+fn share(slot: &RequestSlot) -> Option<f64> {
+    let prompt = slot.prompt_tokens?;
+    let read = slot.cache_read_tokens?;
+    (prompt > 0 && read <= prompt).then_some(read as f64 / prompt as f64)
+}
+/// The time from `from` to `to` (RFC 3339). `None` when either does not
+/// parse or `to` is earlier, so a backwards clock never yields a gap.
+pub(crate) fn elapsed(from: &str, to: &str) -> Option<time::Duration> {
+    let from = OffsetDateTime::parse(from, &Rfc3339).ok()?;
+    let to = OffsetDateTime::parse(to, &Rfc3339).ok()?;
+    (to >= from).then_some(to - from)
+}
+
+/// [`elapsed`] in whole seconds.
+pub(crate) fn elapsed_seconds(from: &str, to: &str) -> Option<u64> {
+    u64::try_from(elapsed(from, to)?.whole_seconds()).ok()
+}
+fn comparable(a: &OwnedRequest, b: &OwnedRequest) -> bool {
+    a.ordering != "ambiguous"
+        && b.ordering != "ambiguous"
+        && a.slot.model.is_some()
+        && a.slot.model == b.slot.model
+        && !b.compaction_before
+        && !b.configuration_changed
+        && a.slot.effort == b.slot.effort
+        && a.configuration_witness == b.configuration_witness
+        && !prompt_reduced(&a.slot, &b.slot)
+}
+fn prompt_reduced(previous: &RequestSlot, current: &RequestSlot) -> bool {
+    previous
+        .prompt_tokens
+        .zip(current.prompt_tokens)
+        .is_some_and(|(previous, current)| current < previous / 2)
+}
+fn material(baseline: &RequestSlot, current: &RequestSlot) -> bool {
+    let (Some(before), Some(now), Some(prompt), Some(read), Some(prior_read)) = (
+        share(baseline),
+        share(current),
+        current.prompt_tokens,
+        current.cache_read_tokens,
+        baseline.cache_read_tokens,
+    ) else {
+        return false;
+    };
+    prompt >= 20_000
+        && before >= 0.8
+        && (now <= 0.05
+            || (before - now >= 0.5 && prior_read.min(prompt).saturating_sub(read) >= 20_000))
+}
+
+/// [`detect_unique`] keyed by event id.
+#[cfg(test)]
+pub(crate) fn detect(
+    session_ref: &str,
+    requests: &[OwnedRequest],
+) -> BTreeMap<String, Observation> {
+    detect_unique(session_ref, requests)
         .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()
-        })
         .map(|row| (row.event_id.clone(), row))
         .collect()
 }
-/// An upsert of a row the server already holds unchanged.
-fn cache_row_held(
-    held: &BTreeMap<String, cache_observations::Observation>,
-    operation: &cache_observations::Operation,
-) -> bool {
-    matches!(operation, cache_observations::Operation::Upsert { observation }
-        if held.get(&observation.event_id) == Some(observation.as_ref()))
-}
-pub(in crate::snapshots) fn cache_state_within_limits(state: &Value) -> bool {
-    state["observations"].as_array().is_some_and(|rows| {
-        rows.len() <= cache_observations::MAX_ROWS
-            && rows.iter().all(|row| row["status"] != "retracted")
-    }) && crate::canonical_json::canonicalize(state)
-        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_STATE_BYTES)
-}
-/// One session's cache wire, shared by every source. A replayed request is
-/// one request; a conflicting replay or an unparseable time cannot certify
-/// an omitted count, nor can an incomplete request book: those ship
-/// `partial` with no rows. Rows stay in session order, so an upload that
-/// must trim drops the latest first.
-pub(in crate::snapshots) fn cache_wire<'a>(
-    session: &str,
-    requests: impl IntoIterator<Item = &'a OwnedRequest>,
-    complete: bool,
-) -> CacheObservations {
-    let mut seen = BTreeMap::new();
-    let mut unique = Vec::new();
-    for request in requests {
-        if OffsetDateTime::parse(&request.slot.occurred_at, &Rfc3339).is_err() {
-            return CacheObservations::partial(None);
+
+/// Every row of the session, in session order. Input has already passed the
+/// adapter's duplicate/conflict check. Replaying the same owned sequence
+/// rebuilds identical rows after restart or correction. Adjacent witnesses
+/// are selected before episode baselines; no later warm request is
+/// substituted.
+pub(crate) fn detect_unique(session_ref: &str, requests: &[OwnedRequest]) -> Vec<Observation> {
+    let mut rows = Vec::new();
+    let mut baseline: Option<&OwnedRequest> = None;
+    let mut episode: Option<String> = None;
+    for (index, request) in requests.iter().enumerate() {
+        let previous = index.checked_sub(1).map(|i| &requests[i]);
+        let next = requests.get(index + 1);
+        let boundary = previous.is_some_and(|prior| !comparable(prior, request));
+        let boundary_loss =
+            boundary && previous.is_some_and(|prior| material(&prior.slot, &request.slot));
+        if boundary {
+            baseline = None;
+            episode = None;
         }
-        match seen.get(&request.slot.request_ref) {
-            Some(prior) if prior != &request.slot => return CacheObservations::partial(None),
-            Some(_) => {}
-            None => {
-                seen.insert(request.slot.request_ref.clone(), request.slot.clone());
-                unique.push(request.clone());
+        let cold = request.slot.prompt_tokens.is_some_and(|n| n >= 20_000)
+            && share(&request.slot).is_some_and(|n| n <= 0.05);
+        let loss = baseline.is_some_and(|prior| material(&prior.slot, &request.slot));
+        if !loss && !cold && !boundary_loss {
+            if share(&request.slot).is_some_and(|n| n >= 0.8) {
+                baseline = Some(request);
+                episode = None;
             }
+            continue;
         }
+        if loss && request.ordering != "ambiguous" && episode.is_none() {
+            episode = Some(request.slot.request_ref.clone());
+        }
+        let model_change = previous.is_some_and(|prior| prior.slot.model != request.slot.model);
+        let configuration_changed = request.configuration_changed
+            || previous.is_some_and(|prior| {
+                prior.slot.effort != request.slot.effort
+                    || prior.configuration_witness != request.configuration_witness
+            });
+        let prompt_reduced =
+            previous.is_some_and(|prior| prompt_reduced(&prior.slot, &request.slot));
+        let report_gap = previous
+            .and_then(|prior| elapsed_seconds(&prior.slot.occurred_at, &request.slot.occurred_at));
+        let mut conditions = Vec::new();
+        if model_change {
+            conditions.push("model_changed".into());
+        }
+        if request.compaction_before {
+            conditions.push("recorded_compaction".into());
+        }
+        if configuration_changed {
+            conditions.push("recorded_configuration_change".into());
+        }
+        if request.idle_seconds.is_some_and(|seconds| seconds >= 3600) {
+            conditions.push("long_task_inactivity".into());
+        }
+        let explanation = if model_change {
+            "model_change"
+        } else if request.compaction_before {
+            "compaction"
+        } else if configuration_changed {
+            "configuration_change"
+        } else if loss
+            && request.configuration_witness.is_some()
+            && request.idle_seconds.is_some_and(|n| n >= 3600)
+        {
+            "likely_expiry"
+        } else {
+            "unclear"
+        };
+        if prompt_reduced {
+            conditions.push("prompt_size_reduced".into());
+        }
+        if report_gap.is_some_and(|seconds| seconds >= 3600) {
+            conditions.push("long_report_gap".into());
+        }
+        let kind = if request.ordering == "ambiguous" {
+            "ambiguous"
+        } else if model_change
+            || request.compaction_before
+            || configuration_changed
+            || prompt_reduced
+        {
+            "expected_rebuild"
+        } else if loss {
+            "unexpected_loss"
+        } else {
+            "cold_start"
+        };
+        // Provider identity plus existing session identity; no counter, offset or version digest.
+        let event_id = event_id(session_ref, &request.slot.request_ref);
+        let recovery_comparable = next.is_some_and(|next| comparable(request, next));
+        let observation = Observation {
+            event_id: event_id.clone(),
+            affected_request_ref: request.slot.request_ref.clone(),
+            episode_anchor_request_ref: episode.clone(),
+            baseline_request_ref: baseline.map(|b| b.slot.request_ref.clone()),
+            occurred_at: request.slot.occurred_at.clone(),
+            observation_kind: kind.into(),
+            status: if next.is_none() {
+                "awaiting_next"
+            } else if recovery_comparable {
+                "complete"
+            } else {
+                "next_unavailable"
+            }
+            .into(),
+            previous: previous.map(|p| p.slot.clone()),
+            affected: request.slot.clone(),
+            immediate_next: next.map(|n| n.slot.clone()),
+            ordering_confidence: request.ordering.clone(),
+            explanation_code: explanation.into(),
+            supporting_conditions: conditions,
+            idle_seconds: request.idle_seconds,
+            report_gap_seconds: report_gap,
+            detector_version: "v1".into(),
+        };
+        rows.push(observation);
     }
-    if !complete {
-        return CacheObservations::partial(None);
+    rows
+}
+
+#[cfg(test)]
+mod tests;
+pub(in crate::snapshots) mod upload;
+
+pub(crate) fn codex_slot(
+    value: &serde_json::Value,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Option<RequestSlot> {
+    if value.get("type")?.as_str()? != "token_usage_record" {
+        return None;
     }
-    CacheObservations {
-        schema_version: 1,
-        operations: cache_observations::detect_unique(session, &unique)
-            .into_iter()
-            .map(|observation| cache_observations::Operation::Upsert {
-                observation: Box::new(observation),
-            })
-            .collect(),
-        coverage: "complete".into(),
-        omitted_observation_count: None,
-        full_replacement: false,
+    let payload = value.get("payload")?;
+    let request_ref = payload.get("response_id")?.as_str()?.to_string();
+    if request_ref.is_empty() || request_ref.len() > 256 {
+        return None;
+    }
+    let usage = payload.get("usage")?;
+    let prompt = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let read = usage
+        .get("cached_input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let write = usage
+        .get("cache_write_input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    Some(RequestSlot {
+        request_ref,
+        occurred_at: value.get("timestamp")?.as_str()?.to_string(),
+        model,
+        effort,
+        prompt_tokens: prompt,
+        cache_read_tokens: read,
+        cache_creation_tokens: write,
+        uncached_tokens: prompt
+            .zip(read)
+            .zip(write)
+            .and_then(|((p, r), w)| p.checked_sub(r)?.checked_sub(w)),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count, full_replacement);
+crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
+crate::durable_tail_codec::durable_struct!(OwnedRequest {
+    D slot: RequestSlot,
+    N ordering: String,
+    N compaction_before: bool,
+    N configuration_changed: bool,
+    H configuration_witness: Option<String>,
+    N idle_seconds: Option<u64>,
+});
+crate::heap_layout_bound::fields!(RequestSlot; request_ref, occurred_at, model, effort, prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
+crate::durable_tail_codec::durable_struct!(RequestSlot {
+    L request_ref: String,
+    N occurred_at: String,
+    U model: Option<String>,
+    U effort: Option<String>,
+    N prompt_tokens: Option<u64>,
+    N cache_read_tokens: Option<u64>,
+    N cache_creation_tokens: Option<u64>,
+    N uncached_tokens: Option<u64>,
+    N output_tokens: Option<u64>,
+});
+
+crate::heap_layout_bound::fields!(Observation; event_id, affected_request_ref, episode_anchor_request_ref, baseline_request_ref, occurred_at, observation_kind, status, previous, affected, immediate_next, ordering_confidence, explanation_code, supporting_conditions, idle_seconds, report_gap_seconds, detector_version);
+
+impl crate::heap_layout_bound::HeapLayoutBound for Operation {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Upsert { observation } => observation.heap_bound(c),
+            Self::Retract { event_id } => event_id.heap_bound(c),
+        }
     }
 }

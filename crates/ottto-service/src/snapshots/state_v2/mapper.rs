@@ -485,7 +485,25 @@ impl Rows<'_> {
         kind: &str,
         values: &BTreeMap<String, T>,
     ) -> Result<()> {
-        self.put(key(kind, "", 0)?, &values.len())?;
+        self.map_kept(kind, values, &BTreeSet::new())
+    }
+    /// `map`, with `kept` rows of `kind` left exactly as committed: never
+    /// written, never deleted, still counted by the manifest.
+    pub(super) fn map_kept<T: Serialize>(
+        &mut self,
+        kind: &str,
+        values: &BTreeMap<String, T>,
+        kept: &BTreeSet<RowKey>,
+    ) -> Result<()> {
+        let kept: Vec<&RowKey> = kept
+            .iter()
+            .filter(|row| record_kind(row) == Some(kind))
+            .collect();
+        self.put(key(kind, "", 0)?, &(values.len() + kept.len()))?;
+        for row in kept {
+            let digest = *self.old.get(row).context("state_v2_kept_row")?;
+            self.put_digest(row.clone(), &(), digest)?;
+        }
         for (name, value) in values {
             self.put(key(kind, name, 1)?, value)?;
         }

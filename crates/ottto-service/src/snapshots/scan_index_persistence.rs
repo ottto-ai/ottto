@@ -977,10 +977,10 @@ impl LockedStore {
         let before = Stamp::capture(&file, true)?;
         let mut boundary = [0u8; 1];
         file.read_exact(&mut boundary)?;
-        ensure!(boundary == [b'{'], "scan_index_fragment_boundary");
+        ensure!(boundary == *b"{", "scan_index_fragment_boundary");
         file.seek(SeekFrom::End(-1))?;
         file.read_exact(&mut boundary)?;
-        ensure!(boundary == [b'}'], "scan_index_fragment_boundary");
+        ensure!(boundary == *b"}", "scan_index_fragment_boundary");
         file.seek(SeekFrom::Start(0))?;
         ensure!(before.bytes == object.bytes, "scan_index_object_length");
         validate_object_digest(&mut file, &self.binding, object)?;

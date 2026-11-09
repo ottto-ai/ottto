@@ -15,7 +15,7 @@ use std::thread;
 const XPC_CONTROL_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn ottto_xpc_serve(
         mach_service: *const c_char,
         handler: extern "C" fn(*const c_char, libc::pid_t, libc::uid_t, *mut c_void) -> *mut c_char,
@@ -53,6 +53,8 @@ extern "C" fn handle_xpc_request(
     peer_euid: libc::uid_t,
     context: *mut c_void,
 ) -> *mut c_char {
+    let _stage =
+        crate::local_resource_diagnostics::StageWindow::begin("unknown", "offpass_control_xpc");
     if request_json.is_null() || context.is_null() {
         crate::control_plane_health::record_request_error();
         return null_response();

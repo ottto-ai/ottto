@@ -7,7 +7,7 @@
 //! `UsageTotals` and `UsageCosts` are the token counters and exact cost picos
 //! a row accumulates, with their add, monotonic and delta rules.
 
-pub(super) mod cache_observations;
+pub(crate) mod cache_observations;
 
 use super::rfc3339_unix_seconds;
 use super::scan::limits::in_codex_forward_evidence_epoch;

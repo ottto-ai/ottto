@@ -102,17 +102,27 @@ pub(crate) struct ColdSession {
 impl ColdSession {
     /// (custody under `dir`, its cold graph).
     pub(crate) fn publish(source: Source, index: &ScanIndex, dir: &Path) -> (Self, ScanIndex) {
-        let path = dir
-            .join("snapshots/destinations")
-            .join("a".repeat(64))
-            .join(synthetic_file(source, ".json"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let progress = serde_json::to_vec(&serde_json::json!({
             "schema_version": 3,
             "destination_namespace_hash": "a".repeat(64),
         }))
         .unwrap();
-        let cold = publish(index, &path, &progress);
+        Self::publish_with_progress(source, index, dir, &progress)
+    }
+    /// `publish` of a route whose upload-progress JSON holds exactly
+    /// `progress` before publication.
+    pub(crate) fn publish_with_progress(
+        source: Source,
+        index: &ScanIndex,
+        dir: &Path,
+        progress: &[u8],
+    ) -> (Self, ScanIndex) {
+        let path = dir
+            .join("snapshots/destinations")
+            .join("a".repeat(64))
+            .join(synthetic_file(source, ".json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cold = publish(index, &path, progress);
         assert!(cold.v2().persistence_v2.is_some(), "a live session");
         (Self { path }, cold)
     }
@@ -218,7 +228,7 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         match std::fs::read(progress_path) {
             Ok(bytes) => assert_eq!(
                 bytes, progress,
-                "synthetic custody must seal the actual original bytes"
+                "the published route keeps the actual original bytes"
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ottto_core::write_owner_only_file_atomic(progress_path, progress)?
@@ -227,13 +237,6 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
         }
         Ok(())
     })
-    .unwrap();
-    ack::ProgressRecovery::seal_import(
-        identity.clone(),
-        identity.fence_generation,
-        path,
-        Some(progress),
-    )
     .unwrap();
     fence::publish(path, &identity, &mut false).unwrap();
     ScanIndex::load(path).unwrap()

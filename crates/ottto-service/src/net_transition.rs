@@ -14,6 +14,8 @@
 //! next upload cycle starts from fresh connections.
 
 #[cfg(target_os = "macos")]
+use crate::local_resource_diagnostics::StageWindow;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 /// Rebuild only after the routing table has been quiet this long: transitions
@@ -146,6 +148,8 @@ fn observe_route_socket(socket: RouteSocket) {
             }
         };
         let now = Instant::now();
+        let _stage = (message.is_some() || pending_since.is_some())
+            .then(|| StageWindow::begin("unknown", "offpass_network_transition"));
         if let Some(length) = message {
             if is_transition_message(&buffer[..length]) {
                 // Quiet-period debounce: each new message re-arms the timer so

@@ -20,6 +20,12 @@ manual_is_multiple_of = "allow"
 manual_repeat_n = "allow"
 nonminimal_bool = "allow"
 unnecessary_map_or = "allow"
+# Edition 2024 extends collapsible_if to nested `if let`, suggesting let
+# chains. Applying them and re-enabling the lint is tracked in #1557.
+collapsible_if = "allow"
+# Rust 1.99 Clippy suggests `as_chunks` for constant `chunks_exact` sizes in
+# the digest and fingerprint codecs; that rewrite is a separate cleanup too.
+chunks_exact_to_as_chunks = "allow"
 
 # Optimise dependencies (not workspace crates) in test builds; debug
 # assertions and overflow checks stay on.

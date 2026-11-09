@@ -1,4 +1,4 @@
-use super::*;
+use crate::snapshots::*;
 
 #[test]
 fn snapshot_source_session_id_matches_snapshot_wire() {

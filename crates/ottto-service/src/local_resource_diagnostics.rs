@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cli_children;
 pub(crate) mod jsonl;
 
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
@@ -39,7 +40,7 @@ macro_rules! lifetime_counters {
         pub(crate) fn add(event: Event, amount: u64) {
             use ::std::sync::atomic::Ordering::Relaxed;
             $($hook(event, amount);)?
-            let _ = TOTALS[event as usize].fetch_update(Relaxed, Relaxed, |n| {
+            let _ = TOTALS[event as usize].try_update(Relaxed, Relaxed, |n| {
                 Some(n.saturating_add(amount))
             });
             #[cfg(test)]
@@ -103,7 +104,7 @@ macro_rules! sparse_lifetime_counters {
 /// A process-wide diagnostic static behind `$with`. Each test thread gets its
 /// own copy, so a fixture never reads or drains another test's counts.
 macro_rules! process_static {
-    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr_2021) => {
         $(#[$attr])*
         $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
             #[cfg(not(test))]
@@ -230,7 +231,7 @@ pub(crate) fn claude_identity_over_cap(
                 OverCap::NearCap => 6,
                 OverCap::IdentityHeld => 7,
             };
-            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+            let _ = counters[index].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
         #[derive(Serialize)]
         struct Counts<'a> {
@@ -338,7 +339,7 @@ process_static!(fn with_codex_zst_refused: CodexZstRefused = CodexZstRefused::ne
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     with_codex_zst_refused(|refused| {
         let _ = refused.counters[cause as usize]
-            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+            .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
     });
 }
 
@@ -361,12 +362,12 @@ process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::
 /// `codex_zst_refused_flush` reports them as one per-walk row.
 pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
     with_codex_zst_headers(|headers| {
-        let _ = headers[0].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        let _ = headers[0].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         for (index, (total, count)) in headers[1..].iter().zip(counts).enumerate() {
             if index == CODEX_ZST_PEAK {
                 total.fetch_max(count, Relaxed);
             } else {
-                let _ = total.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
+                let _ = total.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
             }
         }
     });
@@ -506,7 +507,7 @@ pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
 fn add_claude_sidecar_counts(deltas: [u64; 9]) {
     with_claude_sidecar_reparse(|counts| {
         for (counter, delta) in counts.iter().zip(deltas) {
-            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+            let _ = counter.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
         }
     });
 }
@@ -633,7 +634,7 @@ impl CapCounts {
     }
     pub(crate) fn record(source: &str, event: usize, amount: u64) {
         source_count(source, CAP_EVENT_START + event, |slot| {
-            slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+            slot.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
                 .unwrap_or_else(|n| n)
         });
     }
@@ -668,7 +669,8 @@ const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
 const FORCED_SEED_START: usize = USAGE_GAP_START + 4;
-const UNSELECTED_REASONS: usize = FORCED_SEED_START + FORCED_SEEDS;
+const TAIL_LOAD_START: usize = FORCED_SEED_START + FORCED_SEEDS;
+const UNSELECTED_REASONS: usize = TAIL_LOAD_START + 2;
 process_static!(
     /// Claude, Codex, Pi x reason, drained by that source's page line.
     fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -700,7 +702,7 @@ pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u
     let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
     for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
         source_count(source, UNACKED_LOST_START + slot, |n| {
-            n.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+            n.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
                 .unwrap_or_else(|n| n)
         });
     }
@@ -727,6 +729,13 @@ pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
     source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
         slot.fetch_add(amount, Relaxed)
     });
+}
+/// One successful Tail hit on this native page; bytes are the loaded
+/// reduction pages (`tail_db_load_bytes.page`), excluding the head.
+pub(crate) fn tail_loaded(source: &str, bytes: u64) {
+    for (slot, amount) in [(TAIL_LOAD_START, 1), (TAIL_LOAD_START + 1, bytes)] {
+        source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
+    }
 }
 const PAGE_SELECTION: [(&str, usize); 7] = [
     ("selected", PAGE_SELECTION_START),
@@ -889,7 +898,7 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
         };
         let increment = |counts: &[AtomicU64; 4]| {
             counts[slot]
-                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
                 .map_or(u64::MAX, |n| n.saturating_add(1))
         };
         let total = with_credential_file_cap_refused(increment);
@@ -1167,6 +1176,8 @@ impl Probe {
             unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             page_selection: BTreeMap<&'static str, u64>,
+            tail_loads: u64,
+            tail_load_bytes: u64,
             #[serde(flatten)]
             file_reads: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -1217,6 +1228,8 @@ impl Probe {
                 .flatten(),
             unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
             page_selection: drain(source, &PAGE_SELECTION),
+            tail_loads: source_count(source, TAIL_LOAD_START, |n| n.swap(0, Relaxed)),
+            tail_load_bytes: source_count(source, TAIL_LOAD_START + 1, |n| n.swap(0, Relaxed)),
             file_reads: drain(source, &FILE_READS),
             hold_wake: drain(
                 source,
@@ -1297,6 +1310,8 @@ struct Observation {
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
     footprint: footprint::Observation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cli_children: Vec<cli_children::Counts>,
 }
 impl Observation {
     /// A zero-window event: a timestamp and no resource measurements.
@@ -1311,6 +1326,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             footprint: Default::default(),
+            cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -1387,8 +1403,8 @@ fn source_finish_inner<T>(
     drop(window);
     result
 }
-/// Named footprint window inside a source stage. One record with empty counts
-/// when dropped normally; unwinding emits nothing, like `source_finish`.
+/// Named stage window, emitted on normal drop; unwinding emits nothing.
+/// `offpass_` stages add CPU split scalars and do not start footprint sampling.
 pub(crate) struct StageWindow {
     stage: &'static str,
     source: Source,
@@ -1396,11 +1412,14 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
+    offpass_cpu: Option<Option<StateV2Cpu>>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
 /// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
-/// keeps, the largest root's rows with its keep bit, and legacy owners.
+/// keeps, the largest root's rows with its keep bit, and legacy owners; and
+/// the evidence chunk's families and their side-file bytes (`None`: a size
+/// could not be read).
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct EvidenceMem {
     in_use_bytes: [Option<u64>; 3],
@@ -1409,9 +1428,18 @@ pub(crate) struct EvidenceMem {
     largest_root_rows: usize,
     largest_root_kept: bool,
     pub(crate) legacy_owners: usize,
+    groups: usize,
+    side_file_bytes: Option<u64>,
 }
 crate::heap_layout_bound::no_heap!(true; EvidenceMem);
 impl EvidenceMem {
+    pub(crate) fn of_chunk(groups: usize, side_file_bytes: Option<u64>) -> Self {
+        Self {
+            groups,
+            side_file_bytes,
+            ..Self::default()
+        }
+    }
     /// Checkpoint 0 = A, 1 = B, 2 = C.
     pub(crate) fn sample(&mut self, at: usize) {
         self.in_use_bytes[at] = footprint::malloc_in_use();
@@ -1434,13 +1462,15 @@ impl StageWindow {
         self.evidence_mem = Some(mem);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        let offpass = stage.starts_with("offpass_");
         Self {
             stage,
             source: Source::from_slug(source),
             probe: Probe::start(),
-            footprint: footprint::Stage::begin(),
+            footprint: (!offpass).then(footprint::Stage::begin).flatten(),
             jsonl: None,
             evidence_mem: None,
+            offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1456,7 +1486,21 @@ impl Drop for StageWindow {
             return;
         }
         #[derive(Serialize)]
+        struct Cpu {
+            cpu_user_us: Option<u64>,
+            cpu_sys_us: Option<u64>,
+        }
+        let cpu = self.offpass_cpu.map(|before| {
+            let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
+            Cpu {
+                cpu_user_us: samples.and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
+                cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+            }
+        });
+        #[derive(Serialize)]
         struct Counts {
+            #[serde(flatten)]
+            cpu: Option<Cpu>,
             // Zero exposure is stored as None and stays off the record.
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
@@ -1470,8 +1514,13 @@ impl Drop for StageWindow {
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            observation: if self.offpass_cpu.is_some() {
+                self.probe.observation()
+            } else {
+                self.probe.stage_observation(self.footprint.as_ref())
+            },
             counts: Counts {
+                cpu,
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
@@ -1741,7 +1790,7 @@ struct HistoryProofCorrectionDeferred {
 pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
     let members = u64::try_from(members).unwrap_or(u64::MAX);
     let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |total| Some(total.saturating_add(members)),
@@ -1788,7 +1837,7 @@ struct ReemissionFamilyClosureRootAbsentExcluded {
 /// only; no path, id or wire event.
 pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
     let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |total| Some(total.saturating_add(members)),
@@ -1840,6 +1889,11 @@ pub(crate) fn codex_continuation_mint(outcome: &'static str) {
 pub fn rotate_service_log_at_startup() {
     #[cfg(unix)]
     stderr_rotation::rotate_at_startup();
+}
+/// Rotates a service log that reached the startup threshold while running.
+pub(crate) fn rotate_service_log_if_due() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_while_running();
 }
 
 /// Content-free allocator launch configuration, called once before serving.
@@ -2712,6 +2766,33 @@ mod tests {
         }
     }
 
+    /// [behaviour] A completed off-pass work unit uses the existing stage carrier.
+    #[test]
+    fn offpass_work_reports_cpu_split_and_wall_without_footprint_sampling() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, rows) = capture(|| {
+                let _stage = StageWindow::begin(source, "offpass_agent_status");
+                Ok::<_, anyhow::Error>(17)
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["stage"], "offpass_agent_status");
+            assert_eq!(row["source"], source);
+            assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            for field in ["cpu_user_us", "cpu_sys_us"] {
+                assert!(row["counts"].get(field).is_some());
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                assert!(row["counts"][field].is_u64());
+            }
+            assert!(row["observation"].get("footprint_samples").is_none());
+            assert!(row["observation"]
+                .get("footprint_sample_failures")
+                .is_none());
+        }
+    }
+
     #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
@@ -2728,6 +2809,7 @@ mod tests {
             assert_eq!(records[1]["stage"], "source_prepare");
             for record in records {
                 assert_eq!(record["source"], source);
+                assert_eq!(record["counts"], serde_json::json!({}));
                 assert!(record["observation"]["footprint_sample_failures"].is_u64());
                 let row = &record["observation"];
                 if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
@@ -2754,6 +2836,47 @@ mod tests {
                 "footprint_sample_failures",
             ] {
                 assert!(row.get(field).is_none());
+            }
+        }
+    }
+
+    /// [behaviour] Each native page sums successful Tail loads and reduction
+    /// page bytes for its own source, then drains both scalars.
+    #[test]
+    fn tail_load_counts_reset_per_native_page() {
+        let (_, records) = capture(|| {
+            for source in ["claude_code", "codex", "pi"] {
+                tail_loaded(source, 11);
+                tail_loaded(source, 29);
+            }
+            for source in ["claude_code", "codex", "pi"] {
+                for bytes in [None, Some(7), None] {
+                    let probe = Probe::page();
+                    if let Some(bytes) = bytes {
+                        tail_loaded(source, bytes);
+                    }
+                    probe.collection(
+                        source,
+                        CollectionCounts {
+                            scanned_files: 0,
+                            semantic_noops: 0,
+                            sampled_acquisition: None,
+                            full_causes: Default::default(),
+                        },
+                    );
+                }
+            }
+        });
+        let pages: Vec<_> = records
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect();
+        assert_eq!(pages.len(), 9);
+        for (pages, source) in pages.chunks_exact(3).zip(["claude_code", "codex", "pi"]) {
+            for (page, (loads, bytes)) in pages.iter().zip([(2, 40), (1, 7), (0, 0)]) {
+                assert_eq!(page["source"], source);
+                assert_eq!(page["counts"]["tail_loads"], loads);
+                assert_eq!(page["counts"]["tail_load_bytes"], bytes);
             }
         }
     }
@@ -3403,7 +3526,7 @@ pub(crate) fn scan_index_storage(
     static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
     let add = |counter: &AtomicU64, n: u64| {
         counter
-            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
             .unwrap_or_else(|v| v)
             .saturating_add(n)
     };
@@ -3465,7 +3588,7 @@ pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, t
 pub(crate) fn scan_index_manifest_refused(source: &'static str) {
     static TOTAL: AtomicU64 = AtomicU64::new(0);
     let count = TOTAL
-        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
         .saturating_add(1);
     traversal_point(
@@ -3486,7 +3609,7 @@ pub(crate) fn scan_index_repair_required(
     static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
         [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
     let count = TOTALS[cause as usize]
-        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
         .saturating_add(1);
     traversal_point(

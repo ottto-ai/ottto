@@ -2,7 +2,6 @@
 //! selected files, applies it to the index and returns either the scan to
 //! resume or the completed result.
 use crate::snapshots::*;
-use tail_source::refold_moved::unchanged;
 impl OwnedSourceScan {
     pub(crate) fn step(
         self,
@@ -1689,8 +1688,7 @@ impl OwnedSourceScan {
                             // no reduction (its replay is joined).
                             cursor_eof_applied = Some(publication.eof_applied());
                             cursor_certificate = Some(
-                                Some(checkpoint)
-                                    .filter(|_| census_trusted && active.group.is_none()),
+                                (census_trusted && active.group.is_none()).then_some(checkpoint),
                             );
                             cursor_publication = Some(publication);
                             cursor_fragment = fragment;
@@ -1827,7 +1825,7 @@ impl OwnedSourceScan {
                     sampling: file_sampling,
                     candidate,
                     decision,
-                    parse_reason,
+                    parse_reason: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -2444,7 +2442,6 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
-                            refold_unchanged: false,
                             withheld_content: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
@@ -2511,7 +2508,6 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
-                    refold_unchanged: unchanged(parse_reason, file_sampling.as_ref()),
                     withheld_content: parse_complete
                         .then(|| index.withheld_completed_seen(&candidate))
                         .flatten(),

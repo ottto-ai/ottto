@@ -228,21 +228,28 @@ impl Page {
         // observes: the fixture's diag, read receipts and hooks stay its own.
         let checks = STREAMED_CHECKS.with(std::cell::Cell::take);
         let terminal = self.scan.census_complete;
-        let whole = checks.map(|_| {
+        // Each reference arm folds its own copy of the page, index and
+        // accepted buckets, and leaves this thread's remembered veto and
+        // reemission latch as it found them.
+        let reference = |seam: &'static std::thread::LocalKey<std::cell::Cell<bool>>| {
             unobserved(|| {
-                let mut whole = twin(self);
-                let mut accepted = accepted.as_deref().cloned();
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
-                    .with(|whole_corpus| whole_corpus.set(true));
-                let reads = api_reads(|| {
-                    whole.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
-                });
-                crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE
-                    .with(|whole_corpus| whole_corpus.set(false));
-                (whole, accepted, reads)
+                evidence_chunk_tests::isolated(|| {
+                    let mut page = twin(self);
+                    let mut accepted = accepted.as_deref().cloned();
+                    seam.with(|on| on.set(true));
+                    let reads = api_reads(|| {
+                        page.enrich_with_budget(corpus, accepted.as_mut(), wire_budget);
+                    });
+                    seam.with(|on| on.set(false));
+                    (page, accepted, reads)
+                })
             })
-        });
+        };
+        let whole = checks.map(|_| reference(&crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE));
+        // The same streamed fold over the page as one evidence chunk.
+        let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
+        let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
@@ -282,14 +289,24 @@ impl Page {
             &backfill,
         );
         self.disposition = disposition.clone();
-        if let (Some(mut checks), Some((whole, whole_accepted, whole_reads))) = (checks, whole) {
+        if let (
+            Some(mut checks),
+            Some((whole, whole_accepted, whole_reads)),
+            Some((one, one_accepted, one_reads)),
+        ) = (checks, whole, one)
+        {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
+            let chunks = crate::snapshot_sync::evidence_chunks_for_test() - chunks_before;
             unobserved(|| {
-                checks.compare(
+                checks.compare_references(
                     terminal,
-                    (&whole, whole_accepted.as_ref(), whole_reads),
+                    [
+                        (&whole, whole_accepted.as_ref(), whole_reads),
+                        (&one, one_accepted.as_ref(), one_reads),
+                    ],
                     (self, accepted.as_deref(), reads),
-                )
+                    chunks,
+                );
             });
             STREAMED_CHECKS.with(|slot| slot.set(Some(checks)));
         }
@@ -365,6 +382,10 @@ struct StreamedChecks {
     /// Enrichments whose bodies, both ways, carry L2 and its org forward to
     /// root A's own request that has no telemetry row.
     carried: usize,
+    /// Enrichments whose page ran as two or more evidence chunks, and the
+    /// most chunks one page ran.
+    chunked: usize,
+    max_chunks: usize,
 }
 
 impl StreamedChecks {
@@ -558,8 +579,14 @@ const MALFORMED: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 /// owner), and U with a malformed sidecar. `multi_root`: F also claims A's
 /// request (MultiRootClaims).
 fn five_root_sweep(multi_root: bool) {
+    five_root_sweep_paged(multi_root, 1);
+}
+
+/// `five_root_sweep` with up to `limit` files per page: with every root on
+/// one page, its families run as packed evidence chunks.
+fn five_root_sweep_paged(multi_root: bool, limit: usize) {
     with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-streamed-evidence-{multi_root}"));
+        let mut c = Corpus::new(&format!("e2-streamed-evidence-{multi_root}-{limit}"));
         let a = c.root(
             ROOT,
             &(line(ROOT, "shared", AT, 10)
@@ -658,7 +685,7 @@ fn five_root_sweep(multi_root: bool) {
                 );
             }
             for _ in 0..12 {
-                let mut page = c.raw(&scanner, index, 1, true, &[]);
+                let mut page = c.raw(&scanner, index, limit, true, &[]);
                 page.enrich_with(&c, Some(&mut accepted));
                 page.finish();
                 index = c.reload(&mut page.index);
@@ -851,7 +878,23 @@ pub(in crate::snapshot_sync) fn upload_source_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_source_persisting(source, upload_policy, items, progress, respond, |_| Ok(()))
+}
+/// `upload_source_under` with the caller's progress persistence, as the
+/// production pass passes its ledger save.
+pub(in crate::snapshot_sync) fn upload_source_persisting(
+    source: SnapshotSource,
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -885,7 +928,7 @@ pub(in crate::snapshot_sync) fn upload_source_under(
             response.validate_entity_ack(&wire)?;
             Ok(response)
         },
-        |_| Ok(()),
+        persist,
     );
     (result, sent, order)
 }
@@ -3453,6 +3496,10 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("claude_tail_money_tests.rs");
     #[cfg(unix)]
+    mod root_twin_scope_tests {
+        include!("root_twin_scope_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
@@ -3480,6 +3527,8 @@ pub(in crate::snapshot_sync) mod reject_isolation_tests {
 mod state_v2_money_tests {
     include!("state_v2_money_tests.rs");
 }
+
+mod evidence_chunk_tests;
 
 #[cfg(unix)]
 mod s2_oracle_tests;
@@ -3731,8 +3780,18 @@ fn released(name: &str) -> serde_json::Value {
         ))
         .unwrap()
     });
-    let value = fixture[name].clone();
+    let mut value = fixture[name].clone();
     assert!(!value.is_null(), "released fixture {name}");
+    // A released ledger's LRU stamp is decoded and dropped, never written.
+    let sessions = value
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|map| map.values_mut());
+    for session in sessions.filter_map(serde_json::Value::as_object_mut) {
+        if session.contains_key("key_epoch") {
+            session.remove("last_ack");
+        }
+    }
     value
 }
 /// A body's serialized form without its source-file fingerprint: a hash of

@@ -19,11 +19,11 @@
 //! workspace-label consent; every other path travels as the tenant attribution
 //! HMAC and follows attribution consent. No text leaves the Mac.
 
-use super::UsageTotals;
 use crate::codex_prelude_footprint::{char_count as units, BlockKind, CodexPreludeParser};
 use crate::composition_kinds::shell::{
     extension, normalize_path, shell_changes_directory, shell_path_tokens, MAX_SHELL_PATH_TOKENS,
 };
+use crate::snapshots::UsageTotals;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ const MAX_CODEX_AGENTS_MD_BYTES: usize = MAX_HELD_INSTRUCTION_BYTES - 8 * 1024;
 /// Tool call ids are short; a longer one is not tracked.
 const MAX_CALL_ID_BYTES: usize = 256;
 const MAX_TOOL_LABEL_CHARS: usize = 64;
-pub(super) const WINDOW_REQUESTS: usize = 3;
+pub(in crate::snapshots) const WINDOW_REQUESTS: usize = 3;
 /// Claude Code appends this line to the request-1 auto-memory entry when it
 /// loaded only part of MEMORY.md.
 const MEMORY_CUT_MARKER: &str = "> WARNING: MEMORY.md is";
@@ -339,7 +339,7 @@ fn tool_label(name: &str) -> String {
 /// A Claude response spanning several model requests (`usage.iterations[]`):
 /// its counters are not request 1's and later ordinals shift.
 fn claude_multi_request(value: &Value) -> bool {
-    super::claude_code_usage_root(value)
+    crate::snapshots::claude_code_usage_root(value)
         .and_then(|usage| usage.get("iterations"))
         .and_then(Value::as_array)
         .is_some_and(|iterations| iterations.len() > 1)
@@ -467,7 +467,7 @@ fn slot(request: u8) -> usize {
 /// Per-transcript accumulator. Everything but the counters is dropped at the
 /// window freeze.
 #[derive(Debug, Clone, Default)]
-pub(super) struct SessionStartState {
+pub(in crate::snapshots) struct SessionStartState {
     client_version: Option<String>,
     user_turns: u8,
     inherited_prefix: bool,
@@ -666,16 +666,16 @@ impl SessionStartState {
 }
 
 impl SessionStartState {
-    pub(super) fn client_version(&self) -> Option<&str> {
+    pub(in crate::snapshots) fn client_version(&self) -> Option<&str> {
         self.client_version.as_deref()
     }
 
-    pub(super) fn note_user_turn(&mut self) {
+    pub(in crate::snapshots) fn note_user_turn(&mut self) {
         self.user_turns = (self.user_turns + 1).min(2);
     }
 
     /// The transcript starts with records copied from another session.
-    pub(super) fn note_inherited_prefix(&mut self) {
+    pub(in crate::snapshots) fn note_inherited_prefix(&mut self) {
         self.inherited_prefix = true;
     }
 
@@ -705,7 +705,7 @@ impl SessionStartState {
     /// Whether there is opening content a record body never carries (`X`:
     /// instruction text, opening files with their paths, config digests, each
     /// opening call's file paths). The Codex prelude is its own fact.
-    pub(super) fn has_opening_fact(&self) -> bool {
+    pub(in crate::snapshots) fn has_opening_fact(&self) -> bool {
         self.instructions.is_some()
             || !self.files.is_empty()
             || self.config_digest.is_some()
@@ -718,7 +718,7 @@ impl SessionStartState {
 
     /// The opening-settings session fact (D168-1): that content, beside the
     /// record body that keeps its keys (blob and call ids, in key order).
-    pub(super) fn put_opening_fact(
+    pub(in crate::snapshots) fn put_opening_fact(
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
@@ -745,12 +745,12 @@ impl SessionStartState {
 
     /// Whether the Codex prelude parser is held: content (`X`) a record body
     /// never carries, stored as the Codex prelude session fact.
-    pub(super) fn has_codex_prelude(&self) -> bool {
+    pub(in crate::snapshots) fn has_codex_prelude(&self) -> bool {
         self.codex_prelude.is_some()
     }
 
     /// The Codex prelude session fact (D168-1): the held parser, in full.
-    pub(super) fn put_codex_prelude_fact(
+    pub(in crate::snapshots) fn put_codex_prelude_fact(
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
@@ -763,7 +763,7 @@ impl SessionStartState {
     }
 
     /// Restores the Codex prelude fact into a decoded body.
-    pub(super) fn take_codex_prelude_fact(
+    pub(in crate::snapshots) fn take_codex_prelude_fact(
         &mut self,
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
@@ -773,7 +773,7 @@ impl SessionStartState {
 
     /// Restores the opening-settings fact into a decoded body: its blob and
     /// call keys must be the ones the fact was written beside.
-    pub(super) fn take_opening_fact(
+    pub(in crate::snapshots) fn take_opening_fact(
         &mut self,
         d: &mut crate::durable_tail_codec::Dec<'_>,
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
@@ -814,7 +814,7 @@ impl SessionStartState {
     /// Opening-settings content: request-1 instructions, one opening file at
     /// `path`, and an opening call that read it.
     #[cfg(test)]
-    pub(super) fn opening_fact_for_test(&mut self, instructions: &str, path: &str) {
+    pub(in crate::snapshots) fn opening_fact_for_test(&mut self, instructions: &str, path: &str) {
         self.instructions = Some(instructions.into());
         self.files.insert(path.into(), OpeningFileState::default());
         self.open_call_for_test("toolu_opening", &[path]);
@@ -822,7 +822,7 @@ impl SessionStartState {
 
     /// An opening call holding `files`, as a read in the window records it.
     #[cfg(test)]
-    pub(super) fn open_call_for_test(&mut self, id: &str, files: &[&str]) {
+    pub(in crate::snapshots) fn open_call_for_test(&mut self, id: &str, files: &[&str]) {
         let call = OpeningCall {
             files: files.iter().map(|file| file.to_string()).collect(),
             ..OpeningCall::default()
@@ -830,7 +830,7 @@ impl SessionStartState {
         self.calls.insert(OpeningCallId { id: id.into() }, call);
     }
     #[cfg(test)]
-    pub(super) fn call_files_for_test(&self, id: &str) -> Option<&[String]> {
+    pub(in crate::snapshots) fn call_files_for_test(&self, id: &str) -> Option<&[String]> {
         self.calls.get(id).map(|call| call.files.as_slice())
     }
 
@@ -865,7 +865,7 @@ impl SessionStartState {
 
     /// One owned Claude line. `responses` = distinct responses seen so far, so
     /// content on this line arrives in request `responses + 1`.
-    pub(super) fn observe_claude_line(
+    pub(in crate::snapshots) fn observe_claude_line(
         &mut self,
         value: &Value,
         responses: u64,
@@ -1140,7 +1140,7 @@ impl SessionStartState {
     }
 
     /// One resolved Claude response, in transcript order (`sequence` 0-based).
-    pub(super) fn note_claude_response(
+    pub(in crate::snapshots) fn note_claude_response(
         &mut self,
         sequence: u64,
         usage: &UsageTotals,
@@ -1170,7 +1170,7 @@ impl SessionStartState {
 
     /// Codex `session_meta` row, read before ownership so a fork keeps its
     /// version. It starts the shared prelude parser.
-    pub(super) fn note_codex_session_meta(&mut self, row: &Value) {
+    pub(in crate::snapshots) fn note_codex_session_meta(&mut self, row: &Value) {
         if let Some(meta) = row.get("payload") {
             self.note_client_version(str_at(meta, "cli_version"));
         }
@@ -1201,7 +1201,7 @@ impl SessionStartState {
     }
 
     /// One owned Codex line.
-    pub(super) fn observe_codex_line(&mut self, value: &Value, cwd: Option<&Path>) {
+    pub(in crate::snapshots) fn observe_codex_line(&mut self, value: &Value, cwd: Option<&Path>) {
         if self.frozen {
             return;
         }
@@ -1307,7 +1307,7 @@ impl SessionStartState {
     }
 
     /// One admitted Codex usage record with a positive input.
-    pub(super) fn note_codex_request(&mut self, usage: &UsageTotals) {
+    pub(in crate::snapshots) fn note_codex_request(&mut self, usage: &UsageTotals) {
         let index = usize::from(self.codex_requests);
         if index >= WINDOW_REQUESTS || usage.input_tokens == 0 {
             return;
@@ -1515,7 +1515,7 @@ impl SessionStartState {
     /// Everything request-indexed is cut to the contiguous requests actually
     /// observed: a file, truncation or tool call staged for a request the
     /// transcript has not reached yet is not sent (nor counted as overflow).
-    pub(super) fn finish(
+    pub(in crate::snapshots) fn finish(
         self,
         fresh_start: bool,
         first_turn_context_tokens: Option<u64>,
@@ -1673,8 +1673,8 @@ impl SessionStartState {
     }
 }
 
-pub(super) const CLAUDE_PARTS_METHOD: &str = "cc_wire_v1";
-pub(super) const CODEX_PARTS_METHOD: &str = "codex_items_v1";
+pub(in crate::snapshots) const CLAUDE_PARTS_METHOD: &str = "cc_wire_v1";
+pub(in crate::snapshots) const CODEX_PARTS_METHOD: &str = "codex_items_v1";
 
 impl ClaudeBlob {
     fn add(&mut self, part: Part, text: &str) {
@@ -1906,7 +1906,7 @@ pub(crate) enum StartVerdict {
 /// client version only). Measured when the item carries any start value the
 /// server stores besides the client version and the config fingerprint; the
 /// server calls the same start "measured". Reads only the item: no file IO.
-pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+pub(crate) fn session_start_verdict(item: &crate::snapshots::SnapshotItem) -> StartVerdict {
     let Some(start) = item.session_start.as_deref() else {
         return StartVerdict::NotMeasured;
     };
@@ -1985,7 +1985,7 @@ pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict 
 /// holds a non-null value outside the client version, the config fingerprint
 /// and the opening-file rows (those go to their own table).
 #[cfg(test)]
-pub(crate) fn uploaded_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+pub(crate) fn uploaded_start_verdict(item: &crate::snapshots::SnapshotItem) -> StartVerdict {
     let body = serde_json::to_value(item).expect("serialize item");
     let measured = body
         .get("session_start")
@@ -2007,15 +2007,15 @@ pub(crate) fn uploaded_start_verdict(item: &super::SnapshotItem) -> StartVerdict
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        parse_claude_code_jsonl_file_with_title_metadata_and_attribution, parse_codex_jsonl_file,
-        ClaudeTitleMetadata, SnapshotItem, SnapshotSource,
-    };
     use super::*;
     use crate::codex_prelude_footprint;
     use crate::composition_kinds::shell::is_plain_path;
     use crate::session_attribution::{
         SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
+    };
+    use crate::snapshots::{
+        parse_claude_code_jsonl_file_with_title_metadata_and_attribution, parse_codex_jsonl_file,
+        ClaudeTitleMetadata, SnapshotItem, SnapshotSource,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
@@ -3112,7 +3112,7 @@ mod tests {
     #[test]
     #[ignore = "local cost receipt over real transcripts"]
     fn session_start_cost_receipt() {
-        use super::super::{
+        use crate::snapshots::{
             apply_claude_code_line, apply_codex_line, codex_last_usage, CodexOwnershipBoundary,
             SnapshotAccumulator,
         };

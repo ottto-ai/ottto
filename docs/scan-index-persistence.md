@@ -552,6 +552,21 @@ checkpoints and generation advance together. Restart planning, preflight and
 fsynced staging precede BEGIN. The restart owner receives `post_commit` only after
 an unambiguous durable COMMIT; Published/Ambiguous outcomes require reopening.
 
+Every graph commit advances the graph generation G. Owner-local upload-progress
+commits advance `progress_generation` instead (absent reads as 0): the same
+finalizer compares it, stamps the current writer capability and commits, and moves
+no graph row, erasure epoch or Tail state, so G and the graph session's stamp stay
+valid. A COMMIT error reopens and classifies from the committed CAS row of the same
+kind of commit. Progress rows (`progress.cache_state`, `progress.cache_head`,
+`progress.identity`, `progress.ledger`) have no private-path extraction, so
+replacing or deleting one never owes erasure. The graph's catalogue walk reads one
+bounded header page per progress kind it meets and resumes after that kind's last
+possible key; the graph baseline never names them and the graph hydrate never loads
+them. The ledger row sizes against the 64 MiB value bound, as the whole traversal
+fields do. A progress refusal that leaves nothing durable keeps the graph session
+current; a published or ambiguous COMMIT reloads it. No production path writes these
+rows yet.
+
 If restart staging excludes any file, the complete save is discarded and the
 committed graph is reloaded. No acceptance, ACK handoff, rebuild-debt retirement
 or owned-start census from that attempt is published.
@@ -585,6 +600,10 @@ committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
 transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
 8 MiB and idle TRUNCATE remain in effect.
+Custody stores and upload history allow read-only SQLite mappings up to 2147418112 bytes per database.
+The effective ceiling is read back at open; larger databases continue through ordinary reads.
+WAL/FULL, fullfsync, secure_delete and erasure maintenance retain their settings.
+A mapped-file I/O fault or external truncation can terminate the service; supervised installs restart and recover through SQLite.
 Each save or import that writes rows reports `row_cap_max`, the largest written
 row's logical bytes as a percent of its sizing target with its kind name, and
 `row_cap_alarm` at 75% or more, including above 100%, which commits and never

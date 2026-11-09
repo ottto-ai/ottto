@@ -1,5 +1,6 @@
 use crate::control::{handle_request_with_peer, LocalClientPeer};
 use crate::control_plane_health::{self, PublishedListener};
+use crate::local_resource_diagnostics::StageWindow;
 use crate::LocalDaemon;
 use anyhow::{Context, Result};
 use ottto_protocol::{CliError, CliErrorCode, LocalControlRequest, LocalControlResponse};
@@ -180,6 +181,7 @@ fn accept_error_means_listener_gone(error: &std::io::Error) -> bool {
 }
 
 fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
+    let _stage = StageWindow::begin("unknown", "offpass_control_socket");
     // Whether an accepted socket inherits the listener's O_NONBLOCK differs by
     // platform; the poll-driven I/O below requires it, so set it explicitly.
     if let Err(error) = stream.set_nonblocking(true) {

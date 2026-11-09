@@ -159,17 +159,27 @@ pub(super) fn hydrate_txn(
             after.as_ref(),
             128,
         )?;
-        if page.is_empty() {
+        let Some(last) = page.last() else {
             break;
-        }
+        };
+        after = Some(last.key.clone());
         for header in &page {
             let RowKey::Record { kind, .. } = &header.key else {
                 bail!("state_v2_record_kind");
             };
-            ensure!(
-                catalogue::group(kind.name()).is_some(),
-                "state_v2_unmapped_kind"
-            );
+            let group = catalogue::group(kind.name());
+            ensure!(group.is_some(), "state_v2_unmapped_kind");
+            // Upload progress is not graph state: resume after this kind's
+            // last possible key, so each progress kind met costs one bounded
+            // header page.
+            if group == Some(catalogue::Group::Progress) {
+                after = Some(RowKey::record(
+                    kind.name(),
+                    vec![u8::MAX; KEY_BYTES],
+                    i64::MAX as u64,
+                )?);
+                break;
+            }
             // Legacy archive member keys retain first-seen evidence. Their
             // values stay inert; no policy state or baseline digest is loaded.
             if catalogue::retired(kind.name())
@@ -182,7 +192,6 @@ pub(super) fn hydrate_txn(
                 retired.insert(header.key.clone());
             }
         }
-        after = page.last().map(|h| h.key.clone());
     }
     super::telemetry::hydrate_checkpoint("hydrate_after_catalogue", 0, None);
     let mut index = ScanIndex::default();
@@ -399,6 +408,8 @@ pub(super) fn private_paths(
         RowKey::Record { kind, .. } => {
             let extract = match catalogue::group(kind.name()) {
                 Some(catalogue::Group::Misc) => kinds_misc::private_paths,
+                // Upload progress holds no private-path extraction.
+                Some(catalogue::Group::Progress) => return Ok(()),
                 Some(_) => mapper::private_paths,
                 None => bail!("state_v2_unmapped_kind"),
             };

@@ -875,16 +875,23 @@ fn late_main_side_call(c: &Corpus) {
 /// its two copies after an exact ACK and save: both copies fold, no unchanged
 /// child loads or re-folds on that page or the next, and money matches cold
 /// with the children's bodies carried. A move of the main's usage logs alone
-/// still re-reads the family on its page, then settles the same way.
+/// still re-reads the family on its page, then settles the same way. A
+/// child's activity retry or a change to the other main copy also keeps
+/// the whole-family read, with cold-equivalent money and placement.
 #[test]
 fn root_twin_audit_overdue_growth_does_not_repull_family() {
     use crate::snapshots::e2_pipeline_scan_fixture::{
         overdue_audit_for_test, tail_counter_for_test,
     };
     with_e2(|| {
-        for usage_logs_only in [false, true] {
+        for case in [
+            "growth",
+            "usage_logs",
+            "child_activity_retry",
+            "other_main_copy",
+        ] {
             let c = twins(
-                &format!("subagent-twin-root-scope-{usage_logs_only}"),
+                &format!("subagent-twin-root-scope-{case}"),
                 false,
                 TURN,
                 false,
@@ -899,24 +906,59 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
             let mut carried = acked(&first);
             let mut prior = commit(&session, first);
             let main = c.root.join(format!("z/{ROOT}.jsonl"));
-            overdue_audit_for_test(&mut prior, &main);
-            if usage_logs_only {
+            if matches!(case, "growth" | "usage_logs") {
+                overdue_audit_for_test(&mut prior, &main);
+            }
+            if case == "usage_logs" {
                 late_main_side_call(&c);
             } else {
                 append(&main, &line(ROOT, "audit-growth", GROW, 8));
             }
+            let mut hints = vec![main];
+            if case == "child_activity_retry" {
+                // Drop activity on both copies so the body owner retries.
+                for home in ["a", "z"] {
+                    let path = c.root.join(member(home, 0));
+                    let key = path.to_string_lossy().into_owned();
+                    let owned = prior.file_snapshot_fingerprints.get(&key).cloned();
+                    for fingerprint in owned.into_iter().flatten() {
+                        prior.snapshot_activity_at.remove(&fingerprint);
+                    }
+                    hints.push(path);
+                }
+            } else if case == "other_main_copy" {
+                let path = c.root.join(format!("a/{ROOT}.jsonl"));
+                append(&path, &line(ROOT, "broad-other", GROW, 8));
+                hints.push(path);
+            }
             let refolds = || tail_counter_for_test("tail_refold", "forced_family");
             let before = refolds();
             let (warm, rows) = crate::local_resource_diagnostics::capture(|| {
-                hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&main))
+                hinted(&c, prior.clone(), 100, true, &hints)
             });
             let [seeds, selection] = seed_counts(&rows);
-            if usage_logs_only {
-                // Each listed child's fingerprint carries the main's usage
-                // logs, so a usage-log move re-identifies every child copy as
-                // changed: those child seeds keep today's whole-family read.
-                assert!(seeds.get("child_member").is_some_and(|n| *n > 0));
-                assert!(seeds.get("source_changed").is_some_and(|n| *n > 0));
+            if case != "growth" {
+                if case == "usage_logs" {
+                    // Each listed child's fingerprint carries the main's
+                    // usage logs, so their move re-identifies every copy.
+                    assert!(seeds.get("source_changed").is_some_and(|n| *n > 0));
+                }
+                if case == "other_main_copy" {
+                    assert_eq!(seeds.get("root_member"), Some(&2));
+                } else {
+                    assert!(seeds.get("child_member").is_some_and(|n| *n > 0));
+                    if case == "child_activity_retry" {
+                        assert_eq!(seeds.get("root_member"), Some(&1));
+                    }
+                }
+                if case != "usage_logs" {
+                    for agent in 0..3 {
+                        assert!(
+                            body(&warm, &child(agent)).is_some(),
+                            "{case}: child {agent}"
+                        );
+                    }
+                }
                 assert_eq!(selection.get("forced_family_roots"), Some(&1));
                 assert_eq!(selection.get("forced_family_member_scoped"), None);
                 let mut actual = result(&warm, Mode::Ram);
@@ -937,66 +979,9 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
             // copies again; no child loads, re-folds or re-sends.
             let before = refolds();
             let next = page(&c, prior, 100, true);
-            assert!(refolds() - before <= 2, "{usage_logs_only}: the next page");
+            assert!(refolds() - before <= 2, "{case}: the next page");
             for agent in 0..3 {
-                assert!(body(&next, &child(agent)).is_none(), "{usage_logs_only}");
-            }
-        }
-    });
-}
-
-/// [regress] Beside a main-only append, any other seed of that root keeps
-/// the whole-family read in the same page: a child's activity retry, or a
-/// change to the main's other copy.
-#[test]
-fn main_append_beside_another_family_seed_reads_the_family() {
-    with_e2(|| {
-        for case in ["child_activity_retry", "other_main_copy"] {
-            let c = twins(
-                &format!("subagent-twin-broad-{case}"),
-                false,
-                TURN,
-                false,
-                false,
-            );
-            let (session, index) = StateV2ColdSession::publish(
-                Source::Claude,
-                &ScanIndex::default(),
-                &c.base.join("state"),
-            );
-            let mut prior = commit(&session, page(&c, index, 100, true));
-            let main = c.root.join(format!("z/{ROOT}.jsonl"));
-            append(&main, &line(ROOT, "broad-main", GROW, 8));
-            // One copy of a child owns its bodies: drop their activity on
-            // both copies, so the owner retries.
-            let mut hints = vec![main];
-            if case == "child_activity_retry" {
-                for home in ["a", "z"] {
-                    let path = c.root.join(member(home, 0));
-                    let key = path.to_string_lossy().into_owned();
-                    let owned = prior.file_snapshot_fingerprints.get(&key).cloned();
-                    for fingerprint in owned.into_iter().flatten() {
-                        prior.snapshot_activity_at.remove(&fingerprint);
-                    }
-                    hints.push(path);
-                }
-            } else {
-                let path = c.root.join(format!("a/{ROOT}.jsonl"));
-                append(&path, &line(ROOT, "broad-other", GROW, 8));
-                hints.push(path);
-            }
-            let (warm, rows) =
-                crate::local_resource_diagnostics::capture(|| hinted(&c, prior, 100, true, &hints));
-            let [seeds, selection] = seed_counts(&rows);
-            let main_seeds = if case == "other_main_copy" { 2 } else { 1 };
-            assert_eq!(seeds.get("root_member"), Some(&main_seeds), "{case}");
-            assert_eq!(selection.get("forced_family_roots"), Some(&1), "{case}");
-            assert_eq!(selection.get("forced_family_member_scoped"), None, "{case}");
-            for agent in 0..3 {
-                assert!(
-                    body(&warm, &child(agent)).is_some(),
-                    "{case}: child {agent}"
-                );
+                assert!(body(&next, &child(agent)).is_none(), "{case}");
             }
         }
     });

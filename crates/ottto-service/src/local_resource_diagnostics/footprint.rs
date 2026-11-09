@@ -286,7 +286,7 @@ pub(super) fn current() -> StateV2Memory {
         remaining: [u64; 15],
         phys_footprint: u64,
     }
-    extern "C" {
+    unsafe extern "C" {
         static mach_task_self_: libc::mach_port_t;
     }
     let mut vm = TaskVmInfo::default();

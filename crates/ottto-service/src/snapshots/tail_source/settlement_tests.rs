@@ -95,7 +95,6 @@ pub(super) fn finalize(
     let parsed_snapshot_count = items.len();
     scan.snapshots = items;
     scan.pending_finalization.push(PendingIndexFinalization {
-        refold_unchanged: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: false,

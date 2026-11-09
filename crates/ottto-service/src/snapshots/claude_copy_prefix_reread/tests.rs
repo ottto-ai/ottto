@@ -18,10 +18,10 @@ fn prepare(index: &mut ScanIndex, support: &Path, roots: &[PathBuf]) -> Result<V
 }
 
 fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
-    let (home, root, mut index) = super::super::claude_history_upgrade_tests::families(name, 3);
+    let (home, root, mut index) = crate::snapshots::claude_history_upgrade_tests::families(name, 3);
     // This fixture models already delivered history with per-file receipts;
     // otherwise unrelated context debt exists BEFORE the switch changes.
-    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
+    crate::snapshots::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     let mut paths = index
         .files
         .keys()
@@ -508,7 +508,7 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
         .map(|s| s.snapshot_fingerprint.clone())
         .collect();
     index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
-    super::super::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
+    crate::snapshots::e2_pipeline_scan_fixture::receipt_acked_files_for_test(&mut index, "ctx-1");
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }

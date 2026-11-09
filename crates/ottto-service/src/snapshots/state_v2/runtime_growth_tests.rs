@@ -73,7 +73,6 @@ impl Fixture {
         kinds::populate(&index, &mut tx, &mut cx).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
         db.finish_import().unwrap();
-        super::super::ack::ProgressRecovery::seal_import(identity.clone(), 1, &path, None).unwrap();
         fence::publish(&path, &identity, &mut false).unwrap();
         Self {
             support,
@@ -366,8 +365,6 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
     );
     let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &old);
     guard().unwrap();
-    let receipt = super::super::ack::ProgressRecovery::for_index(&old, &f.path).unwrap();
-    assert!(receipt.is_some());
     old.historical_replay_generation = Some("synthetic-next-context".into());
     old.save(&f.path).unwrap();
     assert!(
@@ -397,6 +394,45 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
             ["last_growth_full_unix"],
         serde_json::json!(NOW)
     );
+}
+
+/// [behaviour] A claim-only growth save earlier in the pass moves the session
+/// to the claim's G; a progress page from the pass's index authenticates at
+/// that lineage instead of refusing as a stale graph.
+#[test]
+fn progress_page_follows_the_claim_lineage() {
+    let f = Fixture::new();
+    let mut claim = f.load();
+    let pass = claim.clone();
+    claim
+        .v2_mut()
+        .growth_retention
+        .insert(f.key.clone(), debt(Some(NOW)));
+    claim.save_growth_claim(&f.path).unwrap();
+    {
+        let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path, claim.generation).unwrap();
+    }
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&pass, &f.path),
+        Some(pass.generation + 1)
+    );
+    let (states, heads) = (
+        BTreeMap::from([("s".to_string(), 1_u64)]),
+        BTreeMap::<String, u64>::new(),
+    );
+    let page = progress::Page {
+        cache_state: &states,
+        cache_head: &heads,
+        ledger: &1_u64,
+    };
+    let outcome = crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+        with_progress_session(&f.path, owner, |db, identity, graph| {
+            progress::commit(db, identity, graph, &Default::default(), &page, None)
+        })
+    })
+    .unwrap();
+    assert!(matches!(outcome, progress::Outcome::Committed(_)));
 }
 
 /// One growth Full claim through selection admission. Also reports whether

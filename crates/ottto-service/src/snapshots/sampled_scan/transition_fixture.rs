@@ -985,6 +985,19 @@ pub(crate) mod money_oracle {
         }
     }
 
+    fn retain_envelope_entities(normalized: &mut Value, mut keep: impl FnMut(&Value) -> bool) {
+        for envelope in normalized.as_array_mut().unwrap().iter_mut() {
+            envelope["snapshots"]
+                .as_array_mut()
+                .unwrap()
+                .retain(&mut keep);
+        }
+        normalized
+            .as_array_mut()
+            .unwrap()
+            .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+    }
+
     /// `entity` is held in `other`; every emitted sibling must still equal cold.
     pub(crate) fn assert_held(
         entity: &str,
@@ -1018,17 +1031,7 @@ pub(crate) mod money_oracle {
         let mut actual = other.clone();
         // Filter whole envelopes, preserving every field of each emitted sibling.
         for result in [&mut expected, &mut actual] {
-            for envelope in result.normalized.as_array_mut().unwrap().iter_mut() {
-                envelope["snapshots"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|s| s["source_session_id"] != entity);
-            }
-            result
-                .normalized
-                .as_array_mut()
-                .unwrap()
-                .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+            retain_envelope_entities(&mut result.normalized, |s| s["source_session_id"] != entity);
         }
         if !expected.snapshots.is_empty() {
             assert_equivalent(&expected, &actual);
@@ -1070,12 +1073,6 @@ pub(crate) mod money_oracle {
                 &placement_snapshot(&carried.body),
                 &mut differences,
             );
-            for envelope in expected.normalized.as_array_mut().unwrap().iter_mut() {
-                envelope["snapshots"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|s| s["source_session_id"] != entity.as_str());
-            }
         }
         assert!(
             differences.is_empty(),
@@ -1084,11 +1081,11 @@ pub(crate) mod money_oracle {
             cold.mode,
             differences.join("\n")
         );
-        expected
-            .normalized
-            .as_array_mut()
-            .unwrap()
-            .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+        retain_envelope_entities(&mut expected.normalized, |s| {
+            expected
+                .snapshots
+                .contains_key(s["source_session_id"].as_str().unwrap())
+        });
         // An off-page member awaiting verification leaves its family's context
         // posture uncertified, as for a main with one copy: the emitted main
         // withholds as `unknown_birth` where cold withholds as `multi_file`.

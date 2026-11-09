@@ -1273,3 +1273,6 @@ mod subagent_twin_tests;
 
 #[path = "unkept_requeue_oracle_tests.rs"]
 mod unkept_requeue_oracle_tests;
+
+#[path = "context_posture_refold_tests.rs"]
+mod context_posture_refold_tests;

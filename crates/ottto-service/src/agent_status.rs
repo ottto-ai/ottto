@@ -1820,6 +1820,12 @@ fn collect_codex_status_snapshots(
         }
     }
 
+    CODEX_CLI_META
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain_listed(&codex_scan_homes.iter().cloned().collect());
+
     let mut snapshots = Vec::new();
     let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -3259,6 +3265,183 @@ pub fn parse_codex_status_fallback(
     snapshot
 }
 
+const CLI_META_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct CliMeta<F> {
+    loaded_at: Instant,
+    facts: F,
+}
+
+type CliFacts<K, F, const N: usize> = crate::transcript_acquisition::StampedFacts<
+    K,
+    CliMeta<F>,
+    [crate::transcript_acquisition::SourceStamp; N],
+>;
+
+#[derive(Clone)]
+struct CodexCliMeta {
+    // No account, email, plan or identity is retained from CLI text.
+    login: AgentLoginState,
+    models: AgentModelStatus,
+}
+
+static CODEX_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, CodexCliMeta, 3>>> = OnceLock::new();
+static CLAUDE_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, (), 1>>> = OnceLock::new();
+
+fn cli_meta<K: Ord + Clone, F: Clone, E, const N: usize>(
+    cache: &Mutex<CliFacts<K, F, N>>,
+    key: K,
+    capture: impl FnMut() -> std::io::Result<[crate::transcript_acquisition::SourceStamp; N]>,
+    load: impl FnOnce() -> Result<F, E>,
+    now: Instant,
+    bypass: bool,
+) -> Result<F, E> {
+    // Move this key out while loading: never hold the shared lock over a CLI
+    // spawn, file metadata lookup or parsing. Concurrent misses may both read.
+    let mut local = CliFacts::default();
+    {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stamp, facts)) = cache.kept.remove(&key) {
+            if !bypass && now.saturating_duration_since(facts.loaded_at) < CLI_META_MAX_AGE {
+                local.kept.insert(key.clone(), (stamp, facts));
+            }
+        }
+    }
+    let result = local.reuse_or_load(key.clone(), capture, || {
+        load().map(|facts| CliMeta {
+            loaded_at: now,
+            facts,
+        })
+    });
+    if let Some(kept) = local.kept.remove(&key) {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .kept
+            .insert(key, kept);
+    }
+    result.map(|entry| entry.facts)
+}
+
+fn cli_binary_stamp(binary: &str) -> std::io::Result<crate::transcript_acquisition::SourceStamp> {
+    let path = crate::command_env::executable_path(binary)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let stamp = crate::transcript_acquisition::SourceStamp::capture_file(&path.canonicalize()?)?;
+    match stamp {
+        crate::transcript_acquisition::SourceStamp::File(_) => Ok(stamp),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    }
+}
+
+fn codex_cli_meta(
+    home: &Path,
+    allow_legacy_oauth: bool,
+    reuse_login: bool,
+) -> (
+    Result<AgentLoginState, CommandOutput>,
+    AgentModelStatus,
+    Option<AgentAccountStatus>,
+) {
+    use crate::transcript_acquisition::SourceStamp;
+    let mut fresh = None;
+    let mut fresh_login_account = None;
+    let result = cli_meta(
+        CODEX_CLI_META.get_or_init(Default::default),
+        home.to_path_buf(),
+        || {
+            let binary = cli_binary_stamp("codex")?;
+            let auth = SourceStamp::capture_file(&home.join("auth.json"))?;
+            // Absent auth must never suppress a login probe (keyring homes).
+            if matches!(auth, SourceStamp::Absent) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            Ok([
+                binary,
+                auth,
+                SourceStamp::capture_file(&home.join("config.toml"))?,
+            ])
+        },
+        || {
+            let login = run_codex_home_command(
+                home,
+                &["login", "status"],
+                COMMAND_TIMEOUT,
+                allow_legacy_oauth,
+            );
+            let models = run_codex_home_command(
+                home,
+                &["debug", "models", "--bundled"],
+                COMMAND_TIMEOUT,
+                allow_legacy_oauth,
+            );
+            let parsed_account = parse_codex_account_text(&login.stdout);
+            let parsed_login = parsed_account
+                .as_ref()
+                .map(|account| account.login_state.clone());
+            let parsed_models = collect_codex_model_status_from_output(&models);
+            let valid = login.command_found
+                && login.success
+                && login.status_code == Some(0)
+                && parsed_login.is_some()
+                && models.command_found
+                && models.success
+                && models.status_code == Some(0)
+                && !parsed_models.available_models.is_empty();
+            if valid {
+                // The fresh fallback is used this pass only, never kept in facts.
+                fresh_login_account = parsed_account;
+                Ok(CodexCliMeta {
+                    login: parsed_login.unwrap(),
+                    models: parsed_models,
+                })
+            } else {
+                fresh = Some((login, parsed_account, parsed_models));
+                Err(())
+            }
+        },
+        Instant::now(),
+        !reuse_login
+            || crate::provider_calls::current_trigger()
+                == Some(crate::provider_calls::Trigger::Setup),
+    );
+    match result {
+        Ok(meta) => (Ok(meta.login), meta.models, fresh_login_account),
+        Err(()) => {
+            let (output, parsed, models) = fresh.expect("loader returned uncached outputs");
+            let fresh_account = if output.command_found && output.success {
+                parsed
+            } else {
+                None
+            };
+            let login = fresh_account
+                .as_ref()
+                .map(|account| account.login_state.clone())
+                .ok_or(output);
+            (login, models, fresh_account)
+        }
+    }
+}
+
+fn claude_version_detected() -> bool {
+    cli_meta(
+        CLAUDE_CLI_META.get_or_init(Default::default),
+        PathBuf::from("claude"),
+        || Ok([cli_binary_stamp("claude")?]),
+        || {
+            let output = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
+            if output.command_found && output.success {
+                Ok(())
+            } else {
+                Err(())
+            }
+        },
+        Instant::now(),
+        false,
+    )
+    .is_ok()
+}
+
 fn collect_codex_status_for_home(
     captured_at: String,
     expires_at: String,
@@ -3297,38 +3480,61 @@ fn collect_codex_status_for_home(
         ..unsupported_account("openai")
     });
 
-    let login = run_codex_home_command(
-        codex_home,
-        &["login", "status"],
-        COMMAND_TIMEOUT,
-        allow_legacy_oauth,
-    );
-    if login.command_found {
-        snapshot.collection_method = AgentStatusCollectionMethod::CliText;
-        if login.success {
-            if let Some(account) = parse_codex_account_text(&login.stdout) {
-                snapshot.status = AgentStatusState::Available;
-                snapshot.account = Some(account);
+    let auth_account = read_codex_auth_account_at(codex_home, home_trust);
+    // Reuse login metadata only when this pass's fresh auth read covers every
+    // variable field the CLI fallback can fill. Incomplete/unreadable auth must
+    // run the CLI fresh; the full parsed account is never cached.
+    let reuse_login = auth_account
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .is_some_and(|account| {
+            account.email.is_some()
+                && account.plan_type.is_some()
+                && account.subscription_product.is_some()
+                && account.billing_channel.is_some()
+        });
+    let (login, mut model_status, fresh_login_account) =
+        codex_cli_meta(codex_home, allow_legacy_oauth, reuse_login);
+    match login {
+        Ok(login_state) => {
+            snapshot.collection_method = AgentStatusCollectionMethod::CliText;
+            snapshot.status = AgentStatusState::Available;
+            if let Some(account) = &mut snapshot.account {
+                if login_state == AgentLoginState::SignedIn {
+                    account.billing_channel = Some("subscription".to_string());
+                }
+                account.login_state = login_state;
+                account.auth_method = Some("oauth".to_string());
+                account.confidence = AgentStatusConfidence::Medium;
             }
-        } else {
-            snapshot.diagnostics.push(command_diagnostic(
-                "codex_login_status_failed",
-                "codex login status did not return a usable status.",
-                &login,
-            ));
-            if matches!(
-                login.status_code,
-                Some(1) | Some(2) | Some(64) | Some(65) | Some(66) | Some(67)
-            ) {
-                snapshot.status = AgentStatusState::AuthRequired;
-                if let Some(account) = &mut snapshot.account {
-                    account.login_state = AgentLoginState::SignedOut;
-                    account.confidence = AgentStatusConfidence::Medium;
+        }
+        Err(login) if login.command_found => {
+            snapshot.collection_method = AgentStatusCollectionMethod::CliText;
+            if !login.success {
+                snapshot.diagnostics.push(command_diagnostic(
+                    "codex_login_status_failed",
+                    "codex login status did not return a usable status.",
+                    &login,
+                ));
+                if matches!(
+                    login.status_code,
+                    Some(1) | Some(2) | Some(64) | Some(65) | Some(66) | Some(67)
+                ) {
+                    snapshot.status = AgentStatusState::AuthRequired;
+                    if let Some(account) = &mut snapshot.account {
+                        account.login_state = AgentLoginState::SignedOut;
+                        account.confidence = AgentStatusConfidence::Medium;
+                    }
                 }
             }
         }
+        Err(_) => {}
     }
-    match read_codex_auth_account_at(codex_home, home_trust) {
+    if let Some(account) = fresh_login_account {
+        snapshot.account = Some(account);
+    }
+    match auth_account {
         Ok(Some(auth_account)) => {
             snapshot.status = AgentStatusState::Available;
             snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), auth_account));
@@ -3337,13 +3543,6 @@ fn collect_codex_status_for_home(
         Err(_) => append_codex_credential_read_failed_diagnostic(&mut snapshot),
     }
 
-    let models = run_codex_home_command(
-        codex_home,
-        &["debug", "models", "--bundled"],
-        COMMAND_TIMEOUT,
-        allow_legacy_oauth,
-    );
-    let mut model_status = collect_codex_model_status_from_output(&models);
     apply_codex_config_model(
         &mut model_status,
         read_codex_config_model_at(codex_home, home_trust),
@@ -4465,7 +4664,7 @@ fn collect_claude_status(
                 ));
         }
     }
-    let version = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
+    let version_detected = claude_version_detected();
     snapshot.model = Some(AgentModelStatus {
         active_model: None,
         default_model: None,
@@ -4744,7 +4943,7 @@ fn collect_claude_status(
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
-    if version.command_found && version.success {
+    if version_detected {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "claude_version_detected",
             AgentDiagnosticSeverity::Info,
@@ -16521,7 +16720,7 @@ fn codex_app_server_end_failure(
     phase: &str,
     disconnected: bool,
     initialize_error: Option<&str>,
-    child: &mut std::process::Child,
+    child: &mut crate::local_resource_diagnostics::cli_children::MeasuredChild,
 ) -> String {
     if let Some(message) = initialize_error {
         return message.to_string();
@@ -16751,8 +16950,7 @@ fn run_codex_app_server_rate_limits_for_home(
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
     }
-    let mut child = command
-        .spawn()
+    let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command)
         .map_err(|_| "Codex app-server could not be started.".to_string())?;
     run.spawned = true;
     let stdout = child
@@ -19804,7 +20002,7 @@ fn run_command_capture_with_exact_env(
 
 fn run_prepared_command_capture(mut command: Command, timeout: Duration) -> CommandOutput {
     let start = Instant::now();
-    let mut child = match command.spawn() {
+    let mut child = match crate::local_resource_diagnostics::cli_children::spawn(&mut command) {
         Ok(child) => child,
         Err(_) => {
             return CommandOutput {
@@ -20532,9 +20730,9 @@ mod tests {
             let previous = std::env::var_os(key);
             let effective_home_previous =
                 (key == "HOME").then(|| std::env::var_os("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"));
-            std::env::set_var(key, &value);
+            unsafe { std::env::set_var(key, &value) };
             if key == "HOME" {
-                std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &value);
+                unsafe { std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &value) };
             }
             Self {
                 key,
@@ -20547,13 +20745,15 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.previous.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
             if let Some(previous) = self.effective_home_previous.as_ref() {
                 match previous {
-                    Some(value) => std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", value),
-                    None => std::env::remove_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"),
+                    Some(value) => unsafe {
+                        std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", value)
+                    },
+                    None => unsafe { std::env::remove_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS") },
                 }
             }
         }
@@ -23043,6 +23243,10 @@ for line in sys.stdin:
             .expect("fake Codex mode");
 
         (root, home)
+    }
+
+    mod cli_metadata_tests {
+        include!("agent_status/cli_metadata_tests.rs");
     }
 
     #[cfg(unix)]
@@ -36393,7 +36597,7 @@ mod claude_login_phase0_tests {
     impl Guard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -36401,8 +36605,8 @@ mod claude_login_phase0_tests {
     impl Drop for Guard {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }

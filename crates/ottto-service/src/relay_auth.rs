@@ -653,14 +653,16 @@ mod http_tests {
         impl Drop for Env {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(value) => std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value),
-                    None => std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"),
+                    Some(value) => unsafe {
+                        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value)
+                    },
+                    None => unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") },
                 }
             }
         }
         let support = crate::test_scratch::ScratchDir::new("relay-probe-handover");
         let _restore = Env(std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"));
-        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref());
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref()) };
         let backend = Backend::start(vec![401, 200, 200]);
         let client = SnapshotApiClient::new(&backend.base);
         let device = device();
@@ -738,14 +740,16 @@ mod http_tests {
         impl Drop for Env {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(value) => std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value),
-                    None => std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"),
+                    Some(value) => unsafe {
+                        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value)
+                    },
+                    None => unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") },
                 }
             }
         }
         let support = crate::test_scratch::ScratchDir::new("relay-generation");
         let _restore = Env(std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"));
-        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref());
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref()) };
         let backend = Backend::start(vec![401, 200]);
         let client = SnapshotApiClient::new(&backend.base);
         let mut device = device();

@@ -34,7 +34,6 @@ pub(crate) struct Counts {
     pub(crate) refused_new_buckets: u64,
     pub(crate) accepted_state_unknown: u64,
     pub(crate) accepted_share_changed: u64,
-    pub(crate) accepted_state_evicted: u64,
     pub(crate) accepted_overflow: OverflowCounts,
     /// Final model rows sent untagged: a share lacked a cost its priced row carries.
     pub(crate) unpriced_part_untagged: u64,
@@ -75,7 +74,7 @@ impl Counts {
         self == &Self::default()
     }
 }
-const COUNTER_COUNT: usize = 23;
+const COUNTER_COUNT: usize = 22;
 crate::local_resource_diagnostics::process_static!(fn counters:
     [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT]);
 pub(super) fn record(counts: &Counts) {
@@ -85,7 +84,6 @@ pub(super) fn record(counts: &Counts) {
             counts.refused_new_buckets,
             counts.accepted_state_unknown,
             counts.accepted_share_changed,
-            counts.accepted_state_evicted,
             counts.accepted_overflow.same_as_parent,
             counts.accepted_overflow.differs,
             counts.unpriced_part_untagged,
@@ -105,19 +103,18 @@ pub(super) fn record(counts: &Counts) {
             counts.copy_invalidated_rows,
             counts.copy_invalidated_unfit,
         ]) {
-            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
+            let _ = counter.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, copy_derived_proof_invalidated, copy_derived_mixed_not_invalidated, copy_derived_skipped_evidence_unavailable, copy_invalidated_rows, copy_invalidated_unfit] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete, retained_marker_rows, retained_proof_missing_received, retained_set_cleared, retained_missing_unfit, proved_rows_capped, copy_derived_proof_invalidated, copy_derived_mixed_not_invalidated, copy_derived_skipped_evidence_unavailable, copy_invalidated_rows, copy_invalidated_unfit] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
         refused_new_buckets,
         accepted_state_unknown,
         accepted_share_changed,
-        accepted_state_evicted,
         accepted_overflow: OverflowCounts {
             same_as_parent,
             differs,

@@ -25,6 +25,9 @@ pub(in crate::snapshots) struct AccountMoveObservations {
 pub(in crate::snapshots) struct DiscoveryRetention<'a> {
     /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
     pub(in crate::snapshots) files: &'a SharedMap<String, ScanIndexEntry>,
+    /// Confirmed-empty keys: a nonempty entry with no final group outside
+    /// this set is owed (`sampled_audit::path_requires_verification`).
+    pub(in crate::snapshots) confirmed_empty: &'a BTreeSet<String>,
     /// Correctness hold: unresolved ownership debt stays discoverable, including growth.
     /// Only the approved interim withheld_reparse{start,evidence,growth} exception may Full.
     /// At the hold cap no new exemption is invented; unknown identity cannot memo-Skip.
@@ -63,7 +66,7 @@ impl<'a> DiscoveryRetention<'a> {
 
     /// Owed by a registered source: the discovery window does not apply.
     pub(in crate::snapshots) fn owes(&self, path: &Path) -> bool {
-        sampled_audit::path_requires_verification(self.files, path)
+        sampled_audit::path_requires_verification(self.files, self.confirmed_empty, path)
             || self.account_holds.contains_key(&local_index_key(path))
     }
 
@@ -104,8 +107,10 @@ mod discovery_support {
             files: &'a SharedMap<String, ScanIndexEntry>,
         ) -> Self {
             static NONE: BTreeMap<String, String> = BTreeMap::new();
+            static EMPTY: BTreeSet<String> = BTreeSet::new();
             Self {
                 files,
+                confirmed_empty: &EMPTY,
                 account_holds: &NONE,
                 memo: None,
                 growth: None,

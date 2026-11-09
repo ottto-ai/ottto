@@ -1,6 +1,7 @@
 //! Bounded compatibility ingress for exporters that retain their startup port.
 use super::*;
 use crate::agent_configs::claude_managed_settings;
+use crate::local_resource_diagnostics::StageWindow;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -940,6 +941,7 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                 loop {
                     let now = now_seconds();
                     if now >= next_tick {
+                        let _stage = StageWindow::begin("unknown", "offpass_legacy_relay");
                         let generation = admission.generation.load(Ordering::SeqCst);
                         let approval = read_approval();
                         let approved = match approval {

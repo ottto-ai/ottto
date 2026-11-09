@@ -509,7 +509,7 @@ impl ClaudeReemissionStopCause {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ClaudeReemissionStop {
     latched: bool,
     cause: ClaudeReemissionStopCause,
@@ -595,12 +595,11 @@ pub(super) fn note_claude_reemission_stop_with_cause_at(
                 return None;
             }
             true
-        } else if let Some(cause) = cause {
+        } else {
+            let cause = cause?;
             stop.latched = true;
             stop.cause = cause;
             false
-        } else {
-            return None;
         };
         stop.last_alarm = Some(now);
         Some((reminder, stop.withheld_folds, stop.cause))
@@ -649,6 +648,16 @@ pub(super) fn claude_reemission_stop_withheld_folds() -> u64 {
 #[cfg(test)]
 pub(crate) fn restart_claude_reemission_stop_for_test() {
     with_claude_reemission_stop(|stop| *stop = ClaudeReemissionStop::new());
+}
+
+/// Test seam: runs `body`, then puts the latch back as it was, so a reference
+/// fold leaves this thread's latch unchanged.
+#[cfg(test)]
+pub(crate) fn with_claude_reemission_stop_restored_for_test<T>(body: impl FnOnce() -> T) -> T {
+    let before = with_claude_reemission_stop(|stop| stop.clone());
+    let result = body();
+    with_claude_reemission_stop(|stop| *stop = before);
+    result
 }
 
 #[cfg(test)]

@@ -71,12 +71,12 @@ impl ScanIndex {
             .as_ref()
             .and_then(|path| path.parent()?.file_name()?.to_str())
             .unwrap_or(&expected.destination_namespace_hash);
-        let recovery = crate::snapshots::ProgressRecovery::for_index(&index, &index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load_with_recovery(
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &index_path,
             &progress_path,
             destination,
             snapshot_quarantine_witness(SnapshotSource::Codex),
-            recovery,
         )
         .unwrap();
         progress.context_receipt_candidates =

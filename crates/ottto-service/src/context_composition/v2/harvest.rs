@@ -57,6 +57,7 @@ use super::{
     REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
+use crate::local_resource_diagnostics::StageWindow;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use crate::upload_policy::FootprintRules;
@@ -107,6 +108,7 @@ pub(in crate::context_composition) fn spawn_v2_sync() -> Result<()> {
 }
 
 fn run_wake(worktrees: &mut WorktreeCache) -> Result<()> {
+    let _stage = StageWindow::begin("unknown", "offpass_context_composition");
     // Pin reloads can allocate as much as a scan. Keep both in the worker;
     // only the hourly folder map returns to the scheduler.
     let mut command = Command::new(std::env::current_exe()?);
@@ -442,7 +444,7 @@ pub fn run_context_composition_worker() -> Result<()> {
 fn set_utility_qos() {
     #[cfg(target_os = "macos")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
         }
         const QOS_CLASS_UTILITY: u32 = 0x11;
@@ -1266,7 +1268,7 @@ pub(super) fn run_source(
 pub(super) fn release_memory() {
     #[cfg(target_os = "macos")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
         // SAFETY: a null zone requests relief from all system malloc zones.

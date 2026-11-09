@@ -20,6 +20,7 @@
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
 use crate::command_env::SpawnEnv;
+use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
@@ -2115,6 +2116,7 @@ fn harvest_all_once(
     support_dir: &Path,
     feed: Option<&CodexVersionFeed>,
 ) -> Result<()> {
+    let _stage = StageWindow::begin("unknown", "offpass_mcp_inventory");
     // Local kill-switch: a user can disable the harvest on their own machine
     // (independent of the org setting) by setting `OTTTO_MCP_HARVEST_DISABLED` or
     // dropping `<support>/mcp_inventory/disabled`. Checked first, so a disabled
@@ -3322,7 +3324,7 @@ url = "https://unset.test/mcp"
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
             let prev = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self {
                 key: key.to_string(),
                 prev,
@@ -3333,8 +3335,8 @@ url = "https://unset.test/mcp"
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                None => unsafe { std::env::remove_var(&self.key) },
             }
         }
     }
