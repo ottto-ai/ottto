@@ -6,7 +6,6 @@ use crate::snapshots::*;
 use crate::transcript_acquisition::{ContentStamp, SourceStamp, StampedFacts};
 
 pub(in crate::snapshots) mod facts;
-mod logs_cursor;
 pub(in crate::snapshots) use facts::SidecarFacts;
 
 #[derive(Debug, Clone, Default)]
@@ -101,11 +100,7 @@ impl std::fmt::Debug for TitlePrefix {
         f.write_str("TitlePrefix")
     }
 }
-impl crate::heap_layout_bound::HeapLayoutBound for TitlePrefix {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
-    }
-}
+crate::heap_layout_bound::no_heap!(false; TitlePrefix { raw_digest, prefix });
 impl CodexStateThread {
     pub(in crate::snapshots) fn title_digest(&self) -> Option<[u8; 32]> {
         self.compact_title.as_ref().map_or_else(
@@ -845,24 +840,35 @@ const CODEX_LOGS2_WINDOW_PAD_DAYS: u64 = 1;
 const CODEX_LOGS2_MAX_WINDOW_DAYS: u64 = 14;
 
 impl CodexTurnTraceMap {
-    #[cfg(test)]
     pub(in crate::snapshots) fn load_from_roots(
         roots: &[PathBuf],
         backfill_window_days: u64,
     ) -> Self {
-        load_traces(roots, backfill_window_days, &mut SidecarFacts::default()).0
+        let mut map = Self::default();
+        let mut codex_dirs = BTreeSet::new();
+        for root in roots {
+            if let Some(parent) = root.parent() {
+                codex_dirs.insert(parent.to_path_buf());
+            }
+        }
+        let since_epoch = codex_logs2_since_epoch(backfill_window_days);
+        map.since_epoch = since_epoch;
+        for codex_dir in codex_dirs {
+            // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
+            // exists on some installs. Read whichever is present.
+            for db_path in [
+                codex_dir.join("logs_2.sqlite"),
+                codex_dir.join("sqlite").join("logs_2.sqlite"),
+            ] {
+                map.incomplete |= !load_codex_logs2_priority_turns(
+                    &db_path,
+                    since_epoch,
+                    &mut map.priority_turns,
+                );
+            }
+        }
+        map
     }
-}
-
-pub(in crate::snapshots) fn load_traces(
-    roots: &[PathBuf],
-    days: u64,
-    facts: &mut SidecarFacts,
-) -> (
-    CodexTurnTraceMap,
-    crate::codex_scan_diagnostics::LoaderEvidence,
-) {
-    logs_cursor::load(roots, codex_logs2_since_epoch(days), facts)
 }
 
 fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
@@ -876,86 +882,54 @@ fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
 
 /// False when a present DB could not be read completely (open, prepare,
 /// query or row error, or the row cap reached); a missing DB is complete.
-#[cfg(test)]
-fn load_codex_logs2_priority_turns(path: &Path, since: i64, turns: &mut BTreeSet<String>) -> bool {
-    load_codex_logs2_priority_turns_counted(path, since, turns).0
-}
-
-fn load_codex_logs2_priority_turns_counted(
+fn load_codex_logs2_priority_turns(
     path: &Path,
     since_epoch: i64,
     priority_turns: &mut BTreeSet<String>,
-) -> (bool, u64) {
+) -> bool {
     if !path.exists() {
-        return (true, 0);
+        return true;
     }
     let Ok(connection) = codex_sqlite_read::CodexSqliteRead::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
         std::time::Duration::from_millis(CODEX_LOGS2_BUSY_TIMEOUT_MS),
     ) else {
-        return (false, 0);
+        return false;
     };
-    let mut turns = BTreeSet::new();
-    let result = connection.read(|connection| {
-        read_codex_logs2_priority_turns(connection, since_epoch, None, "", |_, turn| {
-            turns.extend(turn);
-            Ok(true)
-        })
-    });
-    let Ok((complete, read)) = result else {
-        return (false, 0);
+    let Ok((turns, complete, read)) = connection.read(|connection| {
+        // Only `response.create` request rows carry the *requested* service_tier.
+        // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
+        // then filters to the sparse request rows (hundreds, not the full table).
+        let mut statement = connection.prepare(
+            "SELECT feedback_log_body FROM logs \
+             WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
+             ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut complete = true;
+        let mut read = 0_u64;
+        let mut turns = Vec::new();
+        for body in rows {
+            let Ok(body) = body else {
+                complete = false;
+                continue;
+            };
+            read += 1;
+            turns.extend(codex_logs2_priority_turn_from_body(&body));
+        }
+        if read == CODEX_LOGS2_MAX_ROWS as u64 {
+            CapCounts::record("codex", 3, 1);
+        }
+        Ok((turns, complete, read))
+    }) else {
+        return false;
     };
     priority_turns.extend(turns);
-    (complete, read)
-}
-
-/// One query/decode owner for the original ts-DESC selection and cursor deltas.
-/// The visitor may stop a delta when the original selection must be reloaded.
-fn read_codex_logs2_priority_turns(
-    connection: &Connection,
-    since: i64,
-    after_id: Option<i64>,
-    identity_columns: &str,
-    mut visit: impl FnMut(&rusqlite::Row<'_>, Option<String>) -> rusqlite::Result<bool>,
-) -> Result<(bool, u64)> {
-    // Only response.create request rows carry the requested service_tier.
-    let selection = if after_id.is_some() {
-        "AND id > ?2"
-    } else {
-        "ORDER BY ts DESC LIMIT ?2"
-    };
-    let sql = format!(
-        "SELECT feedback_log_body{identity_columns} FROM logs \
-         WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' {selection}"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(
-        rusqlite::params![since, after_id.unwrap_or(CODEX_LOGS2_MAX_ROWS)],
-        |row| {
-            Ok(visit(
-                row,
-                codex_logs2_priority_turn_from_body(&row.get::<_, String>(0)?),
-            ))
-        },
-    )?;
-    let (mut complete, mut read) = (true, 0_u64);
-    for row in rows {
-        match row {
-            Ok(keep_reading) => {
-                read += 1;
-                if !keep_reading? {
-                    break;
-                }
-            }
-            Err(_) => complete = false,
-        }
-    }
-    if after_id.is_none() && read == CODEX_LOGS2_MAX_ROWS as u64 {
-        CapCounts::record("codex", 3, 1);
-        complete = false;
-    }
-    Ok((complete, read))
+    complete && read < CODEX_LOGS2_MAX_ROWS as u64
 }
 
 /// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a

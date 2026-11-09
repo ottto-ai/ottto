@@ -27,9 +27,7 @@ impl std::fmt::Debug for RawRows {
 #[derive(Default)]
 pub(in crate::snapshots) struct SidecarFacts {
     pub homes: StampedFacts<PathBuf, Arc<codex_root_copies::RootSidecar>, [SourceStamp; 3]>,
-    pub logs: BTreeMap<PathBuf, logs_cursor::LogCursor>,
     heap_bytes: usize,
-    home_heap_bytes: usize,
 }
 impl HeapLayoutBound for SidecarFacts {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -63,9 +61,8 @@ impl SidecarFacts {
         let reuse = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
             matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
         });
-        self.homes.retain_listed(&listed);
         if !reuse {
-            self.homes.retain_listed(&BTreeSet::new());
+            self.homes.kept.clear();
         }
         let mut after = BTreeMap::new();
         let mut loaded = BTreeMap::new();
@@ -101,44 +98,38 @@ impl SidecarFacts {
             }
             self.charge_homes();
         }
-        self.charge_heap();
         metadata
     }
 
     fn charge_homes(&mut self) {
         // Charge immutable entry heaps only on insertion/replacement.
-        self.home_heap_bytes =
-            self.homes
-                .kept
-                .iter()
-                .fold(0usize, |total, (home, (stamp, facts))| {
-                    let facts = crate::heap_layout_bound::completed_bound(&**facts, usize::MAX)
-                        .unwrap_or(usize::MAX);
-                    let stamp = stamp
-                        .iter()
-                        .map(|stamp| match stamp {
-                            SourceStamp::Sqlite { target, .. } => target.capacity(),
-                            _ => 0,
-                        })
-                        .sum::<usize>();
-                    total
-                        .saturating_add(home.capacity())
-                        .saturating_add(stamp)
-                        .saturating_add(
-                            crate::heap_layout_bound::tree_node_bytes::<
-                                PathBuf,
-                                ([SourceStamp; 3], Arc<codex_root_copies::RootSidecar>),
-                            >()
-                            .unwrap_or(usize::MAX),
-                        )
-                        .saturating_add(facts)
-                        .saturating_add(2 * std::mem::size_of::<usize>())
-                });
-    }
-    pub fn charge_heap(&mut self) {
-        self.heap_bytes = self.home_heap_bytes.saturating_add(
-            crate::heap_layout_bound::completed_bound(&self.logs, usize::MAX).unwrap_or(usize::MAX),
-        );
+        self.heap_bytes = self
+            .homes
+            .kept
+            .iter()
+            .fold(0usize, |total, (home, (stamp, facts))| {
+                let facts = crate::heap_layout_bound::completed_bound(&**facts, usize::MAX)
+                    .unwrap_or(usize::MAX);
+                let stamp = stamp
+                    .iter()
+                    .map(|stamp| match stamp {
+                        SourceStamp::Sqlite { target, .. } => target.capacity(),
+                        _ => 0,
+                    })
+                    .sum::<usize>();
+                total
+                    .saturating_add(home.capacity())
+                    .saturating_add(stamp)
+                    .saturating_add(
+                        crate::heap_layout_bound::tree_node_bytes::<
+                            PathBuf,
+                            ([SourceStamp; 3], Arc<codex_root_copies::RootSidecar>),
+                        >()
+                        .unwrap_or(usize::MAX),
+                    )
+                    .saturating_add(facts)
+                    .saturating_add(2 * std::mem::size_of::<usize>())
+            });
     }
 }
 

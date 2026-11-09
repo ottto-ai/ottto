@@ -19,7 +19,6 @@ fn sidecar_reuse_counters_reach_emitted_row() {
         "thread_history_1_reloaded=0",
         "session_index_reused=0",
         "session_index_reloaded=0",
-        "logs_2_delta_rows=0",
         "absent_roots=0",
     ] {
         assert!(row.contains(field), "missing emitted field: {field}");
@@ -30,14 +29,12 @@ fn sidecar_reuse_counters_reach_emitted_row() {
     d.state_titles.absent_roots = 3;
     d.rollout_extents.reused_roots = 2;
     d.session_index.reloaded_roots = 4;
-    d.logs_2.delta_rows = 11;
     let row = SyncCounts::from_scan_result(&scan, 0, 30).terminal_census_line("codex");
     for field in [
         "state_5_reused=7",
         "state_5_reloaded=9",
         "thread_history_1_reused=2",
         "session_index_reloaded=4",
-        "logs_2_delta_rows=11",
         "absent_roots=3",
     ] {
         assert!(row.contains(field), "missing emitted value: {field}");

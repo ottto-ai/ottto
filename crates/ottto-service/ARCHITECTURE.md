@@ -154,12 +154,11 @@ streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
 
-Recent log facts use one read transaction for maximum id, new matches and
-retained-row existence checks. Both log locations remain independent, expired
-rows leave the union and a larger time window reloads it. The existing capped
-result stays incomplete and restarts the cursor; the next pass reloads it.
-Facts and cursors are never persisted; a restart fully loads them. Terminal
-scan diagnostics include per-input reuse/reload counts and log delta rows.
+Recent logs still use the existing full reader on every pass at both log
+locations, including its time window, ts-DESC result limit and incompleteness
+rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
+scan diagnostics include reuse/reload counts for state, history and session
+index facts, plus absent roots. An incremental logs reader is deferred.
 
 ## CLI status metadata
 
