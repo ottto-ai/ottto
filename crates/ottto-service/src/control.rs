@@ -28269,6 +28269,143 @@ X-API-Key = "otel_redacted"
 
     #[test]
     #[serial]
+    fn relay_runtime_failure_health_survives_control_and_config_intents() {
+        use ottto_protocol::{LocalHealthSeverity, RelayRuntimeState, RelayState};
+
+        let (root, _guards) = managed_claude_relay_fixture();
+        let daemon = daemon(); // Unconnected synthetic account keeps Verify local.
+        let connected = RelayState {
+            state: RelayRuntimeState::Connected,
+            endpoint: Some("http://127.0.0.1:48123".into()),
+            last_connected_at: None,
+            last_error: None,
+        };
+        let failure_blockers = |status: &ottto_protocol::DaemonStatus| {
+            status
+                .canonical_health
+                .as_ref()
+                .unwrap()
+                .blockers
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b.code.as_str(),
+                        "relay_bind_failed" | "relay_listener_failed"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        daemon
+            .set_relay_state_for_trusted_client(connected.clone())
+            .unwrap();
+        for _ in 0..2 {
+            assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+        }
+        for (code, guidance) in [
+            (
+                "relay_bind_failed",
+                "Claude telemetry listener unavailable; restart Ottto, then Verify",
+            ),
+            (
+                "relay_listener_failed",
+                "Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto",
+            ),
+        ] {
+            let failed = RelayState {
+                state: RelayRuntimeState::Failed,
+                last_error: Some(StableMessage {
+                    code: code.into(),
+                    text: "synthetic listener failure".into(),
+                }),
+                ..connected.clone()
+            };
+            daemon
+                .set_relay_state_for_trusted_client(failed.clone())
+                .unwrap();
+            let mut status = daemon.status_for_trusted_client().unwrap();
+            assert_eq!(status.relay, failed);
+            if code == "relay_listener_failed" {
+                assert!(failure_blockers(&status).is_empty());
+                crate::refresh_canonical_local_health(&mut status);
+                assert!(
+                    failure_blockers(&status).is_empty(),
+                    "upload reprojection respects grace"
+                );
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(59));
+                assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(60));
+            }
+            status = daemon.status_for_trusted_client().unwrap();
+            let blockers = failure_blockers(&status);
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].code, code);
+            assert_eq!(blockers[0].severity, LocalHealthSeverity::Warning);
+            assert_eq!(blockers[0].owner, "source");
+            assert_eq!(blockers[0].source, "runtime");
+            assert_eq!(blockers[0].clear_condition, guidance);
+            let since = blockers[0].since.clone();
+            status.generated_at = "2099-01-01T00:00:00Z".into();
+            crate::refresh_canonical_local_health(&mut status);
+            assert_eq!(failure_blockers(&status)[0].since, since);
+            for command in [
+                LocalControlCommand::RelayStart,
+                LocalControlCommand::RelayStop,
+            ] {
+                let response = handle_command(
+                    &daemon,
+                    RequestAuthorization::Token("token".into()),
+                    command,
+                    InstallOwner::Unknown,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_value::<RelayState>(response).unwrap(),
+                    failed
+                );
+                let current = daemon.status_for_trusted_client().unwrap();
+                assert_eq!(failure_blockers(&current)[0].since, since);
+            }
+            verify_source(
+                &daemon,
+                &RequestAuthorization::Token("token".into()),
+                SourceKind::ClaudeCode,
+                false,
+            )
+            .unwrap();
+            fs::write(root.join(".claude/settings.json"), "{}").unwrap();
+            let patch = repair_source_config(&daemon, &SourceKind::ClaudeCode).unwrap();
+            assert!(patch.changed);
+            let current = daemon.status_for_trusted_client().unwrap();
+            assert_eq!(current.relay, failed);
+            assert_eq!(failure_blockers(&current)[0].since, since);
+            daemon
+                .set_relay_state_for_trusted_client(connected.clone())
+                .unwrap();
+            let recovered = daemon.status_for_trusted_client().unwrap();
+            assert!(recovered.relay.last_error.is_none());
+            assert!(failure_blockers(&recovered).is_empty());
+
+            // Recovery and a new failure between reads must start a fresh grace.
+            if code == "relay_listener_failed" {
+                daemon
+                    .set_relay_state_for_trusted_client(failed.clone())
+                    .unwrap();
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(60));
+                daemon
+                    .set_relay_state_for_trusted_client(connected.clone())
+                    .unwrap();
+                daemon.set_relay_state_for_trusted_client(failed).unwrap();
+                assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
     #[cfg(unix)]
     fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent() {
         let (root, _guards) = managed_claude_relay_fixture();
