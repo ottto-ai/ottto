@@ -294,12 +294,25 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
         for refusal in ["refused", "not_stored", "partial", "crash_after_ack"] {
             let mut progress = wide.progress.clone();
             let scanner = E2ScanFixture::capturing_identity();
+            scanner.on_committed_route(
+                &crate::snapshots::e2_pipeline_scan_fixture::route_of(&wide.index).unwrap(),
+            );
             let mut page =
-                with_resident_budget(0.05, || c.raw(&scanner, wide.index.clone(), 100, true, &[]));
+                with_resident_budget(if refusal == "partial" { 0.25 } else { 0.05 }, || {
+                    c.raw(&scanner, wide.index.clone(), 100, true, &[])
+                });
             assert!(page.scan.charge_deferred);
             page.enrich(&c);
             page.finish();
             let offered = under_required_cas(&page.scan.snapshots, &progress);
+            assert!(
+                !offered.is_empty(),
+                "the ACK control must send a native body"
+            );
+            if refusal == "partial" {
+                assert!(offered.len() >= 2);
+            }
+            let refused_entity = offered.last().unwrap().source_session_id.clone();
             let before = progress.accepted_body_witnesses.clone();
             let (_, wire, _) = upload(&offered, &mut progress, |batch| {
                 let mut response = ack(batch)?;
@@ -328,9 +341,18 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
                         response.sessions_reconciled = 0;
                     }
                     "partial" => {
-                        response.accepted_entities.clear();
-                        response.accepted = 0;
-                        response.sessions_reconciled = 0;
+                        if let Some(at) = response
+                            .accepted_entities
+                            .iter()
+                            .position(|e| e.source_session_id == refused_entity)
+                        {
+                            let mut refused = response.accepted_entities.remove(at);
+                            response.accepted -= 1;
+                            response.sessions_reconciled -= 1;
+                            refused.head_challenge =
+                                refused.head_etag.take().map(|_| "c".repeat(64));
+                            response.conflict_entities.push(refused);
+                        }
                     }
                     _ => {}
                 }
@@ -353,6 +375,17 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
                     "exact receipt suppresses duplicate after ACK"
                 );
                 assert_eq!(progress.accepted_body_witnesses, before);
+            } else if refusal == "partial" {
+                for item in &offered {
+                    let observed = progress
+                        .accepted_body_witnesses
+                        .get(&item.snapshot_fingerprint);
+                    if item.source_session_id == refused_entity {
+                        assert_eq!(observed, before.get(&item.snapshot_fingerprint));
+                    } else {
+                        assert_eq!(observed, Some(&snapshot_upload_body_witness(item)));
+                    }
+                }
             } else {
                 assert_eq!(
                     progress.accepted_body_witnesses, before,
