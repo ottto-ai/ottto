@@ -89,3 +89,8 @@ crates/ottto-service/src/lib.rs	snapshots::g7_debt::tests::pre_fix_accepted_fold
 crates/ottto-service/src/lib.rs	snapshots::g7_debt::tests::restart_and_failed_pass_keep_the_earliest_debt	snapshots::upload::freshness_debt::tests::restart_and_failed_pass_keep_the_earliest_debt
 crates/ottto-service/src/lib.rs	snapshots::g7_debt::tests::revision_value_roundtrips_and_refuses_other_versions	snapshots::upload::freshness_debt::tests::revision_value_roundtrips_and_refuses_other_versions
 crates/ottto-service/src/lib.rs	snapshots::g7_debt::tests::roster_only_for_a_complete_walk_without_issues	snapshots::upload::freshness_debt::tests::roster_only_for_a_complete_walk_without_issues
+crates/ottto-service/src/lib.rs	snapshots::compact_index_tests::pretty_and_compact_files_decode_identically_through_every_reader	snapshots::scan_index::tests::compact_writer::pretty_and_compact_files_decode_identically_through_every_reader
+crates/ottto-service/src/lib.rs	snapshots::compact_index_tests::held_slots_cross_both_layouts_and_save_counts_the_written_bytes	snapshots::scan_index::tests::compact_writer::held_slots_cross_both_layouts_and_save_counts_the_written_bytes
+crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::snapshot_file_entity_set_digest_is_pinned	snapshots::scan_index::file_set_digest::tests::snapshot_file_entity_set_digest_is_pinned
+crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::snapshot_file_upload_body_set_digest_is_pinned	snapshots::scan_index::file_set_digest::tests::snapshot_file_upload_body_set_digest_is_pinned
+crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::file_set_digest_domains_are_distinct	snapshots::scan_index::file_set_digest::tests::file_set_digest_domains_are_distinct
