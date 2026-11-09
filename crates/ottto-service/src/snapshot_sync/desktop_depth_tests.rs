@@ -87,9 +87,11 @@ fn desktop_depth_recovery_matches_never_flipped_money_and_placement() {
         std::fs::remove_file(invalid).unwrap();
         std::fs::create_dir_all(bucket.join("local_session")).unwrap();
         // Retry the real incomplete index after its existing backoff expires.
-        lost.index
-            .claude_desktop_store_retry_not_before_unix_seconds = None;
-        let mut recovered = ready(&corpus, &scanner, lost.index, 100, true);
+        let mut saved = serde_json::to_value(&lost.index).unwrap();
+        saved["claude_desktop_store_retry_not_before_unix_seconds"] = serde_json::Value::Null;
+        let mut retry = serde_json::from_value(saved).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut retry, &lost.index);
+        let mut recovered = ready(&corpus, &scanner, retry, 100, true);
         recovered.finish();
         assert_eq!(disposition(&recovered), Some("complete"));
         let recovered_route = route(&recovered, Mode::Restart);
