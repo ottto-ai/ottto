@@ -91,7 +91,7 @@ macro_rules! process_state {
 pub(crate) use usage::cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
-mod change_reason;
+use scan::read_cause as change_reason;
 mod claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
@@ -111,13 +111,14 @@ pub(crate) use claude_context_file_birth::{
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
 use sources::codex::root_copies as codex_root_copies;
-pub(crate) mod ownership_diagnostics;
+
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
     local_count as history_local_count, with_max_gated_claude_revision,
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use ownership_diagnostics as ownership;
+pub(crate) use scan::ownership_diagnostics;
 #[cfg(test)]
 mod admission_reoffer_window_tests;
 mod claude_family_census_shadow;
@@ -214,7 +215,7 @@ pub(crate) mod discovery_growth;
 #[cfg(test)]
 mod discovery_growth_tests;
 #[cfg(unix)]
-pub(crate) mod durable_sources;
+pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
