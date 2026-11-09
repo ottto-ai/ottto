@@ -364,7 +364,7 @@ macro_rules! json_file_store {
         $(#[$meta:meta])*
         pub struct $name:ident {
             noun: $noun:literal,
-            read: $read:expr,
+            read: $read:expr_2021,
             saves: $saved:ty,
             $(default_path: $default_path:ident,)?
         }

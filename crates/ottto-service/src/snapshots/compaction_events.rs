@@ -23,7 +23,7 @@ use std::num::NonZeroU64;
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use super::{
+use crate::snapshots::{
     ClaudeCompactionKind, ClaudeCompactionObservation, ClaudeTranscriptUsageOccurrence,
     MAX_COMPACTION_TIMESTAMPS,
 };
@@ -70,7 +70,7 @@ const CLAUDE_IDLE_COMPACTION_GAP_SECONDS: i64 = 50 * 60;
 /// except where the upload contract already carries it (the closed string
 /// from `wire`); persisted only in the local durable-tail store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ClaudeCompactionTrigger {
+pub(in crate::snapshots) enum ClaudeCompactionTrigger {
     Auto,
     Manual,
     Idle,
@@ -82,7 +82,7 @@ crate::durable_tail_codec::durable_enum!(ClaudeCompactionTrigger {
 });
 
 impl ClaudeCompactionTrigger {
-    pub(super) fn from_marker(value: Option<&str>) -> Option<Self> {
+    pub(in crate::snapshots) fn from_marker(value: Option<&str>) -> Option<Self> {
         match value? {
             "auto" => Some(Self::Auto),
             "manual" => Some(Self::Manual),
@@ -126,7 +126,7 @@ crate::heap_layout_bound::no_heap!(true; ClaudeCompactionTrigger);
 /// fold's posture writers through `set_claude_compaction_scalars`, never by
 /// `finish()`. Also returns how many of these events sit next to an id-less
 /// response (local counters only).
-pub(super) fn claude_compaction_events<'a>(
+pub(in crate::snapshots) fn claude_compaction_events<'a>(
     owned_observations: &[ClaudeCompactionObservation],
     paired: &BTreeSet<usize>,
     own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
@@ -219,9 +219,9 @@ pub(super) fn claude_compaction_events<'a>(
 /// no request id. That response is never a size, so `before` came from an
 /// earlier request (or `after` from a later one). Local log counters only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct ClaudeIdLessNeighbours {
-    pub(super) before: u64,
-    pub(super) after: u64,
+pub(in crate::snapshots) struct ClaudeIdLessNeighbours {
+    pub(in crate::snapshots) before: u64,
+    pub(in crate::snapshots) after: u64,
 }
 
 /// The newest `MAX_COMPACTION_TIMESTAMPS` distinct `at` values seen so far,
@@ -298,7 +298,7 @@ crate::durable_tail_codec::durable_struct!(CodexCompactionSize {
 /// both length and vector capacity stay at most `MAX_COMPACTION_TIMESTAMPS`.
 /// The existing count and timestamp accumulator are independent and unchanged.
 #[derive(Debug, Clone, Default)]
-pub(super) struct CodexCompactionSizes {
+pub(in crate::snapshots) struct CodexCompactionSizes {
     entries: Vec<(String, CodexCompactionSize)>,
     pending_after: bool,
 }
@@ -310,7 +310,7 @@ crate::durable_tail_codec::durable_struct!(CodexCompactionSizes {
 impl CodexCompactionSizes {
     /// Keep the first marker at each timestamp. Once a timestamp falls below
     /// the newest-64 cutoff it can never return: that cutoff only increases.
-    pub(super) fn note_marker(&mut self, at: &str, before: Option<u64>) {
+    pub(in crate::snapshots) fn note_marker(&mut self, at: &str, before: Option<u64>) {
         let Err(mut index) = self
             .entries
             .binary_search_by(|(timestamp, _)| timestamp.as_str().cmp(at))
@@ -346,7 +346,7 @@ impl CodexCompactionSizes {
     /// Every retained marker still waiting takes the next counted non-zero
     /// request. Timestamp order need not be parse order, so check every entry
     /// (at most 64), only when a marker has been admitted since the last fill.
-    pub(super) fn note_counted_request(&mut self, context_tokens: u64) {
+    pub(in crate::snapshots) fn note_counted_request(&mut self, context_tokens: u64) {
         if !self.pending_after {
             return;
         }
@@ -361,7 +361,7 @@ impl CodexCompactionSizes {
 
     /// Already sorted, distinct and bounded: allocate only the surviving
     /// events, moving their keys rather than cloning the timestamp accumulator.
-    pub(super) fn into_events(self) -> Vec<SnapshotCompactionEvent> {
+    pub(in crate::snapshots) fn into_events(self) -> Vec<SnapshotCompactionEvent> {
         self.entries
             .into_iter()
             .map(|(at, size)| SnapshotCompactionEvent {

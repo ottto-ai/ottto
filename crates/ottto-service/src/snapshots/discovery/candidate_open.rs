@@ -246,7 +246,7 @@ pub(in crate::snapshots) fn open_and_identify_scan_candidate_with_rescue_at(
             candidate.size_bytes,
             codex_fragment::Stamp::candidate(&candidate),
         );
-    let recovery = DiscoveryRecovery::from(retention.files);
+    let recovery = DiscoveryRecovery::from(retention);
     let requires_recovery = recovery.requires(source, &candidate.path, candidate.size_bytes);
     if !requires_recovery
         && aged

@@ -3,6 +3,6 @@
 # code accepts only compilers validated in
 # crates/ottto-service/src/heap_layout_bound.rs; update both together.
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

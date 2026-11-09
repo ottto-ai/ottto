@@ -120,7 +120,7 @@ impl<'a> Raw<'a> {
 /// Decode `text` into a view `T`; a line with a duplicate key decodes once
 /// more after `Value` keeps the last occurrence, as the v1 reader would.
 macro_rules! decode_view {
-    ($text:expr, $owned:ident, $ty:ty) => {
+    ($text:expr_2021, $owned:ident, $ty:ty) => {
         match serde_json::from_str::<$ty>($text) {
             Ok(view) => Some(view),
             Err(_) => {

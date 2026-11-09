@@ -1,7 +1,7 @@
-use super::super::super::line_delivery::{
+use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
 };
-use super::super::super::scan_index_persistence::Source;
+use crate::snapshots::scan_index_persistence::Source;
 use sampled_scan::transition_fixture::{self as oracle, money_oracle, Accepted, Mode, RouteResult};
 
 const MAIN: &str = "019e5a00-0000-7000-8000-00000000000a";

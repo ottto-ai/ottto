@@ -8,5 +8,6 @@
 //! and tool-usage counters.
 
 pub(in crate::snapshots) mod apply;
+pub(crate) mod delivery;
 pub(in crate::snapshots) mod parser;
 pub(in crate::snapshots) mod selectors;

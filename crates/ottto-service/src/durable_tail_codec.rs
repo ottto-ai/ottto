@@ -1263,18 +1263,18 @@ impl<A: Durable, B: Durable, C: Durable> Durable for (A, B, C) {
 /// One field of a persisted type, by class. Internal to the macros below.
 #[doc(hidden)]
 macro_rules! durable_field {
-    (put N, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put N, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let value: &$ty = $f;
         $crate::durable_tail_codec::Durable::put(value, $e)?;
     }};
-    (put H, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put H, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let value: &$ty = $f;
         $crate::durable_tail_codec::HDigest::put_h(value, $e, $path)?;
     }};
-    (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
+    (put U, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
-    (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put L, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let value: &$ty = $f;
         #[cfg(test)]
         let start = $e.position();
@@ -1282,26 +1282,26 @@ macro_rules! durable_field {
         #[cfg(test)]
         $crate::durable_tail_codec::note_l_span($e, start, $path);
     }};
-    (put D, $e:ident, $f:ident, $ty:ty, $path:expr) => {
+    (put D, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
-    (put G, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put G, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let value: &$ty = $f;
         $crate::durable_tail_codec::GrownArray::put_grown(value, $e)?;
     }};
-    (put P, $e:ident, $f:ident, $ty:ty, $path:expr) => {
+    (put P, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
-    (put X, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put X, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let _: &$ty = $f;
     }};
-    (put E, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put E, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let value: &$ty = $f;
         if !$e.field_moved($path) && !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
             return Err($crate::durable_tail_codec::Refuse::NonEmpty($path));
         }
     }};
-    (put I, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+    (put I, $e:ident, $f:ident, $ty:ty, $path:expr_2021) => {{
         let _: &$ty = $f;
     }};
     (take N, $d:ident, $ty:ty) => {

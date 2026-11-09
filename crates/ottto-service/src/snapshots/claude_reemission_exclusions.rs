@@ -595,12 +595,11 @@ pub(super) fn note_claude_reemission_stop_with_cause_at(
                 return None;
             }
             true
-        } else if let Some(cause) = cause {
+        } else {
+            let cause = cause?;
             stop.latched = true;
             stop.cause = cause;
             false
-        } else {
-            return None;
         };
         stop.last_alarm = Some(now);
         Some((reminder, stop.withheld_folds, stop.cause))

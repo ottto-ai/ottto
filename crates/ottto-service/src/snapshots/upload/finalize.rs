@@ -6,6 +6,7 @@ use crate::snapshots::*;
 
 #[derive(Debug, Clone)]
 pub(in crate::snapshots) struct PendingIndexFinalization {
+    pub(in crate::snapshots) refold_unchanged: bool,
     pub(in crate::snapshots) withheld_content: Option<withheld_account::Seen>,
     pub(in crate::snapshots) sampled_audit_verified: bool,
     pub(in crate::snapshots) codex_pending_recovery: bool,
@@ -145,8 +146,16 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     // Backstop of the one emission seam: no held history body is finalized.
     index.veto_claude_history_emission(source, &mut result.snapshots);
+    let mut refold_components =
+        tail_source::refold_moved::page(source, &result.pending_finalization);
     for snapshot in &mut result.snapshots {
-        snapshot.snapshot_fingerprint = snapshot_fingerprint(source, snapshot);
+        let components = snapshot_semantic_component_hashes(source, snapshot);
+        snapshot.snapshot_fingerprint = snapshot_fingerprint_from_component_hashes(
+            source,
+            &snapshot.source_session_id,
+            &components,
+        );
+        tail_source::refold_moved::capture(snapshot, &components, &mut refold_components);
         index.snapshot_activity_at.insert(
             snapshot.snapshot_fingerprint.clone(),
             snapshot_semantic_activity_at(snapshot),
@@ -209,6 +218,12 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .unwrap_or_default();
         let final_group_fingerprint = (!final_fingerprints.is_empty())
             .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
+        tail_source::refold_moved::observe(
+            source,
+            pending,
+            final_group_fingerprint.as_deref(),
+            &mut refold_components,
+        );
         let final_upload_body_witness = by_source_file_body_witness
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
@@ -523,4 +538,4 @@ pub(in crate::snapshots) fn snapshot_semantic_activity_at(item: &SnapshotItem) -
         .map(|(_, value)| value.to_string())
 }
 
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; refold_unchanged, withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);

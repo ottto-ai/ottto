@@ -1562,6 +1562,7 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
     }
 }
 
+mod cleared_group_listing;
 mod codex_archive_tests;
 
 /// [regress] A positive remove hint in a retained Codex generation retires
@@ -1723,5 +1724,191 @@ fn hint_orders_an_already_queued_census_member_ahead_of_the_fifo() {
         assert!(index.traversal.is_none());
         assert_eq!(index.files.len(), 6);
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// Fully settle a flat census so the next page cannot reuse an unfinished walk.
+fn settled_listing_fixture(source: SnapshotSource) -> (Fixture, ScanIndex, Vec<PathBuf>) {
+    let f = Fixture::new();
+    let paths = (0..6)
+        .map(|n| {
+            let session = format!("0f000000-0000-4000-8000-{n:012}");
+            let path = f.root.join(format!("{session}.jsonl"));
+            append_records(&path, &usage_records(source, &session, 1, true));
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut index = ScanIndex::default();
+    let scan = listing_page(&f, source, &mut index, 10);
+    assert!(scan.census_complete);
+    assert!(index.traversal.is_none());
+    assert_eq!(index.files.len(), paths.len());
+    assert!(index.terminal_contract_retries.is_empty());
+    assert!(index.decode_holds.is_empty());
+    assert!(index.v2().growth_retention.is_empty());
+    for path in &paths {
+        let entry = &index.files[&local_index_key(path)];
+        assert!(index.listing_unchanged(path, &fs::metadata(path).unwrap()));
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+    }
+    (f, index, paths)
+}
+
+fn listing_page(
+    f: &Fixture,
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    limit: usize,
+) -> SourceScanResult {
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    let mut scan = scan_source_roots_with_limit_and_attribution(
+        source,
+        std::slice::from_ref(&f.root),
+        index,
+        &now,
+        7,
+        limit,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    if source == SnapshotSource::ClaudeCode {
+        apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &Default::default(),
+            &Default::default(),
+            index,
+        );
+    }
+    finalize_scan_after_policy(source, &mut scan, index);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    scan
+}
+
+/// [regress] Growth while stopped is read on the first census page listing it,
+/// even when its indexed path is last in the cold FIFO, on Claude and Pi.
+#[test]
+fn census_listing_reads_indexed_growth_ahead_of_the_cold_fifo() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let (f, mut index, paths) = settled_listing_fixture(source);
+        let target = paths.last().unwrap();
+        let session = target.file_stem().unwrap().to_str().unwrap();
+        append_records(target, &usage_records(source, session, 2, false));
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        assert_eq!(
+            ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7),
+            TraversalProgress::Started
+        );
+        let mut request = ListingRequest::default();
+        request.record(ListingTrigger::Start);
+        start_due_listing_pass(
+            source,
+            index.traversal.as_mut().unwrap(),
+            &now,
+            true,
+            &mut request,
+        );
+        assert!(!request.requested());
+        let scan = listing_page(&f, source, &mut index, 2);
+        assert_eq!(
+            index.files[&local_index_key(target)].size_bytes,
+            fs::metadata(target).unwrap().len(),
+            "{source:?}: indexed growth must be read on the first listing page"
+        );
+        assert!(scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == session && item.request_count == 2));
+        let walk = index.traversal.as_ref().unwrap();
+        assert_eq!(walk.counts.listing_generations, 0);
+        assert_eq!(walk.counts.listing_changes_without_hint, 1);
+    }
+}
+
+/// [behaviour] A later listing promotes queued growth in place, once, on either
+/// pass kind; the next page reads it ahead of the remaining cold census members.
+#[test]
+fn listing_promotes_queued_growth_without_reordering_or_duplicating_it() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        for relisting in [false, true] {
+            let (f, mut index, paths) = settled_listing_fixture(source);
+            let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+            ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7);
+            advance_bounded_directory_traversal(source, &mut index, 7, None);
+            let before = index.traversal.as_ref().unwrap().pending_candidates.clone();
+            assert_eq!(before.back().unwrap().path, *paths.last().unwrap());
+            assert!(before.iter().all(|candidate| !candidate.watcher_hint));
+            let target = &before.back().unwrap().path;
+            let session = target.file_stem().unwrap().to_str().unwrap();
+            append_records(target, &usage_records(source, session, 2, false));
+            for _ in 0..2 {
+                if relisting {
+                    relist(source, &mut index);
+                } else {
+                    index
+                        .traversal
+                        .as_mut()
+                        .unwrap()
+                        .pending_directories
+                        .push_back(ScanTraversalPath {
+                            scan_root: f.root.clone(),
+                            path: f.root.clone(),
+                            census_member: true,
+                            watcher_hint: false,
+                        });
+                    advance_bounded_directory_traversal(source, &mut index, 7, None);
+                }
+                let walk = index.traversal.as_ref().unwrap();
+                assert_eq!(
+                    walk.pending_candidates
+                        .iter()
+                        .map(|candidate| &candidate.path)
+                        .collect::<Vec<_>>(),
+                    before
+                        .iter()
+                        .map(|candidate| &candidate.path)
+                        .collect::<Vec<_>>()
+                );
+                assert!(walk.pending_candidates.back().unwrap().watcher_hint);
+                assert_eq!(walk.counts.listing_changes_without_hint, 1);
+            }
+            listing_page(&f, source, &mut index, 2);
+            assert_eq!(
+                index.files[&local_index_key(target)].size_bytes,
+                fs::metadata(target).unwrap().len()
+            );
+        }
+    }
+}
+
+/// [behaviour] An unchanged census stays cold even when some entries are owed.
+#[test]
+fn census_listing_does_not_hint_unchanged_or_owed_files() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let (f, mut index, paths) = settled_listing_fixture(source);
+        index
+            .files
+            .get_mut(&local_index_key(&paths[0]))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7);
+        advance_bounded_directory_traversal(source, &mut index, 7, None);
+        let walk = index.traversal.as_ref().unwrap();
+        assert_eq!(walk.pending_candidates.len(), paths.len());
+        assert!(walk
+            .pending_candidates
+            .iter()
+            .all(|candidate| candidate.census_member && !candidate.watcher_hint));
+        assert_eq!(walk.counts.listing_changes_without_hint, 0);
     }
 }

@@ -86,8 +86,8 @@ pub(in crate::snapshots) struct ScanTraversalCounts {
     /// runs.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub(in crate::snapshots) listing_generations: u64,
-    /// Files a re-listing pass queued that no watcher hint or earlier walk
-    /// had already queued: what the watcher missed.
+    /// Changed files a listing newly queued or promoted without an existing
+    /// hint: what the watcher missed.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub(in crate::snapshots) listing_changes_without_hint: u64,
     /// Owed files with an unchanged stamp a re-listing pass queued, at most

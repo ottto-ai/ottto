@@ -8,7 +8,7 @@
 use serde::Serialize;
 
 #[cfg(test)]
-pub(super) mod v1 {
+pub(in crate::snapshots) mod v1 {
     pub(crate) const MAX_CONTEXT_CURVE_POINTS: usize = 256;
     pub(crate) const MAX_CONTEXT_CURVE_BOUNDARIES: usize = 64;
     pub(crate) const MAX_CONTEXT_CURVE_MODEL_WINDOWS: usize = 16;
@@ -27,17 +27,17 @@ pub(super) mod v1 {
 // durable-tail accumulator slots, so the pinned allowlist digest and the
 // records already on disk stay readable without a Full re-read.
 #[derive(Debug, Clone)]
-pub(super) struct ContextCurveCandidatePoint {
-    pub(super) observed_at: Option<String>,
-    pub(super) effective_input_tokens: u64,
-    pub(super) model: Option<String>,
-    pub(super) context_window_tokens: Option<u64>,
+pub(in crate::snapshots) struct ContextCurveCandidatePoint {
+    pub(in crate::snapshots) observed_at: Option<String>,
+    pub(in crate::snapshots) effective_input_tokens: u64,
+    pub(in crate::snapshots) model: Option<String>,
+    pub(in crate::snapshots) context_window_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ContextCurveCandidateBoundary {
-    pub(super) observed_at: Option<String>,
-    pub(super) point_count_before: u64,
+pub(in crate::snapshots) struct ContextCurveCandidateBoundary {
+    pub(in crate::snapshots) observed_at: Option<String>,
+    pub(in crate::snapshots) point_count_before: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

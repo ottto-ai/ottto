@@ -4876,7 +4876,6 @@ pub(in crate::snapshots) fn disclose_job_debt(
         targets,
     );
 }
-
 pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     disclosure: &Disclosure,
     candidate: &CandidateFile,
@@ -4890,6 +4889,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         targets.residue_index_keys.insert(index_key.clone());
     }
     targets.pending_finalization.push(PendingIndexFinalization {
+        refold_unchanged: false,
         withheld_content: None,
         sampled_audit_verified: false,
         codex_pending_recovery: index

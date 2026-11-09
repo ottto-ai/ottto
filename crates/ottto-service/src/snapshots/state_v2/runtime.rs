@@ -919,7 +919,7 @@ pub(in super::super) fn guard_local(
 pub(in super::super) fn recovery_save_guard(
     path: &Path,
     index: &ScanIndex,
-) -> Result<Option<impl Fn() -> Result<()>>> {
+) -> Result<Option<impl Fn() -> Result<()> + use<>>> {
     let Some(runtime) = &index.v2().persistence_v2 else {
         return Ok(None);
     };

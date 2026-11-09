@@ -3440,11 +3440,9 @@ fn watcher_overflow_dirties_generation_and_clean_sweep_repairs_missed_change() {
         false,
     )
     .expect("clean repair generation");
-    assert_eq!(repaired.snapshots.len(), 1);
-    assert_eq!(repaired.snapshots[0].input_tokens, 99);
+    assert!(repaired.snapshots.is_empty()); // The one-slot page reserves the cold member.
     finalize_scan_after_policy(SnapshotSource::Pi, &mut repaired, &mut index);
     assert!(!repaired.census_complete);
-
     let final_page = scan_source_roots_with_limit_and_attribution(
         SnapshotSource::Pi,
         std::slice::from_ref(&root),
@@ -3459,6 +3457,8 @@ fn watcher_overflow_dirties_generation_and_clean_sweep_repairs_missed_change() {
     )
     .expect("finish clean repair generation");
     assert!(final_page.census_complete);
+    assert_eq!(final_page.snapshots.len(), 1);
+    assert_eq!(final_page.snapshots[0].input_tokens, 99);
     let _ = fs::remove_dir_all(root);
 }
 

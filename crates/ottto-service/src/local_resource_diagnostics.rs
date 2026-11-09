@@ -39,7 +39,7 @@ macro_rules! lifetime_counters {
         pub(crate) fn add(event: Event, amount: u64) {
             use ::std::sync::atomic::Ordering::Relaxed;
             $($hook(event, amount);)?
-            let _ = TOTALS[event as usize].fetch_update(Relaxed, Relaxed, |n| {
+            let _ = TOTALS[event as usize].try_update(Relaxed, Relaxed, |n| {
                 Some(n.saturating_add(amount))
             });
             #[cfg(test)]
@@ -103,7 +103,7 @@ macro_rules! sparse_lifetime_counters {
 /// A process-wide diagnostic static behind `$with`. Each test thread gets its
 /// own copy, so a fixture never reads or drains another test's counts.
 macro_rules! process_static {
-    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr) => {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr_2021) => {
         $(#[$attr])*
         $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
             #[cfg(not(test))]
@@ -230,7 +230,7 @@ pub(crate) fn claude_identity_over_cap(
                 OverCap::NearCap => 6,
                 OverCap::IdentityHeld => 7,
             };
-            let _ = counters[index].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+            let _ = counters[index].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         }
         #[derive(Serialize)]
         struct Counts<'a> {
@@ -338,7 +338,7 @@ process_static!(fn with_codex_zst_refused: CodexZstRefused = CodexZstRefused::ne
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     with_codex_zst_refused(|refused| {
         let _ = refused.counters[cause as usize]
-            .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+            .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
     });
 }
 
@@ -361,12 +361,12 @@ process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::
 /// `codex_zst_refused_flush` reports them as one per-walk row.
 pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
     with_codex_zst_headers(|headers| {
-        let _ = headers[0].fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        let _ = headers[0].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
         for (index, (total, count)) in headers[1..].iter().zip(counts).enumerate() {
             if index == CODEX_ZST_PEAK {
                 total.fetch_max(count, Relaxed);
             } else {
-                let _ = total.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
+                let _ = total.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
             }
         }
     });
@@ -506,7 +506,7 @@ pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
 fn add_claude_sidecar_counts(deltas: [u64; 9]) {
     with_claude_sidecar_reparse(|counts| {
         for (counter, delta) in counts.iter().zip(deltas) {
-            let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+            let _ = counter.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
         }
     });
 }
@@ -633,7 +633,7 @@ impl CapCounts {
     }
     pub(crate) fn record(source: &str, event: usize, amount: u64) {
         source_count(source, CAP_EVENT_START + event, |slot| {
-            slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+            slot.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
                 .unwrap_or_else(|n| n)
         });
     }
@@ -700,7 +700,7 @@ pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u
     let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
     for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
         source_count(source, UNACKED_LOST_START + slot, |n| {
-            n.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+            n.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
                 .unwrap_or_else(|n| n)
         });
     }
@@ -876,7 +876,7 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
         };
         let increment = |counts: &[AtomicU64; 4]| {
             counts[slot]
-                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
                 .map_or(u64::MAX, |n| n.saturating_add(1))
         };
         let total = with_credential_file_cap_refused(increment);
@@ -1727,7 +1727,7 @@ struct HistoryProofCorrectionDeferred {
 pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
     let members = u64::try_from(members).unwrap_or(u64::MAX);
     let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |total| Some(total.saturating_add(members)),
@@ -1774,7 +1774,7 @@ struct ReemissionFamilyClosureRootAbsentExcluded {
 /// only; no path, id or wire event.
 pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
     let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |total| Some(total.saturating_add(members)),
@@ -3389,7 +3389,7 @@ pub(crate) fn scan_index_storage(
     static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
     let add = |counter: &AtomicU64, n: u64| {
         counter
-            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
             .unwrap_or_else(|v| v)
             .saturating_add(n)
     };
@@ -3451,7 +3451,7 @@ pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, t
 pub(crate) fn scan_index_manifest_refused(source: &'static str) {
     static TOTAL: AtomicU64 = AtomicU64::new(0);
     let count = TOTAL
-        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
         .saturating_add(1);
     traversal_point(
@@ -3472,7 +3472,7 @@ pub(crate) fn scan_index_repair_required(
     static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
         [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
     let count = TOTALS[cause as usize]
-        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)
         .saturating_add(1);
     traversal_point(

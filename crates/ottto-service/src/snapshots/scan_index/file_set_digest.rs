@@ -91,7 +91,7 @@ where
 
 /// Lowercase hex of [`snapshot_file_upload_body_set_digest`], as
 /// finalization records it.
-pub(in crate::snapshots) fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
+pub(crate) fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -112,3 +112,6 @@ pub(in crate::snapshots) fn sha256_hex_owned(parts: &[String]) -> String {
     }
     format!("{:x}", digest.finalize())
 }
+
+#[cfg(test)]
+mod tests;

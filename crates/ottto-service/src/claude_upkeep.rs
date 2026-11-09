@@ -266,7 +266,7 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: impl Into<OsString>) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value.into());
+            unsafe { std::env::set_var(key, value.into()) };
             Self { key, previous }
         }
     }
@@ -274,9 +274,9 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.as_ref() {
-                std::env::set_var(self.key, value);
+                unsafe { std::env::set_var(self.key, value) };
             } else {
-                std::env::remove_var(self.key);
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

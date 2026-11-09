@@ -20532,9 +20532,9 @@ mod tests {
             let previous = std::env::var_os(key);
             let effective_home_previous =
                 (key == "HOME").then(|| std::env::var_os("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"));
-            std::env::set_var(key, &value);
+            unsafe { std::env::set_var(key, &value) };
             if key == "HOME" {
-                std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &value);
+                unsafe { std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &value) };
             }
             Self {
                 key,
@@ -20547,13 +20547,15 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.previous.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
             if let Some(previous) = self.effective_home_previous.as_ref() {
                 match previous {
-                    Some(value) => std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", value),
-                    None => std::env::remove_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"),
+                    Some(value) => unsafe {
+                        std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", value)
+                    },
+                    None => unsafe { std::env::remove_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS") },
                 }
             }
         }
@@ -36393,7 +36395,7 @@ mod claude_login_phase0_tests {
     impl Guard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -36401,8 +36403,8 @@ mod claude_login_phase0_tests {
     impl Drop for Guard {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }

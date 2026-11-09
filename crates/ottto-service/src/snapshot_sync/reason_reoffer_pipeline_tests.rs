@@ -248,6 +248,7 @@ struct CycleResult {
     index_path: PathBuf,
     /// Distinct exact-body conflicts the scan's cooldown view deferred.
     cooldown_deferred: usize,
+    held_probe_rearms: u64,
 }
 
 struct ReofferPipeline {
@@ -405,6 +406,7 @@ impl ReofferPipeline {
             progress_path,
             index_path,
             cooldown_deferred,
+            held_probe_rearms: 0,
         }
     }
 
@@ -416,7 +418,12 @@ impl ReofferPipeline {
         if restart {
             self.daemon = test_daemon("otm_test");
         }
-        let (cycle, records) = crate::local_resource_diagnostics::capture(|| self.cycle(now));
+        let (mut cycle, records) = crate::local_resource_diagnostics::capture(|| self.cycle(now));
+        cycle.held_probe_rearms = records
+            .iter()
+            .filter(|record| record["stage"] == "held_probe_witness_rearm")
+            .map(|record| record["counts"]["count"].as_u64().unwrap())
+            .sum();
         let pages = records
             .iter()
             .filter(|record| {
@@ -463,34 +470,25 @@ impl ReofferPipeline {
         walk(&self.support);
     }
 
-    /// This pipeline stands in for the daemon on its support directory,
-    /// holding #801's single-writer lock there, so the post-save durable
-    /// write runs.
+    /// Use a canonical state-database route and hold the daemon's
+    /// single-writer lock for the durable restore receipt.
     #[cfg(unix)]
-    fn hold_state_dir_lock(&self) {
+    fn hold_state_dir_lock(&mut self) {
+        self.support = self.support.canonicalize().unwrap();
+        // The fixture's existing environment guard restores this on drop.
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support) };
         crate::locked_state_dir::test_locks::hold(&self.support);
     }
 
-    /// Durable warm-cache records on disk under the support directory.
+    /// Committed Tail heads in the saved index's state database.
     #[cfg(unix)]
     fn durable_records(&self) -> usize {
-        fn walk(dir: &std::path::Path, inside: bool) -> usize {
-            std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let store = path.extension().is_some_and(|ext| ext == "durable-tail");
-                        walk(&path, inside || store)
-                    } else {
-                        usize::from(inside && path.extension().is_some_and(|ext| ext == "rec"))
-                    }
-                })
-                .sum()
-        }
-        walk(&self.support, false)
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ));
+        let index = ScanIndex::load(&index_path).unwrap();
+        crate::snapshots::state_v2::tail_kind_counts_for_test(&index)["tail.head"]
     }
 
     fn transcript(&self) -> PathBuf {
@@ -2630,4 +2628,147 @@ fn held_probe_cache_observations_never_offered() {
     assert!(offered
         .iter()
         .all(|item| item.get("cache_observations").is_none()));
+}
+
+// Restore the finalized tuple an older writer saved, with fresh exact stale
+// coverage and an unchanged source stamp from the real prepare/finish route.
+fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleResult, SnapshotItem) {
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut cycle, finalized) = held_probe_cycle(pipeline, now);
+    assert_eq!(finalized.len(), 1);
+    let mut full = finalized[0].clone();
+    assert!(full.cache_observations.is_some());
+    prepare_snapshot_cache_for_upload(
+        &mut full,
+        &test_upload_progress(),
+        true,
+        false,
+        &BTreeSet::new(),
+    );
+    let probe = cache_head_probe(&full);
+    assert_ne!(body_set(&full), body_set(&probe));
+    // finish_cycle transfers terminal custody to the index. Restore it as
+    // real preparation does before inspecting the seeded eligibility.
+    cycle
+        .progress
+        .prepare_quarantine_retries(&cycle.index.quarantined_snapshot_fingerprints);
+    assert_eq!(
+        cycle.progress.quarantined_fingerprints[&probe.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(
+        cycle.progress.covered_stale_bodies()[&probe.snapshot_fingerprint],
+        snapshot_upload_body_witness(&probe)
+    );
+    for entry in cycle.index.files.values_mut() {
+        entry.last_upload_body_witness = Some(body_set(&full));
+        entry.upload_context_receipt = None;
+    }
+    cycle.index.save(&cycle.index_path).unwrap();
+    (cycle, probe)
+}
+
+fn reset_held_probe_process() {
+    stale_owed::HELD_PROBE_REARMED[SnapshotSource::ClaudeCode.slot()]
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [behaviour] Only complete exact covered terminal membership may rearm;
+/// retryable, owed, partial, aligned and decode-held files stay untouched.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_rearm_keeps_uncovered_and_aligned_files() {
+    if !supported("held_probe_rearm_keeps_uncovered_and_aligned_files") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-controls",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    let (legacy, probe) = seed_legacy_probe_file(&mut pipeline, now);
+    let fp = &probe.snapshot_fingerprint;
+    let key = legacy.index.files.keys().next().unwrap().clone();
+    for case in ["covered", "mixed", "owed", "sibling", "aligned", "decode"] {
+        let mut progress = legacy.progress.clone();
+        let mut index = legacy.index.clone();
+        match case {
+            "mixed" => {
+                progress
+                    .quarantined_fingerprints
+                    .get_mut(fp)
+                    .unwrap()
+                    .disposition = SnapshotQuarantineDisposition::RetryPending;
+            }
+            "owed" => progress.permanent_rejections.get_mut(fp).unwrap().exposure = None,
+            "sibling" => {
+                let sibling = "e".repeat(64);
+                progress.quarantined_fingerprints.insert(
+                    sibling.clone(),
+                    progress.quarantined_fingerprints[fp].clone(),
+                );
+                index
+                    .file_snapshot_fingerprints
+                    .get_mut(&key)
+                    .unwrap()
+                    .insert(sibling);
+            }
+            "aligned" => {
+                index.files.get_mut(&key).unwrap().last_upload_body_witness = Some(body_set(&probe))
+            }
+            "decode" => crate::snapshots::e2_pipeline_scan_fixture::hold_file_decode_for_test(
+                &mut index, &key,
+            ),
+            _ => {}
+        }
+        let group = index.files[&key].last_snapshot_fingerprint.clone();
+        let digest = index.files[&key].last_upload_body_witness.clone();
+        let source = index.files[&key].source_file_fingerprint.clone();
+        assert_eq!(
+            progress.rearm_held_probe_witness_files(&mut index),
+            usize::from(case == "covered"),
+            "{case}"
+        );
+        assert_eq!(index.files[&key].source_file_fingerprint, source, "{case}");
+        if case == "covered" {
+            assert!(index.files[&key].last_snapshot_fingerprint.is_none());
+            assert!(index.files[&key].last_upload_body_witness.is_none());
+        } else {
+            assert_eq!(index.files[&key].last_snapshot_fingerprint, group, "{case}");
+            assert_eq!(index.files[&key].last_upload_body_witness, digest, "{case}");
+        }
+    }
+    // Even an unaligned tuple cannot rearm twice in the same process.
+    reset_held_probe_process();
+    for expected in [1, 0] {
+        let mut index = legacy.index.clone();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            stale_owed::rearm_held_probe_once(
+                SnapshotSource::ClaudeCode,
+                &legacy.progress,
+                &mut index,
+            );
+        });
+        let count = records
+            .iter()
+            .filter(|r| r["stage"] == "held_probe_witness_rearm")
+            .map(|r| r["counts"]["count"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(count, expected);
+        assert_eq!(
+            index.files[&key].last_snapshot_fingerprint.is_none(),
+            expected == 1
+        );
+    }
+}
+
+// The re-armed legacy file reached by a kept generation's due re-listing.
+mod held_probe_listing_tests {
+    include!("held_probe_listing_tests.rs");
 }
