@@ -5601,5 +5601,4 @@ pub(in crate::snapshots) mod header_cache_tests {
 }
 
 #[cfg(all(test, unix))]
-#[path = "codex_file_join/header_cache_output_tests.rs"]
 mod header_cache_output_tests;

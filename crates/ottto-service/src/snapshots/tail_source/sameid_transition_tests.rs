@@ -57,7 +57,7 @@ fn codex_independent_fold_matches_fixed_vectors_cost_presence_and_placement() {
     ];
     let set = |item: &mut SnapshotItem, v: [u64; 8], cost: Option<&str>| {
         macro_rules! vector {
-            ($row:expr) => {{
+            ($row:expr_2021) => {{
                 $row.input_tokens = v[0];
                 $row.output_tokens = v[1];
                 $row.cache_read_tokens = v[2];

@@ -156,7 +156,10 @@ impl CodexPreludeFeed {
     fn lock(&self) -> MutexGuard<'_, Feed> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
-    pub(crate) fn observer(self: &Arc<Self>, roots: &[PathBuf]) -> Box<impl LineObserver + Send> {
+    pub(crate) fn observer(
+        self: &Arc<Self>,
+        roots: &[PathBuf],
+    ) -> Box<impl LineObserver + Send + use<>> {
         let slots = roots.len().saturating_mul(size_of::<(PathBuf, PathBuf)>());
         let mut bytes = 64usize.saturating_add(slots);
         let mut snapshot = Vec::with_capacity(if bytes <= ROOT_BYTES { roots.len() } else { 0 });

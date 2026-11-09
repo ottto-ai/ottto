@@ -1,8 +1,8 @@
 //! Uploads past the server's per-patch and per-session cache bounds, and
 //! accepted-state budget regressions.
 //! No fixture content comes from a provider account.
-use super::cache_observations::{Operation, MAX_OPERATIONS, MAX_ROWS, MAX_STATE_BYTES};
-use super::*;
+use crate::snapshots::cache_observations::{Operation, MAX_OPERATIONS, MAX_ROWS, MAX_STATE_BYTES};
+use crate::snapshots::*;
 
 fn request(name: &str, read: u64, second: i64) -> OwnedRequest {
     let start = OffsetDateTime::parse("2026-09-30T10:00:00Z", &Rfc3339).unwrap();
@@ -63,7 +63,7 @@ fn retracted(wire: &CacheObservations) -> usize {
 
 /// The upload step for one pass, given the accepted state of the last one.
 fn upload(requests: &[OwnedRequest], prior: Option<&Value>) -> (CacheObservations, Value) {
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(cache_wire("s", requests, true));
     prepare_cache_observations(&mut item, prior);
     let wire = item.cache_observations.unwrap();
@@ -327,7 +327,7 @@ fn large_accepted_prior_small_replacements_validate_actual_merge_after_every_tri
         encoded(&cache_state_from_patch(Some(&prior), &trimmed).unwrap()) > encoded(&merged),
         "discarding a shrinking replacement increases cumulative bytes"
     );
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(candidate);
     prepare_cache_observations(&mut item, Some(&prior));
     let wire = item.cache_observations.unwrap();
@@ -354,7 +354,7 @@ fn dropped_replacement_is_present_and_not_counted_as_omitted() {
             **observation = large_row(observation.as_ref().clone(), 32);
         }
     }
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(candidate);
     prepare_cache_observations(&mut item, Some(&prior));
     let wire = item.cache_observations.unwrap();
@@ -399,7 +399,7 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
     exact["observations"] = serde_json::to_value(base).unwrap();
     pad_to(&mut exact, MAX_STATE_BYTES);
     assert_eq!(encoded(&exact), MAX_STATE_BYTES);
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(CacheObservations {
         schema_version: 1,
         operations: vec![],
@@ -434,7 +434,7 @@ fn partial_retracted_status_is_not_a_deletion_backdoor() {
         observation.status = "retracted".into();
     }
     wire.coverage = "partial".into();
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(wire);
     prepare_cache_observations(&mut item, Some(&prior));
     assert!(item.cache_observations.unwrap().operations.is_empty());
@@ -463,7 +463,7 @@ fn malformed_accepted_rows_refuse_complete_and_partial_cache_updates() {
             patch.coverage = coverage.into();
             assert!(cache_state_from_patch(Some(&prior), &patch).is_none());
             let before = prior.clone();
-            let mut item = super::tests::sample_session_artifact_item();
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
             item.cache_observations = Some(patch);
             // A previously projected state must be cleared on refusal too.
             item.cache_observations_state = Some(valid.clone());
@@ -485,7 +485,7 @@ fn under_cap_byte_trim_keeps_the_session_prefix_even_with_backwards_clocks() {
     let candidate = cache_wire("s", &requests, true);
     assert_eq!(candidate.coverage, "complete");
     // Fitting complete patches retain the preexisting event-ID wire order.
-    let mut item = super::tests::sample_session_artifact_item();
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
     item.cache_observations = Some(candidate.clone());
     prepare_cache_observations(&mut item, None);
     let complete = item.cache_observations.unwrap();

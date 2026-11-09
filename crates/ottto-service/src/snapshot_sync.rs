@@ -10163,6 +10163,8 @@ where
     if replaced_retained_proof {
         persist(progress)?;
     }
+    // This page's attempt rows are written once its progress save returns.
+    let attempt_history = crate::upload_receipts::defer();
     let response = upload(batch);
     // The callback includes local preflight and authority checks. Only a reply
     // or a typed batch response proves this ordinary retry reached a send.
@@ -10465,7 +10467,9 @@ where
     }
     // The remote write happened first. If this local atomic save
     // fails, stop: at most this one idempotent page can replay.
-    persist(progress).map_err(|_| {
+    let saved = persist(progress);
+    drop(attempt_history);
+    saved.map_err(|_| {
         anyhow::Error::new(SnapshotLocalStateRejected {
             operation: "save upload checkpoint",
         })
@@ -21112,8 +21116,7 @@ mod tests {
                 },
             )
             .expect("report terminal manifest withdrawal");
-            let request = captured.lock().expect("captured requests")[1].clone();
-            request
+            captured.lock().expect("captured requests")[1].clone()
         };
 
         for request in [
@@ -21479,7 +21482,7 @@ mod tests {
 
         fn set_os(key: &'static str, value: std::ffi::OsString) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -21487,9 +21490,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -22302,7 +22305,7 @@ mod tests {
         let root = crate::snapshots::native_join_fixture_root(priority);
         let index_path = root.join("index.json");
         let progress_path = root.join("progress.json");
-        let receipt_dir = root.join("receipts");
+        let receipt_dir = root.canonicalize().unwrap().join("receipts");
         let mut baseline = ScanIndex::default();
         baseline.save(&index_path).unwrap();
         let prepare = |index: &mut ScanIndex| prepare_codex_union_fixture(&root, index);
@@ -22440,11 +22443,10 @@ mod tests {
         assert!(matches!(outcome, ResumableUploadResult::Completed));
         assert_eq!(accepted, 1);
         server.join().unwrap();
-        let receipts: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(crate::upload_receipts::upload_receipts_path(&receipt_dir)).unwrap(),
-        )
-        .unwrap();
-        assert!(!receipts["receipts"].as_array().unwrap().is_empty());
+        assert!(!crate::upload_receipts::read(&receipt_dir, 500, None, None)
+            .unwrap()
+            .receipts
+            .is_empty());
         if lose_member_after_ack {
             std::fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
             let usage = serde_json::json!({"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":100});

@@ -2054,7 +2054,7 @@ fn pi_pages(
 }
 
 macro_rules! pi_row {
-    ($name:expr) => {
+    ($name:expr_2021) => {
         if !supported($name) {
             return;
         }

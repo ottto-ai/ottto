@@ -651,7 +651,21 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
 /// [regress] Failed audit B cannot re-enter ahead of A, C and the unread agent.
 #[test]
 fn unkept_audit_key_does_not_starve_pending_census_at_page_limit_one() {
-    let (fixture, index, scan, previous) = selected_fixture();
+    let mut fixture = SelectionFixture::new();
+    // These cold members have not changed; synthetic placeholder stamps would
+    // now promote them, testing hint priority instead of audit fairness.
+    for slot in [0, 3] {
+        let metadata = fs::metadata(&fixture.paths[slot]).unwrap();
+        let entry = fixture
+            .previous
+            .files
+            .get_mut(&local_index_key(&fixture.paths[slot]))
+            .unwrap();
+        entry.size_bytes = metadata.len();
+        entry.modified_unix_nanos = metadata.modified().ok().and_then(unix_nanos);
+        entry.modified_unix_seconds = metadata.modified().ok().and_then(unix_seconds).unwrap();
+    }
+    let (fixture, index, scan, previous) = selected_fixture_from(fixture);
     let progress = fixture._scratch.join("audit-fair-progress.json");
     let mut prior = crate::snapshot_sync::checkpoint_unselected_for_test(
         &index,

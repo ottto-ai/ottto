@@ -2121,8 +2121,8 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         // A flip re-arms no traversal: start the next census generation.
         f.index.traversal = None;
         // Use the scanner's real discovery, then place the reachable traversal
-        // shape from the review at the front: one context alias and an unhinted
-        // ordinary singleton. Inventory still supplies the remaining aliases.
+        // shape at the front: one context alias and an ordinary singleton,
+        // hinted when rewritten. Inventory still supplies the remaining aliases.
         ensure_bounded_traversal(
             f.source,
             std::slice::from_ref(&f.root),
@@ -2146,10 +2146,9 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
                     2
                 }
             });
-        assert!(traversal
-            .pending_candidates
-            .iter()
-            .all(|pending| !pending.watcher_hint));
+        assert!(traversal.pending_candidates.iter().all(
+            |pending| pending.watcher_hint == (same_size_rewrite && pending.path == singleton)
+        ));
         assert_eq!(traversal.pending_candidates[0].path, a);
         assert_eq!(traversal.pending_candidates[1].path, singleton);
         // The owed group is no context-only work any more: like any unchanged

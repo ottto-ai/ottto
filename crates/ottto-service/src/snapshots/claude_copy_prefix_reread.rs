@@ -1,6 +1,6 @@
 //! Explicit local scope; ordinary re-owe, selection, history budgets and ACKs
 //! own execution. No transcript reader, uploader or scheduler lives here.
-use super::*;
+use crate::snapshots::*;
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -8,7 +8,7 @@ use std::io::Read;
 const REQUEST: &str = "claude-copy-prefix-reread.json";
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 /// Local one-shot mark, carried with the existing settled money marks.
-pub(super) const REOWED: u8 = 128;
+pub(in crate::snapshots) const REOWED: u8 = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Member {
@@ -505,7 +505,7 @@ fn prepare_request(
 /// Offer scoped debt before ordinary census/audits, earlier files first,
 /// within the SAME selection limit. Native history admission still charges
 /// all file/byte budgets and can hold it. No separate rate or continuation.
-pub(super) fn select(
+pub(in crate::snapshots) fn select(
     index: &mut ScanIndex,
     scope: &[PathBuf],
     selected: &mut Vec<ScanTraversalPath>,
@@ -578,7 +578,11 @@ pub(super) fn select(
 /// A scoped unchanged revision re-read also owes its qualified context. That
 /// second debt must not turn a history-budget hold into an ordinary read.
 /// Real changes and independent audit/authority reasons keep their rules.
-pub(super) fn unchanged_requested(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
+pub(in crate::snapshots) fn unchanged_requested(
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    now: u64,
+) -> bool {
     let key = local_index_key(&candidate.path);
     index
             .claude_money_birth_store

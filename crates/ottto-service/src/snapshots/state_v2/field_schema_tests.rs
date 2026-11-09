@@ -168,7 +168,7 @@ impl Synth {
 struct Gen<'a>(&'a mut Synth);
 /// Answers from the given value at this path, when there is one.
 macro_rules! given {
-    ($gen:ident.$method:ident($($arg:expr),*)) => {
+    ($gen:ident.$method:ident($($arg:expr_2021),*)) => {
         if let Some(json) = $gen.0.given_here()? {
             return json.$method($($arg),*).map_err(de::Error::custom);
         }

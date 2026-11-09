@@ -4,4 +4,7 @@
 
 mod committable_subset;
 pub(super) mod finalize;
+pub(crate) mod freshness_debt;
 mod reoffer_quarantine;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;

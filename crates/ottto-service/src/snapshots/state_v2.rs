@@ -58,6 +58,9 @@ mod kinds_misc;
 mod mapper;
 mod progress;
 mod sqlite;
+pub(crate) use sqlite::history as upload_history;
+#[cfg(test)]
+pub(crate) use sqlite::sidecar as sqlite_sidecar;
 mod tail;
 use kinds::KindCx;
 #[cfg(test)]

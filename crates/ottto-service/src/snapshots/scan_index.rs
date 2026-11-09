@@ -14,6 +14,8 @@ pub(super) mod save;
 pub(super) mod serde_lenient;
 pub(super) mod source_fingerprint;
 mod test_accessors;
+#[cfg(test)]
+pub(in crate::snapshots) mod tests;
 
 use super::*;
 use super::{

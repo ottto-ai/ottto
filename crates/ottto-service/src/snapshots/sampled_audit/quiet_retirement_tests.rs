@@ -744,6 +744,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert!(sampled_audit::path_requires_verification(
             &loaded.files,
+            &loaded.confirmed_empty_files,
             &fixture.file.0
         ));
         let modified =

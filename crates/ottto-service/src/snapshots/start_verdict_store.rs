@@ -3,7 +3,7 @@
 //! fields. This log therefore records only verdict changes, keyed by a hash
 //! of the destination, source and snapshot session id. No transcript is opened here.
 
-use super::{session_start_verdict, SnapshotItem, StartVerdict};
+use crate::snapshots::{session_start_verdict, SnapshotItem, StartVerdict};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

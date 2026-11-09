@@ -1,5 +1,5 @@
 //! Admit context-only body reads before constructing a parser. No durable queue.
-use super::*;
+use crate::snapshots::*;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalCounts {
@@ -11,7 +11,7 @@ pub(crate) struct LocalCounts {
     read_paths: BTreeMap<String, ScanTraversalPath>,
 }
 #[derive(Debug)]
-pub(super) struct Budget {
+pub(in crate::snapshots) struct Budget {
     native_limit: u64,
     native_read: u64,
     native_reserved: u64,
@@ -23,7 +23,7 @@ pub(super) struct Budget {
     deferred: Vec<CandidateFile>,
 }
 impl Budget {
-    pub(super) fn new(source: SnapshotSource) -> Self {
+    pub(in crate::snapshots) fn new(source: SnapshotSource) -> Self {
         let native_limit = match source {
             SnapshotSource::Codex => sampled_scan::codex_cursor::Limits::current().singleton(),
             _ => claude_history_upgrade::HISTORY_UPGRADE_BYTES_PER_PAGE,
@@ -41,7 +41,7 @@ impl Budget {
             deferred: Vec::new(),
         }
     }
-    pub(super) fn admit(
+    pub(in crate::snapshots) fn admit(
         &mut self,
         source: SnapshotSource,
         index: &mut ScanIndex,
@@ -51,7 +51,7 @@ impl Budget {
         self.admit_unit(source, index, std::slice::from_ref(candidate), ordinary)
     }
     #[inline(never)]
-    pub(super) fn admit_unit(
+    pub(in crate::snapshots) fn admit_unit(
         &mut self,
         source: SnapshotSource,
         index: &mut ScanIndex,
@@ -134,13 +134,17 @@ impl Budget {
         self.page_wire_counted = (ordinary.len(), bytes);
         bytes
     }
-    pub(super) fn is_admitted(&self, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn is_admitted(&self, candidate: &CandidateFile) -> bool {
         self.admitted.contains(&local_index_key(&candidate.path))
     }
-    pub(super) fn defer(&mut self, candidate: CandidateFile) {
+    pub(in crate::snapshots) fn defer(&mut self, candidate: CandidateFile) {
         self.deferred.push(candidate);
     }
-    pub(super) fn flush(&mut self, index: &mut ScanIndex, flags: &BTreeMap<String, (bool, bool)>) {
+    pub(in crate::snapshots) fn flush(
+        &mut self,
+        index: &mut ScanIndex,
+        flags: &BTreeMap<String, (bool, bool)>,
+    ) {
         // One pending-queue walk per page, not one walk per deferred file.
         sampled_scan::codex_cursor::requeue_members(index, flags, &self.deferred);
         self.deferred.clear();
@@ -153,7 +157,7 @@ impl Budget {
     }
     /// A cursor job's bytes are bounded by its own cursor allowance and never
     /// charge this page's room.
-    pub(super) fn record(
+    pub(in crate::snapshots) fn record(
         &mut self,
         index: &mut ScanIndex,
         candidate: &CandidateFile,
@@ -188,7 +192,7 @@ impl Budget {
             self.native_read = self.native_read.saturating_add(bytes);
         }
     }
-    pub(super) fn charge_cursor_ordinary(
+    pub(in crate::snapshots) fn charge_cursor_ordinary(
         &mut self,
         page: &mut sampled_scan::codex_cursor::PageBudget,
     ) {
@@ -201,7 +205,10 @@ impl Budget {
 impl ScanIndex {
     /// Return split files read on this page to their generation's
     /// queue in one pending pass; each next read resends only unACKed bodies.
-    pub(super) fn requeue_split_context_reads<'a>(&mut self, keys: impl Iterator<Item = &'a str>) {
+    pub(in crate::snapshots) fn requeue_split_context_reads<'a>(
+        &mut self,
+        keys: impl Iterator<Item = &'a str>,
+    ) {
         let Some(traversal) = self.traversal.as_mut() else {
             return;
         };
@@ -216,7 +223,7 @@ impl ScanIndex {
             .pending_candidates
             .extend(absent.into_values().cloned());
     }
-    pub(super) fn context_only_read(&self, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn context_only_read(&self, candidate: &CandidateFile) -> bool {
         if !self.file_upload_context_enabled() {
             return false;
         }
@@ -247,7 +254,10 @@ thread_local! { static TEST_READ_LIMIT: std::cell::Cell<Option<u64>> = const { s
 #[cfg(test)]
 thread_local! { static TEST_READ_ORDER: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
-pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+pub(in crate::snapshots) fn with_read_limit<T>(
+    limit: u64,
+    f: impl FnOnce() -> T,
+) -> (T, Vec<PathBuf>) {
     struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -278,7 +288,7 @@ mod tests {
             let mut budget = Budget::new(source);
             let mut index = ScanIndex::default();
             let mut candidate =
-                super::super::tests::test_candidate(PathBuf::from("/synthetic/large.jsonl"));
+                crate::snapshots::tests::test_candidate(PathBuf::from("/synthetic/large.jsonl"));
             candidate.size_bytes = budget.native_limit + 1;
             assert!(budget.admit(source, &mut index, &candidate, &[]));
             let mut next = candidate.clone();

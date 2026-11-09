@@ -14,8 +14,9 @@ fail (exit 1). Notes never fail.
                 module directory has its `<dir>.rs`; no `mod.rs`; files other
                 than .rs only under tests/fixtures/ and
                 state_v2/sqlite/migrations/*.sql.
-  budget        at most 25 entries per directory; module depth at most 3 below
-                snapshots/, 5 inside a tests/ directory.
+  budget        at most 25 entries per directory; at most 3 directories below
+                snapshots/ (sources/claude/census/x.rs is 3), 5 inside a tests/
+                directory.
   path-include  `#[path]` and item-level `include!` only as listed in
                 scripts/source_layout_includes.tsv, a list that may only shrink:
                 against the base commit a new row must replace a removed row
@@ -27,6 +28,13 @@ fail (exit 1). Notes never fail.
   header        a non-test .rs file starts with a `//!` module doc.
   stutter       a file or directory name does not start with its parent
                 directory's name.
+  tests         a `#[test]` attribute only in a file named tests.rs or under a
+                tests/ directory.
+  isolation     inside a source (snapshots/sources/<src>.rs and everything
+                under snapshots/sources/<src>/) no path names
+                `sources::<other source>`.
+  test-stem     no file stem ends in `_tests` (tests live in tests.rs or
+                tests/<topic>.rs).
 
 Exit status: 0, or 1 when an enforced rule has findings, 2 on a usage error (or a
 setup error while a rule is enforced).
@@ -49,7 +57,8 @@ SCOPE_FILE = f"{CRATE}/src/snapshots.rs"
 SCOPE_DIR = f"{CRATE}/src/snapshots"
 LIMITS = "scripts/source_layout_limits.tsv"
 INCLUDES = "scripts/source_layout_includes.tsv"
-RULES = ("size", "tree", "budget", "path-include", "names", "header", "stutter")
+RULES = ("size", "tree", "budget", "path-include", "names", "header", "stutter", "tests", "isolation",
+         "test-stem")
 MAX_LINES, NOTE_LINES = 3000, 1500
 MAX_ENTRIES, MAX_DEPTH, TESTS_EXTRA_DEPTH = 25, 3, 2
 BANNED = {"util", "utils", "helper", "helpers", "misc", "common", "shared", "base", "core", "types",
@@ -128,7 +137,8 @@ def is_test_file(path: str) -> bool:
 
 
 def module_depth(path: str) -> int:
-    return 0 if path == SCOPE_FILE else len(inside(path).split("/"))
+    """Directories between snapshots/ and the file."""
+    return 0 if path == SCOPE_FILE else len(inside(path).split("/")) - 1
 
 
 def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits: dict[str, int] | None,
@@ -262,6 +272,71 @@ def check_stutter(named: list[tuple[str, str]], out: list[Finding]) -> None:
             out.append(Finding("stutter", path, f"name starts with its directory name {parent}"))
 
 
+def test_attrs(lexed: rst.Lexed) -> int:
+    """Outer test attributes (`#[test]`, `#[tokio::test]`, ...) anywhere in the file's code."""
+    count = 0
+    for index, token in enumerate(lexed.tokens):
+        if lexed.is_punct(index, "#"):
+            bracket = lexed.next_code(index + 1)
+            if lexed.is_punct(bracket, "[") and rst.is_test_attr(
+                    lexed.text[token.start:lexed.tokens[lexed.match[bracket]].end]):
+                count += 1
+    return count
+
+
+def check_tests(files: list[str], source: rst.Source, out: list[Finding]) -> None:
+    for path in files:
+        if (not path.endswith(".rs") or posixpath.basename(path) == "tests.rs"
+                or "tests" in inside(path).split("/")[:-1]):
+            continue
+        try:
+            count = test_attrs(source.lexed(path))
+        except rst.SourceError as error:
+            out.append(Finding("tests", path, f"cannot read: {error}"))
+            continue
+        if count:
+            out.append(Finding("tests", path, f"{count} #[test] outside tests.rs and tests/"))
+
+
+def source_of(path: str) -> str | None:
+    """The source (`claude`, `codex`, ...) whose subtree holds `path`, if any."""
+    parts = inside(path).split("/")
+    if parts[0] != "sources" or len(parts) < 2 or (len(parts) == 2 and not parts[1].endswith(".rs")):
+        return None
+    return parts[1].removesuffix(".rs")
+
+
+def check_isolation(files: list[str], source: rst.Source, out: list[Finding]) -> None:
+    for path in files:
+        own = source_of(path) if path.endswith(".rs") else None
+        if own is None:
+            continue
+        try:
+            lexed = source.lexed(path)
+        except rst.SourceError as error:
+            out.append(Finding("isolation", path, f"cannot read: {error}"))
+            continue
+        named: dict[str, list[int]] = {}
+        for index in range(len(lexed.tokens)):
+            if not lexed.is_ident(index, "sources"):
+                continue
+            first = lexed.next_code(index + 1)
+            second = lexed.next_code(first + 1)
+            other = lexed.next_code(second + 1)
+            if (lexed.is_punct(first, ":") and lexed.is_punct(second, ":") and lexed.is_ident(other)
+                    and lexed.tok(other) != own):
+                named.setdefault(lexed.tok(other), []).append(lexed.line(lexed.tokens[index].start))
+        for other, lines in sorted(named.items()):
+            out.append(Finding("isolation", path, f"names sources::{other} on line(s) "
+                                                  f"{', '.join(map(str, lines))}"))
+
+
+def check_test_stem(named: list[tuple[str, str]], out: list[Finding]) -> None:
+    for path, stem in named:
+        if path.endswith(".rs") and stem.endswith("_tests"):
+            out.append(Finding("test-stem", path, "stem ends in _tests; use tests.rs or tests/<topic>.rs"))
+
+
 def base_text(repo: Path, base: str, path: str) -> str | None:
     try:
         return rst.git(repo, "show", f"{base}:{path}")
@@ -312,6 +387,9 @@ def main(argv: list[str] | None = None) -> int:
     check_names(named, findings)
     check_header(root, files, source, findings)
     check_stutter(named, findings)
+    check_tests(files, source, findings)
+    check_isolation(files, source, findings)
+    check_test_stem(named, findings)
     for finding in findings:
         kind = "note" if finding.note else finding.rule
         print(f"source-layout: {kind}: {finding.path}: {finding.message}")

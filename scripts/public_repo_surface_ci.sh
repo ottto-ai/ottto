@@ -209,8 +209,9 @@ run_step() {
 # The move checks compare the change with its base: the first parent of the
 # pull-request merge commit in GitHub Actions, else the merge-base with
 # origin/main. They fail only for a pull request whose description has a line
-# starting with `Move-only:` (passed in MOVE_ONLY_PR_BODY); otherwise they report
-# and pass. Without a base (a staged checkout) they are skipped.
+# starting with one of the given labels (default `Move-only:`; the description is
+# passed in MOVE_ONLY_PR_BODY); otherwise they report and pass. Without a base (a
+# staged checkout) they are skipped.
 move_check_base() {
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
     git rev-parse -q --verify 'HEAD^1' || true
@@ -221,16 +222,36 @@ move_check_base() {
 
 move_check() {
   local script="$1"
+  local labels="${2:-Move-only:}"
   local base
   base="$(move_check_base)"
   if [[ -z "$base" ]]; then
     echo "public-surface-ci: no base commit; skipping $script"
     return 0
   fi
-  if grep -q '^Move-only:' <<< "${MOVE_ONLY_PR_BODY:-}"; then
+  if grep -qE "^($labels)" <<< "${MOVE_ONLY_PR_BODY:-}"; then
     env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD
   else
     env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD --report
+  fi
+}
+
+# Whole-file module moves and their path-absolutizing prep changes: same base,
+# report always; a line starting with `File-move:` or `Absolutize:` in the pull
+# request description makes the matching mode blocking.
+file_move_check() {
+  local mode="$1"
+  local body_line="$2"
+  local base
+  base="$(move_check_base)"
+  if [[ -z "$base" ]]; then
+    echo "public-surface-ci: no base commit; skipping the file move check ($mode)"
+    return 0
+  fi
+  if grep -q "^$body_line" <<< "${MOVE_ONLY_PR_BODY:-}"; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD --report
   fi
 }
 
@@ -257,8 +278,14 @@ run_step P "test Mac batch helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts
 run_step P "test move ledger check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_move_ledger.py
 run_step P "test test-ID map check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_test_id_map.py
 run_step P "test source layout check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_source_layout.py
+run_step P "test file move check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_file_moves.py
 run_step P "check that a move-only change only moves items" move_check scripts/check_move_ledger.py
-run_step P "check test IDs and never-retry decisions" move_check scripts/check_test_id_map.py
+run_step P "check that a file-move change only moves whole module files" file_move_check move File-move:
+run_step P "check that an absolutize change only makes super paths absolute" file_move_check absolutize Absolutize:
+# Whole-file moves rename test IDs and absolutize changes must keep them, so
+# their labels also make the test-ID map blocking.
+run_step P "check test IDs and never-retry decisions" \
+  move_check scripts/check_test_id_map.py 'Move-only:|File-move:|Absolutize:'
 run_step P "report the snapshots source layout" source_layout_report
 
 run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh

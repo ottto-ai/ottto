@@ -1,19 +1,25 @@
 //! The Tail counters: `[since last emit, process total]` per source, name and
 //! label, counts only, carried on that source's `durable_tail_alarm`. They
 //! reset at process start and never decide anything.
+use super::refold_moved::Baselines;
 use crate::snapshots::SnapshotSource;
 use std::collections::BTreeMap;
 
 /// Keyed by the source's slug, then name and label.
 type Counts = BTreeMap<(&'static str, &'static str, &'static str), [u64; 2]>;
+type State = (Counts, BTreeMap<&'static str, usize>, Baselines);
 
 #[cfg(not(test))]
-static COUNTS: std::sync::Mutex<Counts> = std::sync::Mutex::new(BTreeMap::new());
+static COUNTS: std::sync::Mutex<State> =
+    std::sync::Mutex::new((BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
 #[cfg(test)]
 thread_local! {
-    static COUNTS: std::cell::RefCell<Counts> = const { std::cell::RefCell::new(BTreeMap::new()) };
+    static COUNTS: std::cell::RefCell<State> = const { std::cell::RefCell::new((BTreeMap::new(), BTreeMap::new(), BTreeMap::new())) };
 }
 fn with<R>(visit: impl FnOnce(&mut Counts) -> R) -> R {
+    with_state(|state| visit(&mut state.0))
+}
+pub(super) fn with_state<R>(visit: impl FnOnce(&mut State) -> R) -> R {
     #[cfg(not(test))]
     {
         visit(

@@ -1335,7 +1335,7 @@ for line in sys.stdin:
                     .iter()
                     .map(|(key, value)| {
                         let previous = std::env::var_os(key);
-                        std::env::set_var(key, value);
+                        unsafe { std::env::set_var(key, value) };
                         (*key, previous)
                     })
                     .collect();
@@ -1347,8 +1347,8 @@ for line in sys.stdin:
             fn drop(&mut self) {
                 for (key, previous) in &self.0 {
                     match previous {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
                     }
                 }
             }

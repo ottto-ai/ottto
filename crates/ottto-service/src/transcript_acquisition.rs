@@ -1123,7 +1123,7 @@ impl ReadPlan {
         lossy: bool,
         consumed: u64,
     ) -> Result<Checkpoint, PrefixRefusal> {
-        use FullReason::*;
+        use crate::transcript_acquisition::FullReason::*;
         let invalid = |reason| Err(PrefixRefusal::Invalidated(reason));
         if !cfg!(unix) {
             return invalid(UnsupportedIdentity);
@@ -2073,7 +2073,7 @@ mod tests {
             )
             .unwrap_err()
         };
-        use FullReason::*;
+        use crate::transcript_acquisition::FullReason::*;
         assert_eq!(
             refusal(&|f| f.replace_bytes(b"one\ntwX\n"), true),
             PrefixRefusal::Invalidated(SameSizeEdit)
