@@ -319,6 +319,66 @@ fn resident_wave_codex_join_group_straddles_budget_and_pi_drains() {
                     .unwrap();
                 }
             }
+            let mut scan = OwnedSourceScan::new(
+                source,
+                std::slice::from_ref(&root),
+                ScanIndex::default(),
+                "2026-10-27T08:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+                4,
+                None,
+                &[],
+                false,
+            );
+            // The second join is selected through b0, while its census member
+            // b1 remains pending outside the selection. Admission consumes both.
+            let held = root.join("b1.jsonl");
+            let member = scan
+                .identified_candidates
+                .remove(
+                    scan.identified_candidates
+                        .iter()
+                        .position(|c| c.path == held)
+                        .unwrap(),
+                )
+                .unwrap();
+            scan.selected_flags.remove(&local_index_key(&held));
+            scan.selected_flags
+                .insert(local_index_key(&root.join("b0.jsonl")), (false, false));
+            let pending = ScanTraversalPath {
+                scan_root: member.scan_root,
+                path: member.path,
+                census_member: true,
+                watcher_hint: false,
+            };
+            scan.index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .push_back(pending.clone());
+            let (index, page) =
+                claude_history_upgrade::with_resident_budget(FILE_CHARGE, || loop {
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete { index, scan } => break (index, scan),
+                    }
+                });
+            assert_eq!(page.scanned_file_count, 2, "the first join is indivisible");
+            assert!(page.charge_deferred);
+            assert!(
+                index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .pending_candidates
+                    .contains(&pending),
+                "resident deferral restores the unselected census member"
+            );
+            assert!(
+                !page.census_complete,
+                "the pending census member holds retirement"
+            );
         } else {
             for n in 0..6 {
                 fs::write(root.join(format!("pi-{n}.jsonl")), format!(

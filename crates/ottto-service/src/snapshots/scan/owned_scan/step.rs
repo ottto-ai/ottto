@@ -1087,6 +1087,9 @@ impl OwnedSourceScan {
                     if !history_upgrade.resident_can_start() {
                         let mut members = group.members;
                         members.extend(codex_join_groups.drain(..).flat_map(|g| g.members));
+                        // Admission consumed pending entries for the whole join,
+                        // including census members outside this page's selection.
+                        scan::owned_scan::requeue_members(index, &selected_flags, &members);
                         members.extend(identified_candidates.drain(..));
                         identified_candidates = members.into();
                         history_upgrade.defer_resident(
