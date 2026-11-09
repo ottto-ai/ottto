@@ -152,7 +152,9 @@ failed commands and inputs changed during loading are never kept. Setup reads
 bypass reuse and refresh successful facts. Only the full status listing evicts
 removed homes; account-screen reads never evict other homes.
 
-Login text containing email or plan fields is served fresh and never cached.
+Login is reused only when this pass's fresh auth read supplies email, plan,
+subscription product and billing channel. Otherwise CLI account fields are read
+fresh and merged exactly as before. The cache retains only the login enum.
 Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi

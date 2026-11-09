@@ -1,22 +1,19 @@
 //! Fixed argv classes only; no paths, arguments, output or account identifiers.
 use serde::Serialize;
-use std::io::{self, Read};
+use std::io;
 use std::ops::{Deref, DerefMut};
-use std::process::{Child, Command, ExitStatus, Output};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-const ARGV: [&str; 8] = [
+const ARGV: [&str; 5] = [
     "codex login status",
-    "codex debug models --bundled",
-    "claude --version",
-    "codex app-server",
-    "codex cloud list",
-    "codex login",
-    "codex --version",
-    "codex verify",
+    "codex models",
+    "claude version",
+    "other codex",
+    "other",
 ];
-super::process_static!(fn with_totals: [[AtomicU64; 8]; 2] =
-    [const { [const { AtomicU64::new(0) }; 8] }; 2]);
+super::process_static!(fn with_totals: [[AtomicU64; 5]; 2] =
+    [const { [const { AtomicU64::new(0) }; 5] }; 2]);
 
 #[derive(Debug, Serialize)]
 pub(super) struct Counts {
@@ -41,7 +38,7 @@ pub(super) fn snapshot() -> Vec<Counts> {
 /// Ownership, signals, process groups and pipe handling remain with the caller.
 pub(crate) struct MeasuredChild {
     inner: Child,
-    class: Option<usize>,
+    class: usize,
     status: Option<ExitStatus>,
 }
 impl Deref for MeasuredChild {
@@ -62,20 +59,14 @@ pub(crate) fn spawn(command: &mut Command) -> io::Result<MeasuredChild> {
         .and_then(|s| s.to_str());
     let has = |value: &str| command.get_args().any(|arg| arg == value);
     let class = match binary {
-        Some("codex") if has("login") && has("status") => Some(0),
-        Some("codex") if has("debug") && has("models") && has("--bundled") => Some(1),
-        Some("claude") if has("--version") => Some(2),
-        Some("codex") if has("app-server") => Some(3),
-        Some("codex") if has("cloud") && has("list") => Some(4),
-        Some("codex") if has("login") => Some(5),
-        Some("codex") if has("--version") => Some(6),
-        Some("codex") => Some(7),
-        _ => None,
+        Some("codex") if has("login") && has("status") => 0,
+        Some("codex") if has("debug") && has("models") && has("--bundled") => 1,
+        Some("claude") if has("--version") => 2,
+        Some("codex") => 3,
+        _ => 4,
     };
     let inner = command.spawn()?;
-    if let Some(i) = class {
-        with_totals(|totals| totals[0][i].fetch_add(1, Relaxed));
-    }
+    with_totals(|totals| totals[0][class].fetch_add(1, Relaxed));
     Ok(MeasuredChild {
         inner,
         class,
@@ -111,14 +102,6 @@ impl MeasuredChild {
         if self.status.is_some() {
             return Ok(self.status);
         }
-        if self.class.is_none() {
-            self.status = if blocking {
-                Some(self.inner.wait()?)
-            } else {
-                self.inner.try_wait()?
-            };
-            return Ok(self.status);
-        }
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
@@ -150,14 +133,12 @@ impl MeasuredChild {
                         .saturating_mul(1_000_000)
                         .saturating_add(v.tv_usec as u64)
                 };
-                if let Some(i) = self.class {
-                    with_totals(|totals| {
-                        totals[1][i].fetch_add(
-                            micros(usage.ru_utime).saturating_add(micros(usage.ru_stime)),
-                            Relaxed,
-                        )
-                    });
-                }
+                with_totals(|totals| {
+                    totals[1][self.class].fetch_add(
+                        micros(usage.ru_utime).saturating_add(micros(usage.ru_stime)),
+                        Relaxed,
+                    )
+                });
                 self.status = Some(ExitStatus::from_raw(status));
                 return Ok(self.status);
             }
@@ -171,21 +152,5 @@ impl MeasuredChild {
             };
             Ok(self.status)
         }
-    }
-    pub(crate) fn wait_with_output(mut self) -> io::Result<Output> {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut pipe) = self.inner.stdout.take() {
-            pipe.read_to_end(&mut stdout)?;
-        }
-        if let Some(mut pipe) = self.inner.stderr.take() {
-            pipe.read_to_end(&mut stderr)?;
-        }
-        let status = self.wait()?;
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
     }
 }
