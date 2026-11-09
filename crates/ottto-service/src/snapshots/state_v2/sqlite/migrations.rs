@@ -14,6 +14,10 @@ const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
         "tail revision and head envelope: older writers would drop debt",
     ),
     (5, "zstd Tail values and fragments"),
+    (
+        6,
+        "upload progress rows: older writers would read stale JSON progress",
+    ),
 ];
 pub(super) const WRITER_CAPABILITY: u64 =
     WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;
@@ -148,17 +152,18 @@ pub(super) fn run(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// [format] Capability 5 fences the previous reader/writer without DDL.
+    /// [format] Capability 6 (progress rows) fences the previous
+    /// reader/writer without DDL, as capability 5 fenced capability 4.
     #[test]
-    fn compressed_tail_fences_capability_four() {
-        let scratch = crate::test_scratch::ScratchDir::canonical("tail-writer-fence");
+    fn progress_rows_fence_capability_five() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("progress-writer-fence");
         let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
-        db.control("minimum_writer_capability", &5_u64).unwrap();
+        db.control("minimum_writer_capability", &6_u64).unwrap();
         let conn = db.conn().unwrap();
-        assert_eq!(WRITER_CAPABILITY, 5);
+        assert_eq!(WRITER_CAPABILITY, 6);
         assert_eq!(revision(conn).unwrap(), 1);
         assert!(writer_supported(conn).is_ok());
-        let error = writer_supported_at(conn, 4).unwrap_err();
+        let error = writer_supported_at(conn, 5).unwrap_err();
         assert_eq!(
             error.downcast_ref::<super::super::super::Hold>(),
             Some(&super::super::super::Hold::NewerSchema)

@@ -35,7 +35,15 @@ fn native_corpus(source: SnapshotSource) -> (Corpus, Vec<PathBuf>) {
 }
 
 fn native_corpus_of(source: SnapshotSource, sessions: &[&str]) -> (Corpus, Vec<PathBuf>) {
-    let mut c = corpus("unkept-native-oracle");
+    native_corpus_in(corpus("unkept-native-oracle"), source, sessions)
+}
+
+/// `sessions` as native `source` transcripts under the fresh corpus `c`.
+fn native_corpus_in(
+    mut c: Corpus,
+    source: SnapshotSource,
+    sessions: &[&str],
+) -> (Corpus, Vec<PathBuf>) {
     let paths = sessions
         .iter()
         .map(|session| {
@@ -124,12 +132,24 @@ fn send(
     progress: &mut SnapshotUploadProgress,
     respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
-    let (status, batches, _) = upload_source_under(
+    send_with(source, page, progress, respond, |_| Ok(()))
+}
+
+/// `send` with the caller's progress persistence after each ACK.
+fn send_with(
+    source: SnapshotSource,
+    page: &Page,
+    progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> (Result<ResumableUploadResult>, RouteResult) {
+    let (status, batches, _) = upload_source_persisting(
         source,
         SnapshotUploadPolicy::default(),
         &page.scan.snapshots,
         progress,
         respond,
+        persist,
     );
     let sent = batches
         .iter()
@@ -188,12 +208,6 @@ fn checkpoint(
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
-    if progress.ack_recovery.is_none() {
-        progress.ack_recovery =
-            crate::snapshots::ProgressRecovery::for_index(&page.committed, index_path)
-                .unwrap()
-                .map(Box::new);
-    }
     progress.save(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,
@@ -1194,3 +1208,6 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
         }
     });
 }
+
+#[path = "progress_rows_oracle_tests.rs"]
+mod progress_rows_oracle_tests;
