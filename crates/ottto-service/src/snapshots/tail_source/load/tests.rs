@@ -483,3 +483,26 @@ fn a_future_revision_holds() {
         .unwrap()
         .contains(&key));
 }
+
+/// [behaviour] A reconstruction's load outcome: a key rotation is a miss, a
+/// Codex sidecar binding change is its own outcome, any other cause an error.
+#[test]
+fn a_reconstruction_counts_its_load_outcome() {
+    let rows = [
+        (ReconstructCause::KeyEpoch, "miss"),
+        (
+            ReconstructCause::Incompatible(super::super::codex::INCOMPATIBLE_SIDECAR_BINDING),
+            "sidecar_binding",
+        ),
+        (ReconstructCause::INCOMPATIBLE, "error"),
+        (
+            ReconstructCause::Incompatible("incompatible_counting_version"),
+            "error",
+        ),
+        (ReconstructCause::Corrupt, "error"),
+        (ReconstructCause::Identity, "error"),
+    ];
+    for (cause, outcome) in rows {
+        assert_eq!(reconstruct_outcome(cause), outcome, "{cause:?}");
+    }
+}
