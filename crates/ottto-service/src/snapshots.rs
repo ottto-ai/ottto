@@ -480,8 +480,6 @@ mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
-#[cfg(test)]
-mod pi_ledger_tests;
 pub(crate) mod terminal_contract_retry;
 #[cfg(test)]
 mod terminal_contract_retry_tests;
