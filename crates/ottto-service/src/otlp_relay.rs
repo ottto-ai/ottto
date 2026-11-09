@@ -584,12 +584,29 @@ const RELAY_MISMATCH_PERSIST: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const RELAY_MISMATCH_PERSIST: Duration = Duration::ZERO;
 
-/// In-memory streak for the mismatch finding: set after two evaluations of the
-/// same mismatch, cleared by the first evaluation without one.
+pub(crate) fn listener_failure(relay: &RelayState) -> Option<StableMessage> {
+    relay
+        .last_error
+        .as_ref()
+        .filter(|error| {
+            relay.state == RelayRuntimeState::Failed && error.code == "relay_listener_failed"
+        })
+        .cloned()
+}
+
+/// In-memory streak shared by the mutually exclusive mismatch and listener
+/// failure findings, cleared by the first evaluation without either.
 #[derive(Debug, Default)]
-pub(crate) struct RelayMismatchDebounce(std::sync::Mutex<Option<(Instant, String)>>);
+pub(crate) struct RelayMismatchDebounce(std::sync::Mutex<Option<(Instant, StableMessage)>>);
 
 impl RelayMismatchDebounce {
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&self, elapsed: Duration) {
+        if let Some((since, _)) = self.0.lock().unwrap().as_mut() {
+            *since = Instant::now() - elapsed;
+        }
+    }
+
     pub(crate) fn observe(&self, finding: Option<StableMessage>) -> Option<StableMessage> {
         let mut seen = self
             .0
@@ -600,11 +617,16 @@ impl RelayMismatchDebounce {
             return None;
         };
         match seen.as_ref() {
-            Some((since, text)) if *text == finding.text => {
-                (since.elapsed() >= RELAY_MISMATCH_PERSIST).then_some(finding)
+            Some((since, previous)) if *previous == finding => {
+                let grace = if finding.code == "relay_listener_failed" {
+                    Duration::from_secs(60)
+                } else {
+                    RELAY_MISMATCH_PERSIST
+                };
+                (since.elapsed() >= grace).then_some(finding)
             }
             _ => {
-                *seen = Some((Instant::now(), finding.text.clone()));
+                *seen = Some((Instant::now(), finding));
                 None
             }
         }

@@ -1223,6 +1223,9 @@ fails a provider call, and a line it cannot write promptly is dropped.
 
 ## Claude Relay Endpoint Mismatch
 
+- `relay_bind_failed`: immediate source warning — Claude telemetry listener unavailable; restart Ottto, then Verify.
+- `relay_listener_failed`: source warning after 60 seconds failed — Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto.
+
 When the relay is connected but approved Claude telemetry settings name a
 different loopback port, `ottto doctor` reports both ports. `ottto status --json`
 and `ottto doctor --json` expose `relay.last_error.code` as
