@@ -157,8 +157,8 @@ existing fingerprint bytes after the merged title prefix is known.
 Recent log facts use one read transaction for maximum id, new matches and
 retained-row existence checks. Both log locations remain independent, expired
 rows leave the union and a larger time window reloads it. The existing capped
-result remains incomplete and is never retained. Facts and cursors are never
-persisted; restarting the process fully loads them again. Existing terminal
+result stays incomplete and restarts the cursor; the next pass reloads it.
+Facts and cursors are never persisted; a restart fully loads them. Terminal
 scan diagnostics include per-input reuse/reload counts and log delta rows.
 
 ## CLI status metadata
