@@ -391,7 +391,12 @@ and finish, so compare its peak with theirs but never subtract or sum them.
 
 Claude Code's local-evidence stage adds three outer footprint records (none on
 panic), v1 and v2 alike: `claude_local_evidence` wraps the
-sidecar read and fold, and contains `evidence_read` then `evidence_fold`.
+sidecar read and fold, and contains `evidence_read` then `evidence_fold`. The
+page's families run in packed chunks (next-fit in page order; the batch size
+is the page's largest family by side-file bytes), and `evidence_read`,
+`evidence_fold` and the records inside them repeat once per chunk; the count
+of `evidence_read` records before a `claude_local_evidence` record is the
+page's chunk count.
 Inside `evidence_read`, `evidence_decode` (each root's strict API/trace row
 read) and `evidence_cross_root` (each root's cross-root summary add plus the
 final sort) are summed over roots into one record each per pass, with
@@ -402,7 +407,8 @@ Inside `evidence_fold`, one footprint record per step, in order and without
 counts: `evidence_side_calls` (side calls and the read holds),
 `evidence_identity_index`, `evidence_reported_usage`, `evidence_reconcile`
 (request accounts and activity staging), `evidence_finish_page`,
-`evidence_identity_tags`, `evidence_qualification` and `evidence_census_health`.
+`evidence_identity_tags` and `evidence_qualification`; then, once per page,
+`evidence_census_health`.
 Of the three outer footprint records, only `evidence_read` has counts: one
 `evidence_mem` object of scalars. `in_use_bytes` (system-allocator live
 bytes, `malloc_zone_statistics` `size_in_use`, after the API evidence is attached, after the root loop and
@@ -410,7 +416,10 @@ after the cross-root finish; `null` off macOS), `footprint_bytes` (physical
 footprint at the first two points; the third is `stage_end_footprint_bytes`),
 `kept_rows` (API plus trace rows the pass keeps for the fold),
 `largest_root_rows` with `largest_root_kept` (the root with the most rows and
-whether the pass kept it), and `legacy_owners` (legacy request owners). Compare
+whether the pass kept it), `legacy_owners` (legacy request owners), and
+`groups` with `side_file_bytes` (the chunk's families and their side-file
+bytes, `null` when a size could not be read). `kept_rows` is the chunk's; the
+page total is the sum over its chunks. Compare
 deltas between the points only; footprint also charges memory the allocator
 does not report.
 A complete state-v2 hydrate adds one `hydrate_usage_heads` footprint record

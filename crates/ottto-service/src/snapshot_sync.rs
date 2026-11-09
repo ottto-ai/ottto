@@ -9152,12 +9152,10 @@ fn whole_corpus_evidence() -> bool {
 #[cfg(test)]
 thread_local! {
     static ONE_EVIDENCE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Packed evidence chunks run on this thread (reference arms excluded),
-    /// so a fixture can assert its packing.
+    /// Packed chunks run on this thread, reference arms excluded.
     static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Evidence chunks run on this thread so far.
 #[cfg(test)]
 pub(crate) fn evidence_chunks_for_test() -> usize {
     EVIDENCE_CHUNKS.with(std::cell::Cell::get)
@@ -9175,75 +9173,76 @@ fn one_evidence_chunk() -> bool {
     false
 }
 
-/// Next-fit packing of the page's evidence groups, in page order, into the
-/// chunks the evidence body runs once each: a chunk closes before a group
-/// would take its side-file bytes past the page's largest group. A group is
-/// never split. The batch size is that largest group: no constant, cap or
-/// timer. Sizes come from file metadata; no side file is opened.
-fn pack_claude_evidence_groups(
+/// One evidence chunk: the page slots of whole families, how many families,
+/// and their side-file bytes (`None`: a size could not be read).
+struct ClaudeEvidenceChunk {
+    slots: Vec<usize>,
+    families: usize,
+    side_file_bytes: Option<u64>,
+}
+
+/// Next-fit packing of the page's families, in page order, into the chunks the
+/// evidence body runs once each. The batch size is the page's largest family
+/// by side-file bytes (file metadata only): a family is never split, and one
+/// whose size cannot be read runs alone. An empty page is one empty chunk.
+fn pack_claude_evidence_families(
     support_dir: &Path,
-    groups: Vec<(Vec<usize>, BTreeSet<String>)>,
-) -> Vec<Vec<usize>> {
-    if one_evidence_chunk() || groups.len() < 2 {
-        let mut page = groups
-            .into_iter()
-            .flat_map(|(slots, _)| slots)
-            .collect::<Vec<_>>();
-        page.sort_unstable();
-        return vec![page];
-    }
-    let sized = groups
+    items: &[SnapshotItem],
+) -> Vec<ClaudeEvidenceChunk> {
+    let mut families = crate::snapshots::claude_request_money::e2::page_families(items)
         .into_iter()
-        .map(|(slots, roots)| {
-            let bytes = roots
-                .iter()
-                .filter_map(|root| {
-                    crate::claude_local_otel::telemetry_pair_bytes(
-                        support_dir,
-                        &crate::claude_local_otel::telemetry_stem(root),
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .fold(0, u64::saturating_add);
-            (slots, bytes)
+        .map(|(root, slots)| {
+            let stem = crate::claude_local_otel::telemetry_stem(&root);
+            let bytes = crate::claude_local_otel::telemetry_pair_bytes(support_dir, &stem);
+            (slots, bytes.ok().map(|bytes| bytes.unwrap_or(0)))
         })
         .collect::<Vec<_>>();
-    let batch = sized.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
-    let mut chunks = Vec::<Vec<usize>>::new();
-    let mut used = 0_u64;
-    for (slots, bytes) in sized {
-        match chunks.last_mut() {
-            Some(chunk) if used.saturating_add(bytes) <= batch => chunk.extend(slots),
-            _ => {
-                chunks.push(slots);
-                used = 0;
-            }
+    families.sort_unstable_by_key(|(slots, _)| slots[0]);
+    let batch = families.iter().filter_map(|(_, bytes)| *bytes).max();
+    let fits = |total: Option<u64>| {
+        one_evidence_chunk()
+            || total
+                .zip(batch)
+                .is_some_and(|(total, batch)| total <= batch)
+    };
+    let mut chunks = vec![ClaudeEvidenceChunk {
+        slots: Vec::new(),
+        families: 0,
+        side_file_bytes: Some(0),
+    }];
+    for (slots, bytes) in families {
+        let open = chunks.last_mut().expect("packing starts with one chunk");
+        let total =
+            (open.side_file_bytes.zip(bytes)).map(|(used, bytes)| used.saturating_add(bytes));
+        if open.families == 0 || fits(total) {
+            open.slots.extend(slots);
+            open.families += 1;
+            open.side_file_bytes = total;
+        } else {
+            chunks.push(ClaudeEvidenceChunk {
+                slots,
+                families: 1,
+                side_file_bytes: bytes,
+            });
         }
-        used = used.saturating_add(bytes);
     }
     for chunk in &mut chunks {
-        chunk.sort_unstable();
+        chunk.slots.sort_unstable();
     }
     chunks
 }
 
-/// What every evidence chunk of one page shares: the page's original
-/// carriers, read before any chunk runs, and the pass's counters.
+/// What the chunks of one page share: its original carriers and the counters.
 struct ClaudeEvidencePage<'p> {
     originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
     stats: ClaudeLocalEvidenceStats,
-    /// Roots already counted this pass: a scope root that a later chunk reads
-    /// again counts once (its bytes still show as re-read).
-    counted_roots: BTreeSet<String>,
 }
 
-/// The evidence stage over one page: the page is split into groups of whole
-/// families (`EvidenceScope::item_groups`), packed into chunks, and the
-/// evidence body runs once per chunk, so only one chunk's rows are resident
-/// at a time. The copy decisions, original carriers, census health and the
-/// release of emitted folds run once over the page.
+/// The evidence stage over one page: its families are packed into chunks and
+/// the evidence body runs once per chunk, so one chunk's rows are resident at
+/// a time. Copy decisions, original carriers, census health and the release
+/// of emitted folds run once over the page.
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9277,7 +9276,6 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             requested_session_count: claude_evidence_session_ids(&scan_result.snapshots).len(),
             ..Default::default()
         },
-        counted_roots: BTreeSet::new(),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9297,14 +9295,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         "claude_code",
         "claude_local_evidence",
     );
-    let chunks = pack_claude_evidence_groups(
-        support_dir,
-        crate::snapshots::claude_cross_root_evidence::EvidenceScope::item_groups(
-            &scan_result.snapshots,
-            index,
-            &fork_parents,
-        ),
-    );
+    let chunks = pack_claude_evidence_families(support_dir, &scan_result.snapshots);
     #[cfg(test)]
     if !one_evidence_chunk() {
         EVIDENCE_CHUNKS.with(|count| count.set(count.get() + chunks.len()));
@@ -9324,7 +9315,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         |item: &SnapshotItem| (item.claude_money.as_deref()).and_then(|fold| fold.location_key());
     let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     for chunk in chunks {
-        scan_result.snapshots = (chunk.iter())
+        scan_result.snapshots = (chunk.slots.iter())
             .map(|&slot| slots[slot].take().expect("each slot is in one chunk"))
             .collect();
         let keys = (scan_result.snapshots.iter())
@@ -9337,6 +9328,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             .filter(|(root, _)| roots.contains(root))
             .cloned()
             .collect();
+        let evidence_mem = crate::local_resource_diagnostics::EvidenceMem::of_chunk(
+            chunk.families,
+            chunk.side_file_bytes,
+        );
         disposition.absorb(apply_claude_local_evidence_chunk(
             support_dir,
             scan_result,
@@ -9344,7 +9339,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             accepted_identity_buckets,
             wire_budget,
             &mut page,
-            chunk_fork_parents,
+            (chunk_fork_parents, evidence_mem),
         ));
         // The body only removes items (index unavailable, or an emitted
         // session's later path twins), keeping the rest in order: each
@@ -9352,7 +9347,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         let mut survivors = std::mem::take(&mut scan_result.snapshots)
             .into_iter()
             .peekable();
-        for (&slot, (session, located)) in chunk.iter().zip(&keys) {
+        for (&slot, (session, located)) in chunk.slots.iter().zip(&keys) {
             if survivors.peek().is_some_and(|item| {
                 item.source_session_id == *session && location(item) == *located
             }) {
@@ -9439,10 +9434,8 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     (disposition, census_withheld, stats)
 }
 
-/// The evidence body over one chunk of whole families (`scan_result`'s
-/// snapshots): the API read and attach, the strict per-root read of the
-/// chunk's scope and the fold steps through account qualification. It counts
-/// into the page's stats and returns the chunk's disposition.
+/// The evidence body over one chunk (`scan_result`'s snapshots), from the API
+/// read through account qualification; returns the chunk's disposition.
 fn apply_claude_local_evidence_chunk(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9450,7 +9443,10 @@ fn apply_claude_local_evidence_chunk(
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
     page: &mut ClaudeEvidencePage<'_>,
-    fork_parents: Vec<(String, String)>,
+    (fork_parents, mut evidence_mem): (
+        Vec<(String, String)>,
+        crate::local_resource_diagnostics::EvidenceMem,
+    ),
 ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     let (originals, request_owned_originals) = (page.originals, page.request_owned_originals);
@@ -9460,7 +9456,6 @@ fn apply_claude_local_evidence_chunk(
         .collect::<BTreeSet<_>>();
     let mut read_window =
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", "evidence_read");
-    let mut evidence_mem = crate::local_resource_diagnostics::EvidenceMem::default();
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let api_load = crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids);
     match api_load {
@@ -9519,12 +9514,7 @@ fn apply_claude_local_evidence_chunk(
         None => scope,
     };
     let usage_roots = scope.roots().cloned().collect::<Vec<_>>();
-    // A root counts on its first read in the pass only.
-    let fresh = (usage_roots.iter())
-        .filter(|root| page.counted_roots.insert((*root).clone()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    stats.candidate_root_count += fresh.len();
+    stats.candidate_root_count += usage_roots.len();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
@@ -9563,10 +9553,7 @@ fn apply_claude_local_evidence_chunk(
             paired
         })
         .collect::<Vec<_>>();
-    stats.paired_sidecar_root_count += usage_roots
-        .iter()
-        .filter(|root| fresh.contains(*root))
-        .count();
+    stats.paired_sidecar_root_count += usage_roots.len();
 
     // Release all non-paired rows before moving the selected roots into the
     // usage aggregate.
@@ -9607,12 +9594,6 @@ fn apply_claude_local_evidence_chunk(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
-        let mut reread = ClaudeLocalEvidenceStats::default();
-        let stats = if fresh.contains(&root_session_id) {
-            &mut *stats
-        } else {
-            &mut reread
-        };
         let (mut api, mut trace) = decode_window.time(|| {
             let api = api_read.take_strict_report(support_dir, &root_session_id);
             let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(

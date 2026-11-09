@@ -1148,8 +1148,7 @@ impl ClaudeContextFileBirthCounts {
             .record(outcome, tagged, partially);
     }
 
-    /// Adds one evidence chunk's fold counts to its page's: fieldwise sums,
-    /// per version under the same key bound, and the overflow bit OR'd.
+    /// Adds one evidence chunk's counts to its page's, as recorded.
     pub(crate) fn absorb(&mut self, chunk: Self) {
         let Self {
             total,
@@ -1164,17 +1163,8 @@ impl ClaudeContextFileBirthCounts {
         } = chunk;
         self.total.absorb(&total);
         for (version, counts) in by_claude_code_version {
-            let key = if self.by_claude_code_version.contains_key(&version)
-                || self.by_claude_code_version.len() < MAX_CONTEXT_BASIS_VERSION_KEYS
-            {
-                version
-            } else {
-                "other".to_owned()
-            };
-            self.by_claude_code_version
-                .entry(key)
-                .or_default()
-                .absorb(&counts);
+            let page = self.by_claude_code_version.entry(version).or_default();
+            page.absorb(&counts);
         }
         self.demotion_quarantined_session_count += demotion_quarantined_session_count;
         self.contractless_scalars_witness_present_session_count +=

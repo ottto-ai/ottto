@@ -1386,7 +1386,9 @@ pub(crate) struct StageWindow {
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
 /// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
-/// keeps, the largest root's rows with its keep bit, and legacy owners.
+/// keeps, the largest root's rows with its keep bit, and legacy owners; and
+/// the evidence chunk's families and their side-file bytes (`None`: a size
+/// could not be read).
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct EvidenceMem {
     in_use_bytes: [Option<u64>; 3],
@@ -1395,9 +1397,18 @@ pub(crate) struct EvidenceMem {
     largest_root_rows: usize,
     largest_root_kept: bool,
     pub(crate) legacy_owners: usize,
+    groups: usize,
+    side_file_bytes: Option<u64>,
 }
 crate::heap_layout_bound::no_heap!(true; EvidenceMem);
 impl EvidenceMem {
+    pub(crate) fn of_chunk(groups: usize, side_file_bytes: Option<u64>) -> Self {
+        Self {
+            groups,
+            side_file_bytes,
+            ..Self::default()
+        }
+    }
     /// Checkpoint 0 = A, 1 = B, 2 = C.
     pub(crate) fn sample(&mut self, at: usize) {
         self.in_use_bytes[at] = footprint::malloc_in_use();

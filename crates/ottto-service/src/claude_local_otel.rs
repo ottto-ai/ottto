@@ -3102,6 +3102,8 @@ mod tests {
         assert_eq!(mem["largest_root_rows"], 4);
         assert_eq!(mem["largest_root_kept"], true);
         assert_eq!(mem["legacy_owners"], 2);
+        assert_eq!(mem["groups"], 1);
+        assert!(mem["side_file_bytes"].as_u64().unwrap() > 0);
         let in_use = mem["in_use_bytes"].as_array().unwrap();
         assert_eq!(in_use.len(), 3);
         assert!(in_use
