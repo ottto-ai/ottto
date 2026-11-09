@@ -290,7 +290,21 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
                 &line(session, "successor", "2026-08-02T07:00:40Z", 13),
             );
         }
-        let cold = drain(&c, f64::INFINITY, false);
+        let mut cold_page = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            wide.index.clone(),
+            100,
+            true,
+            &[],
+        );
+        assert!(
+            cold_page.modes.0 > 0,
+            "cold Full keeps the same prior receipt context"
+        );
+        cold_page.enrich(&c);
+        cold_page.finish();
+        let mut cold = mixed_route_acked(&cold_page, &wide.progress, Mode::ColdFull, ack).0;
+        canonical_entities(&mut cold);
         for refusal in ["refused", "not_stored", "partial", "crash_after_ack"] {
             let mut progress = wide.progress.clone();
             let scanner = E2ScanFixture::capturing_identity();
@@ -403,7 +417,7 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
                 RouteResult::emitted(Mode::Ram, SnapshotSource::ClaudeCode, wire, &offered);
             actual.accepted = wide.route.accepted.clone();
             canonical_entities(&mut actual);
-            let mut expected = cold.route.clone();
+            let mut expected = cold.clone();
             expected
                 .snapshots
                 .retain(|id, _| actual.snapshots.contains_key(id) || id == held);
