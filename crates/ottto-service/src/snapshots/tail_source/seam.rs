@@ -175,9 +175,14 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
     /// In load order: page key, then digest and encoded resident byte length.
-    pages: Vec<((Collection, u64), ([u8; 32], u64))>,
+    pages: Vec<((Collection, u64), PageStamp)>,
     logs: Vec<(Collection, LogBase)>,
 }
+struct PageStamp {
+    digest: [u8; 32],
+    bytes: u64,
+}
+
 struct LogBase {
     /// Sorted element digests.
     keys: Vec<u64>,
@@ -212,8 +217,13 @@ impl TailBase {
         page: u64,
         bytes: &[u8],
     ) -> Result<(), ReconstructCause> {
-        self.pages
-            .push(((collection, page), (page_digest(bytes), bytes.len() as u64)));
+        self.pages.push((
+            (collection, page),
+            PageStamp {
+                digest: page_digest(bytes),
+                bytes: bytes.len() as u64,
+            },
+        ));
         if S::collections()
             .iter()
             .any(|spec| spec.collection == collection && spec.shape == PageShape::Log)
@@ -240,7 +250,7 @@ impl TailBase {
         self.pages
             .binary_search_by(|(at, _)| at.cmp(&page))
             .ok()
-            .map(|at| &self.pages[at].1 .0)
+            .map(|at| &self.pages[at].1.digest)
     }
 
     /// The new head, every collection's metadata, and only the pages whose
@@ -300,7 +310,7 @@ impl TailBase {
                 self.pages
                     .iter()
                     .filter(|((c, _), _)| *c == spec.collection)
-                    .fold(0u64, |sum, (_, (_, size))| sum.saturating_add(*size))
+                    .fold(0u64, |sum, (_, stamp)| sum.saturating_add(stamp.bytes))
             } else {
                 0
             };
@@ -320,7 +330,7 @@ impl TailBase {
                         .pages
                         .binary_search_by(|(key, _)| key.cmp(&(spec.collection, page)))
                     {
-                        collection_bytes = collection_bytes.saturating_sub(self.pages[at].1 .1);
+                        collection_bytes = collection_bytes.saturating_sub(self.pages[at].1.bytes);
                     }
                 }
                 collection_bytes = collection_bytes.saturating_add(bytes.len() as u64);
@@ -360,7 +370,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for TailBase {
         c.add(
             self.pages
                 .capacity()
-                .checked_mul(size_of::<((Collection, u64), ([u8; 32], u64))>())?
+                .checked_mul(size_of::<((Collection, u64), PageStamp)>())?
                 .checked_add(
                     self.logs
                         .capacity()
