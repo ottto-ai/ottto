@@ -53,9 +53,15 @@ fn emitted(page: &Page, session: &str, mode: Mode) -> RouteResult {
     progress
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
-    let (result, batches, _) = upload(&items, &mut progress, ack);
+    let (result, batches, _) = upload_under(page.upload_policy, &items, &mut progress, ack);
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    let mut route = RouteResult::emitted(mode, SnapshotSource::ClaudeCode, batches, &items);
+    let mut route = RouteResult::emitted_under(
+        mode,
+        SnapshotSource::ClaudeCode,
+        batches,
+        &items,
+        page.upload_policy,
+    );
     route.accepted_identity_buckets =
         Some(json!({session: progress.accepted_identity_buckets.get(session)}));
     route
@@ -120,6 +126,19 @@ fn desktop_depth_recovery_matches_never_flipped_money_and_placement() {
     });
 }
 
+fn lineage_page(corpus: &Corpus, scanner: &E2ScanFixture, index: ScanIndex) -> Page {
+    let mut page = corpus.raw(scanner, index, 100, true, &[]);
+    page.upload_policy.session_attribution_enabled = true;
+    page.enrich(corpus);
+    let mut sent = twin(&page);
+    sent.finish();
+    let mut progress = e2_progress();
+    let (result, _, _) = upload_under(page.upload_policy, &sent.scan.snapshots, &mut progress, ack);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    page.delivered = Some(progress.fresh_context_body_acks);
+    page
+}
+
 /// [money] An evidence-less child loses and regains only its lineage. Each
 /// stage matches a cold scan's body, placement inputs and actual ACK ledger,
 /// and counts one owned request without an extra copy.
@@ -129,6 +148,11 @@ fn parentless_child_matches_cold_at_each_census_stage() {
         const CHILD: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let (mut corpus, _) = desktop_corpus();
         corpus.root(CHILD, &line(CHILD, "child", AT, 9));
+        corpus.evidence_for(
+            CHILD,
+            &[api_login(CHILD, "child", 9, '1', Some('8'))],
+            &[trace_for(CHILD, "child", "")],
+        );
         // Preserve an old durable store shape with lineage and no original
         // identity, using the real discovered inventory and retry/backoff path.
         let probe = ready(
@@ -158,16 +182,14 @@ fn parentless_child_matches_cold_at_each_census_stage() {
                 saved["traversal"] = serde_json::Value::Null;
             };
             let index = restored_fields(&prior, change);
-            let mut page = ready(&corpus, &scanner, index, 100, true);
+            let mut page = lineage_page(&corpus, &scanner, index);
             page.finish();
             let mut cold_seed = seed.clone();
             change(&mut cold_seed);
-            let mut cold = ready(
+            let mut cold = lineage_page(
                 &corpus,
                 &E2ScanFixture::capturing_identity(),
                 serde_json::from_value(cold_seed).unwrap(),
-                100,
-                true,
             );
             cold.finish();
             let child = body(&page, CHILD);
@@ -198,6 +220,7 @@ fn parentless_child_matches_cold_at_each_census_stage() {
             );
             let expected = emitted(&cold, CHILD, Mode::ColdFull);
             let actual = emitted(&page, CHILD, Mode::Ram);
+            assert!(expected.accepted_identity_buckets.as_ref().unwrap()[CHILD].is_object());
             money_oracle::assert_equivalent(&expected, &actual);
             money_oracle::assert_placement_equivalent(&expected, &actual);
             prior = page.index;
