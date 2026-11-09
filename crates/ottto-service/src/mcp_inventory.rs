@@ -20,6 +20,7 @@
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
 use crate::command_env::SpawnEnv;
+use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::write_json_atomic;
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
@@ -2115,6 +2116,7 @@ fn harvest_all_once(
     support_dir: &Path,
     feed: Option<&CodexVersionFeed>,
 ) -> Result<()> {
+    let _stage = StageWindow::begin("unknown", "offpass_mcp_inventory");
     // Local kill-switch: a user can disable the harvest on their own machine
     // (independent of the org setting) by setting `OTTTO_MCP_HARVEST_DISABLED` or
     // dropping `<support>/mcp_inventory/disabled`. Checked first, so a disabled

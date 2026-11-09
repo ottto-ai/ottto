@@ -5,6 +5,7 @@ use crate::agent_status::{
     collect_agent_status_collection_reusing, AgentStatusCollection, ClaudeDesktopMetadataCache,
     CodexHomeBinding,
 };
+use crate::local_resource_diagnostics::StageWindow;
 use crate::{LocalApiError, LocalDaemon};
 use ottto_protocol::SourceKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -313,6 +314,7 @@ impl StatusLane {
             }
             (reused, app_only, first_pass)
         };
+        let _stage = StageWindow::begin("unknown", "offpass_agent_status");
         let collection = if let Some(collection) = reused {
             collection
         } else {
