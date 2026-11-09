@@ -20,7 +20,6 @@ fn erase_locked(path: &Path) -> Result<()> {
     for (suffix, _, _) in fence::ARTIFACTS {
         fence::remove_artifact(&fence::sibling(path, suffix))?;
     }
-    super::super::ack::erase_failed_imports(path)?;
     super::super::super::sync_checkpoint_parent(path)?;
     remove_retired_record_dir(&retired_record_dir(path))?;
     super::super::super::sync_checkpoint_parent(path)?;
@@ -33,15 +32,10 @@ pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanInde
     Ok(load_locked(path, importable, published(path)?)?.0)
 }
 pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
-    save_with_mode(path, index, false, None)
+    save_with_mode(path, index, false)
 }
-pub(super) fn save_with_mode(
-    path: &Path,
-    index: &mut ScanIndex,
-    claim_only: bool,
-    owner: Option<&crate::snapshot_sync::SnapshotProgressLock>,
-) -> Result<bool> {
-    save_locked(path, index, claim_only, owner, published(path)?)
+pub(super) fn save_with_mode(path: &Path, index: &mut ScanIndex, claim_only: bool) -> Result<bool> {
+    save_locked(path, index, claim_only, published(path)?)
 }
 
 /// Generation of a freshly imported native fixture store.
@@ -119,25 +113,14 @@ impl Fixture {
                 .unwrap();
         db.control("identity", &self.identity()).unwrap();
         db.control("generation", &0_u64).unwrap();
-        let mut generation = 0;
         if let Some(graph) = mapped {
             let mut cx = KindCx::default();
             cx.binding = Some(self.identity().binding);
             let mut tx = db.begin(TxnMode::Write).unwrap();
             kinds::populate(graph, &mut tx, &mut cx).unwrap();
             assert_eq!(tx.commit(0, G), DurableCommitOutcome::Committed(G));
-            generation = G;
         }
         db.finish_import().unwrap();
-        // Synthetic fixture has no original ledger; seal that exact absence
-        // before any publication boundary, as the production importer must.
-        super::super::ack::ProgressRecovery::seal_import(
-            self.identity(),
-            generation,
-            &self.path,
-            None,
-        )
-        .unwrap();
     }
     pub(super) fn published(&self) {
         self.imported();
@@ -459,37 +442,6 @@ fn another_graph_save_cannot_advance_a_stale_external_guard() {
     crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
 }
 
-/// [format] route replays receipt before fresh or reused connection and missing receipt holds.
-#[test]
-fn route_replays_receipt_before_fresh_or_reused_connection_and_missing_receipt_holds() {
-    for reused in [false, true] {
-        let f = Fixture::new();
-        f.published();
-        if reused {
-            load_with(&f.path, false).unwrap().unwrap();
-        }
-        let recovery =
-            super::super::ack::ProgressRecovery::seal_import(f.identity(), G, &f.path, None)
-                .unwrap();
-        let progress = f.path.with_file_name(format!(
-            "{}-upload-progress.json",
-            f.path.file_stem().unwrap().to_str().unwrap()
-        ));
-        let next = br#"{"generation":1,"accepted":"exact-body"}"#;
-        recovery.before_progress_save_bytes(None, next).unwrap();
-        assert!(!progress.exists());
-        // Holds the same owner lock as the production load entry point; replay
-        // must not recursively acquire it through the external side-effect guard.
-        let _lock = super::super::super::CheckpointLock::acquire(&f.path).unwrap();
-        assert!(load_with(&f.path, false).unwrap().is_some());
-        assert_eq!(fs::read(&progress).unwrap(), next);
-        fs::remove_file(fence::sibling(&f.path, ".v2-ack-receipt")).unwrap();
-        assert!(load_with(&f.path, false).is_err());
-        assert_eq!(fs::read(&progress).unwrap(), next);
-        assert!(guard_containment_locked(&f.path).is_err());
-    }
-}
-
 /// [format] real mapper runtime saves admitted state and keeps runtime policy.
 #[test]
 fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
@@ -498,14 +450,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     index.historical_replay_generation = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
-    assert!(save_locked(
-        &f.path,
-        &mut index,
-        false,
-        None,
-        published(&f.path).unwrap()
-    )
-    .unwrap());
+    assert!(save_locked(&f.path, &mut index, false, published(&f.path).unwrap()).unwrap());
     // Committed row digests seed the next page; idle releases them.
     with_state(&f.path, |state| {
         assert_eq!(
@@ -522,7 +467,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         Ok(())
     })
     .unwrap();
-    assert!(save_locked(&f.path, &mut index, false, None, true).unwrap());
+    assert!(save_locked(&f.path, &mut index, false, true).unwrap());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_some());
         Ok(())
@@ -553,13 +498,13 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
 fn newly_adopted_import_can_save_without_an_intervening_load() {
     let f = Fixture::new();
     fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-    // Use the real inventory/import/publication path so import seals the
-    // external progress receipt through the production mapper.
+    // Use the real inventory/import/publication path: publication writes no
+    // progress receipt; upload progress moves in on its own first load.
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
     after_v1_locked(&f.path, &mut index).unwrap();
     assert!(index.v2().persistence_v2.is_some());
-    assert!(fence::sibling(&f.path, ".v2-ack-receipt").is_file());
+    assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
     assert_eq!(index.generation, 1);
     let runtime = index.v2().persistence_v2.clone().unwrap();
     assert!(save_with(&f.path, &mut index).unwrap());
@@ -646,8 +591,6 @@ mod hydrate_parity {
         kinds::populate(index, &mut tx, &mut cx).unwrap();
         assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
         db.finish_import().unwrap();
-        super::super::super::ack::ProgressRecovery::seal_import(f.identity(), 1, &f.path, None)
-            .unwrap();
         fence::publish(&f.path, &f.identity(), &mut false).unwrap();
     }
     fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
@@ -1161,7 +1104,7 @@ fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
         guard().unwrap_err().downcast_ref::<Hold>(),
         Some(&Hold::SaveFull)
     );
-    assert!(save_with_mode(&f.path, &mut retry, true, None).unwrap());
+    assert!(save_with_mode(&f.path, &mut retry, true).unwrap());
     assert_eq!(
         guard_external(
             &f.path,
@@ -1253,14 +1196,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_context = current.historical_replay_generation.clone();
     assert!(current.prepare_historical_replay("uncommitted-context".into()));
     fill_session(&mut current);
-    assert!(save_locked(
-        &f.path,
-        &mut current,
-        false,
-        None,
-        published(&f.path).unwrap()
-    )
-    .is_err());
+    assert!(save_locked(&f.path, &mut current, false, published(&f.path).unwrap()).is_err());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_none());
         Ok(())
@@ -1704,10 +1640,22 @@ mod progress_rows {
     use super::*;
     use serde_json::{json, Value as Json};
 
-    type Page = progress::Page<Json, Json, Json>;
+    /// A page's owned rows; `view` borrows them as a `progress::Page`.
+    struct Page {
+        cache_state: BTreeMap<String, Json>,
+        cache_head: BTreeMap<String, Json>,
+        ledger: Json,
+    }
+    fn view(page: &Page) -> progress::Page<'_, Json, Json, Json> {
+        progress::Page {
+            cache_state: &page.cache_state,
+            cache_head: &page.cache_head,
+            ledger: &page.ledger,
+        }
+    }
 
     fn page(sessions: &[&str], offset: u64) -> Page {
-        progress::Page {
+        Page {
             cache_state: sessions
                 .iter()
                 .map(|s| (s.to_string(), json!({ "offset": offset })))
@@ -1721,12 +1669,14 @@ mod progress_rows {
     }
     fn commit(
         f: &Fixture,
-        index: &ScanIndex,
+        _index: &ScanIndex,
         baseline: progress::Baseline,
         page: &Page,
     ) -> Result<progress::Outcome> {
         crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
-            commit_progress_locked(&f.path, index, owner, baseline, page)
+            with_progress_session(&f.path, owner, |db, identity, graph| {
+                progress::commit(db, identity, graph, &baseline, &view(page), None)
+            })
         })
     }
     fn control(index: &ScanIndex, name: &str) -> Option<u64> {
@@ -1794,6 +1744,7 @@ mod progress_rows {
         let foreign = progress::Baseline {
             generation: 1,
             rows: [(graph_row, [0; 32])].into(),
+            kept: Default::default(),
         };
         for refused in [empty, foreign] {
             assert_eq!(
@@ -1869,6 +1820,269 @@ mod progress_rows {
         }
     }
 
+    /// [behaviour] Identity rows belong to the `points` seam alone. A page
+    /// commits them with P + 1; hydrate and every baseline leave them out; a
+    /// later page never rewrites or deletes them (byte-identical); the graph
+    /// walk steps over them and the header audit counts them as progress; a
+    /// point read fetches only the named keys and sets an invalid row aside;
+    /// and a page with nothing changed opens no transaction.
+    #[test]
+    fn identity_rows_belong_to_the_points_seam_alone() {
+        fn identity_rows(db: &mut sqlite::Sqlite) -> Vec<(Header, Json)> {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let kind = RecordKind::parse("progress.identity").unwrap();
+            let headers = tx.scan_kind(&kind, None, 128).unwrap();
+            headers
+                .into_iter()
+                .map(|h| {
+                    let value = mapper::read::<Json>(&mut tx, &h, None).unwrap();
+                    (h, value)
+                })
+                .collect()
+        }
+        fn names_identity(baseline: &progress::Baseline) -> bool {
+            baseline.rows.keys().any(|key| {
+                matches!(key, RowKey::Record { kind, .. } if kind.name() == "progress.identity")
+            })
+        }
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let first = page(&["a", "b"], 1);
+        let empty = progress::Baseline::default();
+        let progress::Outcome::Committed(baseline) = commit(&f, &index, empty, &first).unwrap()
+        else {
+            panic!("the first page commits");
+        };
+        // The same page again opens no transaction and claims no generation.
+        assert_eq!(
+            commit(&f, &index, baseline.clone(), &first).unwrap(),
+            progress::Outcome::Unchanged
+        );
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+
+        let mut seen = None;
+        let outcome =
+            crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+                with_progress_session(&f.path, owner, |db, identity, graph| {
+                    let mut points = |tx: &mut dyn Transaction, next: u64| -> Result<bool> {
+                        seen = Some(next);
+                        progress::put_point(tx, "k1", &json!({ "bucket": 1 }))?;
+                        progress::put_point(tx, "k2", &json!({ "bucket": 2 }))?;
+                        progress::put_point(tx, "bad", &json!("not an object"))?;
+                        Ok(true)
+                    };
+                    progress::commit(
+                        db,
+                        identity,
+                        graph,
+                        &baseline,
+                        &view(&first),
+                        Some(&mut points),
+                    )
+                })
+            })
+            .unwrap();
+        let progress::Outcome::Committed(baseline) = outcome else {
+            panic!("points alone commit the page");
+        };
+        assert_eq!((seen, baseline.generation), (Some(2), 2));
+        assert!(!names_identity(&baseline));
+        let mut stored = Vec::new();
+        with_session_db(&index, |db| {
+            stored = identity_rows(db);
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let (_, hydrated) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+            assert_eq!(hydrated, baseline, "hydrate leaves identity rows out");
+            let keys: BTreeSet<String> = ["k1", "k2", "bad", "absent"].map(String::from).into();
+            let (points, set_aside) =
+                progress::read_points::<Json>(&mut tx, &keys, |_, v| v.is_object()).unwrap();
+            assert_eq!(points.keys().collect::<Vec<_>>(), ["k1", "k2"]);
+            assert_eq!(set_aside, 1, "the invalid row is set aside and counted");
+        });
+        assert_eq!(stored.len(), 3);
+
+        // A later page removes "a": the identity rows stay byte-identical.
+        let progress::Outcome::Committed(baseline) =
+            commit(&f, &index, baseline, &page(&["b"], 2)).unwrap()
+        else {
+            panic!("the next page commits");
+        };
+        assert!(!names_identity(&baseline));
+        with_session_db(&index, |db| {
+            assert_eq!(identity_rows(db), stored);
+            let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+            db.audit_headers().unwrap();
+            // One member and a manifest per map, the ledger's manifest and one
+            // chunk, 3 identity.
+            let (_, progress_rows, _) = sqlite::row_counts_for_test(db);
+            assert_eq!(progress_rows, 6 + 3);
+            let (_, cx) = kinds::hydrate(db, identity.binding.clone()).unwrap();
+            assert!(cx.retired.iter().all(|key| !progress::owned(key)));
+        });
+    }
+
+    /// [behaviour] The ledger is an ordered chunk stream with no total limit:
+    /// a ledger over many chunks (multi-byte text split on char boundaries)
+    /// round-trips exactly, a smaller one deletes its trailing chunks, each
+    /// committed page records the ledger's bytes, and a missing, extra or
+    /// out-of-order chunk refuses the read, so the source holds.
+    #[test]
+    fn progress_ledger_is_an_ordered_chunk_stream() {
+        fn chunks(db: &mut sqlite::Sqlite) -> Vec<Header> {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let kind = RecordKind::parse("progress.ledger").unwrap();
+            let headers = tx.scan_kind(&kind, None, 128).unwrap();
+            let members = headers.into_iter();
+            members
+                .filter(|h| matches!(h.key, RowKey::Record { position: 1, .. }))
+                .collect()
+        }
+        fn stored_ledger(db: &mut sqlite::Sqlite) -> Result<Json> {
+            let mut tx = db.begin(TxnMode::Read)?;
+            let (stored, _) = progress::read::<Json, Json, Json>(&mut tx)?;
+            Ok(stored.context("progress rows")?.ledger)
+        }
+        let mut big = page(&["a"], 1);
+        big.ledger["text"] = json!("\u{e9}\u{20ac}".repeat(300) + &"x".repeat(1000));
+        let bytes = serde_json::to_string(&big.ledger).unwrap().len();
+        let small = page(&["a"], 2);
+
+        for damage in [None, Some("missing"), Some("extra"), Some("gap")] {
+            let f = Fixture::new();
+            f.published();
+            let index = load_with(&f.path, false).unwrap().unwrap();
+            telemetry::take_thread_event_for_test("progress_ledger_bytes");
+            let empty = progress::Baseline::default();
+            let progress::Outcome::Committed(baseline) = commit(&f, &index, empty, &big).unwrap()
+            else {
+                panic!("the first page commits");
+            };
+            assert_eq!(
+                telemetry::take_thread_event_for_test("progress_ledger_bytes"),
+                Some(json!(bytes)),
+                "one scalar per committed page"
+            );
+            let mut stored = Vec::new();
+            with_session_db(&index, |db| {
+                stored = chunks(db);
+                assert_eq!(stored_ledger(db).unwrap(), big.ledger);
+            });
+            assert!(stored.len() > 4, "{} chunks", stored.len());
+            let Some(damage) = damage else {
+                assert_eq!(
+                    commit(&f, &index, baseline.clone(), &big).unwrap(),
+                    progress::Outcome::Unchanged
+                );
+                assert!(commit(&f, &index, baseline, &small).is_ok());
+                with_session_db(&index, |db| {
+                    assert_eq!(chunks(db).len(), 1, "trailing chunks are deleted");
+                    assert_eq!(stored_ledger(db).unwrap(), small.ledger);
+                });
+                continue;
+            };
+            with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Write).unwrap();
+                let name = |n: usize| format!("{n:010}");
+                let at = |n: usize| mapper::key("progress.ledger", &name(n), 1).unwrap();
+                let last = stored.len() - 1;
+                match damage {
+                    "missing" => mapper::remove(&mut tx, &stored[1].key).unwrap(),
+                    "extra" => {
+                        mapper::put(&mut tx, &at(stored.len()), &"x").unwrap();
+                    }
+                    _ => {
+                        let value: String = mapper::read(&mut tx, &stored[last], None).unwrap();
+                        mapper::remove(&mut tx, &stored[last].key).unwrap();
+                        mapper::put(&mut tx, &at(last + 5), &value).unwrap();
+                    }
+                }
+                let outcome = tx.commit_inner(sqlite::Cas::Progress {
+                    expected: 1,
+                    next: 2,
+                });
+                assert_eq!(outcome, DurableCommitOutcome::Committed(2));
+                assert!(stored_ledger(db).is_err(), "{damage}: the read refuses");
+            });
+        }
+    }
+
+    /// The committed progress rows of the session store, as plain values.
+    fn stored_rows(db: &mut sqlite::Sqlite) -> Json {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let (stored, baseline) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+        let stored = stored.expect("progress rows");
+        json!({
+            "generation": baseline.generation,
+            "cache_state": stored.cache_state,
+            "cache_head": stored.cache_head,
+            "ledger": stored.ledger,
+        })
+    }
+    fn carry_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("OTTTO_PROGRESS_CARRY_DIR").expect("the carry harness"))
+    }
+
+    /// [format] Carry fixture for an older binary: a published route holding
+    /// progress rows at writer capability 6, checkpointed and kept on disk.
+    /// Run only by scripts/test_progress_rows_carry.py.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn write_progress_rows_carry_fixture() {
+        let root = carry_dir();
+        let support = root.join("support");
+        let parent = support.join("snapshots/destinations").join("b".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let f = Fixture {
+            path: parent.join("claude_code-test-scan-index.json"),
+            support,
+        };
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let outcome = commit(
+            &f,
+            &index,
+            progress::Baseline::default(),
+            &page(&["a", "b"], 1),
+        );
+        assert!(matches!(outcome.unwrap(), progress::Outcome::Committed(_)));
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        let mut expected = Json::Null;
+        with_session_db(&index, |db| {
+            expected = stored_rows(db);
+            db.clean_checkpoint().unwrap();
+        });
+        fs::write(
+            root.join("expected.json"),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("index-path.txt"), f.path.to_str().unwrap()).unwrap();
+        // The older binary and the re-upgrade read this store after exit.
+        std::mem::forget(f);
+        println!("PROGRESS_CARRY_FIXTURE_WRITTEN");
+    }
+
+    /// [format] After an older binary refused the store, this binary opens it
+    /// and reads exactly the rows it wrote: re-upgrade equals no downgrade.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn verify_progress_rows_carry_reupgrade() {
+        let root = carry_dir();
+        let path = PathBuf::from(fs::read_to_string(root.join("index-path.txt")).unwrap());
+        let index = load_with(&path, false).unwrap().unwrap();
+        let mut actual = Json::Null;
+        with_session_db(&index, |db| actual = stored_rows(db));
+        let expected: Json =
+            serde_json::from_slice(&fs::read(root.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(
+            actual, expected,
+            "re-upgrade equals the never-downgraded store"
+        );
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        println!("PROGRESS_CARRY_REUPGRADE_VERIFIED");
+    }
+
     /// [behaviour] Progress rows are counted apart from graph records and never
     /// trip the records alarm, and the graph's catalogue walk still finds the
     /// graph kinds on both sides of the progress range.
@@ -1885,10 +2099,12 @@ mod progress_rows {
             // At the alarm threshold, progress rows never trip it.
             sqlite::set_record_rows_for_test(db, 200_000);
             let empty = progress::Baseline::default();
-            let outcome = progress::commit(db, &identity, G, empty, &page(&["s"], 1)).unwrap();
+            let page = page(&["s"], 1);
+            let outcome = progress::commit(db, &identity, G, &empty, &view(&page), None).unwrap();
             assert!(matches!(outcome, progress::Outcome::Committed(_)));
-            // One member of each map, their two manifests and the ledger.
-            let rows = 5;
+            // One member of each map, their two manifests, the ledger's
+            // manifest and its one chunk.
+            let rows = 6;
             assert_eq!(sqlite::row_counts_for_test(db), (200_000, rows, false));
             db.audit_headers().unwrap();
             assert_eq!(sqlite::row_counts_for_test(db), (graph, rows, false));
