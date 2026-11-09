@@ -3850,5 +3850,4 @@ fn observed_at() -> String {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
