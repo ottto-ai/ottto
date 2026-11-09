@@ -664,7 +664,7 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 7;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 9;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
@@ -722,6 +722,8 @@ pub(crate) enum PageSelection {
     /// closure for forced roots names (those added and those on the page).
     ForcedFamilyRoots,
     ForcedFamilyMembersPulled,
+    ChargeDeferred,
+    ChargeEstimate,
     /// Distinct Claude roots whose own seeds read only the root's homes.
     ForcedFamilyMemberScoped,
 }
@@ -737,14 +739,16 @@ pub(crate) fn tail_loaded(source: &str, bytes: u64) {
         source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
     }
 }
-const PAGE_SELECTION: [(&str, usize); 7] = [
+const PAGE_SELECTION: [(&str, usize); 9] = [
     ("selected", PAGE_SELECTION_START),
     ("owed_selected", PAGE_SELECTION_START + 1),
     ("skipped", PAGE_SELECTION_START + 2),
     ("deferred_roots", PAGE_SELECTION_START + 3),
     ("forced_family_roots", PAGE_SELECTION_START + 4),
     ("forced_family_members_pulled", PAGE_SELECTION_START + 5),
-    ("forced_family_member_scoped", PAGE_SELECTION_START + 6),
+    ("charge_deferred", PAGE_SELECTION_START + 6),
+    ("charge_estimate", PAGE_SELECTION_START + 7),
+    ("forced_family_member_scoped", PAGE_SELECTION_START + 8),
 ];
 /// Claude twin seeds (one each), by the twin's own `CandidateParseReason`,
 /// `other` for a Parse without one, or `identification_failed`, and again as

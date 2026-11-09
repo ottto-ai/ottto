@@ -1290,6 +1290,9 @@ fails a provider call, and a line it cannot write promptly is dropped.
 
 ## Claude Relay Endpoint Mismatch
 
+- `relay_bind_failed`: immediate source warning — Claude telemetry listener unavailable; restart Ottto, then Verify.
+- `relay_listener_failed`: source warning after 60 seconds failed — Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto.
+
 When the relay is connected but approved Claude telemetry settings name a
 different loopback port, `ottto doctor` reports both ports. `ottto status --json`
 and `ottto doctor --json` expose `relay.last_error.code` as
@@ -1407,6 +1410,14 @@ decisions for Rejected pages with non-progressing, restorable local holds.
 Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
 reset it.
+
+Claude Desktop census restarts emit a `bounded_traversal_transition` record with
+`event: restarting` and `reason: sidecar_census_restart` before discarding an existing
+checkpoint. It carries the old `index_generation`, `window_unix_seconds`,
+`pending_directories` and `pending_candidates`; no record is emitted without a prior
+checkpoint. This is distinct from `retiring` and does not count as census completion.
+The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
+feeds its error state or an alert.
 
 ## Prior Held Family Observation
 

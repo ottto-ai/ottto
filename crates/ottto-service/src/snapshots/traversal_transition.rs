@@ -92,6 +92,33 @@ impl Starting {
     }
 }
 
+pub(super) fn restarting(
+    source: SnapshotSource,
+    index_generation: u64,
+    traversal: &ScanTraversalCheckpoint,
+) {
+    #[derive(Serialize)]
+    struct Restarting {
+        event: &'static str,
+        reason: &'static str,
+        index_generation: u64,
+        window_unix_seconds: Option<u64>,
+        pending_directories: usize,
+        pending_candidates: usize,
+    }
+    crate::local_resource_diagnostics::traversal_transition(
+        source.api_slug(),
+        &Restarting {
+            event: "restarting",
+            reason: "sidecar_census_restart",
+            index_generation,
+            window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
+            pending_directories: traversal.pending_directories.len(),
+            pending_candidates: traversal.pending_candidates.len(),
+        },
+    );
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RetireReason {
@@ -153,6 +180,8 @@ pub(super) fn retiring(
 
 #[cfg(test)]
 mod tests {
+    mod sidecar_restart;
+
     use super::*;
     use crate::local_resource_diagnostics::capture;
     use crate::snapshots::{ensure_bounded_traversal, scan_source_roots, BACKFILL_WINDOW_DAYS};

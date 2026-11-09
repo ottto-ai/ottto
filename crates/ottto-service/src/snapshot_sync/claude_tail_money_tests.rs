@@ -3173,6 +3173,34 @@ fn refused_or_not_stored_successor_cold_reopen_preserves_money() {
     }
 }
 
+fn ack_with_disposition(
+    batch: &[SnapshotItem],
+    disposition: &str,
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let mut response = ack(batch)?;
+    if disposition == "not_stored" {
+        response.unchanged_entities = std::mem::take(&mut response.accepted_entities);
+        for entity in &mut response.unchanged_entities {
+            entity.unchanged_basis = Some("usage_identical".into());
+        }
+    } else if disposition == "refused" {
+        response.rejected_entities = std::mem::take(&mut response.accepted_entities)
+            .into_iter()
+            .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
+                source_session_id: entity.source_session_id,
+                snapshot_fingerprint: entity.snapshot_fingerprint,
+                occurrence_count: entity.occurrence_count,
+                reason: "usage_accounting_authority_downgrade".into(),
+                detail: "synthetic refusal".into(),
+                permanent: true,
+            })
+            .collect();
+        response.accepted = 0;
+        response.sessions_reconciled = 0;
+    }
+    Ok(response)
+}
+
 fn successor_cold_reopen(disposition: Option<&str>) {
     if !supported("successor-cold-reopen") {
         return;
@@ -3211,28 +3239,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         assert_eq!(successor.scan.malformed_json_line_count, 1);
         if let Some(disposition) = disposition {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
-                let mut response = ack(batch)?;
-                if disposition == "not_stored" {
-                    response.unchanged_entities = std::mem::take(&mut response.accepted_entities);
-                    for entity in &mut response.unchanged_entities {
-                        entity.unchanged_basis = Some("usage_identical".into());
-                    }
-                } else {
-                    response.rejected_entities = std::mem::take(&mut response.accepted_entities)
-                        .into_iter()
-                        .map(|entity| crate::snapshot_client::SnapshotEntityRejection {
-                            source_session_id: entity.source_session_id,
-                            snapshot_fingerprint: entity.snapshot_fingerprint,
-                            occurrence_count: entity.occurrence_count,
-                            reason: "usage_accounting_authority_downgrade".into(),
-                            detail: "synthetic refusal".into(),
-                            permanent: true,
-                        })
-                        .collect();
-                    response.accepted = 0;
-                    response.sessions_reconciled = 0;
-                }
-                Ok(response)
+                ack_with_disposition(batch, disposition)
             });
             progress.save(&progress_path).unwrap();
         }

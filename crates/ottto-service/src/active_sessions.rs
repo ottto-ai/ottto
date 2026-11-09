@@ -9,9 +9,8 @@
 //! content-free snapshot fields.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use ottto_protocol::{
@@ -28,6 +27,7 @@ use crate::snapshots::{
     SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
     CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS, CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS,
 };
+use crate::transcript_acquisition::{SourceStamp, StampedFacts};
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
 const WATERMARK_RETENTION_DAYS: i64 = 90;
@@ -51,11 +51,30 @@ pub fn active_session_cache_path(support_dir: &Path, source: SnapshotSource) -> 
         .join(format!("{}.json", source.api_slug()))
 }
 
+/// Parsed reconciliations kept while their cache file is unchanged. The status
+/// path reads one on every local request, and a companion refresh sends many;
+/// the file changes only when a scan reconciles (always by rename).
+static RECONCILIATIONS: OnceLock<
+    Mutex<StampedFacts<PathBuf, Option<ActiveSessionReconciliation>>>,
+> = OnceLock::new();
+
 pub fn read_active_session_reconciliation(
     support_dir: &Path,
     source: SnapshotSource,
 ) -> Option<ActiveSessionReconciliation> {
-    read_cache(&active_session_cache_path(support_dir, source)).reconciliation
+    let path = active_session_cache_path(support_dir, source);
+    // Held across a miss: concurrent requests wait for one parse instead of
+    // each repeating it.
+    let mut kept = RECONCILIATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    kept.reuse_or_load(
+        path.clone(),
+        || SourceStamp::capture_file(&path),
+        || Ok::<_, std::convert::Infallible>(read_cache(&path).reconciliation),
+    )
+    .unwrap_or_else(|never| match never {})
 }
 
 pub fn reconcile_active_sessions(
@@ -1043,10 +1062,10 @@ fn non_empty(value: &str) -> bool {
 }
 
 fn read_cache(path: &Path) -> ActiveSessionCache {
-    let Ok(file) = File::open(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return ActiveSessionCache::default();
     };
-    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
@@ -1517,6 +1536,59 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
+    }
+
+    #[test]
+    fn status_read_reuses_reconciliation_until_cache_file_changes() {
+        let dir = temp_dir("status-read-stamp");
+        let source = SnapshotSource::ClaudeCode;
+        let path = active_session_cache_path(&dir, source);
+        assert_eq!(read_active_session_reconciliation(&dir, source), None);
+
+        let first = reconcile_active_sessions(
+            &dir,
+            source,
+            &[test_snapshot("s1", "2026-07-19T10:04:00Z")],
+            None,
+            None,
+            "2026-07-19T10:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(first.sessions.len(), 1);
+        assert_eq!(
+            read_active_session_reconciliation(&dir, source),
+            Some(first.clone())
+        );
+
+        // Same object, length and mtime: the kept parse is returned, so the
+        // garbled bytes are never read.
+        let original = std::fs::metadata(&path).unwrap();
+        let garbled = vec![b' '; original.len() as usize];
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut &file, &garbled).unwrap();
+        file.set_modified(original.modified().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(
+            read_active_session_reconciliation(&dir, source),
+            Some(first.clone())
+        );
+
+        // A reconcile replaces the file, so the next read parses it again.
+        let mut cache = ActiveSessionCache::default();
+        let mut second = first.clone();
+        second.sessions.clear();
+        second.changed_session_count = 0;
+        cache.reconciliation = Some(second.clone());
+        write_cache(&path, &cache).unwrap();
+        assert_ne!(Some(second.clone()), Some(first));
+        assert_eq!(
+            read_active_session_reconciliation(&dir, source),
+            Some(second)
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_active_session_reconciliation(&dir, source), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

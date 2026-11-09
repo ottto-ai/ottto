@@ -3495,6 +3495,9 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 // independent of the Tail implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("claude_tail_money_tests.rs");
+    mod resident_wave_money_tests {
+        include!("resident_wave_money_tests.rs");
+    }
     #[cfg(unix)]
     mod root_twin_scope_tests {
         include!("root_twin_scope_tests.rs");
@@ -5519,3 +5522,5 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
         assert_eq!(settled.claude_copy_removals.get(key), recorded.as_slice());
     });
 }
+
+mod desktop_depth_tests;

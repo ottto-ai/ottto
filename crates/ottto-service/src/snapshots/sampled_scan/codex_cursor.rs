@@ -3821,7 +3821,7 @@ pub(in crate::snapshots) fn requeue(
     flags: &BTreeMap<String, (bool, bool)>,
     candidate: &CandidateFile,
 ) {
-    requeue_members(index, flags, [candidate]);
+    scan::owned_scan::requeue_members(index, flags, [candidate]);
 }
 
 /// The cursor attempt for this file ended in this page: remove the path that
@@ -3832,47 +3832,6 @@ pub(in crate::snapshots) fn dequeue(index: &mut ScanIndex, candidate: &Candidate
         traversal
             .pending_candidates
             .retain(|pending| pending.path != candidate.path);
-    }
-}
-
-/// `requeue` for every member of a group in one pass over the pending
-/// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path
-/// is cloned.
-pub(in crate::snapshots) fn requeue_members<'a>(
-    index: &mut ScanIndex,
-    flags: &BTreeMap<String, (bool, bool)>,
-    members: impl IntoIterator<Item = &'a CandidateFile>,
-) {
-    let Some(traversal) = index.traversal.as_mut() else {
-        return;
-    };
-    let members = members.into_iter().collect::<Vec<_>>();
-    // The members not pending yet; a repeated member is pushed once.
-    let mut absent = members
-        .iter()
-        .copied()
-        .map(|member| member.path.as_path())
-        .collect::<std::collections::HashSet<_>>();
-    for pending in &traversal.pending_candidates {
-        if absent.is_empty() {
-            break;
-        }
-        absent.remove(pending.path.as_path());
-    }
-    for candidate in members {
-        if !absent.remove(candidate.path.as_path()) {
-            continue;
-        }
-        let (census_member, watcher_hint) = flags
-            .get(&local_index_key(&candidate.path))
-            .copied()
-            .unwrap_or((true, false));
-        traversal.pending_candidates.push_back(ScanTraversalPath {
-            scan_root: candidate.scan_root.clone(),
-            path: candidate.path.clone(),
-            census_member,
-            watcher_hint,
-        });
     }
 }
 

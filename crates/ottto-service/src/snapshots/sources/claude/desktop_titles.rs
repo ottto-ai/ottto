@@ -3,6 +3,23 @@
 //! live window, and the bounded store census and path selection.
 
 use crate::snapshots::*;
+use crate::transcript_acquisition::{SourceStamp, StampedFacts};
+
+pub(in crate::snapshots) type DesktopTitleFacts =
+    StampedFacts<String, Option<DesktopSessionFileFacts>>;
+
+/// Content only: bucket identity is reconstructed by each sweep.
+#[derive(Clone)]
+pub(in crate::snapshots) struct DesktopSessionFileFacts {
+    cli_session_id: String,
+    title: Option<String>,
+    user_set: bool,
+    imported: bool,
+    source_created_at: Option<String>,
+    desktop_session_id: Option<String>,
+    spawned_from_desktop_session_id: Option<String>,
+    spawned_from_unresolved: bool,
+}
 
 /// Claude Code sidecar title metadata read from the Claude desktop app's
 /// per-session store — the Claude analogue of `CodexTitleMetadata`.
@@ -101,7 +118,6 @@ pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
 #[cfg(test)]
 pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 32;
 pub(in crate::snapshots) const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
 
 impl ClaudeTitleMetadata {
@@ -195,7 +211,7 @@ impl ClaudeTitleMetadata {
         parts.extend([
             "original_session_carrier:v1",
             &original_identity,
-            if self.original_identity_census_incomplete {
+            if self.original_identity_census_incomplete && !original_identity.is_empty() {
                 "incomplete"
             } else {
                 "complete"
@@ -238,10 +254,25 @@ impl ClaudeTitleMetadata {
         Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z")
     }
 
+    #[cfg(test)]
     pub(in crate::snapshots) fn load_from_roots_with_index(
         roots: &[PathBuf],
         index: &mut ScanIndex,
         collected_at: &str,
+    ) -> Self {
+        Self::load_from_roots_reusing(
+            roots,
+            index,
+            collected_at,
+            &mut DesktopTitleFacts::default(),
+        )
+    }
+
+    pub(in crate::snapshots) fn load_from_roots_reusing(
+        roots: &[PathBuf],
+        index: &mut ScanIndex,
+        collected_at: &str,
+        facts: &mut DesktopTitleFacts,
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
         let mut census = ClaudeDesktopStoreCensus::default();
@@ -261,7 +292,7 @@ impl ClaudeTitleMetadata {
                     .map(|root| root.join("claude-code-sessions")),
             );
         }
-        Self::load_from_store_dirs_with_census(&store_dirs, index, collected_at, census)
+        Self::load_from_store_dirs_with_census(&store_dirs, index, collected_at, census, facts)
     }
 
     #[cfg(test)]
@@ -275,6 +306,7 @@ impl ClaudeTitleMetadata {
             index,
             collected_at,
             ClaudeDesktopStoreCensus::default(),
+            &mut DesktopTitleFacts::default(),
         )
     }
 
@@ -283,6 +315,7 @@ impl ClaudeTitleMetadata {
         index: &mut ScanIndex,
         collected_at: &str,
         mut census: ClaudeDesktopStoreCensus,
+        facts: &mut DesktopTitleFacts,
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
         let retry_due = match (
@@ -354,6 +387,7 @@ impl ClaudeTitleMetadata {
                 break;
             }
         }
+        facts.retain_listed(&census.observed_paths);
         let (session_files, sweep_complete, next_cursor, next_upper_bound) =
             selection.finish(census.discovered_file_count);
         // The retained store entries already record which profile sources were
@@ -378,11 +412,14 @@ impl ClaudeTitleMetadata {
             let original_identity = store_dirs
                 .iter()
                 .find_map(|store_dir| claude_desktop_original_identity(store_dir, path));
-            match load_claude_desktop_session_title(
-                path,
-                account_identifier_hash,
-                original_identity,
-            ) {
+            let loaded = facts.reuse_or_load(
+                local_index_key(path),
+                || SourceStamp::capture_file(path),
+                || load_desktop_session_file_facts(path),
+            );
+            match loaded.map(|facts| {
+                facts.map(|facts| facts.into_entry(account_identifier_hash, original_identity))
+            }) {
                 Ok(Some(entry)) => {
                     if let Some(profile) = new_profiles
                         .iter()
@@ -868,7 +905,7 @@ struct ClaudeDesktopStoreCensus {
     discovered_file_count: usize,
     unreadable_path_count: usize,
     symlink_rejected_count: usize,
-    depth_exceeded_count: usize,
+    max_depth_seen: usize,
     invalid_file_count: usize,
     entry_budget_exceeded_count: usize,
     #[serde(skip)]
@@ -880,7 +917,6 @@ impl ClaudeDesktopStoreCensus {
         self.profile_discovery_incomplete_count > 0
             || self.unreadable_path_count > 0
             || self.symlink_rejected_count > 0
-            || self.depth_exceeded_count > 0
             || self.invalid_file_count > 0
             || self.entry_budget_exceeded_count > 0
     }
@@ -960,10 +996,7 @@ fn collect_claude_desktop_session_files(
     selection: &mut BoundedPathSelection,
     census: &mut ClaudeDesktopStoreCensus,
 ) {
-    if depth > MAX_CLAUDE_DESKTOP_STORE_DEPTH {
-        census.depth_exceeded_count += 1;
-        return;
-    }
+    census.max_depth_seen = census.max_depth_seen.max(depth);
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -1058,11 +1091,17 @@ pub(in crate::snapshots) fn claude_desktop_original_identity(
     })
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn load_claude_desktop_session_title(
     path: &Path,
     account_identifier_hash: Option<String>,
-    mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
+    original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
+    Ok(load_desktop_session_file_facts(path)?
+        .map(|facts| facts.into_entry(account_identifier_hash, original_identity)))
+}
+
+fn load_desktop_session_file_facts(path: &Path) -> Result<Option<DesktopSessionFileFacts>> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1076,6 +1115,7 @@ pub(in crate::snapshots) fn load_claude_desktop_session_title(
     if !metadata.is_file() || metadata.len() > MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES {
         return Err(anyhow::anyhow!("Claude desktop title sidecar was invalid"));
     }
+    crate::local_resource_diagnostics::claude_reread::desktop_store_body_read();
     let mut bytes = Vec::new();
     file.take(MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1107,22 +1147,17 @@ pub(in crate::snapshots) fn load_claude_desktop_session_title(
     };
     let user_set =
         title.is_some() && string_at(&value, &["titleSource"]).as_deref() == Some("user");
-    if let Some(identity) = &mut original_identity {
-        // Any present import marker (including malformed/unknown tags) vetoes
-        // treating the destination bucket as original. Never retain its raw value.
-        identity.imported = value.get("importedFrom").is_some();
-        // Native creation is separate from minimum retained transcript activity:
-        // a resumed or truncated suffix must never manufacture a later creator.
-        identity.source_created_at = value.get("createdAt").and_then(|value| {
-            if let Some(text) = value.as_str() {
-                if OffsetDateTime::parse(text, &Rfc3339).is_ok() {
-                    return Some(text.to_string());
-                }
+    // Retain only the presence of an import marker, never its raw value.
+    let imported = value.get("importedFrom").is_some();
+    let source_created_at = value.get("createdAt").and_then(|value| {
+        if let Some(text) = value.as_str() {
+            if OffsetDateTime::parse(text, &Rfc3339).is_ok() {
+                return Some(text.to_string());
             }
-            let millis = value.as_i64().or_else(|| value.as_str()?.parse().ok())?;
-            bounded_rfc3339_millis(millis)
-        });
-    }
+        }
+        let millis = value.as_i64().or_else(|| value.as_str()?.parse().ok())?;
+        bounded_rfc3339_millis(millis)
+    });
     // Lineage ids are optional: a missing or malformed one leaves the session
     // unlinked and never invalidates its title. They are identities, so they are
     // read byte-exact rather than through the trimming `string_at`: a padded id
@@ -1140,12 +1175,12 @@ pub(in crate::snapshots) fn load_claude_desktop_session_title(
         && value
             .get("spawnedFrom")
             .is_some_and(|value| !value.is_null());
-    Ok(Some(ClaudeDesktopTitleIndexEntry {
+    Ok(Some(DesktopSessionFileFacts {
         cli_session_id,
         title,
         user_set,
-        account_identifier_hash,
-        original_identity,
+        imported,
+        source_created_at,
         desktop_session_id,
         spawned_from_desktop_session_id,
         spawned_from_unresolved,
@@ -1167,3 +1202,32 @@ crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
 crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+
+impl DesktopSessionFileFacts {
+    fn into_entry(
+        self,
+        account_identifier_hash: Option<String>,
+        mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
+    ) -> ClaudeDesktopTitleIndexEntry {
+        if let Some(identity) = &mut original_identity {
+            identity.imported = self.imported;
+            identity.source_created_at = self.source_created_at;
+        }
+        ClaudeDesktopTitleIndexEntry {
+            cli_session_id: self.cli_session_id,
+            title: self.title,
+            user_set: self.user_set,
+            account_identifier_hash,
+            original_identity,
+            desktop_session_id: self.desktop_session_id,
+            spawned_from_desktop_session_id: self.spawned_from_desktop_session_id,
+            spawned_from_unresolved: self.spawned_from_unresolved,
+        }
+    }
+}
+crate::heap_layout_bound::fields!(DesktopSessionFileFacts; cli_session_id, title, user_set, imported, source_created_at, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
+
+#[cfg(all(test, unix))]
+mod reuse_tests;
+#[cfg(test)]
+mod tests;
