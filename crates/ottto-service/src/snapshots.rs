@@ -92,7 +92,7 @@ pub(crate) use usage::cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
 use scan::read_cause as change_reason;
-mod claude_context_file_birth;
+use sources::claude::context_file_birth as claude_context_file_birth;
 pub(crate) mod claude_cross_root_evidence;
 mod upload_context_read;
 mod upload_context_receipt;
@@ -170,26 +170,17 @@ pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
-mod codex_counting_lifecycle_tests;
-#[cfg(test)]
-mod codex_counting_rss_tests;
-#[cfg(test)]
 mod codex_counting_v2_tests;
-mod codex_counting_version;
+use sources::codex::counting::version as codex_counting_version;
 use sources::codex::dictionary_slots as codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
-#[cfg(test)]
-mod file_set_digest_tests;
+
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
-#[cfg(test)]
-mod claude_response_compaction_tests;
-mod claude_response_records;
-#[cfg(test)]
-mod claude_thinking_tokens_tests;
+use sources::claude::response_records as claude_response_records;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -234,8 +225,6 @@ mod source_erasure_tests;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
-#[cfg(test)]
-mod usage_occurrence_retention_tests;
 pub(crate) use sources::claude::account::withheld as withheld_account;
 #[cfg(test)]
 mod withheld_owner_charge_tests;
@@ -470,8 +459,6 @@ pub(crate) use sources::claude::census::authority_proof_correction::{
 };
 include!("snapshots/load_containment.rs");
 
-#[cfg(test)]
-mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;

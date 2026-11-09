@@ -433,6 +433,7 @@ impl Report {
             "held_files": self.held_files,
             "unread_bytes": self.unread_bytes,
             "over_6h_files": self.over_6h_files,
+            "unknown_age_files": self.unknown_age_files,
             "oldest_age_s": self.oldest.map(|(at, _)| now_ms.saturating_sub(at) / 1000),
             "oldest_age_lower_bound": self.oldest.is_some_and(|(_, lower)| lower)
                 || self.unknown_age_files > 0,
@@ -649,13 +650,15 @@ impl<'a> Page<'a> {
     fn live(&self, index: &ScanIndex, key: &str, listing: &Listing<'_>) -> Live {
         let metadata = listing.metadata;
         let len = metadata.len();
-        // A future mtime is a regressed clock: unknown, never fresh.
+        // A future mtime is a regressed clock: unknown, never fresh. Read the
+        // clock now: a file written during the listing is not in the future.
+        let stat_now = sampled_scan::now_seconds();
         let mtime = metadata
             .modified()
             .ok()
             .and_then(unix_nanos)
             .map(|nanos| nanos / 1_000_000)
-            .filter(|ms| ms / 1000 <= self.now_ms / 1000);
+            .filter(|ms| ms / 1000 <= stat_now);
         // Never indexed: no stored state, so its age is a lower bound.
         let mut live = Live {
             len,
