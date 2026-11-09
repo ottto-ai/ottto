@@ -1,4 +1,7 @@
 use super::*;
+use crate::snapshots::claude_request_census::{
+    ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+};
 
 /// Keep the native complete/current census record, but give it the ordinary
 /// Tail provenance whose off-page binding this regression exercises.
@@ -11,13 +14,41 @@ fn ordinary_tail_root(page: &mut Page, path: &Path) {
         .unwrap()
         .clone();
     assert!(record.can_bind_recomposed_body());
+    assert_eq!(record.shape_for_test(), ClaudeRequestCensusShape::Exact);
     assert_eq!(
         record.fingerprint_hex_for_test(),
         page.index.files[key].source_file_fingerprint
     );
     page.index
         .claude_request_census_mut_for_test()
-        .insert_for_test(key, record.with_unverified_for_test(true));
+        .insert_for_test(key, record.clone().with_unverified_for_test(true));
+    // An idle complete empty member binds posture through its verified own
+    // entry, but keeps the strict usage/cache gate withheld on BOTH pages.
+    // Otherwise page membership itself changes cache-row eligibility, which
+    // is independent of the posture binding under test.
+    let idle = path
+        .parent()
+        .unwrap()
+        .join(ROOT)
+        .join("subagents/agent-idle.jsonl");
+    let idle = idle.to_str().unwrap();
+    let revision = "e".repeat(64);
+    let mut entry = page.index.files[key].clone();
+    entry.source_file_fingerprint = revision.clone();
+    entry.scan_identity_version = Some("semantic_sync:v2".into());
+    page.index.files.insert(idle.into(), entry);
+    page.index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            idle,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &revision,
+                record.window_for_test(),
+                ClaudeRequestCensusShape::Empty,
+                vec![],
+            )
+            .with_unverified_for_test(true),
+        );
     page.index.files.get_mut(key).unwrap().scan_identity_version =
         Some("semantic_sync:v2+sampled_unverified:v2:9999999999:c".into());
 }
@@ -36,12 +67,18 @@ fn posture(item: &SnapshotItem) -> serde_json::Value {
 #[test]
 fn context_posture_survives_a_split_family_refold() {
     with_e2(|| {
-        let (mut c, root_path) = placement_corpus("context-posture-split-refold");
+        let (c, root_path) = placement_corpus("context-posture-split-refold");
         let child_path = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
+        let mut response: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&child_path).unwrap()).unwrap();
+        response["isSidechain"] = json!(true);
+        response["agentId"] = json!("000");
+        std::fs::write(&child_path, response.to_string() + "\n").unwrap();
         append(
             &child_path,
             &(json!({
                 "type": "system", "subtype": "compact_boundary", "sessionId": ROOT,
+                "isSidechain": true, "agentId": "000",
                 "timestamp": "2026-08-02T07:03:30Z",
                 "compactMetadata": {"trigger": "auto", "preTokens": 40, "postTokens": 10}
             })
@@ -50,7 +87,6 @@ fn context_posture_survives_a_split_family_refold() {
         );
         // Reuse the placement control: two accounts, a switch, a side call,
         // an evidence gap and tagged usage, all through real scanning/ACKs.
-        c.births.insert(child_path, nanos(AT));
         let (session, index) = StateV2ColdSession::publish(
             Source::Claude,
             &ScanIndex::default(),
