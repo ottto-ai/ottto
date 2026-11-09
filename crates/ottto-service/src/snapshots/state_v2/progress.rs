@@ -1,0 +1,184 @@
+//! Owner-local upload progress as keyed rows of the custody store. Dormant: no
+//! production path writes or reads these rows yet.
+//!
+//! A progress page commits through the shared finalizer as `Cas::Progress`: it
+//! compares and advances `progress_generation` and stamps the current writer
+//! capability. It never moves the graph generation G, a graph row, an erasure
+//! epoch or Tail state, so the graph session's stamp stays valid. The graph's
+//! catalogue walk steps over these kinds, its baseline never names them and
+//! its hydrate never loads them. They hold no private-path extraction, so
+//! replacing or deleting them never owes erasure.
+use super::*;
+use anyhow::{bail, ensure};
+use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
+
+/// The control a progress commit compares and advances. Absent reads as 0.
+pub(super) const GENERATION: &str = "progress_generation";
+const CACHE_STATE: &str = "progress.cache_state";
+const CACHE_HEAD: &str = "progress.cache_head";
+const LEDGER: &str = "progress.ledger";
+
+/// A progress row (`catalogue::PROGRESS_KINDS`) or the progress CAS control.
+pub(super) fn owned(key: &RowKey) -> bool {
+    match key {
+        RowKey::Record { kind, .. } => kind.name().starts_with("progress."),
+        RowKey::Meta(name) => name == GENERATION,
+        RowKey::RequestSet(_) => false,
+    }
+}
+
+/// One page's progress: two keyed maps (a count manifest plus one row per
+/// member) and one ledger row holding every other durable field.
+pub(super) struct Page<S, H, L> {
+    pub(super) cache_state: BTreeMap<String, S>,
+    pub(super) cache_head: BTreeMap<String, H>,
+    pub(super) ledger: L,
+}
+
+/// Committed progress row digests at `generation`, the progress CAS value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Baseline {
+    pub(super) generation: u64,
+    pub(super) rows: mapper::Digests,
+}
+
+/// Hydrated progress: the page (`None` before any progress) and its baseline.
+pub(super) type Hydrated<S, H, L> = (Option<Page<S, H, L>>, Baseline);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// The page and `progress_generation` committed; the next baseline.
+    Committed(Baseline),
+    /// Nothing changed durably: keep the previous baseline and re-offer.
+    NotPublished,
+}
+
+fn ledger_key() -> Result<RowKey> {
+    mapper::key(LEDGER, "", 1)
+}
+
+fn generation(tx: &mut dyn Transaction) -> Result<u64> {
+    let Some(h) = tx.get(&RowKey::Meta(GENERATION.into()))? else {
+        return Ok(0);
+    };
+    ensure!(h.len <= CONTROL_BYTES, "state_v2_progress_generation");
+    let mut bytes = Vec::new();
+    tx.read_value(&h, &mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// A map kind that may be absent at any layout: no manifest means no members.
+fn read_kind<T: DeserializeOwned + Serialize>(
+    tx: &mut dyn Transaction,
+    kind: &str,
+    seed: &mut mapper::Digests,
+) -> Result<BTreeMap<String, T>> {
+    if tx.get(&mapper::key(kind, "", 0)?)?.is_none() {
+        ensure!(
+            tx.scan_kind(&RecordKind::parse(kind)?, None, 1)?.is_empty(),
+            "state_v2_missing_manifest"
+        );
+        return Ok(BTreeMap::new());
+    }
+    mapper::read_map(tx, kind, None, Some(seed))
+}
+
+/// Every progress row in the caller's read snapshot, with the row digests that
+/// seed the next write. `None`: the store holds no progress yet.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the progress hydrate has no caller yet")
+)]
+pub(super) fn read<S, H, L>(tx: &mut dyn Transaction) -> Result<Hydrated<S, H, L>>
+where
+    S: DeserializeOwned + Serialize,
+    H: DeserializeOwned + Serialize,
+    L: DeserializeOwned + Serialize,
+{
+    let mut rows = mapper::Digests::new();
+    let generation = generation(tx)?;
+    let cache_state = read_kind(tx, CACHE_STATE, &mut rows)?;
+    let cache_head = read_kind(tx, CACHE_HEAD, &mut rows)?;
+    let page = match tx.get(&ledger_key()?)? {
+        Some(h) => Some(Page {
+            cache_state,
+            cache_head,
+            ledger: mapper::read(tx, &h, Some(&mut rows))?,
+        }),
+        None => {
+            ensure!(
+                cache_state.is_empty() && cache_head.is_empty(),
+                "state_v2_progress_ledger_missing"
+            );
+            None
+        }
+    };
+    Ok((page, Baseline { generation, rows }))
+}
+
+/// Write `page` against `old`: a row is written only if its digest changed,
+/// and map members missing from `page` are removed. Returns the next digests.
+fn write<S: Serialize, H: Serialize, L: Serialize>(
+    tx: &mut dyn Transaction,
+    old: mapper::Digests,
+    page: &Page<S, H, L>,
+) -> Result<mapper::Digests> {
+    // `finish` deletes what `old` names: only progress rows may be named.
+    ensure!(old.keys().all(owned), "state_v2_progress_scope");
+    let mut rows = mapper::Rows {
+        tx: Some(tx),
+        old,
+        ..Default::default()
+    };
+    rows.map(CACHE_STATE, &page.cache_state)?;
+    rows.map(CACHE_HEAD, &page.cache_head)?;
+    rows.put(ledger_key()?, &page.ledger)?;
+    rows.finish()
+}
+
+/// One page in one write transaction under the caller's source owner, written
+/// against `baseline` (hydrated by `read`, or `Baseline::default()` for a
+/// store without progress) and compared with its generation. The writer is
+/// authenticated at the committed graph G, which this commit leaves as it is.
+/// A refusal before or at COMMIT that leaves nothing durable (a write or
+/// admission refusal, a stale baseline) rolls back as NotPublished and keeps
+/// the graph session current. Published and Ambiguous reopened the connection:
+/// the caller's session reloads, Published included, as a conservative choice.
+pub(super) fn commit<S: Serialize, H: Serialize, L: Serialize>(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    graph: u64,
+    baseline: Baseline,
+    page: &Page<S, H, L>,
+) -> Result<Outcome> {
+    let expected = baseline.generation;
+    let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
+    db.validate_save(identity, graph)?;
+    let mut tx = db.begin(TxnMode::Write)?;
+    let rows = match write(&mut tx, baseline.rows, page) {
+        Ok(rows) => rows,
+        Err(_) => {
+            drop(tx);
+            return not_published(db);
+        }
+    };
+    match tx.commit_inner(sqlite::Cas::Progress { expected, next }) {
+        DurableCommitOutcome::Committed(generation) => {
+            Ok(Outcome::Committed(Baseline { generation, rows }))
+        }
+        DurableCommitOutcome::NotPublished => not_published(db),
+        DurableCommitOutcome::Published(_) | DurableCommitOutcome::Ambiguous => {
+            bail!(Hold::ReloadRequired)
+        }
+    }
+}
+/// Nothing became durable. A disk-full failure keeps its typed hold and an
+/// unknown connection state reloads; anything else changed no store state.
+fn not_published(db: &sqlite::Sqlite) -> Result<Outcome> {
+    if let Some(hold) = db.save_failure() {
+        bail!(hold);
+    }
+    ensure!(!db.reload_required(), Hold::ReloadRequired);
+    Ok(Outcome::NotPublished)
+}

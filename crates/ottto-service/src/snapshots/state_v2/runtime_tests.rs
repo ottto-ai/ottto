@@ -1698,3 +1698,216 @@ fn retired_file_size_debt_clears_through_normal_save_and_reopen() {
         assert_cleared(&reopened);
     }
 }
+
+/// Upload-progress rows in the custody store.
+mod progress_rows {
+    use super::*;
+    use serde_json::{json, Value as Json};
+
+    type Page = progress::Page<Json, Json, Json>;
+
+    fn page(sessions: &[&str], offset: u64) -> Page {
+        progress::Page {
+            cache_state: sessions
+                .iter()
+                .map(|s| (s.to_string(), json!({ "offset": offset })))
+                .collect(),
+            cache_head: sessions
+                .iter()
+                .map(|s| (s.to_string(), json!({ "head": s })))
+                .collect(),
+            ledger: json!({ "schema_version": 1, "offset": offset }),
+        }
+    }
+    fn commit(
+        f: &Fixture,
+        index: &ScanIndex,
+        baseline: progress::Baseline,
+        page: &Page,
+    ) -> Result<progress::Outcome> {
+        crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+            commit_progress_locked(&f.path, index, owner, baseline, page)
+        })
+    }
+    fn control(index: &ScanIndex, name: &str) -> Option<u64> {
+        let mut value = None;
+        with_session_db(index, |db| value = db.read_control(name).unwrap());
+        value
+    }
+    /// The graph session's stamp; the session must still be current.
+    fn session_stamp(index: &ScanIndex) -> (u64, u64) {
+        let runtime = index.v2().persistence_v2.as_ref().unwrap();
+        let guard = runtime.session.lock().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert!(!session.reload, "the graph session must not reload");
+        session.stamp
+    }
+    fn progress_headers(db: &mut sqlite::Sqlite) -> Vec<Header> {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut headers = Vec::new();
+        for kind in catalogue::PROGRESS_KINDS {
+            headers.extend(
+                tx.scan_kind(&RecordKind::parse(kind).unwrap(), None, 128)
+                    .unwrap(),
+            );
+        }
+        headers
+    }
+    fn has_member(db: &mut sqlite::Sqlite, session: &str) -> bool {
+        let key = mapper::key("progress.cache_state", session, 1).unwrap();
+        db.begin(TxnMode::Read)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some()
+    }
+
+    /// [behaviour] A progress page advances `progress_generation` alone: G, the
+    /// session stamp and the capability stamp stay, a stale baseline refuses
+    /// without a write, removed members owe no erasure, and `read` hydrates
+    /// the committed baseline.
+    #[test]
+    fn progress_commit_moves_only_its_own_generation() {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let stamp = session_stamp(&index);
+        let capability = control(&index, "minimum_writer_capability");
+        assert_eq!(capability, Some(sqlite::writer_capability_for_test()));
+        let empty = progress::Baseline::default();
+        let first = commit(&f, &index, empty.clone(), &page(&["a", "b"], 1)).unwrap();
+        let progress::Outcome::Committed(baseline) = first else {
+            panic!("the first page commits");
+        };
+        assert_eq!(baseline.generation, 1);
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+        assert_eq!(control(&index, "generation"), Some(G));
+        assert_eq!(control(&index, "minimum_writer_capability"), capability);
+        assert_eq!(session_stamp(&index), stamp);
+        with_session_db(&index, |db| assert_eq!(db.stamp().unwrap(), stamp));
+
+        // A stale baseline, and a write refusal before COMMIT (a baseline that
+        // names a graph row), refuse: no row, no generation, no reload.
+        let mut before = Vec::new();
+        with_session_db(&index, |db| before = progress_headers(db));
+        let graph_row = mapper::key("account.current", "x", 1).unwrap();
+        let foreign = progress::Baseline {
+            generation: 1,
+            rows: [(graph_row, [0; 32])].into(),
+        };
+        for refused in [empty, foreign] {
+            assert_eq!(
+                commit(&f, &index, refused, &page(&["c"], 9)).unwrap(),
+                progress::Outcome::NotPublished
+            );
+            assert_eq!(session_stamp(&index), stamp);
+        }
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+        with_session_db(&index, |db| {
+            assert_eq!(progress_headers(db), before);
+            assert!(!db.reload_required());
+            // Every graph row would now owe erasure on removal; progress never does.
+            db.path_extractor(|_, _, emit| emit("/synthetic/private/path"));
+        });
+        let erasure = control(&index, "erasure_pending");
+
+        // The next page against the committed baseline removes "a".
+        let second = commit(&f, &index, baseline, &page(&["b", "c"], 2)).unwrap();
+        let progress::Outcome::Committed(baseline) = second else {
+            panic!("the second page commits");
+        };
+        assert_eq!(baseline.generation, 2);
+        assert_eq!(control(&index, "erasure_pending"), erasure);
+        with_session_db(&index, |db| {
+            assert_eq!(sqlite::erasure_marks_for_test(db), 0);
+            assert!(!has_member(db, "a") && has_member(db, "c"));
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let (stored, hydrated) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+            assert!(stored.is_some_and(|stored| stored.cache_state.len() == 2));
+            assert_eq!(hydrated, baseline);
+        });
+        assert_eq!(session_stamp(&index), stamp);
+    }
+
+    /// [behaviour] A COMMIT error reopens and classifies from the progress CAS
+    /// row, never from the graph's generation.
+    #[test]
+    fn progress_commit_error_classifies_from_the_progress_row() {
+        let cases = [
+            (
+                ("progress_generation", 1),
+                DurableCommitOutcome::Published(1),
+            ),
+            (("progress_generation", 9), DurableCommitOutcome::Ambiguous),
+            // The graph's row moving says nothing about this commit.
+            (("generation", G + 1), DurableCommitOutcome::NotPublished),
+        ];
+        for ((name, value), outcome) in cases {
+            let f = Fixture::new();
+            f.published();
+            let index = load_with(&f.path, false).unwrap().unwrap();
+            with_session_db(&index, |db| {
+                sqlite::fence_commit_writing(db, "progress_generation");
+                sqlite::on_reopen_write_control(name, value);
+                let mut tx = db.begin(TxnMode::Write).unwrap();
+                mapper::put(
+                    &mut tx,
+                    &mapper::key("progress.ledger", "", 1).unwrap(),
+                    &json!({ "offset": 1 }),
+                )
+                .unwrap();
+                let published = outcome != DurableCommitOutcome::NotPublished;
+                assert_eq!(
+                    tx.commit_inner(sqlite::Cas::Progress {
+                        expected: 0,
+                        next: 1
+                    }),
+                    outcome
+                );
+                assert_eq!(db.reload_required(), published);
+            });
+        }
+    }
+
+    /// [behaviour] Progress rows are counted apart from graph records and never
+    /// trip the records alarm, and the graph's catalogue walk still finds the
+    /// graph kinds on both sides of the progress range.
+    #[test]
+    fn progress_rows_stay_out_of_graph_counts_and_walk() {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        with_session_db(&index, |db| {
+            let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+            db.audit_headers().unwrap();
+            let (graph, progress, alarm) = sqlite::row_counts_for_test(db);
+            assert_eq!((progress, alarm), (0, false));
+            // At the alarm threshold, progress rows never trip it.
+            sqlite::set_record_rows_for_test(db, 200_000);
+            let empty = progress::Baseline::default();
+            let outcome = progress::commit(db, &identity, G, empty, &page(&["s"], 1)).unwrap();
+            assert!(matches!(outcome, progress::Outcome::Committed(_)));
+            // One member of each map, their two manifests and the ledger.
+            let rows = 5;
+            assert_eq!(sqlite::row_counts_for_test(db), (200_000, rows, false));
+            db.audit_headers().unwrap();
+            assert_eq!(sqlite::row_counts_for_test(db), (graph, rows, false));
+
+            // Graph rows on both sides of the range are records; they count.
+            let before = mapper::key("account.current", "before-progress", 1).unwrap();
+            let after = mapper::key("proof.owned_start", "after-progress", 1).unwrap();
+            sqlite::set_record_rows_for_test(db, 199_999);
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            mapper::put(&mut tx, &before, &json!({})).unwrap();
+            mapper::put(&mut tx, &after, &json!({})).unwrap();
+            assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+            assert_eq!(sqlite::row_counts_for_test(db), (200_001, rows, true));
+            assert_eq!(
+                db.read_control::<u64>("progress_generation").unwrap(),
+                Some(1)
+            );
+            let (_, cx) = kinds::hydrate(db, identity.binding.clone()).unwrap();
+            assert!(cx.retired.contains(&before) && cx.retired.contains(&after));
+        });
+    }
+}
