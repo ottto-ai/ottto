@@ -63,25 +63,26 @@ fn serve_unix_socket_with_limit_and_handler(
 
 /// Accepts control connections on `listener` and serves each on its own worker.
 ///
-/// No thread ever sleeps inside a socket syscall here. The listener and every
-/// accepted stream are non-blocking, and all waiting happens in `poll(2)`
+/// Accepted streams are non-blocking and wait only in `poll(2)`
 /// ([`wait_for_fd`]). On macOS this is load-bearing, not a style choice.
 ///
 /// XNU marks a socket `SS_DRAINING` when a descriptor for it is closed while
 /// another thread is blocked on it. The flag never clears, and each connection
 /// accepted afterwards copies it from the listener (`sonewconn` copies
-/// `so_state`). From then on every *sleeping* socket wait fails. A blocking
-/// `accept` returns `ECONNABORTED` once per incoming connection. `sbwait`
-/// returns `EBADF`, so a read that has to wait for the request fails, and so
-/// does a write that has to wait for buffer space. That second case cuts every
-/// response larger than one unix-socket send buffer (8 KiB,
-/// `net.local.stream.sendspace`) off at exactly 8192 bytes while `write_all`
-/// reports `EBADF`. A daemon that reached this state kept failing every large
-/// `status` until it restarted.
+/// `so_state`). From then on `sbwait` returns `EBADF`, so a read that has to
+/// wait for the request fails, and so does a write that has to wait for buffer
+/// space. That second case cuts every response larger than one unix-socket
+/// send buffer (8 KiB, `net.local.stream.sendspace`) off at exactly 8192 bytes.
+/// Non-blocking I/O never enters `sbwait`, so a drained listener keeps serving
+/// complete responses.
 ///
-/// Non-blocking calls never enter `sbwait`, and `poll` does not look at
-/// `SS_DRAINING`, so the same poisoned listener keeps serving complete
-/// responses in either direction.
+/// On macOS the listener itself stays blocking and sleeps in `accept`. A
+/// `close` or `dup2` of its descriptor drains the socket and wakes that
+/// `accept` with `ECONNABORTED`; the next `accept` then reports the lost
+/// descriptor. On a drained listener `ECONNABORTED` comes once per incoming
+/// connection, and the retry accepts it. Elsewhere `close` does not wake a
+/// blocked `accept`, so the listener is non-blocking and waits in `poll` with
+/// a periodic recheck.
 fn serve_listener(
     listener: UnixListener,
     path: &Path,
@@ -89,8 +90,8 @@ fn serve_listener(
     handler: RequestHandler,
 ) -> Result<()> {
     listener
-        .set_nonblocking(true)
-        .with_context(|| format!("set socket nonblocking {}", path.display()))?;
+        .set_nonblocking(cfg!(not(target_os = "macos")))
+        .with_context(|| format!("set socket blocking mode {}", path.display()))?;
     // Lets the check-in report whether this listener is draining. `listener`
     // is a parameter, so this local drops (and unpublishes the descriptor)
     // before it on every return path, before the descriptor can be closed and
@@ -103,11 +104,10 @@ fn serve_listener(
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                // A stale `close` or `dup2` elsewhere in the process can take
-                // the descriptor away during this wait, and XNU does not wake
-                // a `poll` whose descriptor is closed or replaced: the socket
-                // would go silent for good. Waking regularly lets the next
-                // `accept` report the loss.
+                // Not reached on macOS, where the listener blocks. A stale
+                // `close` or `dup2` can take the descriptor away during this
+                // wait without waking the `poll`, so waking regularly lets the
+                // next `accept` report the loss.
                 match wait_for_fd(
                     listener.as_raw_fd(),
                     libc::POLLIN,
@@ -436,8 +436,8 @@ fn write_response(stream: &mut UnixStream, response: &LocalControlResponse) -> R
 /// Blocks in `poll(2)` until `fd` reports `events` (or an error/hang-up, which
 /// the caller's next read or write surfaces), or until `deadline` passes.
 ///
-/// Every wait on the control socket goes through here instead of blocking
-/// inside `accept`/`read`/`write`; see [`serve_listener`] for why.
+/// Every wait on an accepted control stream goes through here instead of
+/// blocking inside `read`/`write`; see [`serve_listener`] for why.
 fn wait_for_fd(
     fd: libc::c_int,
     events: libc::c_short,
@@ -1072,6 +1072,15 @@ mod tests {
             let _ = done_tx.send(serve_listener(listener, &server_path, None, handler));
         });
         thread::sleep(Duration::from_millis(100));
+        // On macOS the listener blocks, so `accept` never returns `WouldBlock`
+        // and the loop has no periodic wait: only the drain wakes it.
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: reads the flags of the listener's open descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0, "fcntl F_GETFL on the listener");
+            assert_eq!(flags & libc::O_NONBLOCK, 0, "listener must block on macOS");
+        }
 
         let dev_null = fs::File::open("/dev/null").expect("open /dev/null");
         // SAFETY: deliberately replaces the listener's descriptor, which is
