@@ -31,9 +31,29 @@ pub(crate) fn edit_progress_rows_for_test(
         let mut read = progress::read_progress_rows(path, owner)?;
         let mut ledger = read.ledger.expect("the route holds progress rows");
         edit(&mut read.cache_state, &mut read.cache_head, &mut ledger);
-        let page = read
-            .rows
-            .commit(owner, &read.cache_state, &read.cache_head, &ledger)?;
+        let page = read.rows.commit(
+            owner,
+            (&read.cache_state, &read.cache_head, &ledger),
+            &[] as &[(&str, ())],
+        )?;
+        assert!(matches!(page, progress::ProgressPage::Committed(_)));
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Overwrite the identity row `name` of the route at `path` with a value no
+/// hint decodes from, as one more progress page.
+pub(crate) fn damage_identity_row_for_test(path: &Path, name: &str) {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+        let mut read = progress::read_progress_rows(path, owner)?;
+        let ledger = read.ledger.expect("the route holds progress rows");
+        let damaged = [(name, serde_json::json!({ "damaged": true }))];
+        let page = (read.rows).commit(
+            owner,
+            (&read.cache_state, &read.cache_head, &ledger),
+            &damaged,
+        )?;
         assert!(matches!(page, progress::ProgressPage::Committed(_)));
         Ok(())
     })
@@ -166,6 +186,23 @@ pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
         serde_json::from_value(object.remove(name).unwrap_or_default()).unwrap_or_default()
     };
     let (states, heads) = (map("accepted_cache_states"), map("accepted_cache_heads"));
+    // Identity hints split into identity rows under their epoch's scope.
+    let hints = map("accepted_identity_buckets");
+    if let Some(hint) = hints.values().next() {
+        object.insert(
+            "accepted_identity_scope".into(),
+            serde_json::json!({"key_epoch": hint["key_epoch"],
+                "discard_before": 0, "retained_before": 0}),
+        );
+    }
+    let mut points = |tx: &mut dyn Transaction, progress_generation: u64| -> Result<bool> {
+        for (name, accepted) in &hints {
+            let point = serde_json::json!({"progress_generation": progress_generation,
+                "accepted": accepted});
+            progress::put_point(tx, name, &point)?;
+        }
+        Ok(!hints.is_empty())
+    };
     let generation = object
         .remove("generation")
         .and_then(|g| g.as_u64())
@@ -180,7 +217,7 @@ pub(crate) fn import_progress_rows_for_test(index: &ScanIndex, json: &[u8]) {
         ledger: &ledger,
     };
     let imported = progress_session_locked(&path, |db, identity, graph| {
-        progress::import(db, identity, graph, &page, &marker, None)
+        progress::import(db, identity, graph, &page, &marker, Some(&mut points))
     })
     .unwrap();
     assert!(matches!(imported, progress::Imported::Committed(_)));
