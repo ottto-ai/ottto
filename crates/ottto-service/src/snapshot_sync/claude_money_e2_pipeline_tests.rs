@@ -3750,8 +3750,18 @@ fn released(name: &str) -> serde_json::Value {
         ))
         .unwrap()
     });
-    let value = fixture[name].clone();
+    let mut value = fixture[name].clone();
     assert!(!value.is_null(), "released fixture {name}");
+    // A released ledger's LRU stamp is decoded and dropped, never written.
+    let sessions = value
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|map| map.values_mut());
+    for session in sessions.filter_map(serde_json::Value::as_object_mut) {
+        if session.contains_key("key_epoch") {
+            session.remove("last_ack");
+        }
+    }
     value
 }
 /// A body's serialized form without its source-file fingerprint: a hash of

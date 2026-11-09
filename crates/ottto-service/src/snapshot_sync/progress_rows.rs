@@ -6,7 +6,8 @@
 //! A page COMMIT is the receipt: a crash before it re-offers the exact body,
 //! and once it is durable the graph may settle against it.
 use super::*;
-use crate::snapshots::{ProgressMarker, ProgressPage, ProgressRead};
+use crate::snapshots::claude_request_identity::{AcceptedSession, IdentityScope};
+use crate::snapshots::{ProgressMarker, ProgressPage, ProgressPoint, ProgressRead};
 
 /// Fields the ledger never holds: the keyed maps and the generation.
 const KEYED: [&str; 3] = [
@@ -79,13 +80,16 @@ impl SnapshotUploadProgress {
         Ok(progress)
     }
 
-    /// The ledger of this progress.
+    /// The ledger of this progress. Identity hints are rows of their own
+    /// (`accepted_identity_scope` holds their barriers).
     pub(super) fn ledger_row(&mut self) -> Result<serde_json::Value> {
         let states = std::mem::take(&mut self.accepted_cache_states);
         let heads = std::mem::take(&mut self.accepted_cache_heads);
+        let hints = std::mem::take(&mut self.accepted_identity_buckets);
         let ledger = serde_json::to_value(&*self);
         self.accepted_cache_states = states;
         self.accepted_cache_heads = heads;
+        self.accepted_identity_buckets = hints;
         let mut ledger = ledger.context("encode snapshot upload progress ledger")?;
         let fields = ledger
             .as_object_mut()
@@ -156,11 +160,12 @@ impl SnapshotUploadProgress {
 
     /// The one-time import: the JSON ledger (or the exact progress a legacy
     /// ACK receipt holds ahead of it) becomes the route's first rows with the
-    /// import marker at P = 1. Unparseable input or an invalid ledger holds
-    /// the source and stays on disk; an invalid keyed entry imports as its row
-    /// and is set aside, as the row loader treats it. A failed COMMIT holds
-    /// this pass, and the next load imports again. Once the marker commits the
-    /// legacy files are purged.
+    /// import marker at P = 1, its identity hints one row per session.
+    /// Unparseable input or an invalid ledger holds the source and stays on
+    /// disk; an invalid keyed entry imports as its row and is set aside, as
+    /// the row loader treats it. A failed COMMIT holds this pass, and the next
+    /// load imports again. Once the marker commits the legacy files are
+    /// purged.
     fn import_rows(
         index: &ScanIndex,
         index_path: &Path,
@@ -198,6 +203,10 @@ impl SnapshotUploadProgress {
             progress.valid(namespace),
             "snapshot upload progress for import is invalid"
         );
+        progress.accepted_identity_scope = IdentityScope {
+            key_epoch: progress.accepted_identity_buckets.resident_epoch(),
+            ..IdentityScope::default()
+        };
         let states = &progress.accepted_cache_states;
         let bad_states: Vec<String> = states
             .iter()
@@ -211,12 +220,15 @@ impl SnapshotUploadProgress {
             .map(|(key, _)| key.clone())
             .collect();
         let ledger = progress.ledger_row()?;
+        let points = progress.accepted_identity_buckets.dirty();
         let page = (
             &progress.accepted_cache_states,
             &progress.accepted_cache_heads,
             &ledger,
         );
-        let rows = crate::snapshots::import_progress_rows(index, index_path, owner, page, &marker)?;
+        let rows = crate::snapshots::import_progress_rows(
+            index, index_path, owner, page, &points, &marker,
+        )?;
         let progress = match rows {
             Some(mut rows) => {
                 // Stored and counted, never accepted evidence: the next body
@@ -230,6 +242,7 @@ impl SnapshotUploadProgress {
                 }
                 progress.generation = rows.generation();
                 progress.rows = Some(Box::new(rows));
+                progress.accepted_identity_buckets.release();
                 progress
             }
             // Another writer's import committed first: its rows win.
@@ -246,9 +259,12 @@ impl SnapshotUploadProgress {
     /// Write one progress page: the changed keyed rows and the ledger, at
     /// this pass's progress generation. Nothing durable on NotPublished: RAM
     /// keeps every change and the next save writes it again.
+    /// Identity hints whose encoded value changed ride the same commit as
+    /// rows; once durable every resident hint is released.
     pub(super) fn save_rows(&mut self, path: &Path) -> Result<()> {
         let owner = SnapshotProgressLock::acquire(path)?.for_v2(path);
         let ledger = self.ledger_row()?;
+        let points = self.accepted_identity_buckets.dirty();
         let rows = self
             .rows
             .as_mut()
@@ -256,17 +272,53 @@ impl SnapshotUploadProgress {
         if rows.generation() != self.generation {
             return Err(anyhow!("snapshot upload progress changed concurrently"));
         }
-        match rows.commit(
-            &owner,
+        let page = (
             &self.accepted_cache_states,
             &self.accepted_cache_heads,
             &ledger,
-        )? {
+        );
+        match rows.commit(&owner, page, &points)? {
             ProgressPage::Committed(generation) => self.generation = generation,
             ProgressPage::Unchanged => {}
             ProgressPage::NotPublished => {
                 return Err(anyhow!("snapshot upload progress page was not published"))
             }
+        }
+        self.accepted_identity_buckets.release();
+        Ok(())
+    }
+
+    /// Before a consumer reads identity hints: load the stored rows of
+    /// `sessions` not resident, under the stored scope. A row from before a
+    /// key epoch change or under another epoch stays unloaded; one from
+    /// before a replay change loads without retained proof. The JSON ledger
+    /// keeps every hint resident.
+    pub(super) fn load_identity<'s>(
+        &mut self,
+        sessions: impl IntoIterator<Item = &'s str>,
+    ) -> Result<()> {
+        let Some(rows) = self.rows.as_deref() else {
+            return Ok(());
+        };
+        let hints = &mut self.accepted_identity_buckets;
+        let scope = &mut self.accepted_identity_scope;
+        let epoch = hints.epoch();
+        if scope.key_epoch != epoch {
+            hints.discard_resident(scope.key_epoch.is_some());
+            scope.key_epoch = epoch;
+            scope.discard_before = self.generation.saturating_add(1);
+        }
+        let keys = (sessions.into_iter())
+            .filter_map(|session| hints.row_name(session))
+            .filter(|name| !hints.holds_row(name))
+            .collect::<BTreeSet<_>>();
+        let discard_before = scope.discard_before;
+        let points = rows.read_points::<ProgressPoint<AcceptedSession>>(&keys, |_, point| {
+            point.progress_generation >= discard_before && hints.admissible(&point.accepted)
+        })?;
+        for (name, point) in points {
+            let retained_reset = point.progress_generation < scope.retained_before;
+            hints.admit(name, point.accepted, retained_reset);
         }
         Ok(())
     }
