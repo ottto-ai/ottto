@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cli_children;
 pub(crate) mod jsonl;
 
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
@@ -1283,6 +1284,8 @@ struct Observation {
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
     footprint: footprint::Observation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cli_children: Vec<cli_children::Counts>,
 }
 impl Observation {
     /// A zero-window event: a timestamp and no resource measurements.
@@ -1297,6 +1300,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             footprint: Default::default(),
+            cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
