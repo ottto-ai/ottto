@@ -24,8 +24,7 @@ impl CloudCliFixture {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_dir("cloud-cli-process");
         fs::write(root.join("output"), output).unwrap();
-        let quote =
-            |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
         let body = if mode == "output" {
             format!(
                 "/bin/cat {}\nexit {exit_code}\n",
@@ -188,8 +187,7 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     let mut sentinel = Command::new("/bin/sleep").arg("4").spawn().unwrap();
     let caller_group = unsafe { libc::getpgrp() };
     let started = Instant::now();
-    let result =
-        CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
+    let result = CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
     // Always reap the separately owned sentinel before an oracle can panic.
     let sentinel_alive = sentinel.try_wait().unwrap().is_none();
     let _ = sentinel.kill();
@@ -2261,8 +2259,7 @@ fn runtime_rejects_untrusted_destination_without_mutating_grant() {
     let before_grant = fs::read(grants.path()).unwrap();
 
     assert!(
-        load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections,)
-            .is_err()
+        load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections,).is_err()
     );
     assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
     assert!(validated_cloud_session_api_base_url("http://localhost.evil").is_err());
@@ -2334,11 +2331,7 @@ fn revocation_after_finalize_revalidation_closes_relay_admission() {
     let release = Arc::new(std::sync::Barrier::new(2));
     // Skip the chunk boundary and stop exactly after finalization's
     // backend authority response but before finalization admission.
-    checkpoints.set_relay_admission_barrier_for_test(
-        1,
-        Arc::clone(&entered),
-        Arc::clone(&release),
-    );
+    checkpoints.set_relay_admission_barrier_for_test(1, Arc::clone(&entered), Arc::clone(&release));
 
     let collector_grants = grants.clone();
     let collector_checkpoints = Arc::clone(&checkpoints);
@@ -2499,27 +2492,26 @@ fn hundred_full_pages_emit_ten_ordered_chunks_with_reproducible_digests() {
 
 #[test]
 fn v2_digest_vectors_are_length_framed_canonical_and_time_independent() {
-    let observation =
-        |entity_key: &str, lifecycle: &str, attempt_count: u64, observed_at: &str| {
-            CloudSessionObservationEntityV1 {
-                entity_key: entity_key.to_string(),
-                entity_kind: "task".to_string(),
-                lifecycle: lifecycle.to_string(),
-                attempt_count: Some(attempt_count),
-                environment_kind: "unknown".to_string(),
-                measurement_basis: "not_itemized".to_string(),
-                coverage: vec![
-                    "identity".to_string(),
-                    "status".to_string(),
-                    "attempts".to_string(),
-                ],
-                created_at: None,
-                started_at: None,
-                updated_at: None,
-                completed_at: None,
-                observed_at: observed_at.to_string(),
-            }
-        };
+    let observation = |entity_key: &str, lifecycle: &str, attempt_count: u64, observed_at: &str| {
+        CloudSessionObservationEntityV1 {
+            entity_key: entity_key.to_string(),
+            entity_kind: "task".to_string(),
+            lifecycle: lifecycle.to_string(),
+            attempt_count: Some(attempt_count),
+            environment_kind: "unknown".to_string(),
+            measurement_basis: "not_itemized".to_string(),
+            coverage: vec![
+                "identity".to_string(),
+                "status".to_string(),
+                "attempts".to_string(),
+            ],
+            created_at: None,
+            started_at: None,
+            updated_at: None,
+            completed_at: None,
+            observed_at: observed_at.to_string(),
+        }
+    };
     let observations = vec![
         observation("hmac-sha256:bbb", "completed", 2, "2026-07-22T12:00:00Z"),
         observation("hmac-sha256:aaa", "running", 1, "2026-07-21T12:00:00Z"),
