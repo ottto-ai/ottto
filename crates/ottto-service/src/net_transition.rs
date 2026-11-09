@@ -316,7 +316,9 @@ mod readiness_tests {
         ));
         peer.write_all(&[1]).unwrap();
         let ready = ready_rx.recv_timeout(Duration::from_millis(500));
-        peer.shutdown(std::net::Shutdown::Both).unwrap();
+        // Unblocks the waiter if the read never arrived. On macOS this fails
+        // with ENOTCONN once the waiter has already closed its end.
+        let _ = peer.shutdown(std::net::Shutdown::Both);
         waiter.join().unwrap();
         assert_eq!(ready.unwrap(), Some(1));
     }
