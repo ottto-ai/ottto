@@ -213,7 +213,7 @@ pub(in crate::snapshots) fn entry<S: TailSource>(
     capture: bool,
     held: &mut File,
     scope: &Scope,
-) -> Load {
+) -> (Load, u64) {
     let id = HeadIdentity::new(
         route,
         S::SOURCE,
@@ -221,7 +221,7 @@ pub(in crate::snapshots) fn entry<S: TailSource>(
         &candidate.path,
         capture,
     );
-    load::<S>(
+    load_with_bytes::<S>(
         index,
         route,
         &local_index_key(&candidate.path),
@@ -260,6 +260,7 @@ struct Hit {
     page_bytes: u64,
 }
 
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "the shared load takes every codec's cycle inputs"
@@ -274,6 +275,23 @@ pub(super) fn load<S: TailSource>(
     fresh: &CandidateFile,
     live: &SnapshotAccumulator,
 ) -> Load {
+    load_with_bytes::<S>(index, route, key, id, held, scope, fresh, live).0
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared load takes every codec's cycle inputs"
+)]
+fn load_with_bytes<S: TailSource>(
+    index: &ScanIndex,
+    route: &Path,
+    key: &str,
+    id: &HeadIdentity,
+    held: &mut File,
+    scope: &Scope,
+    fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
+) -> (Load, u64) {
     let source = S::SOURCE;
     // (outcome, counted reconstruction, load)
     let loaded = stored::<S>(index, key, id, held, scope, fresh, live);
@@ -283,7 +301,7 @@ pub(super) fn load<S: TailSource>(
             counters::bump(source, "tail_db_loads", "hit");
             counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
             counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
-            return Load::Reused(hit.retained, base);
+            return (Load::Reused(hit.retained, base), hit.page_bytes);
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
@@ -341,7 +359,7 @@ pub(super) fn load<S: TailSource>(
         }
     }
     counters::bump(source, "tail_db_loads", outcome);
-    load
+    (load, 0)
 }
 
 /// A reconstruction's `tail_db_loads` outcome. A key rotation is a miss. A

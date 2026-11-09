@@ -3993,6 +3993,18 @@ fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
 }
 
 /// Remaining wait for `source`, or `None` when it is due now.
+fn paced_scan_due() -> Option<Instant> {
+    [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .filter(|source| source_upload_backoff_remaining(*source).is_none())
+    .filter_map(|source| with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten())
+    .min()
+}
+
 fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
     let now = Instant::now();
     let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
@@ -4820,6 +4832,9 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
     fn pending(&mut self) -> Option<(Instant, Duration)> {
         continuation::production_pending()
     }
+    fn paced_due(&mut self) -> Option<Instant> {
+        paced_scan_due()
+    }
     fn page(&mut self, deadline: Instant) -> continuation::Outcome {
         continuation::run_production_page(self.home, self.support_dir, self.daemon, deadline)
     }
@@ -5187,6 +5202,22 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _paced_qos = if paced_scan_due().is_some_and(|due| due <= Instant::now()) {
+        let qos = continuation::resident_background();
+        if qos.is_none() {
+            if let Ok(mut cadences) = source_cadences().lock() {
+                for cadence in cadences
+                    .values_mut()
+                    .filter(|cadence| cadence.paced_scan_due().is_some())
+                {
+                    cadence.clear_continuation();
+                }
+            }
+        }
+        qos
+    } else {
+        None
+    };
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
     // Declared after the guard, so it settles before the lock is released.
@@ -8714,6 +8745,9 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
+    if scan_result.charge_deferred {
+        continuation::request_resident_scan(source);
+    }
 
     // Refresh the per-source detected-uses cache the daemon health assembly
     // reads for the Companion's "Detected Uses" panel. The scan is incremental,

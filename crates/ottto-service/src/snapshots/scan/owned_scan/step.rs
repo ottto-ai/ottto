@@ -155,7 +155,7 @@ impl OwnedSourceScan {
             mut codex_join_completed,
             mut codex_legacy_join_baselines,
             mut codex_page,
-            codex_selected_flags,
+            selected_flags,
             mut continuation_ticket,
             mut line_delivery,
             codex_versions,
@@ -194,7 +194,7 @@ impl OwnedSourceScan {
                     if !inventory.step_selected(
                         &codex_title_metadata,
                         index,
-                        &codex_selected_flags,
+                        &selected_flags,
                         sampling.as_ref().map(|context| &context.cache),
                     ) {
                         pending!();
@@ -309,7 +309,7 @@ impl OwnedSourceScan {
                                     .all(|member| index.context_only_read(member)),
                             !*own,
                             !sampled_scan::codex_cursor::census_member(
-                                &codex_selected_flags,
+                                &selected_flags,
                                 group.members.iter().map(|member| member.path.as_path()),
                             ),
                         )
@@ -375,11 +375,7 @@ impl OwnedSourceScan {
                                 .iter()
                                 .filter(|member| selected.contains(&local_index_key(&member.path)))
                                 .collect::<Vec<_>>();
-                            sampled_scan::codex_cursor::requeue_members(
-                                index,
-                                &codex_selected_flags,
-                                owned,
-                            );
+                            scan::owned_scan::requeue_members(index, &selected_flags, owned);
                             continue;
                         }
                         let malformed_pending = group.members.iter().any(|member| {
@@ -432,7 +428,7 @@ impl OwnedSourceScan {
                         // re-reads.
                         let rereads_crowd_members = !fenced
                             && !sampled_scan::codex_cursor::census_member(
-                                &codex_selected_flags,
+                                &selected_flags,
                                 group.members.iter().map(|member| member.path.as_path()),
                             )
                             && {
@@ -442,7 +438,7 @@ impl OwnedSourceScan {
                                         let key = local_index_key(&candidate.path);
                                         !grouped_paths.contains(&key)
                                             && sampled_scan::codex_cursor::selected_census_member(
-                                                &codex_selected_flags,
+                                                &selected_flags,
                                                 &candidate.path,
                                             )
                                     })
@@ -502,7 +498,7 @@ impl OwnedSourceScan {
                                             // G1: a re-read is not re-enrolled.
                                             census_member:
                                                 sampled_scan::codex_cursor::selected_census_member(
-                                                    &codex_selected_flags,
+                                                    &selected_flags,
                                                     &member.path,
                                                 ),
                                             watcher_hint: false,
@@ -576,7 +572,7 @@ impl OwnedSourceScan {
                                     .rposition(|candidate| {
                                         disposable(candidate)
                                             && !sampled_scan::codex_cursor::selected_census_member(
-                                                &codex_selected_flags,
+                                                &selected_flags,
                                                 &candidate.path,
                                             )
                                     })
@@ -587,7 +583,7 @@ impl OwnedSourceScan {
                             .or_else(|| {
                                 identified_candidates.iter().rposition(|candidate| {
                                     !sampled_scan::codex_cursor::selected_census_member(
-                                        &codex_selected_flags,
+                                        &selected_flags,
                                         &candidate.path,
                                     )
                                 })
@@ -598,7 +594,7 @@ impl OwnedSourceScan {
                                 // G1: a re-read is not re-enrolled.
                                 let census_member =
                                     sampled_scan::codex_cursor::selected_census_member(
-                                        &codex_selected_flags,
+                                        &selected_flags,
                                         &candidate.path,
                                     );
                                 traversal.pending_candidates.push_front(ScanTraversalPath {
@@ -659,7 +655,7 @@ impl OwnedSourceScan {
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
                         sampled_scan::codex_cursor::census_member(
-                            &codex_selected_flags,
+                            &selected_flags,
                             boot.group
                                 .members
                                 .iter()
@@ -675,9 +671,9 @@ impl OwnedSourceScan {
                             }
                             scanned_file_count =
                                 scanned_file_count.saturating_sub(boot.group.members.len());
-                            sampled_scan::codex_cursor::requeue_members(
+                            scan::owned_scan::requeue_members(
                                 index,
-                                &codex_selected_flags,
+                                &selected_flags,
                                 &boot.group.members,
                             );
                             pending!();
@@ -829,7 +825,7 @@ impl OwnedSourceScan {
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
                         sampled_scan::codex_cursor::census_member(
-                            &codex_selected_flags,
+                            &selected_flags,
                             boot.group
                                 .members
                                 .iter()
@@ -850,9 +846,9 @@ impl OwnedSourceScan {
                                     .request_group_own_page(&context.namespace, &boot.key);
                             }
                             scanned_file_count = scanned_file_count.saturating_sub(members);
-                            sampled_scan::codex_cursor::requeue_members(
+                            scan::owned_scan::requeue_members(
                                 index,
-                                &codex_selected_flags,
+                                &selected_flags,
                                 &boot.group.members,
                             );
                             pending!();
@@ -904,9 +900,9 @@ impl OwnedSourceScan {
                         Ok(lease) => {
                             // The members hold the strict census until the
                             // job's attempt ends (accepted or debt).
-                            sampled_scan::codex_cursor::requeue_members(
+                            scan::owned_scan::requeue_members(
                                 index,
-                                &codex_selected_flags,
+                                &selected_flags,
                                 &group_members,
                             );
                             codex_cursor_lease = Some(lease);
@@ -914,9 +910,9 @@ impl OwnedSourceScan {
                         Err(sampled_scan::codex_cursor::StartRefusal::Busy) => {
                             context.cache.cursor_note_deferred();
                             scanned_file_count = scanned_file_count.saturating_sub(members);
-                            sampled_scan::codex_cursor::requeue_members(
+                            scan::owned_scan::requeue_members(
                                 index,
-                                &codex_selected_flags,
+                                &selected_flags,
                                 &group_members,
                             );
                             pending!();
@@ -987,7 +983,7 @@ impl OwnedSourceScan {
                             support: claude_effort_support_dir_ref,
                             traces: codex_turn_traces.clone(),
                             inventory: codex_join_inventory.as_ref(),
-                            flags: &codex_selected_flags,
+                            flags: &selected_flags,
                             census_complete: state_census_complete && sidecar_census_complete,
                             continuation: codex_page.continuation(),
                             ordinary_equivalent: codex_page.ordinary_equivalent(),
@@ -1039,18 +1035,10 @@ impl OwnedSourceScan {
                 // queue untouched, and the page finishes.
                 if codex_page.continuation() {
                     for candidate in identified_candidates.drain(..) {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
+                        sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
                     }
                     for group in codex_join_groups.drain(..) {
-                        sampled_scan::codex_cursor::requeue_members(
-                            index,
-                            &codex_selected_flags,
-                            &group.members,
-                        );
+                        scan::owned_scan::requeue_members(index, &selected_flags, &group.members);
                     }
                 }
             }
@@ -1067,12 +1055,12 @@ impl OwnedSourceScan {
                             .iter()
                             .all(|candidate| index.context_only_read(candidate)))
                         && !sampled_scan::codex_cursor::census_member(
-                            &codex_selected_flags,
+                            &selected_flags,
                             group.members.iter().map(|member| member.path.as_path()),
                         )
                 }) && identified_candidates.iter().any(|candidate| {
                     sampled_scan::codex_cursor::selected_census_member(
-                        &codex_selected_flags,
+                        &selected_flags,
                         &candidate.path,
                     )
                 })
@@ -1096,6 +1084,30 @@ impl OwnedSourceScan {
                 });
             if active_file.is_none() && !rereads_wait() && !context_group_waits {
                 if let Some(group) = codex_join_groups.pop_front() {
+                    if !history_upgrade.resident_can_start() {
+                        let mut members = group.members;
+                        members.extend(codex_join_groups.drain(..).flat_map(|g| g.members));
+                        history_upgrade.charge_deferred += members.len();
+                        page_selection(
+                            source.api_slug(),
+                            PageSelection::ChargeDeferred,
+                            members.len() as u64,
+                        );
+                        scan::owned_scan::requeue_members(
+                            index,
+                            &selected_flags,
+                            members.iter().filter(|member| {
+                                selected_flags.contains_key(&local_index_key(&member.path))
+                            }),
+                        );
+                        history_upgrade.defer_resident(
+                            source,
+                            index,
+                            &selected_flags,
+                            &mut identified_candidates,
+                        );
+                        pending!();
+                    }
                     if index.file_upload_context_enabled()
                         && group
                             .members
@@ -1108,11 +1120,7 @@ impl OwnedSourceScan {
                             &snapshots,
                         )
                     {
-                        sampled_scan::codex_cursor::requeue_members(
-                            index,
-                            &codex_selected_flags,
-                            &group.members,
-                        );
+                        scan::owned_scan::requeue_members(index, &selected_flags, &group.members);
                         pending!();
                     }
                     if group
@@ -1354,7 +1362,7 @@ impl OwnedSourceScan {
                             source,
                             &error,
                             index,
-                            &codex_selected_flags,
+                            &selected_flags,
                             &active.candidate,
                         ) {
                             active.parser.reader.reader.close();
@@ -2143,23 +2151,29 @@ impl OwnedSourceScan {
                         Some(eof_applied) => tail.sealed_by_job(eof_applied),
                         None => tail,
                     });
-                #[cfg(unix)]
-                let parsed_file = {
-                    let tailed = tail.is_some();
-                    let mut encode = |live: PreFinalization<'_>| {
-                        if let Some(tail) = tail.as_mut() {
-                            tail.encode(&live);
-                        }
-                    };
-                    let pre = tailed.then_some(&mut encode as &mut dyn FnMut(PreFinalization<'_>));
-                    parser.finish_boxed_native(finish_request, pre)
+                let mut resident_bytes = 0;
+                let mut encode = |live: PreFinalization<'_>| {
+                    #[cfg(unix)]
+                    if let Some(tail) = tail.as_mut() {
+                        tail.encode(&live);
+                        resident_bytes = tail.resident_bytes();
+                        return;
+                    }
+                    resident_bytes = tail_source::resident_bytes(source, live.accumulator);
                 };
+                let parsed_file = parser.finish_boxed_native(finish_request, Some(&mut encode));
+                history_upgrade.charge_resident(
+                    source,
+                    file_sampling
+                        .as_ref()
+                        .map_or(0, |s| s.resident_loaded_bytes),
+                    resident_bytes,
+                    1 + aliases.len(),
+                );
                 // On a Tail route: whether this file's committed head stays
                 // its continuation (staged, or nothing to restate).
                 #[cfg(unix)]
                 let tail_reused = tail.map(|tail| tail.publish(&parsed_file));
-                #[cfg(not(unix))]
-                let parsed_file = parser.finish_boxed_native(finish_request, None);
                 #[cfg(test)]
                 sampled_scan::test_hooks::fire(
                     sampled_scan::test_hooks::Point::BeforeNativeEffects,
@@ -2810,7 +2824,7 @@ impl OwnedSourceScan {
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
-                context_read_budget.flush(index, &codex_selected_flags);
+                context_read_budget.flush(index, &selected_flags);
                 if codex_page.continuation() {
                     if let Some(traversal) = index.traversal.as_mut() {
                         traversal.counts.caps.drain(source.api_slug());
@@ -3472,6 +3486,7 @@ impl OwnedSourceScan {
                 });
                 let scan = SourceScanResult {
                     census_status,
+                    charge_deferred: history_upgrade.charge_deferred > 0,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -3662,7 +3677,7 @@ impl OwnedSourceScan {
                     // The paused or active cursor job owns this file (a group
                     // job owns every member); it stays pending (holding the
                     // census) until that job's attempt ends (§d.1.2 c).
-                    sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
+                    sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
                     pending!();
                 }
             }
@@ -3701,11 +3716,7 @@ impl OwnedSourceScan {
                 ) {
                     Ok(input) => input,
                     Err(_) => {
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
+                        sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
                         pending!();
                     }
                 }
@@ -3965,6 +3976,20 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            if !history_upgrade.admit_resident_unit(
+                &candidate,
+                &mut identified_candidates,
+                &forced_claude_family_reparses,
+            ) {
+                identified_candidates.push_front(candidate);
+                history_upgrade.defer_resident(
+                    source,
+                    index,
+                    &selected_flags,
+                    &mut identified_candidates,
+                );
+                pending!();
+            }
             #[cfg(test)]
             sampled_scan::test_hooks::after_selection(index, parse_reason);
             if let Some(context) = sampling
@@ -4127,18 +4152,14 @@ impl OwnedSourceScan {
                     &key,
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
                     sampled_scan::codex_cursor::census_member(
-                        &codex_selected_flags,
+                        &selected_flags,
                         [candidate.path.as_path()],
                     ),
                     Some(sampled_scan::codex_cursor::PaceProbe { file: &opened_file }),
                 ) {
                     sampled_scan::codex_cursor::StartPlan::Defer => {
                         context.cache.cursor_note_deferred();
-                        sampled_scan::codex_cursor::requeue(
-                            index,
-                            &codex_selected_flags,
-                            &candidate,
-                        );
+                        sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
                         pending!();
                     }
                     // Processed for this generation (K7 fence): not requeued,
@@ -4176,7 +4197,7 @@ impl OwnedSourceScan {
                         source,
                         &error,
                         index,
-                        &codex_selected_flags,
+                        &selected_flags,
                         &candidate,
                     ) {
                         pending!();
@@ -4192,6 +4213,7 @@ impl OwnedSourceScan {
                 }
             };
 
+            let mut resident_loaded_bytes = 0;
             let mut file_sampling = None;
             let mut retained_offset = None;
             // Counted once the page actually reads the file: a fence
@@ -4346,7 +4368,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let (mut retained, debt) = match tail_load {
                             Some(route) => {
-                                match tail_source::load_candidate(
+                                let (loaded, loaded_bytes) = tail_source::load_candidate(
                                     source,
                                     index,
                                     route,
@@ -4355,7 +4377,9 @@ impl OwnedSourceScan {
                                     claude_request_identity_capture,
                                     parser.reader.reader.get_mut(),
                                     &scope,
-                                ) {
+                                );
+                                resident_loaded_bytes = loaded_bytes;
+                                match loaded {
                                     tail_source::load::Load::Reused(retained, base) => {
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
@@ -4547,6 +4571,7 @@ impl OwnedSourceScan {
                             audit_due,
                             tier_prefix_replay: false,
                             census_base_bound,
+                            resident_loaded_bytes,
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -4611,6 +4636,7 @@ impl OwnedSourceScan {
                             audit_due: None,
                             tier_prefix_replay: false,
                             census_base_bound: false,
+                            resident_loaded_bytes,
                         });
                     }
                 }
@@ -4679,7 +4705,7 @@ impl OwnedSourceScan {
                     &local_index_key(&active.candidate.path),
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
                     sampled_scan::codex_cursor::census_member(
-                        &codex_selected_flags,
+                        &selected_flags,
                         [active.candidate.path.as_path()],
                     ),
                     Some(sampled_scan::codex_cursor::PaceProbe {
@@ -4718,7 +4744,7 @@ impl OwnedSourceScan {
                                 // its attempt ends (accepted or debt).
                                 sampled_scan::codex_cursor::requeue(
                                     index,
-                                    &codex_selected_flags,
+                                    &selected_flags,
                                     &active.candidate,
                                 );
                                 codex_cursor_lease = Some(lease);
@@ -4762,11 +4788,7 @@ impl OwnedSourceScan {
                     // before its retained state was consumed).
                     context.cache.cursor_note_deferred();
                     scanned_file_count = scanned_file_count.saturating_sub(1);
-                    sampled_scan::codex_cursor::requeue(
-                        index,
-                        &codex_selected_flags,
-                        &active.candidate,
-                    );
+                    sampled_scan::codex_cursor::requeue(index, &selected_flags, &active.candidate);
                     pending!();
                 }
             }
@@ -4834,7 +4856,7 @@ impl OwnedSourceScan {
             codex_join_completed,
             codex_legacy_join_baselines,
             codex_page,
-            codex_selected_flags,
+            selected_flags,
             continuation_ticket,
             line_delivery,
             codex_versions,

@@ -1113,7 +1113,7 @@ fn native_platform_qos_restores_on_a_spawned_thread_and_power_has_valid_range() 
         drop(guard);
         let restored = if prior.0 == 0 { (0x15, prior.1) } else { prior };
         assert_eq!(query_qos(), Some(restored));
-        assert!(matches!(unsafe { ottto_power_state() }, -1..=1));
+        assert!(matches!(unsafe { ottto_power_state() }, -1..=2));
     })
     .join()
     .unwrap();
@@ -1327,4 +1327,67 @@ fn realistic_inputs_mint_through_the_tickets_walk_with_headroom() {
             _ => panic!("a production Codex ticket"),
         }
     });
+}
+
+/// [behaviour] Paced ordinary work picks its gap at request time, including
+/// battery, without the cursor's 20-second contention cutoff.
+#[test]
+fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
+    let now = Instant::now();
+    for (answer, state, gap) in [
+        (1, PlatformState::Allowed, Some(30)),
+        (2, PlatformState::Battery, Some(180)),
+        (0, PlatformState::Refused, None),
+        (-1, PlatformState::Unknown, None),
+        (3, PlatformState::Unknown, None),
+    ] {
+        assert_eq!(power_state(answer), state);
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        if let Some(pacing) = resident_pacing(state) {
+            assert!(cadence.request_paced_scan(now, Duration::from_secs(103), pacing));
+        }
+        assert_eq!(
+            cadence.paced_scan_due(),
+            gap.map(|gap| now + Duration::from_secs(gap))
+        );
+        if let Some(gap) = gap {
+            assert_eq!(cadence.next_scan_after(now), Duration::from_secs(gap));
+            cadence.record_scan_success(now + Duration::from_secs(gap), 0);
+            assert!(
+                cadence.paced_scan_due().is_none(),
+                "a quiet pass adds no wake"
+            );
+        }
+    }
+    // LPM on AC and on battery has the same shim answer: no pacing request.
+    assert!(resident_pacing(power_state(0)).is_none());
+    let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+    cadence.record_scan_success(now, 1);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_AC);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_BATTERY);
+    assert_eq!(
+        cadence.paced_scan_due(),
+        Some(now + Duration::from_secs(180))
+    );
+    // Server minima and backoff still win; a new ordinary success resets its clock.
+    cadence.set_server_min_interval(Some(Duration::from_secs(210)));
+    assert_eq!(cadence.next_scan_after(now), Duration::from_secs(210));
+
+    let w = World::new();
+    let mut cursor = FakePort::new(&w, &[End::Paused]);
+    let mut gates = FakeGates::allowed(&w);
+    w.ordinary_page_asks(Duration::from_secs(1));
+    w.advance_to_due();
+    gates.power = PlatformState::Battery;
+    let outcome = run_page(
+        &mut FakeHost(&w),
+        &mut cursor,
+        &mut gates,
+        &w.lock,
+        &w.slot,
+        w.now.get() + Duration::from_secs(300),
+    );
+    assert!(matches!(outcome, Outcome::Skipped(Skip::Platform)));
+    assert_eq!(w.network.get(), 0);
 }

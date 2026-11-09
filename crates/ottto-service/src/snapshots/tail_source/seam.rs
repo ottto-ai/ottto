@@ -39,7 +39,8 @@ pub(in crate::snapshots) struct PendingTail {
     unsealed: bool,
     full: bool,
     base: Option<TailBase>,
-    encode: fn(&PreFinalization<'_>, &PendingTail) -> Encoded,
+    encode: fn(&PreFinalization<'_>, &PendingTail) -> (Encoded, u64),
+    resident_bytes: u64,
     encoded: Option<Encoded>,
 }
 
@@ -89,6 +90,7 @@ impl PendingTail {
             base,
             encode: tail_encode::<S>,
             encoded: None,
+            resident_bytes: 0,
         })
     }
 
@@ -107,8 +109,17 @@ impl PendingTail {
 
     /// The PRE seam: encode into the local buffer only.
     pub(in crate::snapshots) fn encode(&mut self, view: &PreFinalization<'_>) {
-        let encoded = (self.encode)(view, self);
+        let (encoded, resident_bytes) = (self.encode)(view, self);
+        self.resident_bytes = if encoded.is_ok() {
+            resident_bytes
+        } else {
+            u64::MAX
+        };
         self.encoded = Some(encoded);
+    }
+
+    pub(in crate::snapshots) fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
     }
 
     /// The native verdict, then this completion's one call into the store.
@@ -139,11 +150,22 @@ impl PendingTail {
     }
 }
 
-fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) -> Encoded {
-    match tail.base.as_ref().filter(|_| !tail.full) {
-        Some(base) => base.stage::<S>(view, &tail.certificate, &tail.id, Change::Ordinary),
-        None => TailBase::default().stage::<S>(view, &tail.certificate, &tail.id, Change::Reset),
-    }
+fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) -> (Encoded, u64) {
+    let mut resident_bytes = 0;
+    let base = TailBase::default();
+    let base = tail.base.as_ref().filter(|_| !tail.full).unwrap_or(&base);
+    let encoded = base.stage_counted::<S>(
+        view,
+        &tail.certificate,
+        &tail.id,
+        if tail.full || tail.base.is_none() {
+            Change::Reset
+        } else {
+            Change::Ordinary
+        },
+        &mut resident_bytes,
+    );
+    (encoded, resident_bytes)
 }
 
 /// The committed head a read continued: its digest, each page's digest, and
@@ -152,8 +174,8 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 #[derive(Default)]
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
-    /// In load order: by collection, then page.
-    pages: Vec<((Collection, u64), [u8; 32])>,
+    /// In load order: page key, then digest and encoded resident byte length.
+    pages: Vec<((Collection, u64), ([u8; 32], u64))>,
     logs: Vec<(Collection, LogBase)>,
 }
 struct LogBase {
@@ -190,7 +212,8 @@ impl TailBase {
         page: u64,
         bytes: &[u8],
     ) -> Result<(), ReconstructCause> {
-        self.pages.push(((collection, page), page_digest(bytes)));
+        self.pages
+            .push(((collection, page), (page_digest(bytes), bytes.len() as u64)));
         if S::collections()
             .iter()
             .any(|spec| spec.collection == collection && spec.shape == PageShape::Log)
@@ -217,18 +240,30 @@ impl TailBase {
         self.pages
             .binary_search_by(|(at, _)| at.cmp(&page))
             .ok()
-            .map(|at| &self.pages[at].1)
+            .map(|at| &self.pages[at].1 .0)
     }
 
     /// The new head, every collection's metadata, and only the pages whose
     /// bytes differ from the committed ones; `None` when neither the head
     /// nor any page differs. A `Reset` (an empty base's) always stages.
+    #[cfg(test)]
     pub(super) fn stage<S: TailSource>(
         &self,
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,
         id: &HeadIdentity,
         change: Change,
+    ) -> Result<Option<StagedFile>, Refuse> {
+        self.stage_counted::<S>(view, certificate, id, change, &mut 0)
+    }
+
+    fn stage_counted<S: TailSource>(
+        &self,
+        view: &PreFinalization<'_>,
+        certificate: &DurableCertificate,
+        id: &HeadIdentity,
+        change: Change,
+        resident_bytes: &mut u64,
     ) -> Result<Option<StagedFile>, Refuse> {
         let acc = view.accumulator;
         if let Some(field) = S::finish_field_nonempty(acc) {
@@ -261,6 +296,14 @@ impl TailBase {
                 Some((_, log)) => log_pages::<S>(acc, spec, log)?,
                 None => S::encode_pages(acc, spec.collection)?,
             };
+            let mut collection_bytes = if log.is_some() {
+                self.pages
+                    .iter()
+                    .filter(|((c, _), _)| *c == spec.collection)
+                    .fold(0u64, |sum, (_, (_, size))| sum.saturating_add(*size))
+            } else {
+                0
+            };
             let mut rewritten = false;
             if log.is_none() {
                 let held: BTreeSet<u64> = pages.iter().map(|(page, _)| *page).collect();
@@ -272,6 +315,15 @@ impl TailBase {
                 }
             }
             for (page, bytes) in pages {
+                if log.is_some() {
+                    if let Ok(at) = self
+                        .pages
+                        .binary_search_by(|(key, _)| key.cmp(&(spec.collection, page)))
+                    {
+                        collection_bytes = collection_bytes.saturating_sub(self.pages[at].1 .1);
+                    }
+                }
+                collection_bytes = collection_bytes.saturating_add(bytes.len() as u64);
                 match self.committed((spec.collection, page)) {
                     Some(digest) if *digest == page_digest(&bytes) => continue,
                     Some(_) => rewritten = true,
@@ -279,6 +331,7 @@ impl TailBase {
                 }
                 staged.pages.insert((spec.collection, page), bytes);
             }
+            *resident_bytes = resident_bytes.saturating_add(collection_bytes);
             if rewritten && spec.private {
                 staged.change = Change::DropsPrivate;
             }
@@ -307,7 +360,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for TailBase {
         c.add(
             self.pages
                 .capacity()
-                .checked_mul(size_of::<((Collection, u64), [u8; 32])>())?
+                .checked_mul(size_of::<((Collection, u64), ([u8; 32], u64))>())?
                 .checked_add(
                     self.logs
                         .capacity()

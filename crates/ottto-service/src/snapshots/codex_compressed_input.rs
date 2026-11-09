@@ -1373,7 +1373,7 @@ pub(in crate::snapshots) mod tests {
                 true,
             );
             let key = local_index_key(&f.0);
-            scan.codex_selected_flags.insert(key.clone(), (true, true));
+            scan.selected_flags.insert(key.clone(), (true, true));
             let checkpoint = fixture(b"", ".json");
             fs::remove_file(&checkpoint.0).unwrap();
             let ((mut refused, result), logs) =

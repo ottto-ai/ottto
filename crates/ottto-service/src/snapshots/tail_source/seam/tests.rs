@@ -203,6 +203,7 @@ impl Route {
             base,
             encode: tail_encode::<S>,
             encoded: None,
+            resident_bytes: 0,
         };
         let identity = opened_object_identity(S::SOURCE, &mut File::open(path).unwrap()).unwrap();
         let request = FinishRequest {
@@ -403,4 +404,80 @@ impl Drop for Route {
             state_v2::money_test_support::erase_published(&self.path);
         }
     }
+}
+
+/// [behaviour] Resident size is the full reduction, even if PRE stages
+/// nothing or only an open log page. Dirty bytes cannot stand in for it.
+#[test]
+fn resident_size_includes_unchanged_pages_without_reencoding_them() {
+    let id = HeadIdentity::new(
+        Path::new("/synthetic/state.json"),
+        SnapshotSource::ClaudeCode,
+        Path::new("/synthetic"),
+        Path::new("/synthetic/a.jsonl"),
+        false,
+    );
+    let (reduction, certificate) = parse_lines(
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        &lines(300),
+        "a.jsonl",
+    );
+    let staged = stage_reduction::<Claude>(&reduction, &certificate, &id);
+    let mut base = TailBase::new(&staged.head);
+    for (&(collection, page), bytes) in &staged.pages {
+        base.observe::<Claude>(collection, page, bytes).unwrap();
+    }
+    let expected = staged
+        .pages
+        .values()
+        .map(|bytes| bytes.len() as u64)
+        .sum::<u64>();
+    let (acc, report, scalars) = reduction.finish_view();
+    let mut bytes = 0;
+    assert!(base
+        .stage_counted::<Claude>(
+            &PreFinalization::new(acc, report, scalars),
+            &certificate,
+            &id,
+            Change::Ordinary,
+            &mut bytes
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        bytes, expected,
+        "unchanged non-publication still pays resident size"
+    );
+
+    let (grown, certificate) = parse_lines(
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        &lines(302),
+        "a.jsonl",
+    );
+    let full = stage_reduction::<Claude>(&grown, &certificate, &id);
+    let (acc, report, scalars) = grown.finish_view();
+    let mut bytes = 0;
+    let partial = base
+        .stage_counted::<Claude>(
+            &PreFinalization::new(acc, report, scalars),
+            &certificate,
+            &id,
+            Change::Ordinary,
+            &mut bytes,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        partial.pages.len() < full.pages.len(),
+        "the fixture exercises incremental staging"
+    );
+    assert_eq!(
+        bytes,
+        full.pages
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>()
+    );
 }

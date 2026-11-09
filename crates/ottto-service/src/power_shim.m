@@ -11,6 +11,7 @@ int ottto_power_state(void) {
         NSProcessInfo *process = NSProcessInfo.processInfo;
         if (![process respondsToSelector:@selector(isLowPowerModeEnabled)]) return -1;
         if (ac < 0) return -1;
-        return ac && !process.isLowPowerModeEnabled ? 1 : 0;
+        if (process.isLowPowerModeEnabled) return 0;
+        return ac ? 1 : 2;
     }
 }

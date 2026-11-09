@@ -3468,6 +3468,9 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 // independent of the Tail implementation used by this build.
 pub(in crate::snapshot_sync) mod money_equivalence_tests {
     include!("claude_tail_money_tests.rs");
+    mod resident_wave_money_tests {
+        include!("resident_wave_money_tests.rs");
+    }
     #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");

@@ -545,11 +545,15 @@ fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
         })
 }
 
-/// One page's history budget and its count-only, local diagnostics.
+/// One page's resident charge, history budget and count-only local diagnostics.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HistoryPage {
     files: usize,
     bytes: u64,
+    resident_charge: f64,
+    resident_admitted: BTreeSet<String>,
+    forced_pending_entries: Vec<super::ScanTraversalPath>,
+    pub(super) charge_deferred: usize,
     reserved: BTreeSet<String>,
     /// Candidates classified as owed upgrades.
     pub(super) owed: u64,
@@ -576,9 +580,150 @@ pub(crate) struct HistoryPage {
     pub(super) queued_family_deferred_paths: BTreeSet<super::claude_money_birth_store::LocationKey>,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun, queued_family_deferred_paths);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, resident_charge, resident_admitted, forced_pending_entries, charge_deferred, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun, queued_family_deferred_paths);
+
+const PEAK_LINE_MIB: u64 = 500;
+const FLOOR_MIB: u64 = 150;
+const FINISH_RESERVE_MIB: u64 = 120;
+/// D326 amendment: soft admission allowance, not a footprint guarantee.
+/// The AIMD file limit binds above ≈200 MiB on observed waves.
+pub(super) const RESIDENT_PAGE_BUDGET_MIB: u64 = PEAK_LINE_MIB - FLOOR_MIB - FINISH_RESERVE_MIB;
+const _: () = assert!(PEAK_LINE_MIB > FLOOR_MIB + FINISH_RESERVE_MIB);
 
 impl HistoryPage {
+    fn resident_budget() -> f64 {
+        #[cfg(test)]
+        if let Some(budget) = RESIDENT_TEST_BUDGET.with(std::cell::Cell::get) {
+            return budget;
+        }
+        RESIDENT_PAGE_BUDGET_MIB as f64
+    }
+    pub(super) fn with_forced_pending(mut self, pending: Vec<super::ScanTraversalPath>) -> Self {
+        self.forced_pending_entries = pending;
+        self
+    }
+    pub(super) fn resident_can_start(&self) -> bool {
+        self.resident_charge == 0.0 || self.resident_charge < Self::resident_budget()
+    }
+    /// Admit a whole forced family or twin group; ordinary families may split.
+    pub(super) fn admit_resident_unit(
+        &mut self,
+        candidate: &super::CandidateFile,
+        remaining: &mut std::collections::VecDeque<super::CandidateFile>,
+        forced: &BTreeSet<String>,
+    ) -> bool {
+        let key = super::local_index_key(&candidate.path);
+        if self.resident_admitted.remove(&key) {
+            return true;
+        }
+        if !self.resident_can_start() {
+            return false;
+        }
+        let root = super::claude_index_path_member_ref(&candidate.path)
+            .filter(|member| forced.contains(member.root))
+            .map(|member| member.root.to_owned());
+        let twins = super::claude_index_path_member_ref(&candidate.path).and_then(|member| {
+            self.twin_index
+                .get()
+                .and_then(|twins| twins.get(&member.into_owned().1))
+        });
+        if root.is_none() && twins.is_none() {
+            return true;
+        }
+        for other in remaining.iter() {
+            let key = super::local_index_key(&other.path);
+            if root.as_ref().is_some_and(|root| {
+                super::claude_index_path_member_ref(&other.path)
+                    .is_some_and(|member| member.root == root)
+            }) || twins.is_some_and(|twins| twins.iter().any(|(twin, _)| twin == &key))
+            {
+                self.resident_admitted.insert(key);
+            }
+        }
+        remaining.make_contiguous().sort_by_key(|other| {
+            !self
+                .resident_admitted
+                .contains(&super::local_index_key(&other.path))
+        });
+        true
+    }
+    /// Return all deferred units together. Synthetic closure members are never
+    /// enrolled as new census members; restore only consumed pending entries.
+    pub(super) fn defer_resident(
+        &mut self,
+        source: super::SnapshotSource,
+        index: &mut super::ScanIndex,
+        flags: &BTreeMap<String, (bool, bool)>,
+        candidates: &mut std::collections::VecDeque<super::CandidateFile>,
+    ) {
+        let mut deferred = Vec::new();
+        for candidate in std::mem::take(candidates) {
+            if self
+                .resident_admitted
+                .contains(&super::local_index_key(&candidate.path))
+            {
+                candidates.push_back(candidate);
+            } else {
+                deferred.push(candidate);
+            }
+        }
+        self.charge_deferred += deferred.len();
+        super::scan::owned_scan::requeue_members(
+            index,
+            flags,
+            deferred
+                .iter()
+                .filter(|candidate| flags.contains_key(&super::local_index_key(&candidate.path))),
+        );
+        let roots = deferred
+            .iter()
+            .filter_map(|candidate| {
+                super::claude_index_path_member_ref(&candidate.path)
+                    .map(|member| member.root.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(walk) = index.traversal.as_mut() {
+            let mut pending = walk
+                .pending_candidates
+                .iter()
+                .map(|p| p.path.clone())
+                .collect::<BTreeSet<_>>();
+            self.forced_pending_entries.retain(|entry| {
+                if super::claude_index_path_member_ref(&entry.path)
+                    .is_some_and(|member| roots.contains(member.root))
+                {
+                    if pending.insert(entry.path.clone()) {
+                        walk.pending_candidates.push_back(entry.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        crate::local_resource_diagnostics::page_selection(
+            source.api_slug(),
+            crate::local_resource_diagnostics::PageSelection::ChargeDeferred,
+            deferred.len() as u64,
+        );
+    }
+    /// One completion charge, independent of Tail publication eligibility.
+    pub(super) fn charge_resident(
+        &mut self,
+        source: super::SnapshotSource,
+        loaded: u64,
+        reduction: u64,
+        files: usize,
+    ) {
+        let charge = 4.503 * loaded.max(reduction) as f64 / 1_048_576.0 + 0.0871 * files as f64;
+        self.resident_charge += charge;
+        crate::local_resource_diagnostics::page_selection(
+            source.api_slug(),
+            crate::local_resource_diagnostics::PageSelection::ChargeEstimate,
+            (charge * 1_048_576.0).ceil() as u64,
+        );
+    }
+
     /// A page whose twin groups candidate selection already built.
     pub(super) fn with_twin_groups(
         twin_index: std::cell::OnceCell<ClaudeTwinGroups>,
@@ -2441,4 +2586,18 @@ mod tests {
         assert!(emission.literal_denied("denied"));
         assert_eq!(HistoryHold::TelemetryUnread.as_str(), "telemetry_unread");
     }
+}
+
+#[cfg(test)]
+thread_local! { static RESIDENT_TEST_BUDGET: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(super) fn with_resident_budget<T>(budget: f64, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<f64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RESIDENT_TEST_BUDGET.with(|b| b.set(self.0));
+        }
+    }
+    let _reset = Reset(RESIDENT_TEST_BUDGET.with(|b| b.replace(Some(budget))));
+    run()
 }

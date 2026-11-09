@@ -189,8 +189,9 @@ pub(super) struct Active {
     /// tiers and re-reads the file from its start (D168 `tier_prefix_replay`).
     pub(super) tier_prefix_replay: bool,
     pub(super) census_base_bound: bool,
+    pub(super) resident_loaded_bytes: u64,
 }
-crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound);
+crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound, resident_loaded_bytes);
 
 impl Context {
     #[inline(never)]

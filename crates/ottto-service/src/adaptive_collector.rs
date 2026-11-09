@@ -89,6 +89,7 @@ pub struct SourceCadence {
     disabled: bool,
     server_min_interval: Option<Duration>,
     continuation: Option<ContinuationRequest>,
+    ordinary_pacing: Option<ContinuationPacing>,
 }
 
 impl SourceCadence {
@@ -102,6 +103,7 @@ impl SourceCadence {
             disabled: false,
             server_min_interval: None,
             continuation: None,
+            ordinary_pacing: None,
         }
     }
 
@@ -158,6 +160,7 @@ impl SourceCadence {
         if self.disabled {
             return;
         }
+        self.clear_continuation();
         self.last_scan_at = Some(now);
         self.consecutive_failures = 0;
         if uploaded_count > 0 {
@@ -177,6 +180,7 @@ impl SourceCadence {
         if self.disabled {
             return;
         }
+        self.clear_continuation();
         self.last_scan_at = Some(now);
         self.consecutive_failures += 1;
         self.state = LocalCollectorState::Failing;
@@ -218,11 +222,36 @@ impl SourceCadence {
     /// unknown outcomes clear instead, so they can never manufacture urgency.
     /// Returns whether the request stands; a disabled source takes none.
     pub fn request_continuation(&mut self, finished_at: Instant, work: Duration) -> bool {
+        self.ordinary_pacing = None;
         self.continuation = (!self.disabled).then_some(ContinuationRequest { finished_at, work });
         self.continuation.is_some()
     }
 
+    /// Reuse the continuation request to bring the next ordinary scan forward.
+    /// It still prepares, saves and moves the ordinary clock on success.
+    pub fn request_paced_scan(
+        &mut self,
+        finished_at: Instant,
+        work: Duration,
+        pacing: ContinuationPacing,
+    ) -> bool {
+        let requested = self.request_continuation(finished_at, work);
+        self.ordinary_pacing = requested.then_some(pacing);
+        requested
+    }
+
+    pub fn paced_scan_due(&self) -> Option<Instant> {
+        self.due_with_pacing(self.ordinary_pacing?)
+    }
+
+    pub fn clear_cursor_continuation(&mut self) {
+        if self.ordinary_pacing.is_none() {
+            self.clear_continuation();
+        }
+    }
+
     pub fn clear_continuation(&mut self) {
+        self.ordinary_pacing = None;
         self.continuation = None;
     }
 
@@ -244,6 +273,13 @@ impl SourceCadence {
     /// does a continuation job's EOF completion: its caller saves the clock
     /// before the unchanged completion upload and restores it afterwards.
     pub fn continuation_due(&self, pacing: ContinuationPacing) -> Option<Instant> {
+        if self.ordinary_pacing.is_some() {
+            return None;
+        }
+        self.due_with_pacing(pacing)
+    }
+
+    fn due_with_pacing(&self, pacing: ContinuationPacing) -> Option<Instant> {
         if self.disabled {
             return None;
         }
@@ -274,7 +310,10 @@ impl SourceCadence {
         let since_scan = self
             .last_scan_at
             .map(|last_scan| now.saturating_duration_since(last_scan));
-        remaining_after(interval, since_scan)
+        let ordinary = remaining_after(interval, since_scan);
+        self.paced_scan_due().map_or(ordinary, |due| {
+            ordinary.min(due.saturating_duration_since(now))
+        })
     }
 
     fn failure_backoff(&self) -> Duration {

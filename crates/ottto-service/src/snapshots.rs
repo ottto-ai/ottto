@@ -557,6 +557,7 @@ pub struct SourceScanResult {
     pub discovered_file_count: usize,
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
+    pub(crate) charge_deferred: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,

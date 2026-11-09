@@ -146,7 +146,7 @@ impl Budget {
         flags: &BTreeMap<String, (bool, bool)>,
     ) {
         // One pending-queue walk per page, not one walk per deferred file.
-        sampled_scan::codex_cursor::requeue_members(index, flags, &self.deferred);
+        scan::owned_scan::requeue_members(index, flags, &self.deferred);
         self.deferred.clear();
         for (key, read) in &mut index.context_read_counts.read_paths {
             if let Some(&(census_member, watcher_hint)) = flags.get(key) {
