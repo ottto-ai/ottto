@@ -2153,7 +2153,7 @@ pub struct CodexCloudCliRunner;
 
 #[cfg(unix)]
 struct CodexCloudChild {
-    child: Option<std::process::Child>,
+    child: Option<crate::local_resource_diagnostics::cli_children::MeasuredChild>,
 }
 
 #[cfg(unix)]
@@ -2236,8 +2236,7 @@ fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<S
     command.process_group(0);
     let mut owned = CodexCloudChild {
         child: Some(
-            command
-                .spawn()
+            crate::local_resource_diagnostics::cli_children::spawn(command)
                 .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
         ),
     };

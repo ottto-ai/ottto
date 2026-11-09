@@ -1820,6 +1820,12 @@ fn collect_codex_status_snapshots(
         }
     }
 
+    CODEX_CLI_META
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain_listed(&codex_scan_homes.iter().cloned().collect());
+
     let mut snapshots = Vec::new();
     let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -3259,6 +3265,173 @@ pub fn parse_codex_status_fallback(
     snapshot
 }
 
+const CLI_META_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct CliMeta<F> {
+    loaded_at: Instant,
+    facts: F,
+}
+
+type CliFacts<K, F, const N: usize> = crate::transcript_acquisition::StampedFacts<
+    K,
+    CliMeta<F>,
+    [crate::transcript_acquisition::SourceStamp; N],
+>;
+
+#[derive(Clone)]
+struct CodexCliMeta {
+    // No account, email, plan or identity is retained from CLI text.
+    login: AgentLoginState,
+    models: AgentModelStatus,
+}
+
+static CODEX_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, CodexCliMeta, 3>>> = OnceLock::new();
+static CLAUDE_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, (), 1>>> = OnceLock::new();
+
+fn cli_meta<K: Ord + Clone, F: Clone, E, const N: usize>(
+    cache: &Mutex<CliFacts<K, F, N>>,
+    key: K,
+    capture: impl FnMut() -> std::io::Result<[crate::transcript_acquisition::SourceStamp; N]>,
+    load: impl FnOnce() -> Result<F, E>,
+    now: Instant,
+    bypass: bool,
+) -> Result<F, E> {
+    // Move this key out while loading: never hold the shared lock over a CLI
+    // spawn, file metadata lookup or parsing. Concurrent misses may both read.
+    let mut local = CliFacts::default();
+    {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stamp, facts)) = cache.kept.remove(&key) {
+            if !bypass && now.saturating_duration_since(facts.loaded_at) < CLI_META_MAX_AGE {
+                local.kept.insert(key.clone(), (stamp, facts));
+            }
+        }
+    }
+    let result = local.reuse_or_load(key.clone(), capture, || {
+        load().map(|facts| CliMeta {
+            loaded_at: now,
+            facts,
+        })
+    });
+    if let Some(kept) = local.kept.remove(&key) {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .kept
+            .insert(key, kept);
+    }
+    result.map(|entry| entry.facts)
+}
+
+fn cli_binary_stamp(binary: &str) -> std::io::Result<crate::transcript_acquisition::SourceStamp> {
+    let path = crate::command_env::executable_path(binary)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let stamp = crate::transcript_acquisition::SourceStamp::capture_file(&path.canonicalize()?)?;
+    match stamp {
+        crate::transcript_acquisition::SourceStamp::File(_) => Ok(stamp),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    }
+}
+
+fn codex_cli_meta(
+    home: &Path,
+    allow_legacy_oauth: bool,
+) -> (Result<AgentLoginState, CommandOutput>, AgentModelStatus) {
+    use crate::transcript_acquisition::SourceStamp;
+    let mut fresh = None;
+    let result = cli_meta(
+        CODEX_CLI_META.get_or_init(Default::default),
+        home.to_path_buf(),
+        || {
+            let binary = cli_binary_stamp("codex")?;
+            let auth = SourceStamp::capture_file(&home.join("auth.json"))?;
+            // Absent auth must never suppress a login probe (keyring homes).
+            if matches!(auth, SourceStamp::Absent) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            Ok([
+                binary,
+                auth,
+                SourceStamp::capture_file(&home.join("config.toml"))?,
+            ])
+        },
+        || {
+            let login = run_codex_home_command(
+                home,
+                &["login", "status"],
+                COMMAND_TIMEOUT,
+                allow_legacy_oauth,
+            );
+            let models = run_codex_home_command(
+                home,
+                &["debug", "models", "--bundled"],
+                COMMAND_TIMEOUT,
+                allow_legacy_oauth,
+            );
+            let parsed_login =
+                parse_codex_account_text(&login.stdout).map(|account| account.login_state);
+            let parsed_models = collect_codex_model_status_from_output(&models);
+            let valid = login.command_found
+                && login.success
+                && login.status_code == Some(0)
+                && parsed_login.is_some()
+                && models.command_found
+                && models.success
+                && models.status_code == Some(0)
+                && !parsed_models.available_models.is_empty();
+            if valid {
+                Ok(CodexCliMeta {
+                    login: parsed_login.unwrap(),
+                    models: parsed_models,
+                })
+            } else {
+                fresh = Some((login, parsed_login, parsed_models));
+                Err(())
+            }
+        },
+        Instant::now(),
+        crate::provider_calls::current_trigger() == Some(crate::provider_calls::Trigger::Setup),
+    );
+    match result {
+        Ok(meta) => (Ok(meta.login), meta.models),
+        Err(()) => {
+            let (output, parsed, models) = fresh.expect("loader returned uncached outputs");
+            (
+                if output.command_found && output.success {
+                    parsed.ok_or(output)
+                } else {
+                    Err(output)
+                },
+                models,
+            )
+        }
+    }
+}
+
+fn claude_version_detected() -> bool {
+    cli_meta(
+        CLAUDE_CLI_META.get_or_init(Default::default),
+        PathBuf::from("claude"),
+        || Ok([cli_binary_stamp("claude")?]),
+        || {
+            let output = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
+            if output.command_found
+                && output.success
+                && output.status_code == Some(0)
+                && !output.stdout.trim().is_empty()
+            {
+                Ok(())
+            } else {
+                Err(())
+            }
+        },
+        Instant::now(),
+        crate::provider_calls::current_trigger() == Some(crate::provider_calls::Trigger::Setup),
+    )
+    .is_ok()
+}
+
 fn collect_codex_status_for_home(
     captured_at: String,
     expires_at: String,
@@ -3297,36 +3470,38 @@ fn collect_codex_status_for_home(
         ..unsupported_account("openai")
     });
 
-    let login = run_codex_home_command(
-        codex_home,
-        &["login", "status"],
-        COMMAND_TIMEOUT,
-        allow_legacy_oauth,
-    );
-    if login.command_found {
-        snapshot.collection_method = AgentStatusCollectionMethod::CliText;
-        if login.success {
-            if let Some(account) = parse_codex_account_text(&login.stdout) {
-                snapshot.status = AgentStatusState::Available;
-                snapshot.account = Some(account);
+    let (login, mut model_status) = codex_cli_meta(codex_home, allow_legacy_oauth);
+    match login {
+        Ok(login_state) => {
+            snapshot.collection_method = AgentStatusCollectionMethod::CliText;
+            snapshot.status = AgentStatusState::Available;
+            if let Some(account) = &mut snapshot.account {
+                account.login_state = login_state;
+                account.auth_method = Some("oauth".to_string());
+                account.confidence = AgentStatusConfidence::Medium;
             }
-        } else {
-            snapshot.diagnostics.push(command_diagnostic(
-                "codex_login_status_failed",
-                "codex login status did not return a usable status.",
-                &login,
-            ));
-            if matches!(
-                login.status_code,
-                Some(1) | Some(2) | Some(64) | Some(65) | Some(66) | Some(67)
-            ) {
-                snapshot.status = AgentStatusState::AuthRequired;
-                if let Some(account) = &mut snapshot.account {
-                    account.login_state = AgentLoginState::SignedOut;
-                    account.confidence = AgentStatusConfidence::Medium;
+        }
+        Err(login) if login.command_found => {
+            snapshot.collection_method = AgentStatusCollectionMethod::CliText;
+            if !login.success {
+                snapshot.diagnostics.push(command_diagnostic(
+                    "codex_login_status_failed",
+                    "codex login status did not return a usable status.",
+                    &login,
+                ));
+                if matches!(
+                    login.status_code,
+                    Some(1) | Some(2) | Some(64) | Some(65) | Some(66) | Some(67)
+                ) {
+                    snapshot.status = AgentStatusState::AuthRequired;
+                    if let Some(account) = &mut snapshot.account {
+                        account.login_state = AgentLoginState::SignedOut;
+                        account.confidence = AgentStatusConfidence::Medium;
+                    }
                 }
             }
         }
+        Err(_) => {}
     }
     match read_codex_auth_account_at(codex_home, home_trust) {
         Ok(Some(auth_account)) => {
@@ -3337,13 +3512,6 @@ fn collect_codex_status_for_home(
         Err(_) => append_codex_credential_read_failed_diagnostic(&mut snapshot),
     }
 
-    let models = run_codex_home_command(
-        codex_home,
-        &["debug", "models", "--bundled"],
-        COMMAND_TIMEOUT,
-        allow_legacy_oauth,
-    );
-    let mut model_status = collect_codex_model_status_from_output(&models);
     apply_codex_config_model(
         &mut model_status,
         read_codex_config_model_at(codex_home, home_trust),
@@ -4465,7 +4633,7 @@ fn collect_claude_status(
                 ));
         }
     }
-    let version = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
+    let version_detected = claude_version_detected();
     snapshot.model = Some(AgentModelStatus {
         active_model: None,
         default_model: None,
@@ -4744,7 +4912,7 @@ fn collect_claude_status(
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
-    if version.command_found && version.success {
+    if version_detected {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "claude_version_detected",
             AgentDiagnosticSeverity::Info,
@@ -16521,7 +16689,7 @@ fn codex_app_server_end_failure(
     phase: &str,
     disconnected: bool,
     initialize_error: Option<&str>,
-    child: &mut std::process::Child,
+    child: &mut crate::local_resource_diagnostics::cli_children::MeasuredChild,
 ) -> String {
     if let Some(message) = initialize_error {
         return message.to_string();
@@ -16751,8 +16919,7 @@ fn run_codex_app_server_rate_limits_for_home(
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
     }
-    let mut child = command
-        .spawn()
+    let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command)
         .map_err(|_| "Codex app-server could not be started.".to_string())?;
     run.spawned = true;
     let stdout = child
@@ -19804,7 +19971,7 @@ fn run_command_capture_with_exact_env(
 
 fn run_prepared_command_capture(mut command: Command, timeout: Duration) -> CommandOutput {
     let start = Instant::now();
-    let mut child = match command.spawn() {
+    let mut child = match crate::local_resource_diagnostics::cli_children::spawn(&mut command) {
         Ok(child) => child,
         Err(_) => {
             return CommandOutput {
@@ -23047,17 +23214,273 @@ for line in sys.stdin:
         (root, home)
     }
 
+    /// [behaviour] Metadata input stamps, setup reads and age invalidate reuse.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_cache_input_changes() {
+        let (root, home) = cli_meta_fixture("cli-meta-inputs");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let starts = || {
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        let read = || {
+            assert!(codex_cli_meta(&home, false).0.is_ok());
+        };
+        read();
+        read();
+        assert_eq!(starts(), 2, "hit");
+        for (i, row) in ["binary", "auth", "config", "age", "setup"]
+            .iter()
+            .enumerate()
+        {
+            match *row {
+                "binary" => {
+                    let binary = root.join("codex");
+                    let script = fs::read_to_string(&binary).unwrap();
+                    fs::write(binary, format!("{script}\n# upgraded\n")).unwrap();
+                }
+                "auth" => fs::write(home.join("auth.json"), "{ \"tokens\": {} }").unwrap(),
+                "config" => fs::write(home.join("config.toml"), "model = \"gpt-5\"\n").unwrap(),
+                "age" => {
+                    CODEX_CLI_META
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .kept
+                        .get_mut(&home)
+                        .unwrap()
+                        .1
+                        .loaded_at = Instant::now() - CLI_META_MAX_AGE;
+                }
+                "setup" => {}
+                _ => unreachable!(),
+            }
+            if *row == "setup" {
+                crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, read);
+            } else {
+                read();
+            }
+            read();
+            assert_eq!(starts(), 4 + 2 * i, "{row} reruns then reuses");
+        }
+        fs::remove_file(home.join("auth.json")).unwrap();
+        read();
+        read();
+        assert_eq!(starts(), 16, "absent auth never reuses");
+        assert!(!CODEX_CLI_META
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .kept
+            .contains_key(&home));
+        fs::write(home.join("auth.json"), "{}").unwrap();
+        read();
+        let mut cache = CODEX_CLI_META.get().unwrap().lock().unwrap();
+        cache.retain_listed(&BTreeSet::new());
+        assert!(!cache.kept.contains_key(&home), "removed home evicted");
+        drop(cache);
+        read();
+        assert_eq!(starts(), 20, "evicted home reruns");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] Failed, timed-out, nonzero and unparsed CLI results never cache.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_cache_failures_are_not_kept() {
+        let (root, home) = cli_meta_fixture("cli-meta-failure");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let binary = root.join("codex");
+        let successful = fs::read_to_string(&binary).unwrap();
+        for row in ["nonzero", "unparsed", "models-unparsed"] {
+            let script = match row {
+                "nonzero" => successful.replace(
+                    "print(\"Logged in\")",
+                    "print(\"not logged in\"); sys.exit(1)",
+                ),
+                "unparsed" => successful.replace("Logged in", "unrecognized"),
+                _ => successful.replace("gpt-5", "unrecognized"),
+            };
+            fs::write(&binary, script).unwrap();
+            for _ in 0..2 {
+                let _ = codex_cli_meta(&home, false);
+            }
+            assert!(
+                !CODEX_CLI_META
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .kept
+                    .contains_key(&home),
+                "{row}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            12
+        );
+        // Existing runner seam: a missing executable and an actual deadline,
+        // fed through the same cache helper; errors cannot become kept facts.
+        for timeout in [false, true] {
+            let cache = Mutex::new(CliFacts::<u8, (), 1>::default());
+            let mut runs = 0;
+            for _ in 0..2 {
+                let result = cli_meta(
+                    &cache,
+                    0,
+                    || Ok([cli_binary_stamp("codex")?]),
+                    || {
+                        runs += 1;
+                        let output = if timeout {
+                            let mut command = Command::new("/bin/sh");
+                            command
+                                .args(["-c", "exec sleep 30"])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null());
+                            run_prepared_command_capture(command, Duration::from_millis(20))
+                        } else {
+                            let command = Command::new(root.join("missing"));
+                            run_prepared_command_capture(command, Duration::from_millis(20))
+                        };
+                        assert!(!output.success);
+                        assert_eq!(output.status_code, None);
+                        Err::<(), _>(())
+                    },
+                    Instant::now(),
+                    false,
+                );
+                assert!(result.is_err());
+            }
+            assert_eq!(runs, 2, "timeout={timeout}");
+            assert!(cache.lock().unwrap().kept.is_empty());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] Version reuse follows only Claude's binary, not home files.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cli_metadata_cache_claude_binary() {
+        let (root, home) = cli_meta_fixture("cli-meta-claude");
+        let binary = root.join("claude");
+        let script = format!(
+            "#!/bin/sh\necho start >> '{}'\necho 2.1.288\n",
+            home.join("starts").display()
+        );
+        fs::write(&binary, &script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        assert!(claude_version_detected());
+        assert!(claude_version_detected());
+        fs::write(home.join("config.toml"), "unrelated = true").unwrap();
+        assert!(claude_version_detected());
+        assert_eq!(
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::write(&binary, format!("{script}# upgrade\n")).unwrap();
+        assert!(claude_version_detected());
+        assert_eq!(
+            fs::read_to_string(home.join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [behaviour] Shared witnesses never follow symlinks or keep racing loads.
+    #[cfg(unix)]
+    #[test]
+    fn cli_metadata_source_stamps() {
+        use crate::transcript_acquisition::{SourceStamp, StampedFacts};
+        let root = std::env::temp_dir().join(format!("ottto-cli-stamps-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source");
+        assert!(matches!(
+            SourceStamp::capture_file(&path).unwrap(),
+            SourceStamp::Absent
+        ));
+        assert!(SourceStamp::capture_file(&root).is_err());
+        fs::write(&path, "a").unwrap();
+        let a = SourceStamp::capture_file(&path).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(SourceStamp::capture_file(&link).is_err());
+        let mut cache = StampedFacts::default();
+        let mut runs = 0;
+        for _ in 0..2 {
+            let facts = cache
+                .reuse_or_load(
+                    0,
+                    || SourceStamp::capture_file(&path),
+                    || {
+                        runs += 1;
+                        Ok::<_, ()>(7)
+                    },
+                )
+                .unwrap();
+            assert_eq!(facts, 7);
+        }
+        assert_eq!(runs, 1);
+        fs::write(&path, "changed").unwrap();
+        assert!(!a.same(&SourceStamp::capture_file(&path).unwrap()));
+        cache
+            .reuse_or_load(
+                0,
+                || SourceStamp::capture_file(&path),
+                || {
+                    fs::write(&path, "changed during load").unwrap();
+                    Ok::<_, ()>(8)
+                },
+            )
+            .unwrap();
+        assert!(cache.kept.is_empty(), "before differs from after");
+        for _ in 0..2 {
+            assert!(cache
+                .reuse_or_load(0, || SourceStamp::capture_file(&path), || Err::<i32, _>(()))
+                .is_err());
+        }
+        assert!(cache.kept.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn cli_meta_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let (root, home) = synthetic_codex_collector_home(label, 0o600);
+        let binary = root.join("codex");
+        let script = fs::read_to_string(&binary).unwrap().replace(
+            "import sys", "import sys, os\nif sys.argv[1:] in ([\"login\", \"status\"], [\"debug\", \"models\", \"--bundled\"]):\n    with open(os.path.join(os.environ[\"CODEX_HOME\"], \"starts\"), \"a\") as f: f.write(\"start\\n\")"
+        ).replace("synthetic-model", "gpt-5");
+        fs::write(binary, script).unwrap();
+        (root, home)
+    }
+
     /// [regress] Repeated status collection must not spawn unchanged CLI metadata.
     #[cfg(unix)]
     #[test]
     #[serial]
     fn cli_metadata_cache_hit_skips_spawn() {
-        let (root, home) = synthetic_codex_collector_home("cli-meta-hit", 0o600);
-        let binary = root.join("codex");
-        let script = fs::read_to_string(&binary).unwrap().replace(
-            "import sys", "import sys, os\nif sys.argv[1:] in ([\"login\", \"status\"], [\"debug\", \"models\", \"--bundled\"]):\n    with open(os.path.join(os.environ[\"CODEX_HOME\"], \"starts\"), \"a\") as f: f.write(\"start\\n\")"
-        ).replace("synthetic-model", "gpt-5");
-        fs::write(&binary, script).unwrap();
+        let (root, home) = cli_meta_fixture("cli-meta-hit");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
         for _ in 0..2 {

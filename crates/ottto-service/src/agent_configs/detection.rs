@@ -172,12 +172,12 @@ fn claude_desktop_support_dir(home: &Path) -> PathBuf {
 
 fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
     let start = Instant::now();
-    let mut child = Command::new(binary_path)
+    let mut command = Command::new(binary_path);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command).ok()?;
 
     loop {
         match child.try_wait() {

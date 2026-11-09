@@ -41,10 +41,11 @@
 //! `daemon_sign_in_supported` says this daemon runs sign-ins, not that the
 //! Codex CLI is installed: a missing CLI ends the run `codex_unavailable`.
 
+use crate::local_resource_diagnostics::cli_children::MeasuredChild as Child;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -486,7 +487,7 @@ fn supervise_login(run: &Arc<Run>, home: &Path, deadline: Deadline) -> LoginEnd 
     if run.cancelled() {
         return LoginEnd::Ended(CodexAccountSignInOutcomeV1::Cancelled, CANCELLED_MESSAGE);
     }
-    let Ok(mut child) = command.spawn() else {
+    let Ok(mut child) = crate::local_resource_diagnostics::cli_children::spawn(&mut command) else {
         return LoginEnd::Ended(
             CodexAccountSignInOutcomeV1::CodexUnavailable,
             CODEX_UNAVAILABLE_MESSAGE,
