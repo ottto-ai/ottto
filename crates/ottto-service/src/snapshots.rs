@@ -169,12 +169,8 @@ pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
-mod codex_counting_lifecycle_tests;
-#[cfg(test)]
-mod codex_counting_rss_tests;
-#[cfg(test)]
 mod codex_counting_v2_tests;
-mod codex_counting_version;
+use sources::codex::counting::version as codex_counting_version;
 use sources::codex::dictionary_slots as codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
