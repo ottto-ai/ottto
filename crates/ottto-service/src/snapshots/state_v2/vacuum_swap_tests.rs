@@ -190,16 +190,12 @@ fn erasure_swap_faults_keep_custody_for_every_source() {
 }
 
 /// [regress] Space admission is one copy plus the WAL plus 1 GiB, not two
-/// copies; a busy TRUNCATE fails before any copy exists; the separate upload
-/// history file is never touched.
+/// copies.
 #[test]
-fn erasure_swap_space_busy_and_history() {
+fn erasure_swap_admits_one_copy_plus_wal_and_reserve() {
     const GIB: u64 = 1 << 30;
-    let dir = ScratchDir::canonical("vacuum-swap-single");
+    let dir = ScratchDir::canonical("vacuum-swap-space");
     let (mut db, path, _) = store(Source::Claude, &dir);
-    let history = dir.join(sqlite::history::FILE_NAME);
-    fs::write(&history, b"history rows").unwrap();
-    let history_inode = ino(&history);
     // A complete idle TRUNCATE leaves no WAL: the copy needs file + 1 GiB.
     let idle = db.checkpoint(CheckpointMode::IdleReclaim);
     assert_eq!(idle.state, CheckpointState::Complete);
@@ -217,8 +213,19 @@ fn erasure_swap_space_busy_and_history() {
     sqlite::set_space_reader(&mut db, Some(|p| Some(fs::metadata(p).ok()?.len() + GIB)));
     let admitted = db.checkpoint(CheckpointMode::Purge);
     assert_eq!(admitted.state, CheckpointState::Complete);
+}
+
+/// [regress] A busy TRUNCATE fails before any copy exists; the separate
+/// upload history file is never touched.
+#[test]
+fn erasure_swap_busy_truncate_fails_before_the_copy() {
+    let dir = ScratchDir::canonical("vacuum-swap-busy");
+    let (mut db, path, _) = store(Source::Codex, &dir);
+    let history = dir.join(sqlite::history::FILE_NAME);
+    fs::write(&history, b"history rows").unwrap();
+    let history_inode = ino(&history);
+    assert_eq!(attempt(&mut db).map(|()| pending(&db)).unwrap(), Some(0));
     // Another writer keeps TRUNCATE from completing.
-    sqlite::set_space_reader(&mut db, None);
     db.control("erasure_pending", &EPOCH).unwrap();
     let writer = rusqlite::Connection::open(&path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
