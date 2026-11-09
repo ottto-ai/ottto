@@ -125,6 +125,17 @@ fn drain_from(
         }
         assert!(page.scan.charge_deferred);
         if restart {
+            let progress_path = c.base.join("resident-progress.json");
+            progress.save(&progress_path).unwrap();
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 99),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            progress
+                .accepted_identity_buckets
+                .bind_test_key(Some([0x42; 32]));
             scanner = E2ScanFixture::capturing_identity();
             scanner.on_committed_route(
                 &crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).unwrap(),
@@ -257,7 +268,7 @@ fn resident_wave_final_acked_money_and_saved_deferral_restart_are_equal() {
 }
 
 /// [money] Deferred units retain nonempty accepted proof and never settle an
-/// unaccepted successor. Every refusal variant is followed by an eventual ACK.
+/// unaccepted successor; an exact ACK receipt survives a process reopen.
 #[test]
 fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() {
     if !supported("resident-wave-held") {
