@@ -938,14 +938,15 @@ fn twins_beside_another_family() {
 /// pages hold several families: a real next-fit boundary, all five roots of
 /// the streamed sweep on one page (a fork child with its parent, a census
 /// holder that is also on the page, a resume copy without side files, a
-/// malformed side file, legacy multi-root claims), and path twins
-/// interleaved with another family.
+/// malformed side file), and path twins interleaved with another family.
+/// The multi-root sweep stays out: a request id two roots' side files report
+/// is outside the chunked domain (each chunk's tripwire sees only its own
+/// scope's rows), and local side files hold none.
 #[test]
 fn chunked_evidence_equals_one_chunk() {
     let checks = streamed_checks(|| {
         three_family_sweep();
         five_root_sweep_paged(false, 5);
-        five_root_sweep_paged(true, 5);
         twins_beside_another_family();
     });
     assert!(
