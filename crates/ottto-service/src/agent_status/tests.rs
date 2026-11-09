@@ -3132,6 +3132,10 @@ for line in sys.stdin:
     (root, home)
 }
 
+mod cli_metadata_tests {
+    include!("cli_metadata_tests.rs");
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]

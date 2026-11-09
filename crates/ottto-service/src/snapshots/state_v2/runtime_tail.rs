@@ -30,7 +30,7 @@ pub(in crate::snapshots) fn carry_tail(
                 }
             };
             let moved = state.tail.carry_observation(to, &carry)?;
-            recovered_write(&path, None, &id, session, |session| {
+            typed_write(session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
                 session.cx.tail = Some(moved);
                 let digests =
@@ -256,7 +256,7 @@ fn exit_commit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
         .0;
     let _save_window = telemetry::Window::begin("save");
     with_save_session(path, Some(runtime), expected, |state, session, id| {
-        recovered_write(path, None, &id, session, |session| {
+        typed_write(session, |session| {
             super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail)?;
             session.stamp = session.db.stamp()?;
             state.save_digests = None;

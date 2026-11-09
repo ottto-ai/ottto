@@ -132,7 +132,6 @@ fn identity(tx: &mut dyn Transaction) -> Result<Identity> {
 /// Kept private; filenames, commitments and namespace bindings are not telemetry.
 #[derive(Default, Debug)]
 pub(super) struct Original {
-    progress: Option<super::ack::OriginalProgress>,
     pub(super) presence: std::collections::BTreeMap<String, bool>,
     files: Vec<OriginalFile>,
     missing: Option<std::path::PathBuf>,
@@ -611,29 +610,9 @@ impl Original {
         result.unchanged()?;
         Ok(result)
     }
-    pub(super) fn capture_progress(&mut self, path: &Path) -> Result<()> {
-        self.progress = Some(super::ack::OriginalProgress::capture(path)?);
-        Ok(())
-    }
-    pub(super) fn retry_identity(&self, proposed: Identity) -> Result<Identity> {
-        self.progress
-            .as_ref()
-            .ok_or(Pause::Mismatch)?
-            .retry_identity(proposed)
-    }
-    #[cfg(test)]
-    pub(super) fn seal_progress(
-        &self,
-        path: &Path,
-        identity: &Identity,
-        store: &mut sqlite::Sqlite,
-    ) -> Result<()> {
-        self.verify_baseline(path)?;
-        self.progress
-            .as_ref()
-            .ok_or(Pause::Mismatch)?
-            .seal(path, identity, store)
-    }
+    /// Publish the import. Upload progress is not part of it: the JSON
+    /// ledger stays where it is until the route's first progress load moves
+    /// it into rows.
     pub(super) fn publish_import(
         &self,
         path: &Path,
@@ -642,14 +621,9 @@ impl Original {
         latched: &mut bool,
     ) -> Result<()> {
         self.verify_baseline(path)?;
-        self.progress
-            .as_ref()
-            .ok_or(Pause::Mismatch)?
-            .with_sealed_import(path, identity, db, |db| {
-                db.finish_import()?;
-                self.unchanged()?;
-                fence::publish(path, identity, latched)
-            })
+        db.finish_import()?;
+        self.unchanged()?;
+        fence::publish(path, identity, latched)
     }
     fn verify_baseline(&self, path: &Path) -> Result<()> {
         for (n, source) in self.files.iter().enumerate() {
@@ -954,7 +928,7 @@ mod application_cases {
 
     /// [format] composed import advances once and seals owned progress before final path exists.
     #[test]
-    fn composed_import_advances_once_and_seals_owned_progress_before_final_path_exists() {
+    fn composed_import_advances_once_before_final_path_exists() {
         for generation in [0_u64, 41] {
             let c = Corpus::new();
             let index = ScanIndex {
@@ -963,8 +937,7 @@ mod application_cases {
             };
             ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&index).unwrap())
                 .unwrap();
-            let mut original = Original::read(&c.path).unwrap();
-            original.capture_progress(&c.path).unwrap();
+            let original = Original::read(&c.path).unwrap();
             original.preserve(&c.path).unwrap();
             let identity = Identity {
                 format: FORMAT,
@@ -994,21 +967,11 @@ mod application_cases {
                 serde_json::to_vec(&loaded).unwrap(),
                 serde_json::to_vec(&index).unwrap()
             );
-            // Capture and verify on the import snapshot, before final DB exists.
-            original.seal_progress(&c.path, &identity, &mut db).unwrap();
-            original.seal_progress(&c.path, &identity, &mut db).unwrap();
-            let receipt = fs::read(fence::sibling(&c.path, ".v2-ack-receipt")).unwrap();
+            // The import writes no progress custody beside the graph.
             assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
+            assert!(!fence::sibling(&c.path, ".v2-ack-receipt").exists());
             db.finish_import().unwrap();
-            let mut proposed = identity.clone();
-            proposed.db_id = "different-attempt".into();
-            assert_eq!(original.retry_identity(proposed).unwrap(), identity);
             fence::cleanup_unpublished(&c.path, false).unwrap();
-            assert_eq!(
-                fs::read(fence::sibling(&c.path, ".v2-ack-receipt")).unwrap(),
-                receipt,
-                "failed-import companion custody survives ordinary orphan cleanup"
-            );
         }
     }
 
@@ -1087,7 +1050,7 @@ mod application_cases {
                     Ok(path.to_owned())
                 })
                 .unwrap();
-            let mut original = Original::read(&c.path).unwrap();
+            let original = Original::read(&c.path).unwrap();
             let identity = Identity {
                 format: FORMAT,
                 db_id: "large-traversal".into(),
@@ -1110,7 +1073,6 @@ mod application_cases {
             drop(tx);
             let restored = hydrate_context(&mut db).unwrap().0;
             assert_eq!(serde_json::to_vec(&restored.traversal).unwrap(), expected);
-            original.capture_progress(&c.path).unwrap();
             original.preserve(&c.path).unwrap();
             original
                 .publish_import(&c.path, &identity, db, &mut false)
@@ -1124,8 +1086,7 @@ mod application_cases {
             let wide = serde_json::to_vec(&current.traversal).unwrap();
             assert!(wide.len() > 16 * 1024 * 1024);
             assert!(
-                super::super::runtime::save_locked(&c.path, &mut current, false, None, true)
-                    .unwrap()
+                super::super::runtime::save_locked(&c.path, &mut current, false, true).unwrap()
             );
             let saved = serde_json::to_vec(&current).unwrap();
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
@@ -1156,7 +1117,7 @@ mod application_cases {
 
     /// [format] import publication holds progress owner and reopens real claude mapper at new generation.
     #[test]
-    fn import_publication_holds_progress_owner_and_reopens_real_claude_mapper_at_new_generation() {
+    fn import_publication_leaves_progress_and_reopens_real_claude_mapper_at_new_generation() {
         let c = Corpus::new();
         let index = ScanIndex {
             generation: 9,
@@ -1164,8 +1125,7 @@ mod application_cases {
         };
         ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&index).unwrap())
             .unwrap();
-        let mut original = Original::read(&c.path).unwrap();
-        original.capture_progress(&c.path).unwrap();
+        let original = Original::read(&c.path).unwrap();
         original.preserve(&c.path).unwrap();
         let identity = Identity {
             format: FORMAT,
@@ -1179,19 +1139,11 @@ mod application_cases {
         db.control("generation", &9_u64).unwrap();
         import_graph(&mut db, &index, Some(&original)).unwrap();
         original
-            .progress
-            .as_ref()
-            .unwrap()
-            .with_sealed_import(&c.path, &identity, db, |db| {
-                assert!(
-                    crate::snapshot_sync::with_state_v2_progress_lock(&c.path, |_| Ok(())).is_err(),
-                    "the post-seal callback still owns the progress lock"
-                );
-                db.finish_import()?;
-                original.unchanged()?;
-                fence::publish(&c.path, &identity, &mut false)
-            })
+            .publish_import(&c.path, &identity, db, &mut false)
             .unwrap();
+        // Publication takes no progress owner and writes no receipt.
+        assert!(crate::snapshot_sync::with_state_v2_progress_lock(&c.path, |_| Ok(())).is_ok());
+        assert!(!fence::sibling(&c.path, ".v2-ack-receipt").exists());
         let _lock = super::super::super::CheckpointLock::acquire(&c.path).unwrap();
         let loaded = super::super::runtime::load_locked(
             &c.path,
@@ -1203,52 +1155,6 @@ mod application_cases {
         .unwrap();
         assert_eq!(loaded.generation, 10);
         assert!(loaded.v2().persistence_v2.is_some());
-    }
-
-    /// [format] original progress requires owner and unchanged bytes and baseline.
-    #[test]
-    fn original_progress_requires_owner_and_unchanged_bytes_and_baseline() {
-        let c = Corpus::new();
-        let progress_path = c.path.with_file_name(money_test_support::synthetic_file(
-            super::super::super::scan_index_persistence::Source::Claude,
-            "-upload-progress.json",
-        ));
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "schema_version":3, "generation":7, "destination_namespace_hash":c.binding().namespace_hash,
-            "opaque_extension":{"exact":"bytes"}
-        })).unwrap();
-        ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
-        let mut original = Original::read(&c.path).unwrap();
-        original.capture_progress(&c.path).unwrap();
-        let identity = Identity {
-            format: FORMAT,
-            db_id: "owned-import".into(),
-            binding: c.binding(),
-            fence_generation: 1,
-        };
-        // An existing companion belongs to the exact original owner, not a name.
-        let recovery = super::super::ack::ProgressRecovery::seal_import(
-            identity.clone(),
-            1,
-            &c.path,
-            Some(&bytes),
-        )
-        .unwrap();
-        drop(recovery);
-        assert_eq!(original.retry_identity(identity.clone()).unwrap(), identity);
-        let mut changed = bytes.clone();
-        changed.push(b' ');
-        ottto_core::write_owner_only_file_atomic(&progress_path, &changed).unwrap();
-        assert!(original.retry_identity(identity.clone()).is_err());
-        ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
-        let foreign = serde_json::to_vec(
-            &serde_json::json!({"schema_version":3,"destination_namespace_hash":"b".repeat(64)}),
-        )
-        .unwrap();
-        ottto_core::write_owner_only_file_atomic(&progress_path, &foreign).unwrap();
-        assert!(super::super::ack::OriginalProgress::capture(&c.path).is_err());
-        assert_eq!(fs::read(&progress_path).unwrap(), foreign);
-        assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
     }
 
     /// [format] original presence precedes normalization and inventory has no write side effects.

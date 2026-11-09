@@ -1978,83 +1978,21 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
 }
 
 // Synthetic persisted ACKs only; no live source/provider/account state.
-fn bound_progress(
-    index_path: &Path,
-    progress_path: &Path,
-    namespace: &str,
-) -> SnapshotUploadProgress {
+fn bound_progress(progress_path: &Path, namespace: &str) -> SnapshotUploadProgress {
     let mut progress = SnapshotUploadProgress::new(
         namespace.into(),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     );
-    let recovery = crate::snapshots::ProgressRecovery::synthetic(index_path, namespace, 0);
-    recovery.adopt_synthetic(None);
-    progress.ack_recovery = Some(Box::new(recovery));
     progress.save(progress_path).unwrap();
     progress
 }
-fn load_bound_progress(
-    progress: &SnapshotUploadProgress,
-    path: &Path,
-    namespace: &str,
-) -> SnapshotUploadProgress {
-    progress
-        .ack_recovery
-        .as_ref()
-        .unwrap()
-        .recover(path)
-        .unwrap();
-    let mut loaded = SnapshotUploadProgress::load(
+fn load_bound_progress(path: &Path, namespace: &str) -> SnapshotUploadProgress {
+    SnapshotUploadProgress::load(
         path,
         namespace,
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
-    .unwrap();
-    loaded.ack_recovery = progress.ack_recovery.clone();
-    loaded
-}
-/// [money] v2 receipt first crash restores exact ack without duplicate accepted upload.
-#[test]
-fn v2_receipt_first_crash_restores_exact_ack_without_duplicate_accepted_upload() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-upload-crash");
-    let index_path = scratch.join("index");
-    let path = scratch.join("progress");
-    let namespace = "a".repeat(64);
-    let mut progress = bound_progress(&index_path, &path, &namespace);
-    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-    let old = std::fs::read(&path).unwrap();
-    progress.record_body(
-        &item.snapshot_fingerprint,
-        &snapshot_upload_body_witness(&item),
-    );
-    progress.generation += 1;
-    let new = serde_json::to_vec_pretty(&progress).unwrap();
-    progress
-        .ack_recovery
-        .as_ref()
-        .unwrap()
-        .before_progress_save_bytes(Some(&old), &new)
-        .unwrap();
-    // Crash before progress rename and before any v2 accepted-state commit.
-    assert_eq!(std::fs::read(&path).unwrap(), old);
-    let mut loaded = load_bound_progress(&progress, &path, &namespace);
-    let mut accepted = 0;
-    let mut posts = 0;
-    upload_resumable_batches_with_body_witness(
-        &[item],
-        &unique_poison_scope(),
-        &mut loaded,
-        &mut accepted,
-        |item| item.snapshot_fingerprint.as_str(),
-        snapshot_upload_body_witness,
-        |batch| {
-            posts += 1;
-            exact_ack(batch)
-        },
-        |state| state.save(&path),
-    )
-    .unwrap();
-    assert_eq!((posts, accepted), (0, 0));
+    .unwrap()
 }
 /// [money] v2 db first crash retires only the committed exact handoff.
 #[test]
@@ -2065,7 +2003,7 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     let namespace = "a".repeat(64);
     let fp = "b".repeat(64);
     let body = "c".repeat(64);
-    let mut progress = bound_progress(&index_path, &path, &namespace);
+    let mut progress = bound_progress(&path, &namespace);
     progress.record_body(&fp, &body);
     progress.save(&path).unwrap();
     let mut saved = ScanIndex::default();
@@ -2077,49 +2015,14 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     });
     saved.save(&index_path).unwrap();
     // Crash after source commit, before cleanup of the external progress ACK.
-    let mut loaded = load_bound_progress(&progress, &path, &namespace);
+    let mut loaded = load_bound_progress(&path, &namespace);
     loaded
         .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
         .unwrap();
     assert!(loaded.accepted_fingerprints.is_empty());
     assert!(saved.upload_ack_retirement_handoff.is_none());
-    let reloaded = load_bound_progress(&loaded, &path, &namespace);
+    let reloaded = load_bound_progress(&path, &namespace);
     assert!(reloaded.accepted_fingerprints.is_empty());
-}
-/// [money] v2 newer receipt precedes older db retirement and cannot be retired by it.
-#[test]
-fn v2_newer_receipt_precedes_older_db_retirement_and_cannot_be_retired_by_it() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-newer-first");
-    let index_path = scratch.join("index");
-    let path = scratch.join("progress");
-    let namespace = "a".repeat(64);
-    let fp = "b".repeat(64);
-    let mut progress = bound_progress(&index_path, &path, &namespace);
-    progress.record_body(&fp, &"c".repeat(64));
-    progress.save(&path).unwrap();
-    let old = std::fs::read(&path).unwrap();
-    progress.record_body(&fp, &"d".repeat(64));
-    progress.generation += 1;
-    progress
-        .ack_recovery
-        .as_ref()
-        .unwrap()
-        .before_progress_save_bytes(Some(&old), &serde_json::to_vec_pretty(&progress).unwrap())
-        .unwrap();
-    let mut saved = ScanIndex::default();
-    saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
-        destination_namespace_hash: namespace.clone(),
-        committed_generation: 1,
-        bodies: [(fp.clone(), "c".repeat(64))].into(),
-        pending_bodies: BTreeMap::new(),
-    });
-    saved.save(&index_path).unwrap();
-    let mut loaded = load_bound_progress(&progress, &path, &namespace);
-    loaded
-        .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
-        .unwrap();
-    assert_eq!(loaded.accepted_body_witnesses[&fp], "d".repeat(64));
-    assert!(saved.upload_ack_retirement_handoff.is_none());
 }
 /// [money] v2 transport error and failed index commit never authorize an ack.
 #[test]
@@ -2128,7 +2031,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
     let index_path = scratch.join("index");
     let path = scratch.join("progress");
     let namespace = "a".repeat(64);
-    let mut progress = bound_progress(&index_path, &path, &namespace);
+    let mut progress = bound_progress(&path, &namespace);
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let mut accepted = 0;
     let result = upload_resumable_batches_with_body_witness(
@@ -2142,7 +2045,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
         |state| state.save(&path),
     );
     assert!(result.is_err());
-    let loaded = load_bound_progress(&progress, &path, &namespace);
+    let loaded = load_bound_progress(&path, &namespace);
     assert!(loaded.accepted_fingerprints.is_empty());
     assert_eq!(accepted, 0);
 
@@ -2164,58 +2067,6 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
         .recover_ack_retirement_handoff(&mut tentative, &index_path, &path)
         .unwrap();
     assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
-}
-
-/// [off=main] v2 runtime binding preserves existing progress bytes and off performs no receipt io.
-#[test]
-fn v2_runtime_binding_preserves_existing_progress_bytes_and_off_performs_no_receipt_io() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-off-bytes");
-    let index_path = scratch.join("absent-index");
-    let mut progress = SnapshotUploadProgress::new(
-        "a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    );
-    progress.record_body(&"b".repeat(64), &"c".repeat(64));
-    let existing_bytes = serde_json::to_vec_pretty(&progress).unwrap();
-    progress.ack_recovery = Some(Box::new(crate::snapshots::ProgressRecovery::synthetic(
-        &index_path,
-        &"a".repeat(64),
-        0,
-    )));
-    assert_eq!(
-        serde_json::to_vec_pretty(&progress).unwrap(),
-        existing_bytes
-    );
-    assert!(
-        crate::snapshots::ProgressRecovery::for_index(&ScanIndex::default(), &index_path)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
-}
-
-/// [money] v2 bound invalid progress holds without legacy quarantine or reset.
-#[test]
-fn v2_bound_invalid_progress_holds_without_legacy_quarantine_or_reset() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-no-quarantine");
-    let path = scratch.join("progress");
-    let recovery =
-        crate::snapshots::ProgressRecovery::synthetic(&scratch.join("index"), &"a".repeat(64), 0);
-    let invalid = SnapshotUploadProgress::new(
-        "b".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    );
-    let bytes = serde_json::to_vec_pretty(&invalid).unwrap();
-    ottto_core::write_owner_only_file_atomic(&path, &bytes).unwrap();
-    recovery.adopt_synthetic(Some(&bytes));
-    assert!(SnapshotUploadProgress::load_with_recovery(
-        &path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        Some(recovery),
-    )
-    .is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
 /// [regress] This pass's own unsaved progress merge no longer refuses a
@@ -2343,10 +2194,18 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 &std::fs::read(&progress_path).unwrap(),
             );
             let mut working = committed.clone();
-            progress.ack_recovery =
-                crate::snapshots::ProgressRecovery::for_index(&committed, &index_path)
-                    .unwrap()
-                    .map(Box::new);
+            // The routed progress: the rows its first load imports.
+            let load = || {
+                SnapshotUploadProgress::load_for_index(
+                    &committed,
+                    &index_path,
+                    &progress_path,
+                    &f.namespace,
+                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                )
+                .unwrap()
+            };
+            progress = load();
             // Two exact sibling ACKs followed by a real uploader stop. No file
             // publication changes: the activation/staging guard stays intact.
             let upload = |items: &[SnapshotItem],
@@ -2397,7 +2256,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                         .is_some());
                 }
             }
-            let persisted_progress = std::fs::read(&progress_path).unwrap();
+            let persisted_progress = serde_json::to_value(load()).unwrap();
             working.mark_bounded_sweep_unsettled();
             let saved = checkpoint_partial_snapshot_index_with_audit_release(
                 &working,
@@ -2444,7 +2303,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 accepted.keys().cloned().collect(),
                 "only saved exact bodies may retire"
             );
-            assert_eq!(std::fs::read(&progress_path).unwrap(), persisted_progress);
+            assert_eq!(serde_json::to_value(load()).unwrap(), persisted_progress);
             progress
                 .release_acks_after_partial_index_save(
                     &progress_path,
@@ -2455,24 +2314,16 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 )
                 .unwrap();
             assert!(progress.accepted_body_witnesses.is_empty());
-            let reloaded = SnapshotUploadProgress::load(
-                &progress_path,
-                &f.namespace,
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .unwrap();
-            assert!(reloaded.accepted_fingerprints.is_empty());
+            assert!(load().accepted_fingerprints.is_empty());
         }
     }
 }
 
-/// Progress and receipt bytes (SHA-256) after each save in the test below,
-/// written as compact JSON.
-const ACK_SAVE_BYTES: [&str; 4] = [
+/// Progress bytes (SHA-256) after each save in the test below, written as
+/// compact JSON.
+const ACK_SAVE_BYTES: [&str; 2] = [
     "3cb0d1c2f50044d3f7c741074b0e157bc06fe1717de0c5e4e09ed42e14d67728",
-    "56be4e6c2e107513748b85d79c209550a2e495c6515e7c9faa68b66f41c9c152",
     "0ad339132c749dcc24faf3cdc23ba5804ab6503e27cbc37d953bbd15aab199fc",
-    "aac690e0dde83355a31294447aeb1f209fe2e0561ebd866ba1b36e416a3296ee",
 ];
 /// The same two progress saves (SHA-256) as the earlier pretty-printed build
 /// wrote them, before the save kept one copy of the progress.
@@ -2480,16 +2331,14 @@ const PRETTY_PROGRESS_BYTES: [&str; 2] = [
     "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
     "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
 ];
-/// [money] An ACK-bound save writes stable progress and receipt bytes through
-/// both compare-and-swap decode paths, the receipt seals exactly the saved
-/// progress, and the compact progress holds the same ledger the pretty build
-/// wrote: printed pretty again, it is byte-identical.
+/// [money] An ACK save writes stable progress bytes through both
+/// compare-and-swap decode paths, and the compact progress holds the same
+/// ledger the pretty build wrote: printed pretty again, it is byte-identical.
 #[test]
-fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
+fn ack_bound_saves_keep_exact_progress_bytes() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-bytes");
-    let index_path = scratch.join("index");
     let path = scratch.join("progress");
-    let mut progress = bound_progress(&index_path, &path, &"a".repeat(64));
+    let mut progress = bound_progress(&path, &"a".repeat(64));
     let mut hashes = Vec::new();
     let mut pretty = Vec::new();
     let sha = |bytes: &[u8]| crate::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
@@ -2503,26 +2352,21 @@ fn ack_bound_saves_keep_exact_progress_and_receipt_bytes() {
         let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
         progress.save_with_read_limit(&path, limit).unwrap();
         let saved = std::fs::read(&path).unwrap();
-        let receipt = std::fs::read(scratch.join("index.v2-ack-receipt")).unwrap();
-        let sealed: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
-        assert_eq!(sealed["progress"].as_str().unwrap().as_bytes(), saved);
         let ledger: SnapshotUploadProgress = serde_json::from_slice(&saved).unwrap();
         pretty.push(sha(&serde_json::to_vec_pretty(&ledger).unwrap()));
         hashes.push(sha(&saved));
-        hashes.push(sha(&receipt));
     }
     assert_eq!(hashes, ACK_SAVE_BYTES);
     assert_eq!(pretty, PRETTY_PROGRESS_BYTES);
 }
 
-/// Memory: allocator peak of one ACK-bound save of a ~5 MiB progress, per
+/// Memory: allocator peak of one ACK save of a ~5 MiB progress, per
 /// progress byte. Requested bytes with realloc overlap; not resident memory.
 #[test]
 fn ack_bound_save_allocation_peak_per_progress_byte() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-peak");
-    let index_path = scratch.join("index");
     let path = scratch.join("progress");
-    let mut progress = bound_progress(&index_path, &path, &"a".repeat(64));
+    let mut progress = bound_progress(&path, &"a".repeat(64));
     let text = "line\n\"quoted\" ".repeat(128);
     for n in 0..2048 {
         let state = serde_json::json!({ "text": &text });

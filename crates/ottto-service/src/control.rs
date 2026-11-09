@@ -13588,7 +13588,7 @@ fn run_bounded_command(
     if let Some(login) = claude_login.as_ref() {
         crate::claude_spawn_gate::pin_claude_login(&mut command, login);
     }
-    let mut child = match command.spawn() {
+    let mut child = match crate::local_resource_diagnostics::cli_children::spawn(&mut command) {
         Ok(child) => child,
         Err(_) => {
             return SmokeResult {
@@ -13640,9 +13640,11 @@ fn run_bounded_command(
             }
             Ok(None) if start.elapsed() >= timeout => {
                 let left_running = match claude_login.as_ref() {
-                    Some(login) => {
-                        crate::claude_spawn_gate::stop_claude_child(child, login, "smoke")
-                    }
+                    Some(login) => crate::claude_spawn_gate::stop_claude_child(
+                        child.into_inner(),
+                        login,
+                        "smoke",
+                    ),
                     None => {
                         let _ = child.kill();
                         let _ = child.wait();

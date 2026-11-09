@@ -6,6 +6,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cli_children;
 pub(crate) mod jsonl;
 
 /// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
@@ -1283,6 +1284,8 @@ struct Observation {
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
     footprint: footprint::Observation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cli_children: Vec<cli_children::Counts>,
 }
 impl Observation {
     /// A zero-window event: a timestamp and no resource measurements.
@@ -1297,6 +1300,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             footprint: Default::default(),
+            cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -1373,8 +1377,8 @@ fn source_finish_inner<T>(
     drop(window);
     result
 }
-/// Named footprint window inside a source stage. One record with empty counts
-/// when dropped normally; unwinding emits nothing, like `source_finish`.
+/// Named stage window, emitted on normal drop; unwinding emits nothing.
+/// `offpass_` stages add CPU split scalars and do not start footprint sampling.
 pub(crate) struct StageWindow {
     stage: &'static str,
     source: Source,
@@ -1382,6 +1386,7 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
+    offpass_cpu: Option<Option<StateV2Cpu>>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
@@ -1420,13 +1425,15 @@ impl StageWindow {
         self.evidence_mem = Some(mem);
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        let offpass = stage.starts_with("offpass_");
         Self {
             stage,
             source: Source::from_slug(source),
             probe: Probe::start(),
-            footprint: footprint::Stage::begin(),
+            footprint: (!offpass).then(footprint::Stage::begin).flatten(),
             jsonl: None,
             evidence_mem: None,
+            offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1442,7 +1449,21 @@ impl Drop for StageWindow {
             return;
         }
         #[derive(Serialize)]
+        struct Cpu {
+            cpu_user_us: Option<u64>,
+            cpu_sys_us: Option<u64>,
+        }
+        let cpu = self.offpass_cpu.map(|before| {
+            let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
+            Cpu {
+                cpu_user_us: samples.and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
+                cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+            }
+        });
+        #[derive(Serialize)]
         struct Counts {
+            #[serde(flatten)]
+            cpu: Option<Cpu>,
             // Zero exposure is stored as None and stays off the record.
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
@@ -1456,8 +1477,13 @@ impl Drop for StageWindow {
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            observation: if self.offpass_cpu.is_some() {
+                self.probe.observation()
+            } else {
+                self.probe.stage_observation(self.footprint.as_ref())
+            },
             counts: Counts {
+                cpu,
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
@@ -2698,6 +2724,33 @@ mod tests {
         }
     }
 
+    /// [behaviour] A completed off-pass work unit uses the existing stage carrier.
+    #[test]
+    fn offpass_work_reports_cpu_split_and_wall_without_footprint_sampling() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, rows) = capture(|| {
+                let _stage = StageWindow::begin(source, "offpass_agent_status");
+                Ok::<_, anyhow::Error>(17)
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["stage"], "offpass_agent_status");
+            assert_eq!(row["source"], source);
+            assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            for field in ["cpu_user_us", "cpu_sys_us"] {
+                assert!(row["counts"].get(field).is_some());
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                assert!(row["counts"][field].is_u64());
+            }
+            assert!(row["observation"].get("footprint_samples").is_none());
+            assert!(row["observation"]
+                .get("footprint_sample_failures")
+                .is_none());
+        }
+    }
+
     #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {
@@ -2714,6 +2767,7 @@ mod tests {
             assert_eq!(records[1]["stage"], "source_prepare");
             for record in records {
                 assert_eq!(record["source"], source);
+                assert_eq!(record["counts"], serde_json::json!({}));
                 assert!(record["observation"]["footprint_sample_failures"].is_u64());
                 let row = &record["observation"];
                 if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {

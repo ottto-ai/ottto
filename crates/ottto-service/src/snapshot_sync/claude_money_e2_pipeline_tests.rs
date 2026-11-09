@@ -851,7 +851,23 @@ pub(in crate::snapshot_sync) fn upload_source_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
+    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    Result<ResumableUploadResult>,
+    Vec<Vec<u8>>,
+    Vec<Vec<String>>,
+) {
+    upload_source_persisting(source, upload_policy, items, progress, respond, |_| Ok(()))
+}
+/// `upload_source_under` with the caller's progress persistence, as the
+/// production pass passes its ledger save.
+pub(in crate::snapshot_sync) fn upload_source_persisting(
+    source: SnapshotSource,
+    upload_policy: SnapshotUploadPolicy,
+    items: &[SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
     mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -885,7 +901,7 @@ pub(in crate::snapshot_sync) fn upload_source_under(
             response.validate_entity_ack(&wire)?;
             Ok(response)
         },
-        |_| Ok(()),
+        persist,
     );
     (result, sent, order)
 }
@@ -3731,8 +3747,18 @@ fn released(name: &str) -> serde_json::Value {
         ))
         .unwrap()
     });
-    let value = fixture[name].clone();
+    let mut value = fixture[name].clone();
     assert!(!value.is_null(), "released fixture {name}");
+    // A released ledger's LRU stamp is decoded and dropped, never written.
+    let sessions = value
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|map| map.values_mut());
+    for session in sessions.filter_map(serde_json::Value::as_object_mut) {
+        if session.contains_key("key_epoch") {
+            session.remove("last_ack");
+        }
+    }
     value
 }
 /// A body's serialized form without its source-file fingerprint: a hash of
