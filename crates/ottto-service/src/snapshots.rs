@@ -110,9 +110,7 @@ pub(crate) use claude_context_file_birth::{
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
-#[cfg(test)]
-mod codex_creator_slot_tests;
-mod codex_root_copies;
+use sources::codex::root_copies as codex_root_copies;
 pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
@@ -171,15 +169,13 @@ pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
-mod codex_context_window_tests;
-#[cfg(test)]
 mod codex_counting_lifecycle_tests;
 #[cfg(test)]
 mod codex_counting_rss_tests;
 #[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
-mod codex_dictionary_slots;
+use sources::codex::dictionary_slots as codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 #[cfg(test)]
@@ -212,8 +208,8 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::LocalContextPoints;
-mod codex_fragment;
-pub(crate) mod codex_version;
+use sources::codex::eof_fragment as codex_fragment;
+pub(crate) use sources::codex::mcp_version as codex_version;
 pub(crate) mod discovery_growth;
 #[cfg(test)]
 mod discovery_growth_tests;

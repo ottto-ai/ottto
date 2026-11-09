@@ -4,10 +4,14 @@
 
 pub(in crate::snapshots) mod config_defaults;
 pub(in crate::snapshots) mod counting;
+pub(crate) mod dictionary_slots;
+pub(crate) mod eof_fragment;
 pub(in crate::snapshots) mod identity;
 pub(in crate::snapshots) mod line;
+pub(crate) mod mcp_version;
 pub(in crate::snapshots) mod recovery_capture;
 pub(in crate::snapshots) mod rollout_header;
+pub(crate) mod root_copies;
 pub(in crate::snapshots) mod sidecar;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
