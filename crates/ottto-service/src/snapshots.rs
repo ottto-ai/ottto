@@ -211,6 +211,8 @@ pub(crate) use scan::durable_sources;
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
 mod held_audit_restore_tests;
+#[cfg(test)]
+mod resident_wave_tests;
 pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
 use scan::lines::delivery::tests as line_delivery_tests;
