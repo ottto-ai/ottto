@@ -112,3 +112,6 @@ pub(in crate::snapshots) fn sha256_hex_owned(parts: &[String]) -> String {
     }
     format!("{:x}", digest.finalize())
 }
+
+#[cfg(test)]
+mod tests;

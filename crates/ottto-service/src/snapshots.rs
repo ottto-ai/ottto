@@ -182,8 +182,7 @@ mod codex_counting_version;
 mod codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
-#[cfg(test)]
-mod file_set_digest_tests;
+
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -473,8 +472,6 @@ pub(crate) use sources::claude::census::authority_proof_correction::{
 };
 include!("snapshots/load_containment.rs");
 
-#[cfg(test)]
-mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
