@@ -974,12 +974,18 @@ pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf
 /// Release a synthetic small-page request without discarding staged Tail state.
 #[cfg(test)]
 pub(crate) fn release_collection_page_limit_for_test(index: &ScanIndex) {
+    set_collection_page_limit_for_test(index, 250);
+}
+
+/// Isolate another page resource from the existing AIMD file allowance.
+#[cfg(test)]
+pub(crate) fn set_collection_page_limit_for_test(index: &ScanIndex, limit: usize) {
     let path = runtime_path(index)
         .unwrap()
         .expect("a routed fixture index");
     with_state(&path, |state| {
-        state.page_limit = 250;
-        state.requested_page = 250;
+        state.page_limit = limit;
+        state.requested_page = limit;
         Ok(())
     })
     .unwrap();
