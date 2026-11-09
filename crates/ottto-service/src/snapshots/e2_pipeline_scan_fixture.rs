@@ -617,6 +617,10 @@ pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_money_birth_store).unwrap()
 }
 
+pub(crate) fn with_resident_budget<T>(budget: f64, run: impl FnOnce() -> T) -> T {
+    super::claude_history_upgrade::with_resident_budget(budget, run)
+}
+
 pub(crate) fn with_history_byte_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
     with_body_witness_adoption_byte_budget(limit, f)
 }

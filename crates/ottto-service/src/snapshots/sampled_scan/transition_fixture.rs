@@ -45,7 +45,7 @@ pub(crate) fn codex_legacy_singletons(
         while !inventory.step_selected(
             &scan.codex_title_metadata,
             &mut scan.index,
-            &scan.codex_selected_flags,
+            &scan.selected_flags,
             Some(&cache),
         ) {}
     }

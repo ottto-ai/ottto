@@ -100,6 +100,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) audit_now: u64,
     pub(in crate::snapshots) backfill_window_days: u64,
     pub(in crate::snapshots) file_limit: usize,
+    pub(in crate::snapshots) page_file_limit_hit: bool,
     /// This scan's sync cycle holds a contract-5 permit.
     pub(in crate::snapshots) claude_request_identity_capture: bool,
     pub(in crate::snapshots) claude_effort_support_dir: Option<PathBuf>,
@@ -117,7 +118,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) scanned_file_count: usize,
     pub(in crate::snapshots) scanned_session_count: usize,
     pub(in crate::snapshots) semantic_noop_count: usize,
-    /// This page's history-upgrade budget and count-only gate diagnostics.
+    /// This page's resident charge, history-upgrade budget and gate diagnostics.
     pub(in crate::snapshots) history_upgrade: HistoryPage,
     pub(in crate::snapshots) context_read_budget: upload_context_read::Budget,
     pub(in crate::snapshots) residue_index_keys: BTreeSet<String>,
@@ -145,9 +146,9 @@ pub(crate) struct OwnedSourceScan {
     /// Decoded bytes this page consumed; the cursor job and ordinary Codex
     /// singleton reads have separate budgets.
     pub(in crate::snapshots) codex_page: sampled_scan::codex_cursor::PageBudget,
-    /// Selection flags of this page's Codex candidates, so a budget deferral
+    /// Selection flags of all this page's candidates, so a budget deferral
     /// returns a file to `pending_candidates` with its original priority.
-    pub(in crate::snapshots) codex_selected_flags: BTreeMap<String, (bool, bool)>,
+    pub(in crate::snapshots) selected_flags: BTreeMap<String, (bool, bool)>,
     /// Stage 1 hunk A: the ticket this page's pause minted, carried across
     /// `step` calls into the result.
     pub(in crate::snapshots) continuation_ticket:
@@ -331,6 +332,7 @@ impl OwnedSourceScan {
             audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
+            page_file_limit_hit: false,
             claude_request_identity_capture: false,
             claude_effort_support_dir: None,
             claude_title_metadata: Default::default(),
@@ -365,7 +367,7 @@ impl OwnedSourceScan {
             codex_join_completed: Vec::new(),
             codex_legacy_join_baselines: Vec::new(),
             codex_page,
-            codex_selected_flags: Default::default(),
+            selected_flags: Default::default(),
             continuation_ticket: None,
             line_delivery: None,
             launch_events: None,
@@ -782,6 +784,7 @@ impl OwnedSourceScan {
             };
             pending_paths.push(candidate);
         }
+        let page_file_limit_hit = file_limit > 0 && pending_paths.len() >= file_limit;
         if source == SnapshotSource::Codex {
             // G1 (fix 2): the same selection, read census members first. The
             // reserved census member and every other first read are charged
@@ -850,20 +853,15 @@ impl OwnedSourceScan {
                 pending_paths.iter().map(|pending| pending.path.as_path()),
             ))
         });
-        let codex_selected_flags =
-            if source == SnapshotSource::Codex || index.file_upload_context_enabled() {
-                pending_paths
-                    .iter()
-                    .map(|pending| {
-                        (
-                            local_index_key(&pending.path),
-                            (pending.census_member, pending.watcher_hint),
-                        )
-                    })
-                    .collect()
-            } else {
-                BTreeMap::new()
-            };
+        let selected_flags = pending_paths
+            .iter()
+            .map(|pending| {
+                (
+                    local_index_key(&pending.path),
+                    (pending.census_member, pending.watcher_hint),
+                )
+            })
+            .collect();
         let mut candidate_discovery =
             CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
         let mut files = pending_paths
@@ -994,6 +992,7 @@ impl OwnedSourceScan {
                 }
             }
         }
+        let mut forced_pending_entries = Vec::new();
         let mut claude_twin_only_family_reparses = BTreeSet::new();
         // `e2`: the page's path-twin groups, built at most once per page and
         // shared with twin staging and the parse-time birth context.
@@ -1106,9 +1105,14 @@ impl OwnedSourceScan {
             .filter(|path| !already_identified.contains(&local_index_key(path)))
             .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
-                traversal
-                    .pending_candidates
-                    .retain(|pending| !missing_family_paths.contains(&pending.path));
+                traversal.pending_candidates.retain(|pending| {
+                    if missing_family_paths.contains(&pending.path) {
+                        forced_pending_entries.push(pending.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             let move_sources = index.held_move_sources();
             for path in missing_family_paths {
@@ -1191,6 +1195,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
             codex_title_metadata,
@@ -1210,7 +1215,8 @@ impl OwnedSourceScan {
             history_upgrade: HistoryPage::with_twin_groups(
                 claude_twin_groups,
                 claude_queued_family_deferred_paths,
-            ),
+            )
+            .with_forced_pending(forced_pending_entries),
             context_read_budget: upload_context_read::Budget::new(source),
             residue_index_keys,
             settled_residue_index_keys,
@@ -1230,7 +1236,7 @@ impl OwnedSourceScan {
             codex_page: sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(
                 next_generation_hints,
             ),
-            codex_selected_flags,
+            selected_flags,
             continuation_ticket: None,
             line_delivery: None,
             launch_events: None,
@@ -1253,3 +1259,44 @@ impl OwnedSourceScan {
 }
 
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
+
+/// `requeue` for every member of a group in one pass over the pending
+/// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path
+/// is cloned.
+pub(in crate::snapshots) fn requeue_members<'a>(
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+) {
+    let Some(traversal) = index.traversal.as_mut() else {
+        return;
+    };
+    let members = members.into_iter().collect::<Vec<_>>();
+    // The members not pending yet; a repeated member is pushed once.
+    let mut absent = members
+        .iter()
+        .copied()
+        .map(|member| member.path.as_path())
+        .collect::<std::collections::HashSet<_>>();
+    for pending in &traversal.pending_candidates {
+        if absent.is_empty() {
+            break;
+        }
+        absent.remove(pending.path.as_path());
+    }
+    for candidate in members {
+        if !absent.remove(candidate.path.as_path()) {
+            continue;
+        }
+        let (census_member, watcher_hint) = flags
+            .get(&local_index_key(&candidate.path))
+            .copied()
+            .unwrap_or((true, false));
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: candidate.scan_root.clone(),
+            path: candidate.path.clone(),
+            census_member,
+            watcher_hint,
+        });
+    }
+}

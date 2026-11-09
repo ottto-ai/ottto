@@ -62,11 +62,29 @@ pub(in crate::snapshots) fn load_candidate(
     capture: bool,
     held: &mut File,
     scope: &crate::transcript_acquisition::Scope,
-) -> load::Load {
+) -> (load::Load, u64) {
     with_codec!(
         source,
         S => load::entry::<S>(index, route, candidate, live, capture, held, scope)
     )
+}
+
+/// Successfully encoded reduction pages, including unchanged and non-publishing finishes.
+/// Temporary encoded pages are dropped collection by collection.
+pub(in crate::snapshots) fn resident_bytes(
+    source: SnapshotSource,
+    acc: &SnapshotAccumulator,
+) -> u64 {
+    fn size<S: TailSource>(acc: &SnapshotAccumulator) -> u64 {
+        S::collections()
+            .iter()
+            .filter_map(|spec| S::encode_pages(acc, spec.collection).ok())
+            .flatten()
+            .fold(0u64, |sum, (_, bytes)| {
+                sum.saturating_add(bytes.len() as u64)
+            })
+    }
+    with_codec!(source, S => size::<S>(acc))
 }
 
 /// `key`'s accepted usage on its committed head, as (requests, tokens), for

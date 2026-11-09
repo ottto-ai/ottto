@@ -1113,7 +1113,7 @@ fn native_platform_qos_restores_on_a_spawned_thread_and_power_has_valid_range() 
         drop(guard);
         let restored = if prior.0 == 0 { (0x15, prior.1) } else { prior };
         assert_eq!(query_qos(), Some(restored));
-        assert!(matches!(unsafe { ottto_power_state() }, -1..=1));
+        assert!(matches!(unsafe { ottto_power_state() }, -1..=2));
     })
     .join()
     .unwrap();
@@ -1327,4 +1327,184 @@ fn realistic_inputs_mint_through_the_tickets_walk_with_headroom() {
             _ => panic!("a production Codex ticket"),
         }
     });
+}
+
+/// [behaviour] Paced ordinary work picks its gap at request time, including
+/// battery, without the cursor's 20-second contention cutoff.
+#[test]
+fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
+    let now = Instant::now();
+    for (answer, state, gap) in [
+        (1, PlatformState::Allowed, Some(30)),
+        (2, PlatformState::Battery, Some(180)),
+        (0, PlatformState::Refused, None),
+        (-1, PlatformState::Unknown, None),
+        (3, PlatformState::Unknown, None),
+    ] {
+        assert_eq!(power_state(answer), state);
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        if let Some(pacing) = resident_pacing(state) {
+            assert!(cadence.request_paced_scan(now, Duration::from_secs(103), pacing));
+        }
+        assert_eq!(
+            cadence.paced_scan_due(),
+            gap.map(|gap| now + Duration::from_secs(gap))
+        );
+        if let Some(gap) = gap {
+            assert_eq!(cadence.next_scan_after(now), Duration::from_secs(gap));
+            cadence.record_scan_success(now + Duration::from_secs(gap), 0);
+            assert!(
+                cadence.paced_scan_due().is_none(),
+                "a quiet pass adds no wake"
+            );
+        }
+    }
+    // LPM on AC and on battery has the same shim answer: no pacing request.
+    assert!(resident_pacing(power_state(0)).is_none());
+    let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+    cadence.record_scan_success(now, 1);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_AC);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_BATTERY);
+    assert_eq!(
+        cadence.paced_scan_due(),
+        Some(now + Duration::from_secs(180))
+    );
+    // Server minima and backoff still win; a new ordinary success resets its clock.
+    cadence.set_server_min_interval(Some(Duration::from_secs(210)));
+    assert_eq!(cadence.next_scan_after(now), Duration::from_secs(210));
+
+    let w = World::new();
+    let mut cursor = FakePort::new(&w, &[End::Paused]);
+    let mut gates = FakeGates::allowed(&w);
+    w.ordinary_page_asks(Duration::from_secs(1));
+    w.advance_to_due();
+    gates.power = PlatformState::Battery;
+    let outcome = run_page(
+        &mut FakeHost(&w),
+        &mut cursor,
+        &mut gates,
+        &w.lock,
+        &w.slot,
+        w.now.get() + Duration::from_secs(300),
+    );
+    assert!(matches!(outcome, Outcome::Skipped(Skip::Platform)));
+    assert_eq!(w.network.get(), 0);
+}
+
+/// [behaviour] A full file selection paces queued work through the same power
+/// gates as a resident deferral; a drained or underfull selection adds no wake.
+#[test]
+fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    let home = crate::test_scratch::private_dir("file-limit-pacing")
+        .canonicalize()
+        .unwrap();
+    let now = Instant::now();
+    for (case, (files, power, gap)) in [
+        (3_usize, PlatformState::Allowed, Some(30)),
+        (3, PlatformState::Battery, Some(180)),
+        (2, PlatformState::Allowed, None),
+        (1, PlatformState::Allowed, None),
+        (3, power_state(0), None), // Low Power Mode on AC or battery.
+        (3, PlatformState::Unknown, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = home.join(case.to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        for file in 0..files {
+            std::fs::write(
+                root.join(format!("session-{file}.jsonl")),
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1793088001000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+            )
+            .unwrap();
+        }
+        let (_, scan, _) = E2ScanFixture::default().scan_other_page(
+            SnapshotSource::Pi,
+            &[root],
+            &home,
+            ScanIndex::default(),
+            true,
+            2,
+            &[],
+        );
+        assert_eq!(scan.backfill_file_limit, 2);
+        assert_eq!(scan.scanned_file_count, files.min(2));
+        assert_eq!(scan.page_file_limit_hit, files >= 2);
+        assert_eq!(scan.census_status.pending_work, files > 2);
+        assert!(
+            !scan.charge_deferred,
+            "the file allowance is the only trigger"
+        );
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        if resident_scan_requested(&scan)
+            && let Some(pacing) = resident_pacing(power)
+        {
+            assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing));
+        }
+        assert_eq!(
+            cadence.paced_scan_due(),
+            gap.map(|gap| now + Duration::from_secs(gap))
+        );
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// [behaviour] A resident wake starts another ordinary pass, releases the
+/// sync lock while waiting, and adds no wake after a quiet successful drain.
+#[test]
+fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
+    struct OrdinaryLoop {
+        now: Instant,
+        cadence: SourceCadence,
+        lock: Mutex<()>,
+        waits: Vec<Duration>,
+    }
+    impl LoopHost for OrdinaryLoop {
+        fn now(&mut self) -> Instant {
+            self.now
+        }
+        fn wait(&mut self, wait: Duration) -> bool {
+            assert!(self.lock.try_lock().is_ok());
+            self.waits.push(wait);
+            self.now += wait;
+            false
+        }
+        fn pending(&mut self) -> Option<(Instant, Duration)> {
+            None
+        }
+        fn paced_due(&mut self) -> Option<Instant> {
+            self.cadence.paced_scan_due()
+        }
+        fn page(&mut self, _: Instant) -> Outcome {
+            panic!("no cursor page requested")
+        }
+    }
+    for pacing in [PACED_AC, PACED_BATTERY] {
+        let now = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(now, 1);
+        cadence.request_paced_scan(now, Duration::from_secs(103), pacing);
+        cadence.clear_cursor_continuation(); // ordinary prepare drops only a cursor.
+        assert!(cadence.continuation_due(PACING).is_none());
+        let mut host = OrdinaryLoop {
+            now,
+            cadence,
+            lock: Mutex::new(()),
+            waits: Vec::new(),
+        };
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [pacing.min_gap]);
+        assert_eq!(host.cadence.next_scan_after(host.now), Duration::ZERO);
+        host.cadence.record_scan_success(host.now, 0);
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [pacing.min_gap, SNAPSHOT_SYNC_INTERVAL]);
+        host.cadence
+            .request_paced_scan(host.now, Duration::from_secs(103), pacing);
+        host.cadence.record_scan_failure(host.now);
+        assert!(host.cadence.paced_scan_due().is_none());
+    }
 }
