@@ -486,7 +486,8 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
+        let mut scan = OwnedSourceScan::new_with_recovery_priority(
             SnapshotSource::ClaudeCode,
             roots,
             index,
@@ -496,10 +497,12 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
+            &mut ListingRequest::default(),
             self.capture_claude_identity,
+            &[],
+            sampled.then_some((self.cache.as_ref(), &scope)),
         );
         if sampled {
-            let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         // The same synthetic root births reach the page's staged twin probes,

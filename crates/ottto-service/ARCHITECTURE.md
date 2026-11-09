@@ -143,6 +143,14 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+Claude Desktop title sweeps keep compact parsed session facts in the shared RAM
+cache while each regular file's device, inode, length and nanosecond mtime match.
+Every eligible sweep still lists the store, evicts unlisted facts and reconstructs
+account and original identity from the current path. Failed loads are never kept;
+loading holds no cache lock. Census, refusal, pruning and retry rules are unchanged,
+and callers without a shared cache load cold. The status lane keeps its separate
+Desktop metadata cache.
+
 ## CLI status metadata
 
 Codex login state and bundled model metadata are cached in RAM per home while the

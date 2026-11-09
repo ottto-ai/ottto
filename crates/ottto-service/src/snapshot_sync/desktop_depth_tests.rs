@@ -123,6 +123,7 @@ fn desktop_depth_recovery_matches_never_flipped_money_and_placement() {
         let recovered_route = emitted(&recovered, ROOT, Mode::Restart);
         money_oracle::assert_equivalent(&never_flipped, &recovered_route);
         money_oracle::assert_placement_equivalent(&never_flipped, &recovered_route);
+        assert_warm_desktop_parity(&corpus, &scanner);
     });
 }
 
@@ -224,6 +225,101 @@ fn parentless_child_matches_cold_at_each_census_stage() {
             money_oracle::assert_equivalent(&expected, &actual);
             money_oracle::assert_placement_equivalent(&expected, &actual);
             prior = page.index;
+            assert_warm_desktop_parity(&corpus, &scanner);
         }
+    });
+}
+
+fn desktop_reads(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row["counts"]["desktop_metadata"]["desktop_store_body_reads"].as_u64())
+        .sum()
+}
+
+fn assert_warm_desktop_parity(corpus: &Corpus, scanner: &E2ScanFixture) {
+    let prime = ready(corpus, scanner, ScanIndex::default(), 100, true);
+    let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+    let saved = serde_json::to_value(&prime.index).unwrap();
+    seed["claude_desktop_store_inventory"] = saved["claude_desktop_store_inventory"].clone();
+    seed["claude_desktop_title_files"] = saved["claude_desktop_title_files"].clone();
+    // A hit must still compare against stale durable identity and lineage.
+    for entry in seed["claude_desktop_title_files"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        entry["original_identity"]["imported"] = json!(true);
+        entry["original_identity"]["source_created_at"] = json!("2026-08-01T00:00:00Z");
+        entry["spawned_from_unresolved"] = json!(true);
+    }
+    let (warm, rows) = crate::local_resource_diagnostics::capture(|| {
+        let mut page = lineage_page(
+            corpus,
+            scanner,
+            serde_json::from_value(seed.clone()).unwrap(),
+        );
+        page.finish();
+        page
+    });
+    assert_eq!(desktop_reads(&rows), 0, "warm Desktop store bodies");
+    let (cold, rows) = crate::local_resource_diagnostics::capture(|| {
+        let mut page = lineage_page(
+            corpus,
+            &E2ScanFixture::capturing_identity(),
+            serde_json::from_value(seed).unwrap(),
+        );
+        page.finish();
+        page
+    });
+    assert!(
+        desktop_reads(&rows) > 0,
+        "fresh owner really loads the fixture"
+    );
+    let warm_saved = serde_json::to_value(&warm.index).unwrap();
+    let cold_saved = serde_json::to_value(&cold.index).unwrap();
+    for (key, value) in warm_saved.as_object().unwrap() {
+        if key.starts_with("claude_desktop_") {
+            assert_eq!(value, &cold_saved[key], "{key}");
+        }
+    }
+    // Each fixture entity, including the two-login switch/gap/side control,
+    // goes through actual uploads and accepted placement ledgers.
+    for session in cold
+        .scan
+        .snapshots
+        .iter()
+        .map(|s| s.source_session_id.as_str())
+    {
+        money_oracle::assert_equivalent(
+            &emitted(&cold, session, Mode::ColdFull),
+            &emitted(&warm, session, Mode::Ram),
+        );
+    }
+}
+
+/// [behaviour] An eligible unchanged warm pass reads zero Desktop bodies.
+/// Reset atime below mtime so Linux relatime records any accidental body read.
+#[test]
+fn unchanged_warm_desktop_pass_reads_zero_bodies() {
+    with_e2(|| {
+        let (corpus, bucket) = desktop_corpus();
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut first = ready(&corpus, &scanner, ScanIndex::default(), 100, true);
+        first.finish();
+        let path = bucket.join("local_session.json");
+        let untouched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(untouched))
+            .unwrap();
+        let mut warm = ready(&corpus, &scanner, first.index, 100, true);
+        warm.finish();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().accessed().unwrap(),
+            untouched,
+            "unchanged warm pass must read zero Desktop store bodies"
+        );
     });
 }

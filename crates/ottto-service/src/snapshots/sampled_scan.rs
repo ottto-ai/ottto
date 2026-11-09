@@ -73,6 +73,7 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    desktop_titles: Mutex<super::sources::claude::desktop_titles::DesktopTitleFacts>,
     pub(crate) withheld_memo: withheld_account::Memo,
     cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -91,6 +92,7 @@ pub(crate) struct SharedCache {
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
+            desktop_titles: Mutex::default(),
             withheld_memo: Default::default(),
             cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
@@ -112,7 +114,28 @@ impl HeapLayoutBound for SharedCache {
         // Its optional entries are priced separately by the rotation owner.
         self.withheld_memo.heap_bound(c)?;
         self.cursor.heap_bound(c)?;
+        self.desktop_titles.heap_bound(c)?;
         c.add(self.root_reservation())
+    }
+}
+impl SharedCache {
+    /// Move facts out for the sweep so no shared lock spans listing or reads.
+    pub(in crate::snapshots) fn with_desktop_titles<T>(
+        &self,
+        load: impl FnOnce(&mut super::sources::claude::desktop_titles::DesktopTitleFacts) -> T,
+    ) -> T {
+        let mut facts = std::mem::take(
+            &mut *self
+                .desktop_titles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let result = load(&mut facts);
+        *self
+            .desktop_titles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = facts;
+        result
     }
 }
 #[cfg(test)]
@@ -578,6 +601,7 @@ mod cache_lifecycle_tests {
         let mut parts = Counter::new(usize::MAX);
         cache.cursor.heap_bound(&mut parts).unwrap();
         cache.withheld_memo.heap_bound(&mut parts).unwrap();
+        cache.desktop_titles.heap_bound(&mut parts).unwrap();
         assert_eq!(
             whole.bytes,
             OFF_MAIN_SHARED_BYTES

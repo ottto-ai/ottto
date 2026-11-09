@@ -1295,6 +1295,26 @@ impl crate::heap_layout_bound::HeapLayoutBound for Scope {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(value, c)
     }
 }
+
+impl crate::heap_layout_bound::HeapLayoutBound for SourceStamp {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Absent => Some(()),
+            Self::File(stamp) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(stamp, c),
+        }
+    }
+}
+impl<
+        K: crate::heap_layout_bound::HeapLayoutBound,
+        F: crate::heap_layout_bound::HeapLayoutBound,
+        S: crate::heap_layout_bound::HeapLayoutBound,
+    > crate::heap_layout_bound::HeapLayoutBound for StampedFacts<K, F, S>
+{
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.kept, c)
+    }
+}
+
 crate::heap_layout_bound::fields!(AuditDebt; due_unix_seconds);
 crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(unix)] inode,
     #[cfg(unix)] modified, #[cfg(unix)] changed);
