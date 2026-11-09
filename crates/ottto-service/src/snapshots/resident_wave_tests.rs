@@ -65,6 +65,7 @@ fn resident_wave_shape_defers_before_three_b_of_refolds() {
         entry.source_file_fingerprint = "source-changed".into();
     }
     index.traversal = None;
+    state_v2::set_collection_page_limit_for_test(&index, n + 1);
     let (index, page, modes) =
         fixture.scan_other_page(SnapshotSource::Pi, &roots, &home, index, true, n + 1, &[]);
     let q = page.scanned_file_count as f64 * FILE_CHARGE;
@@ -72,6 +73,10 @@ fn resident_wave_shape_defers_before_three_b_of_refolds() {
         .traversal
         .as_ref()
         .map_or(0, |walk| walk.pending_candidates.len());
+    eprintln!(
+        "resident_shape files={} charge={q} deferred={deferred} full={} tail={} unchanged={}",
+        page.scanned_file_count, modes.0, modes.1, modes.2
+    );
     assert!(q <= B + FILE_CHARGE, "resident charge {q} > B + U_max");
     assert!(deferred > 0, "a 3 B wave must leave pending work");
     assert!(
