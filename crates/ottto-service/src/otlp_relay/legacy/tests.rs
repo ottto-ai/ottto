@@ -1033,6 +1033,7 @@ fn waiting_supervisor(
     let worker = thread::spawn(move || {
         let mut health = Instant::now() + Duration::from_secs(1);
         loop {
+            supervisor.flush_activity(now_seconds()).unwrap();
             supervisor.accept_ready(Instant::now(), |_, _| {
                 accepted.send(()).unwrap();
             });
@@ -1079,6 +1080,7 @@ fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
             file.as_raw_fd()
         };
         let (endpoint, waits, _accepts, worker) = waiting_supervisor(supervisor);
+        // The notification proves arrival at the wait boundary, before poll.
         waits.recv_timeout(Duration::from_secs(2)).unwrap();
         let started = Instant::now();
         // SAFETY: both fds are live; intentionally replace the supervisor fd.
@@ -1127,7 +1129,11 @@ fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
             .unwrap();
         let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         let mut served = false;
-        supervisor.accept_ready(Instant::now(), |_, _| served = true);
+        retry_would_block(|| {
+            supervisor.accept_ready(Instant::now(), |_, _| served = true);
+            served.then_some(()).ok_or(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap();
         assert!(served);
     }
 }
@@ -1190,7 +1196,10 @@ fn command_enqueued_while_draining_is_handled_and_wake_failure_is_reported() {
             let result = self.wake.read(bytes);
             if matches!(result, Ok(n) if n > 0) {
                 if let Some(ack) = self.ack.take() {
-                    self.endpoint.send(Command::Release(APPROVED, ack)).unwrap();
+                    self.endpoint
+                        .send(Command::Release(APPROVED, ack))
+                        .unwrap()
+                        .unwrap();
                 }
             }
             result
@@ -1214,12 +1223,18 @@ fn command_enqueued_while_draining_is_handled_and_wake_failure_is_reported() {
     // A full nonblocking wake is already signalled, so sending still succeeds.
     while (&*endpoint.wake).write(&[0; 4096]).is_ok() {}
     let (ack, done) = mpsc::sync_channel(1);
-    endpoint.send(Command::Release(APPROVED, ack)).unwrap();
+    endpoint
+        .send(Command::Release(APPROVED, ack))
+        .unwrap()
+        .unwrap();
     assert!(supervisor.drain_commands(&mut wake, &receiver).unwrap());
     done.try_recv().unwrap();
     drop(wake);
     let (ack, _) = mpsc::sync_channel(1);
-    assert!(endpoint.send(Command::Release(APPROVED, ack)).is_err());
+    assert!(endpoint
+        .send(Command::Release(APPROVED, ack))
+        .unwrap()
+        .is_err());
 }
 
 /// [behaviour] A readable listener in backoff waits until its retry, without spinning.
@@ -1230,6 +1245,7 @@ fn readable_listener_in_backoff_waits_until_retry() {
     supervisor
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
+    supervisor.flush_activity(now_seconds()).unwrap();
     let retry = Instant::now() + Duration::from_millis(250);
     supervisor.open.get_mut(&port).unwrap().accepts.retry_at = Some(retry);
     let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -1259,4 +1275,82 @@ fn readable_listener_in_backoff_waits_until_retry() {
         )
         .unwrap());
     assert_eq!(health, fixed);
+}
+
+/// [regress] A failed wake still waits for an enqueued command's ACK, with a timeout.
+#[test]
+fn send_and_wait_reports_wake_failure_after_ack_or_timeout() {
+    for acknowledge in [true, false] {
+        let (endpoint, receiver, wake) = Endpoint::channel(Arc::new(Admission::default())).unwrap();
+        drop(wake);
+        let (finished, returned) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let Command::Release(_, ack) = receiver.recv().unwrap() else {
+                panic!("expected release");
+            };
+            if acknowledge {
+                // A zero-capacity ACK succeeds only while the caller waits.
+                ack.send(())
+                    .expect("caller skipped the enqueued command's ACK");
+            } else {
+                // Keep the ACK sender alive until the caller's bounded wait ends.
+                returned.recv_timeout(Duration::from_secs(4)).unwrap();
+                drop(ack);
+            }
+        });
+        let started = Instant::now();
+        let error = send_and_wait(&endpoint, |ack| Command::Release(APPROVED, ack)).unwrap_err();
+        assert!(error.downcast_ref::<io::Error>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        if !acknowledge {
+            assert!(started.elapsed() >= Duration::from_secs(2));
+            finished.send(()).unwrap();
+        }
+        worker.join().unwrap();
+    }
+}
+
+/// [regress] The flush deadline wakes the wait even with no listeners or traffic.
+#[test]
+fn idle_wait_flushes_on_time_independently_of_reconcile_and_listeners() {
+    for listening in [false, true] {
+        let (_dir, mut supervisor) = scratch();
+        let (_reservation, port) = reserve_port();
+        if listening {
+            supervisor
+                .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+                .unwrap();
+        }
+        supervisor.record.seeded = true;
+        supervisor.activity_dirty = true;
+        let now = now_seconds();
+        supervisor.last_flush = now - REQUEST_FLUSH_SECONDS + 1;
+        let (_endpoint, receiver, mut wake) =
+            Endpoint::channel(supervisor.admission.clone()).unwrap();
+        let mut health = Instant::now() + Duration::from_secs(10);
+        let started = Instant::now();
+        assert!(supervisor
+            .wait_for_events(&mut wake, &receiver, now + RETRY_SECONDS, &mut health)
+            .unwrap());
+        supervisor.flush_activity(now_seconds()).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1250));
+        assert!(!supervisor.activity_dirty);
+        assert!(
+            Supervisor::load(
+                supervisor.path.clone(),
+                supervisor.counters.clone(),
+                now_seconds()
+            )
+            .unwrap()
+            .record
+            .seeded
+        );
+        // An overdue flush also returns promptly rather than underflowing.
+        supervisor.last_flush = now_seconds() - REQUEST_FLUSH_SECONDS - 1;
+        let started = Instant::now();
+        assert!(supervisor
+            .wait_for_events(&mut wake, &receiver, now + RETRY_SECONDS, &mut health)
+            .unwrap());
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
 }

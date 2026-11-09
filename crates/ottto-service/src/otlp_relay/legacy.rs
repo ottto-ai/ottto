@@ -71,16 +71,18 @@ impl Endpoint {
         ))
     }
 
-    fn send(&self, command: Command) -> Result<()> {
+    // The outer result reports enqueue failure; the inner result reports wake failure.
+    fn send(&self, command: Command) -> Result<io::Result<()>> {
         self.sender.send(command)?;
+        // write_all retries Interrupted; WouldBlock means already signalled.
         #[cfg(unix)]
-        match (&*self.wake).write(&[1]) {
-            Ok(1) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
-            Ok(_) => return Err(anyhow!("legacy relay wake closed")),
-        }
-        Ok(())
+        let wake = match (&*self.wake).write_all(&[1]) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            result => result,
+        };
+        #[cfg(not(unix))]
+        let wake = Ok(());
+        Ok(wake)
     }
 }
 
@@ -936,7 +938,10 @@ impl Supervisor {
                 *next_health += Duration::from_secs(1);
             }
         }
-        let mut timeout = Duration::from_secs(next_tick.saturating_sub(now_seconds()));
+        let wall_now = now_seconds();
+        let until_flush =
+            REQUEST_FLUSH_SECONDS.saturating_sub(wall_now.saturating_sub(self.last_flush));
+        let mut timeout = Duration::from_secs(next_tick.saturating_sub(wall_now).min(until_flush));
         if !self.open.is_empty() {
             timeout = timeout.min(next_health.saturating_duration_since(now));
         }
@@ -1010,16 +1015,24 @@ impl Supervisor {
 
 /// Release a legacy address before primary recovery tries to acquire it.
 /// A missing/failed compatibility supervisor never prevents primary binding.
-fn send_and_wait(endpoint: &Endpoint, command: impl FnOnce(mpsc::SyncSender<()>) -> Command) {
+fn send_and_wait(
+    endpoint: &Endpoint,
+    command: impl FnOnce(mpsc::SyncSender<()>) -> Command,
+) -> Result<()> {
     let (ack, done) = mpsc::sync_channel(0);
-    if endpoint.send(command(ack)).is_ok() && done.recv_timeout(Duration::from_secs(2)).is_err() {
+    let wake = endpoint.send(command(ack))?;
+    if let Err(error) = &wake {
+        relay_log!("could not wake legacy OTLP supervisor: {error}");
+    }
+    if done.recv_timeout(Duration::from_secs(2)).is_err() {
         relay_log!("legacy OTLP supervisor acknowledgement timed out");
     }
+    wake.map_err(Into::into)
 }
 
 pub(super) fn release_for_primary(port: u16) {
     if let Some(endpoint) = endpoint() {
-        send_and_wait(&endpoint, |ack| Command::Release(port, ack));
+        let _ = send_and_wait(&endpoint, |ack| Command::Release(port, ack));
     }
 }
 
@@ -1031,7 +1044,7 @@ pub(crate) fn revoke_now() {
             .revoke_pending
             .fetch_add(1, Ordering::SeqCst);
         endpoint.admission.generation.fetch_add(1, Ordering::SeqCst);
-        send_and_wait(&endpoint, Command::Revoke);
+        let _ = send_and_wait(&endpoint, Command::Revoke);
     }
 }
 
