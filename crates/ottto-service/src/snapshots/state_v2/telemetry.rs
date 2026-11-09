@@ -16,6 +16,7 @@ struct Stats {
     stage_memory: BTreeMap<&'static str, MemoryWindow>,
     retained_heap_bytes: BTreeMap<&'static str, RetainedHeap>,
     decoded_per_pass: Decoded,
+    tail_per_pass: TailPass,
     bytes_written_per_pass: Option<u64>,
     import_peak_rss_bytes: Option<u64>,
 }
@@ -89,6 +90,40 @@ fn publish(stats: &Stats) {
 }
 fn in_pass() -> bool {
     PASS.with(|pass| pass.borrow().active)
+}
+/// In a pass, a Tail load or stage folds into the pass-end row's
+/// `tail_per_pass` and only updates `latest`; outside a pass it is an `event`.
+fn tail_event(name: &'static str, value: &impl Serialize, fold: impl FnOnce(&mut TailPass)) {
+    let folded = PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if pass.active {
+            fold(&mut pass.tail);
+        }
+        pass.active
+    });
+    if !folded {
+        event(name, value);
+    } else if let (Ok(value), Ok(mut stats)) = (serde_json::to_value(value), stats().lock()) {
+        stats.latest.insert(name, value);
+    }
+}
+/// One Tail read transaction's wall time in milliseconds.
+pub(super) fn tail_load(ms: u128) {
+    tail_event("tail_load_tx_ms", &ms, |tail| {
+        let ms = u64::try_from(ms).unwrap_or(u64::MAX);
+        tail.loads += 1;
+        tail.load_ms_sum = tail.load_ms_sum.saturating_add(ms);
+        tail.load_ms_max = tail.load_ms_max.max(ms);
+    });
+}
+/// The staged Tail buffer after a change: files, bytes and its peak bytes.
+pub(super) fn tail_stage(files: usize, bytes: u64, peak_bytes: u64) {
+    let value = serde_json::json!({"files": files, "bytes": bytes, "peak_bytes": peak_bytes});
+    tail_event("tail_stage", &value, |tail| {
+        tail.stage_reports += 1;
+        tail.stage_files_max = tail.stage_files_max.max(files as u64);
+        tail.stage_bytes_max = tail.stage_bytes_max.max(bytes);
+    });
 }
 /// Test evidence only: the latest value of a content-free event.
 #[cfg(test)]
@@ -262,6 +297,17 @@ struct Decoded {
     headers: u64,
     chunks: u64,
 }
+/// Tail loads and stages in one pass: counts, sums and maxima only.
+#[derive(Clone, Copy, Default, Serialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct TailPass {
+    loads: u64,
+    load_ms_sum: u64,
+    load_ms_max: u64,
+    stage_reports: u64,
+    stage_files_max: u64,
+    stage_bytes_max: u64,
+}
 #[derive(Default)]
 #[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 struct Pass {
@@ -270,6 +316,7 @@ struct Pass {
     cpu_start: Option<u64>,
     written_start: Option<u64>,
     decoded: Decoded,
+    tail: TailPass,
     acquire_sampled: bool,
     initialized: bool,
 }
@@ -354,6 +401,7 @@ pub(in super::super) fn plateau() {
                 .zip(process_written_bytes())
                 .and_then(|(a, b)| b.checked_sub(a));
             stats.decoded_per_pass = pass.decoded;
+            stats.tail_per_pass = std::mem::take(&mut pass.tail);
             crate::local_resource_diagnostics::claude_state_v2(&*stats);
         }
         pass.active = false;
@@ -700,6 +748,76 @@ mod ops_tests {
         assert!(outside
             .iter()
             .all(|row| row["stage_memory"].is_object() && row["save_dirty_rows"]["max"].is_u64()));
+    }
+
+    /// [behaviour] In a pass, Tail loads and stages print no row of their own;
+    /// the pass-end row carries their counts, sums and maxima, then resets.
+    #[test]
+    fn pass_tail_rows_fold_into_the_pass_end_row() {
+        take_thread_event_for_test("tail_load_tx_ms");
+        let previous = PASS.with(|pass| {
+            std::mem::replace(
+                &mut *pass.borrow_mut(),
+                Pass {
+                    active: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            for ms in [3, 0, 10] {
+                tail_load(ms);
+            }
+            tail_stage(2, 100, 100);
+            tail_stage(5, 40, 100);
+            plateau();
+        });
+        let tail = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous).tail);
+        let rows: Vec<_> = records
+            .into_iter()
+            .filter(|record| record["stage"] == "claude_state_v2")
+            .map(|record| record["counts"].clone())
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0]["tail_per_pass"],
+            serde_json::json!({
+                "loads": 3, "load_ms_sum": 13, "load_ms_max": 10,
+                "stage_reports": 2, "stage_files_max": 5, "stage_bytes_max": 100,
+            })
+        );
+        assert!(rows[0]["latest"]["tail_stage"]["peak_bytes"].is_u64());
+        assert_eq!(tail, TailPass::default());
+        assert!(take_thread_event_for_test("tail_load_tx_ms").is_none());
+    }
+
+    /// [behaviour] Outside a pass, each Tail load and stage prints the full
+    /// row at once, as any other event.
+    #[test]
+    fn tail_rows_outside_a_pass_print_the_full_row() {
+        let previous = PASS.with(|pass| std::mem::take(&mut *pass.borrow_mut()));
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            tail_load(7);
+            tail_stage(1, 2, 3);
+        });
+        PASS.with(|pass| *pass.borrow_mut() = previous);
+        let rows: Vec<_> = records
+            .into_iter()
+            .filter(|record| record["stage"] == "claude_state_v2")
+            .map(|record| record["counts"].clone())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows
+            .iter()
+            .all(|row| row["latest"].is_object() && row["stage_memory"].is_object()));
+        assert_eq!(
+            take_thread_event_for_test("tail_load_tx_ms"),
+            Some(serde_json::json!(7))
+        );
+        assert_eq!(
+            take_thread_event_for_test("tail_stage"),
+            Some(serde_json::json!({"files": 1, "bytes": 2, "peak_bytes": 3}))
+        );
     }
 
     /// [regress] The outer save window preserves CPU/wall in the pass-end record.

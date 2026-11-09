@@ -180,7 +180,7 @@ pub(in crate::snapshots) fn load_tail(
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_pages(tx, key.as_bytes(), head, stamp.0, &mut visit)
     })?;
-    telemetry::event("tail_load_tx_ms", &started.elapsed().as_millis());
+    telemetry::tail_load(started.elapsed().as_millis());
     Ok(())
 }
 /// `head`'s revisions by id, one short read transaction; same outcomes as
