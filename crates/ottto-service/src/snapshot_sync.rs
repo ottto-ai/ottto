@@ -11296,7 +11296,7 @@ fn collector_status_request(
     let mut next_retry_at = None;
     if census_status_active {
         let census = status.counts.census_status;
-        // First failed gate wins, even if discovery is still progressing.
+        // First failed gate wins; settled ownership does not block advancing discovery.
         block_cause = if status.counts.unreadable_path_count > 0 {
             Some(CensusBlockCause::UnreadableEvents)
         } else if status.counts.disappeared_file_count > 0 {
@@ -11306,7 +11306,8 @@ fn collector_status_request(
         } else if census.transport_reservation_refused {
             Some(CensusBlockCause::TransportReservation)
         } else if census.reconciliation_incomplete
-            && status.counts.ownership_incomplete_file_count > 0
+            && status.counts.ownership_incomplete_file_count
+                > status.counts.terminal_ownership_incomplete_file_count
         {
             Some(CensusBlockCause::OwnershipIncomplete)
         } else if !census.pending_work || census.retryable_problem {
