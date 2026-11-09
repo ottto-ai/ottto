@@ -707,6 +707,7 @@ fn combined_twin_bytes_are_admitted_as_the_first_page_group() {
     fs::remove_dir_all(home).unwrap();
 }
 
+#[path = "proof_recovery_tests.rs"]
 mod proof_recovery_tests;
 
 /// [regress] First-unit admission replaces permanent size refusal for singleton, twin and combined groups.
