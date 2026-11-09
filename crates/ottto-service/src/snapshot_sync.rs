@@ -9237,6 +9237,8 @@ struct ClaudeEvidencePage<'p> {
     originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
     stats: ClaudeLocalEvidenceStats,
+    /// Roots already counted: a scope root two chunks read counts once.
+    counted_roots: BTreeSet<String>,
 }
 
 /// The evidence stage over one page: its families are packed into chunks and
@@ -9276,6 +9278,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             requested_session_count: claude_evidence_session_ids(&scan_result.snapshots).len(),
             ..Default::default()
         },
+        counted_roots: BTreeSet::new(),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9514,7 +9517,12 @@ fn apply_claude_local_evidence_chunk(
         None => scope,
     };
     let usage_roots = scope.roots().cloned().collect::<Vec<_>>();
-    stats.candidate_root_count += usage_roots.len();
+    // A root counts on its first read in the pass only.
+    let fresh = (usage_roots.iter())
+        .filter(|root| page.counted_roots.insert((*root).clone()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    stats.candidate_root_count += fresh.len();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
         |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
@@ -9553,7 +9561,10 @@ fn apply_claude_local_evidence_chunk(
             paired
         })
         .collect::<Vec<_>>();
-    stats.paired_sidecar_root_count += usage_roots.len();
+    stats.paired_sidecar_root_count += usage_roots
+        .iter()
+        .filter(|root| fresh.contains(*root))
+        .count();
 
     // Release all non-paired rows before moving the selected roots into the
     // usage aggregate.
@@ -9594,6 +9605,13 @@ fn apply_claude_local_evidence_chunk(
         crate::local_resource_diagnostics::StageSum::begin("claude_code", "evidence_decode");
     cross_window.demanded_requests = Some(cross.request_roots.demand_count());
     for root_session_id in usage_roots {
+        // A root another chunk already read counts nowhere.
+        let mut reread = ClaudeLocalEvidenceStats::default();
+        let stats = if fresh.contains(&root_session_id) {
+            &mut *stats
+        } else {
+            &mut reread
+        };
         let (mut api, mut trace) = decode_window.time(|| {
             let api = api_read.take_strict_report(support_dir, &root_session_id);
             let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
