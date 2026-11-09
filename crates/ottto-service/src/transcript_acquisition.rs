@@ -1373,6 +1373,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for SourceStamp {
         match self {
             Self::Absent => Some(()),
             Self::File(stamp) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(stamp, c),
+            Self::Sqlite { target, .. } => {
+                crate::heap_layout_bound::HeapLayoutBound::heap_bound(target, c)
+            }
         }
     }
 }
