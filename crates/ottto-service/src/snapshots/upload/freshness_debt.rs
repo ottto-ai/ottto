@@ -685,7 +685,9 @@ impl<'a> Page<'a> {
         let Some(entry) = index.files.get(key) else {
             return live;
         };
-        let unchanged = index.listing_stamp_matches(listing.path, metadata);
+        // Equal length only: a held-back Codex fragment's bytes stay owed.
+        let unchanged = index.listing_stamp_matches(listing.path, metadata)
+            || (entry.size_bytes == len && entry.same_listing_stamp_as(metadata));
         let len = if unchanged { entry.size_bytes } else { len };
         live.len = len;
         if unchanged {
