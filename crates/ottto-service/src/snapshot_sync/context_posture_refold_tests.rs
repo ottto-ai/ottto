@@ -40,12 +40,13 @@ fn context_posture_survives_a_split_family_refold() {
         let child_path = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
         append(
             &child_path,
-            &json!({
+            &(json!({
                 "type": "system", "subtype": "compact_boundary", "sessionId": ROOT,
                 "timestamp": "2026-08-02T07:03:30Z",
                 "compactMetadata": {"trigger": "auto", "preTokens": 40, "postTokens": 10}
             })
-            .to_string(),
+            .to_string()
+                + "\n"),
         );
         // Reuse the placement control: two accounts, a switch, a side call,
         // an evidence gap and tagged usage, all through real scanning/ACKs.
