@@ -11456,7 +11456,7 @@ fn collector_status_request(
     let mut next_retry_at = None;
     if census_status_active {
         let census = status.counts.census_status;
-        // First failed gate wins, even if discovery is still progressing.
+        // First failed gate wins; settled ownership does not block advancing discovery.
         block_cause = if status.counts.unreadable_path_count > 0 {
             Some(CensusBlockCause::UnreadableEvents)
         } else if status.counts.disappeared_file_count > 0 {
@@ -11466,7 +11466,8 @@ fn collector_status_request(
         } else if census.transport_reservation_refused {
             Some(CensusBlockCause::TransportReservation)
         } else if census.reconciliation_incomplete
-            && status.counts.ownership_incomplete_file_count > 0
+            && status.counts.ownership_incomplete_file_count
+                > status.counts.terminal_ownership_incomplete_file_count
         {
             Some(CensusBlockCause::OwnershipIncomplete)
         } else if !census.pending_work || census.retryable_problem {
@@ -20208,6 +20209,68 @@ mod tests {
                 assert_eq!(receipt["next_retry_at"], "1970-01-01T00:01:00Z");
                 assert_eq!(receipt["last_success_at"], serde_json::Value::Null);
                 assert_eq!(receipt["last_census_complete"], false);
+            }
+        }
+    }
+
+    mod census_ownership_tests {
+        use super::*;
+
+        /// [regress] Settled ownership does not block a draining census; an
+        /// additional account-deferred hold still blocks through the shared gate.
+        #[test]
+        #[serial(source_manifests)]
+        fn draining_census_blocks_only_unsettled_ownership() {
+            let _source_manifests = SourceManifestTestGuard::new();
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Codex,
+                SnapshotSource::Pi,
+            ] {
+                for deferred_hold in [false, true] {
+                    let index = if deferred_hold {
+                        claude_index_with(serde_json::json!({
+                            "claude_account_deferred_holds": {"/opaque/deferred.jsonl": "deferred-source"},
+                        }))
+                    } else {
+                        ScanIndex::default()
+                    };
+                    let mut counts = SyncCounts::for_policy(183);
+                    counts.ownership_incomplete_file_count = 1;
+                    counts.terminal_ownership_incomplete_file_count = 1;
+                    counts.skipped_file_count_due_to_limit = 7;
+                    counts.census_status.pending_work = true;
+                    counts.census_status.reconciliation_incomplete = true;
+                    let receipt = captured_terminal_receipt_for_source_under_hint(
+                        source,
+                        counts.with_snapshot_terminal_counts(&index),
+                        CollectorState::Success,
+                        TerminalManifestSource::Withdraw,
+                        183,
+                        RESIDUE_ADMITTING_HINT,
+                    );
+                    assert_eq!(
+                        receipt["last_error_code"],
+                        if deferred_hold {
+                            "census_blocked"
+                        } else {
+                            "census_incomplete"
+                        }
+                    );
+                    assert_eq!(
+                        receipt.get("last_census_block_cause"),
+                        deferred_hold
+                            .then(|| serde_json::json!("ownership_incomplete"))
+                            .as_ref()
+                    );
+                    assert_eq!(receipt["last_census_complete"], false);
+                    assert_eq!(receipt["last_census_pending_file_count"], 7);
+                    assert_eq!(
+                        receipt["last_ownership_incomplete_file_count"],
+                        1 + u64::from(deferred_hold)
+                    );
+                    assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+                }
             }
         }
     }
