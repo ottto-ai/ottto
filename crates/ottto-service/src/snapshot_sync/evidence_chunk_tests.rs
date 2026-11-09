@@ -39,7 +39,8 @@ impl StreamedChecks {
     }
 
     /// The expected multi-root difference: ROOT's body may differ in its
-    /// context posture only (`CONTEXT_FIELDS`); with that posture made equal,
+    /// context posture only (`CONTEXT_FIELDS`); with that posture (and the
+    /// exact-body binding of its admitted request identity) made equal,
     /// bodies, holds, accepted buckets, wire bytes, totals, placement, the
     /// post-ACK ledger and re-emission are equal.
     fn compare_context_only(
@@ -83,6 +84,11 @@ impl StreamedChecks {
                 assert_eq!(item.source_session_id, ROOT, "only ROOT's posture differs");
                 CONTEXT_ONLY.with(|diverged| diverged.set(diverged.get().map(|n| n + 1)));
                 match_context_posture(item, packed);
+                // The admitted request identity binds the exact body.
+                neutral
+                    .disposition
+                    .mixed_uploads
+                    .admit_request_identity(item);
             }
         }
         assert_eq!(
@@ -96,7 +102,7 @@ impl StreamedChecks {
             disposition.context_file_birth = Default::default();
             disposition
         };
-        assert_eq!(holds(reference), holds(packed), "holds");
+        assert_eq!(holds(&neutral), holds(packed), "holds");
         assert_eq!(reference_accepted, accepted, "accepted buckets");
         let carried = [reference, packed].map(|page| carried_forward(&page.scan.snapshots));
         assert_eq!(carried[0], carried[1], "carried accounts");
