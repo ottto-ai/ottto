@@ -1408,12 +1408,27 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
             &queued.index,
             SOURCE
         ));
-        let mut retry = hinted(&c, queued.index, 100, true, &hints);
-        retry.finish();
-        assert_eq!(
-            retry.modes.0, 0,
-            "stored Tail retry must not cause a Full read"
+        // A bounded page may leave a family member queued. Resume its retained
+        // queue without re-hinting an already selected owner ahead of its sibling.
+        let mut retry = hinted(&c, queued.index, 100, true, &[]);
+        let mut offered = Vec::new();
+        for _ in 0..8 {
+            retry.finish();
+            assert_eq!(
+                retry.modes.0, 0,
+                "stored Tail retry must not cause a Full read"
+            );
+            offered.append(&mut retry.scan.snapshots);
+            if retry.scan.census_complete {
+                break;
+            }
+            retry = hinted(&c, retry.index, 100, true, &[]);
+        }
+        assert!(
+            retry.scan.census_complete,
+            "drain the retained family queue"
         );
+        retry.scan.snapshots = offered;
         assert_eq!(
             retry
                 .scan
