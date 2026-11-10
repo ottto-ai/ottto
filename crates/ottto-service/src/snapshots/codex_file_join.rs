@@ -3152,7 +3152,10 @@ pub(super) mod tests {
         OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow_mut().clear());
     }
     /// The older build's per-row stamp, where it ran: before tier replay.
-    pub(crate) fn older_build_logs_tier(selector: &mut SelectorCapture, turn: Option<&str>) {
+    pub(in crate::snapshots) fn older_build_logs_tier(
+        selector: &mut SelectorCapture,
+        turn: Option<&str>,
+    ) {
         if turn.is_some_and(|turn| {
             OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow().contains(turn))
         }) {
