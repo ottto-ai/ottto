@@ -521,6 +521,79 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     }
 }
 
+/// [regress] Header facts a warm process cache carries from earlier durable
+/// lookups keep each page's money: every appended page's bodies and placement
+/// equal a cold Full's, on one warm cache and with a restart (empty cache,
+/// reloaded store; also what an upgrade leaves) between pages. The warm third
+/// page looks up fewer heads than the restarted one. [money] Two accounts, a
+/// side call in archived_sessions, an evidence gap and a mid-session switch.
+#[test]
+fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut third_page_lookups = Vec::new();
+    for restart in [false, true] {
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let side = c.path(SIDE);
+        fs::rename(&side, c.archived.join(side.file_name().unwrap())).unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let warm = Arc::new(sampled_scan::SharedCache::default());
+        let cache = || {
+            if restart {
+                Arc::default()
+            } else {
+                warm.clone()
+            }
+        };
+        let mut index = prior;
+        for page_number in 0..3 {
+            match page_number {
+                0 => {}
+                1 => append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched")))),
+                _ => append(&c.path(MAIN), &turn(4)),
+            }
+            if restart {
+                index = ScanIndex::load(session.path()).unwrap();
+            }
+            let before = index.clone();
+            let (working, scan, _, _, logs) = page(&c, index, cache());
+            let (next, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+            index = next;
+            assert_eq!(posts.len(), 1, "page {page_number}");
+            let (_, mut cold, _, _, _) = page(
+                &c,
+                ScanIndex::default(),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            if page_number > 0 {
+                cold.snapshots.retain(|s| s.source_session_id == MAIN);
+            }
+            money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &scan, posts));
+            if page_number == 2 {
+                let lookups = emitted_header_lookups(&logs)
+                    .iter()
+                    .filter_map(|window| window["lookups"].as_u64())
+                    .sum::<u64>();
+                third_page_lookups.push(lookups);
+            }
+        }
+        drop(session);
+    }
+    assert!(
+        third_page_lookups[0] < third_page_lookups[1],
+        "warm carried lookups {third_page_lookups:?}"
+    );
+}
+
 /// [regress] A rollout created in an unrelated Codex home while a page is
 /// open leaves that page's checkpoint valid: the page uploads and saves.
 #[test]

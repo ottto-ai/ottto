@@ -5645,64 +5645,16 @@ pub(in crate::snapshots) mod header_cache_tests {
             &ScanIndex::default(),
             &state,
         );
-        let accept = |index: &mut ScanIndex| {
-            for n in [0, 2] {
-                let fingerprint = format!("{n}").repeat(64);
-                index.files.insert(
-                    keys[n].clone(),
-                    ScanIndexEntry {
-                        last_snapshot_fingerprint: Some(fingerprint.clone()),
-                        codex_joined_member_set: Some("joined".into()),
-                        codex_counting_owner: Some(codex_protected_owner(ORDER_OWNERS[n]).into()),
-                        ..Default::default()
-                    },
-                );
-                index
-                    .file_snapshot_fingerprints
-                    .insert(keys[n].clone(), BTreeSet::from([fingerprint.clone()]));
-                index.accepted_snapshot_fingerprints.insert(fingerprint);
-            }
-            index.files.entry(keys[1].clone()).or_default();
-        };
-        accept(&mut index);
+        accept_order(&mut index, &keys);
         stage_independent_inventory(
             &index,
             &[native.headers[0].candidate.clone()],
             ORDER_OWNERS[0],
         )
         .unwrap();
-        let route = state_v2::runtime_path(&index).unwrap().unwrap();
-        let plain = fs::File::open(sessions.join(ORDER_NAMES[1])).unwrap();
-        state_v2::stage_tail(
-            &route,
-            &keys[1],
-            state_v2::StagedFile {
-                revision: 1,
-                head: b"head".to_vec(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        state_v2::observe_tails(
-            &route,
-            vec![(
-                keys[1].clone(),
-                state_v2::Observation {
-                    inventory: Some(state_v2::InventoryFacts {
-                        owner: ORDER_OWNERS[1].to_owned(),
-                        created_unix_ms: Some(42),
-                        stamp: sampled_scan::codex_cursor::OpenStamp::capture(&plain)
-                            .unwrap()
-                            .content_stamp(),
-                        read_bytes: PHYSICAL_READ_BYTES,
-                    }),
-                    ..Default::default()
-                },
-            )],
-        )
-        .unwrap();
+        stage_physical(&root, &index, 42, true);
         let mut index = session.save_reload(&mut index);
-        accept(&mut index);
+        accept_order(&mut index, &keys);
         let head = |n: usize| state_v2::load_head(&index, &keys[n], 1).unwrap();
         let joined = head(0).unwrap();
         assert!(joined.metadata_only);
@@ -5713,12 +5665,60 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert!(head(2).is_none());
         (root, session, index)
     }
+    /// The scan graph's accepted joined members `a` and `c`, and plain `b`.
+    fn accept_order(index: &mut ScanIndex, keys: &[String]) {
+        for n in [0, 2] {
+            let fingerprint = format!("{n}").repeat(64);
+            index.files.insert(
+                keys[n].clone(),
+                ScanIndexEntry {
+                    last_snapshot_fingerprint: Some(fingerprint.clone()),
+                    codex_joined_member_set: Some("joined".into()),
+                    codex_counting_owner: Some(codex_protected_owner(ORDER_OWNERS[n]).into()),
+                    ..Default::default()
+                },
+            );
+            index
+                .file_snapshot_fingerprints
+                .insert(keys[n].clone(), BTreeSet::from([fingerprint.clone()]));
+            index.accepted_snapshot_fingerprints.insert(fingerprint);
+        }
+        index.files.entry(keys[1].clone()).or_default();
+    }
+    /// Stages `b`'s physical header facts (created `created`) for the next
+    /// commit, with a reduction head when `head`; its file is unchanged.
+    fn stage_physical(root: &Path, index: &ScanIndex, created: i64, head: bool) {
+        let route = state_v2::runtime_path(index).unwrap().unwrap();
+        let key = local_index_key(&root.join("sessions").join(ORDER_NAMES[1]));
+        let plain = fs::File::open(root.join("sessions").join(ORDER_NAMES[1])).unwrap();
+        if head {
+            let staged = state_v2::StagedFile {
+                revision: 1,
+                head: b"head".to_vec(),
+                ..Default::default()
+            };
+            state_v2::stage_tail(&route, &key, staged).unwrap();
+        }
+        let inventory = state_v2::InventoryFacts {
+            owner: ORDER_OWNERS[1].to_owned(),
+            created_unix_ms: Some(created),
+            stamp: sampled_scan::codex_cursor::OpenStamp::capture(&plain)
+                .unwrap()
+                .content_stamp(),
+            read_bytes: PHYSICAL_READ_BYTES,
+        };
+        let observation = state_v2::Observation {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        state_v2::observe_tails(&route, vec![(key, observation)]).unwrap();
+    }
     /// One inventory over the lookup-order members on `index`; the durable
     /// head lookups it ran. `fail` fails that 1-based lookup.
     fn ordered(
         root: &Path,
         index: &mut ScanIndex,
-        cache: &Arc<sampled_scan::SharedCache>,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
         fail: Option<usize>,
     ) -> (HeaderInventory, usize) {
         let sessions = root.join("sessions");
@@ -5730,7 +5730,7 @@ pub(in crate::snapshots) mod header_cache_tests {
             &CodexTitleMetadata::default(),
             index,
             &BTreeMap::new(),
-            Some(cache),
+            cache,
         ) {}
         let calls = state_v2::LOAD_HEAD_CALLS.get().0;
         state_v2::LOAD_HEAD_CALLS.set((0, None));
@@ -5742,7 +5742,8 @@ pub(in crate::snapshots) mod header_cache_tests {
     /// longer fail the member. Each member's facts are the base order's: `a`
     /// joined durable (created None even with the header time in RAM), `b`
     /// physical durable, `c` RAM after both lookups miss. Any lookup that
-    /// runs and errors still fails its member.
+    /// runs and errors still fails its member. A later inventory on the same
+    /// cache carries `a`'s and `b`'s durable facts without a lookup.
     #[test]
     fn joined_archive_hit_runs_one_durable_lookup_and_keeps_durable_facts() {
         let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
@@ -5776,32 +5777,42 @@ pub(in crate::snapshots) mod header_cache_tests {
         ) {}
         assert_eq!(state_v2::LOAD_HEAD_CALLS.get().0, 1, "joined hit: 1 lookup");
         assert_eq!(facts(&alone), expected[..1]);
-        // All three, cold then warm RAM: a 1 + b 1 + c 2 lookups.
-        let (first, calls) = ordered(&root, &mut index, &cold, None);
-        assert_eq!(calls, 4);
+        // All three: `a` carries its durable facts (base: 1 lookup), b 1 + c 2.
+        let (first, calls) = ordered(&root, &mut index, Some(&cold), None);
+        assert_eq!(calls, 3);
         assert!(first.complete);
         assert_eq!(facts(&first), expected);
         assert_eq!((first.reuse_hits, first.reuse_misses), (2, 1));
         assert!(first.read_bytes > 0, "c is read natively");
         let staged_bytes = MAX_HEADER_BYTES + PHYSICAL_READ_BYTES as usize;
         assert_eq!(first.bytes_avoided, staged_bytes);
-        let (warm, calls) = ordered(&root, &mut index, &cold, None);
-        assert_eq!(calls, 4);
+        // Warm: only `c` looks up (base: 4); `a` keeps its durable None.
+        let (warm, calls) = ordered(&root, &mut index, Some(&cold), None);
+        assert_eq!(calls, 2);
         assert_eq!(facts(&warm), expected);
         assert_eq!((warm.reuse_hits, warm.read_bytes), (3, 0));
         assert_eq!(warm.bytes_avoided, staged_bytes + first.read_bytes);
         let counted = cold.counters_for_test();
-        assert_eq!(counted.header_durable_lookups, 1 + 4 + 4);
+        assert_eq!(counted.header_durable_lookups, 1 + 3 + 2);
         assert_eq!(counted.header_reuse_hits, 1 + 2 + 3);
         assert_eq!(
             counted.header_bytes_avoided as usize,
             MAX_HEADER_BYTES + staged_bytes + staged_bytes + first.read_bytes
         );
+        // A carried member runs no lookup that could fail it: the warm
+        // cache's 1st lookup is `c`'s joined lookup.
+        let (failed, _) = ordered(&root, &mut index, Some(&cold), Some(1));
+        assert_eq!(
+            failed.refused.keys().cloned().collect::<Vec<_>>(),
+            vec![keys[2].clone()]
+        );
+        assert_eq!(facts(&failed), expected[..2]);
         // An evaluated lookup's error fails its member as before: `a`'s
         // joined lookup (1st), and `c`'s physical lookup after its joined miss
         // (4th), even with `c`'s facts in RAM.
         for (fail, member) in [(1, 0), (4, 2)] {
-            let (failed, _) = ordered(&root, &mut index, &cold, Some(fail));
+            let fresh = Arc::new(sampled_scan::SharedCache::default());
+            let (failed, _) = ordered(&root, &mut index, Some(&fresh), Some(fail));
             assert!(!failed.complete, "lookup {fail}");
             assert_eq!(
                 failed.refused.keys().cloned().collect::<Vec<_>>(),
@@ -5815,6 +5826,95 @@ pub(in crate::snapshots) mod header_cache_tests {
                 .collect::<Vec<_>>();
             assert_eq!(facts(&failed), survivors, "lookup {fail}");
         }
+        drop(session);
+        drop(root);
+    }
+    /// [regress] Carried durable facts end, per key, with every commit that
+    /// may change the key's committed head, even on an unchanged file: a
+    /// finish commit, a debt-only observation, the exit commit, erasure,
+    /// retirement and a removed progress row. Another cache taking the store's
+    /// head writes ends them all. Every inventory's facts equal an uncached
+    /// inventory's, so `a`'s durable None wins over its header time on both.
+    #[test]
+    fn carried_header_facts_end_with_each_head_write() {
+        let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
+        let (root, session, mut index) = lookup_order_fixture();
+        let keys = order_paths(&root).into_iter().collect::<Vec<_>>();
+        let route = state_v2::runtime_path(&index).unwrap().unwrap();
+        let warm = Arc::new(sampled_scan::SharedCache::default());
+        // One inventory on the warm cache: (its facts, its lookups).
+        let pass = |index: &mut ScanIndex| {
+            let (carried, calls) = ordered(&root, index, Some(&warm), None);
+            let (fresh, _) = ordered(&root, index, None, None);
+            assert!(carried.complete && fresh.complete);
+            assert_eq!(facts(&carried), facts(&fresh), "carried == uncached");
+            (facts(&carried), calls)
+        };
+        let mut expected = vec![
+            (keys[0].clone(), ORDER_OWNERS[0].to_owned(), None),
+            (keys[1].clone(), ORDER_OWNERS[1].to_owned(), Some(42)),
+            (
+                keys[2].clone(),
+                ORDER_OWNERS[2].to_owned(),
+                Some(ORDER_CREATED[2]),
+            ),
+        ];
+        // Cold: a 1 + b 1 + c 2. Warm: `c` alone; then again after another
+        // cache took the head writes, since any head may have changed.
+        assert_eq!(pass(&mut index), (expected.clone(), 4));
+        assert_eq!(pass(&mut index), (expected.clone(), 2));
+        ordered(&root, &mut index, Some(&Arc::default()), None);
+        assert_eq!(pass(&mut index), (expected.clone(), 4));
+        assert_eq!(pass(&mut index), (expected.clone(), 2));
+        assert_eq!(
+            warm.counters_for_test().header_durable_lookups,
+            4 + 2 + 4 + 2
+        );
+        let reload = |index: &mut ScanIndex| {
+            let mut next = session.save_reload(index);
+            accept_order(&mut next, &keys);
+            *index = next;
+        };
+        // `b`'s new facts on its unchanged file: its finish commit, a
+        // debt-only observation, then the exit commit.
+        for (created, head) in [(43, true), (44, false)] {
+            stage_physical(&root, &index, created, head);
+            reload(&mut index);
+            expected[1].2 = Some(created);
+            assert_eq!(pass(&mut index), (expected.clone(), 1 + 2), "{created}");
+            assert_eq!(pass(&mut index), (expected.clone(), 2), "{created}");
+        }
+        stage_physical(&root, &index, 45, false);
+        state_v2::BaselineRelease::new(&route, &index)
+            .commit_tail()
+            .unwrap();
+        let mut index = ScanIndex::load(session.path()).unwrap();
+        accept_order(&mut index, &keys);
+        expected[1].2 = Some(45);
+        assert_eq!(pass(&mut index), (expected.clone(), 1 + 2));
+        assert_eq!(pass(&mut index), (expected.clone(), 2));
+        // Erased, then (after a new head) retired: `b` reads its header.
+        state_v2::erase_tail(&route, &mut index, [keys[1].clone()]).unwrap();
+        reload(&mut index);
+        expected[1].2 = Some(ORDER_CREATED[1]);
+        assert_eq!(pass(&mut index), (expected.clone(), 1 + 2));
+        stage_physical(&root, &index, 46, true);
+        reload(&mut index);
+        expected[1].2 = Some(46);
+        assert_eq!(pass(&mut index), (expected.clone(), 1 + 2));
+        assert_eq!(pass(&mut index), (expected.clone(), 2));
+        state_v2::retire_tail(&route, [keys[1].clone()]).unwrap();
+        reload(&mut index);
+        expected[1].2 = Some(ORDER_CREATED[1]);
+        assert_eq!(pass(&mut index), (expected.clone(), 1 + 2));
+        // `a`'s progress row goes: its head retires with it. Re-accepted, it
+        // runs both lookups and reads its header time.
+        index.files.remove(&keys[0]);
+        index.file_snapshot_fingerprints.remove(&keys[0]);
+        reload(&mut index);
+        assert!(state_v2::load_head(&index, &keys[0], 1).unwrap().is_none());
+        expected[0].2 = Some(ORDER_CREATED[0]);
+        assert_eq!(pass(&mut index), (expected.clone(), 2 + 1 + 2));
         drop(session);
         drop(root);
     }
