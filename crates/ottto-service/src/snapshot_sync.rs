@@ -17019,7 +17019,7 @@ mod tests {
     fn session_cadence_tracks_power_without_delaying_paced_work() {
         use continuation::{session_power_stretch, PlatformState, PACED_BATTERY, PACING};
         let start = Instant::now();
-        let minutes = |n| Duration::from_secs(n * 60);
+        let minutes = |n: u64| Duration::from_secs(n * 60);
         for power in [
             PlatformState::Allowed,
             PlatformState::Unknown,
