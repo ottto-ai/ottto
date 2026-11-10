@@ -3990,13 +3990,12 @@ fn with_source_cadence<T>(
     source: SnapshotSource,
     apply: impl FnOnce(&mut SourceCadence) -> T,
 ) -> Option<T> {
+    let power = continuation::MacPlatformSignals::default().power();
     let mut cadences = source_cadences().lock().ok()?;
     let cadence = cadences
         .entry(source.api_slug())
         .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
-    cadence.set_power_stretch(continuation::session_power_stretch(
-        continuation::MacPlatformSignals::default().power(),
-    ));
+    cadence.set_power_stretch(continuation::session_power_stretch(power));
     Some(apply(cadence))
 }
 
