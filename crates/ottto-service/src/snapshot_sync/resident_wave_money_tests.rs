@@ -602,8 +602,8 @@ fn resident_wave_source_changed_tail_refolds_match_one_page() {
         let mut wide_seed = drain(&c, f64::INFINITY, false);
         let mut small_seed = drain(&c, f64::INFINITY, false);
         // A completed sidecar sweep restarts the walk even after retirement.
-        wide_seed.index.claude_desktop_store_sweep_had_errors = true;
-        small_seed.index.claude_desktop_store_sweep_had_errors = true;
+        E2ScanFixture::mark_sidecar_sweep_incomplete(&mut wide_seed.index);
+        E2ScanFixture::mark_sidecar_sweep_incomplete(&mut small_seed.index);
         // New finish evidence for every root; native transcripts stay fixed.
         for n in 1..5 {
             let id = format!("{}338a80a-f36e-4cbc-a5bb-50fc66430ba5", n + 1);

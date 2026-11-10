@@ -4,6 +4,7 @@
 
 mod step;
 
+use crate::snapshots::discovery::traversal::scan_traversal_context_fingerprint;
 use crate::snapshots::*;
 
 pub(in crate::snapshots) fn prepare_owned_scan_candidate(

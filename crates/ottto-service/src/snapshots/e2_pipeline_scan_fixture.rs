@@ -420,6 +420,10 @@ pub(crate) struct E2ScanFixture {
     attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
 }
 impl E2ScanFixture {
+    pub(crate) fn mark_sidecar_sweep_incomplete(index: &mut ScanIndex) {
+        index.claude_desktop_store_sweep_had_errors = true;
+    }
+
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
     /// fixtures retain their historical capture-off scope and bytes.
     pub(crate) fn capturing_identity() -> Self {
