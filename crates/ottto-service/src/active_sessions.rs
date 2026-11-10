@@ -145,7 +145,8 @@ fn reconcile_with_registrations(
         .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
         .unwrap_or(now)
         .min(now);
-    let activity_cutoff = activity_clock - active_activity_window(effective_interval);
+    let activity_window = active_activity_window(effective_interval);
+    let activity_cutoff = activity_clock - activity_window;
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
@@ -315,6 +316,7 @@ fn reconcile_with_registrations(
     let reconciliation = ActiveSessionReconciliation {
         scan_started_at: scan_started_at.map(str::to_string),
         reconciled_at: reconciled_at.to_string(),
+        active_window_seconds: activity_window.whole_seconds() as u64,
         changed_session_count,
         sessions,
     };
@@ -1150,13 +1152,28 @@ mod tests {
 
     #[test]
     fn active_window_follows_the_effective_cadence() {
+        let dir = temp_dir("battery-window");
         for (interval, window) in [(300, 15), (900, 20), (1800, 35)] {
             assert_eq!(
                 active_activity_window(std::time::Duration::from_secs(interval)),
                 Duration::minutes(window)
             );
+            let reconciled = reconcile_active_sessions(
+                &dir,
+                SnapshotSource::ClaudeCode,
+                &[],
+                None,
+                None,
+                "2026-07-19T10:00:00Z",
+                std::time::Duration::from_secs(interval),
+            )
+            .unwrap();
+            let value = serde_json::to_value(reconciled).unwrap();
+            assert_eq!(
+                value["active_window_seconds"].as_u64(),
+                Some(window as u64 * 60)
+            );
         }
-        let dir = temp_dir("battery-window");
         let snapshot = test_snapshot("battery-active", "2026-07-19T10:00:00Z");
         let at = |now| {
             reconcile_active_sessions(

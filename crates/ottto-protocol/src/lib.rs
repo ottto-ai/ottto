@@ -776,9 +776,16 @@ pub struct ActiveSessionReconciliation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_started_at: Option<Rfc3339Timestamp>,
     pub reconciled_at: Rfc3339Timestamp,
+    /// Recency window used by the daemon; older caches used fifteen minutes.
+    #[serde(default = "default_active_window_seconds")]
+    pub active_window_seconds: u64,
     pub changed_session_count: u64,
     #[serde(default)]
     pub sessions: Vec<ActiveSession>,
+}
+
+fn default_active_window_seconds() -> u64 {
+    15 * 60
 }
 
 /// One recently changed local coding-agent session. Every field is
@@ -8561,6 +8568,7 @@ mod tests {
             }))
             .expect("older reconciliation");
         assert_eq!(reconciliation.scan_started_at, None);
+        assert_eq!(reconciliation.active_window_seconds, 900);
         let value = serde_json::to_value(reconciliation).unwrap();
         assert!(value.get("scan_started_at").is_none());
     }
@@ -8570,6 +8578,7 @@ mod tests {
         let reconciliation = ActiveSessionReconciliation {
             scan_started_at: Some("2026-07-19T17:55:00Z".to_string()),
             reconciled_at: "2026-07-19T18:00:00Z".to_string(),
+            active_window_seconds: 900,
             changed_session_count: 1,
             sessions: vec![ActiveSession {
                 source_session_id: "session-a".to_string(),
@@ -8627,6 +8636,7 @@ mod tests {
 
         let value = serde_json::to_value(&reconciliation).expect("serialize reconciliation");
         assert_eq!(value["scan_started_at"], "2026-07-19T17:55:00Z");
+        assert_eq!(value["active_window_seconds"].as_u64(), Some(900));
         assert_eq!(value["changed_session_count"], 1);
         assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
         assert_eq!(value["sessions"][0]["compaction_count"], 2);
