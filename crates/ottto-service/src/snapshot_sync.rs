@@ -1,3 +1,4 @@
+use self::continuation::PlatformGates;
 use crate::local_resource_diagnostics::StageWindow;
 #[cfg(test)]
 use crate::snapshots::snapshot_quarantine_witness;
@@ -3993,6 +3994,9 @@ fn with_source_cadence<T>(
     let cadence = cadences
         .entry(source.api_slug())
         .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
+    cadence.set_power_stretch(continuation::session_power_stretch(
+        continuation::MacPlatformSignals::default().power(),
+    ));
     Some(apply(cadence))
 }
 
@@ -4939,7 +4943,7 @@ fn collect_file_activity_with_retry(
         if account_switch.observe(Instant::now(), &mut read_account) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
-                cadence.record_file_event(Instant::now())
+                cadence.record_account_switch(Instant::now())
             });
             return true;
         }
@@ -6499,7 +6503,13 @@ fn prepare_sync_source_inner(
         eprintln!(
             "local snapshot sync deferred for {}: backend backoff has {}s remaining",
             source.api_slug(),
-            remaining.as_secs()
+            remaining.as_secs(),
+            continuation::MacPlatformSignals::default().power(),
+            with_source_cadence(source, |cadence| cadence
+                .ordinary_interval()
+                .min(MAX_CYCLE_INTERVAL))
+            .unwrap_or(SNAPSHOT_SYNC_INTERVAL)
+            .as_secs()
         );
         return Ok(None);
     }
@@ -6606,7 +6616,7 @@ fn prepare_sync_source_inner(
     // scan below, which re-reads every changed transcript on this machine.
     if let Some(remaining) = source_cadence_wait(source) {
         eprintln!(
-            "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence",
+            "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence; power={:?} effective_interval={}s",
             source.api_slug(),
             remaining.as_secs()
         );
@@ -7690,6 +7700,10 @@ fn finish_sync_source(
         Some(&reconciliation_status),
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
+        with_source_cadence(source, |cadence| {
+            cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
+        })
+        .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
     )
     .is_err()
     {
@@ -17003,6 +17017,68 @@ mod tests {
 
     mod inplace_retry_tests {
         include!("snapshot_sync/inplace_retry_tests.rs");
+    }
+
+    #[test]
+    fn session_cadence_tracks_power_without_delaying_paced_work() {
+        use continuation::{session_power_stretch, PlatformState, PACED_BATTERY, PACING};
+        let start = Instant::now();
+        let minutes = |n| Duration::from_secs(n * 60);
+        for power in [
+            PlatformState::Allowed,
+            PlatformState::Unknown,
+            PlatformState::Battery,
+            PlatformState::Refused,
+        ] {
+            let stretch = session_power_stretch(power);
+            let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+            cadence.set_power_stretch(stretch);
+            assert_eq!(cadence.ordinary_interval(), MAX_CYCLE_INTERVAL, "cold");
+            cadence.record_scan_success(start, 0);
+            assert_eq!(
+                cadence.ordinary_interval(),
+                minutes(if stretch == 3 { 15 } else { 10 }),
+                "idle"
+            );
+            cadence.record_scan_success(start, 1);
+            assert_eq!(
+                cadence.ordinary_interval(),
+                SNAPSHOT_SYNC_INTERVAL * stretch,
+                "warm"
+            );
+            cadence.record_file_event(start);
+            assert_eq!(
+                cadence.ordinary_interval(),
+                SNAPSHOT_SYNC_INTERVAL * stretch,
+                "hot"
+            );
+            cadence.request_paced_scan(start, Duration::ZERO, PACED_BATTERY);
+            assert_eq!(cadence.paced_scan_due(), Some(start + minutes(3)));
+            cadence.request_continuation(start, Duration::from_secs(1));
+            assert_eq!(
+                cadence.continuation_due(PACING),
+                Some(start + Duration::from_secs(30))
+            );
+            cadence.set_server_min_interval(Some(minutes(20)));
+            assert_eq!(cadence.ordinary_interval(), minutes(20));
+            cadence.set_server_min_interval(None);
+            cadence.record_scan_failure(start);
+            assert_eq!(cadence.ordinary_interval(), minutes(1), "failure unchanged");
+        }
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(start, 1);
+        let now = start + minutes(5);
+        cadence.set_power_stretch(session_power_stretch(PlatformState::Battery));
+        assert_eq!(cadence.next_scan_after(now), minutes(10), "unplugged");
+        cadence.set_power_stretch(session_power_stretch(PlatformState::Allowed));
+        assert_eq!(cadence.next_scan_after(now), Duration::ZERO, "plugged in");
+        cadence.set_power_stretch(session_power_stretch(PlatformState::Refused));
+        cadence.record_account_switch(now);
+        assert_eq!(
+            cadence.next_scan_after(now),
+            Duration::ZERO,
+            "account switch"
+        );
     }
 
     #[test]

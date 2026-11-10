@@ -29,7 +29,11 @@ use crate::snapshots::{
 };
 use crate::transcript_acquisition::{SourceStamp, StampedFacts};
 
-const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
+fn active_activity_window(effective_interval: std::time::Duration) -> Duration {
+    Duration::seconds(effective_interval.as_secs().min(i64::MAX as u64) as i64)
+        .saturating_add(Duration::minutes(5))
+        .max(Duration::minutes(15))
+}
 const WATERMARK_RETENTION_DAYS: i64 = 90;
 const MAX_ACTIVE_SESSIONS: usize = 100;
 
@@ -84,6 +88,7 @@ pub fn reconcile_active_sessions(
     agent_status: Option<&AgentStatusSnapshot>,
     scan_started_at: Option<&str>,
     reconciled_at: &str,
+    effective_interval: std::time::Duration,
 ) -> Result<ActiveSessionReconciliation> {
     reconcile_with_registrations(
         support_dir,
@@ -93,6 +98,7 @@ pub fn reconcile_active_sessions(
         scan_started_at,
         reconciled_at,
         Some("local"),
+        effective_interval,
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -112,11 +118,12 @@ pub fn clear_active_sessions(
         None,
         reconciled_at,
         None,
+        std::time::Duration::ZERO,
         crate::agent_status::claude_session_registrations,
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn reconcile_with_registrations(
     support_dir: &Path,
     source: SnapshotSource,
@@ -125,6 +132,7 @@ fn reconcile_with_registrations(
     scan_started_at: Option<&str>,
     reconciled_at: &str,
     carry_policy: Option<&str>,
+    effective_interval: std::time::Duration,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
 ) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
@@ -137,7 +145,7 @@ fn reconcile_with_registrations(
         .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
         .unwrap_or(now)
         .min(now);
-    let activity_cutoff = activity_clock - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
+    let activity_cutoff = activity_clock - active_activity_window(effective_interval);
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
@@ -1141,6 +1149,33 @@ mod tests {
     }
 
     #[test]
+    fn active_window_follows_the_effective_cadence() {
+        for (interval, window) in [(300, 15), (900, 20), (1800, 35)] {
+            assert_eq!(
+                active_activity_window(std::time::Duration::from_secs(interval)),
+                Duration::minutes(window)
+            );
+        }
+        let dir = temp_dir("battery-window");
+        let snapshot = test_snapshot("battery-active", "2026-07-19T10:00:00Z");
+        let at = |now| {
+            reconcile_active_sessions(
+                &dir,
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&snapshot),
+                None,
+                None,
+                now,
+                std::time::Duration::from_secs(900),
+            )
+            .unwrap()
+        };
+        assert_eq!(at("2026-07-19T10:18:00Z").sessions.len(), 1);
+        assert!(at("2026-07-19T10:21:00Z").sessions.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reconciled_session_carries_latest_model_and_effort() {
         let dir = temp_dir("latest-identity");
         let mut snapshot = test_snapshot("s-wire", "2026-07-19T10:04:00Z");
@@ -1157,6 +1192,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("reconciliation");
 
@@ -1240,6 +1276,7 @@ mod tests {
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             registrations,
         )
         .unwrap();
@@ -1280,6 +1317,7 @@ mod tests {
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             registrations,
         )
         .unwrap();
@@ -1316,6 +1354,7 @@ mod tests {
             None,
             "2026-07-19T10:10:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
@@ -1341,6 +1380,7 @@ mod tests {
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
@@ -1369,6 +1409,7 @@ mod tests {
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             registrations,
         )
         .unwrap();
@@ -1405,6 +1446,7 @@ mod tests {
                 None,
                 "2026-07-19T10:05:00Z",
                 Some("policy"),
+                std::time::Duration::from_secs(300),
                 registrations,
             )
             .unwrap();
@@ -1429,6 +1471,7 @@ mod tests {
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             registrations,
         )
         .unwrap();
@@ -1481,6 +1524,7 @@ mod tests {
                 None,
                 "2026-07-19T10:05:00Z",
                 Some("policy"),
+                std::time::Duration::from_secs(300),
                 BTreeMap::new,
             )
             .unwrap();
@@ -1502,6 +1546,7 @@ mod tests {
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             BTreeMap::new,
         )
         .unwrap();
@@ -1517,6 +1562,7 @@ mod tests {
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
+            std::time::Duration::from_secs(300),
             || panic!("no registry scan for empty source"),
         )
         .unwrap();
@@ -1552,6 +1598,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .unwrap();
         assert_eq!(first.sessions.len(), 1);
@@ -1613,6 +1660,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:40:00Z",
+            std::time::Duration::from_secs(300),
         )
         .unwrap();
         let cache = read_cache(&path);
@@ -1636,6 +1684,7 @@ mod tests {
             None,
             Some("2026-07-19T10:00:00Z"),
             "2026-07-19T10:40:00Z",
+            std::time::Duration::from_secs(300),
         )
         .unwrap();
         assert_eq!(result.changed_session_count, 1);
@@ -1679,6 +1728,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
         assert_eq!(first.changed_session_count, 1);
@@ -1714,6 +1764,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:06:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("quiet reconciliation");
         assert_eq!(quiet.sessions, first.sessions);
@@ -1725,6 +1776,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:10:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("unchanged reconciliation");
         assert_eq!(unchanged.changed_session_count, 0);
@@ -1743,6 +1795,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
         assert_eq!(first.sessions.len(), 1);
@@ -1755,6 +1808,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:15:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("quiet reconciliation");
         assert_eq!(quiet.changed_session_count, 0);
@@ -1769,6 +1823,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:17:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("mixed reconciliation");
         assert_eq!(mixed.changed_session_count, 1);
@@ -1787,6 +1842,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:20:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("later reconciliation");
         let ids = later
@@ -1810,6 +1866,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
         assert!(first.sessions[0].session_display_name.is_some());
@@ -1824,6 +1881,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:08:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("rebuilt reconciliation");
         assert_eq!(rebuilt.changed_session_count, 0);
@@ -1845,6 +1903,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
         assert_eq!(
@@ -1868,6 +1927,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:08:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("policy-change reconciliation");
         assert_eq!(changed.sessions.len(), 1);
@@ -1913,9 +1973,17 @@ mod tests {
     fn current_account_and_history_come_only_from_this_reads_own_requests() {
         let dir = temp_dir("session-accounts");
         let reconcile = |snapshot: &SnapshotItem, source, at: &str| {
-            reconcile_active_sessions(&dir, source, std::slice::from_ref(snapshot), None, None, at)
-                .expect("reconciliation")
-                .sessions
+            reconcile_active_sessions(
+                &dir,
+                source,
+                std::slice::from_ref(snapshot),
+                None,
+                None,
+                at,
+                std::time::Duration::from_secs(300),
+            )
+            .expect("reconciliation")
+            .sessions
         };
         let mut tagged = test_snapshot("s-claude", "2026-07-19T10:04:00Z");
         tagged.claude_account_display = Some(Box::new(account_display("account-a")));
@@ -1934,6 +2002,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:06:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("quiet")
         .sessions;
@@ -1988,6 +2057,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("codex")
         .sessions;
@@ -2027,6 +2097,7 @@ mod tests {
             Some(&status),
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
         assert_eq!(
@@ -2041,6 +2112,7 @@ mod tests {
             Some(&status),
             None,
             "2026-07-19T10:06:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("agreeing reconciliation");
         assert_eq!(
@@ -2061,6 +2133,7 @@ mod tests {
             Some(&conflicting),
             None,
             "2026-07-19T10:07:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("conflicting reconciliation");
         assert_eq!(withheld.sessions.len(), 1);
@@ -2111,6 +2184,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:05:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("first reconciliation");
 
@@ -2124,6 +2198,7 @@ mod tests {
             None,
             None,
             "2026-07-19T10:07:00Z",
+            std::time::Duration::from_secs(300),
         )
         .expect("next reconciliation");
         assert!(after.sessions.is_empty());
@@ -2516,6 +2591,7 @@ mod tests {
                 Some(&status),
                 None,
                 "2026-07-19T10:05:00Z",
+                std::time::Duration::from_secs(300),
             )
             .unwrap();
             assert_eq!(result.sessions.len(), 1, "{name}");

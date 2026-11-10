@@ -171,6 +171,43 @@ fn accounts(result: &RouteResult) -> BTreeSet<String> {
     out
 }
 
+/// [money] Deferred session ticks keep every append at the committed Tail cursor.
+#[test]
+fn battery_skipped_ticks_preserve_all_appends() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("battery-appends");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let prior = commit(&session, page(&c, index, 100, true));
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+        cadence.record_scan_success(start, 1);
+        cadence.set_power_stretch(3);
+        // Appends at three skipped observations; the third 5-minute tick scans.
+        for (n, seconds) in [1, 300, 600].into_iter().enumerate() {
+            append(
+                &path,
+                &line(ROOT, &format!("battery-{n}"), "2026-08-02T07:04:00Z", 6),
+            );
+            cadence.record_file_event(start + Duration::from_secs(seconds));
+            assert!(!cadence
+                .next_scan_after(start + Duration::from_secs(seconds))
+                .is_zero());
+        }
+        assert!(cadence
+            .next_scan_after(start + SNAPSHOT_SYNC_INTERVAL * 3)
+            .is_zero());
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let stored = page(&c, prior, 100, true);
+        assert_eq!(stored.modes.0, 0, "same cursor, no Full");
+        assert!(stored.modes.1 > 0, "all skipped appends read by Tail");
+        money_oracle::assert_equivalent(&cold, &result(&stored, Mode::Restart));
+    });
+}
+
 /// [money] A restarted Tail and an evicted owner preserve two-account
 /// placement, tagged rows and side calls; swapped placement fails the oracle.
 #[test]
