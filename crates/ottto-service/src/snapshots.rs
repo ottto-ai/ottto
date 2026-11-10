@@ -92,9 +92,10 @@ pub(crate) use usage::cache_observations;
 
 use scan::read_cause as change_reason;
 use sources::claude::context_file_birth as claude_context_file_birth;
+pub(crate) use sources::claude::cross_root_evidence as claude_cross_root_evidence;
 #[cfg(test)]
 pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
-pub(crate) mod claude_cross_root_evidence;
+
 use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
@@ -143,7 +144,7 @@ mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
-pub(crate) mod claude_request_accounts;
+pub(crate) use sources::claude::request_accounts as claude_request_accounts;
 // These census helpers remain until the separate persisted-format cleanup.
 #[allow(
     dead_code,
