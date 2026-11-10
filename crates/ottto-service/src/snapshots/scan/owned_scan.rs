@@ -4,6 +4,7 @@
 
 mod step;
 
+use crate::snapshots::discovery::traversal::scan_traversal_context_fingerprint;
 use crate::snapshots::*;
 
 pub(in crate::snapshots) fn prepare_owned_scan_candidate(
@@ -537,6 +538,11 @@ impl OwnedSourceScan {
             // census loss also revisits consumed pages once to retract completeness.
             if let Some(traversal) = index.traversal.as_ref() {
                 traversal_transition::restarting(source, index.generation, traversal);
+            } else {
+                traversal_transition::disarm_recensus(
+                    source,
+                    &scan_traversal_context_fingerprint(source, roots, backfill_window_days),
+                );
             }
             index.traversal = None;
         }
@@ -578,18 +584,23 @@ impl OwnedSourceScan {
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
+        // Carries run inside the listing, before the walk counts its debt.
+        let mut carries: (BTreeSet<String>, BTreeSet<String>) = Default::default();
         let unlisted = advance_bounded_directory_traversal_with_budget(
             source,
             index,
             backfill_window_days,
             directory_entries_per_tick(),
             Some(&resource_probe.discovery_growth),
+            |index| {
+                if source == SnapshotSource::Codex {
+                    carries = index.prepare_codex_carries(
+                        carry_cache.map(|(cache, scope)| (cache, Some(scope))),
+                    );
+                }
+            },
         );
-        let (carry_deferred, carry_held_owners) = if source == SnapshotSource::Codex {
-            index.prepare_codex_carries(carry_cache.map(|(cache, scope)| (cache, Some(scope))))
-        } else {
-            Default::default()
-        };
+        let (carry_deferred, carry_held_owners) = carries;
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         let codex_census_valid = source == SnapshotSource::Codex
             && index

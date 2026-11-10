@@ -1401,13 +1401,16 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
         .canonicalize()
         .unwrap();
     let now = Instant::now();
-    for (case, (files, power, gap)) in [
-        (3_usize, PlatformState::Allowed, Some(30)),
-        (3, PlatformState::Battery, Some(180)),
-        (2, PlatformState::Allowed, None),
-        (1, PlatformState::Allowed, None),
-        (3, power_state(0), None), // Low Power Mode on AC or battery.
-        (3, PlatformState::Unknown, None),
+    for (case, (files, power, routine, charge, gap)) in [
+        (3_usize, PlatformState::Allowed, false, false, Some(30)),
+        (3, PlatformState::Battery, false, false, Some(180)),
+        (2, PlatformState::Allowed, false, false, None),
+        (1, PlatformState::Allowed, false, false, None),
+        (3, power_state(0), false, false, None), // Low Power Mode on AC or battery.
+        (3, PlatformState::Unknown, false, false, None),
+        (3, PlatformState::Allowed, true, false, None),
+        (3, PlatformState::Battery, true, false, None),
+        (3, PlatformState::Allowed, true, true, Some(30)),
     ]
     .into_iter()
     .enumerate()
@@ -1421,7 +1424,7 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             )
             .unwrap();
         }
-        let (_, scan, _) = E2ScanFixture::default().scan_other_page(
+        let (_, mut scan, _) = E2ScanFixture::default().scan_other_page(
             SnapshotSource::Pi,
             &[root],
             &home,
@@ -1438,6 +1441,12 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             !scan.charge_deferred,
             "the file allowance is the only trigger"
         );
+        assert!(
+            !scan.routine_recensus,
+            "a first walk in this process stays paced"
+        );
+        scan.routine_recensus = routine;
+        scan.charge_deferred = charge;
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(now, 1);
         if resident_scan_requested(&scan)
@@ -1507,4 +1516,270 @@ fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
         host.cadence.record_scan_failure(host.now);
         assert!(host.cadence.paced_scan_due().is_none());
     }
+}
+
+const UTILITY: (u32, i32) = (0x11, 0);
+const BACKGROUND: (u32, i32) = (0x09, 0);
+thread_local! {
+    /// The fake thread QoS that the fake setter writes and the owner reads.
+    static FAKE_QOS: Cell<(u32, i32)> = const { Cell::new(UTILITY) };
+}
+fn fake_qos() -> (u32, i32) {
+    FAKE_QOS.with(Cell::get)
+}
+fn fake_set(class: u32, rel: i32) -> bool {
+    FAKE_QOS.with(|qos| qos.set((class, rel)));
+    true
+}
+fn fake_background() -> Option<MacPlatformSignals> {
+    let mut signals = MacPlatformSignals {
+        saved: None,
+        setter: Some(fake_set),
+    };
+    (signals.enter(Some(fake_qos()), fake_set) == PlatformState::Allowed).then_some(signals)
+}
+fn refused_background() -> Option<MacPlatformSignals> {
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fault {
+    None,
+    PrepareNone,
+    PrepareErr,
+    ValidateErr,
+    Refused,
+    FinishErr,
+    Panic,
+}
+
+/// A rotation owner holding the paced QoS exactly as `SnapshotCycleOwner`
+/// does: entered in `prepare`, dropped in `outcome`. Faults hit Codex only.
+struct PacedOwner {
+    fault: Fault,
+    background: fn() -> Option<MacPlatformSignals>,
+    paced_qos: Option<MacPlatformSignals>,
+    seen: Vec<(SnapshotSource, &'static str, (u32, i32))>,
+}
+impl PacedOwner {
+    fn new(fault: Fault, background: fn() -> Option<MacPlatformSignals>) -> Self {
+        Self {
+            fault,
+            background,
+            paced_qos: None,
+            seen: Vec::new(),
+        }
+    }
+    fn fault(&mut self, source: SnapshotSource, stage: &'static str) -> Fault {
+        self.seen.push((source, stage, fake_qos()));
+        if source == SnapshotSource::Codex {
+            self.fault
+        } else {
+            Fault::None
+        }
+    }
+}
+impl crate::source_rotation::Owner for PacedOwner {
+    type Source = SnapshotSource;
+    type Frame = (SnapshotSource, u8);
+    type Completed = SnapshotSource;
+    fn prepare(
+        &mut self,
+        source: SnapshotSource,
+        _: Option<usize>,
+    ) -> anyhow::Result<Option<Self::Frame>> {
+        drop(self.paced_qos.take());
+        self.paced_qos = paced_source_qos(source, self.background);
+        match self.fault(source, "prepare") {
+            Fault::PrepareNone => Ok(None),
+            Fault::PrepareErr => Err(anyhow!("prepare")),
+            _ => Ok(Some((source, 0))),
+        }
+    }
+    fn validate(&mut self, frame: &Self::Frame) -> anyhow::Result<()> {
+        match self.fault(frame.0, "validate") {
+            Fault::ValidateErr => Err(anyhow!("validate")),
+            _ => Ok(()),
+        }
+    }
+    fn step(
+        &mut self,
+        (source, page): Self::Frame,
+        _: Option<usize>,
+    ) -> crate::source_rotation::Step<Self::Frame, SnapshotSource> {
+        match self.fault(source, "page") {
+            Fault::Refused => crate::source_rotation::Step::Refused(
+                crate::source_rotation::LocalRefusal("fake refusal"),
+            ),
+            Fault::Panic => panic!("fake page panic"),
+            _ if page < 2 => crate::source_rotation::Step::Pending((source, page + 1)),
+            _ => crate::source_rotation::Step::Complete(source),
+        }
+    }
+    fn finish(&mut self, source: SnapshotSource, _: Option<usize>) -> anyhow::Result<()> {
+        match self.fault(source, "finish") {
+            Fault::FinishErr => Err(anyhow!("finish")),
+            _ => Ok(()),
+        }
+    }
+    fn outcome(&mut self, source: SnapshotSource, _: anyhow::Result<()>) {
+        self.fault(source, "outcome");
+        drop(self.paced_qos.take());
+    }
+    fn monotonic(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
+/// Owns the three process cadence slots and upload deadlines for one control.
+struct OwnedCadences(Vec<(&'static str, Option<SourceCadence>)>);
+const ROTATION: [SnapshotSource; 3] = [
+    SnapshotSource::ClaudeCode,
+    SnapshotSource::Codex,
+    SnapshotSource::Pi,
+];
+impl OwnedCadences {
+    /// Codex has a due paced request, Claude a pending (not yet due) one and
+    /// Pi none.
+    fn install() -> Self {
+        let mut cadences = super::super::source_cadences().lock().unwrap();
+        let saved = ROTATION
+            .iter()
+            .map(|source| (source.api_slug(), cadences.remove(source.api_slug())))
+            .collect();
+        let now = Instant::now();
+        let before = now.checked_sub(Duration::from_secs(40)).unwrap();
+        for (source, last_scan) in [
+            (SnapshotSource::ClaudeCode, now),
+            (SnapshotSource::Codex, before),
+            (SnapshotSource::Pi, before),
+        ] {
+            let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+            cadence.record_scan_success(last_scan, 1);
+            if source != SnapshotSource::Pi {
+                assert!(cadence.request_paced_scan(last_scan, Duration::ZERO, PACED_AC));
+            }
+            cadences.insert(source.api_slug(), cadence);
+        }
+        drop(cadences);
+        super::super::source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .clear();
+        Self(saved)
+    }
+    fn due(source: SnapshotSource) -> Option<Instant> {
+        with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten()
+    }
+}
+impl Drop for OwnedCadences {
+    fn drop(&mut self) {
+        super::super::source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .clear();
+        let mut cadences = super::super::source_cadences()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (slug, cadence) in self.0.drain(..) {
+            cadences.remove(slug);
+            if let Some(cadence) = cadence {
+                cadences.insert(slug, cadence);
+            }
+        }
+    }
+}
+
+/// [behaviour] Only the source whose own paced scan is due runs its prepare,
+/// pages and finish at background QoS; siblings in the same cycle keep the
+/// original QoS, and every outcome, error, refusal and unwind restores it.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn paced_qos_covers_only_the_due_source_and_restores_on_every_exit() {
+    for fault in [
+        Fault::None,
+        Fault::PrepareNone,
+        Fault::PrepareErr,
+        Fault::ValidateErr,
+        Fault::Refused,
+        Fault::FinishErr,
+    ] {
+        let _cadences = OwnedCadences::install();
+        let mut owner = PacedOwner::new(fault, fake_background);
+        crate::source_rotation::run(&mut owner, &ROTATION, usize::MAX);
+        assert_eq!(fake_qos(), UTILITY, "{fault:?}: restored after the cycle");
+        for (source, stage, qos) in &owner.seen {
+            let expected = if *source == SnapshotSource::Codex {
+                BACKGROUND
+            } else {
+                UTILITY
+            };
+            assert_eq!(*qos, expected, "{fault:?}: {source:?} {stage}");
+        }
+        let stages = |source| {
+            owner
+                .seen
+                .iter()
+                .filter(move |(seen, _, _)| *seen == source)
+                .map(|(_, stage, _)| *stage)
+        };
+        assert!(stages(SnapshotSource::Pi)
+            .eq(["prepare", "validate", "page", "page", "page", "finish", "outcome"]));
+        if fault == Fault::None {
+            assert!(stages(SnapshotSource::Codex)
+                .eq(["prepare", "validate", "page", "page", "page", "finish", "outcome"]));
+        }
+        assert!(
+            OwnedCadences::due(SnapshotSource::Codex).is_some(),
+            "{fault:?}"
+        );
+        assert!(
+            OwnedCadences::due(SnapshotSource::ClaudeCode).is_some(),
+            "{fault:?}"
+        );
+    }
+
+    // Unwind out of the due source's page drops the owner and restores.
+    let _cadences = OwnedCadences::install();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut owner = PacedOwner::new(Fault::Panic, fake_background);
+        crate::source_rotation::run(&mut owner, &ROTATION, usize::MAX);
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(fake_qos(), UTILITY, "restored on unwind");
+    drop(_cadences);
+
+    // A source under upload backoff is not paced, so it keeps its QoS.
+    let _cadences = OwnedCadences::install();
+    super::super::source_upload_deadlines()
+        .lock()
+        .unwrap()
+        .insert(
+            SnapshotSource::Codex.api_slug(),
+            Instant::now() + Duration::from_secs(600),
+        );
+    let mut owner = PacedOwner::new(Fault::None, fake_background);
+    crate::source_rotation::run(&mut owner, &ROTATION, usize::MAX);
+    assert!(owner.seen.iter().all(|(_, _, qos)| *qos == UTILITY));
+    assert!(OwnedCadences::due(SnapshotSource::Codex).is_some());
+}
+
+/// [behaviour] A refused QoS entry clears only the due source's paced request,
+/// before its cadence gate; siblings keep theirs and nothing is lowered.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn refused_paced_qos_clears_only_that_sources_request() {
+    let _cadences = OwnedCadences::install();
+    let mut owner = PacedOwner::new(Fault::PrepareNone, refused_background);
+    crate::source_rotation::run(&mut owner, &ROTATION, usize::MAX);
+    assert!(owner.seen.iter().all(|(_, _, qos)| *qos == UTILITY));
+    assert!(
+        OwnedCadences::due(SnapshotSource::Codex).is_none(),
+        "cleared"
+    );
+    assert!(
+        OwnedCadences::due(SnapshotSource::ClaudeCode).is_some(),
+        "a sibling's pending request survives"
+    );
+    assert_eq!(fake_qos(), UTILITY);
 }

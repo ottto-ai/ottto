@@ -417,6 +417,60 @@ fn resident_wave_codex_join_group_straddles_budget_and_pi_drains() {
             &scan_money(source, &wide_index, &wide),
             &scan_money(source, &small_index, &small),
         );
+        if source == SnapshotSource::Pi {
+            // A clean completion arms a routine re-walk; its file-limited
+            // pages keep ordinary cadence and preserve every accepted body.
+            let canonical = |index: &ScanIndex| {
+                index
+                    .files
+                    .iter()
+                    .map(|(key, entry)| {
+                        (
+                            key.clone(),
+                            serde_json::to_value((
+                                &entry.last_snapshot_fingerprint,
+                                &entry.last_upload_body_witness,
+                                &entry.upload_context_receipt,
+                            ))
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let before = canonical(&small_index);
+            let fixture = E2ScanFixture::default();
+            let mut index = small_index;
+            if let Some(route) = e2_pipeline_scan_fixture::route_of(&index) {
+                fixture.on_committed_route(&route);
+            }
+            let mut complete = false;
+            let mut pages = 0;
+            for _ in 0..32 {
+                let (mut next, page, _) = fixture.scan_other_page(
+                    source,
+                    std::slice::from_ref(&root),
+                    &root,
+                    index,
+                    true,
+                    2,
+                    &[],
+                );
+                pages += 1;
+                assert!(page.routine_recensus);
+                assert!(!page.charge_deferred);
+                assert!(page.snapshots.is_empty(), "no extra canonical body");
+                complete = page.census_complete;
+                index = e2_pipeline_scan_fixture::save_reload_for_test(
+                    &mut next,
+                    &root.join("routine-index.json"),
+                );
+                if complete {
+                    break;
+                }
+            }
+            assert!(complete && pages >= 3, "routine pages drain across reloads");
+            assert_eq!(canonical(&index), before);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

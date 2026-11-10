@@ -73,6 +73,104 @@ fn enabled(collector: &Collector) -> DailyReferenceGrant {
         .expect("bind backend grant")
 }
 
+/// [behaviour] A rejected cached relay token is replaced for the one auth retry;
+/// a 403 evicts it for the next batch without adding a retry to that batch.
+#[test]
+fn relay_transport_reacquires_after_authorization_rejection() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    for rejected in [401, 403] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut uploads = Vec::new();
+            for (status, body) in [
+                (
+                    200,
+                    r#"{"token":"daily-ref-old","expires_at":"2099-01-01T00:00:00Z"}"#,
+                ),
+                (rejected, "{}"),
+                (
+                    200,
+                    r#"{"token":"daily-ref-new","expires_at":"2099-01-01T00:00:00Z"}"#,
+                ),
+                (200, r#"{"accepted":true}"#),
+                (200, r#"{"accepted":true}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    headers.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                let mut body_bytes = vec![0; length];
+                reader.read_exact(&mut body_bytes).unwrap();
+                if headers.starts_with("POST /api/v1/provider-daily-reference/batches ") {
+                    uploads.push((
+                        headers,
+                        serde_json::from_slice::<Value>(&body_bytes).unwrap(),
+                    ));
+                } else {
+                    assert!(headers.starts_with(&format!(
+                        "POST /api/v1/telemetry/devices/{INSTALLATION_ID}/relay-token "
+                    )));
+                }
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            uploads
+        });
+        let transport = RelayTransport::new(
+            format!("http://{address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec![SOURCE.to_string()],
+            },
+            "daily-reference-device-secret".to_string(),
+        );
+        let batch = json!({"schema_version": SCHEMA_VERSION});
+        if rejected == 403 {
+            assert!(matches!(
+                transport.send_batch(&batch),
+                Err(UploadError::NotAdmitted(403))
+            ));
+        }
+        assert_eq!(
+            transport.send_batch(&batch).unwrap(),
+            json!({"accepted": true})
+        );
+        assert_eq!(
+            transport.send_batch(&batch).unwrap(),
+            json!({"accepted": true})
+        );
+        let uploads = server.join().unwrap();
+        assert_eq!(uploads.len(), 3);
+        assert!(uploads[0].0.contains("Authorization: Bearer daily-ref-old"));
+        for (headers, body) in &uploads[1..] {
+            assert!(headers.contains("Authorization: Bearer daily-ref-new"));
+            assert_eq!(body, &batch);
+        }
+        assert_eq!(uploads[0].1, batch);
+    }
+}
+
 // -- fakes ------------------------------------------------------------
 
 struct StaticReader {
@@ -978,8 +1076,7 @@ fn health_never_resurrects_a_revoked_grant() {
 #[test]
 fn absent_consent_is_silent_and_contacts_nothing() {
     let collector = collector("no-consent");
-    let cycle =
-        collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert!(
         cycle.diagnostics.is_empty(),
@@ -1142,8 +1239,7 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
     )
     .expect("write");
 
-    let cycle =
-        collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let status = collector_status(collector.grants(), false);
     assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
@@ -1298,8 +1394,7 @@ fn a_different_installation_can_never_upload_under_this_consent() {
         installation_id: "00000000-0000-4000-8000-0000000000ff".to_string(),
         provider_account_scope: ACCOUNT_SCOPE.to_string(),
     };
-    let cycle =
-        collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert_eq!(
         cycle.diagnostics[0].code,

@@ -236,6 +236,10 @@ child CPU totals; arguments, paths and command output are never included.
   session fingerprint only when that session carries original Desktop identity evidence.
   Titles, account evidence and spawn lineage keep their independent fingerprint inputs.
   A census restart records the discarded checkpoint before starting a replacement walk.
+- A clean census completion arms the next routine walk in process memory only.
+  Routine walk pages use ordinary cadence when only their file allowance is full;
+  resident-charge deferrals still request paced pages. A process restart, sidecar
+  restart, changed traversal context, unhealthy retry or clean follow-up keeps pacing.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full audit credit or upload acceptance.

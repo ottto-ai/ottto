@@ -1560,6 +1560,7 @@ pub(super) mod tests {
                             BACKFILL_WINDOW_DAYS,
                             1_000,
                             None,
+                            |_| {},
                         ),
                     );
                 }

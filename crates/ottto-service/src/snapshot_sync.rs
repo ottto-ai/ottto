@@ -4013,7 +4013,15 @@ fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
         .clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
 }
 
-/// Remaining wait for `source`, or `None` when it is due now.
+/// When `source`'s paced scan may run; `None` without one or under backoff.
+fn source_paced_due(source: SnapshotSource) -> Option<Instant> {
+    source_upload_backoff_remaining(source)
+        .is_none()
+        .then(|| with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten())
+        .flatten()
+}
+
+/// The earliest paced scan across sources, for the cycle's wake time.
 fn paced_scan_due() -> Option<Instant> {
     [
         SnapshotSource::ClaudeCode,
@@ -4021,8 +4029,7 @@ fn paced_scan_due() -> Option<Instant> {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .filter(|source| source_upload_backoff_remaining(*source).is_none())
-    .filter_map(|source| with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten())
+    .filter_map(source_paced_due)
     .min()
 }
 
@@ -5251,22 +5258,6 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _paced_qos = if paced_scan_due().is_some_and(|due| due <= Instant::now()) {
-        let qos = continuation::resident_background();
-        if qos.is_none() {
-            if let Ok(mut cadences) = source_cadences().lock() {
-                for cadence in cadences
-                    .values_mut()
-                    .filter(|cadence| cadence.paced_scan_due().is_some())
-                {
-                    cadence.clear_continuation();
-                }
-            }
-        }
-        qos
-    } else {
-        None
-    };
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
     // Declared after the guard, so it settles before the lock is released.
@@ -5323,6 +5314,7 @@ fn sync_once_with_retry(
         failed_sources: &mut failed_sources,
         started: Instant::now(),
         codex_started: None,
+        paced_qos: None,
         account_witness,
         retry,
     };
@@ -5513,6 +5505,9 @@ struct SnapshotCycleOwner<'a> {
     /// When this cycle's Codex preparation began, for a continuation ticket's
     /// measured work. Only written while continuation pages are enabled.
     codex_started: Option<Instant>,
+    /// Background QoS for the one source whose paced scan is due, held from
+    /// its prepare through its finish; its outcome (or unwind) restores.
+    paced_qos: Option<continuation::MacPlatformSignals>,
 }
 impl SnapshotCycleOwner<'_> {
     fn finish_completed(
@@ -5556,6 +5551,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
+        drop(self.paced_qos.take());
+        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
         if source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
             // K2: this prepare's policy replaces any older cached inputs.
@@ -5652,6 +5649,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         finished
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
+        drop(self.paced_qos.take());
         if source == SnapshotSource::Codex && result.is_err() {
             continuation::after_ordinary_codex_failure();
         }
@@ -9256,6 +9254,17 @@ thread_local! {
     static ONE_EVIDENCE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Packed chunks run on this thread, reference arms excluded.
     static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The release-timing reference: emitted folds released once at page end.
+    static PAGE_END_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Emitted folds released once at page end: the release-timing reference.
+fn page_end_release() -> bool {
+    #[cfg(test)]
+    if PAGE_END_RELEASE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -9345,8 +9354,8 @@ struct ClaudeEvidencePage<'p> {
 
 /// The evidence stage over one page: its families are packed into chunks and
 /// the evidence body runs once per chunk, so one chunk's rows are resident at
-/// a time. Copy decisions, original carriers, census health and the release
-/// of emitted folds run once over the page.
+/// a time. Copy decisions, original carriers and census health run once over
+/// the page; each chunk's emitted folds are released when it ends.
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9402,7 +9411,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     );
     let chunks = pack_claude_evidence_families(support_dir, &scan_result.snapshots);
     #[cfg(test)]
-    if !one_evidence_chunk() {
+    if !one_evidence_chunk() && !page_end_release() {
         EVIDENCE_CHUNKS.with(|count| count.set(count.get() + chunks.len()));
     }
     // Each session's first page slot: chunk outputs go back in page order.
@@ -9463,6 +9472,15 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             survivors.next().is_none(),
             "the evidence body only removes items"
         );
+        // After the restore, which matches on the folds: no later chunk or
+        // page step reads an emitted fold, so its inputs go with its chunk.
+        if !page_end_release() {
+            for &slot in &chunk.slots {
+                if let Some(item) = restored[slot].as_mut() {
+                    release_emitted(item);
+                }
+            }
+        }
     }
     scan_result.snapshots = restored.into_iter().flatten().collect();
     disposition
@@ -9522,21 +9540,21 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    // All local consumers (finalizer, identity, account qualification and the
-    // optional shadow) have finished. Release native inputs only for emitted
-    // `e2` bodies before upload clones/checkpoints.
-    // Held and legacy bodies retain their inputs for their existing owners.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
+    if page_end_release() {
+        scan_result.snapshots.iter_mut().for_each(release_emitted);
     }
     drop(evidence_window);
     (disposition, census_withheld, stats)
+}
+
+/// All local consumers of a chunk's bodies (finalizer, identity, account
+/// qualification and the optional shadow) have finished. Release native
+/// inputs only for emitted `e2` bodies before upload clones/checkpoints;
+/// held and legacy bodies retain their inputs for their existing owners.
+fn release_emitted(item: &mut SnapshotItem) {
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
 /// The evidence body over one chunk (`scan_result`'s snapshots), from the API

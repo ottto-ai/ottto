@@ -2632,7 +2632,14 @@ fn write_sessions(directory: &Path, count: usize) {
 
 /// One walk tick with a directory budget of 3 entries.
 fn walk_tick(source: SnapshotSource, index: &mut ScanIndex) {
-    advance_bounded_directory_traversal_with_budget(source, index, BACKFILL_WINDOW_DAYS, 3, None);
+    advance_bounded_directory_traversal_with_budget(
+        source,
+        index,
+        BACKFILL_WINDOW_DAYS,
+        3,
+        None,
+        |_| {},
+    );
 }
 
 fn start_walk(source: SnapshotSource, root: &Path) -> ScanIndex {

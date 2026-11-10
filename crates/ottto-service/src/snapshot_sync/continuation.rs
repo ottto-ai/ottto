@@ -1,10 +1,10 @@
 //! Enabled Codex cursor pages: AC only, background QoS, EOF parked for ordinary cadence.
 use super::{
     enabled_snapshot_sources, load_snapshot_device_credentials, run_continuation_scan, safe_error,
-    snapshot_api_base_url, snapshot_upload_destination_namespace, source_upload_backoff_remaining,
-    with_source_cadence, ContinuationInputs, ContinuationScan, ScanIndex, SnapshotSource,
-    SnapshotUploadPolicy, SourcePreparation, SourceScanResult, SNAPSHOT_SYNC_INTERVAL,
-    SNAPSHOT_SYNC_LOCK, SNAPSHOT_SYNC_WORKER_STACK_BYTES,
+    snapshot_api_base_url, snapshot_upload_destination_namespace, source_paced_due,
+    source_upload_backoff_remaining, with_source_cadence, ContinuationInputs, ContinuationScan,
+    ScanIndex, SnapshotSource, SnapshotUploadPolicy, SourcePreparation, SourceScanResult,
+    SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK, SNAPSHOT_SYNC_WORKER_STACK_BYTES,
 };
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
 use crate::snapshots::sampled_scan::SharedCache;
@@ -79,8 +79,24 @@ pub(super) fn resident_background() -> Option<MacPlatformSignals> {
     resident_pacing(MacPlatformSignals::default().power())?;
     MacPlatformSignals::background()
 }
+/// Background QoS for one source's ordinary pass, only while THAT source's
+/// paced scan is due; a refused entry clears only that source's request.
+pub(super) fn paced_source_qos(
+    source: SnapshotSource,
+    background: impl FnOnce() -> Option<MacPlatformSignals>,
+) -> Option<MacPlatformSignals> {
+    if !source_paced_due(source).is_some_and(|due| due <= Instant::now()) {
+        return None;
+    }
+    let qos = background();
+    if qos.is_none() {
+        with_source_cadence(source, SourceCadence::clear_continuation);
+    }
+    qos
+}
 pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
-    scan.charge_deferred || (scan.page_file_limit_hit && scan.census_status.pending_work)
+    scan.charge_deferred
+        || (scan.page_file_limit_hit && scan.census_status.pending_work && !scan.routine_recensus)
 }
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {

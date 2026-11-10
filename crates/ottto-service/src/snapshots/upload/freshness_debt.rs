@@ -531,6 +531,8 @@ pub(in crate::snapshots) struct Page<'a> {
     fold: &'a mut WalkFold,
     /// This page's observations, staged together at its end.
     staged: Vec<(String, Observation)>,
+    /// Unindexed listed files, counted at the page's end after its path carries.
+    unindexed: Vec<(PathBuf, FileDebt)>,
     errors: (usize, usize),
     now_ms: u64,
     last_complete: Option<u64>,
@@ -585,6 +587,7 @@ impl<'a> Page<'a> {
             root_walk,
             fold,
             staged: Vec::new(),
+            unindexed: Vec::new(),
             errors: listing_errors(&traversal.counts),
             now_ms,
             last_complete: index.tail_discovery.last_complete_discovery_at,
@@ -772,7 +775,12 @@ impl<'a> Page<'a> {
         if head.is_some() || !plan.owed.is_empty() || live.evidence.is_some() {
             let mut debt = FileDebt::of(&plan.owed);
             debt.listed = debt.owed && listed_history_held(index, &key, &listing);
-            self.count(index, listing.path, key, debt, live.evidence.is_some());
+            if index.files.contains_key(&key) {
+                self.count(index, listing.path, key, debt, live.evidence.is_some());
+            } else {
+                // Possibly a path carry's destination: counted at the page's end.
+                self.unindexed.push((listing.path.to_path_buf(), debt));
+            }
         }
     }
 
@@ -796,30 +804,45 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// The page's end: its observations are staged for the next save. When a
-    /// root walk ends, a complete walk begun in this process erases every head
+    /// The page's end: its observations are staged for the next save, then
+    /// `carry` runs the page's path carries. A listed file a carry indexed
+    /// counts its carried head's debt, which supersedes the staged listing; any
+    /// other unindexed file counts as listed. When a root walk ends, a complete
+    /// walk begun in this process erases every head
     /// it did not list whose index entry is gone (counted as deleted unaccepted
     /// when owed) and records its start as the last complete discovery; then
     /// the source's whole persisted debt is aggregated. `None`: a page that is
     /// not a walk's end, or a v1 graph.
     pub(in crate::snapshots) fn end(
-        self,
+        mut self,
         index: &mut ScanIndex,
         walk_ended: bool,
+        carry: impl FnOnce(&mut ScanIndex),
     ) -> Option<Report> {
+        let staged = std::mem::take(&mut self.staged);
+        let walk = &mut self.fold.debt;
+        walk.issue |= self.route.is_none();
+        if let Some(route) = self.route.as_deref().filter(|_| !staged.is_empty()) {
+            walk.unavailable |= state_v2::observe_tails(route, staged).is_err();
+        }
+        carry(index);
+        for (path, debt) in std::mem::take(&mut self.unindexed) {
+            let key = local_index_key(&path);
+            let debt = if index.files.contains_key(&key) {
+                FileDebt::committed(index, &key)
+            } else {
+                debt
+            };
+            self.count(index, &path, key, debt, false);
+        }
         let Self {
             route,
             root_walk,
             fold,
-            staged,
             now_ms,
             ..
         } = self;
         let walk = &mut fold.debt;
-        walk.issue |= route.is_none();
-        if let Some(route) = route.as_deref().filter(|_| !staged.is_empty()) {
-            walk.unavailable |= state_v2::observe_tails(route, staged).is_err();
-        }
         if !root_walk || !walk_ended {
             return None;
         }
