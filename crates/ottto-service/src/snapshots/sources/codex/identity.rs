@@ -7,7 +7,7 @@ use crate::snapshots::codex_compressed_input::is_compressed_codex_rollout;
 use crate::snapshots::scan::json_fields::string_at;
 use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped;
 use crate::snapshots::scan_index::file_set_digest::PrefixDigest;
-use crate::snapshots::sources::claude::subagent_identity::{
+use crate::snapshots::session_facts::agent_label::{
     safe_claude_agent_display_label, MAX_CLAUDE_AGENT_LABEL_CHARS,
 };
 use crate::snapshots::{SessionAccountBinding, SnapshotItem};

@@ -33,8 +33,10 @@ pub(in crate::snapshots) fn carry_tail(
             typed_write(session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
                 session.cx.tail = Some(moved);
-                let digests =
-                    import::save(&mut session.db, &id, previous, &mut next, &mut session.cx)?;
+                let saved =
+                    import::save(&mut session.db, &id, previous, &mut next, &mut session.cx);
+                note_head_writes(state, std::mem::take(&mut session.cx.head_writes));
+                let digests = saved?;
                 session.stamp = session.db.stamp()?;
                 state.save_digests = Some(digests);
                 Ok(())
@@ -170,6 +172,24 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
+/// Files whose committed head a commit may have changed since `consumer`'s
+/// last call, for the Codex header inventory's durable facts. `None` (its
+/// first call, another consumer's since, or a new session): any head may have.
+pub(in crate::snapshots) fn take_head_writes(
+    path: &Path,
+    consumer: usize,
+) -> Result<Option<Vec<String>>> {
+    with_state(path, |state| {
+        let previous = state.head_writes.replace((consumer, BTreeSet::new()));
+        Ok(previous
+            .filter(|(owner, _)| *owner == consumer)
+            .map(|(_, keys)| {
+                keys.into_iter()
+                    .map(|key| String::from_utf8_lossy(&key).into_owned())
+                    .collect()
+            }))
+    })
+}
 /// Historical first-seen evidence only; no disposition or attempt is applied.
 pub(in crate::snapshots) fn legacy_archive_was_seen(index: &ScanIndex, key: &str) -> Result<bool> {
     Ok(read_txn(index, |tx| {
@@ -279,7 +299,11 @@ fn exit_commit(path: &Path, runtime: &std::sync::Weak<Runtime>) -> Result<()> {
     let _save_window = telemetry::Window::begin("save");
     with_save_session(path, Some(runtime), expected, |state, session, id| {
         typed_write(session, |session| {
-            super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail)?;
+            let committed =
+                super::super::tail::commit_exit(&mut session.db, &id, expected, &state.tail);
+            let written = state.tail.touched().cloned().collect::<Vec<_>>();
+            note_head_writes(state, written);
+            committed?;
             session.stamp = session.db.stamp()?;
             state.save_digests = None;
             state.tail = TailStage::default();

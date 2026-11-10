@@ -272,6 +272,14 @@ pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) inventory: InventoryFacts,
 }
 impl TailStage {
+    /// Every file whose head a commit of this stage may write or remove.
+    pub(super) fn touched(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.files
+            .keys()
+            .chain(self.debt.keys())
+            .chain(&self.retire)
+            .chain(&self.erase)
+    }
     pub(super) fn carry_observation(&mut self, to: &str, carry: &PathCarry) -> Result<Self> {
         let from = carry.from.as_bytes();
         let to = to.as_bytes().to_vec();
