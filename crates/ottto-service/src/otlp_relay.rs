@@ -371,6 +371,11 @@ impl RelayAcceptor for TcpListener {
 
 /// Accepts relay connections until the listener cannot continue. It never
 /// returns because of one connection's failure.
+///
+/// On macOS a close or `dup2` of the listener's descriptor by another thread
+/// wakes a sleeping accept (drain, then `ECONNABORTED`). A close that lands
+/// after accept takes the descriptor but before it sleeps is not woken: both
+/// threads wait until the next connection arrives.
 fn run_relay_accept_loop(
     acceptor: &mut impl RelayAcceptor,
     dispatch: &mut impl FnMut(TcpStream),
