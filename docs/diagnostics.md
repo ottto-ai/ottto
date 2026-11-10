@@ -83,7 +83,7 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 
 | Field | Measurement |
 | --- | --- |
-| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. Windowed stages also report `disk_read_bytes` and `disk_written_bytes`: process disk bytes across the stage, macOS only, concurrent work included, absent when unavailable. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `retained_heap_bytes.active_graph.{census_hashes,census_occupancy_alarm}` | Request hashes the Claude census holds, and whether they reach 75% of 2,097,152. An alarm only: nothing is capped. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
@@ -373,6 +373,14 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
+`disk_read_bytes` and `disk_written_bytes` are the self-process disk byte
+deltas (`ri_diskio_bytesread`/`ri_diskio_byteswritten` from `proc_pid_rusage`)
+across the same window, on every windowed stage record: `source_prepare`,
+`native_collection_page`, `source_finish`, the evidence windows and the
+`offpass_*` stages. Like the CPU delta they are process-wide: concurrent stages
+overlap, so never sum overlapping windows. They are macOS only and absent
+elsewhere, after a failed sample or on a regressing counter. Summed windows
+(`evidence_decode`, `evidence_cross_root`) and point records omit them.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
 including errors or no-frame returns. Like `source_finish`, it emits no record
@@ -421,6 +429,7 @@ The stable stage names and boundaries are:
 
 These rows add `counts.cpu_user_us` and `counts.cpu_sys_us`: self-process
 user/system CPU deltas in microseconds, `null` when unavailable or regressing.
+Their observation carries the same macOS disk byte deltas as other windows.
 `observation.wall_elapsed_us` remains wall microseconds for the work unit.
 The `offpass_` prefix selects these CPU-only windows in `StageWindow`; ordinary
 in-pass fields and counts remain unchanged. `source` is the existing source
@@ -2216,6 +2225,12 @@ Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`,
 on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
+`save_kinds` splits each committed save's charges by kind: record kind name
+(or `meta` for control rows, `shared_set` for shared values) → `[rows, bytes]`,
+only kinds charged in that save. Rows and bytes use the same accounting, so they
+sum to that save's `save_dirty_rows`/`save_dirty_bytes` sample. A row rewritten
+with an identical header is skipped before it is charged. Counts and bytes
+only, never keys.
 `save_page_reduced` and the existing WAL alarm (>64 MiB) flag pressure without
 splitting a save; the complete valid save commits. A row over the 64 MiB decode
 bound refuses that save as `state_v2_db_unavailable` (`db_unavailable_cause` at

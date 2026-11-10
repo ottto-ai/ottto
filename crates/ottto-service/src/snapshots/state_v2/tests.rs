@@ -1263,6 +1263,43 @@ fn freshness_bookkeeping_never_counts_toward_the_save_target() {
     assert!(db.save_over_target());
 }
 
+/// [behaviour] A save reports charged rows and bytes per kind; they sum to the
+/// save's totals, and an identical rewrite is skipped before it is charged.
+#[test]
+fn save_reports_charged_rows_and_bytes_per_kind() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    for (generation, rows) in [(0, ["a", "b", "c"]), (1, ["a", "b", "changed"])] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        for (row, value) in rows.into_iter().enumerate() {
+            put(&mut tx, &traversal(format!("t-{row}")), value.as_bytes());
+        }
+        put(&mut tx, &file("f".into()), b"evidence");
+        put(&mut tx, &census(format!("c-{generation}")), b"evidence");
+        telemetry::take_thread_event_for_test("save_kinds");
+        let next = generation + 1;
+        assert_eq!(
+            tx.commit(generation, next),
+            DurableCommitOutcome::Committed(next)
+        );
+        let kinds = telemetry::take_thread_event_for_test("save_kinds").unwrap();
+        let kinds = kinds.as_object().unwrap();
+        // Unchanged rows are never charged: only the changed traversal row.
+        let rows = |kind: &str| kinds.get(kind).and_then(|k| k[0].as_u64());
+        let expected = [[Some(3), Some(1), Some(1)], [Some(1), None, Some(1)]];
+        assert_eq!(
+            ["scan_state.traversal", "file.progress", "file.census"].map(rows),
+            expected[generation as usize]
+        );
+        let sum = |i: usize| kinds.values().map(|k| k[i].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(sum(0), sqlite::dirty_rows_for_test(&db));
+        assert_eq!(sum(1), sqlite::dirty_bytes_for_test(&db));
+        assert!(kinds
+            .values()
+            .all(|k| k[0].as_u64() > Some(0) && k[1].as_u64() > Some(0)));
+    }
+}
+
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
