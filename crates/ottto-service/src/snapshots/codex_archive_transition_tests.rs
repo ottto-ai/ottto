@@ -526,16 +526,37 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
 /// equal a cold Full's, on one warm cache and with a restart (empty cache,
 /// reloaded store; also what an upgrade leaves) between pages. Once the
 /// accepted debt has settled, the warm last page looks up fewer heads than the
-/// restarted one. [money] Two accounts, a side call in archived_sessions, an
-/// evidence gap and a mid-session switch.
+/// restarted one. [money] Two accounts with named creator slots (tagged
+/// rows), a side call in archived_sessions, an evidence gap and a mid-session
+/// switch.
 #[test]
 fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Named creator slots for both accounts, so rows carry account tags.
+    let hash = |kind: &str, account: &str| {
+        let value = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{value}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
     // Per arm, each page's (head lookups, header reuse hits).
     let mut counts = Vec::new();
     for restart in [false, true] {
+        let page = |c: &Corpus, index, cache| {
+            page_observed_with_limit(&c.roots(), index, cache, 100, &slots, |_| {})
+        };
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
         c.write(OTHER, Some("b"));
@@ -579,6 +600,14 @@ fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
             );
             if page_number > 0 {
                 cold.snapshots.retain(|s| s.source_session_id == MAIN);
+            } else {
+                assert!(
+                    cold.snapshots
+                        .iter()
+                        .flat_map(|item| &item.model_usage)
+                        .any(|row| row.account_identifier_hash.is_some()),
+                    "tagged positive control"
+                );
             }
             money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &scan, posts));
             let window = emitted_header_lookups(&logs);
