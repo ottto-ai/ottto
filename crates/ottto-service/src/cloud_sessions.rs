@@ -1886,12 +1886,11 @@ impl CloudSessionTransport for RuntimeAvailabilityTransport {
 /// Relay transport for the strict backend route. The consent-gated experimental
 /// runtime composes it only after exact local identity/grant checks. Collection
 /// then revalidates that exact grant before every provider or upload boundary.
-/// It reuses one in-memory relay token and refreshes it once on 401/403.
+/// It acquires through the shared relay-token cache and retries once on 401/403.
 pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
     device_secret: String,
-    relay_token: Mutex<Option<String>>,
     acknowledged_chunks: Mutex<HashMap<String, Vec<CloudSessionObservationChunkV2>>>,
 }
 
@@ -1905,7 +1904,6 @@ impl RelayCloudSessionTransport {
             client: crate::snapshot_client::SnapshotApiClient::new(api_base_url),
             device,
             device_secret,
-            relay_token: Mutex::new(None),
             acknowledged_chunks: Mutex::new(HashMap::new()),
         }
     }
@@ -1951,32 +1949,15 @@ impl RelayCloudSessionTransport {
         Ok(())
     }
 
-    fn token(&self, force_refresh: bool, deadline: Instant) -> Result<String> {
-        {
-            let mut cached = self
-                .relay_token
-                .lock()
-                .map_err(|_| anyhow!("cloud-session relay token lock is unavailable"))?;
-            if force_refresh {
-                *cached = None;
-            } else if let Some(token) = cached.as_ref() {
-                return Ok(token.clone());
-            }
-        }
+    fn token(&self, deadline: Instant) -> Result<String> {
         let timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-        let token = self.client.issue_relay_token_with_timeout(
+        self.client.issue_relay_token_with_timeout(
             &self.device,
             &self.device_secret,
             crate::snapshots::SnapshotSource::Codex,
             timeout,
-        )?;
-        let mut cached = self
-            .relay_token
-            .lock()
-            .map_err(|_| anyhow!("cloud-session relay token lock is unavailable"))?;
-        *cached = Some(token.clone());
-        Ok(token)
+        )
     }
 
     fn send_with_relay_retry<F>(&self, timeout: Duration, send: F) -> Result<()>
@@ -1987,7 +1968,7 @@ impl RelayCloudSessionTransport {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
         }
         let deadline = Instant::now() + timeout;
-        let token = self.token(false, deadline)?;
+        let token = self.token(deadline)?;
         let request_timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
         match send(&self.client, &token, request_timeout) {
@@ -1997,7 +1978,7 @@ impl RelayCloudSessionTransport {
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
                     .is_some() =>
             {
-                let refreshed = self.token(true, deadline)?;
+                let refreshed = self.token(deadline)?;
                 let retry_timeout = remaining_budget(deadline)
                     .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
                 send(&self.client, &refreshed, retry_timeout).map(|_| ())
@@ -2034,7 +2015,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
             return Err(anyhow!("cloud-session backend grant binding is invalid"));
         }
         let deadline = Instant::now() + timeout;
-        let token = self.token(false, deadline)?;
+        let token = self.token(deadline)?;
         let request_timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
         let first = self.client.get_cloud_session_grant_authority_with_timeout(
@@ -2050,7 +2031,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
                     .is_some() =>
             {
-                let refreshed = self.token(true, deadline)?;
+                let refreshed = self.token(deadline)?;
                 let retry_timeout = remaining_budget(deadline)
                     .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
                 self.client.get_cloud_session_grant_authority_with_timeout(
@@ -2081,7 +2062,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         batch.validate_relay_wire_contract()?;
         let request = serde_json::to_value(batch)?;
         let deadline = Instant::now() + timeout;
-        let token = self.token(false, deadline)?;
+        let token = self.token(deadline)?;
         let request_timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
         match self
@@ -2094,7 +2075,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
                     .is_some() =>
             {
-                let refreshed = self.token(true, deadline)?;
+                let refreshed = self.token(deadline)?;
                 let retry_timeout = remaining_budget(deadline)
                     .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
                 self.client
