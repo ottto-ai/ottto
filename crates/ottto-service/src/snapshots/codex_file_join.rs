@@ -3190,6 +3190,63 @@ pub(super) mod tests {
         }
         panic!("bounded native scan did not finish");
     }
+    /// [money] Codex logs no longer price a turn: a logs priority request for a
+    /// new turn, with no tier receipt, leaves every row at the default tier.
+    #[test]
+    fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
+        let (root, _) = fixture();
+        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
+        rows.insert(
+            1,
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
+        );
+        fs::write(
+            root.join("sessions/b.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let connection = rusqlite::Connection::open(root.join("logs_2.sqlite")).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
+                rusqlite::params![
+                    now,
+                    format!(
+                        "turn{{turn.id={turn}}}: websocket request: \
+                         {{\"type\":\"response.create\",\"service_tier\":\"priority\",\
+                         \"model\":\"gpt-5.2\"}}"
+                    )
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let (_, result) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(result.snapshots.len(), 2, "one alias per group member");
+        for item in &result.snapshots {
+            assert_eq!(item.input_tokens, 300);
+            assert!(
+                item.model_usage
+                    .iter()
+                    .all(|row| !row.selector_context.contains_key("service_tier")),
+                "{:?}",
+                item.model_usage
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn production_scanner_aliases_need_common_settlement_and_skip_on_restart() {
         let (root, _) = fixture();
