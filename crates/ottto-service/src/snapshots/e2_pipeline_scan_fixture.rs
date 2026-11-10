@@ -421,7 +421,7 @@ pub(crate) struct E2ScanFixture {
 }
 impl E2ScanFixture {
     pub(crate) fn mark_sidecar_sweep_incomplete(index: &mut ScanIndex) {
-        index.claude_desktop_store_sweep_had_errors = true;
+        index.claude_desktop_store_retry_not_before_unix_seconds = Some(0);
     }
 
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
