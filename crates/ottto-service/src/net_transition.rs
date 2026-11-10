@@ -27,6 +27,10 @@ const TRANSITION_QUIET_PERIOD: Duration = Duration::from_secs(3);
 /// a flapping interface must not thrash them continuously.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const TRANSITION_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Wake coalescing bound: at most one readiness wait per second, matching the
+/// 1 s legacy relay health deadline.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const ROUTE_WAKE_COALESCE_INTERVAL: Duration = Duration::from_secs(1);
 /// Spawn the observer thread. Non-macOS builds are a no-op (the trigger —
 /// macOS network-transition handling of long-running processes — does not
 /// exist elsewhere, and `PF_ROUTE` is BSD-specific).
@@ -137,7 +141,7 @@ impl Drop for RouteSocket {
 
 #[cfg(target_os = "macos")]
 fn observe_route_socket(socket: RouteSocket) {
-    observe_route_messages(socket, is_transition_message, || {
+    observe_route_messages(socket, is_transition_message, std::thread::sleep, || {
         crate::net_resilience::force_rebuild_upstream_agents(
             "a macOS network transition (interface/address change)",
         );
@@ -153,6 +157,7 @@ fn observe_route_socket(socket: RouteSocket) {
 fn observe_route_messages(
     socket: RouteSocket,
     is_transition: impl Fn(&[u8]) -> bool,
+    mut pause: impl FnMut(Duration),
     mut rebuild: impl FnMut(),
 ) {
     // Route messages are bounded well below this (rt_msghdr + a few
@@ -162,12 +167,19 @@ fn observe_route_messages(
     let mut pending_since: Option<Instant> = None;
     let mut last_rebuild_at: Option<Instant> = None;
     let mut readable = false;
+    let mut next_wait_at = Instant::now();
     loop {
         let deadline = pending_since.map(|since| since + TRANSITION_QUIET_PERIOD);
         let result = if readable {
             Ok(())
         } else {
-            socket.wait_readable(deadline)
+            // The queue is drained. Coalesce the next wake: messages queue
+            // unread until a second after the last wake, so a deadline inside
+            // the pause fires at its end (at most 1 s late).
+            pause(next_wait_at.saturating_duration_since(Instant::now()));
+            let result = socket.wait_readable(deadline);
+            next_wait_at = Instant::now() + ROUTE_WAKE_COALESCE_INTERVAL;
+            result
         };
 
         let message = match result.and_then(|()| socket.read_message(&mut buffer)) {
@@ -289,7 +301,7 @@ mod readiness_tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::IntoRawFd;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::sync::{atomic::AtomicBool, atomic::Ordering, mpsc, Arc};
 
     /// [behaviour] An idle indefinite wait wakes on fd readiness.
@@ -336,11 +348,79 @@ mod readiness_tests {
         peer.write_all(&[0; 8]).unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            observe_route_messages(socket, |_| false, || panic!("unexpected rebuild"));
+            observe_route_messages(socket, |_| false, |_| (), || panic!("unexpected rebuild"));
             crate::local_resource_diagnostics::source_prepare("unknown", || (), |_| false);
         });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["stage"], "source_prepare");
+    }
+
+    /// [behaviour] A burst queued during the coalescing pause drains in one
+    /// wake, every message reaches the transition decision, and a quiet
+    /// deadline that passes inside the pause rebuilds once when it ends.
+    #[test]
+    fn route_burst_coalesces_into_one_wake() {
+        let (peer, reader) = UnixDatagram::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let control = reader.try_clone().unwrap();
+        let socket = RouteSocket {
+            fd: reader.into_raw_fd(),
+        };
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let (rebuilt_tx, rebuilt_rx) = mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            observe_route_messages(
+                socket,
+                |message| {
+                    let relevant = message[0] == 1;
+                    seen_tx.send((relevant, Instant::now())).unwrap();
+                    relevant
+                },
+                // The test owns time inside the pause: it ends on resume.
+                |pause| {
+                    let _ = paused_tx.send(pause);
+                    let _ = resume_rx.recv();
+                },
+                || rebuilt_tx.send(Instant::now()).unwrap(),
+            );
+        });
+        let next_pause = || paused_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // No earlier wake, so the first wait starts at once.
+        assert_eq!(next_pause(), Duration::ZERO);
+        resume_tx.send(()).unwrap();
+        peer.send(&[0; 16]).unwrap();
+        let pause = next_pause();
+        assert!(pause > Duration::from_millis(500) && pause <= ROUTE_WAKE_COALESCE_INTERVAL);
+        assert_eq!(seen_rx.try_iter().count(), 1);
+        for index in 0..10 {
+            peer.send(&[u8::from(index == 4); 16]).unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        // One wake drained the whole burst before the next pause.
+        assert!(next_pause() > Duration::from_millis(500));
+        let seen: Vec<_> = seen_rx.try_iter().collect();
+        assert_eq!(seen.len(), 10);
+        let transitions: Vec<_> = seen.iter().filter(|(relevant, _)| *relevant).collect();
+        assert_eq!(transitions.len(), 1);
+        let transition_at = transitions[0].1;
+        // Hold the pause past the quiet deadline; the rebuild waits for its end.
+        std::thread::sleep(
+            (transition_at + TRANSITION_QUIET_PERIOD + Duration::from_millis(100))
+                .saturating_duration_since(Instant::now()),
+        );
+        assert!(rebuilt_rx.try_recv().is_err());
+        let resumed = Instant::now();
+        resume_tx.send(()).unwrap();
+        let rebuilt = rebuilt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(rebuilt >= transition_at + TRANSITION_QUIET_PERIOD);
+        assert!(rebuilt < resumed + Duration::from_millis(500));
+        next_pause();
+        control.shutdown(std::net::Shutdown::Read).unwrap();
+        drop(resume_tx);
+        observer.join().unwrap();
+        assert_eq!(rebuilt_rx.try_iter().count(), 0);
     }
 
     /// [behaviour] Quiet fires without another message, re-arms only for relevant
@@ -365,6 +445,7 @@ mod readiness_tests {
                         }
                         relevant
                     },
+                    |_| (),
                     || {
                         rebuilt_tx.send(Instant::now()).unwrap();
                     },
