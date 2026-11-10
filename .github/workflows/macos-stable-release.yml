@@ -84,7 +84,7 @@ jobs:
       OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           persist-credentials: false
           # Full history for the first-parent check on main.
@@ -327,13 +327,13 @@ jobs:
 
       - name: Create provenance attestation
         if: inputs.release_mode == 'standard'
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
 
       - name: Create SBOM attestation
         if: inputs.release_mode == 'standard'
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
           sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
@@ -371,13 +371,13 @@ jobs:
 
       - name: Create final provenance attestation
         if: inputs.release_mode == 'standard'
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
 
       - name: Create final SBOM attestation
         if: inputs.release_mode == 'standard'
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
           sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
@@ -435,7 +435,7 @@ jobs:
             --keychain-profile "$OTTTO_NOTARY_PROFILE"
 
       - name: Upload release workflow artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}
           if-no-files-found: error
