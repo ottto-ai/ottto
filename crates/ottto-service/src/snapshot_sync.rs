@@ -4464,12 +4464,6 @@ impl SyncCounts {
                     d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
                     d.session_index.reused_roots, d.session_index.reloaded_roots,
                     d.state_titles.absent_roots));
-                for (kind, n) in crate::codex_scan_diagnostics::SIDECAR_RELOAD_KINDS
-                    .iter()
-                    .zip(d.sidecar_reload)
-                {
-                    line.push_str(&format!(" sidecar_reload_{kind}={n}"));
-                }
             }
         }
         line

@@ -244,59 +244,27 @@ impl<K, F, S> Default for StampedFacts<K, F, S> {
         }
     }
 }
-/// Why one lookup reused or reloaded; diagnostics only. A load is reported
-/// by its admission outcome, else by why the kept entry missed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FactsReuse {
-    Hit,
-    Cold,
-    Stamp,
-    Capture,
-    Invalid,
-    ChangedDuringLoad,
-}
 impl<K: Ord, F: Clone, S: ContentStamp> StampedFacts<K, F, S> {
     pub(crate) fn reuse_or_load<E>(
         &mut self,
         key: K,
-        capture: impl FnMut() -> io::Result<S>,
-        load: impl FnOnce() -> Result<F, E>,
-    ) -> Result<F, E> {
-        self.reuse_or_load_why(key, capture, load).0
-    }
-
-    pub(crate) fn reuse_or_load_why<E>(
-        &mut self,
-        key: K,
         mut capture: impl FnMut() -> io::Result<S>,
         load: impl FnOnce() -> Result<F, E>,
-    ) -> (Result<F, E>, FactsReuse) {
+    ) -> Result<F, E> {
         let before = capture();
         if let (Ok(before), Some((stamp, facts))) = (&before, self.kept.get(&key)) {
             if before.same(stamp) {
-                return (Ok(facts.clone()), FactsReuse::Hit);
+                return Ok(facts.clone());
             }
         }
-        let miss = match (&before, self.kept.remove(&key)) {
-            (Err(_), _) => FactsReuse::Capture,
-            (Ok(_), Some(_)) => FactsReuse::Stamp,
-            (Ok(_), None) => FactsReuse::Cold,
-        };
-        let facts = match load() {
-            Ok(facts) => facts,
-            Err(error) => return (Err(error), FactsReuse::Invalid),
-        };
+        self.kept.remove(&key);
+        let facts = load()?;
         if let (Ok(before), Ok(after)) = (before, capture()) {
             if before.same(&after) {
                 self.kept.insert(key, (after, facts.clone()));
-                return (Ok(facts), miss);
             }
         }
-        let reason = match miss {
-            FactsReuse::Capture => FactsReuse::Capture,
-            _ => FactsReuse::ChangedDuringLoad,
-        };
-        (Ok(facts), reason)
+        Ok(facts)
     }
 
     pub(crate) fn retain_listed(&mut self, listed: &std::collections::BTreeSet<K>) {

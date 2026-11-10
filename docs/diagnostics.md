@@ -431,12 +431,6 @@ never sum these overlapping windows or treat worker wait time as child CPU.
 Idle accept polls, legacy accept polls and route read waits are not measured as
 separate work units. Panics emit no row, matching other stage windows.
 
-`offpass_agent_status` also carries `counts.cli_meta`, absent when empty: the
-nonzero CLI metadata cache lookups since the previous row, keyed
-`<codex|claude>_<reason>` with the closed reasons `hit`, `cold`, `stamp`,
-`capture`, `invalid`, `changed_during_load`, `age` and `bypass`. A load is
-named by its admission outcome, else by why the kept entry missed. Counts only.
-
 `footprint_samples_over_400` counts the successful samples in that same measure
 above 400 MiB (419,430,400 bytes), a reporting line only: nothing reads it to
 change behavior. Time above the line is about this count × 50 ms (the start
@@ -2005,15 +1999,6 @@ main's narrower current-representation binding formula. Grouped Codex members
 still have main's index-reset recovery gap there; the paired completion closes
 it for every member/alias. Both parts must ship in the same release, in order;
 the first is not a standalone recovery-complete release.
-
-## Codex sidecar reload causes
-
-The `snapshot terminal_census source=codex` line also carries
-`sidecar_reload_<kind>=<homes>` for the scan's sidecar load: when any home's
-witness changed, the whole group reloads, and each home counts once under its
-first changed witness: `cold` (not kept), `roster` (once, a kept home left),
-`uncacheable`, `state_5_main`, `state_5_wal`, `thread_history_1_main`,
-`thread_history_1_wal`, `session_index`. Unchanged homes and reused groups count zero.
 
 ## Codex ownership-incomplete causes
 

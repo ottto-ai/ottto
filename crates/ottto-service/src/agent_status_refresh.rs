@@ -314,7 +314,7 @@ impl StatusLane {
             }
             (reused, app_only, first_pass)
         };
-        let mut stage = StageWindow::begin("unknown", "offpass_agent_status");
+        let _stage = StageWindow::begin("unknown", "offpass_agent_status");
         let collection = if let Some(collection) = reused {
             collection
         } else {
@@ -333,9 +333,7 @@ impl StatusLane {
                     collect()
                 }
             };
-            let collected = catch_unwind(AssertUnwindSafe(collect));
-            stage.set_cli_meta(crate::agent_status::take_cli_meta_reasons());
-            let collection = match collected {
+            let collection = match catch_unwind(AssertUnwindSafe(collect)) {
                 Ok(collection) => Arc::new(collection),
                 Err(_) => {
                     let mut state = self

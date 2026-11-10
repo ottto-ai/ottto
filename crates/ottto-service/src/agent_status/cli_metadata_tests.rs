@@ -149,7 +149,6 @@ fn cli_metadata_cache_failures_are_not_kept() {
 fn cli_metadata_loader_error_is_not_cached() {
     use crate::transcript_acquisition::SourceStamp;
     let cache = Mutex::new(CliFacts::<u8, (), 1>::default());
-    let reasons: [AtomicU32; 8] = Default::default();
     let mut runs = 0;
     for _ in 0..2 {
         let result = cli_meta(
@@ -162,13 +161,11 @@ fn cli_metadata_loader_error_is_not_cached() {
             },
             Instant::now(),
             false,
-            &reasons,
         );
         assert!(result.is_err());
     }
     assert_eq!(runs, 2);
     assert!(cache.lock().unwrap().kept.is_empty());
-    assert_eq!(reasons[4].load(AtomicOrdering::Relaxed), 2, "invalid");
 }
 
 /// [behaviour] Identity-bearing CLI text retains its fresh legacy fallback.
@@ -482,67 +479,5 @@ fn cli_metadata_stderr_login_status_is_cached() {
             .login_state,
         AgentLoginState::SignedOut
     );
-    fs::remove_dir_all(root).unwrap();
-}
-
-/// [behaviour] Every lookup counts exactly one closed reason, by name.
-#[cfg(unix)]
-#[test]
-fn cli_metadata_reasons_are_closed() {
-    use crate::transcript_acquisition::{FactsReuse, SourceStamp};
-    for (reason, name) in [
-        (FactsReuse::Hit, "hit"),
-        (FactsReuse::Cold, "cold"),
-        (FactsReuse::Stamp, "stamp"),
-        (FactsReuse::Capture, "capture"),
-        (FactsReuse::Invalid, "invalid"),
-        (FactsReuse::ChangedDuringLoad, "changed_during_load"),
-    ] {
-        assert_eq!(CLI_META_REASONS[reason as usize], name);
-    }
-    let root = std::env::temp_dir().join(format!("ottto-cli-reasons-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("source");
-    fs::write(&path, "a").unwrap();
-    let cache = Mutex::new(CliFacts::<u8, (), 1>::default());
-    let reasons: [AtomicU32; 8] = Default::default();
-    let now = Instant::now();
-    let lookup = |at: Instant, bypass: bool, capture: bool, load: bool, change: bool| {
-        let _ = cli_meta(
-            &cache,
-            0,
-            || {
-                if capture {
-                    SourceStamp::capture_file(&path).map(|stamp| [stamp])
-                } else {
-                    Err(std::io::ErrorKind::Other.into())
-                }
-            },
-            || {
-                if change {
-                    fs::write(&path, "changed during load").unwrap();
-                }
-                if load {
-                    Ok(())
-                } else {
-                    Err(())
-                }
-            },
-            at,
-            bypass,
-            &reasons,
-        );
-    };
-    lookup(now, false, true, true, false); // cold
-    lookup(now, false, true, true, false); // hit
-    fs::write(&path, "bb").unwrap();
-    lookup(now, false, true, true, false); // stamp
-    lookup(now + CLI_META_MAX_AGE, false, true, true, false); // age
-    lookup(now, true, true, true, false); // bypass
-    lookup(now, false, false, true, false); // capture
-    lookup(now, false, true, false, false); // invalid
-    lookup(now, false, true, true, true); // changed during load
-    let counts = reasons.iter().map(|n| n.load(AtomicOrdering::Relaxed));
-    assert_eq!(counts.collect::<Vec<_>>(), [1; 8]);
     fs::remove_dir_all(root).unwrap();
 }
