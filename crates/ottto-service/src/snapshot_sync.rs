@@ -5512,7 +5512,7 @@ impl SnapshotCycleOwner<'_> {
             },
         )?;
         let source = preparation.source;
-        let finished = finish_sync_source(
+        finish_sync_source(
             preparation,
             index,
             scan,
@@ -5526,15 +5526,7 @@ impl SnapshotCycleOwner<'_> {
             self.daemon,
             self.transport_cycle,
             self.retry,
-        );
-        // Page end: return the page's freed allocator pages, so the next
-        // page's live footprint (its evidence chunk budget) is not read as
-        // floor.
-        #[cfg(target_os = "macos")]
-        if source == SnapshotSource::ClaudeCode {
-            crate::local_resource_diagnostics::release_free_memory();
-        }
-        finished
+        )
     }
 }
 
@@ -9242,8 +9234,6 @@ thread_local! {
     static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The release-timing reference: emitted folds released once at page end.
     static PAGE_END_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The live footprint packing sees; tests never read the real one.
-    static EVIDENCE_FOOTPRINT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Emitted folds released once at page end: the release-timing reference.
@@ -9280,16 +9270,10 @@ struct ClaudeEvidenceChunk {
     side_file_bytes: Option<u64>,
 }
 
-/// Evidence-chunk working set: MiB of footprint per MB of side-file pair
-/// bytes. Placeholder; set from measured evidence chunks.
-const EVIDENCE_MIB_PER_PAIR_MB: f64 = 1.6;
-
 /// Next-fit packing of the page's families, in page order, into the chunks the
 /// evidence body runs once each. The batch size is the page's largest family
-/// by side-file bytes (file metadata only), lowered to what the live footprint
-/// leaves under the peak line; an unavailable footprint keeps the largest
-/// family. A family is never split: one over the batch, or whose size cannot
-/// be read, runs alone. An empty page is one empty chunk.
+/// by side-file bytes (file metadata only): a family is never split, and one
+/// whose size cannot be read runs alone. An empty page is one empty chunk.
 fn pack_claude_evidence_families(
     support_dir: &Path,
     items: &[SnapshotItem],
@@ -9303,16 +9287,7 @@ fn pack_claude_evidence_families(
         })
         .collect::<Vec<_>>();
     families.sort_unstable_by_key(|(slots, _)| slots[0]);
-    #[cfg(test)]
-    let footprint = EVIDENCE_FOOTPRINT.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    let footprint = crate::local_resource_diagnostics::state_v2_memory().phys_footprint_bytes;
-    let headroom = footprint.map(|bytes| {
-        let left_mib = crate::snapshots::PEAK_LINE_MIB as f64 - bytes as f64 / (1 << 20) as f64;
-        (left_mib.max(0.0) / EVIDENCE_MIB_PER_PAIR_MB * 1e6) as u64
-    });
-    let batch = (families.iter().filter_map(|(_, bytes)| *bytes).max())
-        .map(|largest| headroom.map_or(largest, |headroom| largest.min(headroom)));
+    let batch = families.iter().filter_map(|(_, bytes)| *bytes).max();
     let fits = |total: Option<u64>| {
         one_evidence_chunk()
             || total

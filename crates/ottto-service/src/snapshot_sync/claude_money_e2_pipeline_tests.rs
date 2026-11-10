@@ -248,8 +248,6 @@ impl Page {
         let whole = checks.map(|_| reference(&crate::snapshot_sync::WHOLE_CORPUS_EVIDENCE));
         // The same streamed fold over the page as one evidence chunk.
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
-        // The same packing with emitted folds released once at page end.
-        let page_end = checks.map(|_| reference(&crate::snapshot_sync::PAGE_END_RELEASE));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
         let ((mut disposition, _, stats), released) =
@@ -295,8 +293,7 @@ impl Page {
             Some(mut checks),
             Some((whole, whole_accepted, whole_reads)),
             Some((one, one_accepted, one_reads)),
-            Some((page_end, page_end_accepted, page_end_reads)),
-        ) = (checks, whole, one, page_end)
+        ) = (checks, whole, one)
         {
             let reads = crate::claude_local_otel::evidence_read_counts_for_test().0 - before;
             let chunks = crate::snapshot_sync::evidence_chunks_for_test() - chunks_before;
@@ -306,7 +303,6 @@ impl Page {
                     [
                         (&whole, whole_accepted.as_ref(), whole_reads),
                         (&one, one_accepted.as_ref(), one_reads),
-                        (&page_end, page_end_accepted.as_ref(), page_end_reads),
                     ],
                     (self, accepted.as_deref(), reads),
                     chunks,
@@ -390,9 +386,6 @@ struct StreamedChecks {
     /// most chunks one page ran.
     chunked: usize,
     max_chunks: usize,
-    /// Chunked enrichments with an emitted body, compared to the page-end
-    /// release of the same packing.
-    released_per_chunk: usize,
 }
 
 impl StreamedChecks {

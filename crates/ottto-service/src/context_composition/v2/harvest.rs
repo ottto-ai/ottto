@@ -99,7 +99,7 @@ pub(in crate::context_composition) fn spawn_v2_sync() -> Result<()> {
                 }
                 // All daily state, pipe buffers and superseded hourly
                 // metadata have dropped before this single relief call.
-                crate::local_resource_diagnostics::release_free_memory();
+                release_memory();
                 std::thread::sleep(WAKE_INTERVAL);
             }
         })
@@ -1263,6 +1263,26 @@ pub(super) fn run_source(
     let mut stats = run_source_inner(run, source, roots, target);
     finish(&mut stats, started, cpu_started);
     stats
+}
+
+pub(super) fn release_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone requests relief from all system malloc zones.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: asks the process allocator to release free pages.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
 }
 
 fn run_source_inner(

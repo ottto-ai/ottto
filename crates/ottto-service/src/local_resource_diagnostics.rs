@@ -3710,26 +3710,6 @@ pub(crate) struct StateV2Memory {
 pub(crate) fn state_v2_memory() -> StateV2Memory {
     footprint::current()
 }
-/// Asks the system allocator to return free pages to the OS.
-pub(crate) fn release_free_memory() {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone requests relief from all system malloc zones.
-        unsafe {
-            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: asks the process allocator to release free pages.
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
-}
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
 }

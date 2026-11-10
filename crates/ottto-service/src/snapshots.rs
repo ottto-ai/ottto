@@ -235,7 +235,7 @@ mod withheld_owner_charge_tests;
 use crate::local_resource_diagnostics::CodexZstCause;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
 pub(crate) use claude_history_upgrade::{
-    note_prior_history_unverified, PriorHistory, MAX_GATED_CLAUDE_REVISION, PEAK_LINE_MIB,
+    note_prior_history_unverified, PriorHistory, MAX_GATED_CLAUDE_REVISION,
 };
 use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,

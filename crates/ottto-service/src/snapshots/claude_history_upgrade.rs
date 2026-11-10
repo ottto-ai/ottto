@@ -582,8 +582,7 @@ pub(crate) struct HistoryPage {
 
 crate::heap_layout_bound::fields!(HistoryPage; files, bytes, resident_charge, resident_admitted, forced_pending_entries, charge_deferred, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index, birth_page_begun, queued_family_deferred_paths);
 
-/// The footprint line (MiB) page admission and evidence chunks budget under.
-pub(crate) const PEAK_LINE_MIB: u64 = 500;
+const PEAK_LINE_MIB: u64 = 500;
 const FLOOR_MIB: u64 = 150;
 const FINISH_RESERVE_MIB: u64 = 120;
 /// D326 amendment: soft admission allowance, not a footprint guarantee.
