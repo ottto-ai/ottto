@@ -36,7 +36,8 @@ use std::collections::BTreeMap;
 use ottto_protocol::{
     is_backend_safe_credit_text, is_credit_reason_code, AgentCreditBalance,
     AgentCreditBalanceStatus, AgentCreditBalanceUnit, AgentCreditGrant, AgentQuotaWindowFreshness,
-    CreditBalanceKind, CreditGrantStatus, CreditGrantType, CreditGrantsState, Rfc3339Timestamp,
+    CreditAmount, CreditBalanceKind, CreditGrantStatus, CreditGrantType, CreditGrantsState,
+    Rfc3339Timestamp,
 };
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
@@ -631,9 +632,9 @@ fn latest_granted_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
 /// Balance state for a balance whose `remaining` is a count of what is left
 /// (contract v2.1 §2.2): zero is `exhausted`, a positive amount is `ok`, and
 /// an unknown amount is `unknown`.
-pub(crate) fn status_for_remaining(remaining: Option<u64>) -> AgentCreditBalanceStatus {
+pub(crate) fn status_for_remaining(remaining: Option<CreditAmount>) -> AgentCreditBalanceStatus {
     match remaining {
-        Some(0) => AgentCreditBalanceStatus::Exhausted,
+        Some(amount) if amount.is_zero() => AgentCreditBalanceStatus::Exhausted,
         Some(_) => AgentCreditBalanceStatus::Ok,
         None => AgentCreditBalanceStatus::Unknown,
     }
@@ -670,16 +671,16 @@ fn summarize(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
         // Anthropic reports no saved-reset count of its own: the model's sum
         // over a complete list is the only source, so every other state
         // (partial, capped, unavailable, not supported) clears it.
+        // A sum past the representable range is absent, never wrapped.
         balance.remaining = if complete {
-            Some(
-                balance
-                    .grants
-                    .iter()
-                    .flatten()
-                    .filter(|grant| grant.status != CreditGrantStatus::Paused)
-                    .filter_map(|grant| grant.resets_left)
-                    .sum(),
-            )
+            balance
+                .grants
+                .iter()
+                .flatten()
+                .filter(|grant| grant.status != CreditGrantStatus::Paused)
+                .filter_map(|grant| grant.resets_left)
+                .try_fold(0_u64, u64::checked_add)
+                .and_then(CreditAmount::whole)
         } else {
             None
         };
@@ -828,14 +829,15 @@ pub(crate) fn one_time_credit(
     };
     let expires_at = instant(expires_at, "expires_at");
     let observed_at = instant(observed_at, "observed_at");
+    let remaining = remaining_cents.and_then(CreditAmount::whole);
     let balance = AgentCreditBalance {
         name: "one_time_credit".to_string(),
-        status: status_for_remaining(remaining_cents),
+        status: status_for_remaining(remaining),
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining: remaining_cents,
-        used: used_cents,
-        quota: limit_cents,
+        remaining,
+        used: used_cents.and_then(CreditAmount::whole),
+        quota: limit_cents.and_then(CreditAmount::whole),
         currency: Some("USD".to_string()),
         limit_id: Some(limit_id.to_string()),
         observed_at,

@@ -53,7 +53,7 @@ fn local_meter_fixture(
             freshness: AgentQuotaWindowFreshness::Fresh,
             account_identifier_hash: Some(account_hash.to_string()),
             organization_identifier_hash: Some(organization_hash.to_string()),
-            remaining: Some(789),
+            remaining: CreditAmount::whole(789),
             updated_at: Some("2026-08-05T01:04:00Z".to_string()),
             ..Default::default()
         }],
@@ -207,7 +207,7 @@ fn retained_slot_snapshot_shows_an_older_reader_blind_row_as_unavailable() {
         status: AgentCreditBalanceStatus::Exhausted,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Resets,
-        remaining: Some(0),
+        remaining: Some(CreditAmount::ZERO),
         observed_at: Some(now_text.clone()),
         grant_count: Some(0),
         grants: Some(Vec::new()),
@@ -2473,7 +2473,7 @@ exit 1
                 name: "Usage credits".to_string(),
                 status: AgentCreditBalanceStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                remaining: Some(credits),
+                remaining: CreditAmount::whole(credits),
                 ..Default::default()
             }],
             account_weekly_not_offered: false,
@@ -2566,7 +2566,7 @@ exit 1
         );
         assert_eq!(
             snapshot.credit_balances[0].remaining,
-            Some(expected_credits)
+            CreditAmount::whole(expected_credits)
         );
         assert_eq!(
             snapshot
@@ -5151,7 +5151,7 @@ fn a_failed_codex_probe_placeholder_is_uploaded_without_meters() {
         &[AgentCreditBalance {
             name: "reset_bank".to_string(),
             freshness: AgentQuotaWindowFreshness::Fresh,
-            remaining: Some(2),
+            remaining: CreditAmount::whole(2),
             ..Default::default()
         }],
         current_unix_seconds(),
@@ -5235,7 +5235,7 @@ fn a_failed_codex_upload_never_carries_stale_meters_or_local_plan_words() {
     snapshot.credit_balances = vec![AgentCreditBalance {
         name: "reset_bank".to_string(),
         freshness: AgentQuotaWindowFreshness::Stale,
-        remaining: Some(2),
+        remaining: CreditAmount::whole(2),
         ..Default::default()
     }];
     snapshot.diagnostics.push(AgentStatusDiagnostic::source(
@@ -6805,7 +6805,7 @@ fn codex_app_server_prefers_effective_snapshot_over_internal_limit_map() {
     );
     assert_eq!(credits.len(), 2);
     assert_eq!(credits[0].name, "credits");
-    assert_eq!(credits[0].remaining, Some(4));
+    assert_eq!(credits[0].remaining, CreditAmount::whole(4));
     // A payload without the spend-cap fields leaves them unset.
     assert_eq!(credits[0].spend_control_reached, None);
     assert_eq!(credits[0].rate_limit_reached_type, None);
@@ -6813,7 +6813,7 @@ fn codex_app_server_prefers_effective_snapshot_over_internal_limit_map() {
     assert_eq!(credits[1].name, "reset_bank");
     assert_eq!(credits[1].unit, AgentCreditBalanceUnit::Resets);
     assert_eq!(credits[1].status, AgentCreditBalanceStatus::Ok);
-    assert_eq!(credits[1].remaining, Some(2));
+    assert_eq!(credits[1].remaining, CreditAmount::whole(2));
 }
 
 #[test]
@@ -6879,7 +6879,7 @@ fn reset_credit_null_details_never_fabricate_zero_credits() {
         let balances = codex_app_server_credit_balances(&json);
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].name, "reset_bank");
-        assert_eq!(balances[0].remaining, Some(3));
+        assert_eq!(balances[0].remaining, CreditAmount::whole(3));
         assert_eq!(balances[0].unit, AgentCreditBalanceUnit::Resets);
     }
 }
@@ -6912,7 +6912,7 @@ fn codex_app_server_parser_carries_credit_spend_control_fields() {
 
     assert_eq!(credits.len(), 1);
     assert_eq!(credits[0].name, "credits");
-    assert_eq!(credits[0].remaining, Some(9));
+    assert_eq!(credits[0].remaining, CreditAmount::whole(9));
     // A reached spend cap is a hard stop even with a nominal balance remaining.
     assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
     assert_eq!(credits[0].spend_control_reached, Some(true));
@@ -6944,8 +6944,11 @@ fn codex_app_server_preserves_credit_balances_from_multiple_limit_buckets() {
         .map(|balance| (balance.name.clone(), balance))
         .collect::<BTreeMap<_, _>>();
 
-    assert_eq!(by_name["credits"].remaining, Some(12));
-    assert_eq!(by_name["codex_business_credits"].remaining, Some(4));
+    assert_eq!(by_name["credits"].remaining, CreditAmount::whole(12));
+    assert_eq!(
+        by_name["codex_business_credits"].remaining,
+        CreditAmount::whole(4)
+    );
     assert_eq!(
         by_name["codex_business_credits"].limit_id.as_deref(),
         Some("codex_business")
@@ -6990,9 +6993,9 @@ fn codex_app_server_parser_carries_workspace_monthly_credit_limit() {
     let monthly = &credits[1];
     assert_eq!(monthly.name, "workspace_monthly_credits");
     assert_eq!(monthly.status, AgentCreditBalanceStatus::Ok);
-    assert_eq!(monthly.used, Some(4841));
-    assert_eq!(monthly.quota, Some(8000));
-    assert_eq!(monthly.remaining, Some(3159));
+    assert_eq!(monthly.used, CreditAmount::whole(4841));
+    assert_eq!(monthly.quota, CreditAmount::whole(8000));
+    assert_eq!(monthly.remaining, CreditAmount::whole(3159));
     assert_eq!(monthly.used_percent, Some(61));
     assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-01T00:00:00Z"));
     assert_eq!(monthly.spend_control_reached, Some(false));
@@ -7031,7 +7034,7 @@ fn codex_app_server_falls_back_from_null_effective_snapshot_to_limit_map() {
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].left_percent, Some(79));
     assert_eq!(credits.len(), 1);
-    assert_eq!(credits[0].remaining, Some(3));
+    assert_eq!(credits[0].remaining, CreditAmount::whole(3));
 }
 
 #[test]
@@ -7054,7 +7057,161 @@ fn codex_app_server_parser_preserves_zero_reset_bank_count() {
     assert_eq!(credits[0].name, "reset_bank");
     assert_eq!(credits[0].unit, AgentCreditBalanceUnit::Resets);
     assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
-    assert_eq!(credits[0].remaining, Some(0));
+    assert_eq!(credits[0].remaining, CreditAmount::whole(0));
+}
+
+/// Codex credit status compares exact amounts: 0.4 is low (not exhausted),
+/// 5.4 is ok (not low), `hasCredits: false` with 0.3 keeps a low row, and a
+/// fractional monthly headroom is not exhausted. True zero stays exhausted
+/// and a negative balance stays absent and unknown, never zero.
+#[test]
+fn codex_credit_amounts_are_exact_through_status_and_wire() {
+    use AgentCreditBalanceStatus as Status;
+    let row = |snapshot: Value, name: &str| {
+        let balances =
+            codex_app_server_credit_balances(&serde_json::json!({"rateLimits": snapshot}));
+        let row = balances.into_iter().find(|balance| balance.name == name);
+        let wire = row.as_ref().map(|row| serde_json::to_value(row).unwrap());
+        let remaining = wire.and_then(|wire| wire.get("remaining").cloned());
+        (row.map(|row| row.status), remaining.unwrap_or(Value::Null))
+    };
+    for (credits, status, remaining) in [
+        (
+            r#"{"hasCredits":true,"balance":"0.4"}"#,
+            Some(Status::Low),
+            r#""0.4""#,
+        ),
+        (
+            r#"{"hasCredits":true,"balance":"5.4"}"#,
+            Some(Status::Ok),
+            r#""5.4""#,
+        ),
+        (
+            r#"{"hasCredits":false,"balance":"0.3"}"#,
+            Some(Status::Low),
+            r#""0.3""#,
+        ),
+        (
+            r#"{"hasCredits":true,"balance":"0"}"#,
+            Some(Status::Exhausted),
+            "0",
+        ),
+        (r#"{"hasCredits":false,"balance":"0"}"#, None, "null"),
+        (
+            r#"{"hasCredits":true,"balance":"5"}"#,
+            Some(Status::Low),
+            "5",
+        ),
+        (
+            r#"{"unlimited":false,"balance":"-5"}"#,
+            Some(Status::Unknown),
+            "null",
+        ),
+    ] {
+        let credits: Value = serde_json::from_str(credits).unwrap();
+        let snapshot = serde_json::json!({"limitId": "codex", "credits": credits.clone()});
+        let expected = (status, serde_json::from_str::<Value>(remaining).unwrap());
+        assert_eq!(row(snapshot, "credits"), expected, "{credits}");
+    }
+    let monthly = serde_json::json!({
+        "limitId": "codex",
+        "individualLimit": {"limit": "8000", "used": "7999.5"}
+    });
+    assert_eq!(
+        row(monthly, "workspace_monthly_credits"),
+        (Some(Status::Ok), serde_json::json!("0.5"))
+    );
+}
+
+/// [regress] The provider decodes rounded fractional credit numbers
+/// through `f64`. Each decode keeps a raw credit number exact: it reaches
+/// the wire with the same six half-even digits as its string form (Claude
+/// money: half-even cents on spend, windows, one-time pools and the cached
+/// config copy), numbers outside the credit subtrees stay numbers, and a
+/// one-time pool is admitted exactly when its limit reads as money.
+#[test]
+fn provider_decodes_keep_raw_credit_numbers_exact() {
+    use super::credit_amount_input::{decode, CreditBody};
+    let message = decode(
+        r#"{"id":1,"result":{"rateLimits":{"limitId":"codex",
+            "primary":{"usedPercent":12.5,"windowDurationMins":300},
+            "credits":{"hasCredits":true,"balance":49591.7041935000},
+            "individualLimit":{"limit":8000,"used":1.2345665000}}}}"#,
+        CreditBody::CodexMessage,
+    )
+    .expect("codex message");
+    let rate_limits = &message["result"];
+    assert!(rate_limits["rateLimits"]["primary"]["usedPercent"].is_number());
+    let wire = serde_json::to_value(codex_app_server_credit_balances(rate_limits)).unwrap();
+    assert_eq!(wire[0]["name"], "credits");
+    assert_eq!(wire[0]["remaining"], "49591.704194");
+    assert_eq!(wire[1]["name"], "workspace_monthly_credits");
+    assert_eq!(wire[1]["used"], "1.234566");
+    assert_eq!(wire[1]["quota"], 8000);
+    assert_eq!(wire[1]["remaining"], "7998.765434");
+
+    // 12.5 cents is an exact tie: half-even keeps 12 (was 13).
+    let usage = r#"{"five_hour":{"utilization":12.5,"used_dollars":0.125},
+        "seven_day":{"utilization":3,"used_dollars":2501.367212},
+        "spend":{"enabled":true,"used":0.125,"limit":{"amount_minor":5000,"exponent":2}},
+        "iguana_necktie":{"limit_dollars":250,"used_dollars":0.125,
+            "remaining_dollars":249.875,"resets_at":"2026-11-05T07:59:00+00:00"},
+        "amber_ladder":{"limit_dollars":"1","remaining_dollars":1,
+            "resets_at":"2026-11-05T07:59:00+00:00"},
+        "wattle_ember":{"limit_dollars":{"amount_minor":500,"exponent":2},
+            "resets_at":"2026-11-05T07:59:00+00:00"},
+        "maple_harbor":{"limit_dollars":-5,"remaining_dollars":1,
+            "resets_at":"2026-11-05T07:59:00+00:00"}}"#;
+    let body = decode(usage, CreditBody::ClaudeUsage).expect("usage body");
+    assert!(body["five_hour"]["utilization"].is_number());
+    let windows = claude_oauth_quota_windows(&body)
+        .into_iter()
+        .map(|window| (window.name, window.used_cents))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        windows,
+        [
+            ("session".to_string(), Some(12)),
+            ("weekly".to_string(), Some(250_137))
+        ]
+    );
+    assert_eq!(
+        claude_oauth_credit_balances(&body)[0].used,
+        CreditAmount::whole(12)
+    );
+    let read = claude_credit_pools::claude_credit_read(
+        &body,
+        claude_credit_pools::ClaudeUsageRead::Plain,
+        "2026-10-09T14:06:52Z",
+    );
+    let pools = claude_credit_pools::claude_merge_credit_sections("b", &[], &read)
+        .into_iter()
+        .filter(|balance| {
+            balance.kind == Some(ottto_protocol::CreditBalanceKind::OneTimeCredit)
+        })
+        .map(|pool| {
+            let wire = serde_json::to_value(&pool).unwrap();
+            serde_json::json!([
+                wire["limit_id"],
+                wire["quota"],
+                wire["used"],
+                wire["remaining"]
+            ])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pools,
+        [
+            serde_json::json!(["amber_ladder", 100, null, 100]),
+            serde_json::json!(["iguana_necktie", 25_000, 12, 24_988]),
+            serde_json::json!(["wattle_ember", 500, null, null]),
+        ]
+    );
+    let config =
+        format!(r#"{{"cachedUsageUtilization":{{"fetchedAtMs":1.5,"utilization":{usage}}}}}"#);
+    let config = decode(&config, CreditBody::ClaudeConfig).expect("config");
+    assert!(config["cachedUsageUtilization"]["fetchedAtMs"].is_number());
+    assert_eq!(config["cachedUsageUtilization"]["utilization"], body);
 }
 
 #[test]
@@ -9087,8 +9244,8 @@ fn claude_oauth_usage_cache_covers_collection_gap_then_marks_old_windows_stale()
             status: AgentCreditBalanceStatus::Ok,
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Usd,
-            used: Some(321),
-            quota: Some(500),
+            used: CreditAmount::whole(321),
+            quota: CreditAmount::whole(500),
             enabled: Some(true),
             ..Default::default()
         }],
@@ -11465,9 +11622,9 @@ fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
     assert_eq!(credit.name, "Usage credits");
     assert_eq!(credit.unit, AgentCreditBalanceUnit::Usd);
     assert_eq!(credit.status, AgentCreditBalanceStatus::Low);
-    assert_eq!(credit.used, Some(321));
-    assert_eq!(credit.quota, Some(500));
-    assert_eq!(credit.remaining, Some(179));
+    assert_eq!(credit.used, CreditAmount::whole(321));
+    assert_eq!(credit.quota, CreditAmount::whole(500));
+    assert_eq!(credit.remaining, CreditAmount::whole(179));
     assert_eq!(credit.used_percent, Some(64));
     assert_eq!(credit.currency.as_deref(), Some("USD"));
     assert_eq!(credit.enabled, Some(true));
@@ -11475,20 +11632,20 @@ fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
 
 #[test]
 fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
-    let json = serde_json::json!({
+    let json = credit_amount_input::usage_body(serde_json::json!({
         "spend": {
             "used": {"amount_minor": 500, "currency": "USD", "exponent": 2},
             "limit": 5.0,
             "severity": "critical",
             "enabled": true
         }
-    });
+    }));
     let balances = claude_oauth_credit_balances(&json);
     assert_eq!(balances.len(), 1);
     assert_eq!(balances[0].status, AgentCreditBalanceStatus::Exhausted);
-    assert_eq!(balances[0].used, Some(500));
-    assert_eq!(balances[0].quota, Some(500));
-    assert_eq!(balances[0].remaining, Some(0));
+    assert_eq!(balances[0].used, CreditAmount::whole(500));
+    assert_eq!(balances[0].quota, CreditAmount::whole(500));
+    assert_eq!(balances[0].remaining, CreditAmount::whole(0));
 }
 
 #[test]
@@ -11497,16 +11654,32 @@ fn claude_oauth_money_cents_normalizes_exponents_and_bare_numbers() {
     assert_eq!(claude_oauth_money_cents(Some(&object)), Some(322));
     let zero_exp = serde_json::json!({"amount_minor": 5, "exponent": 0});
     assert_eq!(claude_oauth_money_cents(Some(&zero_exp)), Some(500));
-    let bare = serde_json::json!(5.0);
+    let bare = serde_json::json!("5.0");
     assert_eq!(claude_oauth_money_cents(Some(&bare)), Some(500));
     let negative = serde_json::json!({"amount_minor": -1, "exponent": 2});
     assert_eq!(claude_oauth_money_cents(Some(&negative)), None);
     assert_eq!(claude_oauth_money_cents(None), None);
+    // One exact half-even scaler: an exact half cent rounds to even, and a
+    // decimal string keeps its digits.
+    for (value, cents) in [
+        (
+            serde_json::json!({"amount_minor": 12345, "exponent": 3}),
+            Some(1_234),
+        ),
+        (
+            serde_json::json!({"amount_minor": 12355, "exponent": 3}),
+            Some(1_236),
+        ),
+        (serde_json::json!("0.125"), Some(12)),
+        (serde_json::json!("0.1251"), Some(13)),
+    ] {
+        assert_eq!(claude_oauth_money_cents(Some(&value)), cents, "{value}");
+    }
 }
 
 #[test]
 fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
-    let json = serde_json::json!({
+    let json = credit_amount_input::usage_body(serde_json::json!({
         "extra_usage": {
             "is_enabled": true,
             "monthly_limit": 5.0,
@@ -11514,12 +11687,12 @@ fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
             "utilization": 64,
             "currency": "USD"
         }
-    });
+    }));
     let balances = claude_oauth_credit_balances(&json);
     assert_eq!(balances.len(), 1);
-    assert_eq!(balances[0].used, Some(321));
-    assert_eq!(balances[0].quota, Some(500));
-    assert_eq!(balances[0].remaining, Some(179));
+    assert_eq!(balances[0].used, CreditAmount::whole(321));
+    assert_eq!(balances[0].quota, CreditAmount::whole(500));
+    assert_eq!(balances[0].remaining, CreditAmount::whole(179));
     assert_eq!(balances[0].used_percent, Some(64));
 }
 
@@ -11556,7 +11729,7 @@ fn claude_oauth_scoped_limits_map_model_windows_and_skip_account_kinds() {
 
 #[test]
 fn claude_oauth_window_dollar_fields_map_to_cents() {
-    let json = serde_json::json!({
+    let json = credit_amount_input::usage_body(serde_json::json!({
         "five_hour": {
             "utilization": 24.0,
             "resets_at": "2026-06-29T18:10:00+00:00",
@@ -11564,7 +11737,7 @@ fn claude_oauth_window_dollar_fields_map_to_cents() {
             "used_dollars": 6.0,
             "remaining_dollars": 19.0
         }
-    });
+    }));
     let windows = claude_oauth_quota_windows(&json);
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].limit_cents, Some(2500));

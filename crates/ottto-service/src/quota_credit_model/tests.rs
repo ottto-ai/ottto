@@ -69,7 +69,7 @@ fn saved_resets(remaining: Option<u64>, observed_at: &str) -> AgentCreditBalance
         name: "reset_bank".to_string(),
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Resets,
-        remaining,
+        remaining: remaining.and_then(CreditAmount::whole),
         kind: Some(CreditBalanceKind::SavedResets),
         observed_at: Some(observed_at.to_string()),
         ..Default::default()
@@ -513,7 +513,7 @@ fn claude_saved_resets_sum_only_when_complete() {
             vec![launch(), paused(), spent()],
         ),
     );
-    assert_eq!(complete.remaining, Some(1));
+    assert_eq!(complete.remaining, CreditAmount::whole(1));
     assert_eq!(complete.status, AgentCreditBalanceStatus::Ok);
     assert_eq!(
         complete.next_expires_at.as_deref(),
@@ -521,7 +521,7 @@ fn claude_saved_resets_sum_only_when_complete() {
     );
 
     let empty = claude_reset_bank(READ_AT, read(Provider::Anthropic, Some(0), vec![]));
-    assert_eq!(empty.remaining, Some(0));
+    assert_eq!(empty.remaining, CreditAmount::whole(0));
     assert_eq!(empty.status, AgentCreditBalanceStatus::Exhausted);
 
     // Partial (refused field), partial-by-drop, capped and unavailable: unknown.
@@ -753,8 +753,8 @@ fn readiness_is_passed_through_for_saved_resets_only() {
 #[test]
 fn disabled_balance_shape_and_reason_code() {
     let mut balance = usage_credits(READ_AT);
-    balance.remaining = Some(5);
-    balance.used = Some(7);
+    balance.remaining = CreditAmount::whole(5);
+    balance.used = CreditAmount::whole(7);
     balance.status = AgentCreditBalanceStatus::Ok;
     let diagnostics = apply_disabled(&mut balance, Field::Value("out_of_credits".to_string()));
     assert!(diagnostics.is_empty());
@@ -1282,7 +1282,7 @@ fn codex_plan_and_workspace(observed_at: Option<&str>, kind: bool) -> Vec<AgentC
             status: AgentCreditBalanceStatus::Ok,
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Credits,
-            remaining: Some(2583),
+            remaining: CreditAmount::whole(2583),
             unlimited: Some(false),
             limit_id: Some("codex".to_string()),
             observed_at: observed_at.clone(),
@@ -1294,9 +1294,9 @@ fn codex_plan_and_workspace(observed_at: Option<&str>, kind: bool) -> Vec<AgentC
             status: AgentCreditBalanceStatus::Ok,
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Credits,
-            remaining: Some(400),
-            used: Some(100),
-            quota: Some(500),
+            remaining: CreditAmount::whole(400),
+            used: CreditAmount::whole(100),
+            quota: CreditAmount::whole(500),
             unlimited: Some(false),
             resets_at: Some("2026-11-01T00:00:00Z".to_string()),
             used_percent: Some(20),
@@ -1318,7 +1318,7 @@ fn legacy_no_kind() -> Vec<AgentCreditBalance> {
         status: AgentCreditBalanceStatus::Ok,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Resets,
-        remaining: Some(3),
+        remaining: CreditAmount::whole(3),
         unlimited: Some(false),
         ..Default::default()
     }];
@@ -1328,7 +1328,7 @@ fn legacy_no_kind() -> Vec<AgentCreditBalance> {
         status: AgentCreditBalanceStatus::Ok,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
-        remaining: Some(40),
+        remaining: CreditAmount::whole(40),
         unlimited: Some(false),
         limit_id: Some("codex_bengalfox".to_string()),
         ..Default::default()

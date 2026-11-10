@@ -31,7 +31,7 @@ use ottto_protocol::{
     CodexAccountSlotDescriptorV1, CodexAccountSlotDiagnosticV1, CodexAccountSlotOwnershipV1,
     CodexAccountSlotQuotaSnapshotV1, CodexAccountSlotRelationshipV1, CodexAccountTargetCoverageV1,
     CodexAccountTargetDescriptorV1, CodexAccountTargetDurabilityV1, CodexAccountTargetHealthV1,
-    CodexAccountTargetSetupBlockerV1, CodexAccountsStatusV1, SourceKind,
+    CodexAccountTargetSetupBlockerV1, CodexAccountsStatusV1, CreditAmount, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +55,7 @@ mod codex_credit_grants;
 mod codex_last_known;
 mod codex_saved_quota;
 mod codex_setup_gate;
+mod credit_amount_input;
 
 use codex_saved_quota::{path_stamp, PathStamp};
 
@@ -12235,13 +12236,14 @@ fn collect_claude_oauth_usage_unstamped(
             "This test forbids Claude OAuth provider requests.".to_string(),
         ));
     }
+    // A test response stands in for the provider's response text.
     #[cfg(test)]
     let injected = CLAUDE_OAUTH_TEST_RESPONSE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .map(|respond| respond(&endpoint));
+        .map(|respond| respond(&endpoint).map(|body| body.to_string()));
     #[cfg(not(test))]
-    let injected: Option<Result<Value, u16>> = None;
+    let injected: Option<Result<String, u16>> = None;
     let call_started = Instant::now();
     let record_call = |result: crate::provider_calls::CallResult| {
         use crate::provider_calls::{CallKind, Provider, ProviderCall, Trigger};
@@ -12260,8 +12262,11 @@ fn collect_claude_oauth_usage_unstamped(
         ));
     };
     let response = match injected {
-        Some(Ok(value)) => {
+        Some(Ok(body)) => {
             record_call(crate::provider_calls::CallResult::Ok);
+            let value =
+                credit_amount_input::decode(&body, credit_amount_input::CreditBody::ClaudeUsage)
+                    .unwrap_or_default();
             return claude_oauth_usage_after_response(
                 ClaudeOAuthReading {
                     account_identifier_hash,
@@ -12433,7 +12438,9 @@ fn collect_claude_oauth_usage_unstamped(
             };
         }
     };
-    let Ok(value) = response.into_json::<Value>() else {
+    let Some(value) = response.into_string().ok().and_then(|body| {
+        credit_amount_input::decode(&body, credit_amount_input::CreditBody::ClaudeUsage)
+    }) else {
         return ClaudeOAuthUsageOutcome {
             result: Err("Claude OAuth usage endpoint returned an unreadable response.".to_string()),
             diagnostics: record_claude_oauth_usage_failure_with_legacy(
@@ -13025,8 +13032,10 @@ fn claude_oauth_passive_config(
     organization_identifier_hash: &str,
 ) -> claude_credit_pools::ClaudePassiveConfig {
     claude_oauth_caller_identity_path(caller)
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|body| {
+            credit_amount_input::decode(&body, credit_amount_input::CreditBody::ClaudeConfig)
+        })
         .map(|config| {
             claude_credit_pools::claude_passive_config(
                 &config,
@@ -15063,9 +15072,9 @@ fn claude_oauth_spend_credit_balance(
         },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining,
-        used,
-        quota,
+        remaining: remaining.and_then(CreditAmount::whole),
+        used: used.and_then(CreditAmount::whole),
+        quota: quota.and_then(CreditAmount::whole),
         currency: claude_oauth_money_currency(spend.get("used"))
             .or_else(|| json_trimmed_string(spend, "currency")),
         resets_at: json_timestamp_rfc3339(spend, &["resets_at", "reset_at"]),
@@ -15110,9 +15119,11 @@ fn claude_oauth_extra_usage_credit_balance(
         },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining: if unlimited { None } else { remaining },
-        used,
-        quota,
+        remaining: remaining
+            .filter(|_| !unlimited)
+            .and_then(CreditAmount::whole),
+        used: used.and_then(CreditAmount::whole),
+        quota: quota.and_then(CreditAmount::whole),
         currency: json_trimmed_string(extra, "currency"),
         resets_at: None,
         used_percent,
@@ -15150,36 +15161,21 @@ fn claude_oauth_credit_status(
 /// Normalize a provider money value to integer minor units (cents).
 ///
 /// Accepts either the structured shape `{"amount_minor": 321, "currency":
-/// "USD", "exponent": 2}` (exponent 0..=6, scaled to 2 with round-half-up on
-/// downscale) or a bare non-negative number interpreted as whole dollars.
+/// "USD", "exponent": 2}` (exponent 0..=6) or a bare non-negative number of
+/// whole dollars: an integer, or a decimal lexeme kept by the provider decode
+/// ([`credit_amount_input::decode`]). Both scale through the one exact scaler,
+/// rounding half-even; a float that bypassed that decode is refused.
 fn claude_oauth_money_cents(value: Option<&Value>) -> Option<u64> {
     let value = value?;
     if let Some(object) = value.as_object() {
-        let amount_minor = object.get("amount_minor").and_then(Value::as_i64)?;
-        if amount_minor < 0 {
-            return None;
-        }
-        let amount_minor = amount_minor as u64;
+        let amount_minor = object.get("amount_minor").and_then(Value::as_u64)?;
         let exponent = object.get("exponent").and_then(Value::as_u64).unwrap_or(2);
         if exponent > 6 {
             return None;
         }
-        return Some(match exponent.cmp(&2) {
-            std::cmp::Ordering::Equal => amount_minor,
-            std::cmp::Ordering::Less => {
-                amount_minor.saturating_mul(10_u64.pow((2 - exponent) as u32))
-            }
-            std::cmp::Ordering::Greater => {
-                let divisor = 10_u64.pow((exponent - 2) as u32);
-                (amount_minor + divisor / 2) / divisor
-            }
-        });
+        return ottto_protocol::scale_minor(amount_minor, 2 - exponent as i64);
     }
-    let dollars = value.as_f64()?;
-    if !dollars.is_finite() || dollars < 0.0 {
-        return None;
-    }
-    Some((dollars * 100.0).round() as u64)
+    credit_amount_input::scaled(value, 2)
 }
 
 fn claude_oauth_money_currency(value: Option<&Value>) -> Option<String> {
@@ -17250,7 +17246,9 @@ fn read_bounded_codex_app_server_stdout<R: BufRead>(
             ));
             return;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
+        if let Some(value) =
+            credit_amount_input::decode(line, credit_amount_input::CreditBody::CodexMessage)
+        {
             if sender.send(Ok(value)).is_err() {
                 return;
             }
@@ -17451,13 +17449,14 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         }
     }
     if let Some(remaining) = codex_credit_grants::available_count(value) {
+        let remaining = CreditAmount::whole(remaining);
         let balance = AgentCreditBalance {
             name: codex_credit_grants::RESET_BANK.to_string(),
-            status: crate::quota_credit_model::status_for_remaining(Some(remaining)),
+            status: crate::quota_credit_model::status_for_remaining(remaining),
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Resets,
             account_label: None,
-            remaining: Some(remaining),
+            remaining,
             used: None,
             quota: None,
             unlimited: Some(false),
@@ -17485,8 +17484,8 @@ fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCr
         return None;
     }
 
-    let quota = json_u64(individual_limit, &["limit"]);
-    let used = json_u64(individual_limit, &["used"]);
+    let quota = credit_amount_input::amount_at(individual_limit, &["limit"]);
+    let used = credit_amount_input::amount_at(individual_limit, &["used"]);
     let remaining = match (quota, used) {
         (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
         _ => None,
@@ -17503,7 +17502,7 @@ fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCr
     let rate_limit_reached_type = codex_rate_limit_reached_type(container);
     let limit_id = first_json_string(container, &["limit_id", "limitId"]);
     let status = if spend_control_reached == Some(true)
-        || remaining == Some(0)
+        || remaining == Some(CreditAmount::ZERO)
         || remaining_percent == Some(0)
     {
         AgentCreditBalanceStatus::Exhausted
@@ -17538,7 +17537,7 @@ fn codex_credit_balance_from_credits_snapshot(
     credits: &Value,
     container: &Value,
 ) -> Option<AgentCreditBalance> {
-    let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
+    let remaining = credit_amount_input::amount_at(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
     let has_credits_claim = json_bool(credits, &["hasCredits", "has_credits"]);
     let has_credits = has_credits_claim.unwrap_or(false);
@@ -17601,25 +17600,28 @@ fn codex_credit_balance_from_credits_snapshot(
 fn codex_credits_do_not_apply(
     has_credits_claim: Option<bool>,
     unlimited: Option<bool>,
-    remaining: Option<u64>,
+    remaining: Option<CreditAmount>,
     spend_control_reached: Option<bool>,
 ) -> bool {
     has_credits_claim == Some(false)
         && unlimited != Some(true)
         && spend_control_reached != Some(true)
-        && remaining.unwrap_or(0) == 0
+        && remaining.map_or(true, CreditAmount::is_zero)
 }
 
+/// At or below this exact balance (five credits), Codex credits are low.
+const CODEX_LOW_CREDITS: CreditAmount = CreditAmount::from_micros(5_000_000);
+
 fn codex_credit_balance_status(
-    remaining: Option<u64>,
+    remaining: Option<CreditAmount>,
     unlimited: Option<bool>,
     has_credits: bool,
 ) -> AgentCreditBalanceStatus {
     if unlimited == Some(true) {
         AgentCreditBalanceStatus::Unlimited
-    } else if remaining == Some(0) {
+    } else if remaining.is_some_and(CreditAmount::is_zero) {
         AgentCreditBalanceStatus::Exhausted
-    } else if remaining.is_some_and(|value| value > 0 && value <= 5) {
+    } else if remaining.is_some_and(|value| value <= CODEX_LOW_CREDITS) {
         AgentCreditBalanceStatus::Low
     } else if remaining.is_some() || has_credits {
         AgentCreditBalanceStatus::Ok
