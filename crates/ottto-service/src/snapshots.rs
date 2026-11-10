@@ -1607,7 +1607,6 @@ use sources::claude::subagent_identity::{
 pub(crate) use scan::source_session_id::snapshot_source_session_id;
 
 #[cfg(test)]
-#[path = "snapshots/source_session_id_tests.rs"]
 mod source_session_id_tests;
 
 use scan::json_fields::{string_at, string_eq_at, u64_at};
@@ -2250,7 +2249,6 @@ mod census_unreadable_tests {
     }
 }
 
-#[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;
 pub(crate) use composition_compactions::CompositionCompactions;
 pub(crate) mod start_verdict_store;
