@@ -22644,7 +22644,7 @@ mod tests {
                 usize::from(priority)
             );
             if priority {
-                std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+                crate::snapshots::older_build_logs_expired();
             }
             let mut loaded = ScanIndex::load(&index_path).unwrap();
             let quiet = prepare_codex_union_fixture(&root, &mut loaded);
@@ -22750,7 +22750,7 @@ mod tests {
                     && entry.codex_joined_member_set.is_none()
                     && entry.codex_applied_tier_receipt.is_none()));
             assert!(captured.current_snapshot_fingerprints().is_empty());
-            std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+            crate::snapshots::older_build_logs_expired();
             // Crash after capture, before POST: the capture must retain the old
             // selector without advancing membership or suppressing this upload.
             working = captured;

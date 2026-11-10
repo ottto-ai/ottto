@@ -181,7 +181,10 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
-pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
+pub(crate) use codex_file_join::tests::{
+    counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
+    older_build_logs_priority, older_build_logs_tier,
+};
 use sources::claude::response_records as claude_response_records;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
@@ -1065,7 +1068,7 @@ use sources::codex::sidecar::{
 };
 use sources::codex::sidecar::{
     codex_state_thread_field_diffs, CodexPathSidecarCandidate, CodexRolloutExtent,
-    CodexStateThread, CodexTitleMetadata, CodexTurnTraceMap,
+    CodexStateThread, CodexTitleMetadata,
 };
 
 #[cfg(test)]

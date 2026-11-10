@@ -135,7 +135,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) claude_title_metadata: ClaudeTitleMetadata,
     pub(in crate::snapshots) state_census_complete: bool,
     pub(in crate::snapshots) sidecar_census_complete: bool,
-    pub(in crate::snapshots) codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) codex_census_valid: bool,
     pub(in crate::snapshots) census_window_end: String,
     pub(in crate::snapshots) discovered_file_count: usize,
@@ -364,7 +363,6 @@ impl OwnedSourceScan {
             state_census_complete: !codex_title_metadata.state_census_incomplete,
             sidecar_census_complete: !codex_title_metadata.sidecar_census_incomplete,
             codex_title_metadata,
-            codex_turn_traces: evidence.as_mut().and_then(|e| e.traces.take()),
             codex_census_valid,
             census_window_end,
             discovered_file_count: 0,
@@ -540,14 +538,6 @@ impl OwnedSourceScan {
             }
             index.traversal = None;
         }
-        // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
-        // it read-only across every session file via Arc.
-        let codex_turn_traces = (source == SnapshotSource::Codex).then(|| {
-            Arc::new(CodexTurnTraceMap::load_from_roots(
-                roots,
-                backfill_window_days,
-            ))
-        });
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
@@ -1285,7 +1275,6 @@ impl OwnedSourceScan {
             claude_title_metadata,
             state_census_complete,
             sidecar_census_complete,
-            codex_turn_traces,
             codex_census_valid,
             census_window_end,
             discovered_file_count,

@@ -503,7 +503,6 @@ pub(super) fn now_seconds() -> u64 {
 pub(super) struct ParserOptions<'a> {
     pub(super) source: SnapshotSource,
     pub(super) metadata: &'a CodexTitleMetadata,
-    pub(super) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(super) identity_capture: bool,
     pub(super) cache: Option<&'a Arc<SharedCache>>,
 }
@@ -517,7 +516,6 @@ pub(super) fn new_source_parser(
     let ParserOptions {
         source,
         metadata,
-        traces,
         identity_capture,
         cache,
     } = options;
@@ -536,7 +534,6 @@ pub(super) fn new_source_parser(
             SnapshotSource::Pi => apply_pi_line,
         },
         (source == SnapshotSource::Codex).then_some(metadata),
-        traces,
     )?;
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {

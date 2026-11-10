@@ -128,7 +128,6 @@ impl OwnedSourceScan {
             claude_title_metadata,
             state_census_complete,
             sidecar_census_complete,
-            codex_turn_traces,
             codex_census_valid,
             census_window_end,
             discovered_file_count,
@@ -882,7 +881,6 @@ impl OwnedSourceScan {
                 let boot_key = boot.key.clone();
                 let job = boot.into_job(codex_file_join::JobInputs {
                     metadata: &codex_title_metadata,
-                    traces: codex_turn_traces.clone(),
                     cache: sampling.as_ref().map(|context| &context.cache),
                     index,
                 });
@@ -987,7 +985,6 @@ impl OwnedSourceScan {
                             codex: &codex_title_metadata,
                             claude: &claude_title_metadata,
                             support: claude_effort_support_dir_ref,
-                            traces: codex_turn_traces.clone(),
                             inventory: codex_join_inventory.as_ref(),
                             flags: &selected_flags,
                             census_complete: state_census_complete && sidecar_census_complete,
@@ -1538,7 +1535,6 @@ impl OwnedSourceScan {
                         sampled_scan::ParserOptions {
                             source,
                             metadata: &codex_title_metadata,
-                            traces: codex_turn_traces.clone(),
                             identity_capture: claude_request_identity_capture,
                             cache: sampling.as_ref().map(|c| &c.cache),
                         },
@@ -2831,7 +2827,6 @@ impl OwnedSourceScan {
                         .map(|inventory| CodexContinuationEvidence {
                             inventory,
                             codex: codex_title_metadata,
-                            traces: codex_turn_traces,
                         })
                         .and_then(|evidence| match continuation_ticket.as_ref() {
                             Some(ticket) => evidence.for_paused_job(
@@ -3409,32 +3404,7 @@ impl OwnedSourceScan {
                         enqueue_watcher_hints(source, next, &carried_next_generation, false);
                     }
                 }
-                let mut local_diagnostics = codex_title_metadata.local_diagnostics;
-                if source == SnapshotSource::Codex {
-                    let cutoff = codex_turn_traces
-                        .as_ref()
-                        .map_or(0, |traces| traces.since_epoch as u64);
-                    local_diagnostics.price_tier_old_files_without_receipt = index
-                        .file_snapshot_fingerprints
-                        .iter()
-                        .filter(|(key, fingerprints)| {
-                            index
-                                .files
-                                .get(*key)
-                                .is_some_and(|entry| entry.codex_applied_tier_receipt.is_none())
-                                && !fingerprints.is_empty()
-                                && fingerprints.iter().all(|fingerprint| {
-                                    index
-                                        .snapshot_activity_at
-                                        .get(fingerprint)
-                                        .and_then(Option::as_deref)
-                                        .and_then(rfc3339_unix_seconds)
-                                        .is_some_and(|activity| activity < cutoff)
-                                })
-                        })
-                        .count()
-                        as u64;
-                }
+                let local_diagnostics = codex_title_metadata.local_diagnostics;
                 let continuation_evidence = (codex_join_completed.is_empty()
                     && continuation_ticket.is_some())
                 .then(|| codex_join_inventory.take())
@@ -3443,7 +3413,6 @@ impl OwnedSourceScan {
                 .map(|inventory| CodexContinuationEvidence {
                     inventory,
                     codex: codex_title_metadata,
-                    traces: codex_turn_traces,
                 });
                 if continuation_ticket.is_some() && continuation_evidence.is_none() {
                     crate::local_resource_diagnostics::codex_continuation_mint(
@@ -4181,7 +4150,6 @@ impl OwnedSourceScan {
                 sampled_scan::ParserOptions {
                     source,
                     metadata: &codex_title_metadata,
-                    traces: codex_turn_traces.clone(),
                     identity_capture: claude_request_identity_capture,
                     cache: sampling.as_ref().map(|c| &c.cache),
                 },
@@ -4825,7 +4793,6 @@ impl OwnedSourceScan {
             claude_title_metadata,
             state_census_complete,
             sidecar_census_complete,
-            codex_turn_traces,
             codex_census_valid,
             census_window_end,
             discovered_file_count,

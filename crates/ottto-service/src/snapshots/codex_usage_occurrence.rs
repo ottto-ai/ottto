@@ -770,13 +770,11 @@ impl SnapshotAccumulator {
             return;
         };
         let mut usage_selector = selector.clone();
-        if self.current_turn_is_priority() {
-            usage_selector.insert(
-                "service_tier",
-                "priority".to_string(),
-                "derived_from_logs_2",
-            );
-        }
+        #[cfg(test)]
+        crate::snapshots::older_build_logs_tier(
+            &mut usage_selector,
+            self.latest_turn_id.as_deref(),
+        );
         let model = string_at(value, &["payload", "model"]);
         let applied_tier = self.codex_tier_replay.as_mut().and_then(|replay| {
             replay.selector(

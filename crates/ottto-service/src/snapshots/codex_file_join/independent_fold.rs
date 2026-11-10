@@ -5,7 +5,6 @@ pub(super) fn parser(
     file: File,
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
     index: &ScanIndex,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> std::result::Result<Box<OwnedJsonlParser>, GroupEnd> {
@@ -16,7 +15,6 @@ pub(super) fn parser(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(metadata),
-        traces,
     )
     .map_err(|_| GroupEnd::Strict)?;
     codex_counting_version::configure_singleton(&mut parser, member, index);

@@ -301,7 +301,7 @@ fn the_merged_mcp_name_passes_the_server_snapshot_grammar() {
 fn codex_legacy_join_checks_a_persisted_proof_under_the_released_rules() {
     let policy = SnapshotUploadPolicy::MOST_PRIVATE;
     let (root, inventory) = codex_file_join::tests::fixture();
-    let previous = codex_file_join::tests::legacy_index(&inventory, None);
+    let previous = codex_file_join::tests::legacy_index(&inventory);
     let (mut index, mut result) = codex_file_join::tests::scan(&root, previous.clone(), 2);
     assert_eq!(result.codex_legacy_join_baselines.len(), 2);
     // What an older release persisted for a labels-off session with MCP activity.

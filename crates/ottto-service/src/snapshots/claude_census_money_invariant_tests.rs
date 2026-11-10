@@ -149,7 +149,6 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         None,
-        None,
     )
     .expect("claude parser");
     fs::remove_file(&path).expect("remove transcript fixture");

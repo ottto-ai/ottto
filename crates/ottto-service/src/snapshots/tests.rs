@@ -229,7 +229,6 @@ fn codex_sqlite_spawn_edges_restore_nested_subagent_lineage() {
         "2026-08-02T06:02:00Z",
         "fingerprint".to_string(),
         &metadata,
-        None,
     )
     .expect("parse")
     .into_iter()
@@ -4877,7 +4876,6 @@ fn codex_parser_gates_bounded_template_labels_on_existing_title_consent() {
         "2026-07-19T10:04:00Z",
         "fp-attribution-groups".to_string(),
         &CodexTitleMetadata::default(),
-        None,
         Some(&context),
     )
     .expect("parse")
@@ -6714,7 +6712,6 @@ fn codex_title_changes_affect_only_that_sessions_sidecar_identity() {
         "2026-05-14T10:04:00Z",
         "file-fingerprint".to_string(),
         &first,
-        None,
     )
     .expect("parse first")
     .into_iter()
@@ -6725,7 +6722,6 @@ fn codex_title_changes_affect_only_that_sessions_sidecar_identity() {
         "2026-05-14T10:04:00Z",
         "file-fingerprint".to_string(),
         &second,
-        None,
     )
     .expect("parse second")
     .into_iter()
@@ -6852,136 +6848,6 @@ fn codex_parser_splits_cumulative_usage_by_selector() {
     assert_eq!(standard.output_tokens, 30);
     assert_eq!(fast.input_tokens, 200);
     assert_eq!(fast.output_tokens, 60);
-
-    let _ = fs::remove_file(path);
-}
-
-// turn ids reused across the logs_2 reader + injection tests.
-const FAST_TURN: &str = "019ee443-7197-7d51-84a0-727a6b2655cb";
-const STD_TURN: &str = "019ee421-1b3b-71c3-a0a8-ec9f645bf521";
-
-fn priority_request_body(turn_id: &str) -> String {
-    format!(
-        "session_loop{{thread_id=019ee443-4c18-71c3-843e-847232f694b0}}:\
-             turn{{otel.name=\"session_task.turn\" turn.id={turn_id} \
-             codex.turn.reasoning_effort=xhigh}}: websocket request: \
-             {{\"type\":\"response.create\",\"service_tier\":\"priority\",\
-             \"model\":\"gpt-5.5\",\"instructions\":\"REDACTED PROMPT\"}}"
-    )
-}
-
-#[test]
-fn codex_logs2_reader_collects_priority_turns_from_sqlite() {
-    let codex_dir = temp_dir("codex-logs2-reader");
-    let db_path = codex_dir.join("logs_2.sqlite");
-    let now = unix_seconds(SystemTime::now()).expect("now") as i64;
-    {
-        let connection = Connection::open(&db_path).expect("create db");
-        connection
-            .execute(
-                "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT)",
-                [],
-            )
-            .expect("create table");
-        // In-window priority turn -> collected.
-        connection
-            .execute(
-                "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
-                rusqlite::params![now, priority_request_body(FAST_TURN)],
-            )
-            .expect("insert fast");
-        // In-window standard turn -> ignored.
-        connection
-            .execute(
-                "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
-                rusqlite::params![
-                    now,
-                    "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
-                         websocket request: {\"type\":\"response.create\",\"model\":\"gpt-5.5\"}"
-                ],
-            )
-            .expect("insert std");
-        // Out-of-window priority turn -> excluded by ts bound.
-        connection
-            .execute(
-                "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
-                rusqlite::params![
-                    now - 60 * 86_400,
-                    priority_request_body("019e0000-0000-7000-8000-000000000000")
-                ],
-            )
-            .expect("insert old");
-    }
-
-    let roots = vec![codex_dir.join("sessions")];
-    let map = CodexTurnTraceMap::load_from_roots(&roots, 7);
-    assert!(map.is_priority_turn(FAST_TURN));
-    assert!(!map.is_priority_turn(STD_TURN));
-    assert!(!map.is_priority_turn("019e0000-0000-7000-8000-000000000000"));
-
-    let _ = fs::remove_dir_all(codex_dir);
-}
-
-#[test]
-fn codex_logs2_tier_stamps_priority_on_fast_turn_only() {
-    // Session-cumulative token_count emits one delta per turn. The fast turn
-    // (in the logs_2 priority map) must price as priority; the standard turn
-    // must carry no service_tier, proving the signal does not bleed forward.
-    let path = temp_file("codex-logs2-inject");
-    fs::write(
-        &path,
-        format!(
-            concat!(
-                "{{\"timestamp\":\"2026-06-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019ee443-4c18-71c3-843e-847232f694b0\"}}}}\n",
-                "{{\"timestamp\":\"2026-06-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{fast}\"}}}}\n",
-                "{{\"timestamp\":\"2026-06-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":300,\"output_tokens\":90,\"request_count\":1}},\"model\":\"gpt-5.5\"}}}}}}\n",
-                "{{\"timestamp\":\"2026-06-20T10:03:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{std}\"}}}}\n",
-                "{{\"timestamp\":\"2026-06-20T10:04:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":400,\"output_tokens\":120,\"request_count\":2}},\"model\":\"gpt-5.5\"}}}}}}\n"
-            ),
-            fast = FAST_TURN,
-            std = STD_TURN,
-        ),
-    )
-    .expect("write fixture");
-
-    let mut map = CodexTurnTraceMap::default();
-    map.priority_turns.insert(FAST_TURN.to_string());
-
-    let item = parse_codex_jsonl_file_with_title_metadata(
-        &path,
-        "2026-06-20T10:05:00Z",
-        "file-fingerprint".to_string(),
-        &CodexTitleMetadata::default(),
-        Some(Arc::new(map)),
-    )
-    .expect("parse")
-    .into_iter()
-    .next()
-    .expect("snapshot");
-
-    assert_eq!(item.model_usage.len(), 2);
-    let fast = item
-        .model_usage
-        .iter()
-        .find(|row| {
-            row.selector_context.get("service_tier").map(String::as_str) == Some("priority")
-        })
-        .expect("priority row");
-    assert_eq!(fast.input_tokens, 300);
-    assert_eq!(fast.output_tokens, 90);
-    assert_eq!(
-        fast.selector_sources
-            .get("service_tier")
-            .map(String::as_str),
-        Some("derived_from_logs_2")
-    );
-    let standard = item
-        .model_usage
-        .iter()
-        .find(|row| !row.selector_context.contains_key("service_tier"))
-        .expect("standard row");
-    assert_eq!(standard.input_tokens, 100);
-    assert_eq!(standard.output_tokens, 30);
 
     let _ = fs::remove_file(path);
 }
@@ -7117,7 +6983,6 @@ fn codex_parser_does_not_apply_mutable_config_defaults_to_history() {
         "2026-05-19T10:04:00Z",
         "file-fingerprint".to_string(),
         &metadata,
-        None,
     )
     .expect("parse")
     .into_iter()
@@ -9174,7 +9039,6 @@ fn provider_native_parent_edge_outranks_a_launch_event_claim() {
         "2026-08-09T15:20:00Z",
         "fp-launch-precedence".to_string(),
         &metadata,
-        None,
         Some(&context),
     )
     .expect("parse")
@@ -15782,7 +15646,6 @@ fn codex_usage_splits_per_request_at_the_272k_price_line() {
         "2026-10-01T11:00:00Z",
         "codex-long-bucket-fingerprint".to_string(),
         &CodexTitleMetadata::default(),
-        None,
     )
     .expect("parse")
     .into_iter()
@@ -16235,7 +16098,6 @@ fn parse_codex_test_with_metadata(path: &Path, metadata: &CodexTitleMetadata) ->
         SnapshotSource::Codex,
         apply_codex_line,
         Some(metadata),
-        None,
         None,
         None,
     )
@@ -17947,7 +17809,6 @@ fn parse_parentless_created_thread(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(&metadata),
-        None,
         None,
         None,
     )

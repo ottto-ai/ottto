@@ -32,20 +32,6 @@ fn codex_sidecar_reuse_transition() {
         c.write(id, account);
     }
     let _db = seed_sidecars(&c);
-    let log_source = c.scratch.join("logs-writer.sqlite");
-    let logs = rusqlite::Connection::open(&log_source).unwrap();
-    logs.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, feedback_log_body TEXT)").unwrap();
-    let now = unix_seconds(SystemTime::now()).unwrap() as i64;
-    logs.execute("INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)", rusqlite::params![now, "turn{turn.id=priority-control}: websocket request: {\"type\":\"response.create\",\"service_tier\":\"priority\"}"]).unwrap();
-    crate::snapshots::codex_sqlite_read::tests::copy_database(
-        &log_source,
-        &c.sessions.parent().unwrap().join("logs_2.sqlite"),
-        true,
-    );
-    assert!(
-        CodexTurnTraceMap::load_from_roots(&c.roots(), BACKFILL_WINDOW_DAYS)
-            .is_priority_turn("priority-control")
-    );
     let hash = |kind: &str, account: &str| {
         ottto_core::billing_identity_hash(
             "openai",
