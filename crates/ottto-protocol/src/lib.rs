@@ -8938,6 +8938,36 @@ mod tests {
         );
     }
 
+    /// Reload and purchase settings are optional money-balance metadata: a
+    /// known field is forwarded, nothing is defaulted, and a non-money balance
+    /// or an empty settings object sends none. The prepaid kind round-trips.
+    #[test]
+    fn credit_reload_settings_and_prepaid_kind_round_trip() {
+        let upload = |body: &str| {
+            let balance: AgentCreditBalance = serde_json::from_str(body).unwrap();
+            serde_json::to_string(&redact_credit_balance_for_backend(balance).unwrap()).unwrap()
+        };
+        let usage = r#"{"name":"Usage credits","status":"unknown","freshness":"fresh","unit":"usd","enabled":false,"kind":"usage_credits","auto_reload":{"enabled":false,"threshold":700,"target":"25.5"},"can_purchase_credits":false}"#;
+        assert_eq!(upload(usage), usage);
+        let partial = usage.replace(
+            r#"{"enabled":false,"threshold":700,"target":"25.5"}"#,
+            r#"{"enabled":true}"#,
+        );
+        assert_eq!(upload(&partial), partial);
+        let settings = r#","auto_reload":{"enabled":false,"threshold":700,"target":"25.5"},"can_purchase_credits":false"#;
+        let bare = usage.replace(settings, "");
+        assert_eq!(
+            upload(&usage.replace(r#""unit":"usd""#, r#""unit":"credits""#)),
+            bare.replace(r#""unit":"usd""#, r#""unit":"credits""#)
+        );
+        assert_eq!(
+            upload(&usage.replace(settings, r#","auto_reload":{}"#)),
+            bare
+        );
+        let prepaid = r#"{"name":"prepaid_balance","status":"ok","freshness":"fresh","unit":"usd","remaining":700,"currency":"USD","observed_at":"2026-10-01T12:00:00Z","kind":"prepaid_credits"}"#;
+        assert_eq!(upload(prepaid), prepaid);
+    }
+
     fn v22_credit_balance() -> AgentCreditBalance {
         AgentCreditBalance {
             name: "reset_bank".to_string(),

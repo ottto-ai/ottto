@@ -11485,9 +11485,7 @@ fn quota_coverage_credit_states_do_not_invent_amounts() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, status);
         assert_eq!(rows[0].enabled, Some(enabled));
-        if status != AgentCreditBalanceStatus::Exhausted {
-            assert_eq!(rows[0].remaining, None);
-        }
+        assert_eq!(rows[0].remaining, None);
     }
     assert!(claude_oauth_credit_balances(&serde_json::json!({})).is_empty());
     assert!(claude_oauth_credit_balances(
@@ -11608,30 +11606,182 @@ fn quota_coverage_passive_rollover_requires_ended_exact_meter() {
 
 #[test]
 fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
+    // Observed shape: `cap` is `{money, credits}`. A filled `balance` is the
+    // prepaid balance: its own row, never the usage credits' `remaining`.
     let json = serde_json::json!({
         "spend": {
             "used": {"amount_minor": 321, "currency": "USD", "exponent": 2},
-            "cap": {"amount_minor": 500, "currency": "USD", "exponent": 2},
+            "cap": {"money": {"amount_minor": 500, "currency": "USD", "exponent": 2},
+                    "credits": {"amount_minor": 90000, "exponent": 2}},
             "balance": {"amount_minor": 179, "currency": "USD", "exponent": 2},
             "percent": 64, "severity": "warning", "enabled": true
         }
     });
-    let balances = claude_oauth_credit_balances(&json);
-    assert_eq!(balances.len(), 1);
-    let credit = &balances[0];
-    assert_eq!(credit.name, "Usage credits");
-    assert_eq!(credit.unit, AgentCreditBalanceUnit::Usd);
-    assert_eq!(credit.status, AgentCreditBalanceStatus::Low);
-    assert_eq!(credit.used, CreditAmount::whole(321));
-    assert_eq!(credit.quota, CreditAmount::whole(500));
-    assert_eq!(credit.remaining, CreditAmount::whole(179));
-    assert_eq!(credit.used_percent, Some(64));
-    assert_eq!(credit.currency.as_deref(), Some("USD"));
-    assert_eq!(credit.enabled, Some(true));
+    let wire = serde_json::to_value(claude_oauth_credit_balances(&json)).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!([
+            {"name": "Usage credits", "status": "low", "freshness": "fresh", "unit": "usd",
+             "used": 321, "quota": 500, "currency": "USD", "used_percent": 64,
+             "enabled": true},
+            {"name": "prepaid_balance", "status": "ok", "freshness": "fresh", "unit": "usd",
+             "remaining": 179, "currency": "USD", "kind": "prepaid_credits"}
+        ])
+    );
+}
+
+/// A provider money object of `cents` US cents.
+fn usd(cents: u64) -> serde_json::Value {
+    serde_json::json!({"amount_minor": cents, "currency": "USD", "exponent": 2})
+}
+
+/// Usage credits carry no `remaining` and no marker for it; a valid
+/// `spend.balance` (zero included) is only the separate prepaid row.
+#[test]
+fn claude_usage_credits_never_carry_remaining() {
+    let rows = |balance: serde_json::Value| {
+        serde_json::to_value(claude_oauth_credit_balances(&serde_json::json!({
+            "spend": {"enabled": true, "used": usd(1200), "limit": usd(5000),
+                      "balance": balance}
+        })))
+        .unwrap()
+    };
+    let usage = serde_json::json!({
+        "name": "Usage credits", "status": "ok", "freshness": "fresh", "unit": "usd",
+        "used": 1200, "quota": 5000, "currency": "USD", "used_percent": 24, "enabled": true
+    });
+    let prepaid = |cents: u64, status: &str| {
+        serde_json::json!({
+            "name": "prepaid_balance", "status": status, "freshness": "fresh", "unit": "usd",
+            "remaining": cents, "currency": "USD", "kind": "prepaid_credits"
+        })
+    };
+    for absent in [
+        serde_json::Value::Null,
+        serde_json::json!("x"),
+        serde_json::json!({"amount_minor": -1, "exponent": 2}),
+    ] {
+        assert_eq!(rows(absent), serde_json::json!([usage]));
+    }
+    assert_eq!(rows(usd(700)), serde_json::json!([usage, prepaid(700, "ok")]));
+    assert_eq!(rows(usd(0)), serde_json::json!([usage, prepaid(0, "exhausted")]));
+}
+
+/// `spend.cap.money` is the quota, else `spend.limit`; `cap.credits` is never
+/// sent. The monthly spend reset comes from `limits[]` without a model scope.
+#[test]
+fn claude_oauth_spend_quota_and_monthly_reset() {
+    let row = |spend: serde_json::Value, limits: serde_json::Value| {
+        serde_json::to_value(
+            claude_oauth_credit_balances(&serde_json::json!({"spend": spend, "limits": limits}))
+                .remove(0),
+        )
+        .unwrap()
+    };
+    let credits = serde_json::json!({"amount_minor": 99, "exponent": 0});
+    for (cap, limit, quota) in [
+        (
+            serde_json::json!({"money": usd(5000), "credits": credits}),
+            serde_json::Value::Null,
+            Some(5000),
+        ),
+        (serde_json::json!({"money": usd(6000)}), usd(4000), Some(6000)),
+        (
+            serde_json::json!({"money": {"amount_minor": "x"}, "credits": credits}),
+            usd(4000),
+            Some(4000),
+        ),
+        (serde_json::Value::Null, usd(4000), Some(4000)),
+        (serde_json::json!({"credits": credits}), serde_json::Value::Null, None),
+    ] {
+        let wire = row(
+            serde_json::json!({
+                "enabled": true, "used": usd(1200), "cap": cap, "limit": limit
+            }),
+            serde_json::json!([]),
+        );
+        assert_eq!(wire.get("quota").and_then(serde_json::Value::as_u64), quota, "{cap}");
+        assert!(!wire.to_string().contains("cap"), "{wire}");
+    }
+    let limits = serde_json::json!([
+        {"kind": "spend", "group": "weekly", "resets_at": "2026-11-17T00:00:00Z", "scope": null},
+        {"kind": "spend", "group": "monthly", "percent": 24,
+         "resets_at": "2026-12-01T00:00:00+00:00", "scope": null}
+    ]);
+    let spend = serde_json::json!({"enabled": true, "used": usd(1200), "limit": usd(5000)});
+    assert_eq!(row(spend.clone(), limits.clone())["resets_at"], "2026-12-01T00:00:00Z");
+    let mut own = spend.clone();
+    own["resets_at"] = serde_json::json!("2026-12-02T00:00:00Z");
+    assert_eq!(row(own, limits.clone())["resets_at"], "2026-12-02T00:00:00Z");
+    assert!(row(spend, serde_json::json!([])).get("resets_at").is_none());
+    // No quota window is made from the spend entries.
+    let windows = claude_oauth_quota_windows(&serde_json::json!({
+        "five_hour": {"utilization": 1, "resets_at": "2026-11-10T05:00:00Z"},
+        "limits": limits
+    }));
+    assert_eq!(windows.len(), 1);
+}
+
+/// Spend metadata rides on the chosen usage-credit row, enabled or disabled:
+/// a present `false` stays `false`, a missing or malformed value is absent,
+/// and a disabled row never regains amounts.
+#[test]
+fn claude_spend_metadata_is_typed_and_never_guessed() {
+    for (reached, expected) in [
+        (Some(serde_json::json!(true)), Some(true)),
+        (Some(serde_json::json!(false)), Some(false)),
+        (Some(serde_json::json!("true")), None),
+        (None, None),
+    ] {
+        let mut extra = serde_json::json!({"is_enabled": true});
+        if let Some(reached) = reached {
+            extra["spend_limit_reached"] = reached;
+        }
+        let wire = serde_json::to_value(claude_oauth_credit_balances(&serde_json::json!({
+            "spend": {"enabled": true, "used": usd(1200), "limit": usd(5000)},
+            "extra_usage": extra
+        })))
+        .unwrap();
+        assert_eq!(
+            wire[0].get("spend_control_reached").and_then(serde_json::Value::as_bool),
+            expected
+        );
+    }
+    let disabled = |auto_reload: serde_json::Value| {
+        serde_json::to_value(claude_oauth_credit_balances(&serde_json::json!({
+            "spend": {"enabled": false, "used": usd(1200), "limit": usd(5000),
+                      "balance": null, "can_purchase_credits": false,
+                      "auto_reload": auto_reload}
+        })))
+        .unwrap()
+    };
+    let reload = serde_json::json!({
+        "enabled": false, "threshold_in_minor_units": 700,
+        "reload_to_in_minor_units": 2500, "currency": "USD"
+    });
+    assert_eq!(
+        disabled(reload),
+        serde_json::json!([{
+            "name": "Usage credits", "status": "unknown", "freshness": "fresh", "unit": "usd",
+            "enabled": false, "kind": "usage_credits", "can_purchase_credits": false,
+            "auto_reload": {"enabled": false, "threshold": 700, "target": 2500}
+        }])
+    );
+    for (auto_reload, expected) in [
+        (serde_json::json!(true), None),
+        (serde_json::json!({}), None),
+        (serde_json::json!({"threshold_in_minor_units": "x"}), None),
+        (
+            serde_json::json!({"enabled": true, "threshold_in_minor_units": -5}),
+            Some(serde_json::json!({"enabled": true})),
+        ),
+    ] {
+        assert_eq!(disabled(auto_reload)[0].get("auto_reload").cloned(), expected);
+    }
 }
 
 #[test]
-fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
+fn claude_oauth_spend_falls_back_to_limit_and_never_derives_remaining() {
     let json = credit_amount_input::usage_body(serde_json::json!({
         "spend": {
             "used": {"amount_minor": 500, "currency": "USD", "exponent": 2},
@@ -11645,7 +11795,7 @@ fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
     assert_eq!(balances[0].status, AgentCreditBalanceStatus::Exhausted);
     assert_eq!(balances[0].used, CreditAmount::whole(500));
     assert_eq!(balances[0].quota, CreditAmount::whole(500));
-    assert_eq!(balances[0].remaining, CreditAmount::whole(0));
+    assert_eq!(balances[0].remaining, None);
 }
 
 #[test]
@@ -11692,7 +11842,7 @@ fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
     assert_eq!(balances.len(), 1);
     assert_eq!(balances[0].used, CreditAmount::whole(321));
     assert_eq!(balances[0].quota, CreditAmount::whole(500));
-    assert_eq!(balances[0].remaining, CreditAmount::whole(179));
+    assert_eq!(balances[0].remaining, None);
     assert_eq!(balances[0].used_percent, Some(64));
 }
 

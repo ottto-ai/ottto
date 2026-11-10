@@ -802,6 +802,8 @@ fn usage_credits(observed_at: &str) -> AgentCreditBalance {
 fn usage_section(observed_at: &str) -> Vec<AgentCreditBalance> {
     let mut balance = usage_credits(observed_at);
     assert!(apply_disabled(&mut balance, Field::Value("out_of_credits".to_string())).is_empty());
+    // The plain body's `extra_usage.spend_limit_reached: false`.
+    balance.spend_control_reached = Some(false);
     vec![balance]
 }
 
@@ -1473,6 +1475,7 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
                     Field::Value("org_spend_cap_reached".to_string())
                 )
                 .is_empty());
+                balance.spend_control_reached = Some(true);
                 vec![balance]
             }),
         ),

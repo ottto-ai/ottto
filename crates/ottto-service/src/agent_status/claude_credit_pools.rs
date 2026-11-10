@@ -1596,6 +1596,56 @@ mod tests {
         assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
     }
 
+    /// A valid `spend.balance` is its own prepaid section with its own read
+    /// time: a later plain read without one, or a saved-reset read, re-sends
+    /// it as read, never as an empty or zero balance and never re-dated.
+    #[test]
+    fn prepaid_balance_is_its_own_section() {
+        let body = |balance: Value| {
+            usage_body(json!({
+                "five_hour": window(10, None),
+                "spend": {"enabled": true, "used": {"amount_minor": 1200, "exponent": 2},
+                          "limit": {"amount_minor": 5000, "exponent": 2}, "balance": balance}
+            }))
+        };
+        let (t1, t2) = ("2026-10-09T10:00:00Z", "2026-10-09T11:00:00Z");
+        let balance = json!({"amount_minor": 700, "exponent": 2});
+        let first = claude_merge_credit_sections(
+            "a",
+            &[],
+            &claude_credit_read(&body(balance), ClaudeUsageRead::Plain, t1),
+        );
+        let second = claude_merge_credit_sections(
+            "a",
+            &first,
+            &claude_credit_read(&body(Value::Null), ClaudeUsageRead::Plain, t2),
+        );
+        assert_eq!(
+            serde_json::to_value(&second).unwrap(),
+            json!([
+                {"name": "Usage credits", "status": "ok", "freshness": "fresh", "unit": "usd",
+                 "used": 1200, "quota": 5000, "used_percent": 24, "enabled": true,
+                 "kind": "usage_credits", "observed_at": t2},
+                {"name": "prepaid_balance", "status": "ok", "freshness": "fresh", "unit": "usd",
+                 "remaining": 700, "kind": "prepaid_credits", "observed_at": t1}
+            ])
+        );
+        let variant = claude_merge_credit_sections(
+            "a",
+            &second,
+            &claude_credit_read(
+                &variant_body(cedar_max()),
+                ClaudeUsageRead::SavedResets,
+                "2026-10-09T12:00:00Z",
+            ),
+        );
+        let resent = variant
+            .into_iter()
+            .filter(|b| b.name == CLAUDE_USAGE_CREDITS_NAME || b.name == "prepaid_balance")
+            .collect::<Vec<_>>();
+        assert_eq!(resent, second);
+    }
+
     /// A saved-reset reading whose `cedar_ember` has readiness but no
     /// `grants` array keeps the stored complete list (and so its status);
     /// readiness is fresh. complete → eligible-only → complete.
@@ -3121,6 +3171,119 @@ mod tests {
         assert!(balances_of(&after)
             .iter()
             .any(|b| b.kind == Some(CreditBalanceKind::OneTimeCredit)));
+    }
+
+    /// A schema-4 cache held the usage credits' cap-minus-used headroom as
+    /// `remaining`. Reading it drops only that field and saves schema 5 with
+    /// windows, amounts, read times and spacing kept; identity checks are
+    /// unchanged. After the upgrade the first due slot reads the saved-reset
+    /// variant: the stored usage section is re-sent without the headroom and
+    /// never as a prepaid balance.
+    #[test]
+    #[serial_test::serial]
+    fn variant_first_restart_over_a_v4_cache_drops_the_usage_headroom() {
+        let harness = VariantHarness::new("v4-cache");
+        PINNED_NOW.with(|now| now.set(Some(1_793_491_200)));
+        harness.due(ClaudeReadSchedule::default());
+        let now = harness_now();
+        let (account, organization) = (harness.account, harness.organization);
+        let read_at = "2026-11-01T18:00:00Z";
+        let owned = |text: &str| Some(text.to_string());
+        let usage = AgentCreditBalance {
+            name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
+            status: AgentCreditBalanceStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Usd,
+            used: CreditAmount::whole(1_200),
+            quota: CreditAmount::whole(5_000),
+            remaining: CreditAmount::whole(3_800),
+            enabled: Some(true),
+            kind: Some(CreditBalanceKind::UsageCredits),
+            observed_at: owned(read_at),
+            account_identifier_hash: owned(account),
+            organization_identifier_hash: owned(organization),
+            ..Default::default()
+        };
+        let v4 = super::super::ClaudeOAuthUsageCache {
+            schema_version: 4,
+            account_identifier_hash: account.to_string(),
+            organization_identifier_hash: organization.to_string(),
+            observed_at_epoch_seconds: now - 3 * 3_600,
+            next_refresh_after_epoch_seconds: now - 3 * 3_600 + 300,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                scope: ottto_protocol::AgentQuotaWindowScope::Account,
+                used_percent: Some(10),
+                observed_at: owned(read_at),
+                account_identifier_hash: owned(account),
+                organization_identifier_hash: owned(organization),
+                ..Default::default()
+            }],
+            credit_balances: vec![usage.clone()],
+            account_weekly_not_offered: false,
+            account_session_not_offered: false,
+        };
+        let path = super::super::claude_oauth_usage_cache_path(account, organization);
+        let mut other = v4.clone();
+        other.windows[0].account_identifier_hash = owned("another-account");
+        super::super::write_claude_oauth_usage_cache(&other).unwrap();
+        assert!(super::super::read_claude_oauth_usage_cache(account, organization).is_none());
+
+        super::super::write_claude_oauth_usage_cache(&v4).unwrap();
+        let migrated = super::super::read_claude_oauth_usage_cache(account, organization)
+            .expect("identity-valid v4 cache kept");
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["schema_version"], 5);
+        assert_eq!(migrated.schema_version, 5);
+        assert_eq!(migrated.windows, v4.windows);
+        assert_eq!(
+            (
+                migrated.observed_at_epoch_seconds,
+                migrated.next_refresh_after_epoch_seconds
+            ),
+            (
+                v4.observed_at_epoch_seconds,
+                v4.next_refresh_after_epoch_seconds
+            )
+        );
+        let without_remaining = serde_json::to_value(&usage)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.as_str() != "remaining")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        assert_eq!(
+            on_disk["credit_balances"],
+            json!([Value::Object(without_remaining.clone())])
+        );
+
+        // Upgrade restart: the v4 cache is on disk and the first due slot is
+        // the saved-reset variant.
+        super::super::write_claude_oauth_usage_cache(&v4).unwrap();
+        super::super::CLAUDE_OAUTH_CALLER_BINDINGS
+            .lock()
+            .unwrap()
+            .clear();
+        REQUESTED.lock().unwrap().clear();
+        let outcome = harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        let wire = serde_json::to_value(balances_of(&outcome)).unwrap();
+        let resent = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["name"] != "reset_bank" && b["name"] != "one_time_credit")
+            .collect::<Vec<_>>();
+        assert_eq!(resent.len(), 1, "{wire}");
+        for key in ["used", "quota", "observed_at", "enabled", "kind"] {
+            assert_eq!(resent[0][key], without_remaining[key], "{key}");
+        }
+        assert!(resent[0].get("remaining").is_none());
     }
 
     /// A stored plain reading, then a due saved-reset slot that the provider
