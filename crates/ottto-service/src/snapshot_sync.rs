@@ -6503,13 +6503,7 @@ fn prepare_sync_source_inner(
         eprintln!(
             "local snapshot sync deferred for {}: backend backoff has {}s remaining",
             source.api_slug(),
-            remaining.as_secs(),
-            continuation::MacPlatformSignals::default().power(),
-            with_source_cadence(source, |cadence| cadence
-                .ordinary_interval()
-                .min(MAX_CYCLE_INTERVAL))
-            .unwrap_or(SNAPSHOT_SYNC_INTERVAL)
-            .as_secs()
+            remaining.as_secs()
         );
         return Ok(None);
     }
@@ -6618,7 +6612,10 @@ fn prepare_sync_source_inner(
         eprintln!(
             "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence; power={:?} effective_interval={}s",
             source.api_slug(),
-            remaining.as_secs()
+            remaining.as_secs(),
+            continuation::MacPlatformSignals::default().power(),
+            with_source_cadence(source, |cadence| cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL))
+                .unwrap_or(SNAPSHOT_SYNC_INTERVAL).as_secs()
         );
         return Ok(None);
     }
@@ -17058,6 +17055,12 @@ mod tests {
             assert_eq!(
                 cadence.continuation_due(PACING),
                 Some(start + Duration::from_secs(30))
+            );
+            cadence.request_continuation(start, Duration::from_secs(40));
+            assert_eq!(
+                cadence.continuation_due(PACING),
+                (stretch == 3).then_some(start + minutes(6)),
+                "stretch only widens continuation eligibility"
             );
             cadence.set_server_min_interval(Some(minutes(20)));
             assert_eq!(cadence.ordinary_interval(), minutes(20));
