@@ -396,8 +396,9 @@ windows or infer allocation ownership: the finish window contains its batch-call
 windows.
 
 Between-pass owners emit the same version 2 `local_resources` stage records
-once per completed work unit, including returned errors, at their existing
-work/event cadence. No new timer, thread, history or footprint sampler is opened.
+as one aggregate per `(source, stage)` of completed work units, including returned
+errors, flushed when the next ordinary source prepare begins. No new timer,
+thread, history or footprint sampler is opened.
 The stable stage names and boundaries are:
 
 | Stage | Work unit |
@@ -410,7 +411,7 @@ The stable stage names and boundaries are:
 | `offpass_collector_checkin` | Collector check-in across enabled sources. |
 | `offpass_local_health` | Local health projection upload. |
 | `offpass_control_socket`, `offpass_control_xpc` | Accepted control request, including request I/O. |
-| `offpass_network_transition` | Received route message or pending debounce work, excluding idle timeouts/read waits. |
+| `offpass_network_transition` | Relevant interface/address transition or pool rebuild, excluding route chatter and read waits. |
 | `offpass_telemetry` | Accepted relay connection, including request I/O, decode and forwarding. |
 | `offpass_legacy_relay` | Existing legacy relay supervision tick, including approval/reconciliation. |
 | `offpass_mcp_inventory` | Inventory harvest across granted sources. |
@@ -419,9 +420,14 @@ The stable stage names and boundaries are:
 | `offpass_cloud_sessions` | Cloud session collection cycle. |
 | `offpass_daily_reference` | Provider daily-reference cycle. |
 
-These rows add `counts.cpu_user_us` and `counts.cpu_sys_us`: self-process
-user/system CPU deltas in microseconds, `null` when unavailable or regressing.
-`observation.wall_elapsed_us` remains wall microseconds for the work unit.
+These rows add `counts.count` (completed work units), `counts.cpu_user_us` and
+`counts.cpu_sys_us` (summed self-process CPU deltas in microseconds), and
+`counts.wall_max_us` (longest work unit). `observation.wall_elapsed_us` and
+`shared_process_cpu_delta_us` are sums, preserving all completed measurements.
+A CPU sum is `null` if any contributing measurement is unavailable or regressing.
+The timestamp and process endpoints describe the latest completion, with the
+RSS-before endpoint from the first completion; child counters remain cumulative.
+Pending aggregates are in memory only and are lost on process exit.
 The `offpass_` prefix selects these CPU-only windows in `StageWindow`; ordinary
 in-pass fields and counts remain unchanged. `source` is the existing source
 slug for source-bound work and `unknown` for shared/mixed work. Off-pass names
