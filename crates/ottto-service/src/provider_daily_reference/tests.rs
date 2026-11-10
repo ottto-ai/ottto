@@ -978,8 +978,7 @@ fn health_never_resurrects_a_revoked_grant() {
 #[test]
 fn absent_consent_is_silent_and_contacts_nothing() {
     let collector = collector("no-consent");
-    let cycle =
-        collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert!(
         cycle.diagnostics.is_empty(),
@@ -1142,8 +1141,7 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
     )
     .expect("write");
 
-    let cycle =
-        collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let status = collector_status(collector.grants(), false);
     assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
@@ -1298,8 +1296,7 @@ fn a_different_installation_can_never_upload_under_this_consent() {
         installation_id: "00000000-0000-4000-8000-0000000000ff".to_string(),
         provider_account_scope: ACCOUNT_SCOPE.to_string(),
     };
-    let cycle =
-        collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert_eq!(
         cycle.diagnostics[0].code,

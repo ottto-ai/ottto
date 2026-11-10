@@ -3693,5 +3693,4 @@ fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
