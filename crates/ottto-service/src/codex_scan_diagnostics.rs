@@ -941,6 +941,10 @@ pub(crate) struct CodexScanDiagnostics {
     /// Codex sessions named by a creator record's slot, then refused, by cause.
     #[serde(skip_serializing_if = "crate::local_resource_diagnostics::is_zero")]
     pub creator_slot_naming: [u64; 9],
+    /// Heap of the Codex sidecar facts kept across passes; 0 when none are
+    /// kept. Emitted on the terminal census row only.
+    #[serde(skip)]
+    pub sidecar_facts_heap_bytes: u64,
 }
 
 pub(crate) const CREATOR_NAMED: usize = 0;
@@ -1013,7 +1017,7 @@ pub(crate) struct CountingV2Receipts {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage, creator_slot_naming);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage, creator_slot_naming, sidecar_facts_heap_bytes);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; reused_roots, reloaded_roots, absent_roots, completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, clean_followup, census_complete);

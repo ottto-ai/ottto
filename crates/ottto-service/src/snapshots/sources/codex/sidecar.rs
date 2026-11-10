@@ -535,7 +535,9 @@ impl CodexTitleMetadata {
     }
 
     pub(in crate::snapshots) fn load_reused(roots: &[PathBuf], facts: &mut SidecarFacts) -> Self {
-        facts.load(roots)
+        let mut metadata = facts.load(roots);
+        metadata.local_diagnostics.sidecar_facts_heap_bytes = facts.heap_bytes() as u64;
+        metadata
     }
 
     fn merge_roots(
@@ -575,8 +577,20 @@ impl CodexTitleMetadata {
             );
             let conflicts_before = metadata.identity_conflicts.len();
             let mut threads = BTreeMap::new();
+            // A reused home belongs to a complete, conflict-free group, whose
+            // physical views are exactly what its dropped raw rows produced.
+            let rows: IdRows<'_, &Shared<CodexStateThread>> = if reused {
+                Box::new(
+                    root_sidecar
+                        .threads
+                        .iter()
+                        .map(|(id, row)| (id.as_str(), row)),
+                )
+            } else {
+                Box::new(raw.threads.iter().map(|(id, row)| (id.as_str(), row)))
+            };
             apply_threads(
-                &raw.threads,
+                rows,
                 &mut threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
@@ -622,7 +636,17 @@ impl CodexTitleMetadata {
             }
             let conflicts_before = metadata.identity_conflicts.len();
             let mut extents = BTreeMap::new();
-            let _ = apply_extents(&raw.history, &mut extents, &mut metadata.identity_conflicts);
+            let rows: IdRows<'_, Result<CodexRolloutExtent>> = if reused {
+                Box::new(
+                    root_sidecar
+                        .extents
+                        .iter()
+                        .map(|(id, extent)| (id.as_str(), Ok::<_, anyhow::Error>(*extent))),
+                )
+            } else {
+                Box::new(history_extents(&raw.history))
+            };
+            let _ = apply_extents(rows, &mut extents, &mut metadata.identity_conflicts);
             codex_root_copies::merge_extents(&mut metadata, &extents);
             metadata.local_diagnostics.rollout_extents.merge_root(
                 &raw.evidence[3],
@@ -1014,8 +1038,11 @@ fn apply_titles(
     }
 }
 
-fn apply_threads(
-    rows: &[(String, Shared<CodexStateThread>)],
+/// One home's id-keyed rows: raw loader rows or a kept home's views.
+type IdRows<'a, T> = Box<dyn Iterator<Item = (&'a str, T)> + 'a>;
+
+fn apply_threads<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a Shared<CodexStateThread>)>,
     state_threads: &mut BTreeMap<String, Shared<CodexStateThread>>,
     identity_conflicts: &mut BTreeSet<String>,
     taxonomy: &mut IdentityConflictTaxonomy,
@@ -1026,8 +1053,7 @@ fn apply_threads(
         // One allocation per row; every later map holds a handle to it.
         let thread = thread.clone();
         let conflicts_before = identity_conflicts.len();
-        let id =
-            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
+        let id = record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id);
         if identity_conflicts.len() != conflicts_before {
             taxonomy.state_alias_keys = taxonomy.state_alias_keys.saturating_add(1);
         }
@@ -1059,32 +1085,39 @@ fn apply_threads(
     }
 }
 
-fn apply_extents(
+/// The checked conversion of raw history rows; a conflicted row is skipped
+/// before its conversion is observed.
+fn history_extents(
     rows: &[(String, i64, i64)],
+) -> impl Iterator<Item = (&str, Result<CodexRolloutExtent>)> + '_ {
+    rows.iter().map(|(id, offset, ordinal)| {
+        let extent = (|| -> Result<CodexRolloutExtent> {
+            Ok(CodexRolloutExtent {
+                next_byte_offset: u64::try_from(*offset)
+                    .context("negative Codex rollout byte offset")?,
+                next_ordinal: u64::try_from(*ordinal).context("negative Codex rollout ordinal")?,
+            })
+        })();
+        (id.as_str(), extent)
+    })
+}
+
+fn apply_extents<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Result<CodexRolloutExtent>)>,
     rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
     identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
-    for (raw_thread_id, next_byte_offset, next_ordinal) in rows {
-        let thread_id = record_codex_identity_key(
-            &mut raw_ids_by_key,
-            identity_conflicts,
-            raw_thread_id.as_str(),
-        );
+    for (raw_thread_id, extent) in rows {
+        let thread_id =
+            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_thread_id);
         if identity_conflicts.contains(thread_id.as_str()) {
             loaded.remove(thread_id.as_str());
             rollout_extents.remove(thread_id.as_str());
             continue;
         }
-        let next_byte_offset =
-            u64::try_from(*next_byte_offset).context("negative Codex rollout byte offset")?;
-        let next_ordinal =
-            u64::try_from(*next_ordinal).context("negative Codex rollout ordinal")?;
-        let extent = CodexRolloutExtent {
-            next_byte_offset,
-            next_ordinal,
-        };
+        let extent = extent?;
         if loaded
             .insert(thread_id.clone(), extent)
             .is_some_and(|existing| existing != extent)
@@ -1227,7 +1260,7 @@ pub(in crate::snapshots) fn load_codex_rollout_extents(
     }
     let connection = open_codex_sidecar_database(path, open, None)?;
     let rows = connection.read(facts::history_rows)?;
-    apply_extents(&rows, rollout_extents, identity_conflicts)
+    apply_extents(history_extents(&rows), rollout_extents, identity_conflicts)
 }
 
 /// Any delegation wrapper text, wherever it appears and in any case, is

@@ -128,6 +128,8 @@ fn codex_sidecar_reuse_transition() {
             u32::from(label == "tail"),
             "{label}"
         );
+        // Every owner keeps the complete group after this pass.
+        assert!(d.sidecar_facts_heap_bytes > 0, "{label}");
         let actual = crate::snapshot_sync::codex_transition_acked_route(
             &working,
             &scan,

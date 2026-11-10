@@ -154,6 +154,11 @@ fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> Cod
     }
     let mut reused = CodexTitleMetadata::load_reused(roots, facts);
     let mut fresh = CodexTitleMetadata::load_from_roots(roots);
+    // The emitted gauge is the kept facts' charge, and 0 with nothing kept.
+    let gauge = reused.local_diagnostics.sidecar_facts_heap_bytes;
+    assert_eq!(gauge, facts.heap_bytes() as u64);
+    assert_eq!(gauge == 0, facts.homes.kept.is_empty());
+    assert_eq!(fresh.local_diagnostics.sidecar_facts_heap_bytes, 0);
     let index = ScanIndex::default();
     reused.scope_created_thread_census(&index, roots);
     fresh.scope_created_thread_census(&index, roots);
@@ -418,4 +423,55 @@ fn sqlite_witness_routes_and_refuses_moved_snapshot() {
     );
     assert_eq!(value.unwrap(), 7);
     assert!(kept.kept.is_empty());
+}
+
+/// [money] A kept home keeps only its views: a reused pass derives the same
+/// facts as the raw rows did (`parity`), including an id that differs from
+/// its resolved key, and the raw thread/history copies leave the heap.
+#[test]
+fn kept_home_drops_raw_rows() {
+    let f = Fixture::new();
+    let (db, path) = seed(&f);
+    let upper = "AAAAAAAA-BBBB-4CCC-8DDD-000000000002";
+    let other =
+        f.0.join("sessions")
+            .join(format!("rollout-{}.jsonl", upper.to_lowercase()));
+    db.execute("INSERT INTO threads VALUES (?1, 'Upper title', 5, 0, 1790000000, 1790000001, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![upper, other.to_str().unwrap()]).unwrap();
+    let history = Connection::open(f.0.join("writer/thread_history_1.sqlite")).unwrap();
+    history.execute_batch(&format!("CREATE TABLE thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); INSERT INTO thread_history_projection_state VALUES ('{ID}', 20, 2), ('{upper}', 7, 1)")).unwrap();
+    let paths = [path, other];
+    let mut facts = SidecarFacts::default();
+    let first = parity(&mut facts, &f.roots(), &paths);
+    assert!(first.identity_conflicts.is_empty());
+    let second = parity(&mut facts, &f.roots(), &paths);
+    assert_eq!(second.local_diagnostics.state_titles.reused_roots, 1);
+    assert_eq!(second.root_sidecars[&f.0].extents.len(), 2);
+    let slim = facts.homes.kept[&f.0].1.clone();
+    assert!(slim.raw.threads.is_empty() && slim.raw.history.is_empty());
+    assert_eq!(slim.threads.len(), 2);
+    // The previous representation: the same home plus its raw rows.
+    let mut old = (*slim).clone();
+    old.raw.threads = slim
+        .threads
+        .iter()
+        .map(|(id, row)| (id.clone(), row.clone()))
+        .collect();
+    old.raw.history = slim
+        .extents
+        .iter()
+        .map(|(id, e)| (id.clone(), e.next_byte_offset as i64, e.next_ordinal as i64))
+        .collect();
+    let merged = CodexTitleMetadata::merge_roots(
+        BTreeMap::from([(f.0.clone(), Arc::new(old.clone()))]),
+        false,
+    );
+    assert_metadata(&merged, &second, &paths);
+    let size = |home: &codex_root_copies::RootSidecar| {
+        crate::heap_layout_bound::completed_bound(home, usize::MAX).unwrap()
+    };
+    let raw = crate::heap_layout_bound::completed_bound(&old.raw.threads, usize::MAX).unwrap()
+        + crate::heap_layout_bound::completed_bound(&old.raw.history, usize::MAX).unwrap()
+        - 2 * std::mem::size_of::<Vec<u8>>();
+    assert!(size(&slim) < size(&old));
+    assert_eq!(size(&old) - size(&slim), raw);
 }
