@@ -100,7 +100,8 @@ impl std::fmt::Debug for TitlePrefix {
         f.write_str("TitlePrefix")
     }
 }
-crate::heap_layout_bound::no_heap!(false; TitlePrefix { raw_digest, prefix });
+// Immutable and inline: a kept compacted row has a completed charge.
+crate::heap_layout_bound::no_heap!(true; TitlePrefix { raw_digest, prefix });
 impl CodexStateThread {
     pub(in crate::snapshots) fn title_digest(&self) -> Option<[u8; 32]> {
         self.compact_title.as_ref().map_or_else(

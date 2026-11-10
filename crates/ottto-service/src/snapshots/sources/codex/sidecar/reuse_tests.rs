@@ -162,6 +162,7 @@ fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> Cod
     let gauge = reused.local_diagnostics.sidecar_facts_heap_bytes;
     assert_eq!(gauge, facts.heap_bytes() as u64);
     assert_eq!(gauge == 0, facts.homes.kept.is_empty());
+    assert!(gauge < u64::MAX, "a kept charge is a completed bound");
     assert_eq!(fresh.local_diagnostics.sidecar_facts_heap_bytes, 0);
     let index = ScanIndex::default();
     reused.scope_created_thread_census(&index, roots);
