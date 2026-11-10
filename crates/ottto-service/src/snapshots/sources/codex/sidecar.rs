@@ -3,7 +3,7 @@
 //! rollout-extent rows, and the per-turn priority trace map.
 
 use crate::snapshots::*;
-use crate::transcript_acquisition::{ContentStamp, SourceStamp};
+use crate::transcript_acquisition::SourceStamp;
 
 pub(in crate::snapshots) mod facts;
 

@@ -143,6 +143,16 @@ fn subcensus_failures_are_isolated() {
                 || failed.local_diagnostics.state_threads.completed_roots > 0
         );
     }
+    let f = Fixture::new();
+    let (db, _path) = seed(&f);
+    db.execute_batch("UPDATE threads SET thread_source='agent_created_thread', first_user_message=''; INSERT INTO thread_spawn_edges VALUES (x'ff', 'child')").unwrap();
+    sync_home(&f.0);
+    let q4_failed = CodexTitleMetadata::load_from_roots(&f.roots());
+    assert!(
+        q4_failed.state_created_threads.contains(ID),
+        "Q3 survives Q4 failure"
+    );
+    assert!(!q4_failed.created_thread_census_failed_homes.is_empty());
 }
 
 /// [money] Per-pass conflict suppression keeps the old physical-home view,
