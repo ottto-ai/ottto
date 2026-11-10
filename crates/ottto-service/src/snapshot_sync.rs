@@ -18787,10 +18787,9 @@ mod tests {
                     "returned.jsonl",
                 ),
                 "entity_decode" => {
-                    let mut wire = serde_json::to_value(&index).unwrap();
-                    wire["quarantined_snapshot_fingerprints"] = serde_json::json!({ stale.clone(): {"failed_reconstruction_count": "invalid"} });
-                    index = serde_json::from_value(wire).unwrap();
-                    assert!(index.decode_holds_entity(&stale));
+                    crate::snapshots::e2_pipeline_scan_fixture::hold_entity_decode_for_test(
+                        &mut index, &stale,
+                    )
                 }
                 "refused" | "stale_debt" => {
                     let reason = if guard == "stale_debt" {

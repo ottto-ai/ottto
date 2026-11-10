@@ -317,8 +317,8 @@ fn listed_history_held_leaves_the_age_alarm_unless_refused() {
         f.index.claude_reemission_exclusions =
             claude_reemission_exclusions::ReemissionExclusions::listing_every_family_for_test();
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
-        item.snapshot_fingerprint = "e".repeat(64);
         item.source_file_fingerprint = Some(f.index.files[&key].source_file_fingerprint.clone());
+        item.snapshot_fingerprint = snapshot_fingerprint(f.source, &item);
         let body = snapshot_upload_body_witness(&item);
         f.index
             .files
