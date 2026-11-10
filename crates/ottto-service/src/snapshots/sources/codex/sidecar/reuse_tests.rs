@@ -1,5 +1,6 @@
-//! Synthetic sidecar reuse and fresh-load parity, through the scan constructor.
+//! Synthetic fresh sidecar census, compaction and read-guard checks.
 use super::*;
+use crate::transcript_acquisition::StampedFacts;
 
 thread_local! {
     static STAGED: std::cell::RefCell<BTreeMap<PathBuf, SourceStamp>> = const { std::cell::RefCell::new(BTreeMap::new()) };
@@ -40,26 +41,6 @@ impl Fixture {
     fn roots(&self) -> Vec<PathBuf> {
         vec![self.0.join("sessions")]
     }
-    fn selecting(&self, cache: &sampled_scan::SharedCache) -> OwnedSourceScan {
-        OwnedSourceScan::new_selecting(
-            SnapshotSource::Codex,
-            &self.roots(),
-            ScanIndex::default(),
-            "2026-11-09T12:00:00Z",
-            30,
-            100,
-            None,
-            &[],
-            false,
-            &mut ListingRequest::default(),
-            false,
-            &[],
-            Some((
-                cache,
-                &crate::transcript_acquisition::Scope("sidecar-reuse".into()),
-            )),
-        )
-    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -72,94 +53,7 @@ impl Drop for Fixture {
     }
 }
 
-/// [regress] An unchanged second pass does not reopen the sidecar databases.
-#[test]
-fn reuse_skips_sidecar_read() {
-    let fixture = Fixture::new();
-    let cache = sampled_scan::SharedCache::default();
-    let first = fixture.selecting(&cache);
-    assert!(!first.codex_title_metadata.state_census_incomplete);
-    let second = fixture.selecting(&cache);
-    let d = second.codex_title_metadata.local_diagnostics;
-    assert_eq!(
-        d.state_titles.snapshot_fallbacks
-            + d.state_threads.snapshot_fallbacks
-            + d.spawn_edges.snapshot_fallbacks,
-        0
-    );
-}
-
 const ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001";
-fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[PathBuf]) {
-    macro_rules! equal { ($($field:ident),* $(,)?) => { $(assert_eq!(a.$field, b.$field, stringify!($field));)* }; }
-    equal!(
-        state_threads,
-        rollout_extents,
-        state_created_threads,
-        spawn_parents,
-        spawn_parent_conflicts,
-        identity_conflicts,
-        state_census_incomplete,
-        sidecar_census_incomplete,
-        state_census_unscoped_incomplete,
-        sidecar_census_unscoped_incomplete,
-        created_thread_census_failed_homes,
-        created_thread_scoped,
-        legacy_sidecar_fingerprint,
-        legacy_config_file_present
-    );
-    let titles = |m: &CodexTitleMetadata| {
-        m.titles
-            .iter()
-            .map(|(id, title)| (id.clone(), (title.title.clone(), title.source.clone())))
-            .collect::<BTreeMap<_, _>>()
-    };
-    assert_eq!(titles(a), titles(b));
-    assert_eq!(
-        a.root_sidecars.keys().collect::<Vec<_>>(),
-        b.root_sidecars.keys().collect::<Vec<_>>()
-    );
-    for (home, rows) in &a.root_sidecars {
-        assert_eq!(rows.threads, b.root_sidecars[home].threads);
-        assert_eq!(rows.extents, b.root_sidecars[home].extents);
-    }
-    for path in paths {
-        assert_eq!(
-            a.path_sidecar_fingerprint(path),
-            b.path_sidecar_fingerprint(path)
-        );
-        assert_eq!(
-            a.path_reduction_fingerprint(path),
-            b.path_reduction_fingerprint(path)
-        );
-        let (a, b) = (a.narrowed_to(path), b.narrowed_to(path));
-        assert_metadata(&a, &b, &[]);
-        assert_eq!(
-            a.path_sidecar_fingerprint(path),
-            b.path_sidecar_fingerprint(path)
-        );
-        assert_eq!(
-            a.path_reduction_fingerprint(path),
-            b.path_reduction_fingerprint(path)
-        );
-    }
-}
-fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> CodexTitleMetadata {
-    for home in roots
-        .iter()
-        .filter_map(|root| root.parent())
-        .collect::<BTreeSet<_>>()
-    {
-        sync_home(home);
-    }
-    let mut reused = CodexTitleMetadata::load_reused(roots, facts);
-    let mut fresh = CodexTitleMetadata::load_from_roots(roots);
-    let index = ScanIndex::default();
-    reused.scope_created_thread_census(&index, roots);
-    fresh.scope_created_thread_census(&index, roots);
-    assert_metadata(&reused, &fresh, paths);
-    reused
-}
 fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
     let db = Connection::open(fixture.0.join("writer/state_5.sqlite")).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
@@ -169,110 +63,6 @@ fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
         .join(format!("rollout-{ID}.jsonl"));
     db.execute("INSERT INTO threads VALUES (?1, 'Base title', 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![ID, path.to_str().unwrap()]).unwrap();
     (db, path)
-}
-
-/// [money] Raw row, roster, WAL, partial-census and merged-prefix changes
-/// preserve every map, completeness/scope flag and both v4 fingerprints.
-#[test]
-fn sidecar_state_transitions_match_fresh() {
-    let a = Fixture::new();
-    let b = Fixture::new();
-    let (db, path) = seed(&b);
-    let mut facts = SidecarFacts::default();
-    let mut roots = a.roots();
-    roots.extend(b.roots());
-    fs::write(
-        a.0.join("session_index.jsonl"),
-        json!({"id":ID,"thread_name":"Winning title"}).to_string() + "\n",
-    )
-    .unwrap();
-    for _ in 0..2 {
-        parity(&mut facts, &roots, std::slice::from_ref(&path));
-    }
-    let cached = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(cached.local_diagnostics.state_titles.reused_roots, 2);
-    // Removed winning home: the surviving Q2 row needs a new exact prefix.
-    roots = b.roots();
-    let removed = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(removed.local_diagnostics.state_titles.reloaded_roots, 1);
-    assert_eq!(removed.titles[ID].title, "Base title");
-    roots.extend(a.roots());
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    for title in [
-        None,
-        Some(String::new()),
-        Some("é".repeat(32)),
-        Some("x".repeat(63)),
-        Some("x".repeat(64)),
-        Some("x".repeat(65)),
-        Some(" raw  title \n".into()),
-    ] {
-        db.execute(
-            "UPDATE threads SET title=?1, tokens_used=tokens_used+1",
-            [title],
-        )
-        .unwrap();
-        parity(&mut facts, &roots, std::slice::from_ref(&path));
-        parity(&mut facts, &roots, std::slice::from_ref(&path));
-    }
-    for sql in ["UPDATE threads SET rollout_path='moved', updated_at=updated_at+1", "UPDATE threads SET thread_source='agent_created_thread', first_user_message=''", "INSERT INTO thread_spawn_edges VALUES ('parent', 'child')", "DELETE FROM thread_spawn_edges", "INSERT INTO threads SELECT upper(id), title, tokens_used, archived, created_at, updated_at, model, rollout_path, thread_source, first_user_message FROM threads", "DELETE FROM threads WHERE id != lower(id)"] {
-        db.execute_batch(sql).unwrap(); parity(&mut facts, &roots, std::slice::from_ref(&path));
-    }
-    let history = Connection::open(a.0.join("writer/thread_history_1.sqlite")).unwrap();
-    history.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER)").unwrap();
-    for sql in [
-        format!(
-            "INSERT INTO thread_history_projection_state VALUES ('{ID}', 20, 2), ('{}', 21, 3)",
-            ID.to_uppercase()
-        ),
-        "DELETE FROM thread_history_projection_state".into(),
-    ] {
-        history.execute_batch(&sql).unwrap();
-        parity(&mut facts, &roots, std::slice::from_ref(&path));
-    }
-    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    db.execute_batch("UPDATE threads SET tokens_used=tokens_used+1; PRAGMA wal_checkpoint(RESTART); UPDATE threads SET tokens_used=tokens_used+1").unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    drop(db);
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    let parked = b.0.join("state-old.sqlite");
-    fs::rename(b.0.join("state_5.sqlite"), &parked).unwrap();
-    let missing = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(missing.local_diagnostics.state_titles.absent_roots, 1);
-    fs::rename(parked, b.0.join("state_5.sqlite")).unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    let db = Connection::open(b.0.join("writer/state_5.sqlite")).unwrap();
-    db.execute_batch("PRAGMA journal_mode=DELETE; ALTER TABLE thread_spawn_edges RENAME TO old_edges; CREATE TABLE thread_spawn_edges (parent_thread_id BLOB, child_thread_id TEXT); INSERT INTO thread_spawn_edges VALUES (x'ff', 'child')").unwrap();
-    let q4_failed = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert!(
-        q4_failed.state_created_threads.contains(ID),
-        "Q3 survives Q4 failure"
-    );
-    assert!(!q4_failed.created_thread_census_failed_homes.is_empty());
-    assert!(!facts.homes.kept.contains_key(&b.0));
-    db.execute_batch(
-        "DROP TABLE thread_spawn_edges; ALTER TABLE old_edges RENAME TO thread_spawn_edges",
-    )
-    .unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    fs::write(a.0.join("session_index.jsonl"), "{bad json\n").unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    fs::remove_file(a.0.join("session_index.jsonl")).unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    // Unsupported cache witness retains a successful ordinary plain read.
-    fs::hard_link(b.0.join("state_5.sqlite"), b.0.join("hardlink")).unwrap();
-    assert!(SourceStamp::capture_sqlite(&b.0.join("state_5.sqlite")).is_none());
-    assert!(!parity(&mut facts, &roots, std::slice::from_ref(&path)).state_census_incomplete);
-    assert!(facts.homes.kept.is_empty(), "a partial group holds no RAM");
-    let repeated = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(repeated.local_diagnostics.state_titles.reloaded_roots, 2);
-    assert!(facts.homes.kept.is_empty());
-    fs::remove_file(b.0.join("hardlink")).unwrap();
-    parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(facts.homes.kept.len(), 2);
-    let repaired = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(repaired.local_diagnostics.state_titles.reused_roots, 2);
 }
 
 /// [money] Compact digest and clone/continue keep the legacy byte stream;
@@ -332,7 +122,7 @@ fn compact_title_keeps_legacy_fingerprints_and_raw_equality() {
 }
 
 /// [behaviour] Missing columns/row decode failures retain unrelated census
-/// successes; incomplete state is not kept and a repaired pass loads again.
+/// successes on each fresh load.
 #[test]
 fn subcensus_failures_are_isolated() {
     for sql in [
@@ -341,13 +131,13 @@ fn subcensus_failures_are_isolated() {
         "ALTER TABLE threads RENAME COLUMN first_user_message TO old_message",
     ] {
         let f = Fixture::new();
-        let (db, path) = seed(&f);
-        let mut facts = SidecarFacts::default();
-        parity(&mut facts, &f.roots(), std::slice::from_ref(&path));
+        let (db, _path) = seed(&f);
+        sync_home(&f.0);
+        CodexTitleMetadata::load_from_roots(&f.roots());
         db.execute_batch(sql).unwrap();
-        let failed = parity(&mut facts, &f.roots(), std::slice::from_ref(&path));
+        sync_home(&f.0);
+        let failed = CodexTitleMetadata::load_from_roots(&f.roots());
         assert!(failed.state_census_incomplete);
-        assert!(facts.homes.kept.is_empty());
         assert!(
             failed.local_diagnostics.state_titles.completed_roots > 0
                 || failed.local_diagnostics.state_threads.completed_roots > 0
@@ -356,7 +146,7 @@ fn subcensus_failures_are_isolated() {
 }
 
 /// [money] Per-pass conflict suppression keeps the old physical-home view,
-/// while the resident home still owns its raw row for the next pass.
+/// while the pass owns the raw row used to build it.
 #[test]
 fn alias_conflict_keeps_legacy_physical_fingerprint() {
     let f = Fixture::new();

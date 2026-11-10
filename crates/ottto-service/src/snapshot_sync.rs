@@ -4466,11 +4466,7 @@ impl SyncCounts {
         if source == "codex" {
             line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
             if let Some(d) = self.sidecar_reads {
-                line.push_str(&format!(" state_5_reused={} state_5_reloaded={} thread_history_1_reused={} thread_history_1_reloaded={} session_index_reused={} session_index_reloaded={} absent_roots={}",
-                    d.state_titles.reused_roots, d.state_titles.reloaded_roots,
-                    d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
-                    d.session_index.reused_roots, d.session_index.reloaded_roots,
-                    d.state_titles.absent_roots));
+                line.push_str(&format!(" absent_roots={}", d.state_titles.absent_roots));
             }
         }
         line
@@ -24437,6 +24433,3 @@ mod head_conflict_released_progress_fixture;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
 crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
-
-#[cfg(test)]
-mod codex_sidecar_reuse_tests;

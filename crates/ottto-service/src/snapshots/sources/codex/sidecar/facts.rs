@@ -1,7 +1,6 @@
-//! RAM-only home facts; acquisition is separate from ordered per-pass merging.
+//! Fresh home facts; acquisition is separate from ordered per-pass merging.
 use super::*;
 use crate::codex_scan_diagnostics::{LoaderEvidence, LoaderStage};
-use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 
 type ThreadRows = Vec<(String, Shared<CodexStateThread>)>;
 type TitleRows = Vec<(String, Option<String>)>;
@@ -24,118 +23,28 @@ impl std::fmt::Debug for RawRows {
     }
 }
 
-#[derive(Default)]
-pub(in crate::snapshots) struct SidecarFacts {
-    pub homes: StampedFacts<PathBuf, Arc<codex_root_copies::RootSidecar>, [SourceStamp; 3]>,
-    heap_bytes: usize,
-}
-impl HeapLayoutBound for SidecarFacts {
-    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        c.add(self.heap_bytes)
-    }
-}
-
-fn capture(root: &Path) -> [Option<SourceStamp>; 3] {
+fn capture(root: &Path) -> [Option<SourceStamp>; 2] {
     [
         SourceStamp::capture_sqlite(&root.join("state_5.sqlite")),
         SourceStamp::capture_sqlite(&root.join("thread_history_1.sqlite")),
-        SourceStamp::capture_file(&root.join("session_index.jsonl")).ok(),
     ]
 }
-fn witness(stamps: &[Option<SourceStamp>; 3]) -> Option<[SourceStamp; 3]> {
-    Some([stamps[0].clone()?, stamps[1].clone()?, stamps[2].clone()?])
-}
-
-impl SidecarFacts {
-    pub fn load(&mut self, roots: &[PathBuf]) -> CodexTitleMetadata {
-        let listed = roots
-            .iter()
-            .filter_map(|root| root.parent().map(Path::to_path_buf))
-            .collect::<BTreeSet<_>>();
-        let before = listed
-            .iter()
-            .map(|home| (home.clone(), capture(home)))
-            .collect::<BTreeMap<_, _>>();
-        // Every retained prefix depends on the complete merged group. A
-        // changed roster, failed pass or changed input reloads the group.
-        let reuse = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
-            matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
-        });
-        if !reuse {
-            self.homes.kept.clear();
-        }
-        let mut after = BTreeMap::new();
-        let mut loaded = BTreeMap::new();
-        for home in &listed {
-            let raw = if reuse {
-                self.homes.kept[home].1.clone()
-            } else {
-                let (facts, witness) = load_home(home, &before[home]);
-                after.insert(home.clone(), witness);
-                Arc::new(facts)
-            };
-            loaded.insert(home.clone(), raw);
-        }
-        let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
-        metadata.compact_titles();
-        if !reuse {
-            if !metadata.state_census_incomplete && !metadata.sidecar_census_incomplete {
-                for (home, facts) in &metadata.root_sidecars {
-                    // The helper consumes the captures already made around
-                    // acquisition; compaction must finish before sharing.
-                    let mut stamps = [witness(&before[home]), after[home].clone()].into_iter();
-                    let _: Result<_, std::convert::Infallible> = self.homes.reuse_or_load(
-                        home.clone(),
-                        || {
-                            stamps
-                                .next()
-                                .flatten()
-                                .ok_or_else(|| std::io::Error::other("noncacheable sidecar"))
-                        },
-                        || Ok(facts.clone()),
-                    );
-                }
-            }
-            // A partial group can never be reused; do not retain or charge
-            // its otherwise-cacheable homes while another input declines.
-            if self.homes.kept.len() != listed.len() {
-                self.homes.kept.clear();
-            }
-            self.charge_homes();
-        }
-        metadata
+pub(super) fn load(roots: &[PathBuf]) -> CodexTitleMetadata {
+    let listed = roots
+        .iter()
+        .filter_map(|root| root.parent().map(Path::to_path_buf))
+        .collect::<BTreeSet<_>>();
+    let before = listed
+        .iter()
+        .map(|home| (home.clone(), capture(home)))
+        .collect::<BTreeMap<_, _>>();
+    let mut loaded = BTreeMap::new();
+    for home in &listed {
+        loaded.insert(home.clone(), Arc::new(load_home(home, &before[home])));
     }
-
-    fn charge_homes(&mut self) {
-        // Charge immutable entry heaps only on insertion/replacement.
-        self.heap_bytes = self
-            .homes
-            .kept
-            .iter()
-            .fold(0usize, |total, (home, (stamp, facts))| {
-                let facts = crate::heap_layout_bound::completed_bound(&**facts, usize::MAX)
-                    .unwrap_or(usize::MAX);
-                let stamp = stamp
-                    .iter()
-                    .map(|stamp| match stamp {
-                        SourceStamp::Sqlite { target, .. } => target.capacity(),
-                        _ => 0,
-                    })
-                    .sum::<usize>();
-                total
-                    .saturating_add(home.capacity())
-                    .saturating_add(stamp)
-                    .saturating_add(
-                        crate::heap_layout_bound::tree_node_bytes::<
-                            PathBuf,
-                            ([SourceStamp; 3], Arc<codex_root_copies::RootSidecar>),
-                        >()
-                        .unwrap_or(usize::MAX),
-                    )
-                    .saturating_add(facts)
-                    .saturating_add(2 * std::mem::size_of::<usize>())
-            });
-    }
+    let mut metadata = CodexTitleMetadata::merge_roots(loaded);
+    metadata.compact_titles();
+    metadata
 }
 
 fn observe(result: &Result<()>, open: SidecarOpenCounts) -> LoaderEvidence {
@@ -151,10 +60,7 @@ fn finish<T: Default>(result: Result<T>, counts: SidecarOpenCounts) -> (T, Loade
     }
 }
 
-fn load_home(
-    home: &Path,
-    before: &[Option<SourceStamp>; 3],
-) -> (codex_root_copies::RootSidecar, Option<[SourceStamp; 3]>) {
+fn load_home(home: &Path, before: &[Option<SourceStamp>; 2]) -> codex_root_copies::RootSidecar {
     let mut facts = codex_root_copies::RootSidecar::default();
     let raw = &mut facts.raw;
     let mut after: [Option<SourceStamp>; 3] = [None, None, None];
@@ -237,11 +143,7 @@ fn load_home(
     }
     raw.evidence[3].absent_roots = u32::from(matches!(&after[1], Some(SourceStamp::Absent)));
     raw.evidence[4].absent_roots = u32::from(matches!(&after[2], Some(SourceStamp::Absent)));
-    let complete = raw.evidence.iter().all(|outcome| outcome.failed_roots == 0);
-    let witness = complete
-        .then(|| Some([after[0].take()?, after[1].take()?, after[2].take()?]))
-        .flatten();
-    (facts, witness)
+    facts
 }
 
 pub(super) fn history_rows(db: &Connection) -> Result<Vec<(String, i64, i64)>> {

@@ -3,10 +3,9 @@
 //! rollout-extent rows, and the per-turn priority trace map.
 
 use crate::snapshots::*;
-use crate::transcript_acquisition::{ContentStamp, SourceStamp, StampedFacts};
+use crate::transcript_acquisition::{ContentStamp, SourceStamp};
 
 pub(in crate::snapshots) mod facts;
-pub(in crate::snapshots) use facts::SidecarFacts;
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::snapshots) struct CodexTitleMetadata {
@@ -531,17 +530,10 @@ impl CodexTitleMetadata {
     }
 
     pub(in crate::snapshots) fn load_from_roots(roots: &[PathBuf]) -> Self {
-        SidecarFacts::default().load(roots)
+        facts::load(roots)
     }
 
-    pub(in crate::snapshots) fn load_reused(roots: &[PathBuf], facts: &mut SidecarFacts) -> Self {
-        facts.load(roots)
-    }
-
-    fn merge_roots(
-        homes: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
-        reused: bool,
-    ) -> Self {
+    fn merge_roots(homes: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>) -> Self {
         let mut metadata = Self::default();
         let mut legacy_sidecar_parts = Vec::new();
         let mut parentless_ineligible = BTreeSet::new();
@@ -570,7 +562,6 @@ impl CodexTitleMetadata {
                 &raw.evidence[0],
                 metadata.identity_conflicts.len() != state_conflicts_before,
                 &key,
-                reused,
                 absent,
             );
             let conflicts_before = metadata.identity_conflicts.len();
@@ -586,7 +577,6 @@ impl CodexTitleMetadata {
                 &raw.evidence[1],
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
-                reused,
                 absent,
             );
             let conflicts_before = metadata.identity_conflicts.len();
@@ -601,7 +591,6 @@ impl CodexTitleMetadata {
                 &raw.evidence[2],
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
-                reused,
                 absent,
             );
             let state_incomplete = raw.evidence[..3].iter().any(|e| e.failed_roots > 0);
@@ -628,7 +617,6 @@ impl CodexTitleMetadata {
                 &raw.evidence[3],
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
-                reused,
                 raw.evidence[3].absent_roots > 0,
             );
             if raw.evidence[3].failed_roots > 0 {
@@ -650,7 +638,6 @@ impl CodexTitleMetadata {
                 &raw.evidence[4],
                 metadata.identity_conflicts.len() != conflicts_before,
                 &key,
-                reused,
                 raw.evidence[4].absent_roots > 0,
             );
             if raw.evidence[4].failed_roots > 0 {
@@ -660,9 +647,7 @@ impl CodexTitleMetadata {
             if metadata.identity_conflicts.len() != conflicts_before {
                 metadata.sidecar_census_incomplete = true;
             }
-            // Fresh homes acquire their existing physical-home view during
-            // the ordered merge. Reused groups are complete and unchanged,
-            // so this view is already identical; conflicts are never retained.
+            // Homes acquire their physical-home view during the ordered merge.
             if let Some(home) = Arc::get_mut(&mut root_sidecar) {
                 home.threads = threads;
                 home.extents = extents;

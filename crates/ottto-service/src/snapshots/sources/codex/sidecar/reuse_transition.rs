@@ -15,7 +15,7 @@ pub(super) fn seed_sidecars(c: &Corpus) -> rusqlite::Connection {
     db
 }
 
-/// [money] Cached sidecars feed the native Tail, restore, restart-between-pages,
+/// [money] Fresh sidecars feed the native Tail, restore, restart-between-pages,
 /// compatible binary upgrade, real post-ACK placement and quiet-restart routes.
 #[test]
 fn codex_sidecar_reuse_transition() {
@@ -122,12 +122,6 @@ fn codex_sidecar_reuse_transition() {
         // binary-upgrade arm starts a new process owner from the saved index;
         // no native sidecar facts can cross that process boundary.
         let (working, scan, ..) = run(restored, owner.clone());
-        let d = scan.local_codex_diagnostics.as_ref().unwrap();
-        assert_eq!(
-            d.state_titles.reused_roots,
-            u32::from(label == "tail"),
-            "{label}"
-        );
         let actual = crate::snapshot_sync::codex_transition_acked_route(
             &working,
             &scan,
@@ -141,18 +135,7 @@ fn codex_sidecar_reuse_transition() {
         money_oracle::assert_placement_equivalent(&cold, &actual);
         money_oracle::assert_no_smaller_reemit(MAIN, &cold, &actual, &cold, false);
         assert_eq!(cold.batches, actual.batches, "{label}: byte-identical rows");
-        // A newly started process fully loads first, then reuses on its next
-        // pass while replaying exactly the same owed revision.
         let (_, second, ..) = run(prior.clone(), owner);
-        assert_eq!(
-            second
-                .local_codex_diagnostics
-                .as_ref()
-                .unwrap()
-                .state_titles
-                .reused_roots,
-            1
-        );
         let second =
             crate::snapshot_sync::codex_transition_acked_route(&working, &second, Mode::Ram);
         money_oracle::assert_equivalent(&cold, &second);
@@ -169,7 +152,7 @@ fn codex_sidecar_reuse_transition() {
     println!("CODEX_SIDECAR_REUSE_ORACLE quiet_restart ok");
 }
 
-/// [money] Cached sidecars preserve held/no-smaller and independent-owner progress.
+/// [money] Fresh sidecars preserve held/no-smaller and independent-owner progress.
 #[test]
 fn sidecar_reuse_inventory_refusal_isolates_only_proven_dependants() {
     let _lock = DECODER_TEST_LOCK
@@ -201,15 +184,6 @@ fn sidecar_reuse_inventory_refusal_isolates_only_proven_dependants() {
     e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
     let before = index.clone();
     let (working, held_scan, _, _, _) = page(&c, index, cache.clone());
-    assert_eq!(
-        held_scan
-            .local_codex_diagnostics
-            .as_ref()
-            .unwrap()
-            .state_titles
-            .reused_roots,
-        1
-    );
     assert!(held_scan
         .snapshots
         .iter()

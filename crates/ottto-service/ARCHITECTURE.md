@@ -153,20 +153,16 @@ Desktop metadata cache.
 
 ## Codex sidecar facts
 
-The process-owned transcript cache retains complete Codex home facts in RAM,
-using the shared file stamp for the resolved SQLite main file and its WAL.
-Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
-completeness and path fingerprints. Roster changes, changed inputs and partial
-loads reload the complete title group. Changed thread databases use one
+Every pass loads Codex home facts and rebuilds metadata merges, ownership
+conflicts, completeness and path fingerprints. Thread databases use one
 streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
 
 Recent logs still use the existing full reader on every pass at both log
 locations, including its time window, ts-DESC result limit and incompleteness
-rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
-scan diagnostics include reuse/reload counts for state, history and session
-index facts, plus absent roots. An incremental logs reader is deferred.
+rules. Sidecar facts live only for the pass and are never persisted. Terminal
+scan diagnostics include absent roots. An incremental logs reader is deferred.
 
 ## CLI status metadata
 
