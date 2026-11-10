@@ -3280,13 +3280,21 @@ pub(super) mod tests {
     }
     /// [money] An explicit tier on the rollout's own usage lines now prices its
     /// turn beside a logs priority request, where the logs stamp used to
-    /// replace it: `flex` stays `flex`, and `priority` keeps its price under
-    /// the rollout line's own source.
+    /// replace it: each explicit value prices at its own (normalized) tier
+    /// under the rollout line's own source; `priority` keeps its price.
     #[test]
     fn explicit_rollout_tier_is_no_longer_replaced_by_codex_logs() {
-        for tier in ["flex", "priority"] {
-            let root =
-                logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", Some(tier));
+        for (explicit, tier) in [
+            ("flex", "flex"),
+            ("priority", "priority"),
+            ("fast", "fast"),
+            ("standard", "standard"),
+            ("default", "standard"),
+        ] {
+            let root = logs_priority_request_fixture(
+                "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+                Some(explicit),
+            );
             let (_, result) = scan(&root, ScanIndex::default(), 2);
             assert_eq!(result.snapshots.len(), 2, "one alias per group member");
             for item in &result.snapshots {
@@ -3312,6 +3320,141 @@ pub(super) mod tests {
             }
             fs::remove_dir_all(root).unwrap();
         }
+    }
+    /// Scan `root` as an older build that priced `turn` priority from Codex
+    /// logs, accept the read, save the index, then retire that evidence.
+    /// Returns the saved index path.
+    fn accept_as_older_build(root: &Path, turn: &str) -> PathBuf {
+        older_build_logs_priority(turn);
+        let (mut working, mut first) = scan(root, ScanIndex::default(), 2);
+        assert!(
+            first
+                .snapshots
+                .iter()
+                .flat_map(|item| &item.model_usage)
+                .any(|row| {
+                    row.selector_sources.get("service_tier").map(String::as_str)
+                        == Some("derived_from_logs_2")
+                }),
+            "positive control: the older build priced priority from logs"
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut working);
+        first.finish_codex_capture_boundary(&mut working);
+        let fingerprints = first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut committed =
+            working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
+        let saved = root.join("index.json");
+        committed.save(&saved).unwrap();
+        older_build_logs_expired();
+        saved
+    }
+    /// Input tokens by emitted `service_tier` and its source, over `owner`'s rows.
+    fn tiers_of(
+        scan: &SourceScanResult,
+        owner: &str,
+    ) -> BTreeMap<(Option<String>, Option<String>), u64> {
+        let mut tiers = BTreeMap::new();
+        for row in scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == owner)
+            .flat_map(|item| &item.model_usage)
+        {
+            *tiers
+                .entry((
+                    row.selector_context.get("service_tier").cloned(),
+                    row.selector_sources.get("service_tier").cloned(),
+                ))
+                .or_default() += row.input_tokens;
+        }
+        tiers
+    }
+    /// [money] Rows an older build accepted priority from logs over an explicit
+    /// tier on the rollout's usage lines, re-read in a byte-zero replay: an
+    /// explicit `priority` keeps its price under the line's own source; an
+    /// explicit non-priority tier fails the receipt's key match, so the
+    /// replay emits nothing below priority.
+    #[test]
+    fn accepted_logs_priority_over_an_explicit_tier_replays_or_holds() {
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        for explicit in ["priority", "flex"] {
+            let root = logs_priority_request_fixture(turn, Some(explicit));
+            let saved = accept_as_older_build(&root, turn);
+            let mut loaded = ScanIndex::load(&saved).unwrap();
+            loaded.prepare_historical_replay("logs-explicit-upgrade".into());
+            let (_, replayed) = scan(&root, loaded, 2);
+            let tiers = tiers_of(&replayed, owner);
+            eprintln!(
+                "LOGS_EXPLICIT_REPLAY explicit={explicit} emitted={} tiers={tiers:?}",
+                replayed.snapshots.len()
+            );
+            let below_priority = tiers
+                .iter()
+                .filter(|((tier, _), _)| {
+                    tier.as_deref() == Some(explicit) && explicit != "priority"
+                })
+                .map(|(_, tokens)| *tokens)
+                .sum::<u64>();
+            assert_eq!(below_priority, 0, "{explicit}: no smaller re-emit");
+            if explicit == "priority" && !replayed.snapshots.is_empty() {
+                for ((tier, source), tokens) in &tiers {
+                    if tier.as_deref() == Some("priority") {
+                        assert!(
+                            source.as_deref().is_some_and(|s| s.starts_with("payload.")),
+                            "{source:?}"
+                        );
+                        assert_eq!(*tokens, 400, "both aliases keep b's 200 at priority");
+                    }
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    /// [money] A singleton accepted priority from logs whose index entry holds
+    /// no tier receipt and no receipt requirement (an entry from before
+    /// receipts) re-reads at the default tier on a later Full; base would
+    /// have kept priority while the turn's logs request was live.
+    #[test]
+    fn receipt_less_accepted_singleton_prices_default_on_a_later_full() {
+        let owner = "cccccccc-dddd-4eee-8fff-000000000000";
+        let turn = "cccccccc-1111-4111-8111-cccccccccccc";
+        let (root, _) = fixture();
+        let mut rows = member(owner, "r-c", 200, 200);
+        rows.insert(
+            1,
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
+        );
+        let path = root.join("sessions/c.jsonl");
+        fs::write(
+            &path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let saved = accept_as_older_build(&root, turn);
+        let mut legacy = ScanIndex::load(&saved).unwrap();
+        let entry = legacy.files.get_mut(&local_index_key(&path)).unwrap();
+        entry.codex_applied_tier_receipt = None;
+        entry.codex_applied_tier_receipt_required = false;
+        entry.codex_captured_tier_receipt = None;
+        entry.codex_captured_tier_receipt_required = false;
+        legacy.save(&saved).unwrap();
+        let mut loaded = ScanIndex::load(&saved).unwrap();
+        loaded.prepare_historical_replay("receipt-less-upgrade".into());
+        let (_, replayed) = scan(&root, loaded, 2);
+        let tiers = tiers_of(&replayed, owner);
+        eprintln!(
+            "LOGS_RECEIPT_LESS_REPLAY emitted={} tiers={tiers:?}",
+            replayed.snapshots.len()
+        );
+        assert_eq!(tiers, BTreeMap::from([((None, None), 200)]), "default tier");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn production_scanner_aliases_need_common_settlement_and_skip_on_restart() {
