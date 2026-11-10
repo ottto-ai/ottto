@@ -62,9 +62,18 @@ pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
         Cleanup::SourceOnly,
         Some("owner_lock_inventory"),
     ),
-    // Cleanup-only names: no writer or recovery/adoption path remains.
+    // Cleanup-only names: no recovery/adoption path reads them. Only an
+    // interrupted erasure copy leaves the `.vacuum` names.
     (".v2.sqlite.migration-backup", Cleanup::ObsoleteBackup, None),
     (".v2-recovery", Cleanup::ObsoleteBackup, None),
+    (
+        ".v2.sqlite.vacuum",
+        Cleanup::ObsoleteBackup,
+        Some("vacuum_remnant_inventory"),
+    ),
+    (".v2.sqlite.vacuum-journal", Cleanup::ObsoleteBackup, None),
+    (".v2.sqlite.vacuum-wal", Cleanup::ObsoleteBackup, None),
+    (".v2.sqlite.vacuum-shm", Cleanup::ObsoleteBackup, None),
     (
         ".v2.sqlite.import",
         Cleanup::Unpublished,
@@ -86,8 +95,9 @@ pub(super) const ARTIFACTS: &[(&str, Cleanup, Option<&str>)] = &[
     ),
 ];
 
-/// Old backup copies still carry private-text debt after their writers are
-/// removed. Delete and fsync them before maintenance clears that obligation.
+/// Old backup copies and erasure copies still carry private-text debt after
+/// their writers are removed. Delete and fsync them before maintenance clears
+/// that obligation.
 pub(super) fn purge_obsolete_backups(path: &Path) -> Result<()> {
     for (suffix, cleanup, _) in ARTIFACTS {
         if *cleanup == Cleanup::ObsoleteBackup {

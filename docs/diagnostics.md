@@ -121,8 +121,13 @@ The retained-history goal is a store heap of at most 56 MiB and a reduction over
 90% from the 630 MiB baseline, with finish peak below 164 MiB. Whole-process
 steady RSS is a gauge, not that retained-history acceptance criterion.
 
-Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim; purge means
-VACUUM plus TRUNCATE. Commit outcome arrays are ordered committed, not published,
+Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim. The purge slot
+counts the TRUNCATE before each erasure copy, plus one failure when an attempt
+stops before that TRUNCATE (for example the space refusal). A copy or swap
+failure after a complete TRUNCATE counts in `vacuum_failures` and
+`erasure_vacuum_failed`, not in that slot. `erasure_vacuum.bytes` adds the
+pre-attempt main-file length of each attempt whose copy was published; `runs`
+counts durable completions. Commit outcome arrays are ordered committed, not published,
 published after error, ambiguous. Backend counters reset with the connection;
 process distributions reset with the process. The pending generation, oldest
 erasure time and attempt/failure pacing persist in the DB. No paths, keys, raw
@@ -146,14 +151,15 @@ Erasure measurements include `erasure_pending_age_s`, `oldest_pending_age_s`,
 `erasure_resume_refusals`, `erasure_late_completions`, and
 `erasure_vacuum.{runs,bytes,seconds}`. Fixed failure reasons appear in
 `erasure_vacuum_failed`, including busy, timeout, disk_full, space_or_io,
-backup_io, own_lock, external_lock, lock_io, engine and truncate. The process events
+backup_io, swap_io, own_lock, external_lock, lock_io, engine and truncate. The process events
 `erasure_deadline_breach` and `erasure_late_completion_alarm` alert overdue debt
 and late success respectively. Attempt/failure/deferred counts, `vacuum_latency_ms`,
 `vacuum_wal_peak_bytes`, and free-space available/required/admission gauges describe
 maintenance work. A pending age is null when no obligation exists or its clock
 is unavailable; `erasure_overdue` distinguishes conservative clock handling.
-Debt clears only after VACUUM, successful TRUNCATE and measured empty WAL, followed
-by a durable epoch-matching metadata clear. See [the store policy](scan-index-persistence.md).
+Debt clears only after a successful TRUNCATE with a measured empty WAL, a
+validated `VACUUM INTO` copy renamed over the store, and a durable epoch-matching
+metadata clear. See [the store policy](scan-index-persistence.md).
 
 Source health uses `index_retrying` and "local index busy, retrying" for typed
 reload, migration and save-pressure holds. These do not increment
