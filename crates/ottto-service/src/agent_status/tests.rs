@@ -2473,7 +2473,7 @@ exit 1
                 name: "Usage credits".to_string(),
                 status: AgentCreditBalanceStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                remaining: CreditAmount::whole(credits),
+                used: CreditAmount::whole(credits),
                 ..Default::default()
             }],
             account_weekly_not_offered: false,
@@ -2565,7 +2565,7 @@ exit 1
             Some(organization_hash)
         );
         assert_eq!(
-            snapshot.credit_balances[0].remaining,
+            snapshot.credit_balances[0].used,
             CreditAmount::whole(expected_credits)
         );
         assert_eq!(
@@ -9700,6 +9700,58 @@ fn legacy_usage_cache_migrates_into_its_physical_account_store() {
     let _ = fs::remove_dir_all(support_dir);
 }
 
+/// [format] A stored usage-credit row loses only the old cap-minus-used
+/// `remaining` on load; other rows and fields, and the schema, stay as stored.
+#[test]
+#[serial]
+fn cached_usage_credits_load_without_remaining() {
+    let support_dir = std::env::temp_dir().join(format!(
+        "ottto-claude-oauth-cache-remaining-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&support_dir);
+    fs::create_dir_all(&support_dir).expect("create support dir");
+    let _guard = EnvVarGuard::set_os(
+        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+        support_dir.as_os_str().to_os_string(),
+    );
+    let owned = |text: &str| Some(text.to_string());
+    let row = |name: &str, kind: Option<ottto_protocol::CreditBalanceKind>| AgentCreditBalance {
+        name: name.to_string(),
+        used: CreditAmount::whole(1200),
+        quota: CreditAmount::whole(5000),
+        remaining: CreditAmount::whole(3800),
+        kind,
+        observed_at: owned("2026-11-01T18:00:00Z"),
+        account_identifier_hash: owned("account-a"),
+        organization_identifier_hash: owned("organization-a"),
+        ..Default::default()
+    };
+    let cache = ClaudeOAuthUsageCache {
+        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+        account_identifier_hash: "account-a".to_string(),
+        organization_identifier_hash: "organization-a".to_string(),
+        observed_at_epoch_seconds: 100,
+        next_refresh_after_epoch_seconds: 200,
+        windows: Vec::new(),
+        credit_balances: vec![
+            row("Usage credits", Some(ottto_protocol::CreditBalanceKind::UsageCredits)),
+            row("Usage credits", None),
+            row("one_time_credit", Some(ottto_protocol::CreditBalanceKind::OneTimeCredit)),
+        ],
+        account_weekly_not_offered: false,
+        account_session_not_offered: false,
+    };
+    write_claude_oauth_usage_cache(&cache).expect("write cache");
+    let mut expected = cache.credit_balances.clone();
+    expected[0].remaining = None;
+    expected[1].remaining = None;
+    let loaded = read_claude_oauth_usage_cache("account-a", "organization-a").expect("cache");
+    assert_eq!(loaded.schema_version, CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION);
+    assert_eq!(loaded.credit_balances, expected);
+    let _ = fs::remove_dir_all(support_dir);
+}
+
 #[test]
 #[serial]
 fn default_account_state_is_mirrored_for_downgrade_without_custom_account_leakage() {
@@ -11485,9 +11537,7 @@ fn quota_coverage_credit_states_do_not_invent_amounts() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, status);
         assert_eq!(rows[0].enabled, Some(enabled));
-        if status != AgentCreditBalanceStatus::Exhausted {
-            assert_eq!(rows[0].remaining, None);
-        }
+        assert_eq!(rows[0].remaining, None);
     }
     assert!(claude_oauth_credit_balances(&serde_json::json!({})).is_empty());
     assert!(claude_oauth_credit_balances(
@@ -11606,32 +11656,103 @@ fn quota_coverage_passive_rollover_requires_ended_exact_meter() {
     ));
 }
 
+/// A provider money object of `cents` US cents.
+fn usd(cents: u64) -> serde_json::Value {
+    serde_json::json!({"amount_minor": cents, "currency": "USD", "exponent": 2})
+}
+
+/// The usage-credit row, then the prepaid row, as sent.
+fn claude_credit_rows(body: &serde_json::Value) -> serde_json::Value {
+    let (usage, prepaid, _) = claude_oauth_credit_balances_and_refusals(body);
+    serde_json::to_value(usage.into_iter().chain(prepaid).collect::<Vec<_>>()).unwrap()
+}
+
+/// [money] Usage credits never carry `remaining` (the old cap-minus-used
+/// headroom). The quota is `spend.cap.money`, else `spend.limit`; `cap.credits`
+/// is never sent. A valid `spend.balance` (zero included) is only the prepaid row.
 #[test]
 fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
-    let json = serde_json::json!({
-        "spend": {
-            "used": {"amount_minor": 321, "currency": "USD", "exponent": 2},
-            "cap": {"amount_minor": 500, "currency": "USD", "exponent": 2},
-            "balance": {"amount_minor": 179, "currency": "USD", "exponent": 2},
-            "percent": 64, "severity": "warning", "enabled": true
+    let usage = |used: u64, quota: Option<u64>, status: &str| {
+        let mut row = serde_json::json!({
+            "name": "Usage credits", "status": status, "freshness": "fresh", "unit": "usd",
+            "used": used, "currency": "USD", "enabled": true
+        });
+        if let Some(quota) = quota {
+            row["quota"] = serde_json::json!(quota);
+            row["used_percent"] = serde_json::json!(used * 100 / quota);
         }
+        row
+    };
+    let prepaid = |cents: u64, status: &str| {
+        serde_json::json!({
+            "name": "prepaid_balance", "status": status, "freshness": "fresh", "unit": "usd",
+            "remaining": cents, "currency": "USD", "kind": "prepaid_credits"
+        })
+    };
+    let credits = serde_json::json!({"amount_minor": 90000, "exponent": 2});
+    for (spend, expected) in [
+        // Observed shape: `cap.money` null, so the quota is `limit`.
+        (
+            serde_json::json!({"enabled": true, "used": usd(1200), "limit": usd(5000),
+                               "cap": {"money": null, "credits": credits}, "balance": null}),
+            serde_json::json!([usage(1200, Some(5000), "ok")]),
+        ),
+        (
+            serde_json::json!({"enabled": true, "used": usd(1200), "limit": usd(5000),
+                               "cap": {"money": usd(6000), "credits": credits}}),
+            serde_json::json!([usage(1200, Some(6000), "ok")]),
+        ),
+        // A money object straight under `cap` is not the observed shape.
+        (
+            serde_json::json!({"enabled": true, "used": usd(1200), "cap": usd(500)}),
+            serde_json::json!([usage(1200, None, "ok")]),
+        ),
+        // A zero balance no longer exhausts the usage row.
+        (
+            serde_json::json!({"enabled": true, "used": usd(1200), "limit": usd(5000),
+                               "balance": usd(0)}),
+            serde_json::json!([usage(1200, Some(5000), "ok"), prepaid(0, "exhausted")]),
+        ),
+        // Only a balance: the usage row knows no amount, whatever the severity.
+        (
+            serde_json::json!({"enabled": true, "severity": "critical", "balance": usd(700)}),
+            serde_json::json!([
+                {"name": "Usage credits", "status": "unknown", "freshness": "fresh",
+                 "unit": "usd", "enabled": true},
+                prepaid(700, "ok")
+            ]),
+        ),
+    ] {
+        let body = serde_json::json!({"spend": spend});
+        assert_eq!(claude_credit_rows(&body), expected, "{spend}");
+    }
+}
+
+/// [behaviour] Spend metadata rides on the chosen usage-credit row: reload
+/// settings in cents, the purchase flag (a `false` stays `false`) and the
+/// provider's spend-limit flag.
+#[test]
+fn claude_spend_metadata_is_typed_and_never_guessed() {
+    let body = serde_json::json!({
+        "spend": {"enabled": true, "used": usd(1200), "limit": usd(5000),
+                  "can_purchase_credits": false,
+                  "auto_reload": {"enabled": false, "threshold_in_minor_units": 700,
+                                  "reload_to_in_minor_units": 2500, "currency": "USD"}},
+        "extra_usage": {"is_enabled": true, "spend_limit_reached": true}
     });
-    let balances = claude_oauth_credit_balances(&json);
-    assert_eq!(balances.len(), 1);
-    let credit = &balances[0];
-    assert_eq!(credit.name, "Usage credits");
-    assert_eq!(credit.unit, AgentCreditBalanceUnit::Usd);
-    assert_eq!(credit.status, AgentCreditBalanceStatus::Low);
-    assert_eq!(credit.used, CreditAmount::whole(321));
-    assert_eq!(credit.quota, CreditAmount::whole(500));
-    assert_eq!(credit.remaining, CreditAmount::whole(179));
-    assert_eq!(credit.used_percent, Some(64));
-    assert_eq!(credit.currency.as_deref(), Some("USD"));
-    assert_eq!(credit.enabled, Some(true));
+    assert_eq!(
+        claude_credit_rows(&body),
+        serde_json::json!([{
+            "name": "Usage credits", "status": "ok", "freshness": "fresh", "unit": "usd",
+            "used": 1200, "quota": 5000, "currency": "USD", "used_percent": 24,
+            "enabled": true, "spend_control_reached": true, "can_purchase_credits": false,
+            "auto_reload": {"enabled": false, "threshold": 700, "target": 2500}
+        }])
+    );
 }
 
 #[test]
-fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
+fn claude_oauth_spend_falls_back_to_limit_and_never_derives_remaining() {
     let json = credit_amount_input::usage_body(serde_json::json!({
         "spend": {
             "used": {"amount_minor": 500, "currency": "USD", "exponent": 2},
@@ -11640,12 +11761,14 @@ fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
             "enabled": true
         }
     }));
-    let balances = claude_oauth_credit_balances(&json);
-    assert_eq!(balances.len(), 1);
-    assert_eq!(balances[0].status, AgentCreditBalanceStatus::Exhausted);
-    assert_eq!(balances[0].used, CreditAmount::whole(500));
-    assert_eq!(balances[0].quota, CreditAmount::whole(500));
-    assert_eq!(balances[0].remaining, CreditAmount::whole(0));
+    assert_eq!(
+        serde_json::to_value(claude_oauth_credit_balances(&json)).unwrap(),
+        serde_json::json!([{
+            "name": "Usage credits", "status": "exhausted", "freshness": "fresh",
+            "unit": "usd", "used": 500, "quota": 500, "currency": "USD",
+            "used_percent": 100, "enabled": true
+        }])
+    );
 }
 
 #[test]
@@ -11688,12 +11811,13 @@ fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
             "currency": "USD"
         }
     }));
-    let balances = claude_oauth_credit_balances(&json);
-    assert_eq!(balances.len(), 1);
-    assert_eq!(balances[0].used, CreditAmount::whole(321));
-    assert_eq!(balances[0].quota, CreditAmount::whole(500));
-    assert_eq!(balances[0].remaining, CreditAmount::whole(179));
-    assert_eq!(balances[0].used_percent, Some(64));
+    assert_eq!(
+        serde_json::to_value(claude_oauth_credit_balances(&json)).unwrap(),
+        serde_json::json!([{
+            "name": "Usage credits", "status": "ok", "freshness": "fresh", "unit": "usd",
+            "used": 321, "quota": 500, "currency": "USD", "used_percent": 64, "enabled": true
+        }])
+    );
 }
 
 #[test]

@@ -519,7 +519,7 @@ crate::heap_layout_bound::unit_enum!(false;
     ottto_protocol::AgentContextCompleteness: FullPressure | WindowSizeOnly | Unavailable | Unknown;
     ottto_protocol::AgentContextState: Available | Unsupported | Unknown;
     ottto_protocol::CreditBalanceKind: UsageCredits | PlanCredits | SavedResets | OneTimeCredit
-        | WorkspaceAllowance | Unknown;
+        | WorkspaceAllowance | PrepaidCredits | Unknown;
     ottto_protocol::CreditGrantsState: Complete | Capped | Partial | Unavailable | NotSupported;
     ottto_protocol::CreditGrantsUnavailableCause: Reader;
     ottto_protocol::CreditGrantType: RateLimitReset | Credit | Unknown;
@@ -558,7 +558,9 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentContextSessionPeak; peak_
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentContextPressureSample; at, active_tokens, max_tokens, used_percent, remaining_tokens);
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditBalance; name, status, freshness, unit, account_label, account_identifier_hash, organization_identifier_hash, remaining, used, quota, unlimited, updated_at, currency, resets_at, used_percent, enabled, spend_control_reached, rate_limit_reached_type, limit_id, observed_at, expires_at, disabled_reason, grant_count, grants, grants_state, grants_observed_at, kind, title, next_expires_at, latest_granted_at, eligible, at_limit, ineligible_reason, cooldown_until, grants_unavailable_cause);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditBalance; name, status, freshness, unit, account_label, account_identifier_hash, organization_identifier_hash, remaining, used, quota, unlimited, updated_at, currency, resets_at, used_percent, enabled, spend_control_reached, rate_limit_reached_type, limit_id, observed_at, expires_at, disabled_reason, grant_count, grants, grants_state, grants_observed_at, kind, title, next_expires_at, latest_granted_at, eligible, at_limit, ineligible_reason, cooldown_until, grants_unavailable_cause, auto_reload, can_purchase_credits);
+
+crate::heap_layout_bound::no_heap!(true; ottto_protocol::AgentCreditAutoReload { enabled, threshold, target });
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditGrant; grant_key, grant_type, status, granted_at, starts_at, expires_at, resets_included, resets_left, clears, title, usable_now);
 

@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
-    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit, AgentQuotaWindow,
-    AgentQuotaWindowFreshness, CreditBalanceKind, CreditGrantsUnavailableCause,
+    ActiveSessionReconciliation, AgentCreditAutoReload, AgentCreditBalance, AgentCreditBalanceUnit,
+    AgentQuotaWindow, AgentQuotaWindowFreshness, CreditAmount, CreditBalanceKind,
+    CreditGrantsUnavailableCause,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -20,9 +21,9 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::quota_credit_model::{
-    apply_disabled, apply_readiness, build_grants, one_time_credit, BindingKey,
-    CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantListSection, GrantStatusInput,
-    ListObservation, Provider, ReadinessInput, SectionCache, TimeInput,
+    apply_disabled, apply_readiness, build_grants, one_time_credit, status_for_remaining,
+    BindingKey, CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantListSection,
+    GrantStatusInput, ListObservation, Provider, ReadinessInput, SectionCache, TimeInput,
 };
 
 /// A saved-reset variant response without a recognizable `cedar_ember` stops
@@ -34,6 +35,8 @@ const CLAUDE_SAVED_RESETS_QUERY: &str = "?cedar_ember=1&skip_spend=1";
 
 /// Name of the usage-credit balance (pinned by contract v2.2 §11.7 C4).
 pub(super) const CLAUDE_USAGE_CREDITS_NAME: &str = "Usage credits";
+/// Name of the organization's prepaid balance, a row of its own.
+const CLAUDE_PREPAID_BALANCE_NAME: &str = "prepaid_balance";
 /// Name of the Claude saved-reset balance: the same series name as Codex; the
 /// pool identity's source and binding keep the two apart (§11.7 C4).
 const CLAUDE_SAVED_RESETS_NAME: &str = "reset_bank";
@@ -99,8 +102,9 @@ impl ClaudeUsageRead {
 
 // The model's sections, in emission order. Each read owns some of them; a
 // read that does not carry a section re-sends the last observed one.
-const SECTIONS: [CreditSection; 3] = [
+const SECTIONS: [CreditSection; 4] = [
     CreditSection::UsageCredits,
+    CreditSection::PrepaidCredits,
     CreditSection::OneTimeCredits,
     CreditSection::SavedResets,
 ];
@@ -110,6 +114,7 @@ const SECTIONS: [CreditSection; 3] = [
 #[derive(Debug, Default)]
 pub(super) struct ClaudeCreditRead {
     usage_credits: Option<Vec<AgentCreditBalance>>,
+    prepaid_credits: Option<Vec<AgentCreditBalance>>,
     one_time_credits: Option<Vec<AgentCreditBalance>>,
     saved_resets: Option<Vec<AgentCreditBalance>>,
     pub(super) diagnostics: Vec<CreditModelDiagnostic>,
@@ -120,6 +125,8 @@ pub(super) struct ClaudeCreditRead {
 ///
 /// - Usage credits (`spend`, else `extra_usage`): the plain read only; the
 ///   saved-reset variant skips `spend` by request.
+/// - Prepaid balance: a plain read with a valid `spend.balance` only. Without
+///   one the stored balance is re-sent, never replaced by an empty or zero one.
 /// - One-time dollar pools: every read of a full usage body (both readings
 ///   report them), so a pool is always fresh.
 /// - A body without the usage-credit keys (a passive reading that kept only
@@ -139,18 +146,28 @@ pub(super) fn claude_credit_read(
     let full_body = carries_credit_sections(body);
     let one_time_credits =
         full_body.then(|| claude_one_time_credits(body, observed_at, &mut diagnostics));
-    let usage_credits = (full_body && read == ClaudeUsageRead::Plain).then(|| {
-        let (mut usage_credits, refusals) = super::claude_oauth_credit_balances_and_refusals(body);
+    let (usage_credits, prepaid_credits) = if full_body && read == ClaudeUsageRead::Plain {
+        let (usage, prepaid, refusals) = super::claude_oauth_credit_balances_and_refusals(body);
         diagnostics.extend(refusals);
+        let mut usage_credits = usage.into_iter().collect::<Vec<_>>();
+        let mut prepaid_credits = prepaid.map(|prepaid| vec![prepaid]);
         // `spend`/`extra_usage` → `usage_credits` (contract v2.2 §11.1).
         for balance in &mut usage_credits {
             balance.kind = Some(CreditBalanceKind::UsageCredits);
+        }
+        for balance in usage_credits
+            .iter_mut()
+            .chain(prepaid_credits.iter_mut().flatten())
+        {
             balance.observed_at = Some(observed_at.to_string());
         }
-        usage_credits
-    });
+        (Some(usage_credits), prepaid_credits)
+    } else {
+        (None, None)
+    };
     ClaudeCreditRead {
         usage_credits,
+        prepaid_credits,
         one_time_credits,
         saved_resets,
         diagnostics,
@@ -185,6 +202,7 @@ pub(super) fn claude_saved_resets_recognized(body: &Value) -> bool {
 fn balance_section(balance: &AgentCreditBalance) -> Option<CreditSection> {
     match balance.kind {
         Some(CreditBalanceKind::UsageCredits) => Some(CreditSection::UsageCredits),
+        Some(CreditBalanceKind::PrepaidCredits) => Some(CreditSection::PrepaidCredits),
         Some(CreditBalanceKind::OneTimeCredit) => Some(CreditSection::OneTimeCredits),
         Some(CreditBalanceKind::SavedResets) => Some(CreditSection::SavedResets),
         // Caches written before kinds existed held only the usage-credit row.
@@ -234,6 +252,7 @@ pub(super) fn claude_merge_credit_sections(
         .map(|fresh| keep_stored_grant_list(fresh, previous));
     for (section, fresh) in [
         (CreditSection::UsageCredits, &read.usage_credits),
+        (CreditSection::PrepaidCredits, &read.prepaid_credits),
         (CreditSection::OneTimeCredits, &read.one_time_credits),
         (CreditSection::SavedResets, &saved_resets),
     ] {
@@ -246,6 +265,19 @@ pub(super) fn claude_merge_credit_sections(
         .filter_map(|section| sections.resend_balances(binding, section))
         .flatten()
         .collect()
+}
+
+/// A cache written before usage credits stopped carrying `remaining` stored
+/// the cap-minus-used headroom there. It is dropped, never turned into a
+/// prepaid balance: that cache cannot tell a balance from headroom. Every
+/// other field and section, read times included, stays as stored.
+pub(super) fn drop_usage_credit_remaining(balances: &mut [AgentCreditBalance]) {
+    for balance in balances
+        .iter_mut()
+        .filter(|balance| balance_section(balance) == Some(CreditSection::UsageCredits))
+    {
+        balance.remaining = None;
+    }
 }
 
 /// A saved-reset reading whose `cedar_ember` had readiness but no `grants`
@@ -295,6 +327,61 @@ pub(super) fn claude_disabled_usage_credits(
     });
     refusals.extend(apply_disabled(&mut balance, reason));
     balance
+}
+
+/// The organization's prepaid balance in cents, read at the caller's
+/// `observed_at`. Only a balance, its currency and its own read time: no
+/// usage spend, limit, monthly reset or enabled flag.
+pub(super) fn claude_prepaid_balance(
+    cents: u64,
+    currency: Option<String>,
+) -> Option<AgentCreditBalance> {
+    let remaining = CreditAmount::whole(cents)?;
+    Some(AgentCreditBalance {
+        name: CLAUDE_PREPAID_BALANCE_NAME.to_string(),
+        status: status_for_remaining(Some(remaining)),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        remaining: Some(remaining),
+        currency,
+        kind: Some(CreditBalanceKind::PrepaidCredits),
+        ..Default::default()
+    })
+}
+
+/// Provider metadata on the chosen usage-credit balance, enabled or disabled:
+/// recognized `spend.auto_reload`, `spend.can_purchase_credits` and
+/// `extra_usage.spend_limit_reached` (as `spend_control_reached`). A present
+/// `false` stays `false`; a missing or malformed value stays absent.
+pub(super) fn attach_spend_metadata(
+    balance: &mut AgentCreditBalance,
+    spend: Option<&Value>,
+    extra_usage: Option<&Value>,
+) {
+    let bool_at = |section: Option<&Value>, key: &str| section?.get(key)?.as_bool();
+    balance.auto_reload = spend
+        .and_then(|spend| spend.get("auto_reload"))
+        .and_then(claude_auto_reload);
+    balance.can_purchase_credits = bool_at(spend, "can_purchase_credits");
+    if let Some(reached) = bool_at(extra_usage, "spend_limit_reached") {
+        balance.spend_control_reached = Some(reached);
+    }
+}
+
+/// The one auto-reload settings parser: `enabled`, and the bare-cents
+/// `threshold_in_minor_units` and `reload_to_in_minor_units`. Anything else,
+/// or no recognized field, is absent.
+fn claude_auto_reload(settings: &Value) -> Option<AgentCreditAutoReload> {
+    let settings = settings.as_object()?;
+    let cents = |key: &str| {
+        super::credit_amount_input::scaled(settings.get(key)?, 0).and_then(CreditAmount::whole)
+    };
+    let reload = AgentCreditAutoReload {
+        enabled: settings.get("enabled").and_then(Value::as_bool),
+        threshold: cents("threshold_in_minor_units"),
+        target: cents("reload_to_in_minor_units"),
+    };
+    (reload != AgentCreditAutoReload::default()).then_some(reload)
 }
 
 /// Top-level keys the window parser owns. A window may carry `*_dollars`
@@ -1594,6 +1681,56 @@ mod tests {
         let read = claude_credit_read(&no_spend, ClaudeUsageRead::Plain, READ_AT);
         assert_eq!(read.usage_credits.as_deref(), Some(&[][..]));
         assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// [money] A valid `spend.balance` is its own prepaid section with its own read
+    /// time: a later plain read without one, or a saved-reset read, re-sends
+    /// it as read, never as an empty or zero balance and never re-dated.
+    #[test]
+    fn prepaid_balance_is_its_own_section() {
+        let body = |balance: Value| {
+            usage_body(json!({
+                "five_hour": window(10, None),
+                "spend": {"enabled": true, "used": {"amount_minor": 1200, "exponent": 2},
+                          "limit": {"amount_minor": 5000, "exponent": 2}, "balance": balance}
+            }))
+        };
+        let (t1, t2) = ("2026-10-09T10:00:00Z", "2026-10-09T11:00:00Z");
+        let balance = json!({"amount_minor": 700, "exponent": 2});
+        let first = claude_merge_credit_sections(
+            "a",
+            &[],
+            &claude_credit_read(&body(balance), ClaudeUsageRead::Plain, t1),
+        );
+        let second = claude_merge_credit_sections(
+            "a",
+            &first,
+            &claude_credit_read(&body(Value::Null), ClaudeUsageRead::Plain, t2),
+        );
+        assert_eq!(
+            serde_json::to_value(&second).unwrap(),
+            json!([
+                {"name": "Usage credits", "status": "ok", "freshness": "fresh", "unit": "usd",
+                 "used": 1200, "quota": 5000, "used_percent": 24, "enabled": true,
+                 "kind": "usage_credits", "observed_at": t2},
+                {"name": "prepaid_balance", "status": "ok", "freshness": "fresh", "unit": "usd",
+                 "remaining": 700, "kind": "prepaid_credits", "observed_at": t1}
+            ])
+        );
+        let variant = claude_merge_credit_sections(
+            "a",
+            &second,
+            &claude_credit_read(
+                &variant_body(cedar_max()),
+                ClaudeUsageRead::SavedResets,
+                "2026-10-09T12:00:00Z",
+            ),
+        );
+        let resent = variant
+            .into_iter()
+            .filter(|b| b.name == CLAUDE_USAGE_CREDITS_NAME || b.name == "prepaid_balance")
+            .collect::<Vec<_>>();
+        assert_eq!(resent, second);
     }
 
     /// A saved-reset reading whose `cedar_ember` has readiness but no

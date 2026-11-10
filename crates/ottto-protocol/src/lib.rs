@@ -1977,6 +1977,35 @@ pub struct AgentCreditBalance {
         deserialize_with = "lenient_optional"
     )]
     pub grants_unavailable_cause: Option<CreditGrantsUnavailableCause>,
+    /// Provider auto-reload settings, amounts in this balance's unit. Absent
+    /// when the provider sent no recognized settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reload: Option<AgentCreditAutoReload>,
+    /// Whether the provider says the account may buy credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_purchase_credits: Option<bool>,
+}
+
+/// Provider auto-reload settings of a credit balance. Each field is absent
+/// when the provider did not report it; nothing is defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditAutoReload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Balance at which the provider reloads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub threshold: Option<CreditAmount>,
+    /// Balance the provider reloads to.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub target: Option<CreditAmount>,
 }
 
 /// Why a saved-resets balance's grants are unavailable (quota contract v2.2
@@ -2044,6 +2073,9 @@ pub enum CreditBalanceKind {
     SavedResets,
     OneTimeCredit,
     WorkspaceAllowance,
+    /// A prepaid balance the provider holds for the organization. Never
+    /// usage-credit spend.
+    PrepaidCredits,
     #[default]
     #[serde(other)]
     Unknown,
@@ -8936,6 +8968,20 @@ mod tests {
             (old.remaining, old.used, old.quota),
             (CreditAmount::whole(12), None, None)
         );
+    }
+
+    /// [format] Reload and purchase settings and the prepaid kind round-trip
+    /// through the upload unchanged.
+    #[test]
+    fn credit_reload_settings_and_prepaid_kind_round_trip() {
+        let upload = |body: &str| {
+            let balance: AgentCreditBalance = serde_json::from_str(body).unwrap();
+            serde_json::to_string(&redact_credit_balance_for_backend(balance).unwrap()).unwrap()
+        };
+        let usage = r#"{"name":"Usage credits","status":"unknown","freshness":"fresh","unit":"usd","enabled":false,"kind":"usage_credits","auto_reload":{"enabled":false,"threshold":700,"target":"25.5"},"can_purchase_credits":false}"#;
+        assert_eq!(upload(usage), usage);
+        let prepaid = r#"{"name":"prepaid_balance","status":"ok","freshness":"fresh","unit":"usd","remaining":700,"currency":"USD","observed_at":"2026-10-01T12:00:00Z","kind":"prepaid_credits"}"#;
+        assert_eq!(upload(prepaid), prepaid);
     }
 
     fn v22_credit_balance() -> AgentCreditBalance {

@@ -915,6 +915,8 @@ pub(crate) enum CreditSection {
     GrantList,
     /// Usage-credit balances.
     UsageCredits,
+    /// Prepaid balances; a read without one re-sends the stored one.
+    PrepaidCredits,
     /// One-time credit pools; every read that reports them emits them fresh.
     OneTimeCredits,
     /// Saved-reset balances.
@@ -937,9 +939,9 @@ struct CacheEntry {
 }
 
 /// Bound on cached sections across all bindings. Ottto watches at most 10
-/// Claude and 10 Codex account slots; a Claude binding uses up to three
+/// Claude and 10 Codex account slots; a Claude binding uses up to four
 /// balance sections and a Codex binding one grant list, so the live set is at
-/// most 40 entries. The rest holds sections of identities a slot switched
+/// most 50 entries. The rest holds sections of identities a slot switched
 /// away from (A→B→A). Every section is re-observed on its read cadence, so the
 /// oldest-stored entry is the stalest; evicting it emits a diagnostic.
 const SECTION_CACHE_MAX_ENTRIES: usize = 64;

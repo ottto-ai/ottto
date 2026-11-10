@@ -7,6 +7,7 @@
       "kind": "usage_credits",
       "name": "Usage credits",
       "observed_at": "2026-10-01T12:00:00Z",
+      "spend_control_reached": true,
       "status": "unknown",
       "unit": "usd"
     }

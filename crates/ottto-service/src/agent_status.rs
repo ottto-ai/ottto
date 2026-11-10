@@ -14698,7 +14698,7 @@ fn read_claude_oauth_usage_cache_locked(
     }
     let path = claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
     let body = fs::read_to_string(path).ok()?;
-    let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
+    let mut cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
     if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
         // Older cache layouts (v1: windows only; v2: no account identity) are
         // discarded so the next tick refetches under a known account.
@@ -14711,6 +14711,9 @@ fn read_claude_oauth_usage_cache_locked(
     ) {
         return None;
     }
+    // Caches written before usage credits stopped carrying `remaining` may
+    // still hold that cap-minus-used headroom.
+    claude_credit_pools::drop_usage_credit_remaining(&mut cache.credit_balances);
     Some(cache)
 }
 
@@ -14803,6 +14806,7 @@ fn migrate_legacy_claude_oauth_usage_cache_locked(
     else {
         return;
     };
+    claude_credit_pools::drop_usage_credit_remaining(&mut cache.credit_balances);
     cache.schema_version = CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION;
     if write_claude_oauth_usage_cache_locked(&cache).is_ok() {
         let _ = fs::remove_file(legacy);
@@ -15014,27 +15018,42 @@ fn claude_oauth_scoped_limit_windows(value: &Value) -> Vec<AgentQuotaWindow> {
 
 /// Usage-credit balances from the OAuth usage response. The newer `spend`
 /// object is authoritative; the older `extra_usage` shape is the fallback.
-/// Disabled accounts emit nothing (no credit chrome downstream), and a missing
-/// or unrecognized shape fails soft to an empty list so quota windows are
-/// never hidden by credit parsing.
+/// A switched-off section yields its disabled shape, and a missing or
+/// unrecognized shape fails soft to an empty list so quota windows are never
+/// hidden by credit parsing.
 fn claude_oauth_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
-    claude_oauth_credit_balances_and_refusals(value).0
+    claude_oauth_credit_balances_and_refusals(value)
+        .0
+        .into_iter()
+        .collect()
 }
 
-/// The usage-credit balances plus the model's field refusals (a disabled
-/// reason that is not a reason code), for the adapter's diagnostics.
+/// The usage-credit balance, the prepaid balance (a valid `spend.balance`,
+/// never the usage-credit `remaining`) and the model's field refusals (a
+/// disabled reason that is not a reason code), for the adapter's diagnostics.
 fn claude_oauth_credit_balances_and_refusals(
     value: &Value,
 ) -> (
-    Vec<AgentCreditBalance>,
+    Option<AgentCreditBalance>,
+    Option<AgentCreditBalance>,
     Vec<crate::quota_credit_model::CreditModelDiagnostic>,
 ) {
     let mut refusals = Vec::new();
-    let balance =
-        claude_oauth_spend_credit_balance(value.get("spend"), &mut refusals).or_else(|| {
-            claude_oauth_extra_usage_credit_balance(value.get("extra_usage"), &mut refusals)
-        });
-    (balance.into_iter().collect(), refusals)
+    let spend = value.get("spend");
+    let mut balance = claude_oauth_spend_credit_balance(spend, &mut refusals).or_else(|| {
+        claude_oauth_extra_usage_credit_balance(value.get("extra_usage"), &mut refusals)
+    });
+    if let Some(balance) = balance.as_mut() {
+        claude_credit_pools::attach_spend_metadata(balance, spend, value.get("extra_usage"));
+    }
+    let prepaid = spend.and_then(|spend| {
+        claude_credit_pools::claude_prepaid_balance(
+            claude_oauth_money_cents(spend.get("balance"))?,
+            claude_oauth_money_currency(spend.get("balance"))
+                .or_else(|| json_trimmed_string(spend, "currency")),
+        )
+    });
+    (balance, prepaid, refusals)
 }
 
 fn claude_oauth_spend_credit_balance(
@@ -15049,13 +15068,8 @@ fn claude_oauth_spend_credit_balance(
         ));
     }
     let used = claude_oauth_money_cents(spend.get("used"));
-    let quota = claude_oauth_money_cents(spend.get("cap"))
+    let quota = claude_oauth_money_cents(spend.get("cap").and_then(|cap| cap.get("money")))
         .or_else(|| claude_oauth_money_cents(spend.get("limit")));
-    let remaining =
-        claude_oauth_money_cents(spend.get("balance")).or_else(|| match (quota, used) {
-            (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
-            _ => None,
-        });
     let used_percent = json_u8(spend, &["percent"]).or_else(|| match (used, quota) {
         (Some(used), Some(quota)) if quota > 0 => {
             Some(((used.saturating_mul(100)) / quota).min(100) as u8)
@@ -15065,14 +15079,9 @@ fn claude_oauth_spend_credit_balance(
     let severity = spend.get("severity").and_then(Value::as_str).unwrap_or("");
     Some(AgentCreditBalance {
         name: claude_credit_pools::CLAUDE_USAGE_CREDITS_NAME.to_string(),
-        status: if used.is_none() && quota.is_none() && remaining.is_none() {
-            AgentCreditBalanceStatus::Unknown
-        } else {
-            claude_oauth_credit_status(severity, used, quota, remaining)
-        },
+        status: claude_oauth_credit_status(severity, used, quota),
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining: remaining.and_then(CreditAmount::whole),
         used: used.and_then(CreditAmount::whole),
         quota: quota.and_then(CreditAmount::whole),
         currency: claude_oauth_money_currency(spend.get("used"))
@@ -15102,10 +15111,6 @@ fn claude_oauth_extra_usage_credit_balance(
     // `spend`, which wins above.
     let quota = claude_oauth_money_cents(extra.get("monthly_limit"));
     let used = claude_oauth_money_cents(extra.get("used_credits"));
-    let remaining = match (quota, used) {
-        (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
-        _ => None,
-    };
     // The client uses an explicitly null monthly_limit for unlimited usage;
     // an omitted or malformed limit remains unknown.
     let unlimited = extra.get("monthly_limit").is_some_and(Value::is_null);
@@ -15115,13 +15120,10 @@ fn claude_oauth_extra_usage_credit_balance(
         status: if unlimited {
             AgentCreditBalanceStatus::Unlimited
         } else {
-            claude_oauth_credit_status("", used, quota, remaining)
+            claude_oauth_credit_status("", used, quota)
         },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining: remaining
-            .filter(|_| !unlimited)
-            .and_then(CreditAmount::whole),
         used: used.and_then(CreditAmount::whole),
         quota: quota.and_then(CreditAmount::whole),
         currency: json_trimmed_string(extra, "currency"),
@@ -15137,24 +15139,22 @@ fn claude_oauth_credit_status(
     severity: &str,
     used: Option<u64>,
     quota: Option<u64>,
-    remaining: Option<u64>,
 ) -> AgentCreditBalanceStatus {
+    if used.is_none() && quota.is_none() {
+        return AgentCreditBalanceStatus::Unknown;
+    }
     match severity.trim().to_ascii_lowercase().as_str() {
         "critical" => return AgentCreditBalanceStatus::Exhausted,
         "warning" => return AgentCreditBalanceStatus::Low,
         "normal" => return AgentCreditBalanceStatus::Ok,
         _ => {}
     }
-    match (used, quota, remaining) {
-        (_, _, Some(0)) => AgentCreditBalanceStatus::Exhausted,
-        (Some(used), Some(quota), _) if quota > 0 && used >= quota => {
-            AgentCreditBalanceStatus::Exhausted
-        }
-        (Some(used), Some(quota), _) if quota > 0 && used.saturating_mul(10) >= quota * 9 => {
+    match (used, quota) {
+        (Some(used), Some(quota)) if used >= quota => AgentCreditBalanceStatus::Exhausted,
+        (Some(used), Some(quota)) if used.saturating_mul(10) >= quota * 9 => {
             AgentCreditBalanceStatus::Low
         }
-        (Some(_), _, _) | (_, Some(_), _) => AgentCreditBalanceStatus::Ok,
-        _ => AgentCreditBalanceStatus::Unknown,
+        _ => AgentCreditBalanceStatus::Ok,
     }
 }
 
