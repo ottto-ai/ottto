@@ -419,3 +419,43 @@ fn sqlite_witness_routes_and_refuses_moved_snapshot() {
     assert_eq!(value.unwrap(), 7);
     assert!(kept.kept.is_empty());
 }
+
+/// [behaviour] A group reload names each home's first changed witness kind.
+#[test]
+fn sidecar_reload_kind_names_changed_witness() {
+    use facts::{capture, reload_kind, witness};
+    let home = std::env::temp_dir().join(format!(
+        "ottto-sidecar-reload-{}",
+        ottto_core::generate_control_token().unwrap()
+    ));
+    fs::create_dir_all(&home).unwrap();
+    let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (v INTEGER)")
+        .unwrap();
+    let kept = || witness(&capture(&home)).unwrap();
+    let mut old = kept();
+    assert_eq!(reload_kind(&capture(&home), None), Some(0), "cold");
+    assert_eq!(reload_kind(&capture(&home), Some(&old)), None, "unchanged");
+    // Grow both files: a same-size rewrite inside one mtime tick looks unchanged.
+    db.execute_batch("INSERT INTO t VALUES (zeroblob(20000))")
+        .unwrap();
+    assert_eq!(
+        reload_kind(&capture(&home), Some(&old)),
+        Some(4),
+        "WAL only"
+    );
+    old = kept();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(reload_kind(&capture(&home), Some(&old)), Some(3), "main");
+    old = kept();
+    fs::write(home.join("session_index.jsonl"), "{}\n").unwrap();
+    assert_eq!(reload_kind(&capture(&home), Some(&old)), Some(7), "index");
+    fs::write(home.join("state_5.sqlite-journal"), "").unwrap();
+    assert_eq!(
+        reload_kind(&capture(&home), Some(&old)),
+        Some(2),
+        "uncacheable"
+    );
+    drop(db);
+    let _ = fs::remove_dir_all(&home);
+}

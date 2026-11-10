@@ -1430,6 +1430,7 @@ pub(crate) struct StageWindow {
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    cli_meta: Option<std::collections::BTreeMap<String, u32>>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
@@ -1478,6 +1479,10 @@ impl StageWindow {
     pub(crate) fn set_evidence_mem(&mut self, mem: EvidenceMem) {
         self.evidence_mem = Some(mem);
     }
+    /// CLI metadata cache lookup reasons, counts by closed reason name only.
+    pub(crate) fn set_cli_meta(&mut self, reasons: std::collections::BTreeMap<String, u32>) {
+        self.cli_meta = (!reasons.is_empty()).then_some(reasons);
+    }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         let offpass = stage.starts_with("offpass_");
         Self {
@@ -1488,6 +1493,7 @@ impl StageWindow {
             jsonl: None,
             evidence_mem: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            cli_meta: None,
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1525,6 +1531,8 @@ impl Drop for StageWindow {
             jsonl: Option<jsonl::Counts>,
             #[serde(skip_serializing_if = "Option::is_none")]
             evidence_mem: Option<EvidenceMem>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cli_meta: Option<std::collections::BTreeMap<String, u32>>,
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
@@ -1541,6 +1549,7 @@ impl Drop for StageWindow {
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
+                cli_meta: self.cli_meta.take(),
             },
         });
     }
@@ -1646,6 +1655,7 @@ pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.cli_meta, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }
@@ -2781,6 +2791,22 @@ mod tests {
                 assert!(!text.contains(forbidden));
             }
         }
+    }
+
+    /// [behaviour] CLI metadata reasons ride the off-pass row; empty stays off.
+    #[test]
+    fn offpass_row_carries_cli_meta_reasons() {
+        let (_, rows) = capture(|| {
+            for reasons in [vec![("codex_hit".to_string(), 2)], vec![]] {
+                let mut stage = StageWindow::begin("unknown", "offpass_agent_status");
+                stage.set_cli_meta(reasons.into_iter().collect());
+            }
+        });
+        assert_eq!(
+            rows[0]["counts"]["cli_meta"],
+            serde_json::json!({"codex_hit": 2})
+        );
+        assert!(rows[1]["counts"].get("cli_meta").is_none());
     }
 
     /// [behaviour] A completed off-pass work unit uses the existing stage carrier.

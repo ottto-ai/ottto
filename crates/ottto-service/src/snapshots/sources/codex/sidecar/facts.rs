@@ -35,15 +35,33 @@ impl HeapLayoutBound for SidecarFacts {
     }
 }
 
-fn capture(root: &Path) -> [Option<SourceStamp>; 3] {
+pub(super) fn capture(root: &Path) -> [Option<SourceStamp>; 3] {
     [
         SourceStamp::capture_sqlite(&root.join("state_5.sqlite")),
         SourceStamp::capture_sqlite(&root.join("thread_history_1.sqlite")),
         SourceStamp::capture_file(&root.join("session_index.jsonl")).ok(),
     ]
 }
-fn witness(stamps: &[Option<SourceStamp>; 3]) -> Option<[SourceStamp; 3]> {
+pub(super) fn witness(stamps: &[Option<SourceStamp>; 3]) -> Option<[SourceStamp; 3]> {
     Some([stamps[0].clone()?, stamps[1].clone()?, stamps[2].clone()?])
+}
+
+/// A home's group-reload cause as a `SIDECAR_RELOAD_KINDS` index: its first
+/// changed witness in capture order; `None` when it is unchanged.
+pub(super) fn reload_kind(
+    stamps: &[Option<SourceStamp>; 3],
+    kept: Option<&[SourceStamp; 3]>,
+) -> Option<usize> {
+    let (Some(now), Some(old)) = (witness(stamps), kept) else {
+        return Some(if kept.is_none() { 0 } else { 2 });
+    };
+    let i = now.iter().zip(old).position(|(a, b)| !a.same(b))?;
+    let wal_only = matches!((&now[i], &old[i]), (SourceStamp::Sqlite { target: a, main: am, .. }, SourceStamp::Sqlite { target: b, main: bm, .. }) if a == b && am.same_content(bm));
+    Some(if i == 2 {
+        7
+    } else {
+        3 + 2 * i + usize::from(wal_only)
+    })
 }
 
 impl SidecarFacts {
@@ -61,7 +79,14 @@ impl SidecarFacts {
         let reuse = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
             matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
         });
+        let mut reload = [0_u32; 8];
         if !reuse {
+            reload[1] = u32::from(self.homes.kept.keys().any(|home| !listed.contains(home)));
+            for (home, stamps) in &before {
+                if let Some(kind) = reload_kind(stamps, self.homes.kept.get(home).map(|k| &k.0)) {
+                    reload[kind] = reload[kind].saturating_add(1);
+                }
+            }
             self.homes.kept.clear();
         }
         let mut after = BTreeMap::new();
@@ -77,6 +102,7 @@ impl SidecarFacts {
             loaded.insert(home.clone(), raw);
         }
         let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
+        metadata.local_diagnostics.sidecar_reload = reload;
         metadata.compact_titles();
         if !reuse {
             if !metadata.state_census_incomplete && !metadata.sidecar_census_incomplete {

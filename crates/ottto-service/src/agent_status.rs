@@ -42,6 +42,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -3290,6 +3291,34 @@ struct CodexCliMeta {
 static CODEX_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, CodexCliMeta, 3>>> = OnceLock::new();
 static CLAUDE_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, (), 1>>> = OnceLock::new();
 
+/// Lookup reasons since the last `offpass_agent_status` row: Codex, Claude.
+const CLI_META_REASONS: [&str; 8] = [
+    "hit",
+    "cold",
+    "stamp",
+    "capture",
+    "invalid",
+    "changed_during_load",
+    "age",
+    "bypass",
+];
+static CLI_META_REASON_COUNTS: [[AtomicU32; 8]; 2] =
+    [const { [const { AtomicU32::new(0) }; 8] }; 2];
+
+/// Nonzero counts only, e.g. `codex_hit`; names and counts, never a home.
+pub(crate) fn take_cli_meta_reasons() -> BTreeMap<String, u32> {
+    let mut taken = BTreeMap::new();
+    for (source, counts) in ["codex", "claude"].into_iter().zip(&CLI_META_REASON_COUNTS) {
+        for (reason, count) in CLI_META_REASONS.into_iter().zip(counts) {
+            let n = count.swap(0, AtomicOrdering::Relaxed);
+            if n > 0 {
+                taken.insert(format!("{source}_{reason}"), n);
+            }
+        }
+    }
+    taken
+}
+
 fn cli_meta<K: Ord + Clone, F: Clone, E, const N: usize>(
     cache: &Mutex<CliFacts<K, F, N>>,
     key: K,
@@ -3297,24 +3326,35 @@ fn cli_meta<K: Ord + Clone, F: Clone, E, const N: usize>(
     load: impl FnOnce() -> Result<F, E>,
     now: Instant,
     bypass: bool,
+    reasons: &[AtomicU32; 8],
 ) -> Result<F, E> {
+    use crate::transcript_acquisition::FactsReuse;
     // Move this key out while loading: never hold the shared lock over a CLI
     // spawn, file metadata lookup or parsing. Concurrent misses may both read.
     let mut local = CliFacts::default();
+    let mut aged = false;
     {
         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((stamp, facts)) = cache.kept.remove(&key) {
-            if !bypass && now.saturating_duration_since(facts.loaded_at) < CLI_META_MAX_AGE {
+            aged = now.saturating_duration_since(facts.loaded_at) >= CLI_META_MAX_AGE;
+            if !bypass && !aged {
                 local.kept.insert(key.clone(), (stamp, facts));
             }
         }
     }
-    let result = local.reuse_or_load(key.clone(), capture, || {
+    let (result, reason) = local.reuse_or_load_why(key.clone(), capture, || {
         load().map(|facts| CliMeta {
             loaded_at: now,
             facts,
         })
     });
+    // Bypass never reuses, so it names the lookup whatever the load did.
+    let reason = match reason {
+        _ if bypass => 7,
+        FactsReuse::Cold if aged => 6,
+        reason => reason as usize,
+    };
+    reasons[reason].fetch_add(1, AtomicOrdering::Relaxed);
     if let Some(kept) = local.kept.remove(&key) {
         cache
             .lock()
@@ -3376,7 +3416,15 @@ fn codex_cli_meta(
                 COMMAND_TIMEOUT,
                 allow_legacy_oauth,
             );
-            let parsed_account = parse_codex_account_text(&login.stdout);
+            // Codex prints `login status` to stderr. Admit that text only where
+            // this pass's complete auth read overrides every field it fills;
+            // other homes keep their stdout-only account surface.
+            let login_text = if reuse_login {
+                command_output_text(&login)
+            } else {
+                login.stdout.clone()
+            };
+            let parsed_account = parse_codex_account_text(&login_text);
             let parsed_login = parsed_account
                 .as_ref()
                 .map(|account| account.login_state.clone());
@@ -3405,6 +3453,7 @@ fn codex_cli_meta(
         !reuse_login
             || crate::provider_calls::current_trigger()
                 == Some(crate::provider_calls::Trigger::Setup),
+        &CLI_META_REASON_COUNTS[0],
     );
     match result {
         Ok(meta) => (Ok(meta.login), meta.models, fresh_login_account),
@@ -3439,6 +3488,7 @@ fn claude_version_detected() -> bool {
         },
         Instant::now(),
         false,
+        &CLI_META_REASON_COUNTS[1],
     )
     .is_ok()
 }
