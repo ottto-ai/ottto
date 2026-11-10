@@ -3,6 +3,8 @@
 //! emission, ACK or placement. Tags are process-local and bounded to one
 //! page: file tags live from selection to that page's upload, entity tags
 //! for that upload only. A lost tag counts as `unattributed`, never guessed.
+//! Each snapshot request also names its items' tags in one count header
+//! (`request_header`); never in the body.
 use super::{source_count, source_slot, CHANGE_REASON_START};
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{FullReason, ReadMode};
@@ -345,6 +347,34 @@ pub(crate) fn settled(source: &str, fingerprint: &str, usage_identical: bool) {
     }
 }
 
+/// One request's `X-Ottto-Upload-Reason` value: each item's attempted tag
+/// as `name=count`, in token order, nonzero only. An item this page never
+/// attempted counts as `unattributed`.
+pub(crate) fn request_header<'a>(
+    source: &str,
+    fingerprints: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let slot = source_slot(source);
+    let mut counts = [0u64; TOKENS.len()];
+    with_tags(|tags| {
+        for fingerprint in fingerprints {
+            let token = slot
+                .and_then(|slot| tags.upload[slot].entities.get(fingerprint))
+                .filter(|entity| entity.attempted)
+                .and_then(|entity| entity.token)
+                .unwrap_or(Token::Unattributed);
+            counts[token as usize] += 1;
+        }
+    });
+    TOKENS
+        .into_iter()
+        .zip(counts)
+        .filter(|(_, n)| *n != 0)
+        .map(|(name, n)| format!("{name}={n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// One page line's nonzero rows.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct Page {
@@ -416,6 +446,35 @@ mod tests {
         assert_eq!(row["money_changed_or_unknown"], 0);
         assert_eq!(page["unknown"][0], "money_only_reveal");
         assert!(drain("pi").is_none(), "the line drains its slots");
+    }
+
+    /// [behaviour] A request names each item's attempted tag once, a retry
+    /// keeps it, and an item never attempted or from another source is
+    /// `unattributed`.
+    #[test]
+    fn request_header_counts_attempted_tags_per_request() {
+        selected(
+            "codex",
+            "synthetic-key".into(),
+            Token::ParserRevision,
+            false,
+        );
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "synthetic-key".into(),
+            std::collections::BTreeSet::from(["changed".into()]),
+        );
+        propagate("codex", &index);
+        attempted("codex", "changed", None, None, 1);
+        attempted("codex", "held", None, Some(Token::AckRecovery), 1);
+        attempted("codex", "held-too", None, Some(Token::AckRecovery), 1);
+        attempted("codex", "held", None, None, 1);
+        assert_eq!(
+            request_header("codex", ["held", "changed", "held-too", "unseen"]),
+            "parser_revision=1,ack_recovery=2,unattributed=1"
+        );
+        assert_eq!(request_header("pi", ["changed"]), "unattributed=1");
+        assert_eq!(request_header("codex", []), "");
     }
 
     /// [behaviour] A `head_conflict` tag survives a later selection of the
