@@ -3499,6 +3499,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("resident_wave_money_tests.rs");
     }
     #[cfg(unix)]
+    mod root_twin_scope_tests {
+        include!("root_twin_scope_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }

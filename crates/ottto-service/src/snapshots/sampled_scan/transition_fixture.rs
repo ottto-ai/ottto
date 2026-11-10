@@ -985,6 +985,19 @@ pub(crate) mod money_oracle {
         }
     }
 
+    fn retain_envelope_entities(normalized: &mut Value, mut keep: impl FnMut(&Value) -> bool) {
+        for envelope in normalized.as_array_mut().unwrap().iter_mut() {
+            envelope["snapshots"]
+                .as_array_mut()
+                .unwrap()
+                .retain(&mut keep);
+        }
+        normalized
+            .as_array_mut()
+            .unwrap()
+            .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+    }
+
     /// `entity` is held in `other`; every emitted sibling must still equal cold.
     pub(crate) fn assert_held(
         entity: &str,
@@ -1018,17 +1031,7 @@ pub(crate) mod money_oracle {
         let mut actual = other.clone();
         // Filter whole envelopes, preserving every field of each emitted sibling.
         for result in [&mut expected, &mut actual] {
-            for envelope in result.normalized.as_array_mut().unwrap().iter_mut() {
-                envelope["snapshots"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|s| s["source_session_id"] != entity);
-            }
-            result
-                .normalized
-                .as_array_mut()
-                .unwrap()
-                .retain(|e| !e["snapshots"].as_array().unwrap().is_empty());
+            retain_envelope_entities(&mut result.normalized, |s| s["source_session_id"] != entity);
         }
         if !expected.snapshots.is_empty() {
             assert_equivalent(&expected, &actual);
@@ -1036,6 +1039,79 @@ pub(crate) mod money_oracle {
             assert!(actual.snapshots.is_empty());
             assert_eq!(expected.normalized, actual.normalized);
         }
+    }
+
+    /// `other` left unchanged entities off its page: each carries its accepted
+    /// body (`other.accepted`). Each carried body equals cold's money fields
+    /// and placement; the emitted ones equal cold with the carried filtered
+    /// out, as `assert_held` filters. An entity cold emits that `other`
+    /// neither emits nor carries is still missing.
+    pub(crate) fn assert_carried_equivalent(cold: &RouteResult, other: &RouteResult) {
+        let mut expected = cold.clone();
+        let mut differences = Vec::new();
+        for (entity, body) in &cold.snapshots {
+            if other.snapshots.contains_key(entity) {
+                continue;
+            }
+            expected.snapshots.remove(entity);
+            let Some(carried) = other.accepted.get(entity) else {
+                differences.push(format!("entity/{entity}: missing/extra emitted entity"));
+                continue;
+            };
+            for field in FIELDS {
+                let path = format!("carried/{entity}/{field}");
+                diff(
+                    &path,
+                    &body[*field],
+                    &carried.body[*field],
+                    &mut differences,
+                );
+            }
+            diff(
+                &format!("carried/placement/{entity}"),
+                &placement_snapshot(body),
+                &placement_snapshot(&carried.body),
+                &mut differences,
+            );
+        }
+        assert!(
+            differences.is_empty(),
+            "{:?} carried vs {:?}:\n{}",
+            other.mode,
+            cold.mode,
+            differences.join("\n")
+        );
+        retain_envelope_entities(&mut expected.normalized, |s| {
+            expected
+                .snapshots
+                .contains_key(s["source_session_id"].as_str().unwrap())
+        });
+        // An off-page member awaiting verification leaves its family's context
+        // posture uncertified, as for a main with one copy: the emitted main
+        // withholds as `unknown_birth` where cold withholds as `multi_file`.
+        // Both clear the same context scalars; every other byte still matches.
+        let label = |result: &RouteResult, id: &Value| {
+            let snapshots = result.normalized.as_array().unwrap().iter();
+            let mut snapshots = snapshots.flat_map(|e| e["snapshots"].as_array().unwrap());
+            snapshots
+                .find(|s| &s["source_session_id"] == id)
+                .map(|s| s["context_posture_withheld"].clone())
+        };
+        let other_labels = expected.normalized.as_array().unwrap().iter();
+        let other_labels = other_labels
+            .flat_map(|e| e["snapshots"].as_array().unwrap())
+            .map(|s| label(other, &s["source_session_id"]))
+            .collect::<Vec<_>>();
+        let snapshots = expected.normalized.as_array_mut().unwrap().iter_mut();
+        let snapshots = snapshots.flat_map(|e| e["snapshots"].as_array_mut().unwrap());
+        for (snapshot, other_label) in snapshots.zip(other_labels) {
+            if snapshot["context_posture_withheld"] == "multi_file"
+                && other_label.is_some_and(|label| label == "unknown_birth")
+            {
+                snapshot["context_posture_withheld"] = "unknown_birth".into();
+            }
+        }
+        assert_equivalent(&expected, other);
     }
 
     pub(crate) fn assert_quiet_restart_zero_bytes(result: &RouteResult) {
