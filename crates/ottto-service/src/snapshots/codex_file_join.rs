@@ -3207,13 +3207,14 @@ pub(super) mod tests {
         }
         panic!("bounded native scan did not finish");
     }
-    /// The two-member fixture with b's usage under `turn` (`tier` on its usage
-    /// lines when set) and a Codex logs database holding a priority request
-    /// for that turn, as Codex 0.119-0.142.x wrote it.
-    fn logs_priority_request_fixture(turn: &str, tier: Option<&str>) -> PathBuf {
+    /// The two-member fixture with b's usage under `turn` and a Codex logs
+    /// database holding a priority request for that turn, as Codex
+    /// 0.119-0.142.x wrote it. `tier`, when set, is on b's usage lines, or
+    /// with `inherited` on its `turn_context` only (the running selector).
+    fn logs_priority_request_fixture(turn: &str, tier: Option<&str>, inherited: bool) -> PathBuf {
         let (root, _) = fixture();
         let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
-        if let Some(tier) = tier {
+        if let Some(tier) = tier.filter(|_| !inherited) {
             for row in &mut rows[1..] {
                 if row["type"] == "token_usage_record" {
                     row["payload"]["service_tier"] = json!(tier);
@@ -3222,10 +3223,13 @@ pub(super) mod tests {
                 }
             }
         }
-        rows.insert(
-            1,
-            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
-        );
+        let mut context =
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}});
+        if let Some(tier) = tier.filter(|_| inherited) {
+            // An earlier non-usage line's tier, carried by the running selector.
+            context["payload"]["service_tier"] = json!(tier);
+        }
+        rows.insert(1, context);
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3263,7 +3267,8 @@ pub(super) mod tests {
     /// new turn, with no tier receipt, leaves every row at the default tier.
     #[test]
     fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
-        let root = logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None);
+        let root =
+            logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None, false);
         let (_, result) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(result.snapshots.len(), 2, "one alias per group member");
         for item in &result.snapshots {
@@ -3278,22 +3283,27 @@ pub(super) mod tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
-    /// [money] An explicit tier on the rollout's own usage lines now prices its
-    /// turn beside a logs priority request, where the logs stamp used to
+    /// [money] An explicit tier on the rollout's own usage lines, or inherited
+    /// from its `turn_context`, now prices its turn beside a logs priority
+    /// request, where the logs stamp used to
     /// replace it: each explicit value prices at its own (normalized) tier
     /// under the rollout line's own source; `priority` keeps its price.
     #[test]
     fn explicit_rollout_tier_is_no_longer_replaced_by_codex_logs() {
-        for (explicit, tier) in [
-            ("flex", "flex"),
-            ("priority", "priority"),
-            ("fast", "fast"),
-            ("standard", "standard"),
-            ("default", "standard"),
-        ] {
+        for (explicit, tier, inherited) in [false, true].into_iter().flat_map(|inherited| {
+            [
+                ("flex", "flex"),
+                ("priority", "priority"),
+                ("fast", "fast"),
+                ("standard", "standard"),
+                ("default", "standard"),
+            ]
+            .map(|(explicit, tier)| (explicit, tier, inherited))
+        }) {
             let root = logs_priority_request_fixture(
                 "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
                 Some(explicit),
+                inherited,
             );
             let (_, result) = scan(&root, ScanIndex::default(), 2);
             assert_eq!(result.snapshots.len(), 2, "one alias per group member");
@@ -3307,14 +3317,17 @@ pub(super) mod tests {
                     })
                     .map(|row| row.input_tokens)
                     .sum::<u64>();
-                assert_eq!(tiered, 200, "{tier}: b at its own tier");
+                assert_eq!(
+                    tiered, 200,
+                    "{tier} (inherited {inherited}): b at its own tier"
+                );
                 assert!(
                     item.model_usage.iter().all(|row| {
                         row.selector_sources
                             .get("service_tier")
                             .is_none_or(|source| source.starts_with("payload."))
                     }),
-                    "{tier}: {:?}",
+                    "{tier} (inherited {inherited}): {:?}",
                     item.model_usage
                 );
             }
@@ -3374,7 +3387,8 @@ pub(super) mod tests {
         tiers
     }
     /// [money] Rows an older build accepted priority from logs over an explicit
-    /// tier on the rollout's usage lines, re-read in a byte-zero replay: an
+    /// tier on the rollout's usage lines or inherited from its `turn_context`,
+    /// re-read in a byte-zero replay: an
     /// explicit `priority` keeps its price under the line's own source; an
     /// explicit non-priority tier fails the receipt's key match, so the
     /// replay emits nothing below priority.
@@ -3382,15 +3396,20 @@ pub(super) mod tests {
     fn accepted_logs_priority_over_an_explicit_tier_replays_or_holds() {
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        for explicit in ["priority", "flex"] {
-            let root = logs_priority_request_fixture(turn, Some(explicit));
+        for (explicit, inherited) in [
+            ("priority", false),
+            ("flex", false),
+            ("priority", true),
+            ("flex", true),
+        ] {
+            let root = logs_priority_request_fixture(turn, Some(explicit), inherited);
             let saved = accept_as_older_build(&root, turn);
             let mut loaded = ScanIndex::load(&saved).unwrap();
             loaded.prepare_historical_replay("logs-explicit-upgrade".into());
             let (_, replayed) = scan(&root, loaded, 2);
             let tiers = tiers_of(&replayed, owner);
             eprintln!(
-                "LOGS_EXPLICIT_REPLAY explicit={explicit} emitted={} tiers={tiers:?}",
+                "LOGS_EXPLICIT_REPLAY explicit={explicit} inherited={inherited} emitted={} tiers={tiers:?}",
                 replayed.snapshots.len()
             );
             let below_priority = tiers
