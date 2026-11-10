@@ -151,6 +151,23 @@ loading holds no cache lock. Census, refusal, pruning and retry rules are unchan
 and callers without a shared cache load cold. The status lane keeps its separate
 Desktop metadata cache.
 
+## Codex sidecar facts
+
+The process-owned transcript cache retains complete Codex home facts in RAM,
+using the shared file stamp for the resolved SQLite main file and its WAL.
+Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
+completeness and path fingerprints. Roster changes, changed inputs and partial
+loads reload the complete title group. Changed thread databases use one
+streaming census with independent staging for title, usage and created rows.
+Raw title equality uses an optional digest; a SHA midstate preserves the exact
+existing fingerprint bytes after the merged title prefix is known.
+
+Recent logs still use the existing full reader on every pass at both log
+locations, including its time window, ts-DESC result limit and incompleteness
+rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
+scan diagnostics include reuse/reload counts for state, history and session
+index facts, plus absent roots. An incremental logs reader is deferred.
+
 ## CLI status metadata
 
 Codex login state and bundled model metadata are cached in RAM per home while the

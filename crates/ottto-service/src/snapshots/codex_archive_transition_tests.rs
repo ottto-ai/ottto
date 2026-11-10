@@ -125,7 +125,8 @@ fn page_observed_with_limit(
     let delivered = Delivered::default();
     let ((answer, consumed), logs) = crate::local_resource_diagnostics::capture(|| {
         oracle::observe_consumed(|| {
-            let mut scan = OwnedSourceScan::new(
+            let scope = Scope("encoding-money-transition".into());
+            let mut scan = OwnedSourceScan::new_with_recovery_priority(
                 SnapshotSource::Codex,
                 roots,
                 index,
@@ -135,8 +136,12 @@ fn page_observed_with_limit(
                 None,
                 &[],
                 false,
+                &mut ListingRequest::default(),
+                false,
+                &[],
+                Some((&cache, &scope)),
             )
-            .with_sampled_acquisition(cache, Scope("encoding-money-transition".into()))
+            .with_sampled_acquisition(cache, scope)
             .with_line_observer("test", Box::new(delivered.clone()));
             observe(&mut scan);
             for _ in 0..100_000 {
@@ -1815,4 +1820,9 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
         serde_json::to_value(&index.session_account_bindings).unwrap()
     );
     assert_quiet(&c, index, &paged);
+}
+
+mod sidecar_reuse_transition {
+    use super::*;
+    include!("sources/codex/sidecar/reuse_transition.rs");
 }

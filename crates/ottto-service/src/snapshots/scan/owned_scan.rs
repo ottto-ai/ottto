@@ -478,7 +478,14 @@ impl OwnedSourceScan {
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
         let codex_title_metadata = if source == SnapshotSource::Codex {
-            let mut metadata = CodexTitleMetadata::load_from_roots(roots);
+            let mut metadata = carry_cache.map_or_else(
+                || CodexTitleMetadata::load_from_roots(roots),
+                |(cache, scope)| {
+                    cache.with_codex_sidecars(scope, |facts| {
+                        CodexTitleMetadata::load_reused(roots, facts)
+                    })
+                },
+            );
             metadata.scope_created_thread_census(index, roots);
             metadata
         } else {

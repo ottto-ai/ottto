@@ -5,6 +5,7 @@ use crate::snapshots::*;
 pub(in crate::snapshots) struct RootSidecar {
     pub threads: BTreeMap<String, Shared<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
+    pub raw: super::sidecar::facts::RawRows,
 }
 
 // A copied provider row can reconstruct its millisecond creation time from a
@@ -46,7 +47,10 @@ fn compatible_copy(
     if left == right {
         return true;
     }
-    if left.title != right.title || left.model != right.model || left.archived != right.archived {
+    if left.title_digest() != right.title_digest()
+        || left.model != right.model
+        || left.archived != right.archived
+    {
         return false;
     }
     let Some(locator) = copy_locator(left_root, id, left) else {
@@ -171,7 +175,7 @@ pub(in crate::snapshots) fn merge_extents(
     }
 }
 
-crate::heap_layout_bound::fields!(RootSidecar; threads, extents);
+crate::heap_layout_bound::fields!(RootSidecar; threads, extents, raw);
 
 #[cfg(test)]
 mod tests;
