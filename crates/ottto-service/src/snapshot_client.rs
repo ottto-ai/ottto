@@ -2001,6 +2001,7 @@ fn require_cloud_session_success(
 #[error("config upload refused: source_disabled")]
 pub(crate) struct UploadRefused;
 
+#[expect(clippy::result_large_err, reason = "preserve ureq's send result")]
 fn relay_sent(
     token: &str,
     result: std::result::Result<ureq::Response, ureq::Error>,

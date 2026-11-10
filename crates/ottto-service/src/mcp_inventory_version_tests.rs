@@ -258,7 +258,7 @@ fn harvest_seed_post_success_failure_restart_and_read_free_dumps() {
     assert_eq!(built.inventory.client_version.as_deref(), Some("0.148.9"));
     let captured = Arc::new(Mutex::new(Vec::new()));
     // Full feed uploads once; restart with an empty feed must reuse the seed.
-    let (base, server) = mock_backend(captured.clone(), 5, HintMode::Enabled);
+    let (base, server) = mock_backend(captured.clone(), 4, HintMode::Enabled);
     let client = SnapshotApiClient::new(base.clone());
     let _api = EnvGuard::set("OTTTO_API_BASE_URL", &base);
     with_transcript_io_denied(|| {
@@ -341,7 +341,7 @@ fn harvest_seed_post_success_failure_restart_and_read_free_dumps() {
     );
     let newer = full_version_feed(&home, "2026-10-07T11:00:00Z", "0.149.0");
     let version_only = full_version_feed(&home, "2026-10-07T11:00:01Z", "0.149.1");
-    let (base, server) = mock_backend(captured.clone(), 7, HintMode::Enabled);
+    let (base, server) = mock_backend(captured.clone(), 5, HintMode::Enabled);
     with_transcript_io_denied(|| {
         harvest_source(
             &SnapshotApiClient::new(base.clone()),
