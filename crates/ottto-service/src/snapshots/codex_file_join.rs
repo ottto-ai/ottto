@@ -3326,7 +3326,7 @@ pub(super) mod tests {
     /// Returns the saved index path.
     fn accept_as_older_build(root: &Path, turn: &str) -> PathBuf {
         older_build_logs_priority(turn);
-        let (mut working, mut first) = scan(root, ScanIndex::default(), 2);
+        let (mut working, mut first) = scan(root, ScanIndex::default(), 3);
         assert!(
             first
                 .snapshots
@@ -3447,7 +3447,7 @@ pub(super) mod tests {
         legacy.save(&saved).unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
         loaded.prepare_historical_replay("receipt-less-upgrade".into());
-        let (_, replayed) = scan(&root, loaded, 2);
+        let (_, replayed) = scan(&root, loaded, 3);
         let tiers = tiers_of(&replayed, owner);
         eprintln!(
             "LOGS_RECEIPT_LESS_REPLAY emitted={} tiers={tiers:?}",
