@@ -2822,7 +2822,13 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(record["counts"], serde_json::json!({}));
+        if cfg!(target_os = "macos") {
+            for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
+                assert!(record["counts"]["allocator_relief"][field].is_u64());
+            }
+        } else {
+            assert_eq!(record["counts"], serde_json::json!({}));
+        }
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
