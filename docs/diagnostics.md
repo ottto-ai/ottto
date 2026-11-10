@@ -373,6 +373,7 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
+`source_prepare` also reports `observation.malloc_in_use_bytes` sampled at prepare start on macOS; absent when unavailable.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
 including errors or no-frame returns. Like `source_finish`, it emits no record
