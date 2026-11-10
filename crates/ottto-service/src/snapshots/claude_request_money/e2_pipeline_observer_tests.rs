@@ -85,7 +85,7 @@ pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
 
 /// Capture the counters of folds released by one real enrichment. This keeps
 /// acceptance assertions independent of fold lifetime, with no retained body.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Released {
     pub(crate) root_fallbacks: u64,
     pub(crate) disclosed: u64,
@@ -132,15 +132,13 @@ pub(crate) fn released_for_marks(fold: &FileFold) -> bool {
         && fold.skipped.is_empty()
 }
 
-pub(crate) fn before_release(items: &[SnapshotItem]) {
+/// Each body as its evidence chunk releases it: the page's count sums them.
+pub(crate) fn before_release(item: &SnapshotItem) {
     RELEASED.with(|counts| {
         if let Some(mut page) = counts.get() {
             // Observe final native bodies before the caller's history veto,
             // including disclosing folds that keep inline marks at release.
-            page.removed_requests = items
-                .iter()
-                .map(|item| item.removed_request_count.unwrap_or(0))
-                .sum();
+            page.removed_requests += item.removed_request_count.unwrap_or(0);
             counts.set(Some(page));
         }
     });

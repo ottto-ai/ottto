@@ -9230,6 +9230,17 @@ thread_local! {
     static ONE_EVIDENCE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Packed chunks run on this thread, reference arms excluded.
     static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The release-timing reference: emitted folds released once at page end.
+    static PAGE_END_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Emitted folds released once at page end: the release-timing reference.
+fn page_end_release() -> bool {
+    #[cfg(test)]
+    if PAGE_END_RELEASE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -9319,8 +9330,8 @@ struct ClaudeEvidencePage<'p> {
 
 /// The evidence stage over one page: its families are packed into chunks and
 /// the evidence body runs once per chunk, so one chunk's rows are resident at
-/// a time. Copy decisions, original carriers, census health and the release
-/// of emitted folds run once over the page.
+/// a time. Copy decisions, original carriers and census health run once over
+/// the page; each chunk's emitted folds are released when it ends.
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9376,7 +9387,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     );
     let chunks = pack_claude_evidence_families(support_dir, &scan_result.snapshots);
     #[cfg(test)]
-    if !one_evidence_chunk() {
+    if !one_evidence_chunk() && !page_end_release() {
         EVIDENCE_CHUNKS.with(|count| count.set(count.get() + chunks.len()));
     }
     // Each session's first page slot: chunk outputs go back in page order.
@@ -9437,6 +9448,15 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             survivors.next().is_none(),
             "the evidence body only removes items"
         );
+        // After the restore, which matches on the folds: no later chunk or
+        // page step reads an emitted fold, so its inputs go with its chunk.
+        if !page_end_release() {
+            for &slot in &chunk.slots {
+                if let Some(item) = restored[slot].as_mut() {
+                    release_emitted(item);
+                }
+            }
+        }
     }
     scan_result.snapshots = restored.into_iter().flatten().collect();
     disposition
@@ -9496,21 +9516,21 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    // All local consumers (finalizer, identity, account qualification and the
-    // optional shadow) have finished. Release native inputs only for emitted
-    // `e2` bodies before upload clones/checkpoints.
-    // Held and legacy bodies retain their inputs for their existing owners.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
+    if page_end_release() {
+        scan_result.snapshots.iter_mut().for_each(release_emitted);
     }
     drop(evidence_window);
     (disposition, census_withheld, stats)
+}
+
+/// All local consumers of a chunk's bodies (finalizer, identity, account
+/// qualification and the optional shadow) have finished. Release native
+/// inputs only for emitted `e2` bodies before upload clones/checkpoints;
+/// held and legacy bodies retain their inputs for their existing owners.
+fn release_emitted(item: &mut SnapshotItem) {
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
 /// The evidence body over one chunk (`scan_result`'s snapshots), from the API

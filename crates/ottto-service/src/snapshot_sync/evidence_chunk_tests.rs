@@ -324,6 +324,30 @@ fn evidence_keeps_the_largest_group_not_the_page() {
     });
 }
 
+/// `page.enrich`, first checked against the release-timing reference: the
+/// same page and packing with emitted folds released once at page end. Exact
+/// bodies, index, stats, holds, wire bytes and placement (`compare`), and the
+/// released folds' counters.
+fn enrich_against_page_end(page: &mut Page, c: &Corpus) {
+    let terminal = page.scan.census_complete;
+    let checks = STREAMED_CHECKS.with(std::cell::Cell::take);
+    let reference = unobserved(|| {
+        isolated(|| {
+            let mut reference = twin(page);
+            crate::snapshot_sync::PAGE_END_RELEASE.with(|on| on.set(true));
+            reference.enrich(c);
+            crate::snapshot_sync::PAGE_END_RELEASE.with(|on| on.set(false));
+            reference
+        })
+    });
+    STREAMED_CHECKS.with(|slot| slot.set(checks));
+    page.enrich(c);
+    unobserved(|| {
+        StreamedChecks::default().compare(terminal, (&reference, None, 0), (&*page, None, 0))
+    });
+    assert_eq!(reference.released, page.released, "released folds");
+}
+
 /// The three-family page swept to a terminal census. Its first page is a
 /// real next-fit boundary: BIG alone, then SMALL and SMALLER together.
 fn three_family_sweep() {
@@ -334,7 +358,7 @@ fn three_family_sweep() {
             let before = crate::snapshot_sync::evidence_chunks_for_test();
             let mut page = c.raw(&scanner, index, 100, true, &[]);
             let families = page.scan.snapshots.len();
-            page.enrich(&c);
+            enrich_against_page_end(&mut page, &c);
             if pass == 0 {
                 assert_eq!(families, 3, "one page holds all three roots");
                 assert_eq!(
@@ -387,7 +411,9 @@ fn twins_beside_another_family() {
         );
         let scanner = E2ScanFixture::default();
         let before = crate::snapshot_sync::evidence_chunks_for_test();
-        let mut page = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+        enrich_against_page_end(&mut page, &c);
+        let mut page = deliver_page(page);
         assert_eq!(scanner.paths().len(), 3, "every file was opened");
         assert_eq!(
             crate::snapshot_sync::evidence_chunks_for_test() - before,
@@ -409,8 +435,9 @@ fn twins_beside_another_family() {
 /// the page as one chunk emits, and what a fold keeping every root's rows
 /// emits (all `StreamedChecks`), on non-terminal and terminal passes: a real
 /// next-fit boundary, the five streamed-sweep roots on one page and three per
-/// page, and path twins interleaved with another family. The multi-root sweep
-/// has its own regression below.
+/// page, and path twins interleaved with another family. The two chunked
+/// fixtures also release each chunk's emitted folds exactly as the page-end
+/// release does. The multi-root sweep has its own regression below.
 #[test]
 fn chunked_evidence_equals_one_chunk() {
     let checks = streamed_checks(|| {
