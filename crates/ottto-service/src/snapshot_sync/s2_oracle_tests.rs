@@ -182,6 +182,7 @@ fn battery_skipped_ticks_preserve_all_appends() {
             &c.base.join("state"),
         );
         let prior = commit(&session, page(&c, index, 100, true));
+        let agent_path = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
         let start = Instant::now();
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(start, 1);
@@ -192,6 +193,14 @@ fn battery_skipped_ticks_preserve_all_appends() {
             let suffix = line(ROOT, &format!("battery-{n}"), "2026-08-02T07:04:00Z", 6);
             suffix_bytes += suffix.len() as u64;
             append(&path, &suffix);
+            let agent_suffix = line(
+                ROOT,
+                &format!("battery-agent-{n}"),
+                "2026-08-02T07:04:00Z",
+                3,
+            );
+            suffix_bytes += agent_suffix.len() as u64;
+            append(&agent_path, &agent_suffix);
             cadence.record_file_event(start + Duration::from_secs(seconds));
             assert!(!cadence
                 .next_scan_after(start + Duration::from_secs(seconds))
@@ -201,7 +210,8 @@ fn battery_skipped_ticks_preserve_all_appends() {
             .next_scan_after(start + SNAPSHOT_SYNC_INTERVAL * 3)
             .is_zero());
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
-        let (stored, bytes) = fixture::observe_consumed(|| hinted(&c, prior, 100, true, &[path]));
+        let (stored, bytes) =
+            fixture::observe_consumed(|| hinted(&c, prior, 100, true, &[path, agent_path]));
         assert_eq!(bytes, suffix_bytes, "every skipped byte read exactly once");
         assert_eq!(stored.modes.0, 0, "same cursor, no Full");
         assert!(stored.modes.1 > 0, "all skipped appends read by Tail");
