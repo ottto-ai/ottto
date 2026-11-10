@@ -3074,8 +3074,8 @@ impl OwnedSourceScan {
                 index.count_unacked_retired(source, unacked);
                 // G1: only census members hold discovery. A pending re-read
                 // (growth after this generation processed its path) is
-                // next-generation evidence; retiring drops it and the next
-                // walk re-reads the file if it is stale.
+                // next-generation evidence. A completed kept generation drains
+                // it normally, and cannot start its backstop while it is queued.
                 let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
                     traversal.pending_directories.is_empty()
                         && !traversal
@@ -3152,16 +3152,18 @@ impl OwnedSourceScan {
                         audit_now,
                     );
                 }
-                let reconciliation_complete = if traversal_discovery_done
-                    && traversal_healthy
-                    && clean_frozen_generation
-                    && state_census_complete
-                    && sidecar_census_complete
-                {
-                    reconcile_missing_index_entries_bounded(index, source)
-                } else {
-                    false
-                };
+                let already_completed = traversal_snapshot.completed_unix_seconds.is_some();
+                let reconciliation_complete = already_completed
+                    || if traversal_discovery_done
+                        && traversal_healthy
+                        && clean_frozen_generation
+                        && state_census_complete
+                        && sidecar_census_complete
+                    {
+                        reconcile_missing_index_entries_bounded(index, source)
+                    } else {
+                        false
+                    };
                 // Vanished paths are retired from `files` just above - by exact watcher
                 // remove/rename hints and by bounded census reconciliation. Terminal
                 // dispositions are keyed identically, so retire their orphans in the same
@@ -3173,6 +3175,16 @@ impl OwnedSourceScan {
                 // the inventory, even while that file's parse is deferred.
                 if let Some(inventory) = codex_join_inventory.as_ref() {
                     codex_counting_version::note_inventory_created(index, inventory);
+                }
+                // Full context-curve upload is retired: a restored old curve
+                // never leaves the Mac.
+                for snapshot in &mut snapshots {
+                    snapshot.context_curve = None;
+                }
+                index.preserve_decode_held_files(source, &snapshots, &mut pending_finalization);
+                snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
+                if !index.decode_holds.is_empty() {
+                    index.mark_bounded_sweep_unsettled();
                 }
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
@@ -3190,8 +3202,10 @@ impl OwnedSourceScan {
                     && source == SnapshotSource::ClaudeCode
                     && index.claude_usage_authority_pending_count() > 0;
                 let census_complete = raw_census_complete
+                    && !already_completed
                     && !needs_clean_followup
-                    && !authority_debt_withholds_census;
+                    && !authority_debt_withholds_census
+                    && index.decode_holds.is_empty();
                 // Prune and measure only, before any fold.
                 let claude_request_census_shadow =
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
@@ -3201,6 +3215,9 @@ impl OwnedSourceScan {
                             &census_window_end,
                         )
                     });
+                if census_complete {
+                    index.record_scan_residue_witness(source, &traversal_snapshot);
+                }
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -3283,11 +3300,9 @@ impl OwnedSourceScan {
                     retry_not_before_unix_seconds: traversal
                         .unhealthy_retry_not_before_unix_seconds,
                 };
-                if raw_census_complete {
-                    index.record_scan_residue_witness(source, &traversal_snapshot);
-                }
                 let mut carried_next_generation = Vec::new();
                 if (raw_census_complete
+                    && (!already_completed || needs_clean_followup)
                     && codex_legacy_join_baselines.is_empty()
                     && !pending_finalization.iter().any(|pending| {
                         index.files.get(&pending.index_key).is_some_and(|entry| {
@@ -3320,22 +3335,24 @@ impl OwnedSourceScan {
                     // its window end) are next-generation evidence. Hand them
                     // to the next generation as members rather than dropping
                     // them; they never re-enter the generation closing here.
-                    carried_next_generation = index
-                        .traversal
-                        .as_ref()
-                        .filter(|_| source == SnapshotSource::Codex)
-                        .map_or_else(Vec::new, |traversal| {
-                            traversal
-                                .pending_candidates
-                                .iter()
-                                .filter(|candidate| !candidate.census_member)
-                                .map(|candidate| candidate.path.clone())
-                                .collect::<Vec<_>>()
-                        });
-                    index.traversal = None;
-                    index.resume_after_path = None;
-                    index.resume_upper_bound_path = None;
-                    index.resume_census_window_end = None;
+                    if !census_complete {
+                        carried_next_generation = index
+                            .traversal
+                            .as_ref()
+                            .filter(|_| source == SnapshotSource::Codex)
+                            .map_or_else(Vec::new, |traversal| {
+                                traversal
+                                    .pending_candidates
+                                    .iter()
+                                    .filter(|candidate| !candidate.census_member)
+                                    .map(|candidate| candidate.path.clone())
+                                    .collect::<Vec<_>>()
+                            });
+                        index.traversal = None;
+                        index.resume_after_path = None;
+                        index.resume_upper_bound_path = None;
+                        index.resume_census_window_end = None;
+                    }
                 }
                 let counts = traversal_snapshot.counts;
                 let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
@@ -3360,14 +3377,6 @@ impl OwnedSourceScan {
                     } else {
                         (0, 0)
                     };
-                // Full context-curve upload is retired: a restored old curve
-                // never leaves the Mac.
-                for snapshot in &mut snapshots {
-                    snapshot.context_curve = None;
-                }
-                index.preserve_decode_held_files(source, &snapshots, &mut pending_finalization);
-                snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
-                let census_complete = census_complete && index.decode_holds.is_empty();
                 if census_complete {
                     // Only a healthy EFFECTIVE terminal can prove a
                     // carried file gone. A raw terminal, another file's census,

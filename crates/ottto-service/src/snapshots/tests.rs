@@ -138,6 +138,7 @@ fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalChe
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
+        completed_unix_seconds: None,
     }
 }
 
@@ -2801,6 +2802,7 @@ fn traversal_restart_after_scan_derivation_upgrade_revisits_consumed_prefix() {
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
+        completed_unix_seconds: None,
     });
 
     let scan = scan_source_roots(
@@ -3027,7 +3029,15 @@ fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: b
         .expect("last bounded page");
         apply_claude_reported_usage_with_index(&mut last.snapshots, &api, &trace, &mut index);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut last, &mut index);
-        assert!(index.traversal.is_none(), "directory census drained");
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .is_empty(),
+            "directory census drained"
+        );
         assert_eq!(last.census_complete, generation >= 1);
         index.save(&checkpoint).expect("persist terminal page");
         index = ScanIndex::load(&checkpoint).expect("reload terminal page");
@@ -3198,6 +3208,7 @@ fn deletion_reconciliation_is_bounded_and_resumable() {
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
+            completed_unix_seconds: None,
         }),
         ..ScanIndex::default()
     };
@@ -3243,7 +3254,7 @@ fn repeated_watcher_hints_cannot_starve_bounded_census() {
             assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
         } else {
             assert!(scan.census_complete);
-            assert!(index.traversal.is_none());
+            assert!(index.traversal.is_some());
         }
     }
     let _ = fs::remove_dir_all(root);
@@ -3777,7 +3788,7 @@ fn residue_is_not_settled_while_candidates_are_still_pending() {
         }
     }
     assert!(last.census_complete, "{last:#?}");
-    assert!(index.traversal.is_none());
+    assert!(index.traversal.is_some());
     assert_eq!(
         index
             .scan_residue_witness
@@ -3929,7 +3940,7 @@ fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
     .expect("repaired generation");
     assert!(repaired.census_complete, "{repaired:#?}");
     assert_eq!(repaired.ownership_incomplete_file_count, 1);
-    assert!(index.traversal.is_none());
+    assert!(index.traversal.is_some());
     assert_eq!(
         index
             .scan_residue_witness
@@ -3994,6 +4005,7 @@ fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now(
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
+            completed_unix_seconds: None,
         };
 
     index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
@@ -4068,7 +4080,7 @@ fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now(
     );
 
     // The latch clears with the problem: the next due retry completes and
-    // drops the traversal, so a fresh generation starts at zero.
+    // retains the completed traversal with its retry history cleared.
     fs::remove_file(root.join("escape")).expect("remove symlink");
     let scan = scan_source_roots(
         SnapshotSource::Pi,
@@ -4079,7 +4091,10 @@ fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now(
     )
     .expect("repaired generation");
     assert!(scan.census_complete);
-    assert!(index.traversal.is_none());
+    let completed = index.traversal.as_ref().unwrap();
+    assert!(completed.completed_unix_seconds.is_some());
+    assert_eq!(completed.unhealthy_retry_attempt, 0);
+    assert_eq!(completed.unhealthy_retry_not_before_unix_seconds, None);
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(outside);
 }
@@ -22650,6 +22665,7 @@ fn traversal_reset_scope_checkpoint(
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
+        completed_unix_seconds: None,
     }
 }
 

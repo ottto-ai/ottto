@@ -97,6 +97,60 @@ pub(in crate::snapshots) enum TraversalProgress {
     Resumed,
 }
 
+// The durable graph is hydrated each page. Keep just the completion edge in
+// process memory, bound to the checkpoint it belongs to, across those loads.
+#[derive(Clone)]
+struct CompletedGeneration {
+    context: String,
+    window: String,
+    at: u64,
+}
+
+fn with_completed_generation<T>(
+    source: SnapshotSource,
+    f: impl FnOnce(&mut Option<CompletedGeneration>) -> T,
+) -> T {
+    let slot = match source {
+        SnapshotSource::ClaudeCode => 0,
+        SnapshotSource::Codex => 1,
+        SnapshotSource::Pi => 2,
+    };
+    #[cfg(not(test))]
+    {
+        static COMPLETED: Mutex<[Option<CompletedGeneration>; 3]> = Mutex::new([None, None, None]);
+        f(&mut COMPLETED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[slot])
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static COMPLETED: std::cell::RefCell<[Option<CompletedGeneration>; 3]> = const { std::cell::RefCell::new([None, None, None]) };
+        }
+        COMPLETED.with(|completed| f(&mut completed.borrow_mut()[slot]))
+    }
+}
+
+pub(in crate::snapshots) fn remember_completed_generation(
+    source: SnapshotSource,
+    traversal: &ScanTraversalCheckpoint,
+) {
+    with_completed_generation(source, |slot| {
+        *slot = traversal
+            .completed_unix_seconds
+            .map(|at| CompletedGeneration {
+                context: traversal.context_fingerprint.clone(),
+                window: traversal.census_window_end.clone(),
+                at,
+            });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn forget_completed_generation_for_test(source: SnapshotSource) {
+    with_completed_generation(source, |slot| *slot = None);
+}
+
 pub(in crate::snapshots) fn ensure_bounded_traversal(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -108,6 +162,19 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         rearm_cause::retain(index);
     }
     adopt_legacy_traversal_fingerprint(source, roots, index, backfill_window_days);
+    if let Some(traversal) = index.traversal.as_mut()
+        && traversal.completed_unix_seconds.is_none()
+    {
+        traversal.completed_unix_seconds = with_completed_generation(source, |slot| {
+            slot.as_ref()
+                .filter(|completed| {
+                    completed.context == traversal.context_fingerprint
+                        && completed.window == traversal.census_window_end
+                })
+                .map(|completed| completed.at)
+        });
+    }
+
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -154,8 +221,8 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
                 .iter()
                 .any(|candidate| candidate.census_member)
             && traversal.counts.has_errors();
-        // What clears the latch: a generation that completes drops the
-        // traversal, and a changed scan context takes the `else` branch below;
+        // Completion clears the latch, and a changed scan context takes
+        // the `else` branch below;
         // both start the next traversal at attempt zero. What bounds it: the
         // attempt saturates at `UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS`, the delay
         // at `UNHEALTHY_SCAN_RETRY_MAX_SECONDS`, and a deadline that is past,
@@ -177,11 +244,47 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
             // bounded by the per-tick traversal limits.
             None => true,
         };
-        (terminal_unhealthy && retry_due).then(|| {
-            traversal
-                .unhealthy_retry_attempt
-                .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
-        })
+        let completed_backstop = !traversal.counts.has_errors()
+            && !traversal.watcher_hint_seen
+            && !index.bounded_sweep_had_unsettled_upload
+            && traversal.pending_directories.is_empty()
+            && traversal.pending_candidates.is_empty()
+            && match traversal.completed_unix_seconds {
+                Some(marked) => rfc3339_unix_seconds(collected_at)
+                    .is_some_and(|now| now >= marked.saturating_add(LISTING_INTERVAL_SECONDS)),
+                // A restored exhausted checkpoint has no process-local proof.
+                // Walk once after restart, without rerunning its terminal effects.
+                None => {
+                    traversal.reconciliation_started
+                        && traversal
+                            .reconciliation_upper_bound
+                            .as_ref()
+                            .map_or(true, |upper| {
+                                index
+                                    .files
+                                    .range((
+                                        traversal
+                                            .reconciliation_after
+                                            .as_ref()
+                                            .map_or(std::ops::Bound::Unbounded, |after| {
+                                                std::ops::Bound::Excluded(after.clone())
+                                            }),
+                                        std::ops::Bound::Included(upper.clone()),
+                                    ))
+                                    .next()
+                                    .is_none()
+                            })
+                }
+            };
+        if terminal_unhealthy && retry_due {
+            Some(
+                traversal
+                    .unhealthy_retry_attempt
+                    .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS),
+            )
+        } else {
+            completed_backstop.then_some(0)
+        }
     } else {
         Some(0)
     };
@@ -326,6 +429,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     if let Some(parts) = context_observation {
         claude_contract::started_context(&context_fingerprint, parts, roots);
     }
+    with_completed_generation(source, |slot| *slot = None);
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -351,6 +455,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
         listing_owed_requeued_unix_seconds: Default::default(),
+        completed_unix_seconds: None,
     });
     TraversalProgress::Started
 }

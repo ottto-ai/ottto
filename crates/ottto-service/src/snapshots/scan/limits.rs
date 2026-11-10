@@ -56,7 +56,7 @@ pub(in crate::snapshots) const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 /// (`60 * 2^6` seconds is clamped to one hour). The attempt counter saturates
 /// here: a traversal that stays terminal-unhealthy is re-walked at most hourly
 /// and its persisted witness never grows past this value. The counter clears
-/// only when a generation completes (the traversal is dropped) or the scan
+/// only when a generation completes or the scan
 /// context changes (a fresh traversal starts at zero).
 pub(in crate::snapshots) const UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS: u8 = 7;
 

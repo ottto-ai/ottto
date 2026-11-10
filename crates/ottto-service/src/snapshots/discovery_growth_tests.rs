@@ -212,6 +212,7 @@ impl Fixture {
                             SnapshotUploadPolicy::default(),
                         );
                         finalize_scan_after_policy(source, &mut scan, &mut index);
+                        scan.finish_codex_capture_boundary(&mut index);
                         let accepted = scan
                             .snapshots
                             .iter()
@@ -892,18 +893,10 @@ fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> Sc
         "{source:?}: first reads"
     );
     let now = OffsetDateTime::now_utc();
-    let collected_at = now.format(&Rfc3339).unwrap();
-    ensure_bounded_traversal(
-        source,
-        std::slice::from_ref(&f.root),
-        &mut index,
-        &collected_at,
-        7,
-    );
-    advance_bounded_directory_traversal(source, &mut index, 7, None);
     let traversal = index.traversal.as_mut().unwrap();
     assert!(traversal.pending_directories.is_empty());
-    traversal.pending_candidates.clear();
+    assert!(traversal.pending_candidates.is_empty());
+    assert!(traversal.completed_unix_seconds.is_some());
     let due = now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60;
     traversal.listing_started_unix_seconds = Some(if listing_due {
         due
@@ -1721,7 +1714,7 @@ fn hint_orders_an_already_queued_census_member_ahead_of_the_fifo() {
         for scan in [&first, &hinted, &last] {
             assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
         }
-        assert!(index.traversal.is_none());
+        assert!(index.traversal.is_some());
         assert_eq!(index.files.len(), 6);
         let _ = fs::remove_dir_all(root);
     }
@@ -1741,7 +1734,7 @@ fn settled_listing_fixture(source: SnapshotSource) -> (Fixture, ScanIndex, Vec<P
     let mut index = ScanIndex::default();
     let scan = listing_page(&f, source, &mut index, 10);
     assert!(scan.census_complete);
-    assert!(index.traversal.is_none());
+    assert!(index.traversal.is_some());
     assert_eq!(index.files.len(), paths.len());
     assert!(index.terminal_contract_retries.is_empty());
     assert!(index.decode_holds.is_empty());
@@ -1751,6 +1744,8 @@ fn settled_listing_fixture(source: SnapshotSource) -> (Fixture, ScanIndex, Vec<P
         assert!(index.listing_unchanged(path, &fs::metadata(path).unwrap()));
         assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
     }
+    index.traversal.as_mut().unwrap().completed_unix_seconds = None;
+    forget_completed_generation_for_test(source);
     (f, index, paths)
 }
 
@@ -1783,6 +1778,7 @@ fn listing_page(
         );
     }
     finalize_scan_after_policy(source, &mut scan, index);
+    scan.finish_codex_capture_boundary(index);
     index.record_accepted_snapshot_fingerprints(
         &scan
             .snapshots
@@ -1910,5 +1906,173 @@ fn census_listing_does_not_hint_unchanged_or_owed_files() {
             .iter()
             .all(|candidate| candidate.census_member && !candidate.watcher_hint));
         assert_eq!(walk.counts.listing_changes_without_hint, 0);
+    }
+}
+
+/// [behaviour] Completion is an edge for every source. Hints and re-listing
+/// serve the retained generation; an unhinted subtree is found by the existing
+/// listing backstop, and a durable restart walks once without storing a marker.
+#[test]
+fn completed_generation_hints_listing_backstop_and_restart_for_every_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let marked = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .completed_unix_seconds
+            .unwrap();
+        let clock = |seconds| {
+            OffsetDateTime::from_unix_timestamp(seconds as i64)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap()
+        };
+        let window = index.traversal.as_ref().unwrap().census_window_end.clone();
+        let path = f.root.join("reload-index.json");
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded
+            .traversal
+            .as_ref()
+            .unwrap()
+            .completed_unix_seconds
+            .is_none());
+        let (next, idle, reads, rows) = f.page_at(source, loaded, &clock(marked + 1));
+        index = next;
+        assert!(
+            !idle.census_complete,
+            "{source:?}: no idle manifest publication"
+        );
+        assert!(!idle.scan_cap_hit && !idle.census_status.pending_work);
+        assert!(!idle.census_status.reconciliation_incomplete);
+        assert!(idle.claude_request_census_shadow.is_none());
+        assert!(modes(&reads).is_empty());
+        assert!(!rows.iter().any(|row| row["counts"]["event"] == "retiring"));
+
+        let hinted = f.root.join(format!("{GROWN}.jsonl"));
+        append_records(&hinted, &usage_records(source, GROWN, 2, false));
+        let (next, scan, reads, _) = f.page_with(
+            source,
+            std::slice::from_ref(&f.root),
+            index,
+            &clock(marked + 2),
+            &[hinted],
+            &mut ListingRequest::default(),
+        );
+        index = next;
+        assert!(!scan.census_complete);
+        assert_eq!(modes(&reads), vec![format!("{:?}", growth_mode())]);
+        assert_eq!(index.traversal.as_ref().unwrap().census_window_end, window);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().completed_unix_seconds,
+            Some(marked)
+        );
+
+        // Listing is due before the census backstop: discovery may have taken
+        // time before completion. No hint names this newly created directory.
+        let subtree = f.root.join("unhinted");
+        fs::create_dir(&subtree).unwrap();
+        let new = subtree.join(format!("{CREATED}.jsonl"));
+        append_records(&new, &usage_records(source, CREATED, 1, true));
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .listing_started_unix_seconds = Some(marked - LISTING_INTERVAL_SECONDS);
+        let (next, scan, reads, rows) = f.page_at(source, index, &clock(marked + 3));
+        index = next;
+        assert!(
+            index.files.contains_key(&local_index_key(&new)),
+            "{source:?}: unhinted subtree"
+        );
+        assert_eq!(modes(&reads), vec![format!("{:?}", DeliveryMode::Full)]);
+        assert!(!scan.census_complete);
+        assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+
+        let (next, scan, reads, rows) =
+            f.page_at(source, index, &clock(marked + LISTING_INTERVAL_SECONDS));
+        index = next;
+        assert!(
+            scan.census_complete,
+            "{source:?}: backstop completes a fresh walk"
+        );
+        assert!(
+            modes(&reads).is_empty(),
+            "{source:?}: no unchanged transcript reads"
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["reason"] == "completed_backstop"));
+        let json = serde_json::to_value(index.traversal.as_ref().unwrap()).unwrap();
+        assert!(json.get("completed_unix_seconds").is_none());
+        let restored: ScanTraversalCheckpoint = serde_json::from_value(json.clone()).unwrap();
+        assert!(restored.completed_unix_seconds.is_none());
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            json,
+            "old checkpoint shape"
+        );
+        let path = f.root.join("restart-index.json");
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+        let restored = ScanIndex::load(&path).unwrap();
+        forget_completed_generation_for_test(source);
+        assert!(restored
+            .traversal
+            .as_ref()
+            .unwrap()
+            .completed_unix_seconds
+            .is_none());
+        let (index, scan, reads, rows) = f.page_at(
+            source,
+            restored,
+            &clock(marked + LISTING_INTERVAL_SECONDS + 1),
+        );
+        assert!(scan.census_complete);
+        assert!(modes(&reads).is_empty());
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["reason"] == "completed_backstop"));
+        let (_, scan, _, rows) = f.page(source, index);
+        assert!(!scan.census_complete);
+        assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+    }
+}
+
+/// [regress] Late conflict/partial-save debt drops the completed generation,
+/// without settling its stale observed set again. The follow-up starts clean.
+#[test]
+fn completed_generation_late_unsettled_drops_without_terminal_effects() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        index.mark_bounded_sweep_unsettled();
+        let (index, scan, _, rows) = f.page(source, index);
+        assert!(!scan.census_complete);
+        assert!(scan.claude_request_census_shadow.is_none());
+        assert!(index.traversal.is_none());
+        assert!(index.bounded_sweep_had_unsettled_upload);
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["reason"] == "complete_needs_clean_followup"));
+        let (index, scan, reads, _) = f.page(source, index);
+        assert!(scan.census_complete);
+        assert!(modes(&reads).is_empty());
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .completed_unix_seconds
+            .is_some());
+        assert!(!index.bounded_sweep_had_unsettled_upload);
     }
 }

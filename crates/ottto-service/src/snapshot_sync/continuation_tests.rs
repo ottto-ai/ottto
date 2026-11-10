@@ -1421,9 +1421,10 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             )
             .unwrap();
         }
-        let (_, scan, _) = E2ScanFixture::default().scan_other_page(
+        let scanner = E2ScanFixture::default();
+        let (mut index, mut scan, _) = scanner.scan_other_page(
             SnapshotSource::Pi,
-            &[root],
+            std::slice::from_ref(&root),
             &home,
             ScanIndex::default(),
             true,
@@ -1449,6 +1450,24 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             cadence.paced_scan_due(),
             gap.map(|gap| now + Duration::from_secs(gap))
         );
+        if files <= 2 {
+            crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+            let (_, idle, _) = scanner.scan_other_page(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &home,
+                index,
+                true,
+                2,
+                &[],
+            );
+            assert!(!idle.census_status.pending_work);
+            assert!(!idle.census_status.reconciliation_incomplete);
+            assert!(
+                !resident_scan_requested(&idle),
+                "a completed idle generation requests no pacing"
+            );
+        }
     }
     std::fs::remove_dir_all(home).unwrap();
 }

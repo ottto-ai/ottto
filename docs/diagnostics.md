@@ -1425,6 +1425,16 @@ checkpoint. This is distinct from `retiring` and does not count as census comple
 The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
 feeds its error state or an alert.
 
+A completed bounded traversal is retained between passes. Its `retiring` row
+has `kept: true`; completion effects and manifest publication happen once for
+that generation, and idle passes emit no second retirement. `kept: false`
+means the checkpoint is discarded, including a late unsettled clean follow-up.
+A `starting` row with reason `completed_backstop` starts a fresh census when
+the retained queues are empty and three hours have passed since completion,
+or once after a process restart loses the RAM-only completion marker.
+Hints and metadata re-listing continue to serve the retained generation.
+A permanently unreadable directory still follows the unchanged hourly retry.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes

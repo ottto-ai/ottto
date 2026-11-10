@@ -594,6 +594,11 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
         return false;
     };
     let Some(upper_bound) = snapshot.reconciliation_upper_bound.clone() else {
+        index
+            .traversal
+            .as_mut()
+            .expect("traversal")
+            .reconciliation_started = true;
         return true;
     };
     let after = snapshot.reconciliation_after.clone();

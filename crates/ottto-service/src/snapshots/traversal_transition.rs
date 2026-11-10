@@ -12,6 +12,7 @@ enum StartReason {
     NoRetainedTraversal,
     ContextChanged,
     TerminalUnhealthyRetry,
+    CompletedBackstop,
 }
 
 #[derive(Serialize)]
@@ -48,7 +49,7 @@ pub(super) struct Starting {
 
 impl Starting {
     /// Called only AFTER the existing resume/backoff early return. Thus a
-    /// retained matching traversal reached the real terminal-unhealthy retry.
+    /// retained matching traversal reached a retry or completed backstop.
     pub(super) fn capture(
         source: SnapshotSource,
         index: &ScanIndex,
@@ -74,12 +75,25 @@ impl Starting {
             reason: match (previous.is_some(), matches) {
                 (false, _) => StartReason::NoRetainedTraversal,
                 (true, false) => StartReason::ContextChanged,
-                (true, true) => StartReason::TerminalUnhealthyRetry,
+                (true, true)
+                    if index
+                        .traversal
+                        .as_ref()
+                        .is_some_and(|t| t.counts.has_errors()) =>
+                {
+                    StartReason::TerminalUnhealthyRetry
+                }
+                (true, true) => StartReason::CompletedBackstop,
             },
             index_generation: index.generation,
             window_unix_seconds: rfc3339_unix_seconds(now),
             context_matches: matches,
-            retry_due: matches.then_some(true),
+            retry_due: (matches
+                && index
+                    .traversal
+                    .as_ref()
+                    .is_some_and(|t| t.counts.has_errors()))
+            .then_some(true),
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
             prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
             previous,
@@ -143,6 +157,7 @@ pub(super) fn retiring(
         index_generation: u64,
         window_unix_seconds: Option<u64>,
         raw_census_complete: bool,
+        kept: bool,
         gates: CensusGates,
         /// Fixed names of the paths that set the clean follow-up's flag.
         unsettled_causes: Vec<&'static str>,
@@ -169,6 +184,7 @@ pub(super) fn retiring(
             index_generation,
             window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
             raw_census_complete: raw_complete,
+            kept: gates.census_complete,
             gates,
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
@@ -280,6 +296,41 @@ mod tests {
         );
     }
 
+    /// [regress] The backstop waits for non-member re-reads, then starts at
+    /// attempt zero. Restoring without the RAM marker starts exactly one walk.
+    #[test]
+    fn completed_backstop_waits_for_every_queue_and_reports_its_reason() {
+        use crate::snapshots::{forget_completed_generation_for_test, ScanTraversalPath};
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &[],
+            &mut index,
+            T0,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert!(scan.census_complete);
+        let walk = index.traversal.as_mut().unwrap();
+        walk.completed_unix_seconds = rfc3339_unix_seconds(T0);
+        walk.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: "/synthetic".into(),
+            path: "/synthetic/pending.jsonl".into(),
+            census_member: false,
+            watcher_hint: true,
+        });
+        assert!(start(&mut index, "2026-08-01T03:00:00Z", BACKFILL_WINDOW_DAYS).is_empty());
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_candidates.len(),
+            1
+        );
+        index.traversal.as_mut().unwrap().pending_candidates.clear();
+        let rows = start(&mut index, "2026-08-01T03:00:00Z", BACKFILL_WINDOW_DAYS);
+        assert_eq!(rows[0]["counts"]["reason"], "completed_backstop");
+        assert_eq!(rows[0]["counts"]["new_retry_attempt"], 0);
+        forget_completed_generation_for_test(SnapshotSource::Pi);
+    }
+
     #[test]
     fn traversal_transition_actual_retirement_and_clean_followup() {
         let mut index = ScanIndex::default();
@@ -294,12 +345,18 @@ mod tests {
             .unwrap()
         });
         assert!(scan.census_complete);
-        assert!(index.traversal.is_none());
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .completed_unix_seconds
+            .is_some());
         let retired = rows
             .iter()
             .find(|row| row["counts"]["event"] == "retiring")
             .unwrap();
         assert_eq!(retired["counts"]["reason"], "complete");
+        assert_eq!(retired["counts"]["kept"], true);
         assert_eq!(retired["counts"]["gates"]["census_complete"], true);
         assert_eq!(retired["counts"]["unsettled_causes"], json!([]));
 

@@ -1217,3 +1217,80 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
 
 #[path = "progress_rows_oracle_tests.rs"]
 mod progress_rows_oracle_tests;
+
+/// [money] Retention, changed input, a census backstop and durable restart
+/// conserve emitted money/placement; neither idle nor restart replays bodies.
+#[test]
+#[serial]
+fn completed_generation_native_money_through_backstop_and_restart() {
+    with_e2(|| {
+        for source in [SOURCE, SnapshotSource::Codex, SnapshotSource::Pi] {
+            let (c, paths) = native_corpus(source);
+            let db_source = match source {
+                SOURCE => Source::Claude,
+                SnapshotSource::Codex => Source::Codex,
+                SnapshotSource::Pi => Source::Pi,
+            };
+            let (session, prior) = StateV2ColdSession::publish(
+                db_source,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let first = native_page(source, &c, prior, 100, true);
+            assert!(first.scan.census_complete);
+            let cold = accept(
+                source,
+                &native_page(source, &c, ScanIndex::default(), 100, false),
+            );
+            money_oracle::assert_equivalent(&cold, &accept(source, &first));
+            let mut prior = commit_native(source, &session, first);
+            let (idle, consumed) =
+                fixture::observe_consumed(|| native_page(source, &c, prior, 100, true));
+            assert!(!idle.scan.census_complete, "no idle manifest");
+            assert!(!idle.scan.scan_cap_hit);
+            let mut quiet = accept(source, &idle);
+            quiet.mode = Mode::Restart;
+            quiet.io.consumed = consumed;
+            money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+            prior = idle.index;
+
+            for (path, id) in paths.iter().zip(SESSIONS) {
+                append(path, &response_line(source, id, 2));
+            }
+            crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut prior);
+            let grown = native_page(source, &c, prior, 100, true);
+            assert!(!grown.scan.census_complete);
+            let cold = accept(
+                source,
+                &native_page(source, &c, ScanIndex::default(), 100, false),
+            );
+            let route = accept(source, &grown);
+            money_oracle::assert_equivalent(&cold, &route);
+            money_oracle::assert_no_smaller_reemit(SESSIONS[0], &cold, &route, &cold, false);
+            prior = commit_native(source, &session, grown);
+            crate::snapshots::e2_pipeline_scan_fixture::completed_backstop_due_for_test(
+                &mut prior,
+                source,
+                if source == SOURCE {
+                    "2026-08-02T08:00:00Z"
+                } else {
+                    "2026-10-27T08:00:00Z"
+                },
+            );
+            let backstop = native_page(source, &c, prior, 100, true);
+            assert!(backstop.scan.census_complete);
+            assert!(backstop.scan.snapshots.is_empty());
+            let prior = commit_native(source, &session, backstop);
+            crate::snapshots::forget_completed_generation_for_test(source);
+            let (restart, consumed) =
+                fixture::observe_consumed(|| native_page(source, &c, prior, 100, true));
+            assert!(restart.scan.census_complete, "one walk after restart");
+            let mut quiet = accept(source, &restart);
+            quiet.mode = Mode::Restart;
+            quiet.io.consumed = consumed;
+            money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+            let idle = native_page(source, &c, restart.index, 100, true);
+            assert!(!idle.scan.census_complete);
+        }
+    });
+}

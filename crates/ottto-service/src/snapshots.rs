@@ -710,19 +710,6 @@ impl SourceScanResult {
             }
         }
         if held.is_empty() {
-            if self.census_complete
-                && !self.pending_finalization.iter().any(|pending| {
-                    index
-                        .files
-                        .get(&pending.index_key)
-                        .is_some_and(|entry| entry.codex_applied_tier_receipt.is_some())
-                })
-            {
-                index.traversal = None;
-                index.resume_after_path = None;
-                index.resume_upper_bound_path = None;
-                index.resume_census_window_end = None;
-            }
             return;
         }
         self.hold_codex_groups(
@@ -821,11 +808,20 @@ impl SourceScanResult {
         );
     }
     pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
-        if self.census_complete {
-            index.traversal = None;
-            index.resume_after_path = None;
-            index.resume_upper_bound_path = None;
-            index.resume_census_window_end = None;
+        self.mark_census_completed(index);
+    }
+    /// Finalization/capture vetoes must run before marking the completion edge.
+    fn mark_census_completed(&self, index: &mut ScanIndex) {
+        if self.census_complete
+            && !index.bounded_sweep_had_unsettled_upload
+            && let Some(traversal) = index.traversal.as_mut()
+        {
+            traversal
+                .completed_unix_seconds
+                .get_or_insert_with(|| OffsetDateTime::now_utc().unix_timestamp().max(0) as u64);
+            traversal.unhealthy_retry_attempt = 0;
+            traversal.unhealthy_retry_not_before_unix_seconds = None;
+            remember_completed_generation(self.source, traversal);
         }
     }
     /// Index keys this scan read to completion, with their parsed source
@@ -1392,6 +1388,8 @@ pub(crate) use sources::claude::settings_defaults::{
 pub(crate) use sources::codex::config_defaults::parse_codex_config_defaults;
 
 #[cfg(test)]
+pub(crate) use discovery::traversal::forget_completed_generation_for_test;
+#[cfg(test)]
 use discovery::traversal::{
     adopt_legacy_traversal_fingerprint, scan_traversal_context_fingerprint,
     scan_traversal_context_fingerprint_with,
@@ -1401,7 +1399,8 @@ use discovery::traversal::{
     codex_selection_may_exhaust_page, enqueue_watcher_hints, ensure_bounded_traversal,
     fresh_path_census_member, note_codex_census_turn, pace_listing_owed,
     record_codex_inventory_hold, refresh_retained_codex_roster, release_codex_inventory_hold,
-    requeue_observed_keys, requeue_unindexed_observed, start_due_listing_pass, TraversalProgress,
+    remember_completed_generation, requeue_observed_keys, requeue_unindexed_observed,
+    start_due_listing_pass, TraversalProgress,
 };
 
 pub(crate) fn rfc3339_unix_seconds(value: &str) -> Option<u64> {

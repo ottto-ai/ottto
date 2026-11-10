@@ -365,6 +365,19 @@ pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
         .for_each(age);
 }
 
+/// Make this completed generation's existing backstop due at a fixture clock.
+pub(crate) fn completed_backstop_due_for_test(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    now: &str,
+) {
+    let walk = index.traversal.as_mut().expect("completed traversal");
+    assert!(walk.completed_unix_seconds.is_some());
+    walk.completed_unix_seconds =
+        Some(rfc3339_unix_seconds(now).unwrap() - LISTING_INTERVAL_SECONDS);
+    remember_completed_generation(source, walk);
+}
+
 /// `path`'s verification aged past the audit interval: its sampled audit is
 /// overdue, as a growing file's marker that never settles reads.
 pub(crate) fn overdue_audit_for_test(index: &mut ScanIndex, path: &Path) {

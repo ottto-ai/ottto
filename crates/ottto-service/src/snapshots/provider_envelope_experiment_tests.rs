@@ -1064,7 +1064,7 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
 }
 
 #[test]
-fn completed_census_drops_finished_traversal_with_empty_diagnostic_causes() {
+fn completed_generation_is_kept_until_the_backstop() {
     let fixture = BodyFixture::new();
     let state = OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
@@ -1081,5 +1081,8 @@ fn completed_census_drops_finished_traversal_with_empty_diagnostic_causes() {
     let (index, scan) = finish(state);
     assert!(scan.census_complete);
     assert!(scan.causes.is_empty(), "exercise the empty diagnostic case");
-    assert!(index.traversal.is_none());
+    assert!(
+        index.traversal.is_some(),
+        "completed generation must be kept until the backstop"
+    );
 }

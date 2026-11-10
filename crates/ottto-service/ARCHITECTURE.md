@@ -21,6 +21,16 @@ file-system hint / periodic listing → select file → read new bytes from save
   Each listing gives hint priority to indexed files whose listing stamp changed since their
   last read, promoting queued files in place. Unchanged census files, including owed files,
   keep their ordinary queue order. Existing selection budgets and read gates still apply.
+  A cleanly completed census keeps its traversal for hints and metadata re-listing.
+  Completion effects and manifest publication run only on the completion edge.
+  The completion time stays in RAM, bound to the source, scan context and census
+  window across per-page storage reloads; no checkpoint JSON field is added.
+  When its queues are empty, a new census starts three hours after completion.
+  A process restart performs one fresh walk; late unsettled uploads discard the
+  completed generation and take the ordinary clean follow-up path. Queued
+  non-member re-reads drain normally before the backstop. Unhinted new subtrees
+  can wait up to three hours plus drain; continuous hints can postpone a census
+  backstop while its queues remain occupied.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted

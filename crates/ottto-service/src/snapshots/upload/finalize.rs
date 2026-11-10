@@ -439,6 +439,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
     index
         .snapshot_activity_at
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
+    if source != SnapshotSource::Codex {
+        result.mark_census_completed(index);
+    }
     #[cfg(unix)]
     tail_source::counters::emit(source);
 }

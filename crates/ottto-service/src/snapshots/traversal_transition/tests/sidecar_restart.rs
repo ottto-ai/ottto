@@ -20,6 +20,7 @@ fn sidecar_restart_reports_only_an_existing_discarded_traversal() {
             T0,
             BACKFILL_WINDOW_DAYS,
         );
+        index.traversal.as_mut().unwrap().completed_unix_seconds = rfc3339_unix_seconds(T0);
         let old = index.traversal.as_ref().unwrap();
         let directories = old.pending_directories.len();
         let candidates = old.pending_candidates.len();
