@@ -1214,6 +1214,78 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
     }
 }
 
+/// [regress] A provider archive moves a rollout to another path, keeping its
+/// old mtime. The walk that lists the moved file counts it only after its path
+/// carry, so in that same walk it owes what its predecessor owed: an ACKed file
+/// nothing, an unACKed one once, from its first change. A carry that fails
+/// leaves the moved file owed.
+#[test]
+fn archived_rollout_owes_its_carried_debt_in_the_same_walk() {
+    const CONTEXT: &str = "g7-carry-context";
+    for (acked, carried) in [(true, true), (false, true), (true, false)] {
+        crate::snapshots::money_freshness::restart_for_test();
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        let original = c.path(MAIN);
+        File::options()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 3600))
+            .unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        // One ordinary pass, ACKed or saved unACKed: its walk's debt.
+        let pass = |mut index: ScanIndex| {
+            index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+            e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+            let previous = index.clone();
+            let (mut working, scan, _, _, logs) = page(&c, index, cache.clone());
+            let index = if acked {
+                working
+                    .checkpoint_with_captured_posts(&scan, &previous, "accept")
+                    .0
+            } else {
+                working.save(session.path()).unwrap();
+                ScanIndex::load(session.path()).unwrap()
+            };
+            let debt = logs
+                .iter()
+                .rev()
+                .find(|row| row["stage"] == "freshness_alarm" && row["counts"]["basis"] == "walk")
+                .expect("the pass ends a walk")["counts"]["debt"]
+                .clone();
+            (index, debt)
+        };
+        let (index, _) = pass(prior);
+        let (mut index, before) = pass(index);
+        let owed_before = u64::from(!acked);
+        assert_eq!(before["outstanding_files"], owed_before, "{before}");
+        assert_eq!(before["over_6h_files"], owed_before, "{before}");
+        let archived = c.archived.join(original.file_name().unwrap());
+        fs::rename(&original, &archived).unwrap();
+        let (old_key, new_key) = (local_index_key(&original), local_index_key(&archived));
+        if !carried {
+            // Destination custody refuses the carry.
+            index.confirmed_empty_files.insert(new_key.clone());
+        }
+        let (index, after) = pass(index);
+        let label = format!("acked={acked} carried={carried}\nbefore={before}\nafter={after}");
+        if carried {
+            assert!(!index.files.contains_key(&old_key), "{label}");
+            assert!(index.files.contains_key(&new_key), "{label}");
+        }
+        let owed = u64::from(!acked || !carried);
+        assert_eq!(after["outstanding_files"], owed, "{label}");
+        assert_eq!(after["over_6h_files"], owed, "{label}");
+        drop(session);
+    }
+}
+
 /// [regress] Fail toward reading: an archive replaced after its read by a
 /// grown object (another stamp and size) is identified and read again, and
 /// its new money posts once, equal to a cold run. Asserted after the decoder
