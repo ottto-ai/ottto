@@ -929,3 +929,17 @@ pub(crate) fn hold_file_decode_for_test(index: &mut ScanIndex, key: &str) {
         .v2_insert("files", key.to_owned(), b"null".to_vec(), None, 4)
         .unwrap();
 }
+
+/// Retain the decoder's exact-entity hold for retry eligibility controls.
+pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &str) {
+    index
+        .decode_holds
+        .v2_insert(
+            "quarantined_snapshot_fingerprints",
+            fingerprint.to_owned(),
+            b"null".to_vec(),
+            None,
+            4,
+        )
+        .unwrap();
+}

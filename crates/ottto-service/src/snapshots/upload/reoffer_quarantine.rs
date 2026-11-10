@@ -281,6 +281,13 @@ impl ScanIndex {
         self.head_conflict_sessions.contains(session_key)
     }
 
+    /// The selected owning file of an ordinary quarantine retry this cycle.
+    pub(in crate::snapshots) fn quarantine_retry_leased(&self, key: &str) -> bool {
+        self.terminal_contract_retries
+            .values()
+            .any(|owner| owner == key)
+    }
+
     /// A leased file still queued for a bounded page has not reached a hold.
     pub(crate) fn quarantine_retry_is_queued(&self, fingerprint: &str) -> bool {
         self.terminal_contract_retries
