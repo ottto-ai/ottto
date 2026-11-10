@@ -11604,10 +11604,10 @@ fn quota_coverage_passive_rollover_requires_ended_exact_meter() {
     ));
 }
 
+/// [money] Observed shape: `cap` is `{money, credits}`. A filled `balance` is
+/// the prepaid balance: its own row, never the usage credits' `remaining`.
 #[test]
 fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
-    // Observed shape: `cap` is `{money, credits}`. A filled `balance` is the
-    // prepaid balance: its own row, never the usage credits' `remaining`.
     let json = serde_json::json!({
         "spend": {
             "used": {"amount_minor": 321, "currency": "USD", "exponent": 2},
@@ -11635,7 +11635,7 @@ fn usd(cents: u64) -> serde_json::Value {
     serde_json::json!({"amount_minor": cents, "currency": "USD", "exponent": 2})
 }
 
-/// Usage credits carry no `remaining` and no marker for it; a valid
+/// [money] Usage credits carry no `remaining` and no marker for it; a valid
 /// `spend.balance` (zero included) is only the separate prepaid row.
 #[test]
 fn claude_usage_credits_never_carry_remaining() {
@@ -11665,9 +11665,23 @@ fn claude_usage_credits_never_carry_remaining() {
     }
     assert_eq!(rows(usd(700)), serde_json::json!([usage, prepaid(700, "ok")]));
     assert_eq!(rows(usd(0)), serde_json::json!([usage, prepaid(0, "exhausted")]));
+    let spend = |spend: serde_json::Value| {
+        serde_json::to_value(claude_oauth_credit_balances(&serde_json::json!({"spend": spend})))
+            .unwrap()
+    };
+    // Only a balance: the usage row knows no amount, whatever the severity.
+    let only = spend(serde_json::json!({
+        "enabled": true, "severity": "critical", "balance": usd(700)
+    }));
+    assert_eq!(only[0]["status"], "unknown");
+    assert!(only[0].get("remaining").is_none());
+    assert_eq!(only[1], prepaid(700, "ok"));
+    // A zero limit with nothing used is still exhausted.
+    let zero = spend(serde_json::json!({"enabled": true, "used": usd(0), "limit": usd(0)}));
+    assert_eq!(zero[0]["status"], "exhausted");
 }
 
-/// `spend.cap.money` is the quota, else `spend.limit`; `cap.credits` is never
+/// [money] `spend.cap.money` is the quota, else `spend.limit`; `cap.credits` is never
 /// sent. The monthly spend reset comes from `limits[]` without a model scope.
 #[test]
 fn claude_oauth_spend_quota_and_monthly_reset() {
@@ -11693,6 +11707,8 @@ fn claude_oauth_spend_quota_and_monthly_reset() {
         ),
         (serde_json::Value::Null, usd(4000), Some(4000)),
         (serde_json::json!({"credits": credits}), serde_json::Value::Null, None),
+        // A money object straight under `cap` is not the observed shape.
+        (usd(500), serde_json::Value::Null, None),
     ] {
         let wire = row(
             serde_json::json!({
@@ -11722,7 +11738,7 @@ fn claude_oauth_spend_quota_and_monthly_reset() {
     assert_eq!(windows.len(), 1);
 }
 
-/// Spend metadata rides on the chosen usage-credit row, enabled or disabled:
+/// [behaviour] Spend metadata rides on the chosen usage-credit row, enabled or disabled:
 /// a present `false` stays `false`, a missing or malformed value is absent,
 /// and a disabled row never regains amounts.
 #[test]

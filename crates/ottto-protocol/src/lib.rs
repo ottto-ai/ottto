@@ -1977,6 +1977,35 @@ pub struct AgentCreditBalance {
         deserialize_with = "lenient_optional"
     )]
     pub grants_unavailable_cause: Option<CreditGrantsUnavailableCause>,
+    /// Provider auto-reload settings, amounts in this balance's unit. Absent
+    /// when the provider sent no recognized settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reload: Option<AgentCreditAutoReload>,
+    /// Whether the provider says the account may buy credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_purchase_credits: Option<bool>,
+}
+
+/// Provider auto-reload settings of a credit balance. Each field is absent
+/// when the provider did not report it; nothing is defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditAutoReload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Balance at which the provider reloads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub threshold: Option<CreditAmount>,
+    /// Balance the provider reloads to.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub target: Option<CreditAmount>,
 }
 
 /// Why a saved-resets balance's grants are unavailable (quota contract v2.2
@@ -2044,6 +2073,9 @@ pub enum CreditBalanceKind {
     SavedResets,
     OneTimeCredit,
     WorkspaceAllowance,
+    /// A prepaid balance the provider holds for the organization. Never
+    /// usage-credit spend.
+    PrepaidCredits,
     #[default]
     #[serde(other)]
     Unknown,
@@ -4952,6 +4984,14 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
         .ineligible_reason
         .take()
         .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
+    if credit.unit != AgentCreditBalanceUnit::Usd {
+        // Purchase and reload settings are money balance settings.
+        credit.auto_reload = None;
+        credit.can_purchase_credits = None;
+    }
+    credit.auto_reload = credit.auto_reload.filter(|reload| {
+        reload.enabled.is_some() || reload.threshold.is_some() || reload.target.is_some()
+    });
     if credit.unit != AgentCreditBalanceUnit::Resets {
         // Readiness is only meaningful for saved resets.
         credit.eligible = None;
@@ -8938,7 +8978,7 @@ mod tests {
         );
     }
 
-    /// Reload and purchase settings are optional money-balance metadata: a
+    /// [format] Reload and purchase settings are optional money-balance metadata: a
     /// known field is forwarded, nothing is defaulted, and a non-money balance
     /// or an empty settings object sends none. The prepaid kind round-trips.
     #[test]

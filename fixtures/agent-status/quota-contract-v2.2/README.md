@@ -39,7 +39,8 @@ All single readings use read time `2026-10-01T12:00:00Z`.
 - Fields the protocol skips when absent are never spelled as `null`.
 - Every balance carries `kind` (except in `legacy-no-kind`). Every `kind`
   appears: `plan_credits` and `workspace_allowance` (Codex), `saved_resets`
-  (both), `usage_credits` and `one_time_credit` (Claude). No credit balance carries `updated_at`, fresh
+  (both), `usage_credits` and `one_time_credit` (Claude); Claude's
+  `prepaid_credits` is pinned by the adapter tests. No credit balance carries `updated_at`, fresh
   or re-sent; consumers use the snapshot's capture time. Provider read time is
   `observed_at` (and `grants_observed_at` for a grant list).
 - A snapshot never carries the same balance (`name`, `limit_id`, account)
