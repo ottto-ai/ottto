@@ -294,6 +294,7 @@ fn read_header(
             owner,
             created_unix_ms,
             read_bytes,
+            durable: None,
         },
         witness,
     ))
@@ -359,10 +360,16 @@ pub(in crate::snapshots) struct CachedHeader {
     owner: String,
     created_unix_ms: Option<i64>,
     read_bytes: usize,
+    /// `Some(joined)`: a durable lookup's facts (through the joined-archive
+    /// lookup when `joined`), reused in its place until the object changes or
+    /// a commit may have changed the head. Never a RAM fallback.
+    durable: Option<bool>,
 }
 #[derive(Default)]
 pub(in crate::snapshots) struct HeaderCache {
     entries: BTreeMap<String, CachedHeader>,
+    // The store whose committed heads the durable entries came from.
+    durable_route: Option<PathBuf>,
     // Immutable entry heaps, charged once at insertion via their field macros.
     // Keep the cursor's per-step walk independent of the roster population.
     heap_bytes: usize,
@@ -390,6 +397,31 @@ impl HeaderCache {
         self.evictions = self.evictions.saturating_add(self.entries.len());
         self.entries.clear();
         self.heap_bytes = 0;
+    }
+    /// Drops durable entries whose head a commit may have changed: the
+    /// `changed` keys, or all when `route` is another store or `changed` is
+    /// unknown (`None`).
+    pub(in crate::snapshots) fn forget_durable(
+        &mut self,
+        route: &Path,
+        changed: Option<Vec<String>>,
+    ) {
+        let changed = match changed {
+            Some(keys) if self.durable_route.as_deref() == Some(route) => keys,
+            _ => {
+                self.durable_route = Some(route.to_owned());
+                self.entries.keys().cloned().collect()
+            }
+        };
+        for key in changed {
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|header| header.durable.is_some())
+            {
+                self.refresh(key, None);
+            }
+        }
     }
     fn take_evictions(&mut self) -> usize {
         std::mem::take(&mut self.evictions)
@@ -441,11 +473,12 @@ impl HeaderCache {
         c: &mut crate::heap_layout_bound::Counter,
     ) -> Option<()> {
         crate::heap_layout_bound::tree_nodes::<String, CachedHeader>(self.entries.len(), c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.durable_route, c)?;
         c.add(self.heap_bytes)
     }
 }
-crate::heap_layout_bound::fields!(CachedHeader; stamp, owner, created_unix_ms, read_bytes);
-crate::heap_layout_bound::fields!(HeaderCache; entries, heap_bytes, evictions);
+crate::heap_layout_bound::fields!(CachedHeader; stamp, owner, created_unix_ms, read_bytes, durable);
+crate::heap_layout_bound::fields!(HeaderCache; entries, durable_route, heap_bytes, evictions);
 
 /// One small secure header read per existing native scan step. No transcript
 /// or header Value is parked between steps.
@@ -641,11 +674,35 @@ impl HeaderInventory {
             // Durable facts keep precedence; each later source runs only when
             // every earlier one missed. Any lookup that runs and errors fails the
             // member, as before.
-            let joined_archive = if codex_archive_path(&candidate.path)
+            let joined = codex_archive_path(&candidate.path)
                 && index.files.get(&key).is_some_and(|entry| {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
-                }) {
+                });
+            // An earlier durable lookup's facts stand in for this one while the
+            // object is the same and no commit since may have changed the head.
+            let route = cache.and_then(|_| state_v2::runtime_path(index).ok().flatten());
+            let carried = cache.zip(route.as_deref()).and_then(|(cache, route)| {
+                let consumer = std::ptr::from_ref::<sampled_scan::SharedCache>(cache).addr();
+                let changed = state_v2::take_head_writes(route, consumer).ok().flatten();
+                cache
+                    .with_cursor(|cursor| {
+                        cursor.headers.forget_durable(route, changed);
+                        cursor.headers.get(&key)
+                    })
+                    .flatten()
+                    .filter(|cached| {
+                        cached.durable == Some(joined)
+                            && cached.stamp.same_object(&stamp)
+                            && cached.stamp.same_content(&stamp)
+                    })
+                    .map(|cached| CachedHeader {
+                        stamp: stamp.clone(),
+                        ..cached
+                    })
+            });
+            let carried_hit = carried.is_some();
+            let joined_archive = if !carried_hit && joined {
                 lookups += 1;
                 state_v2::load_head(index, &key, 1)?
                     .filter(|head| {
@@ -661,12 +718,13 @@ impl HeaderInventory {
                             owner: facts.owner,
                             created_unix_ms: facts.created_unix_ms,
                             read_bytes: usize::try_from(facts.read_bytes).unwrap_or(usize::MAX),
+                            durable: Some(joined),
                         })
                     })
             } else {
                 None
             };
-            let durable = match joined_archive {
+            let durable = match carried.or(joined_archive) {
                 Some(facts) => Some(facts),
                 None => {
                     lookups += 1;
@@ -687,17 +745,25 @@ impl HeaderInventory {
                                 read_bytes: facts.map_or(0, |facts| {
                                     usize::try_from(facts.read_bytes).unwrap_or(usize::MAX)
                                 }),
+                                durable: Some(joined),
                             })
                         })
                 }
             };
+            // Keep the lookup's facts for later inventories of this store.
+            let keep = cache.filter(|_| route.is_some() && !carried_hit);
+            if let Some((cache, facts)) = keep.zip(durable.as_ref()) {
+                cache.refresh_header(key.clone(), Some(facts.clone()));
+            }
             let reused = durable
                 .or_else(|| {
                     let cached = cache?
                         .with_cursor(|cursor| cursor.headers.get(&key))
                         .flatten()?;
-                    (cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp))
-                        .then_some(cached)
+                    (cached.durable.is_none()
+                        && cached.stamp.same_object(&stamp)
+                        && cached.stamp.same_content(&stamp))
+                    .then_some(cached)
                 })
                 .map(|facts| {
                     self.reuse_hits += 1;
@@ -5718,7 +5784,7 @@ pub(in crate::snapshots) mod header_cache_tests {
     fn ordered(
         root: &Path,
         index: &mut ScanIndex,
-        cache: Option<&Arc<sampled_scan::SharedCache>>,
+        cache: &Arc<sampled_scan::SharedCache>,
         fail: Option<usize>,
     ) -> (HeaderInventory, usize) {
         let sessions = root.join("sessions");
@@ -5730,7 +5796,7 @@ pub(in crate::snapshots) mod header_cache_tests {
             &CodexTitleMetadata::default(),
             index,
             &BTreeMap::new(),
-            cache,
+            Some(cache),
         ) {}
         let calls = state_v2::LOAD_HEAD_CALLS.get().0;
         state_v2::LOAD_HEAD_CALLS.set((0, None));
@@ -5778,7 +5844,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         assert_eq!(state_v2::LOAD_HEAD_CALLS.get().0, 1, "joined hit: 1 lookup");
         assert_eq!(facts(&alone), expected[..1]);
         // All three: `a` carries its durable facts (base: 1 lookup), b 1 + c 2.
-        let (first, calls) = ordered(&root, &mut index, Some(&cold), None);
+        let (first, calls) = ordered(&root, &mut index, &cold, None);
         assert_eq!(calls, 3);
         assert!(first.complete);
         assert_eq!(facts(&first), expected);
@@ -5787,7 +5853,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         let staged_bytes = MAX_HEADER_BYTES + PHYSICAL_READ_BYTES as usize;
         assert_eq!(first.bytes_avoided, staged_bytes);
         // Warm: only `c` looks up (base: 4); `a` keeps its durable None.
-        let (warm, calls) = ordered(&root, &mut index, Some(&cold), None);
+        let (warm, calls) = ordered(&root, &mut index, &cold, None);
         assert_eq!(calls, 2);
         assert_eq!(facts(&warm), expected);
         assert_eq!((warm.reuse_hits, warm.read_bytes), (3, 0));
@@ -5801,7 +5867,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         );
         // A carried member runs no lookup that could fail it: the warm
         // cache's 1st lookup is `c`'s joined lookup.
-        let (failed, _) = ordered(&root, &mut index, Some(&cold), Some(1));
+        let (failed, _) = ordered(&root, &mut index, &cold, Some(1));
         assert_eq!(
             failed.refused.keys().cloned().collect::<Vec<_>>(),
             vec![keys[2].clone()]
@@ -5812,7 +5878,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         // (4th), even with `c`'s facts in RAM.
         for (fail, member) in [(1, 0), (4, 2)] {
             let fresh = Arc::new(sampled_scan::SharedCache::default());
-            let (failed, _) = ordered(&root, &mut index, Some(&fresh), Some(fail));
+            let (failed, _) = ordered(&root, &mut index, &fresh, Some(fail));
             assert!(!failed.complete, "lookup {fail}");
             assert_eq!(
                 failed.refused.keys().cloned().collect::<Vec<_>>(),
@@ -5833,8 +5899,9 @@ pub(in crate::snapshots) mod header_cache_tests {
     /// may change the key's committed head, even on an unchanged file: a
     /// finish commit, a debt-only observation, the exit commit, erasure,
     /// retirement and a removed progress row. Another cache taking the store's
-    /// head writes ends them all. Every inventory's facts equal an uncached
-    /// inventory's, so `a`'s durable None wins over its header time on both.
+    /// head writes ends them all. Every inventory's facts are a fresh
+    /// lookup's (the base path's), so `a`'s durable None wins over its header
+    /// time while carried.
     #[test]
     fn carried_header_facts_end_with_each_head_write() {
         let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
@@ -5844,11 +5911,9 @@ pub(in crate::snapshots) mod header_cache_tests {
         let warm = Arc::new(sampled_scan::SharedCache::default());
         // One inventory on the warm cache: (its facts, its lookups).
         let pass = |index: &mut ScanIndex| {
-            let (carried, calls) = ordered(&root, index, Some(&warm), None);
-            let (fresh, _) = ordered(&root, index, None, None);
-            assert!(carried.complete && fresh.complete);
-            assert_eq!(facts(&carried), facts(&fresh), "carried == uncached");
-            (facts(&carried), calls)
+            let (inventory, calls) = ordered(&root, index, &warm, None);
+            assert!(inventory.complete);
+            (facts(&inventory), calls)
         };
         let mut expected = vec![
             (keys[0].clone(), ORDER_OWNERS[0].to_owned(), None),
@@ -5863,7 +5928,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         // cache took the head writes, since any head may have changed.
         assert_eq!(pass(&mut index), (expected.clone(), 4));
         assert_eq!(pass(&mut index), (expected.clone(), 2));
-        ordered(&root, &mut index, Some(&Arc::default()), None);
+        ordered(&root, &mut index, &Arc::default(), None);
         assert_eq!(pass(&mut index), (expected.clone(), 4));
         assert_eq!(pass(&mut index), (expected.clone(), 2));
         assert_eq!(
