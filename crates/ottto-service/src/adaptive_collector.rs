@@ -90,6 +90,7 @@ pub struct SourceCadence {
     server_min_interval: Option<Duration>,
     continuation: Option<ContinuationRequest>,
     ordinary_pacing: Option<ContinuationPacing>,
+    power_stretch: u32,
 }
 
 impl SourceCadence {
@@ -104,6 +105,7 @@ impl SourceCadence {
             server_min_interval: None,
             continuation: None,
             ordinary_pacing: None,
+            power_stretch: 1,
         }
     }
 
@@ -137,6 +139,15 @@ impl SourceCadence {
         }
         self.last_activity_at = Some(now);
         self.state = LocalCollectorState::Hot;
+    }
+
+    pub fn record_account_switch(&mut self, now: Instant) {
+        self.record_file_event(now);
+        self.last_scan_at = None;
+    }
+
+    pub fn set_power_stretch(&mut self, multiplier: u32) {
+        self.power_stretch = multiplier.max(1);
     }
 
     pub fn record_backend_hint(
@@ -205,9 +216,12 @@ impl SourceCadence {
             return self.config.cold_interval;
         }
         let tier = match self.state {
-            LocalCollectorState::Hot => self.config.hot_min_interval,
-            LocalCollectorState::Warm => self.config.warm_interval,
-            LocalCollectorState::Idle => self.config.idle_interval,
+            LocalCollectorState::Hot => self.config.hot_min_interval * self.power_stretch,
+            LocalCollectorState::Warm => self.config.warm_interval * self.power_stretch,
+            LocalCollectorState::Idle => self
+                .config
+                .idle_interval
+                .max(self.config.hot_min_interval * self.power_stretch),
             LocalCollectorState::Cold => self.config.cold_interval,
             LocalCollectorState::Failing => self.failure_backoff(),
             LocalCollectorState::Disabled => self.config.cold_interval,

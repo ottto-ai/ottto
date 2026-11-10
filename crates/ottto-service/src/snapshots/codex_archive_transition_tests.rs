@@ -521,6 +521,113 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     }
 }
 
+/// [regress] Header facts a warm process cache carries from earlier durable
+/// lookups keep each page's money: every appended page's bodies and placement
+/// equal a cold Full's, on one warm cache and with a restart (empty cache,
+/// reloaded store; also what an upgrade leaves) between pages. Once the
+/// accepted debt has settled, the warm last page looks up fewer heads than the
+/// restarted one. [money] Two accounts with named creator slots (tagged
+/// rows), a side call in archived_sessions, an evidence gap and a mid-session
+/// switch.
+#[test]
+fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Named creator slots for both accounts, so rows carry account tags.
+    let hash = |kind: &str, account: &str| {
+        let value = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{value}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
+    // Per arm, each page's (head lookups, header reuse hits).
+    let mut counts = Vec::new();
+    for restart in [false, true] {
+        let page = |c: &Corpus, index, cache| {
+            page_observed_with_limit(&c.roots(), index, cache, 100, &slots, |_| {})
+        };
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let side = c.path(SIDE);
+        fs::rename(&side, c.archived.join(side.file_name().unwrap())).unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let warm = Arc::new(sampled_scan::SharedCache::default());
+        let cache = || {
+            if restart {
+                Arc::default()
+            } else {
+                warm.clone()
+            }
+        };
+        let mut index = prior;
+        let mut arm = Vec::new();
+        for page_number in 0..5 {
+            match page_number {
+                0 => {}
+                1 => append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched")))),
+                n => append(&c.path(MAIN), &turn(2 + n)),
+            }
+            if restart {
+                index = ScanIndex::load(session.path()).unwrap();
+            }
+            let before = index.clone();
+            let (working, scan, _, _, logs) = page(&c, index, cache());
+            let (next, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+            index = next;
+            assert_eq!(posts.len(), 1, "page {page_number}");
+            let (_, mut cold, _, _, _) = page(
+                &c,
+                ScanIndex::default(),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            if page_number > 0 {
+                cold.snapshots.retain(|s| s.source_session_id == MAIN);
+            } else {
+                assert!(
+                    cold.snapshots
+                        .iter()
+                        .flat_map(|item| &item.model_usage)
+                        .any(|row| row.account_identifier_hash.is_some()),
+                    "tagged positive control"
+                );
+            }
+            money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &scan, posts));
+            let window = emitted_header_lookups(&logs);
+            let sum = |name: &str| {
+                window
+                    .iter()
+                    .filter_map(|record| record[name].as_u64())
+                    .sum::<u64>()
+            };
+            arm.push((sum("lookups"), sum("reuse_hits")));
+        }
+        counts.push(arm);
+        drop(session);
+    }
+    assert!(
+        counts[0][4].0 < counts[1][4].0,
+        "warm vs restarted (lookups, reuse hits) per page: {counts:?}"
+    );
+}
+
 /// [regress] A rollout created in an unrelated Codex home while a page is
 /// open leaves that page's checkpoint valid: the page uploads and saves.
 #[test]
@@ -1104,6 +1211,78 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         assert_eq!(arm.after["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.after["over_6h_files"], 0, "{label}\n{all}");
         money_oracle::assert_equivalent(&arm.expected, &arm.read);
+    }
+}
+
+/// [regress] A provider archive moves a rollout to another path, keeping its
+/// old mtime. The walk that lists the moved file counts it only after its path
+/// carry, so in that same walk it owes what its predecessor owed: an ACKed file
+/// nothing, an unACKed one once, from its first change. A carry that fails
+/// leaves the moved file owed.
+#[test]
+fn archived_rollout_owes_its_carried_debt_in_the_same_walk() {
+    const CONTEXT: &str = "g7-carry-context";
+    for (acked, carried) in [(true, true), (false, true), (true, false)] {
+        crate::snapshots::money_freshness::restart_for_test();
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        let original = c.path(MAIN);
+        File::options()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 3600))
+            .unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        // One ordinary pass, ACKed or saved unACKed: its walk's debt.
+        let pass = |mut index: ScanIndex| {
+            index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+            e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+            let previous = index.clone();
+            let (mut working, scan, _, _, logs) = page(&c, index, cache.clone());
+            let index = if acked {
+                working
+                    .checkpoint_with_captured_posts(&scan, &previous, "accept")
+                    .0
+            } else {
+                working.save(session.path()).unwrap();
+                ScanIndex::load(session.path()).unwrap()
+            };
+            let debt = logs
+                .iter()
+                .rev()
+                .find(|row| row["stage"] == "freshness_alarm" && row["counts"]["basis"] == "walk")
+                .expect("the pass ends a walk")["counts"]["debt"]
+                .clone();
+            (index, debt)
+        };
+        let (index, _) = pass(prior);
+        let (mut index, before) = pass(index);
+        let owed_before = u64::from(!acked);
+        assert_eq!(before["outstanding_files"], owed_before, "{before}");
+        assert_eq!(before["over_6h_files"], owed_before, "{before}");
+        let archived = c.archived.join(original.file_name().unwrap());
+        fs::rename(&original, &archived).unwrap();
+        let (old_key, new_key) = (local_index_key(&original), local_index_key(&archived));
+        if !carried {
+            // Destination custody refuses the carry.
+            index.confirmed_empty_files.insert(new_key.clone());
+        }
+        let (index, after) = pass(index);
+        let label = format!("acked={acked} carried={carried}\nbefore={before}\nafter={after}");
+        if carried {
+            assert!(!index.files.contains_key(&old_key), "{label}");
+            assert!(index.files.contains_key(&new_key), "{label}");
+        }
+        let owed = u64::from(!acked || !carried);
+        assert_eq!(after["outstanding_files"], owed, "{label}");
+        assert_eq!(after["over_6h_files"], owed, "{label}");
+        drop(session);
     }
 }
 

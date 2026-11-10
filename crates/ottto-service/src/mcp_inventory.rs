@@ -3638,7 +3638,7 @@ done
     }
 
     /// End-to-end: a first harvest uploads; an unchanged second harvest still
-    /// polls the org setting (relay token + activity hint) but skips the upload —
+    /// polls the org setting with the reused token but skips the upload —
     /// the unchanged-skip + Phase-4 per-cycle gate. Drives a real mock stdio MCP
     /// server + a mock backend.
     #[test]
@@ -3646,9 +3646,9 @@ done
         use std::sync::{Arc, Mutex};
 
         let (home, support_dir) = mock_cc_home("harvest-skip");
-        // Cycle 1: token + hint + inventory (3). Cycle 2: token + hint, no POST (2).
+        // Cycle 1: token + hint + inventory (3). Cycle 2: hint, no POST (1).
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (base, server) = mock_backend(captured.clone(), 5, HintMode::Enabled);
+        let (base, server) = mock_backend(captured.clone(), 4, HintMode::Enabled);
         let client = SnapshotApiClient::new(base.clone());
         let device = cc_device("device_test");
 
@@ -3657,6 +3657,20 @@ done
 
         server.join().expect("server thread");
         let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.contains("/relay-token"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.contains("/activity-hints"))
+                .count(),
+            2
+        );
         assert_eq!(
             inventory_post_count(&requests),
             1,

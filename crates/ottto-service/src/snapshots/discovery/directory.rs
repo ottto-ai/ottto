@@ -50,6 +50,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal(
         backfill_window_days,
         directory_entries_per_tick(),
         growth,
+        |_| {},
     )
 }
 
@@ -167,6 +168,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
     growth: Option<&discovery_growth::Page>,
+    carry: impl FnOnce(&mut ScanIndex),
 ) -> BTreeSet<String> {
     let mut traversal = index
         .traversal
@@ -538,11 +540,12 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
         }
     }
     let walk_ended = traversal.pending_directories.is_empty();
-    let debt = debt.end(index, walk_ended);
+    // Path carries run on the restored walk, before its debt is counted.
+    index.traversal = Some(traversal);
+    let debt = debt.end(index, walk_ended, carry);
     if root_walk {
         freshness.page_end(source, walk_ended, debt);
     }
-    index.traversal = Some(traversal);
     unlisted
 }
 

@@ -961,7 +961,7 @@ pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Source {
     ClaudeCode,
@@ -1400,6 +1400,7 @@ pub(crate) fn source_prepare<T>(
     inner: impl FnOnce() -> T,
     v2_active: impl FnOnce(&T) -> bool,
 ) -> T {
+    flush_offpass();
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
@@ -1539,22 +1540,27 @@ impl Drop for StageWindow {
         if std::thread::panicking() {
             return;
         }
-        #[derive(Serialize)]
-        struct Cpu {
-            cpu_user_us: Option<u64>,
-            cpu_sys_us: Option<u64>,
-        }
-        let cpu = self.offpass_cpu.map(|before| {
+        if let Some(before) = self.offpass_cpu {
             let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
-            Cpu {
-                cpu_user_us: samples.and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
-                cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
-            }
-        });
+            let observation = self.probe.observation();
+            aggregate_offpass(Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: self.stage,
+                source: self.source,
+                counts: OffpassCounts {
+                    count: 1,
+                    wall_max_us: observation.wall_elapsed_us,
+                    cpu_user_us: samples
+                        .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
+                    cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+                },
+                observation,
+            });
+            return;
+        }
         #[derive(Serialize)]
         struct Counts {
-            #[serde(flatten)]
-            cpu: Option<Cpu>,
             // Zero exposure is stored as None and stays off the record.
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
@@ -1568,18 +1574,63 @@ impl Drop for StageWindow {
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: if self.offpass_cpu.is_some() {
-                self.probe.observation()
-            } else {
-                self.probe.stage_observation(self.footprint.as_ref())
-            },
+            observation: self.probe.stage_observation(self.footprint.as_ref()),
             counts: Counts {
-                cpu,
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
             },
         });
+    }
+}
+#[derive(Serialize)]
+struct OffpassCounts {
+    count: u64,
+    cpu_user_us: Option<u64>,
+    cpu_sys_us: Option<u64>,
+    wall_max_us: u64,
+}
+// Literal source/stage keys only; one pending row per lane, no work-unit history.
+process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str), Record<OffpassCounts>>> =
+    std::sync::Mutex::new(BTreeMap::new()));
+fn aggregate_offpass(mut row: Record<OffpassCounts>) {
+    with_offpass(|state| {
+        let mut rows = state.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (row.source, row.stage);
+        if let Some(previous) = rows.remove(&key) {
+            row.counts.count += previous.counts.count;
+            row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
+            for (sum, prior) in [
+                (&mut row.counts.cpu_user_us, previous.counts.cpu_user_us),
+                (&mut row.counts.cpu_sys_us, previous.counts.cpu_sys_us),
+                (
+                    &mut row.observation.shared_process_cpu_delta_us,
+                    previous.observation.shared_process_cpu_delta_us,
+                ),
+            ] {
+                *sum = sum.zip(prior).map(|(a, b)| a + b);
+            }
+            row.observation.shared_process_disk_delta = row
+                .observation
+                .shared_process_disk_delta
+                .zip(previous.observation.shared_process_disk_delta)
+                .map(|(a, b)| DiskBytes {
+                    disk_read_bytes: a.disk_read_bytes + b.disk_read_bytes,
+                    disk_written_bytes: a.disk_written_bytes + b.disk_written_bytes,
+                });
+            row.observation.wall_elapsed_us += previous.observation.wall_elapsed_us;
+            row.observation.process_lifetime_max_rss_before_bytes =
+                previous.observation.process_lifetime_max_rss_before_bytes;
+        }
+        rows.insert(key, row);
+    });
+}
+fn flush_offpass() {
+    let rows = with_offpass(|state| {
+        std::mem::take(&mut *state.lock().unwrap_or_else(|error| error.into_inner()))
+    });
+    for row in rows.into_values() {
+        emit(&row);
     }
 }
 /// The page's largest listed or read file size, without paths or read
@@ -2825,12 +2876,15 @@ mod tests {
     fn offpass_work_reports_cpu_split_and_wall_without_footprint_sampling() {
         for source in ["claude_code", "codex", "pi"] {
             let (result, rows) = capture(|| {
-                let _stage = StageWindow::begin(source, "offpass_agent_status");
-                Ok::<_, anyhow::Error>(17)
+                for _ in 0..3 {
+                    let _stage = StageWindow::begin(source, "offpass_agent_status");
+                }
+                source_prepare(source, || Ok::<_, anyhow::Error>(17), |_| false)
             });
             assert_eq!(result.unwrap(), 17);
-            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.len(), 2);
             let row = &rows[0];
+            assert_eq!(row["counts"]["count"], 3);
             assert_eq!(row["schema_version"], 2);
             assert_eq!(row["stage"], "offpass_agent_status");
             assert_eq!(row["source"], source);
@@ -2851,6 +2905,37 @@ mod tests {
                 .get("footprint_sample_failures")
                 .is_none());
         }
+    }
+
+    /// [regress] Repeated off-pass work emits one row with exact totals at prepare.
+    #[test]
+    fn offpass_windows_aggregate_until_prepare() {
+        let (_, rows) = capture(|| {
+            for _ in 0..3 {
+                aggregate_offpass(Record {
+                    schema_version: SCHEMA_VERSION,
+                    process_id: std::process::id(),
+                    stage: "offpass_cloud_sessions",
+                    source: Source::Codex,
+                    observation: Observation::between(7, None, None),
+                    counts: OffpassCounts {
+                        count: 1,
+                        cpu_user_us: Some(2),
+                        cpu_sys_us: Some(5),
+                        wall_max_us: 7,
+                    },
+                });
+            }
+            source_prepare("codex", || (), |_| false);
+            flush_offpass();
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["counts"],
+            serde_json::json!({"count": 3, "cpu_user_us": 6, "cpu_sys_us": 15, "wall_max_us": 7})
+        );
+        assert_eq!(rows[0]["observation"]["wall_elapsed_us"], 21);
+        assert_eq!(rows[1]["stage"], "source_prepare");
     }
 
     #[test]

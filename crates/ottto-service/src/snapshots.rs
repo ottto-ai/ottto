@@ -562,6 +562,8 @@ pub struct SourceScanResult {
     pub(crate) charge_deferred: bool,
     /// Selection filled the effective AIMD file allowance before family deferrals.
     pub(crate) page_file_limit_hit: bool,
+    /// This process started the generation after a clean census completion.
+    pub(crate) routine_recensus: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,

@@ -2371,7 +2371,6 @@ pub struct RelayTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
     device_secret: String,
-    relay_token: std::sync::Mutex<Option<String>>,
 }
 
 impl RelayTransport {
@@ -2384,33 +2383,18 @@ impl RelayTransport {
             client: crate::snapshot_client::SnapshotApiClient::new(api_base_url),
             device,
             device_secret,
-            relay_token: std::sync::Mutex::new(None),
         }
     }
 
-    fn token(&self, force_refresh: bool) -> Result<String, UploadError> {
-        if !force_refresh {
-            if let Ok(cached) = self.relay_token.lock() {
-                if let Some(token) = cached.as_ref() {
-                    return Ok(token.clone());
-                }
-            }
-        }
-        let token = self
-            .client
+    fn token(&self) -> Result<String, UploadError> {
+        self.client
             .issue_relay_token_with_timeout(
                 &self.device,
                 &self.device_secret,
                 crate::snapshots::SnapshotSource::Codex,
                 UPLOAD_TIMEOUT,
             )
-            .map_err(|error| {
-                UploadError::Unavailable(format!("relay token unavailable: {error}"))
-            })?;
-        if let Ok(mut cached) = self.relay_token.lock() {
-            *cached = Some(token.clone());
-        }
-        Ok(token)
+            .map_err(|error| UploadError::Unavailable(format!("relay token unavailable: {error}")))
     }
 }
 
@@ -2422,7 +2406,7 @@ impl DailyReferenceTransport for RelayTransport {
     }
 
     fn send_batch(&self, batch: &Value) -> Result<Value, UploadError> {
-        let token = self.token(false)?;
+        let token = self.token()?;
         match self
             .client
             .upload_provider_daily_reference_batch_with_timeout(&token, batch, UPLOAD_TIMEOUT)
@@ -2434,7 +2418,7 @@ impl DailyReferenceTransport for RelayTransport {
                 // replay the identical body before concluding the build is not
                 // admitted.
                 if matches!(mapped, UploadError::NotAdmitted(401)) {
-                    let token = self.token(true)?;
+                    let token = self.token()?;
                     return self
                         .client
                         .upload_provider_daily_reference_batch_with_timeout(

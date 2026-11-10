@@ -106,11 +106,15 @@ fn cli_metadata_cache_failures_are_not_kept() {
         EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
     let binary = root.join("codex");
     let successful = fs::read_to_string(&binary).unwrap();
-    for row in ["nonzero", "unparsed", "models-unparsed"] {
+    for row in ["nonzero", "stderr-nonzero", "unparsed", "models-unparsed"] {
         let script = match row {
             "nonzero" => successful.replace(
                 "print(\"Logged in\")",
                 "print(\"not logged in\"); sys.exit(1)",
+            ),
+            "stderr-nonzero" => successful.replace(
+                "print(\"Logged in\")",
+                "print(\"Not logged in\", file=sys.stderr); sys.exit(1)",
             ),
             "unparsed" => successful.replace("Logged in", "unrecognized"),
             _ => successful.replace("gpt-5", "unrecognized"),
@@ -135,7 +139,7 @@ fn cli_metadata_cache_failures_are_not_kept() {
             .unwrap()
             .lines()
             .count(),
-        12
+        16
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -410,6 +414,70 @@ fn cli_metadata_cache_hit_skips_spawn() {
             .count(),
         2,
         "unchanged login/models must spawn once each"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [regress] Codex prints `login status` to stderr: unchanged inputs reuse it
+/// and return the fresh result; incomplete auth keeps today's account surface.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn cli_metadata_stderr_login_status_is_cached() {
+    let (root, home) = cli_meta_fixture("cli-meta-stderr");
+    let binary = root.join("codex");
+    let script = fs::read_to_string(&binary).unwrap().replace(
+        "print(\"Logged in\")",
+        "print(\"Logged in using ChatGPT\", file=sys.stderr)",
+    );
+    fs::write(binary, script).unwrap();
+    let _commands =
+        EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+    let starts = || {
+        fs::read_to_string(home.join("starts"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let collect = || {
+        let (snapshot, _, _) = collect_codex_status_for_home(
+            "2026-08-26T00:00:00Z".to_string(),
+            "2026-08-26T00:15:00Z".to_string(),
+            &home,
+            CodexHomeTrust::ProviderDefault,
+            CodexLoginRefresh::Never,
+            CodexQuotaRead::Saved,
+        );
+        serde_json::to_value((&snapshot.account, &snapshot.model, &snapshot.status)).unwrap()
+    };
+    let first = collect();
+    assert_eq!(collect(), first);
+    assert_eq!(
+        starts(),
+        2,
+        "unchanged stderr login status spawns once each"
+    );
+    CODEX_CLI_META.get().unwrap().lock().unwrap().kept.clear();
+    assert_eq!(collect(), first, "cache hit equals a fresh load");
+    assert_eq!(starts(), 4);
+    assert_eq!(first[0]["login_state"], "signed_in");
+    let (login, _, account) = codex_cli_meta(&home, false, false);
+    assert!(
+        login.is_err() && account.is_none(),
+        "bypass parses stdout only"
+    );
+    let stderr = |text: &str| CommandOutput {
+        command_found: true,
+        success: false,
+        status_code: Some(1),
+        stdout: String::new(),
+        stderr: text.to_string(),
+    };
+    assert_eq!(
+        parse_codex_account_text(&command_output_text(&stderr("Not logged in")))
+            .unwrap()
+            .login_state,
+        AgentLoginState::SignedOut
     );
     fs::remove_dir_all(root).unwrap();
 }

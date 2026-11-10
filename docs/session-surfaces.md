@@ -25,9 +25,12 @@ macOS app is currently open.
 ## Which sessions are listed
 
 A session enters `active_session_reconciliation.sessions` when a scan sees its
-transcript activity advance and that activity is less than 15 minutes old.
-Later scans keep it listed until its last observed activity is more than 15
-minutes old, even when they read no new activity for it. A scan that re-reads
+transcript activity advance within the daemon's recency window. That window is
+max(15 minutes, effective scan interval + 5 minutes), including 20 minutes for
+15-minute scans on battery or Low Power Mode. The reconciliation always emits
+`active_window_seconds` as an integer alongside `reconciled_at`; older cached
+reconciliations default to 900 seconds. Later scans keep the session listed until
+its last observed activity leaves that window, even when they read no new activity for it. A scan that re-reads
 a listed session rebuilds its row under the current upload policy and account
 evidence. A row that was not re-read is kept only under the same upload policy,
 and loses its account attribution if current evidence (account or workspace)

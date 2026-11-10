@@ -139,6 +139,11 @@ struct RouteState {
     pass_written_start: Option<u64>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
+    // Files whose committed head a commit may have changed since the Codex
+    // header inventory's cache (its address) last took them (`take_head_writes`).
+    // `None` until it first asks, and again on each new session: then any head
+    // may have changed.
+    head_writes: Option<(usize, BTreeSet<Vec<u8>>)>,
 }
 impl RouteState {
     fn report_hold(&self) {
@@ -195,6 +200,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_hold: None,
                     pass_written_start: None,
                     tail: Default::default(),
+                    head_writes: None,
                 }))
             })
             .clone()
@@ -611,6 +617,7 @@ pub(in super::super) fn save_locked(
         typed_write(session, |session| {
             session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
             let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
+            note_head_writes(state, std::mem::take(&mut session.cx.head_writes));
             // A commit published the stage; otherwise it waits for the next
             // save or the exit commit.
             if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
@@ -1078,7 +1085,15 @@ pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Res
         Ok(())
     }))
 }
+/// After any commit attempt: the heads it may have written.
+fn note_head_writes(state: &mut RouteState, written: impl IntoIterator<Item = Vec<u8>>) {
+    if let Some((_, keys)) = &mut state.head_writes {
+        keys.extend(written);
+    }
+}
 fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
+    // A new session: another writer may have changed any head.
+    state.head_writes = None;
     state.runtimes.retain(|r| r.strong_count() != 0);
     ensure!(state.runtimes.len() < 16, Hold::DbUnavailable);
     if let Some(runtime) = &index.v2().persistence_v2 {

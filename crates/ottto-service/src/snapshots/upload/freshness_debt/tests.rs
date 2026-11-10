@@ -131,6 +131,7 @@ pub(in crate::snapshots) fn walk(
             BACKFILL_WINDOW_DAYS,
             64,
             None,
+            |_| {},
         )
     });
     rows.into_iter()
@@ -529,7 +530,7 @@ fn a_file_written_during_the_listing_has_a_known_age() {
                 },
             );
             sampled_scan::set_test_now(None);
-            let report = page.end(&mut f.index, true).expect("the walk ends");
+            let report = page.end(&mut f.index, true, |_| {}).expect("the walk ends");
             let fields = report.fields(begin * 1000);
             assert_eq!(fields["outstanding_files"], 1, "{store:?}");
             assert_eq!(fields["oldest_age_s"].is_u64(), known, "{store:?}");
