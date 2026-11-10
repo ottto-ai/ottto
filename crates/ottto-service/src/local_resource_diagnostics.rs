@@ -538,11 +538,11 @@ pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
 }
 
 /// Test bound on one serialized `native_collection_page` record. Fixed page
-/// gate totals, the Full/Tail byte split, the Codex header lookup counts and
-/// the macOS disk byte deltas extend this local diagnostic record only; upload/finish records and all
+/// gate totals, the Full/Tail byte split and the Codex header lookup counts
+/// extend this local diagnostic record only; upload/finish records and all
 /// runtime resource caps stay unchanged.
 #[cfg(test)]
-pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4400;
+pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4320;
 
 /// Nonzero-only counters on the existing native_collection_page line. They
 /// observe a finalized file's retained records and gate nothing.
