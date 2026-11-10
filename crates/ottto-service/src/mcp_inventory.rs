@@ -2198,7 +2198,9 @@ fn harvest_source(
     // re-claim/re-onboard/repoint (different identity) never inherits the marker
     // and falls through to harvesting, the default-on behavior.
     let marker = org_disabled_marker_path(support_dir, source);
-    let policy = match client.get_activity_hint(&relay_token) {
+    let policy = match crate::snapshot_sync::small_source_upload(source, || {
+        client.get_activity_hint(&relay_token)
+    }) {
         Ok(hint) => {
             if !hint.mcp_inventory_harvest_enabled {
                 write_org_disabled_marker(&marker, &identity);

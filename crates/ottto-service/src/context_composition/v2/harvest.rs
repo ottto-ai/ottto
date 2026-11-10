@@ -556,7 +556,9 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
         let mut fetched = None;
         if let Some(token) = relay_token.as_deref() {
-            match client.get_activity_hint(token) {
+            match crate::snapshot_sync::small_source_upload(snapshot_source, || {
+                client.get_activity_hint(token)
+            }) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
                     write_marker(&marker, &destination);
                     health.remove(agent_source_label(snapshot_source));

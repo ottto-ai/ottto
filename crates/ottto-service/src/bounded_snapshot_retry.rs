@@ -517,6 +517,9 @@ impl RetryOwner {
                 self.slots[index] = None;
                 continue;
             }
+            if source_upload_backoff_remaining(page.source).is_some() {
+                continue;
+            }
             if now < page.budget.due() {
                 continue;
             }

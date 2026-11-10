@@ -336,10 +336,40 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
 /// envelope is a few hundred bytes; a longer body is not recognized.
 const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
 
-fn shed_from_response(status: u16, response: ureq::Response, count: usize) -> anyhow::Error {
-    let retry_after = response
+fn response_retry_after(response: &ureq::Response) -> Option<Duration> {
+    response
         .header("Retry-After")
-        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
+        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()))
+}
+
+fn small_upload_error(
+    error: ureq::Error,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let diagnostics =
+                UploadFailureDiagnostics::http(operation, endpoint, status, &response);
+            if matches!(status, 408 | 429 | 503) {
+                anyhow::Error::new(UploadShed {
+                    status,
+                    retry_after: response_retry_after(&response),
+                    code: None,
+                })
+                .context(diagnostics)
+            } else {
+                anyhow::Error::new(diagnostics)
+            }
+        }
+        other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+            operation, endpoint, &other,
+        )),
+    }
+}
+
+fn shed_from_response(status: u16, response: ureq::Response, count: usize) -> anyhow::Error {
+    let retry_after = response_retry_after(&response);
     let mut excerpt = Vec::new();
     let (code, named) = match response
         .into_reader()
@@ -647,6 +677,10 @@ impl UploadFailureDiagnostics {
     pub(crate) fn is_snapshot_batch_deadline(&self) -> bool {
         self.endpoint == "snapshot_batch"
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
+    }
+
+    pub(crate) fn is_snapshot_batch_too_large(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status == Some(413)
     }
 
     /// The status of a snapshot-batch server error that a prompt resend of
@@ -2353,7 +2387,8 @@ impl SnapshotApiClient {
             .timeout(timeout)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
-            .call()?;
+            .call()
+            .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?;
         // A policy response never needs a body-sized allowance or raw key
         // retention. Decode only after this cap and drop the fresh hint in-turn.
         let hint = bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
@@ -2370,21 +2405,7 @@ impl SnapshotApiClient {
             .call()
             // Typed diagnostics (not a plain string) so a transport-layer
             // failure on this early per-source call feeds the outage streak.
-            .map_err(|error| match error {
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "activity hint request",
-                        "activity_hint",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
-                    "activity hint request",
-                    "activity_hint",
-                    &other,
-                )),
-            })?
+            .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?
             .into_json::<Value>()
             .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
             .and_then(decode_activity_hint)
@@ -2565,7 +2586,7 @@ impl SnapshotApiClient {
             // A shed request is not a failed request. Keep it typed and carry the
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
-            Err(ureq::Error::Status(code @ (429 | 503), response)) => {
+            Err(ureq::Error::Status(code @ (408 | 429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
                 let shed = shed_from_response(code, response, request.snapshots.len());
                 self.record_batch_http_failure(
@@ -2797,20 +2818,8 @@ impl SnapshotApiClient {
             .send_json(request)
             // Typed diagnostics (not a plain string) so a transport-layer
             // failure on a status receipt feeds the outage streak.
-            .map_err(|error| match error {
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "snapshot status report",
-                        "snapshot_status",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
-                    "snapshot status report",
-                    "snapshot_status",
-                    &other,
-                )),
+            .map_err(|error| {
+                small_upload_error(error, "snapshot status report", "snapshot_status")
             })?
             .into_json()
             .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
@@ -2916,19 +2925,11 @@ impl SnapshotApiClient {
                 crate::account_nicknames::apply_upload(generation.as_ref(), admitted.as_deref());
                 Ok(response)
             }
-            Err(ureq::Error::Status(code, response)) => {
-                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
-                    "agent status upload",
-                    "agent_status",
-                    code,
-                    &response,
-                )))
-            }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+            Err(error) => Err(small_upload_error(
+                error,
                 "agent status upload",
                 "agent_status",
-                &error,
-            ))),
+            )),
         }
     }
 
@@ -5146,6 +5147,12 @@ mod tests {
                     r#"{"accepted":1,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[{"source_session_id":"raw-partial-session","snapshot_fingerprint":"abcdef0123456789","reason":"contract","detail":"fixture","permanent":true,"occurrence_count":1}],"conflict_entities":[]}"#,
                 ),
                 (
+                    "408 Request Timeout",
+                    Some("request-shed"),
+                    Some("30"),
+                    "{}",
+                ),
+                (
                     "429 Too Many Requests",
                     Some("request-shed"),
                     Some("30"),
@@ -5194,11 +5201,10 @@ mod tests {
             );
         client.upload_batch("relay", &request, false).unwrap();
         client.upload_batch("relay", &request, false).unwrap();
-        assert!(client
-            .upload_batch("relay", &request, false)
-            .unwrap_err()
-            .downcast_ref::<UploadShed>()
-            .is_some());
+        for status in [408, 429] {
+            let error = client.upload_batch("relay", &request, false).unwrap_err();
+            assert_eq!(error.downcast_ref::<UploadShed>().unwrap().status, status);
+        }
         assert!(client
             .upload_batch("relay", &request, false)
             .unwrap_err()
@@ -5227,27 +5233,28 @@ mod tests {
                 UploadReceiptOutcomeV1::AuthRejected,
                 UploadReceiptOutcomeV1::Rejected,
                 UploadReceiptOutcomeV1::Shed,
+                UploadReceiptOutcomeV1::Shed,
                 UploadReceiptOutcomeV1::Partial,
                 UploadReceiptOutcomeV1::Accepted,
             ]
         );
         assert_eq!(
-            receipt_response.receipts[5].server_request_id.as_deref(),
+            receipt_response.receipts[6].server_request_id.as_deref(),
             Some("request-accepted")
         );
         assert_eq!(
-            receipt_response.receipts[5].device_label.as_deref(),
+            receipt_response.receipts[6].device_label.as_deref(),
             Some("Test Mac")
         );
         assert_eq!(
-            receipt_response.receipts[5].account_binding,
+            receipt_response.receipts[6].account_binding,
             Some(LocalAccountState::Connected)
         );
         assert_eq!(
-            receipt_response.receipts[4].server_request_id.as_deref(),
+            receipt_response.receipts[5].server_request_id.as_deref(),
             Some("request-partial")
         );
-        assert_eq!(receipt_response.receipts[3].retry_after_seconds, Some(30));
+        assert_eq!(receipt_response.receipts[4].retry_after_seconds, Some(30));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

@@ -1324,3 +1324,79 @@ mod unkept_requeue_oracle_tests;
 
 #[path = "context_posture_refold_tests.rs"]
 mod context_posture_refold_tests;
+
+/// [money] A lone 413 keeps prior accepted money and retries without an ACK or retirement.
+#[test]
+fn lone_413_keeps_money_pending_until_exact_ack() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("lone-413");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let seed = page(&c, index, 100, true);
+        let mut prior = result(&seed, Mode::ColdFull);
+        accepted(&mut prior, &seed.scan.snapshots);
+        let (index, mut progress) = commit_with_progress(&session, seed);
+        append(&path, &line(ROOT, "after-413", "2026-08-02T07:04:00Z", 6));
+        let candidate = hinted(&c, index, 100, true, &[path]);
+        let lone = candidate
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == ROOT)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(lone.len(), 1);
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold_items = cold_page
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == ROOT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let cold = RouteResult::emitted(
+            Mode::ColdFull,
+            SOURCE,
+            upload(&cold_items, &mut e2_progress(), ack).1,
+            &cold_items,
+        );
+        assert!(accounts(&cold).len() >= 2);
+        let before = progress.accepted_fingerprints.clone();
+        progress.fresh_context_body_acks.clear();
+        let receipts = progress.fresh_context_body_acks.clone();
+        for _ in 0..2 {
+            let (outcome, _, _) = upload(&lone, &mut progress, |_| {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    413,
+                    false,
+                )))
+            });
+            let error = outcome.unwrap_err();
+            assert!(error
+                .downcast_ref::<UploadFailureDiagnostics>()
+                .unwrap()
+                .is_snapshot_batch_too_large());
+            assert!(error.downcast_ref::<UploadShed>().is_none());
+            assert!(progress.permanent_rejections.is_empty());
+            assert!(progress.active_quarantine_retries.is_empty());
+            assert_eq!(progress.accepted_fingerprints, before);
+            assert_eq!(progress.fresh_context_body_acks, receipts);
+            assert!(progress.quarantined_fingerprints.is_empty());
+            progress = serde_json::from_value(serde_json::to_value(&progress).unwrap()).unwrap();
+        }
+        let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &lone);
+        held.accepted = prior.accepted.clone();
+        money_oracle::assert_held(ROOT, &prior, &held, &cold);
+        let (outcome, sent, _) = upload(&lone, &mut progress, ack);
+        assert_eq!(outcome.unwrap(), ResumableUploadResult::Completed);
+        money_oracle::assert_equivalent(
+            &cold,
+            &RouteResult::emitted(Mode::Restart, SOURCE, sent, &lone),
+        );
+    });
+}
