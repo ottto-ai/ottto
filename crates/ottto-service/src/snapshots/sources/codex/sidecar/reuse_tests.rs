@@ -116,6 +116,10 @@ fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[Path
     };
     assert_eq!(titles(a), titles(b));
     assert_eq!(
+        serde_json::to_value(a.local_diagnostics.identity_conflict_taxonomy).unwrap(),
+        serde_json::to_value(b.local_diagnostics.identity_conflict_taxonomy).unwrap()
+    );
+    assert_eq!(
         a.root_sidecars.keys().collect::<Vec<_>>(),
         b.root_sidecars.keys().collect::<Vec<_>>()
     );
@@ -449,8 +453,10 @@ fn kept_home_drops_raw_rows() {
     let slim = facts.homes.kept[&f.0].1.clone();
     assert!(slim.raw.threads.is_empty() && slim.raw.history.is_empty());
     assert_eq!(slim.threads.len(), 2);
-    // The previous representation: the same home plus its raw rows.
-    let mut old = (*slim).clone();
+    // The previous representation: the same home plus its raw rows. A clone
+    // drops spare capacity, so both sides start from one cloned baseline.
+    let base = (*slim).clone();
+    let mut old = base.clone();
     old.raw.threads = slim
         .threads
         .iter()
@@ -473,5 +479,5 @@ fn kept_home_drops_raw_rows() {
         + crate::heap_layout_bound::completed_bound(&old.raw.history, usize::MAX).unwrap()
         - 2 * std::mem::size_of::<Vec<u8>>();
     assert!(size(&slim) < size(&old));
-    assert_eq!(size(&old) - size(&slim), raw);
+    assert_eq!(size(&old) - size(&base), raw);
 }
