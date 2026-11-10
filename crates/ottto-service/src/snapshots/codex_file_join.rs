@@ -3207,13 +3207,21 @@ pub(super) mod tests {
         }
         panic!("bounded native scan did not finish");
     }
-    /// [money] Codex logs no longer price a turn: a logs priority request for a
-    /// new turn, with no tier receipt, leaves every row at the default tier.
-    #[test]
-    fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
+    /// The two-member fixture with b's usage under `turn` (`tier` on its usage
+    /// lines when set) and a Codex logs database holding a priority request
+    /// for that turn, as Codex 0.119-0.142.x wrote it.
+    fn logs_priority_request_fixture(turn: &str, tier: Option<&str>) -> PathBuf {
         let (root, _) = fixture();
-        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
+        if let Some(tier) = tier {
+            for row in &mut rows[1..] {
+                if row["type"] == "token_usage_record" {
+                    row["payload"]["service_tier"] = json!(tier);
+                } else {
+                    row["payload"]["info"]["service_tier"] = json!(tier);
+                }
+            }
+        }
         rows.insert(
             1,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
@@ -3249,7 +3257,13 @@ pub(super) mod tests {
                 ],
             )
             .unwrap();
-        drop(connection);
+        root
+    }
+    /// [money] Codex logs no longer price a turn: a logs priority request for a
+    /// new turn, with no tier receipt, leaves every row at the default tier.
+    #[test]
+    fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
+        let root = logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None);
         let (_, result) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(result.snapshots.len(), 2, "one alias per group member");
         for item in &result.snapshots {
@@ -3263,6 +3277,41 @@ pub(super) mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    /// [money] An explicit tier on the rollout's own usage lines now prices its
+    /// turn beside a logs priority request, where the logs stamp used to
+    /// replace it: `flex` stays `flex`, and `priority` keeps its price under
+    /// the rollout line's own source.
+    #[test]
+    fn explicit_rollout_tier_is_no_longer_replaced_by_codex_logs() {
+        for tier in ["flex", "priority"] {
+            let root =
+                logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", Some(tier));
+            let (_, result) = scan(&root, ScanIndex::default(), 2);
+            assert_eq!(result.snapshots.len(), 2, "one alias per group member");
+            for item in &result.snapshots {
+                assert_eq!(item.input_tokens, 300);
+                let tiered = item
+                    .model_usage
+                    .iter()
+                    .filter(|row| {
+                        row.selector_context.get("service_tier").map(String::as_str) == Some(tier)
+                    })
+                    .map(|row| row.input_tokens)
+                    .sum::<u64>();
+                assert_eq!(tiered, 200, "{tier}: b at its own tier");
+                assert!(
+                    item.model_usage.iter().all(|row| {
+                        row.selector_sources
+                            .get("service_tier")
+                            .is_none_or(|source| source.starts_with("payload."))
+                    }),
+                    "{tier}: {:?}",
+                    item.model_usage
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
     #[test]
     fn production_scanner_aliases_need_common_settlement_and_skip_on_restart() {
@@ -4829,9 +4878,17 @@ pub(super) mod tests {
                 .map(|row| row.input_tokens)
                 .sum::<u64>()
         };
+        // The joined members' aliases share one body; the wire carries it once.
+        let one_body_each = |scan: &mut SourceScanResult| {
+            let mut seen = BTreeSet::new();
+            scan.snapshots
+                .retain(|item| seen.insert(item.snapshot_fingerprint.clone()));
+            assert_eq!(scan.snapshots.len(), 1);
+        };
         let root = native_join_fixture_root(true);
+        // The accepted read's raw rows, compared with the replay's raw rows.
+        let (_, mut accepted_rows) = scan(&root, ScanIndex::default(), 2);
         let (mut working, mut first) = scan(&root, ScanIndex::default(), 2);
-        let accepted = scan_money(SnapshotSource::Codex, &working, &first);
         assert_eq!(priority(&first), 400, "positive control: b priced priority");
         finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut working);
         first.finish_codex_capture_boundary(&mut working);
@@ -4844,6 +4901,11 @@ pub(super) mod tests {
             working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
         let saved = root.join("index.json");
         committed.save(&saved).unwrap();
+        // Both routes take their receipt evidence from the saved index, which
+        // the replay reads; what can differ is the replayed rows' money and
+        // placement.
+        one_body_each(&mut accepted_rows);
+        let accepted = scan_money(SnapshotSource::Codex, &committed, &accepted_rows);
         older_build_logs_expired();
 
         let (_, restarted) = scan(&root, ScanIndex::load(&saved).unwrap(), 2);
@@ -4851,10 +4913,11 @@ pub(super) mod tests {
 
         let mut loaded = ScanIndex::load(&saved).unwrap();
         loaded.prepare_historical_replay("logs-priority-upgrade".into());
-        let (replay_index, replayed) = scan(&root, loaded, 2);
+        let (_, mut replayed) = scan(&root, loaded, 2);
         assert_eq!(replayed.ownership_incomplete_file_count, 0);
         assert_eq!(priority(&replayed), 400, "restored from the receipt");
-        let replayed = scan_money(SnapshotSource::Codex, &replay_index, &replayed);
+        one_body_each(&mut replayed);
+        let replayed = scan_money(SnapshotSource::Codex, &committed, &replayed);
         money_oracle::assert_equivalent(&accepted, &replayed);
         money_oracle::assert_placement_equivalent(&accepted, &replayed);
         money_oracle::assert_no_smaller_reemit(owner, &accepted, &replayed, &accepted, false);

@@ -17,6 +17,8 @@ pub(super) fn seed_sidecars(c: &Corpus) -> rusqlite::Connection {
 
 /// [money] Cached sidecars feed the native Tail, restore, restart-between-pages,
 /// compatible binary upgrade, real post-ACK placement and quiet-restart routes.
+/// A turn an older build priced priority from Codex logs keeps that tier on
+/// every route through its tier receipt.
 #[test]
 fn codex_sidecar_reuse_transition() {
     let _lock = DECODER_TEST_LOCK
@@ -32,6 +34,21 @@ fn codex_sidecar_reuse_transition() {
         c.write(id, account);
     }
     let _db = seed_sidecars(&c);
+    // An older build priced MAIN's opening turn priority from Codex logs. The
+    // cold Full below is that build's output; every later route runs after the
+    // logs evidence is gone and must equal it through the tier receipt.
+    let turn_context = |turn: &str| {
+        json!({"type":"turn_context", "timestamp":"2026-10-07T09:30:00Z",
+            "payload":{"turn_id": turn, "model":"gpt-5.2"}})
+        .to_string()
+            + "\n"
+    };
+    fs::write(
+        c.path(MAIN),
+        header(MAIN, Some("a")) + &turn_context("priority-control") + &turn(1) + &turn(2),
+    )
+    .unwrap();
+    crate::snapshots::older_build_logs_priority("priority-control");
     let hash = |kind: &str, account: &str| {
         ottto_core::billing_identity_hash(
             "openai",
@@ -66,6 +83,7 @@ fn codex_sidecar_reuse_transition() {
     let (mut prior, _) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
     // Two independent account streams, native spawned side work, an evidence
     // gap, and a mid-session contradicting creator all pass this loader.
+    append(&c.path(MAIN), &turn_context("later-turn"));
     for id in [MAIN, OTHER, SIDE, GAP] {
         append(&c.path(id), &turn(3));
     }
@@ -95,6 +113,19 @@ fn codex_sidecar_reuse_transition() {
             .is_some_and(|ledger| !ledger.is_null()),
         "actual stored-body ACK ledger"
     );
+    assert!(
+        cold_scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == MAIN)
+            .flat_map(|item| &item.model_usage)
+            .any(|row| {
+                row.selector_sources.get("service_tier").map(String::as_str)
+                    == Some("derived_from_logs_2")
+            }),
+        "priority positive control"
+    );
+    crate::snapshots::older_build_logs_expired();
     let mut committed = None;
     for (label, owner) in [
         ("tail", cache.clone()),
