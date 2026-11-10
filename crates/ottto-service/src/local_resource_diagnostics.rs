@@ -1411,11 +1411,6 @@ pub(crate) fn release_memory() -> AllocatorRelief {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        #[cfg(target_os = "linux")]
-        // SAFETY: asks the process allocator to release free pages.
-        unsafe {
-            libc::malloc_trim(0);
-        }
         AllocatorRelief::default()
     }
 }
