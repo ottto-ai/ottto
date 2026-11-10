@@ -3138,6 +3138,8 @@ impl OwnedSourceScan {
                     .as_ref()
                     .cloned()
                     .expect("traversal remains active");
+                let routine_recensus =
+                    traversal_transition::routine_recensus(source, &traversal_snapshot);
                 let traversal_healthy = !traversal_snapshot.counts.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 // Count-only per-family completion, from the page's
@@ -3486,6 +3488,7 @@ impl OwnedSourceScan {
                     census_status,
                     charge_deferred: history_upgrade.charge_deferred > 0,
                     page_file_limit_hit,
+                    routine_recensus,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),

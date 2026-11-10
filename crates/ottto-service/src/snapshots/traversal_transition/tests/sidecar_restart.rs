@@ -23,12 +23,20 @@ fn sidecar_restart_reports_only_an_existing_discarded_traversal() {
         let old = index.traversal.as_ref().unwrap();
         let directories = old.pending_directories.len();
         let candidates = old.pending_candidates.len();
+        retiring(
+            SnapshotSource::ClaudeCode,
+            0,
+            old,
+            true,
+            0,
+            CensusGates::default(),
+        );
         if !retained {
             index.traversal = None;
         }
         index.generation = 37;
         index.claude_desktop_identity_census_complete = true;
-        let (_, rows) = capture(|| {
+        let (scan, rows) = capture(|| {
             OwnedSourceScan::new(
                 SnapshotSource::ClaudeCode,
                 &[root],
@@ -41,6 +49,13 @@ fn sidecar_restart_reports_only_an_existing_discarded_traversal() {
                 false,
             )
         });
+        assert!(
+            !routine_recensus(
+                SnapshotSource::ClaudeCode,
+                scan.index.traversal.as_ref().unwrap()
+            ),
+            "sidecar restart disarms"
+        );
         let restarts = rows
             .iter()
             .filter(|row| row["counts"]["event"] == "restarting")
