@@ -199,6 +199,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         prior_traversal_context_matches,
         retry_attempt,
     );
+    transition.start_recensus(source, &context_fingerprint, collected_at);
 
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation

@@ -5,6 +5,34 @@ use super::{
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
+
+// None arms the next walk; Some(window) identifies its routine generation.
+// The index reloads between pages. Keep scheduling state only in this process.
+type Recensus = BTreeMap<(usize, String), Option<String>>;
+static RECENSUS: Mutex<Recensus> = Mutex::new(BTreeMap::new());
+
+fn recensus() -> MutexGuard<'static, Recensus> {
+    RECENSUS.lock().unwrap_or_else(|poisoned| {
+        RECENSUS.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+pub(super) fn routine_recensus(
+    source: SnapshotSource,
+    traversal: &ScanTraversalCheckpoint,
+) -> bool {
+    recensus().get(&(source.slot(), traversal.context_fingerprint.clone()))
+        == Some(&Some(traversal.census_window_end.clone()))
+}
+
+pub(super) fn disarm_recensus(source: SnapshotSource, context: &str) {
+    recensus().remove(&(source.slot(), context.to_owned()));
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +118,15 @@ impl Starting {
     pub(super) fn emit(&self, source: SnapshotSource) {
         crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
     }
+
+    pub(super) fn start_recensus(&self, source: SnapshotSource, context: &str, window: &str) {
+        let mut state = recensus();
+        let key = (source.slot(), context.to_owned());
+        let armed = state.remove(&key) == Some(None);
+        if matches!(self.reason, StartReason::NoRetainedTraversal) && armed {
+            state.insert(key, Some(window.to_owned()));
+        }
+    }
 }
 
 pub(super) fn restarting(
@@ -97,6 +134,7 @@ pub(super) fn restarting(
     index_generation: u64,
     traversal: &ScanTraversalCheckpoint,
 ) {
+    disarm_recensus(source, &traversal.context_fingerprint);
     #[derive(Serialize)]
     struct Restarting {
         event: &'static str,
@@ -161,6 +199,14 @@ pub(super) fn retiring(
     } else {
         RetireReason::ParentResolutionRestart
     };
+    {
+        let mut state = recensus();
+        let key = (source.slot(), traversal.context_fingerprint.clone());
+        state.remove(&key);
+        if matches!(reason, RetireReason::Complete) {
+            state.insert(key, None);
+        }
+    }
     crate::local_resource_diagnostics::traversal_transition(
         source.api_slug(),
         &Retiring {
@@ -198,12 +244,21 @@ mod tests {
 
     #[test]
     fn traversal_transition_real_start_resume_context_and_retry() {
+        let scratch = crate::test_scratch::ScratchDir::new("recensus-starts");
+        let roots = [scratch.to_path_buf()];
+        let start = |index: &mut ScanIndex, now: &str, days: u64| {
+            capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &roots, index, now, days)).1
+        };
         let mut index = ScanIndex {
             generation: 37,
             ..ScanIndex::default()
         };
         let first = start(&mut index, T0, BACKFILL_WINDOW_DAYS);
         assert_eq!(first.len(), 1);
+        assert!(!routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
         assert_eq!(first[0]["counts"]["reason"], "no_retained_traversal");
         assert_eq!(first[0]["counts"]["index_generation"], 37);
         assert_eq!(
@@ -245,6 +300,10 @@ mod tests {
 
         let changed = start(&mut index, T1, BACKFILL_WINDOW_DAYS + 1);
         assert_eq!(changed.len(), 1);
+        assert!(!routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
         assert_eq!(changed[0]["counts"]["reason"], "context_changed");
         assert_eq!(
             changed[0]["counts"]["previous"]["window_unix_seconds"],
@@ -253,6 +312,7 @@ mod tests {
         assert!(changed[0]["counts"]["retry_due"].is_null());
 
         let t = index.traversal.as_mut().unwrap();
+        t.pending_directories.clear();
         t.counts.malformed_json_line_count = 3;
         t.unhealthy_retry_attempt = 2;
         t.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds("2026-08-01T00:03:00Z");
@@ -261,6 +321,10 @@ mod tests {
         assert_eq!(serde_json::to_value(&index).unwrap(), before);
         let retried = start(&mut index, "2026-08-01T00:03:00Z", BACKFILL_WINDOW_DAYS + 1);
         assert_eq!(retried.len(), 1);
+        assert!(!routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
         assert_eq!(retried[0]["counts"]["reason"], "terminal_unhealthy_retry");
         assert_eq!(retried[0]["counts"]["retry_due"], true);
         assert_eq!(
@@ -282,11 +346,16 @@ mod tests {
 
     #[test]
     fn traversal_transition_actual_retirement_and_clean_followup() {
+        let scratch = crate::test_scratch::ScratchDir::new("routine-recensus");
+        let roots = [scratch.to_path_buf()];
+        let start = |index: &mut ScanIndex, now: &str, days: u64| {
+            capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &roots, index, now, days)).1
+        };
         let mut index = ScanIndex::default();
         let (scan, rows) = capture(|| {
             scan_source_roots(
                 SnapshotSource::Pi,
-                &[],
+                &roots,
                 &mut index,
                 T0,
                 BACKFILL_WINDOW_DAYS,
@@ -304,11 +373,23 @@ mod tests {
         assert_eq!(retired["counts"]["unsettled_causes"], json!([]));
 
         start(&mut index, T1, BACKFILL_WINDOW_DAYS);
+        let traversal = index.traversal.as_ref().unwrap();
+        assert!(
+            routine_recensus(SnapshotSource::Pi, traversal),
+            "Complete arms"
+        );
+        let saved = serde_json::to_value(traversal).unwrap();
+        assert!(saved.get("routine_recensus").is_none());
+        let restored = serde_json::from_value(saved).unwrap();
+        assert!(
+            routine_recensus(SnapshotSource::Pi, &restored),
+            "page reload retains scheduling"
+        );
         index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
         let (scan, rows) = capture(|| {
             scan_source_roots(
                 SnapshotSource::Pi,
-                &[],
+                &roots,
                 &mut index,
                 T1,
                 BACKFILL_WINDOW_DAYS,
@@ -331,6 +412,10 @@ mod tests {
         // them with the flag.
         let started = start(&mut index, T2, BACKFILL_WINDOW_DAYS);
         assert_eq!(started.len(), 1);
+        assert!(
+            !routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
+            "clean follow-up stays paced"
+        );
         assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
         assert_eq!(
             started[0]["counts"]["prior_unsettled_causes"],
@@ -339,8 +424,40 @@ mod tests {
         assert!(!index.bounded_sweep_had_unsettled_upload);
         assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
         let started = start(&mut index, T3, BACKFILL_WINDOW_DAYS + 1);
+        assert!(
+            !routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
+            "context change stays paced"
+        );
         assert_eq!(started[0]["counts"]["prior_unsettled_upload"], false);
         assert_eq!(started[0]["counts"]["prior_unsettled_causes"], json!([]));
+        for frozen_generation in [false, true] {
+            let traversal = index.traversal.as_ref().unwrap();
+            retiring(
+                SnapshotSource::Pi,
+                0,
+                traversal,
+                true,
+                0,
+                CensusGates::default(),
+            );
+            retiring(
+                SnapshotSource::Pi,
+                0,
+                traversal,
+                false,
+                0,
+                CensusGates {
+                    frozen_generation,
+                    ..Default::default()
+                },
+            );
+            index.traversal = None;
+            start(&mut index, T3, BACKFILL_WINDOW_DAYS + 1);
+            assert!(!routine_recensus(
+                SnapshotSource::Pi,
+                index.traversal.as_ref().unwrap()
+            ));
+        }
     }
 
     fn with_unsettled_causes(index: &ScanIndex, causes: u16) -> ScanIndex {

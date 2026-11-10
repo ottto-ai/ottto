@@ -126,6 +126,15 @@ fn drain_from(
     for _ in 0..32 {
         let mut page = with_resident_budget(budget, || c.raw(&scanner, index, 100, true, &[]));
         pages += 1;
+        if prior.is_some() {
+            assert!(
+                !page.scan.routine_recensus,
+                "sidecar evidence restart stays paced"
+            );
+        }
+        if page.scan.charge_deferred {
+            assert!(continuation::resident_scan_requested(&page.scan));
+        }
         reads += page.scan.scanned_file_count;
         deferred += usize::from(page.scan.charge_deferred);
         complete = page.scan.census_complete;
@@ -590,8 +599,11 @@ fn resident_wave_source_changed_tail_refolds_match_one_page() {
     }
     with_e2(|| {
         let c = corpus_with_family("resident-wave-refolds");
-        let wide_seed = drain(&c, f64::INFINITY, false);
-        let small_seed = drain(&c, f64::INFINITY, false);
+        let mut wide_seed = drain(&c, f64::INFINITY, false);
+        let mut small_seed = drain(&c, f64::INFINITY, false);
+        // A completed sidecar sweep restarts the walk even after retirement.
+        E2ScanFixture::mark_sidecar_sweep_incomplete(&mut wide_seed.index);
+        E2ScanFixture::mark_sidecar_sweep_incomplete(&mut small_seed.index);
         // New finish evidence for every root; native transcripts stay fixed.
         for n in 1..5 {
             let id = format!("{}338a80a-f36e-4cbc-a5bb-50fc66430ba5", n + 1);

@@ -48,7 +48,7 @@ impl OwnedRotationProof {
             (SnapshotSource::ClaudeCode, &b.root, ScanIndex::default()),
         ] {
             let mut index = index;
-            let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
                 source,
                 std::slice::from_ref(root),
                 &mut index,
@@ -57,6 +57,8 @@ impl OwnedRotationProof {
                 MAX_BACKFILL_FILES_PER_SOURCE,
             )
             .unwrap();
+            // Compare native outputs independently of process scheduling history.
+            scan.routine_recensus = false;
             controls.insert(
                 source.api_slug(),
                 (format!("{scan:?}"), serde_json::to_value(index).unwrap()),
@@ -249,7 +251,9 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         }
     }
     fn finish(&mut self, completed: Self::Completed, _remaining: Option<usize>) -> Result<()> {
-        let (preparation, index, scan) = completed;
+        let (preparation, index, mut scan) = completed;
+        // The control walk completed first, so generation origins can differ.
+        scan.routine_recensus = false;
         let expected = &self.controls[preparation.source.api_slug()];
         assert_eq!(
             format!("{scan:?}"),

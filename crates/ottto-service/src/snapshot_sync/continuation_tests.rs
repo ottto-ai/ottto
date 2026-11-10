@@ -1401,13 +1401,16 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
         .canonicalize()
         .unwrap();
     let now = Instant::now();
-    for (case, (files, power, gap)) in [
-        (3_usize, PlatformState::Allowed, Some(30)),
-        (3, PlatformState::Battery, Some(180)),
-        (2, PlatformState::Allowed, None),
-        (1, PlatformState::Allowed, None),
-        (3, power_state(0), None), // Low Power Mode on AC or battery.
-        (3, PlatformState::Unknown, None),
+    for (case, (files, power, routine, charge, gap)) in [
+        (3_usize, PlatformState::Allowed, false, false, Some(30)),
+        (3, PlatformState::Battery, false, false, Some(180)),
+        (2, PlatformState::Allowed, false, false, None),
+        (1, PlatformState::Allowed, false, false, None),
+        (3, power_state(0), false, false, None), // Low Power Mode on AC or battery.
+        (3, PlatformState::Unknown, false, false, None),
+        (3, PlatformState::Allowed, true, false, None),
+        (3, PlatformState::Battery, true, false, None),
+        (3, PlatformState::Allowed, true, true, Some(30)),
     ]
     .into_iter()
     .enumerate()
@@ -1421,7 +1424,7 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             )
             .unwrap();
         }
-        let (_, scan, _) = E2ScanFixture::default().scan_other_page(
+        let (_, mut scan, _) = E2ScanFixture::default().scan_other_page(
             SnapshotSource::Pi,
             &[root],
             &home,
@@ -1438,6 +1441,12 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             !scan.charge_deferred,
             "the file allowance is the only trigger"
         );
+        assert!(
+            !scan.routine_recensus,
+            "a first walk in this process stays paced"
+        );
+        scan.routine_recensus = routine;
+        scan.charge_deferred = charge;
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(now, 1);
         if resident_scan_requested(&scan)

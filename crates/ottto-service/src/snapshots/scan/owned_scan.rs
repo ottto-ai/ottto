@@ -4,6 +4,7 @@
 
 mod step;
 
+use crate::snapshots::discovery::traversal::scan_traversal_context_fingerprint;
 use crate::snapshots::*;
 
 pub(in crate::snapshots) fn prepare_owned_scan_candidate(
@@ -537,6 +538,11 @@ impl OwnedSourceScan {
             // census loss also revisits consumed pages once to retract completeness.
             if let Some(traversal) = index.traversal.as_ref() {
                 traversal_transition::restarting(source, index.generation, traversal);
+            } else {
+                traversal_transition::disarm_recensus(
+                    source,
+                    &scan_traversal_context_fingerprint(source, roots, backfill_window_days),
+                );
             }
             index.traversal = None;
         }
