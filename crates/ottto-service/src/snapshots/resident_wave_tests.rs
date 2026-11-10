@@ -479,6 +479,76 @@ fn resident_deferral_preserves_hu_nonmember_and_first_read_census_semantics() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// [behaviour] The authority membership map is built only for a quarantine:
+/// none, or one whose members match the page, forces the same reparses; a
+/// record missing an observed member still forces its family.
+#[test]
+fn authority_membership_map_is_only_built_for_a_quarantine() {
+    let (home, root, index) = claude_history_upgrade_tests::families("authority-map", 2);
+    let at = "2026-08-23T18:40:00Z";
+    let family = "bbbbbbbb-cccc-4ddd-8eee-000000000001";
+    let other = root.join("bbbbbbbb-cccc-4ddd-8eee-000000000000.jsonl");
+    let mut index = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        index,
+        at,
+        BACKFILL_WINDOW_DAYS,
+        0,
+        None,
+        &[],
+        false,
+    )
+    .index;
+    let walk = index.traversal.as_mut().unwrap();
+    assert!(walk.pending_directories.is_empty());
+    // Only the other family is on the page: no candidate-driven reparse.
+    walk.pending_candidates.retain(|entry| entry.path == other);
+    let mut members: BTreeMap<String, String> = walk
+        .observed_index_keys
+        .iter()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .filter(|(root, _)| root == family)
+        .map(|(_, member)| (member, "f".repeat(64)))
+        .collect();
+    assert_eq!(members.len(), 2);
+    let forced = |members: Option<&BTreeMap<String, String>>| {
+        let mut index = index.clone();
+        if let Some(members) = members {
+            index.claude_usage_authority_quarantine.insert(
+                family.into(),
+                ClaudeUsageAuthorityQuarantineRecord {
+                    contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
+                    proven_witness_fingerprint: "e".repeat(64),
+                    member_source_file_fingerprints: members.clone(),
+                    failed_reconstruction_count: 1,
+                    disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                    retry_after_unix_seconds: u64::MAX,
+                    proof_correction: None,
+                },
+            );
+        }
+        OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+            1,
+            None,
+            &[],
+            false,
+        )
+        .forced_claude_family_reparses
+    };
+    let none = forced(None);
+    assert!(!none.contains(family));
+    assert_eq!(forced(Some(&members)), none);
+    members.pop_first();
+    assert!(forced(Some(&members)).contains(family));
+    fs::remove_dir_all(home).unwrap();
+}
+
 /// [money] The constructor consumes an unselected census member for an
 /// index-only quarantine seed. Deferring that whole family restores the exact
 /// consumed entry, never invents root membership, then reads each member once.

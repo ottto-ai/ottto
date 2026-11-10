@@ -491,7 +491,7 @@ fn misc_row_digests_cover_scalar_map_ack_and_raw_hold_changes() {
 }
 
 /// [format] digests recorded while decoding equal those the seed computes,
-/// for every logical row except untyped census records and opaque holds.
+/// for every logical row except opaque holds.
 #[test]
 fn decoded_row_digests_equal_seed_computed_digests() {
     let (_scratch, mut db) = Scratch::store();
@@ -513,10 +513,54 @@ fn decoded_row_digests_equal_seed_computed_digests() {
             _ => None,
         })
         .collect();
-    assert!(uncached.contains("file.census"));
-    assert!(uncached
-        .iter()
-        .all(|kind| *kind == "file.census" || kind.starts_with("raw_hold.")));
+    assert!(decoded.keys().any(is_census));
+    assert!(uncached.iter().all(|kind| kind.starts_with("raw_hold.")));
+}
+fn is_census(key: &RowKey) -> bool {
+    matches!(key, RowKey::Record { kind, .. } if kind.name() == "file.census")
+}
+
+/// [format] a census row's baseline commits to its stored row: an unchanged
+/// seeded save puts what an unseeded one does, and a record changed before
+/// the baseline is still rewritten.
+#[test]
+fn seeded_census_baseline_commits_to_the_stored_row() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    let (_scratch, mut db) = Scratch::live_store();
+    commit_populate(&mut db, &fixture());
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let mut puts = Vec::new();
+    for seeded in [false, false, true] {
+        let (mut index, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(cx.digests.keys().filter(|key| is_census(key)).count(), 2);
+        if !seeded {
+            cx.digests.clear();
+        }
+        let previous = baseline(&index, &mut cx).unwrap();
+        let before = db.save_row_attempts();
+        super::save_graph(&mut db, &identity, previous, &mut index, &mut cx).unwrap();
+        let after = db.save_row_attempts();
+        puts.push((after.0 - before.0, after.1 - before.1));
+    }
+    assert_eq!(puts[1], puts[2]);
+    let (mut index, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let name = index
+        .claude_request_census
+        .records()
+        .next()
+        .unwrap()
+        .0
+        .clone();
+    let changed = Record::synthetic_for_test(&"c".repeat(64), 9, Shape::Exact, vec![3]);
+    index
+        .claude_request_census
+        .insert(name.clone(), changed.clone());
+    let previous = baseline(&index, &mut cx).unwrap();
+    super::save_graph(&mut db, &identity, previous, &mut index, &mut cx).unwrap();
+    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(restored.claude_request_census.get(&name), Some(&changed));
 }
 
 /// [money] streamed cas merges retry and growth maxima without resurrecting removed quarantine.
@@ -1298,7 +1342,12 @@ fn transcript_codec_compatibility() {
         index.claude_request_census.insert(name.clone(), record);
     }
     commit_populate(&mut db, &index);
-    let (restored, _) = hydrate(&mut db, Scratch::binding()).unwrap();
+    let (restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    // Every field and shape seeds the digest its baseline would compute.
+    let seeded = baseline(&restored, &mut cx).unwrap();
+    let (_, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    cx.digests.clear();
+    assert_eq!(seeded.rows, baseline(&restored, &mut cx).unwrap().rows);
     for name in rows.as_object().unwrap().keys() {
         assert_eq!(
             restored.claude_request_census.get(name),
