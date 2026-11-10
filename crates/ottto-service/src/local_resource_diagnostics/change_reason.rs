@@ -1,9 +1,9 @@
 //! Why a body changed or was re-sent, by single first cause. Counts only:
-//! never a gate, cap or wire field, and nothing here feeds selection,
+//! never a gate, cap or body field, and nothing here feeds selection,
 //! emission, ACK or placement. Tags are process-local and bounded to one
 //! page: file tags live from selection to that page's upload, entity tags
 //! for that upload only. A lost tag counts as `unattributed`, never guessed.
-//! Each snapshot request also names its items' tags in one count header
+//! Each snapshot request names its items' tags in one count header
 //! (`request_header`); never in the body.
 use super::{source_count, source_slot, CHANGE_REASON_START};
 use crate::snapshots::ScanIndex;
