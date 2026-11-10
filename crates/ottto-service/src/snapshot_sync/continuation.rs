@@ -62,6 +62,12 @@ pub(super) const PACED_BATTERY: ContinuationPacing = ContinuationPacing {
     min_gap: Duration::from_secs(180),
     idle_per_work: 0,
 };
+pub(super) fn session_power_stretch(power: PlatformState) -> u32 {
+    match power {
+        PlatformState::Battery | PlatformState::Refused => 3,
+        PlatformState::Allowed | PlatformState::Unknown => 1,
+    }
+}
 fn resident_pacing(power: PlatformState) -> Option<ContinuationPacing> {
     match power {
         PlatformState::Allowed => Some(PACED_AC),

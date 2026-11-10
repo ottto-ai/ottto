@@ -229,6 +229,7 @@ fn codex_exec_creator_slot_reaches_active_sessions_with_workspace() {
             Some(&status),
             None,
             at,
+            std::time::Duration::from_secs(300),
         )
         .unwrap();
         assert_eq!(result.sessions.len(), 1);
