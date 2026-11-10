@@ -531,15 +531,17 @@ fn codex_created_thread_rows_restore_desktop_delegation_lineage() {
         .created_at = Some("2026-08-26T15:02:00Z".to_string());
     // File binding reads the home's row; keep this fixture override in sync
     // with its merged row without changing the expected ownership proof.
-    metadata
-        .root_sidecars
-        .get_mut(&codex_dir)
-        .expect("loaded Codex home")
-        .threads
-        .get_mut(all_local_child)
-        .expect("all-local child home row")
-        .make_mut()
-        .created_at = Some("2026-08-26T15:02:00Z".to_string());
+    Arc::make_mut(
+        metadata
+            .root_sidecars
+            .get_mut(&codex_dir)
+            .expect("loaded Codex home"),
+    )
+    .threads
+    .get_mut(all_local_child)
+    .expect("all-local child home row")
+    .make_mut()
+    .created_at = Some("2026-08-26T15:02:00Z".to_string());
     assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
     assert!(metadata.state_created_threads.contains(child));
     assert!(metadata.state_created_threads.contains(all_local_child));

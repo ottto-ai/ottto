@@ -34,7 +34,7 @@
 
 use super::state_v2::{sidecar, sqlite_uri};
 use crate::codex_scan_diagnostics::LoaderStage;
-use crate::transcript_acquisition::FileStamp;
+use crate::transcript_acquisition::{FileStamp, SourceStamp, SqliteWal};
 use anyhow::{Context, Result};
 use rusqlite::{ffi, Connection, OpenFlags};
 use std::ffi::{c_char, c_int, c_void, CStr, OsStr};
@@ -53,6 +53,9 @@ const GUARD_VFS: &CStr = c"ottto-codex-read";
 pub(crate) struct CodexSqliteRead {
     connection: Connection,
     snapshot: Option<(PathBuf, FileStamp)>,
+    stamped: Option<(PathBuf, SourceStamp)>,
+    after: std::cell::RefCell<Option<SourceStamp>>,
+    stable: std::cell::Cell<bool>,
 }
 
 impl std::ops::Deref for CodexSqliteRead {
@@ -70,14 +73,56 @@ impl CodexSqliteRead {
         // A path that can't be resolved is opened as given; SQLite reports it.
         let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let route = route(&path);
-        Self::open_routed(&path, route, flags, busy_timeout)
+        Self::open_routed_stamped(&path, route, flags, busy_timeout, None)
     }
 
-    fn open_routed(
+    /// Sidecar census entry: the ordered input capture owns the before
+    /// witness. Both schema and data verification use that same witness.
+    pub(crate) fn open_stamped(
+        path: &Path,
+        flags: OpenFlags,
+        busy_timeout: Duration,
+        before: Option<&SourceStamp>,
+    ) -> Result<Self> {
+        let (target, route) = match before {
+            Some(SourceStamp::Sqlite {
+                target,
+                main,
+                wal: SqliteWal::Absent,
+            }) => (target.clone(), Route::Snapshot(main.clone())),
+            Some(SourceStamp::Sqlite { target, .. }) => (target.clone(), Route::Plain),
+            _ => (
+                fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+                Route::Plain,
+            ),
+        };
+        Self::open_routed_stamped(
+            &target,
+            route,
+            flags,
+            busy_timeout,
+            before.cloned().map(|stamp| (path.to_path_buf(), stamp)),
+        )
+    }
+
+    pub(crate) fn after_stamp(&self) -> Option<SourceStamp> {
+        self.stable
+            .get()
+            .then(|| self.after.borrow().clone())
+            .flatten()
+    }
+
+    #[cfg(test)]
+    fn open_routed(path: &Path, route: Route, flags: OpenFlags, timeout: Duration) -> Result<Self> {
+        Self::open_routed_stamped(path, route, flags, timeout, None)
+    }
+
+    fn open_routed_stamped(
         path: &Path,
         route: Route,
         flags: OpenFlags,
         busy_timeout: Duration,
+        stamped: Option<(PathBuf, SourceStamp)>,
     ) -> Result<Self> {
         let stamp = match route {
             Route::Snapshot(stamp) => Some(stamp),
@@ -101,6 +146,9 @@ impl CodexSqliteRead {
         let read = Self {
             connection,
             snapshot: stamp.map(|stamp| (path.to_path_buf(), stamp)),
+            stamped,
+            after: Default::default(),
+            stable: std::cell::Cell::new(true),
         };
         read.read(|connection| {
             connection
@@ -131,6 +179,27 @@ impl CodexSqliteRead {
     /// has the same content stamp; otherwise it fails as busy, so the caller
     /// keeps the read failed and retries it on a later pass.
     fn verify(&self) -> Result<()> {
+        if let Some((path, before)) = &self.stamped {
+            let after = SourceStamp::capture_sqlite(path);
+            let stable = after.as_ref().is_some_and(|after| before.same(after));
+            self.stable.set(self.stable.get() && stable);
+            // Empty and absent compare equal for facts, but an immutable
+            // snapshot still requires WAL absence exactly as the plain API.
+            let idle = matches!(
+                &after,
+                Some(SourceStamp::Sqlite {
+                    wal: SqliteWal::Absent,
+                    ..
+                })
+            );
+            *self.after.borrow_mut() = after;
+            return if self.snapshot.is_some() && (!stable || !idle) {
+                self.stable.set(false);
+                Err(moved())
+            } else {
+                Ok(())
+            };
+        }
         let Some((path, before)) = &self.snapshot else {
             return Ok(());
         };
@@ -164,18 +233,14 @@ fn route(path: &Path) -> Route {
 /// The main file's stamp while it is a regular file with one name and no
 /// `-wal` or `-journal` beside it.
 fn idle_stamp(path: &Path) -> Option<FileStamp> {
-    if !absent(&sidecar(path, "-wal")) || !absent(&sidecar(path, "-journal")) {
-        return None;
+    match SourceStamp::capture_sqlite(path)? {
+        SourceStamp::Sqlite {
+            main,
+            wal: SqliteWal::Absent,
+            ..
+        } => Some(main),
+        _ => None,
     }
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.nlink() != 1 {
-        return None;
-    }
-    FileStamp::capture(metadata).ok()
-}
-
-fn absent(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound)
 }
 
 /// Bytes before the base VFS's own file object inside each guarded file.
@@ -532,7 +597,7 @@ unsafe extern "C" fn io_shm_unmap(file: *mut ffi::sqlite3_file, _delete: c_int) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::snapshots) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -566,6 +631,25 @@ mod tests {
             .collect();
         let metadata = fs::metadata(dir).expect("stat home");
         (entries, (metadata.mtime(), metadata.mtime_nsec()))
+    }
+
+    /// A synthetic provider WAL image, with no process-local writable SHM
+    /// mapping at the read path. Same-process writer mappings are deliberately
+    /// refused by the production guard; the existing guard fixture copies
+    /// these three files for that reason too.
+    pub(in crate::snapshots) fn copy_database(source: &Path, target: &Path, replace: bool) {
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let from = sidecar(source, suffix);
+            let to = sidecar(target, suffix);
+            if replace || !from.exists() {
+                let _ = fs::remove_file(&to);
+            }
+            if from.exists() {
+                fs::set_permissions(&from, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::copy(from, to).unwrap();
+            }
+        }
     }
 
     fn wal_database(path: &Path, value: i64) -> Connection {

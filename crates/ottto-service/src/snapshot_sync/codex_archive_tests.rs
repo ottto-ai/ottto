@@ -25,6 +25,10 @@ fn codex_transition_batch(items: Vec<SnapshotItem>) -> Vec<u8> {
 /// Cold and restored drivers both use the ordinary uploader's native ordering
 /// and batch envelope. No transcript read, remote POST or persisted ACK here.
 pub(crate) fn codex_transition_cold_batches(items: &[SnapshotItem]) -> Vec<Vec<u8>> {
+    codex_transition_upload(items).0
+}
+
+fn codex_transition_upload(items: &[SnapshotItem]) -> (Vec<Vec<u8>>, SnapshotUploadProgress) {
     let mut posts = Vec::new();
     let mut progress = test_upload_progress();
     let result = upload_resumable_batches_with_body_witness(
@@ -42,7 +46,38 @@ pub(crate) fn codex_transition_cold_batches(items: &[SnapshotItem]) -> Vec<Vec<u
     )
     .unwrap();
     assert_eq!(result, ResumableUploadResult::Completed);
-    posts
+    (posts, progress)
+}
+
+pub(crate) fn codex_transition_acked_route(
+    index: &ScanIndex,
+    scan: &SourceScanResult,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    use crate::snapshots::sampled_scan::transition_fixture::{self as fixture, RouteResult};
+    let (posts, progress) = codex_transition_upload(&scan.snapshots);
+    // Codex records exact stored-body witnesses, rather than Claude's
+    // request-share ledger. Observe placement from the actual POST body
+    // only after that exact body has a native stored-body ACK witness.
+    let mut ledger = BTreeMap::new();
+    for post in &posts {
+        let body: serde_json::Value = serde_json::from_slice(post).unwrap();
+        for item in body["snapshots"].as_array().unwrap() {
+            let fingerprint = item["snapshot_fingerprint"].as_str().unwrap();
+            let witness = progress
+                .accepted_body_witnesses
+                .get(fingerprint)
+                .expect("exact stored-body ACK");
+            ledger.insert(
+                item["source_session_id"].as_str().unwrap().to_owned(),
+                serde_json::json!({"body_witness":witness, "stored_body":item}),
+            );
+        }
+    }
+    let mut route = RouteResult::emitted(mode, SnapshotSource::Codex, posts, &scan.snapshots);
+    route.codex_evidence = fixture::codex_evidence(index, scan);
+    route.accepted_identity_buckets = Some(serde_json::json!(ledger));
+    route
 }
 
 impl ScanIndex {
