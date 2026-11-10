@@ -368,11 +368,8 @@ struct ClaudeOAuthUsageCache {
 
 /// v4 adds organization identity and requires exact identity on every embedded
 /// meter. Released v3 account-only caches cannot prove organization ownership
-/// and are discarded rather than relabeled. v5 stores no usage-credit
-/// `remaining`: an identity-valid v4 cache loses only that field on read
-/// ([`claude_credit_pools::drop_usage_credit_remaining`]).
-const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 5;
-const CLAUDE_OAUTH_USAGE_V4_CACHE_SCHEMA_VERSION: u16 = 4;
+/// and are discarded rather than relabeled.
+const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 4;
 const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION: u16 = 3;
 #[cfg(test)]
 static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
@@ -14702,10 +14699,7 @@ fn read_claude_oauth_usage_cache_locked(
     let path = claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
     let body = fs::read_to_string(path).ok()?;
     let mut cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
-    if !matches!(
-        cache.schema_version,
-        CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION | CLAUDE_OAUTH_USAGE_V4_CACHE_SCHEMA_VERSION
-    ) {
+    if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
         // Older cache layouts (v1: windows only; v2: no account identity) are
         // discarded so the next tick refetches under a known account.
         return None;
@@ -14717,11 +14711,9 @@ fn read_claude_oauth_usage_cache_locked(
     ) {
         return None;
     }
-    if cache.schema_version == CLAUDE_OAUTH_USAGE_V4_CACHE_SCHEMA_VERSION {
-        claude_credit_pools::drop_usage_credit_remaining(&mut cache.credit_balances);
-        cache.schema_version = CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION;
-        let _ = write_claude_oauth_usage_cache_locked(&cache);
-    }
+    // Caches written before usage credits stopped carrying `remaining` may
+    // still hold that cap-minus-used headroom.
+    claude_credit_pools::drop_usage_credit_remaining(&mut cache.credit_balances);
     Some(cache)
 }
 
@@ -14803,7 +14795,7 @@ fn migrate_legacy_claude_oauth_usage_cache_locked(
             matches!(
                 cache.schema_version,
                 CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION
-                    | CLAUDE_OAUTH_USAGE_V4_CACHE_SCHEMA_VERSION
+                    | CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
             ) && !cache.windows.is_empty()
                 && claude_oauth_usage_cache_belongs_to_identity(
                     cache,
@@ -15028,26 +15020,29 @@ fn claude_oauth_scoped_limit_windows(value: &Value) -> Vec<AgentQuotaWindow> {
 /// object is authoritative; the older `extra_usage` shape is the fallback.
 /// A switched-off section yields its disabled shape, and a missing or
 /// unrecognized shape fails soft to an empty list so quota windows are never
-/// hidden by credit parsing. A valid `spend.balance` is the provider's prepaid
-/// balance: its own row, never the usage-credit `remaining`.
+/// hidden by credit parsing.
 fn claude_oauth_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
-    claude_oauth_credit_balances_and_refusals(value).0
+    claude_oauth_credit_balances_and_refusals(value)
+        .0
+        .into_iter()
+        .collect()
 }
 
-/// The usage-credit and prepaid balances plus the model's field refusals (a
+/// The usage-credit balance, the prepaid balance (a valid `spend.balance`,
+/// never the usage-credit `remaining`) and the model's field refusals (a
 /// disabled reason that is not a reason code), for the adapter's diagnostics.
 fn claude_oauth_credit_balances_and_refusals(
     value: &Value,
 ) -> (
-    Vec<AgentCreditBalance>,
+    Option<AgentCreditBalance>,
+    Option<AgentCreditBalance>,
     Vec<crate::quota_credit_model::CreditModelDiagnostic>,
 ) {
     let mut refusals = Vec::new();
     let spend = value.get("spend");
-    let mut balance =
-        claude_oauth_spend_credit_balance(spend, value, &mut refusals).or_else(|| {
-            claude_oauth_extra_usage_credit_balance(value.get("extra_usage"), &mut refusals)
-        });
+    let mut balance = claude_oauth_spend_credit_balance(spend, &mut refusals).or_else(|| {
+        claude_oauth_extra_usage_credit_balance(value.get("extra_usage"), &mut refusals)
+    });
     if let Some(balance) = balance.as_mut() {
         claude_credit_pools::attach_spend_metadata(balance, spend, value.get("extra_usage"));
     }
@@ -15058,12 +15053,11 @@ fn claude_oauth_credit_balances_and_refusals(
                 .or_else(|| json_trimmed_string(spend, "currency")),
         )
     });
-    (balance.into_iter().chain(prepaid).collect(), refusals)
+    (balance, prepaid, refusals)
 }
 
 fn claude_oauth_spend_credit_balance(
     spend: Option<&Value>,
-    body: &Value,
     refusals: &mut Vec<crate::quota_credit_model::CreditModelDiagnostic>,
 ) -> Option<AgentCreditBalance> {
     let spend = spend?;
@@ -15092,21 +15086,10 @@ fn claude_oauth_spend_credit_balance(
         quota: quota.and_then(CreditAmount::whole),
         currency: claude_oauth_money_currency(spend.get("used"))
             .or_else(|| json_trimmed_string(spend, "currency")),
-        resets_at: json_timestamp_rfc3339(spend, &["resets_at", "reset_at"])
-            .or_else(|| claude_oauth_monthly_spend_resets_at(body)),
+        resets_at: json_timestamp_rfc3339(spend, &["resets_at", "reset_at"]),
         used_percent,
         enabled: Some(true),
         ..Default::default()
-    })
-}
-
-/// The monthly spend limit's reset from `limits[]` (`kind: spend`, `group:
-/// monthly`); no model scope is required.
-fn claude_oauth_monthly_spend_resets_at(body: &Value) -> Option<String> {
-    body.get("limits")?.as_array()?.iter().find_map(|entry| {
-        (entry.get("kind").and_then(Value::as_str) == Some("spend")
-            && entry.get("group").and_then(Value::as_str) == Some("monthly"))
-        .then(|| json_timestamp_rfc3339(entry, &["resets_at", "reset_at"]))?
     })
 }
 

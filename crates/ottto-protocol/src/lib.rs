@@ -4984,14 +4984,6 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
         .ineligible_reason
         .take()
         .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
-    if credit.unit != AgentCreditBalanceUnit::Usd {
-        // Purchase and reload settings are money balance settings.
-        credit.auto_reload = None;
-        credit.can_purchase_credits = None;
-    }
-    credit.auto_reload = credit.auto_reload.filter(|reload| {
-        reload.enabled.is_some() || reload.threshold.is_some() || reload.target.is_some()
-    });
     if credit.unit != AgentCreditBalanceUnit::Resets {
         // Readiness is only meaningful for saved resets.
         credit.eligible = None;
@@ -8978,9 +8970,8 @@ mod tests {
         );
     }
 
-    /// [format] Reload and purchase settings are optional money-balance metadata: a
-    /// known field is forwarded, nothing is defaulted, and a non-money balance
-    /// or an empty settings object sends none. The prepaid kind round-trips.
+    /// [format] Reload and purchase settings and the prepaid kind round-trip
+    /// through the upload unchanged.
     #[test]
     fn credit_reload_settings_and_prepaid_kind_round_trip() {
         let upload = |body: &str| {
@@ -8989,21 +8980,6 @@ mod tests {
         };
         let usage = r#"{"name":"Usage credits","status":"unknown","freshness":"fresh","unit":"usd","enabled":false,"kind":"usage_credits","auto_reload":{"enabled":false,"threshold":700,"target":"25.5"},"can_purchase_credits":false}"#;
         assert_eq!(upload(usage), usage);
-        let partial = usage.replace(
-            r#"{"enabled":false,"threshold":700,"target":"25.5"}"#,
-            r#"{"enabled":true}"#,
-        );
-        assert_eq!(upload(&partial), partial);
-        let settings = r#","auto_reload":{"enabled":false,"threshold":700,"target":"25.5"},"can_purchase_credits":false"#;
-        let bare = usage.replace(settings, "");
-        assert_eq!(
-            upload(&usage.replace(r#""unit":"usd""#, r#""unit":"credits""#)),
-            bare.replace(r#""unit":"usd""#, r#""unit":"credits""#)
-        );
-        assert_eq!(
-            upload(&usage.replace(settings, r#","auto_reload":{}"#)),
-            bare
-        );
         let prepaid = r#"{"name":"prepaid_balance","status":"ok","freshness":"fresh","unit":"usd","remaining":700,"currency":"USD","observed_at":"2026-10-01T12:00:00Z","kind":"prepaid_credits"}"#;
         assert_eq!(upload(prepaid), prepaid);
     }
