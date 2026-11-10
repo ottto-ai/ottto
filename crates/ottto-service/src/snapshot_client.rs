@@ -1961,9 +1961,10 @@ fn decode_account_nicknames<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
 struct RelayTokenResponse {
     token: String,
+    expires_at: Option<String>,
 }
 
 pub fn relay_token_request_payload(device: &LocalDeviceBinding, source: &str) -> Value {
@@ -1999,6 +2000,16 @@ fn require_cloud_session_success(
 #[derive(Debug, thiserror::Error)]
 #[error("config upload refused: source_disabled")]
 pub(crate) struct UploadRefused;
+
+fn relay_sent(
+    token: &str,
+    result: std::result::Result<ureq::Response, ureq::Error>,
+) -> std::result::Result<ureq::Response, ureq::Error> {
+    if matches!(&result, Err(ureq::Error::Status(401 | 403, _))) {
+        crate::relay_auth::evict(token);
+    }
+    result
+}
 
 /// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
 /// error so the caller can refresh credentials; 400/422 means the `label`
@@ -2261,6 +2272,10 @@ impl SnapshotApiClient {
         timeout: Duration,
         response_cap: Option<usize>,
     ) -> Result<String> {
+        let key = self.relay_auth_binding(device, device_secret, source);
+        if let Some(token) = crate::relay_auth::lookup(key, OffsetDateTime::now_utc()) {
+            return Ok(token);
+        }
         let mut probe = crate::relay_auth::Probe::begin(
             &self.api_base_url,
             device,
@@ -2307,6 +2322,15 @@ impl SnapshotApiClient {
         }
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         probe.success();
+        let now = OffsetDateTime::now_utc();
+        if let Some(expires_at) = response
+            .expires_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .filter(|expires_at| now + time::Duration::seconds(60) < *expires_at)
+        {
+            crate::relay_auth::publish(key, &response.token, expires_at, now);
+        }
         Ok(response.token)
     }
 
@@ -2348,12 +2372,15 @@ impl SnapshotApiClient {
         validate()?;
         self.require_bounded_snapshot_https()?;
         let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let response = agent
-            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
-            .timeout(timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .call()?;
+        let response = relay_sent(
+            relay_token,
+            agent
+                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+                .timeout(timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .call(),
+        )?;
         // A policy response never needs a body-sized allowance or raw key
         // retention. Decode only after this cap and drop the fresh hint in-turn.
         let hint = bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
@@ -2363,31 +2390,34 @@ impl SnapshotApiClient {
     }
 
     pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
-        self.agent
-            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .call()
-            // Typed diagnostics (not a plain string) so a transport-layer
-            // failure on this early per-source call feeds the outage streak.
-            .map_err(|error| match error {
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "activity hint request",
-                        "activity_hint",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+        relay_sent(
+            relay_token,
+            self.agent
+                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .call(),
+        )
+        // Typed diagnostics (not a plain string) so a transport-layer
+        // failure on this early per-source call feeds the outage streak.
+        .map_err(|error| match error {
+            ureq::Error::Status(status, response) => {
+                anyhow::Error::new(UploadFailureDiagnostics::http(
                     "activity hint request",
                     "activity_hint",
-                    &other,
-                )),
-            })?
-            .into_json::<Value>()
-            .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
-            .and_then(decode_activity_hint)
+                    status,
+                    &response,
+                ))
+            }
+            other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "activity hint request",
+                "activity_hint",
+                &other,
+            )),
+        })?
+        .into_json::<Value>()
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
+        .and_then(decode_activity_hint)
     }
 
     #[cfg(test)]
@@ -2497,12 +2527,12 @@ impl SnapshotApiClient {
             Some(encoded) => {
                 let post = request_builder()?.set("Content-Encoding", "gzip");
                 resources.attempt(encoded.len(), true);
-                post.send_bytes(encoded)
+                relay_sent(relay_token, post.send_bytes(encoded))
             }
             None => {
                 let post = request_builder()?;
                 resources.attempt(body.len(), false);
-                post.send_bytes(&body)
+                relay_sent(relay_token, post.send_bytes(&body))
             }
         };
         // A server that does not decompress request bodies cannot tell us so in
@@ -2514,7 +2544,7 @@ impl SnapshotApiClient {
             disable_snapshot_upload_gzip();
             let post = request_builder()?;
             resources.attempt(body.len(), false);
-            outcome = post.send_bytes(&body);
+            outcome = relay_sent(relay_token, post.send_bytes(&body));
         }
         if refused_gzip {
             if let Some((budget, _)) = retry.as_mut() {
@@ -2790,30 +2820,33 @@ impl SnapshotApiClient {
         // Every collector-status receipt leaves through here. A `checkin`
         // declaration that its own payload falsifies never reaches the wire.
         request.validate_declared_report_kind()?;
-        self.agent
-            .post(&self.api_url("/api/v1/agent-session-snapshots/status"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-            // Typed diagnostics (not a plain string) so a transport-layer
-            // failure on a status receipt feeds the outage streak.
-            .map_err(|error| match error {
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "snapshot status report",
-                        "snapshot_status",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+        relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url("/api/v1/agent-session-snapshots/status"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        )
+        // Typed diagnostics (not a plain string) so a transport-layer
+        // failure on a status receipt feeds the outage streak.
+        .map_err(|error| match error {
+            ureq::Error::Status(status, response) => {
+                anyhow::Error::new(UploadFailureDiagnostics::http(
                     "snapshot status report",
                     "snapshot_status",
-                    &other,
-                )),
-            })?
-            .into_json()
-            .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
+                    status,
+                    &response,
+                ))
+            }
+            other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "snapshot status report",
+                "snapshot_status",
+                &other,
+            )),
+        })?
+        .into_json()
+        .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
     }
 
     /// One explicit write through the existing relay credential. No redirects,
@@ -2823,15 +2856,18 @@ impl SnapshotApiClient {
         relay_token: &str,
         body: &Value,
     ) -> std::result::Result<Option<ottto_protocol::AccountNicknameV1>, u16> {
-        let response = credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT)
-            .put(&self.api_url("/api/v1/agent-status/account-nickname"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(body)
-            .map_err(|error| match error {
-                ureq::Error::Status(code, _) => code,
-                _ => 0,
-            })?;
+        let response = relay_sent(
+            relay_token,
+            credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT)
+                .put(&self.api_url("/api/v1/agent-status/account-nickname"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(body),
+        )
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) => code,
+            _ => 0,
+        })?;
         if !(200..300).contains(&response.status()) {
             return Err(response.status());
         }
@@ -2857,13 +2893,14 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &AgentStatusSnapshotUploadRequest,
     ) -> Result<AgentStatusSnapshotUploadResponse> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/agent-status/snapshots"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        match relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url("/api/v1/agent-status/snapshots"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
             Ok(response) => {
                 let response: AgentStatusSnapshotUploadResponse = response
                     .into_json()
@@ -2940,16 +2977,20 @@ impl SnapshotApiClient {
     /// 401/403 surfaces as a relay-authorization error so the caller can refresh
     /// credentials; 400/422 means the inventory contract drifted.
     pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        let sent = self
-            .relay_token_post("/api/v1/mcp/inventory", relay_token)
-            .send_json(request);
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/mcp/inventory", relay_token)
+                .send_json(request),
+        );
         relay_token_upload_response(sent, "mcp inventory")
     }
 
     pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        let sent = self
-            .relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
-            .send_json(request);
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
+                .send_json(request),
+        );
         relay_token_upload_response(sent, "context footprint")
     }
 
@@ -2971,13 +3012,15 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<Value> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        match agent
-            .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
-            .timeout(request_timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
             Ok(response) => {
                 let receipt = require_cloud_session_success(
                     response,
@@ -3013,13 +3056,15 @@ impl SnapshotApiClient {
         let path = format!(
             "/api/v1/cloud-session-observations/grants/{grant_id}/authority?grant_version={grant_version}"
         );
-        match agent
-            .get(&self.api_url(&path))
-            .timeout(request_timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .call()
-        {
+        match relay_sent(
+            relay_token,
+            agent
+                .get(&self.api_url(&path))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .call(),
+        ) {
             Ok(response) => require_cloud_session_success(
                 response,
                 "cloud-session authority read",
@@ -3104,13 +3149,15 @@ impl SnapshotApiClient {
         }
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
         let path = format!("/api/v1/cloud-sessions/scans/{scan_id}/{action}");
-        match agent
-            .post(&self.api_url(&path))
-            .timeout(request_timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url(&path))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
             Ok(response) => {
                 let receipt = require_cloud_session_success(
                     response,
@@ -3139,10 +3186,12 @@ impl SnapshotApiClient {
     /// Sends the serialized body, so the bytes the run counts are the bytes
     /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
-        let sent = self
-            .relay_token_post("/api/v1/context-composition/snapshot", relay_token)
-            .set("Content-Type", "application/json")
-            .send_bytes(body);
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/context-composition/snapshot", relay_token)
+                .set("Content-Type", "application/json")
+                .send_bytes(body),
+        );
         relay_token_upload_response(sent, "context composition")
     }
 
@@ -3155,13 +3204,15 @@ impl SnapshotApiClient {
     ) -> Result<Value> {
         let (agent, request_timeout) =
             bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(10))?;
-        match agent
-            .post(&self.api_url("/api/v1/context-composition/run-health"))
-            .timeout(request_timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(body)
-        {
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url("/api/v1/context-composition/run-health"))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(body),
+        ) {
             Ok(response) => bounded_response_json(response, 64 * 1024)
                 .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
             Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
@@ -3200,13 +3251,14 @@ impl SnapshotApiClient {
         kind: &str,
         request: &impl Serialize,
     ) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url(&format!("/api/v1/apps/health/{kind}")))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        match relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url(&format!("/api/v1/apps/health/{kind}")))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
             Ok(response) => response
                 .into_json()
                 .map_err(|error| anyhow!("parse local health {kind} response failed: {error}")),
@@ -3239,13 +3291,15 @@ impl SnapshotApiClient {
     ) -> Result<Value> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
         let url = self.api_url("/api/v1/provider-daily-reference/batches");
-        match agent
-            .post(&url)
-            .timeout(request_timeout)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&url)
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
             Ok(response) => require_cloud_session_success(
                 response,
                 "provider daily reference upload",
@@ -3612,6 +3666,36 @@ mod tests {
             request
         });
         (client, server)
+    }
+
+    /// [behaviour] Auth rejections evict only the sent token and preserve the result.
+    #[test]
+    #[serial_test::serial]
+    fn relay_send_eviction_preserves_newer_tokens_and_other_failures() {
+        let key = [211; 32];
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        for status in [401, 403, 429, 503] {
+            crate::relay_auth::publish(key, "synthetic-old", now + time::Duration::minutes(5), now);
+            crate::relay_auth::publish(key, "synthetic-new", now + time::Duration::minutes(5), now);
+            let response = ureq::Response::new(status, "Scripted", "synthetic-body").unwrap();
+            let result = relay_sent("synthetic-old", Err(ureq::Error::Status(status, response)));
+            assert!(matches!(result, Err(ureq::Error::Status(code, _)) if code == status));
+            assert!(
+                crate::relay_auth::lookup(key, now).is_some_and(|token| token == "synthetic-new")
+            );
+            let response = ureq::Response::new(status, "Scripted", "synthetic-body").unwrap();
+            let result = relay_sent("synthetic-new", Err(ureq::Error::Status(status, response)));
+            let Err(ureq::Error::Status(code, response)) = result else {
+                panic!("status result changed")
+            };
+            assert_eq!(code, status);
+            assert_eq!(response.into_string().unwrap(), "synthetic-body");
+            assert_eq!(
+                crate::relay_auth::lookup(key, now).is_none(),
+                matches!(status, 401 | 403)
+            );
+        }
+        crate::relay_auth::evict("synthetic-new");
     }
 
     #[test]

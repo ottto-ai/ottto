@@ -1,5 +1,5 @@
-//! Process-wide relay authorization admission. No sleeps, persisted secrets,
-//! token caching, or local-collector scheduling changes.
+//! Process-wide relay authorization admission. No sleeps or persisted secrets.
+//! Reuse tokens only for their exact binding while over 60 seconds from expiry.
 use crate::snapshot_client::RelayTokenAuthorizationRejected;
 use ottto_core::{FileConnectionStore, FileDeviceStore, LocalDeviceBinding};
 use sha2::{Digest, Sha256};
@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
 
 const BASE: Duration = Duration::from_secs(5 * 60);
 const CAP: Duration = Duration::from_secs(60 * 60);
@@ -31,6 +32,36 @@ struct Gate {
 static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
 fn gate() -> &'static Mutex<Gate> {
     GATE.get_or_init(|| Mutex::new(Gate::default()))
+}
+
+type Tokens = BTreeMap<Key, (String, OffsetDateTime)>;
+fn tokens() -> &'static Mutex<Tokens> {
+    static TOKENS: OnceLock<Mutex<Tokens>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(crate) fn lookup(key: Key, now: OffsetDateTime) -> Option<String> {
+    tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .filter(|(_, expires_at)| now + time::Duration::seconds(60) < *expires_at)
+        .map(|(token, _)| token.clone())
+}
+
+pub(crate) fn publish(key: Key, token: &str, expires_at: OffsetDateTime, now: OffsetDateTime) {
+    let mut tokens = tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokens.retain(|_, (_, expires_at)| now < *expires_at);
+    tokens.insert(key, (token.to_owned(), expires_at));
+}
+
+pub(crate) fn evict(token: &str) {
+    tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, (cached, _)| cached != token);
 }
 
 /// Include the destination and setup-run binding so an explicit reattach and
@@ -290,6 +321,10 @@ pub(crate) fn retry_after_setup_refresh(previous_key: Key, refreshed_key: Key) {
 /// An authorized explicit recovery action retries even unchanged credentials.
 /// Ordinary status polling never calls this.
 pub(crate) fn reset() {
+    tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     gate()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -309,6 +344,49 @@ pub(crate) fn clear(key: Key) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [behaviour] Reuse is binding-scoped, expires early, and explicit reset clears it.
+    #[test]
+    #[serial_test::serial]
+    fn cached_tokens_observe_expiry_binding_and_reset() {
+        reset();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let original = key(
+            "https://relay.example",
+            "device",
+            1,
+            "secret",
+            Some("run"),
+            "codex",
+        );
+        publish(
+            original,
+            "synthetic-token",
+            now + time::Duration::minutes(5),
+            now,
+        );
+        assert!(lookup(original, now).is_some_and(|token| token == "synthetic-token"));
+        let other_source = key(
+            "https://relay.example",
+            "device",
+            1,
+            "secret",
+            Some("run"),
+            "pi",
+        );
+        assert!(lookup(other_source, now).is_none());
+        assert!(lookup(original, now + time::Duration::minutes(4)).is_none());
+        // A publication removes expired entries without a background task.
+        publish(
+            [2; 32],
+            "synthetic-new",
+            now + time::Duration::minutes(10),
+            now + time::Duration::minutes(6),
+        );
+        assert!(lookup(original, now).is_none());
+        reset();
+        assert!(lookup([2; 32], now).is_none());
+    }
 
     #[test]
     #[serial_test::serial]
@@ -490,6 +568,9 @@ mod http_tests {
     }
     impl Backend {
         fn start(statuses: Vec<u16>) -> Self {
+            Self::with_body(statuses, r#"{"token":"synthetic-token"}"#)
+        }
+        fn with_body(statuses: Vec<u16>, body: &'static str) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -510,7 +591,6 @@ mod http_tests {
                             crate::retry_tls::credential_test_support::read_request(&mut stream);
                             let status = statuses.next().unwrap_or(500);
                             calls.fetch_add(1, Ordering::Relaxed);
-                            let body = r#"{"token":"synthetic-token"}"#;
                             write!(stream, "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 17\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                             connections.push(stream);
                         }
@@ -698,6 +778,35 @@ mod http_tests {
             .unwrap();
         assert_eq!(backend.calls(), 3, "recovered device performs HTTP again");
         clear(old);
+    }
+
+    /// [behaviour] Only a valid future server expiry enables reuse on the issue path.
+    #[test]
+    #[serial_test::serial]
+    fn server_expiry_controls_token_reuse() {
+        for (body, expected_calls) in [
+            (
+                r#"{"token":"synthetic-token","expires_at":"2099-01-01T00:00:00Z"}"#,
+                1,
+            ),
+            (r#"{"token":"synthetic-token"}"#, 2),
+            (r#"{"token":"synthetic-token","expires_at":"invalid"}"#, 2),
+            (
+                r#"{"token":"synthetic-token","expires_at":"1970-01-01T00:00:00Z"}"#,
+                2,
+            ),
+        ] {
+            reset();
+            let backend = Backend::with_body(vec![200, 200], body);
+            let client = SnapshotApiClient::new(&backend.base);
+            for _ in 0..2 {
+                assert!(client
+                    .issue_relay_token(&device(), "same", SnapshotSource::Codex)
+                    .is_ok_and(|token| token == "synthetic-token"));
+            }
+            assert_eq!(backend.calls(), expected_calls);
+        }
+        reset();
     }
 
     #[test]
