@@ -601,6 +601,11 @@ impl LocalDaemon {
         self.status_for_authorized_client()
     }
 
+    /// Keeps the poisoned-state refusal of the local authorization step.
+    pub(crate) fn require_usable_state(&self) -> Result<(), LocalApiError> {
+        self.state().map(drop)
+    }
+
     /// Allocation-free stop fence for an optional delivery-only turn.
     pub(crate) fn snapshot_retry_running(&self) -> Result<bool, LocalApiError> {
         Ok(self.state()?.running)
@@ -654,9 +659,12 @@ impl LocalDaemon {
             observe_scan_index_health_changes(&mut state);
             // Pair the relay finding with the same captured state and canonical
             // projection as the ScanIndex collection transition events.
-            let finding = self.relay_mismatch.observe(
-                observed.filter(|_| state.relay == relay && state.relay.last_error.is_none()),
-            );
+            let finding =
+                self.relay_mismatch
+                    .observe(otlp_relay::listener_failure(&state.relay).or_else(|| {
+                        observed
+                            .filter(|_| state.relay == relay && state.relay.last_error.is_none())
+                    }));
             status_from_state_with_relay_finding(&mut state, finding)
         };
         Ok(status)
@@ -1525,6 +1533,23 @@ impl LocalDaemon {
 
     fn set_relay_state_authorized(&self, relay: RelayState) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
+        // Control intents do not recover a failed listener. Only a runtime
+        // Connected observation may clear its failure; Failed may update it.
+        if state.relay.state == RelayRuntimeState::Failed
+            && !matches!(
+                relay.state,
+                RelayRuntimeState::Failed | RelayRuntimeState::Connected
+            )
+        {
+            return Ok(());
+        }
+        if state.relay != relay {
+            // Start the failure grace at the transition, even without a status
+            // read, and end any previous streak on recovery.
+            self.relay_mismatch.observe(None);
+            self.relay_mismatch
+                .observe(otlp_relay::listener_failure(&relay));
+        }
         state.relay = relay;
         Ok(())
     }
@@ -2350,7 +2375,7 @@ fn status_from_state_with_relay_finding(
     };
     status.relay = state.relay.clone();
     if status.relay.last_error.is_none() {
-        status.relay.last_error = relay_finding;
+        status.relay.last_error = relay_finding.clone();
     }
     status.sources = state.sources.clone();
     for health in &mut status.sources {
@@ -2366,6 +2391,9 @@ fn status_from_state_with_relay_finding(
         &mut status,
         &state.started_at,
         &mut state.blocker_first_seen,
+        relay_finding
+            .as_ref()
+            .is_some_and(|finding| finding.code == "relay_listener_failed"),
     );
     status
 }
@@ -2459,7 +2487,16 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
             (key, blocker.since.clone())
         })
         .collect();
-    refresh_canonical_local_health_with_started_at(status, &started_at, &mut first_seen);
+    // Reprojection preserves the runtime debounce decision already observed.
+    let listener_failure_persistent = first_seen
+        .keys()
+        .any(|(code, _)| code == "relay_listener_failed");
+    refresh_canonical_local_health_with_started_at(
+        status,
+        &started_at,
+        &mut first_seen,
+        listener_failure_persistent,
+    );
 }
 
 /// Project canonical health from daemon state, where `started_at` is the
@@ -2468,6 +2505,7 @@ fn refresh_canonical_local_health_with_started_at(
     status: &mut DaemonStatus,
     started_at: &str,
     first_seen: &mut BlockerFirstSeen,
+    listener_failure_persistent: bool,
 ) {
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
@@ -2523,7 +2561,13 @@ fn refresh_canonical_local_health_with_started_at(
         }
     }
     apply_account_prerequisite_to_sources(&account, &mut sources);
-    let mut blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
+    let mut blockers = local_health_blockers_for_status(
+        status,
+        &runtime,
+        &account,
+        &sources,
+        listener_failure_persistent,
+    );
     keep_blocker_first_seen(&mut blockers, &observed_at, first_seen);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
     let evidence = events
@@ -3214,6 +3258,7 @@ fn local_health_blockers_for_status(
     runtime: &RuntimeIdentityV1,
     account: &LocalHealthAccountV1,
     sources: &[LocalHealthSourceV1],
+    listener_failure_persistent: bool,
 ) -> Vec<LocalHealthBlockerV1> {
     let mut blockers = Vec::new();
     if snapshot_sync::snapshot_api_base_url().is_err() {
@@ -3307,6 +3352,25 @@ fn local_health_blockers_for_status(
             &observed_at,
             "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
         ));
+    }
+    if status.relay.state == RelayRuntimeState::Failed {
+        if let Some(error) = &status.relay.last_error {
+            let guidance = match error.code.as_str() {
+                "relay_bind_failed" => Some("Claude telemetry listener unavailable; restart Ottto, then Verify"),
+                "relay_listener_failed" if listener_failure_persistent => Some("Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto"),
+                _ => None,
+            };
+            if let Some(guidance) = guidance {
+                blockers.push(blocker(
+                    &error.code,
+                    LocalHealthSeverity::Warning,
+                    "source",
+                    LocalHealthAuthority::Runtime,
+                    &status.generated_at,
+                    guidance,
+                ));
+            }
+        }
     }
     // New Claude Code processes export to a port nobody binds: their usage
     // loses its telemetry login. Pure: reads status()'s response-only finding.

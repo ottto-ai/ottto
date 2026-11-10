@@ -344,8 +344,17 @@ impl PageBudget {
             .map(|InlineDuration(duration)| duration)
     }
 
+    /// Open this scan's diagnostics window before its first counted Codex
+    /// header lookup, without ticking the page clock. `note_page` keeps it.
+    pub(in crate::snapshots) fn open_window(&mut self, cache: &SharedCache) {
+        if self.window_start.is_none() {
+            self.window_start = cache.with_cursor(|cursor| Box::new(cursor.counters));
+        }
+    }
+
     /// Advance the cursor page clock once per scan object (K7, K10). The
-    /// diagnostics window opens under this same lock (no extra lock).
+    /// diagnostics window opens under this same lock (no extra lock) unless
+    /// `open_window` opened it earlier.
     ///
     /// Stage 1 (E): a continuation page opens its diagnostics window but
     /// never ticks the clock, so waiters keep their turn and a paused job's
@@ -353,7 +362,7 @@ impl PageBudget {
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache) {
         if self.continuation {
             if !std::mem::replace(&mut self.page_noted, true) {
-                self.window_start = cache.with_cursor(|cursor| {
+                let start = cache.with_cursor(|cursor| {
                     let start = Box::new(cursor.counters);
                     cursor.counters.deferred_next_generation = cursor
                         .counters
@@ -361,11 +370,12 @@ impl PageBudget {
                         .saturating_add(self.next_generation_hints);
                     start
                 });
+                self.keep_window(start);
             }
             return;
         }
         if !std::mem::replace(&mut self.page_noted, true) {
-            self.window_start = cache.with_cursor(|cursor| {
+            let start = cache.with_cursor(|cursor| {
                 cursor.rotation.page = cursor.rotation.page.saturating_add(1);
                 let start = Box::new(cursor.counters);
                 cursor.counters.deferred_next_generation = cursor
@@ -374,6 +384,13 @@ impl PageBudget {
                     .saturating_add(self.next_generation_hints);
                 start
             });
+            self.keep_window(start);
+        }
+    }
+    /// The page tick's start, unless the window opened earlier (`open_window`).
+    fn keep_window(&mut self, start: Option<Box<Counters>>) {
+        if self.window_start.is_none() {
+            self.window_start = start;
         }
     }
 }
@@ -2988,6 +3005,19 @@ impl SharedCache {
                 {
                     cursor.headers.refresh(key, Some(header));
                 }
+            }
+        });
+    }
+    /// One header inventory member's durable lookups, and its reuse's avoided
+    /// bytes.
+    pub(in crate::snapshots) fn note_header_lookups(&self, lookups: u64, reused: Option<usize>) {
+        self.with_cursor(|cursor| {
+            let counters = &mut cursor.counters;
+            counters.header_durable_lookups += lookups;
+            if let Some(bytes) = reused {
+                counters.header_reuse_hits += 1;
+                counters.header_bytes_avoided =
+                    counters.header_bytes_avoided.saturating_add(bytes as u64);
             }
         });
     }

@@ -94,6 +94,48 @@ fn cold(c: &Corpus) -> RouteResult {
     result(&page(c, ScanIndex::default(), 100, false), Mode::ColdFull)
 }
 
+/// The page's bodies with their exact witnesses, as the ACK accepts them.
+fn acked(page: &Page) -> BTreeMap<String, Accepted> {
+    let mut route = result(page, Mode::Ram);
+    accepted(&mut route, &page.scan.snapshots);
+    route.accepted
+}
+
+/// [money] A change to the main alone reads only the main's copies: no child
+/// is emitted, the main matches cold, and each child's carried body
+/// (`carried`, as last emitted) matches cold's, placement included.
+fn assert_main_only(c: &Corpus, warm: &Page, carried: &BTreeMap<String, Accepted>, mode: Mode) {
+    assert!(body(warm, ROOT).is_some(), "the main is emitted");
+    for agent in 0..3 {
+        assert!(
+            body(warm, &child(agent)).is_none(),
+            "child {agent} stays off"
+        );
+    }
+    let mut actual = result(warm, mode);
+    actual.accepted = carried.clone();
+    money_oracle::assert_carried_equivalent(&cold(c), &actual);
+}
+
+/// This page line's `forced_family_seeds` and `page_selection` counts.
+fn seed_counts(rows: &[serde_json::Value]) -> [BTreeMap<String, u64>; 2] {
+    let mut counts = [BTreeMap::new(), BTreeMap::new()];
+    let pages = rows
+        .iter()
+        .filter(|row| row["stage"] == "native_collection_page");
+    for row in pages {
+        for (slot, key) in counts
+            .iter_mut()
+            .zip(["forced_family_seeds", "page_selection"])
+        {
+            for (name, n) in row["counts"][key].as_object().into_iter().flatten() {
+                *slot.entry(name.clone()).or_default() += n.as_u64().unwrap();
+            }
+        }
+    }
+    counts
+}
+
 /// Check native Full, continuation, persisted restore, upgrade and replay
 /// after a crash before upload against identical final POST bytes/placement.
 fn routes(c: &Corpus) -> RouteResult {
@@ -121,6 +163,7 @@ fn routes(c: &Corpus) -> RouteResult {
         let mut first = c.raw(&scanner, index, 100, true, &[]);
         first.enrich(c);
         money_oracle::assert_equivalent(&expected, &result(&first, mode));
+        let carried = acked(&first);
         // Save native inputs without accepting; the next real change continues them.
         first.finish();
         let mut prior = session.save_reload(&mut first.index);
@@ -137,7 +180,10 @@ fn routes(c: &Corpus) -> RouteResult {
             c.raw(&E2ScanFixture::capturing_identity(), prior, 100, true, &[])
         };
         again.enrich(c);
-        money_oracle::assert_equivalent(&grown, &result(&again, mode));
+        // A main-only append leaves unchanged children with their bodies.
+        let mut actual = result(&again, mode);
+        actual.accepted = carried;
+        money_oracle::assert_carried_equivalent(&grown, &actual);
         // An upgraded prior continues on its own route, never the session's.
         if upgrade {
             again.finish();
@@ -251,6 +297,8 @@ fn occurrence_boundary_counts_unusable_and_old_copies() {
 
 /// [money] Append to either child, then opposite children, then only the
 /// main: the old shared prefix stays singular while distinct suffixes add.
+/// The main-only append reads the main's copies alone: the children keep
+/// their accepted bodies, equal to cold.
 #[test]
 fn growth_on_either_home_and_main_only() {
     with_e2(|| {
@@ -268,6 +316,7 @@ fn growth_on_either_home_and_main_only() {
                 &c.base.join("state"),
             );
             let first = page(&c, index, 100, true);
+            let mut carried = acked(&first);
             let mut prior = commit(&session, first);
             let mut additions = 0;
             for (step, relative) in [
@@ -288,9 +337,18 @@ fn growth_on_either_home_and_main_only() {
                 let warm = hinted(&c, prior.clone(), 100, true, std::slice::from_ref(&path));
                 assert_eq!(warm.modes.0, 0, "append/forced family use Tail");
                 assert!(warm.modes.1 > 0);
-                money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
                 let restored = hinted(&c, restored_prior, 100, true, std::slice::from_ref(&path));
-                money_oracle::assert_equivalent(&expected, &result(&restored, Mode::DiskRestore));
+                if step == 4 {
+                    assert_main_only(&c, &warm, &carried, Mode::Ram);
+                    assert_main_only(&c, &restored, &carried, Mode::DiskRestore);
+                } else {
+                    money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
+                    money_oracle::assert_equivalent(
+                        &expected,
+                        &result(&restored, Mode::DiskRestore),
+                    );
+                }
+                carried.extend(acked(&warm));
                 additions += 1;
                 let sum = expected
                     .snapshots
@@ -366,8 +424,9 @@ fn later_copy_only_child_growth_matches_cold() {
 }
 
 /// [diagnostic] The page line says why twins forced their family in: one seed
-/// per read twin by its own parse reason, the distinct roots, and the family
-/// paths the closure names. Counts only; money still matches the cold oracle.
+/// per read twin by its own parse reason and by member kind, the distinct
+/// roots, the family paths the closure names, and the roots a main-only seed
+/// reads alone. Counts only; money still matches the cold oracle.
 #[test]
 fn forced_family_seed_counts() {
     with_e2(|| {
@@ -377,14 +436,25 @@ fn forced_family_seed_counts() {
             &ScanIndex::default(),
             &c.base.join("state"),
         );
-        let mut prior = commit(&session, page(&c, index, 100, true));
+        let first = page(&c, index, 100, true);
+        let mut carried = acked(&first);
+        let mut prior = commit(&session, first);
         // Two mains, two child pairs and the untwinned child share one root.
         let family = c.births.len() as u64;
         assert_eq!(family, 7);
-        for (step, grown, seeds, roots, pulled) in [
-            (0, vec![member("a", 0)], 1, 1, family),
-            (1, vec![member("a", 0), member("a", 1)], 2, 1, family),
-            (2, vec![member("a", 2)], 0, 0, 0),
+        let main = format!("z/{ROOT}.jsonl");
+        for (step, grown, seeds, roots, pulled, scoped) in [
+            (0, vec![member("a", 0)], (1, "child_member"), 1, family, 0),
+            (
+                1,
+                vec![member("a", 0), member("a", 1)],
+                (2, "child_member"),
+                1,
+                family,
+                0,
+            ),
+            (2, vec![member("a", 2)], (0, ""), 0, 0, 0),
+            (3, vec![main], (1, "root_member"), 0, 0, 1),
         ] {
             let hints = grown.iter().map(|relative| c.root.join(relative));
             let hints = hints.collect::<Vec<_>>();
@@ -395,40 +465,34 @@ fn forced_family_seed_counts() {
             let (warm, rows) = crate::local_resource_diagnostics::capture(|| {
                 hinted(&c, prior.clone(), 100, true, &hints)
             });
-            let pages = rows
-                .iter()
-                .filter(|row| row["stage"] == "native_collection_page")
-                .map(|row| &row["counts"])
-                .collect::<Vec<_>>();
-            assert!(!pages.is_empty(), "step {step}");
-            let mut by_reason = BTreeMap::<String, u64>::new();
-            for (reason, n) in pages
-                .iter()
-                .filter_map(|counts| counts["forced_family_seeds"].as_object())
+            let [by_reason, selection] = seed_counts(&rows);
+            let expected_seeds = (seeds.0 > 0)
+                .then_some([("transcript_changed", seeds.0), (seeds.1, seeds.0)])
+                .into_iter()
                 .flatten()
-            {
-                *by_reason.entry(reason.clone()).or_default() += n.as_u64().unwrap();
-            }
-            let expected_seeds = (seeds > 0).then_some(("transcript_changed".to_string(), seeds));
-            let expected_seeds = expected_seeds.into_iter().collect::<BTreeMap<_, _>>();
+                .map(|(reason, n)| (reason.to_string(), n))
+                .collect::<BTreeMap<_, _>>();
             assert_eq!(by_reason, expected_seeds, "step {step}");
-            let selection = |key: &str| {
-                pages
-                    .iter()
-                    .map(|counts| counts["page_selection"][key].as_u64().unwrap_or(0))
-                    .sum::<u64>()
-            };
+            let selection = |key: &str| selection.get(key).copied().unwrap_or(0);
             assert_eq!(selection("forced_family_roots"), roots, "step {step}");
             assert_eq!(
                 selection("forced_family_members_pulled"),
                 pulled,
                 "step {step}"
             );
+            assert_eq!(
+                selection("forced_family_member_scoped"),
+                scoped,
+                "step {step}"
+            );
             // A page without a seed re-emits only the grown child; the whole
             // family cold oracle applies to the forced pages.
-            if seeds > 0 {
+            if scoped > 0 {
+                assert_main_only(&c, &warm, &carried, Mode::Ram);
+            } else if seeds.0 > 0 {
                 money_oracle::assert_equivalent(&expected, &result(&warm, Mode::Ram));
             }
+            carried.extend(acked(&warm));
             prior = commit(&session, warm);
         }
     });
@@ -486,6 +550,7 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 .unwrap()
                 .values()
                 .any(|v| !v.is_null()));
+            let mut carried = acked(&first);
             let mut prior = commit(&session, first);
             assert_verified_incomplete(&prior, &key);
             for (step, path) in [
@@ -516,9 +581,14 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                 assert_verified_incomplete(&warm.index, &key);
                 let actual = result(&warm, Mode::DiskRestore);
                 // Family refolding can move an unchanged session's carrier;
-                // the full body still matches.
-                money_oracle::assert_equivalent(&expected, &actual);
+                // the full body still matches. A main-only append carries them.
+                if path == &main {
+                    assert_main_only(&c, &warm, &carried, Mode::DiskRestore);
+                } else {
+                    money_oracle::assert_equivalent(&expected, &actual);
+                }
                 assert!(actual.accepted_identity_buckets.is_some());
+                carried.extend(acked(&warm));
                 prior = commit(&session, warm);
                 assert_verified_incomplete(&prior, &key);
                 assert!(
@@ -582,6 +652,22 @@ fn positive_placement_matches_one_home() {
         let c = twins("subagent-twin-positive", false, TURN, false, true);
         let actual = routes(&c);
         assert!(accounts(&actual).len() >= 2);
+        // After an exact ACK, a main-only append carries every child's
+        // accepted body and placement (switch, side call, gap, tagged row).
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state-main-only"),
+        );
+        let first = page(&c, index, 100, true);
+        let carried = acked(&first);
+        let prior = commit(&session, first);
+        let main = c.root.join(format!("z/{ROOT}.jsonl"));
+        let original = std::fs::read_to_string(&main).unwrap();
+        append(&main, &line(ROOT, "main-only", GROW, 8));
+        let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&main));
+        assert_main_only(&c, &warm, &carried, Mode::Ram);
+        std::fs::write(&main, original).unwrap();
         assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 5);
         assert_eq!(
             actual.snapshots[&child(0)]["removed_usage"]["input_tokens"],
@@ -732,14 +818,11 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         assert!(quiet.scan.snapshots.is_empty());
         let main = c.root.join(format!("z/{ROOT}.jsonl"));
         append(&main, &line(ROOT, "main-only", GROW, 8));
-        let pulled = hinted(&c, prior, 100, true, &[main]);
-        let same = body(&pulled, &child(0)).unwrap();
-        assert_eq!(same.request_count, 2);
-        assert_eq!(
-            snapshot_upload_body_witness(same),
-            before.accepted[&child(0)].witness
-        );
-        let prior = commit(&session, pulled);
+        // The doubled child is not re-sent; its accepted body equals cold.
+        let main_only = hinted(&c, prior, 100, true, &[main]);
+        assert_eq!(before.accepted[&child(0)].body["request_count"], 2);
+        assert_main_only(&c, &main_only, &before.accepted, Mode::Ram);
+        let prior = commit(&session, main_only);
         for home in ["a", "z"] {
             append(
                 &c.root.join(member(home, 0)),
@@ -766,5 +849,140 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
             progress.accepted_body_witnesses.get(&fingerprint),
             Some(&witness)
         );
+    });
+}
+
+/// The main's usage logs alone move: one late priced side call it owns.
+fn late_main_side_call(c: &Corpus) {
+    let rows = [
+        (
+            "claude-code-effort",
+            serde_json::to_value(api_login(ROOT, "late-side", 5, '1', Some('7'))).unwrap(),
+        ),
+        (
+            "claude-code-trace-ownership",
+            serde_json::to_value(trace("late-side", "")).unwrap(),
+        ),
+    ];
+    for (directory, row) in rows {
+        let name = format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()));
+        let path = c.support.join("local-otel").join(directory).join(name);
+        append(&path, &(row.to_string() + "\n"));
+    }
+}
+
+/// [regress] A main whose live copy grows with its audit overdue reads only
+/// its two copies after an exact ACK and save: both copies fold, no unchanged
+/// child loads or re-folds on that page or the next, and money matches cold
+/// with the children's bodies carried. A move of the main's usage logs alone
+/// still re-reads the family on its page, then settles the same way. A
+/// child's activity retry or a change to the other main copy also keeps
+/// the whole-family read, with cold-equivalent money and placement.
+#[test]
+fn root_twin_audit_overdue_growth_does_not_repull_family() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        overdue_audit_for_test, tail_counter_for_test,
+    };
+    with_e2(|| {
+        for case in [
+            "growth",
+            "usage_logs",
+            "child_activity_retry",
+            "other_main_copy",
+        ] {
+            let c = twins(
+                &format!("subagent-twin-root-scope-{case}"),
+                false,
+                TURN,
+                false,
+                true,
+            );
+            let (session, index) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state"),
+            );
+            let first = page(&c, index, 100, true);
+            let mut carried = acked(&first);
+            let mut prior = commit(&session, first);
+            let main = c.root.join(format!("z/{ROOT}.jsonl"));
+            if matches!(case, "growth" | "usage_logs") {
+                overdue_audit_for_test(&mut prior, &main);
+            }
+            if case == "usage_logs" {
+                late_main_side_call(&c);
+            } else {
+                append(&main, &line(ROOT, "audit-growth", GROW, 8));
+            }
+            let mut hints = vec![main];
+            if case == "child_activity_retry" {
+                // Drop activity on both copies so the body owner retries.
+                for home in ["a", "z"] {
+                    let path = c.root.join(member(home, 0));
+                    let key = path.to_string_lossy().into_owned();
+                    let owned = prior.file_snapshot_fingerprints.get(&key).cloned();
+                    for fingerprint in owned.into_iter().flatten() {
+                        prior.snapshot_activity_at.remove(&fingerprint);
+                    }
+                    hints.push(path);
+                }
+            } else if case == "other_main_copy" {
+                let path = c.root.join(format!("a/{ROOT}.jsonl"));
+                append(&path, &line(ROOT, "broad-other", GROW, 8));
+                hints.push(path);
+            }
+            let refolds = || tail_counter_for_test("tail_refold", "forced_family");
+            let before = refolds();
+            let (warm, rows) = crate::local_resource_diagnostics::capture(|| {
+                hinted(&c, prior.clone(), 100, true, &hints)
+            });
+            let [seeds, selection] = seed_counts(&rows);
+            if case != "growth" {
+                if case == "usage_logs" {
+                    // Each listed child's fingerprint carries the main's
+                    // usage logs, so their move re-identifies every copy.
+                    assert!(seeds.get("source_changed").is_some_and(|n| *n > 0));
+                }
+                if case == "other_main_copy" {
+                    assert_eq!(seeds.get("root_member"), Some(&2));
+                } else {
+                    assert!(seeds.get("child_member").is_some_and(|n| *n > 0));
+                    if case == "child_activity_retry" {
+                        assert_eq!(seeds.get("root_member"), Some(&1));
+                    }
+                }
+                if case != "usage_logs" {
+                    for agent in 0..3 {
+                        assert!(
+                            body(&warm, &child(agent)).is_some(),
+                            "{case}: child {agent}"
+                        );
+                    }
+                }
+                assert_eq!(selection.get("forced_family_roots"), Some(&1));
+                assert_eq!(selection.get("forced_family_member_scoped"), None);
+                let mut actual = result(&warm, Mode::Ram);
+                actual.accepted = carried.clone();
+                money_oracle::assert_carried_equivalent(&cold(&c), &actual);
+            } else {
+                assert_eq!(refolds() - before, 2, "only the main's two copies fold");
+                assert_eq!(seeds.get("audit"), Some(&1));
+                assert_eq!(seeds.get("root_member"), Some(&1));
+                assert_eq!(seeds.get("child_member"), None);
+                assert_eq!(selection.get("forced_family_roots"), None);
+                assert_eq!(selection.get("forced_family_member_scoped"), Some(&1));
+                assert_main_only(&c, &warm, &carried, Mode::Ram);
+            }
+            carried.extend(acked(&warm));
+            prior = commit(&session, warm);
+            // The main's audit stays due, so the next page may fold its two
+            // copies again; no child loads, re-folds or re-sends.
+            let before = refolds();
+            let next = page(&c, prior, 100, true);
+            assert!(refolds() - before <= 2, "{case}: the next page");
+            for agent in 0..3 {
+                assert!(body(&next, &child(agent)).is_none(), "{case}");
+            }
+        }
     });
 }

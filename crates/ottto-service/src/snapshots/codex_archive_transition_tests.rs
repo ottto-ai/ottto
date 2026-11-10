@@ -125,7 +125,8 @@ fn page_observed_with_limit(
     let delivered = Delivered::default();
     let ((answer, consumed), logs) = crate::local_resource_diagnostics::capture(|| {
         oracle::observe_consumed(|| {
-            let mut scan = OwnedSourceScan::new(
+            let scope = Scope("encoding-money-transition".into());
+            let mut scan = OwnedSourceScan::new_with_recovery_priority(
                 SnapshotSource::Codex,
                 roots,
                 index,
@@ -135,8 +136,12 @@ fn page_observed_with_limit(
                 None,
                 &[],
                 false,
+                &mut ListingRequest::default(),
+                false,
+                &[],
+                Some((&cache, &scope)),
             )
-            .with_sampled_acquisition(cache, Scope("encoding-money-transition".into()))
+            .with_sampled_acquisition(cache, scope)
             .with_line_observer("test", Box::new(delivered.clone()));
             observe(&mut scan);
             for _ in 0..100_000 {
@@ -173,6 +178,18 @@ fn page_observed_with_limit(
         })
     });
     (answer.0, answer.1, delivered, consumed, logs)
+}
+/// The Codex header lookup counts in each emitted cursor diagnostics window.
+fn emitted_header_lookups(logs: &[Value]) -> Vec<Value> {
+    logs.iter()
+        .filter_map(|record| {
+            record.pointer("/counts/sampled_acquisition/codex_cursor/during_scan_window")
+        })
+        .map(|window| {
+            json!({"lookups": window.get("header_durable_lookups"),
+                "reuse_hits": window.get("header_reuse_hits")})
+        })
+        .collect()
 }
 fn route(index: &ScanIndex, scan: &SourceScanResult, posts: Vec<Vec<u8>>) -> RouteResult {
     let mut route = RouteResult::emitted(Mode::Ram, SnapshotSource::Codex, posts, &scan.snapshots);
@@ -252,7 +269,13 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
             &c.scratch.join("state"),
         );
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let (working, first, _, _, _) = page(&c, prior.clone(), cache.clone());
+        let (working, first, _, _, logs) = page(&c, prior.clone(), cache.clone());
+        // [regress] The page's own header inventory lookups land in its
+        // emitted cursor window: one physical lookup per member, no reuse.
+        assert_eq!(
+            emitted_header_lookups(&logs),
+            vec![json!({"lookups": 4, "reuse_hits": null})]
+        );
         let (index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
         assert_eq!(posts.len(), 1);
         let first_route = route(&index, &first, posts);
@@ -1797,4 +1820,9 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
         serde_json::to_value(&index.session_account_bindings).unwrap()
     );
     assert_quiet(&c, index, &paged);
+}
+
+mod sidecar_reuse_transition {
+    use super::*;
+    include!("sources/codex/sidecar/reuse_transition.rs");
 }

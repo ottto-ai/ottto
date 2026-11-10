@@ -646,6 +646,9 @@ impl std::fmt::Display for LoaderStage {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct LoaderEvidence {
+    pub reused_roots: u32,
+    pub reloaded_roots: u32,
+    pub absent_roots: u32,
     pub completed_roots: u32,
     pub failed_roots: u32,
     pub reason: LoaderReason,
@@ -670,6 +673,44 @@ pub(crate) struct SidecarOpenCounts {
     pub snapshots: u32,
 }
 impl LoaderEvidence {
+    pub fn merge_root(
+        &mut self,
+        evidence: &Self,
+        conflict: bool,
+        key: &str,
+        reused: bool,
+        absent: bool,
+    ) {
+        self.reused_roots = self.reused_roots.saturating_add(u32::from(reused));
+        self.reloaded_roots = self.reloaded_roots.saturating_add(u32::from(!reused));
+        self.absent_roots = self.absent_roots.saturating_add(u32::from(absent));
+        self.completed_roots = self
+            .completed_roots
+            .saturating_add(evidence.completed_roots);
+        self.identity_conflict |= conflict;
+        if !reused {
+            self.transient_retries = self
+                .transient_retries
+                .saturating_add(evidence.transient_retries);
+            self.completed_after_retry = self
+                .completed_after_retry
+                .saturating_add(evidence.completed_after_retry);
+            self.snapshot_fallbacks = self
+                .snapshot_fallbacks
+                .saturating_add(evidence.snapshot_fallbacks);
+        }
+        if evidence.failed_roots > 0 {
+            self.mixed_failure_reasons |= self.failed_roots > 0 && self.reason != evidence.reason;
+            if self.failed_roots == 0 {
+                self.reason = evidence.reason;
+                self.first_failure_root_digest = Some(digest(key));
+                self.first_failure_stage = evidence.first_failure_stage;
+                self.sqlite_extended_code = evidence.sqlite_extended_code;
+            }
+            self.failed_roots = self.failed_roots.saturating_add(evidence.failed_roots);
+        }
+    }
+
     pub fn observe_root(
         &mut self,
         result: &Result<()>,
@@ -974,7 +1015,7 @@ pub(crate) struct CountingV2Receipts {
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
 crate::heap_layout_bound::fields!(CodexScanDiagnostics; price_tier_old_files_without_receipt, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, created_thread_scoped_rollouts, identity_conflict_taxonomy, gates, unreadable_causes, quarantine_count, sample_offset, lineage, creator_slot_naming);
 crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
-crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
+crate::heap_layout_bound::fields!(LoaderEvidence; reused_roots, reloaded_roots, absent_roots, completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code, transient_retries, completed_after_retry, snapshot_fallbacks);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
 crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_parent_child_edges);

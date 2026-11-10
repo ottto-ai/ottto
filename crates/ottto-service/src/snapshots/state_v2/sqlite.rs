@@ -702,6 +702,30 @@ impl Sqlite {
         }
         private_parent(path)?;
         let owner_lock = lock_owner(path)?;
+        let (conn, file) = Self::open_locked(path, identity, None, false)?;
+        super::telemetry::event("schema_layout", &"four_tables");
+        let mut store = Self::fresh(conn, path, false, file, owner_lock);
+        // Hydrate reads through read_value, which verifies each checksum once.
+        // Reconstruct required maintenance from durable purge metadata/size;
+        // a nonzero allocated WAL by itself is not a checkpoint debt.
+        store.maintenance(false)?;
+        store.control("phase", &1_u8)?;
+        // Runtime loads re-emit any separate save/custody hold after hydration.
+        super::telemetry::event("hold", &"none");
+        Ok(store)
+    }
+    /// The shared database/connection validation (identity, generation,
+    /// schema, writer capability, limits, WAL mode, quick_check), under an
+    /// owner lock the caller holds. `open`'s outer checks (format, parent
+    /// privacy, the owner lock) are not re-run here. The erasure swap also
+    /// runs it on its copy, with an expected generation and a forced
+    /// quick_check, before that copy can replace the store.
+    pub(super) fn open_locked(
+        path: &Path,
+        identity: &super::Identity,
+        expected: Option<u64>,
+        force_quick_check: bool,
+    ) -> Result<(Connection, File)> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -725,29 +749,24 @@ impl Sqlite {
                 == Some(StorageLimits::current()),
             "state_v2_limits"
         );
-        super::telemetry::event("schema_layout", &"four_tables");
         let generation: u64 = read_json(&conn, &RowKey::Meta("generation".into()))?
             .ok_or_else(|| anyhow::anyhow!("state_v2_generation_missing"))?;
         ensure!(
             generation >= identity.fence_generation,
             "state_v2_generation_rollback"
         );
-        if read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0) {
+        ensure!(
+            expected.is_none_or(|g| g == generation),
+            "state_v2_generation_changed"
+        );
+        if force_quick_check || read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0) {
             let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             quick_check(
                 &conn,
                 maintenance::size_budget(before.len().max(pages.saturating_mul(4096)), 10),
             )?;
         }
-        let mut store = Self::fresh(conn, path, false, file, owner_lock);
-        // Hydrate reads through read_value, which verifies each checksum once.
-        // Reconstruct required maintenance from durable purge metadata/size;
-        // a nonzero allocated WAL by itself is not a checkpoint debt.
-        store.maintenance(false)?;
-        store.control("phase", &1_u8)?;
-        // Runtime loads re-emit any separate save/custody hold after hydration.
-        super::telemetry::event("hold", &"none");
-        Ok(store)
+        Ok((conn, file))
     }
     pub(super) fn finish_import(mut self) -> Result<()> {
         ensure!(self.import, "state_v2_not_import");
@@ -885,7 +904,11 @@ impl Sqlite {
         })
     }
     pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
-        if mode == CheckpointMode::Purge && self.vacuum().is_err() {
+        // A purge truncates the WAL before its copy, inside `vacuum`.
+        if mode == CheckpointMode::Purge {
+            if let Ok(result) = self.vacuum() {
+                return result;
+            }
             self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
                 state: CheckpointState::Failed,
@@ -894,6 +917,10 @@ impl Sqlite {
                 wal_bytes: self.wal_bytes(),
             };
         }
+        self.wal_checkpoint(mode)
+    }
+    /// One WAL checkpoint; TRUNCATE completes only with a zero-length WAL.
+    fn wal_checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         let command = match mode {
             CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
             CheckpointMode::Purge | CheckpointMode::IdleReclaim => {

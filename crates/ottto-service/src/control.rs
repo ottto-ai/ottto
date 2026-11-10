@@ -1117,8 +1117,8 @@ fn handle_command(
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::AgentStatusCached { source } => {
-            // The usual authorization helper builds general status (disk IO).
-            // This command authenticates directly against the in-memory token.
+            // Unlike the usual authorization helper, this skips the daemon-state
+            // poison check: the cached read uses no daemon state.
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
                 RequestAuthorization::TrustedCompanionApp => {}
@@ -3778,13 +3778,10 @@ fn require_authorized_local_client(
 ) -> Result<(), LocalApiError> {
     match authorization {
         RequestAuthorization::Token(token) => {
-            daemon.status(token)?;
-            Ok(())
+            daemon.control_token.authorize(token)?;
+            daemon.require_usable_state()
         }
-        RequestAuthorization::TrustedCompanionApp => {
-            daemon.status_for_trusted_client()?;
-            Ok(())
-        }
+        RequestAuthorization::TrustedCompanionApp => daemon.require_usable_state(),
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
 }
@@ -24578,6 +24575,61 @@ for line in sys.stdin:
         assert!(!companion_peer_is_trusted(Some(&peer)));
     }
 
+    #[test]
+    fn auth_only_command_keeps_trust_and_poisoned_state_refusals() {
+        let daemon = daemon();
+        let command = || LocalControlCommand::SessionLaunchStatus {
+            schema_version: 1,
+            launch_id: "synthetic".into(),
+        };
+        let request = |peer| {
+            let request = LocalControlRequest {
+                request_id: "auth-only".into(),
+                protocol_version: ottto_protocol::SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: command(),
+            };
+            handle_request_with_peer(&daemon, request, peer)
+        };
+        assert!(request(Some(LocalClientPeer::trusted_for_tests())).ok);
+        assert_eq!(
+            request(None).error.expect("error").code,
+            CliErrorCode::LocalClientNotTrusted
+        );
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = daemon.inner.lock().expect("daemon state");
+            panic!("poison the daemon state");
+        }));
+        assert!(poison.is_err());
+        let run = |authorization| {
+            handle_command(
+                &daemon,
+                authorization,
+                command(),
+                InstallOwner::Unknown,
+                None,
+                false,
+            )
+        };
+        // The token check still runs before the poisoned-state refusal.
+        assert!(matches!(
+            run(RequestAuthorization::Token("wrong-token".into())),
+            Err(LocalApiError::Unauthorized)
+        ));
+        for authorization in [
+            RequestAuthorization::Token("token".into()),
+            RequestAuthorization::TrustedCompanionApp,
+        ] {
+            assert!(matches!(
+                run(authorization),
+                Err(LocalApiError::StatePoisoned)
+            ));
+        }
+    }
+
     /// The requirement an internal build resolves to, and the one QA writes
     /// into a dev LaunchAgent when pointing a *release* daemon at a locally
     /// built Companion. An ad-hoc signature carries no team OU, so only the
@@ -28264,6 +28316,143 @@ X-API-Key = "otel_redacted"
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         server.join().unwrap();
         assert_eq!(fs::read(settings).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn relay_runtime_failure_health_survives_control_and_config_intents() {
+        use ottto_protocol::{LocalHealthSeverity, RelayRuntimeState, RelayState};
+
+        let (root, _guards) = managed_claude_relay_fixture();
+        let daemon = daemon(); // Unconnected synthetic account keeps Verify local.
+        let connected = RelayState {
+            state: RelayRuntimeState::Connected,
+            endpoint: Some("http://127.0.0.1:48123".into()),
+            last_connected_at: None,
+            last_error: None,
+        };
+        let failure_blockers = |status: &ottto_protocol::DaemonStatus| {
+            status
+                .canonical_health
+                .as_ref()
+                .unwrap()
+                .blockers
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b.code.as_str(),
+                        "relay_bind_failed" | "relay_listener_failed"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        daemon
+            .set_relay_state_for_trusted_client(connected.clone())
+            .unwrap();
+        for _ in 0..2 {
+            assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+        }
+        for (code, guidance) in [
+            (
+                "relay_bind_failed",
+                "Claude telemetry listener unavailable; restart Ottto, then Verify",
+            ),
+            (
+                "relay_listener_failed",
+                "Ottto is rebinding the Claude telemetry listener; if this persists, restart Ottto",
+            ),
+        ] {
+            let failed = RelayState {
+                state: RelayRuntimeState::Failed,
+                last_error: Some(StableMessage {
+                    code: code.into(),
+                    text: "synthetic listener failure".into(),
+                }),
+                ..connected.clone()
+            };
+            daemon
+                .set_relay_state_for_trusted_client(failed.clone())
+                .unwrap();
+            let mut status = daemon.status_for_trusted_client().unwrap();
+            assert_eq!(status.relay, failed);
+            if code == "relay_listener_failed" {
+                assert!(failure_blockers(&status).is_empty());
+                crate::refresh_canonical_local_health(&mut status);
+                assert!(
+                    failure_blockers(&status).is_empty(),
+                    "upload reprojection respects grace"
+                );
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(59));
+                assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(60));
+            }
+            status = daemon.status_for_trusted_client().unwrap();
+            let blockers = failure_blockers(&status);
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].code, code);
+            assert_eq!(blockers[0].severity, LocalHealthSeverity::Warning);
+            assert_eq!(blockers[0].owner, "source");
+            assert_eq!(blockers[0].source, "runtime");
+            assert_eq!(blockers[0].clear_condition, guidance);
+            let since = blockers[0].since.clone();
+            status.generated_at = "2099-01-01T00:00:00Z".into();
+            crate::refresh_canonical_local_health(&mut status);
+            assert_eq!(failure_blockers(&status)[0].since, since);
+            for command in [
+                LocalControlCommand::RelayStart,
+                LocalControlCommand::RelayStop,
+            ] {
+                let response = handle_command(
+                    &daemon,
+                    RequestAuthorization::Token("token".into()),
+                    command,
+                    InstallOwner::Unknown,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_value::<RelayState>(response).unwrap(),
+                    failed
+                );
+                let current = daemon.status_for_trusted_client().unwrap();
+                assert_eq!(failure_blockers(&current)[0].since, since);
+            }
+            verify_source(
+                &daemon,
+                &RequestAuthorization::Token("token".into()),
+                SourceKind::ClaudeCode,
+                false,
+            )
+            .unwrap();
+            fs::write(root.join(".claude/settings.json"), "{}").unwrap();
+            let patch = repair_source_config(&daemon, &SourceKind::ClaudeCode).unwrap();
+            assert!(patch.changed);
+            let current = daemon.status_for_trusted_client().unwrap();
+            assert_eq!(current.relay, failed);
+            assert_eq!(failure_blockers(&current)[0].since, since);
+            daemon
+                .set_relay_state_for_trusted_client(connected.clone())
+                .unwrap();
+            let recovered = daemon.status_for_trusted_client().unwrap();
+            assert!(recovered.relay.last_error.is_none());
+            assert!(failure_blockers(&recovered).is_empty());
+
+            // Recovery and a new failure between reads must start a fresh grace.
+            if code == "relay_listener_failed" {
+                daemon
+                    .set_relay_state_for_trusted_client(failed.clone())
+                    .unwrap();
+                daemon.relay_mismatch.age_for_test(Duration::from_secs(60));
+                daemon
+                    .set_relay_state_for_trusted_client(connected.clone())
+                    .unwrap();
+                daemon.set_relay_state_for_trusted_client(failed).unwrap();
+                assert!(failure_blockers(&daemon.status_for_trusted_client().unwrap()).is_empty());
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

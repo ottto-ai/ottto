@@ -51,6 +51,10 @@ fn sqlite_cause(error: &anyhow::Error) -> Option<&'static str> {
             _ => "engine",
         })
 }
+#[cfg(not(test))]
+fn swap_point(_: &str, _: &Path) -> Result<()> {
+    Ok(())
+}
 fn retry_seconds(failures: u64) -> u64 {
     3600 * (1_u64 << failures.saturating_sub(1).min(2))
 }
@@ -298,14 +302,14 @@ impl Sqlite {
         self.stats.clone()
     }
 
-    pub(super) fn vacuum(&mut self) -> Result<()> {
+    pub(super) fn vacuum(&mut self) -> Result<CheckpointResult> {
         migrations::check_current(self.conn()?)?;
         let started = Instant::now();
         let bytes = fs::metadata(&self.path).ok().map(|m| m.len()).unwrap_or(0);
         let result = self.vacuum_inner();
         self.stats.erasure_vacuum.seconds += started.elapsed().as_secs_f64();
         self.stats.vacuum_latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
-        if result.is_ok() {
+        if matches!(&result, Ok(r) if r.state == CheckpointState::Complete) {
             self.stats.erasure_vacuum.bytes = self.stats.erasure_vacuum.bytes.saturating_add(bytes);
         }
         if let Err(error) = &result {
@@ -317,7 +321,7 @@ impl Sqlite {
         let count = self.stats.erasure_vacuum_failed.entry(reason).or_default();
         *count = count.saturating_add(1);
     }
-    fn vacuum_inner(&mut self) -> Result<()> {
+    fn vacuum_inner(&mut self) -> Result<CheckpointResult> {
         ensure!(!self.import, "state_v2_import_purge_refused");
         // Main-file length alone undercounts live pages still in the WAL.
         let logical = (|| -> Result<u64> {
@@ -327,20 +331,23 @@ impl Sqlite {
             pages.checked_mul(size).context("state_v2_vacuum_space")
         })()
         .ok();
+        // One copy: the TRUNCATE below proves an empty WAL before copying.
         let required = logical
             .zip(fs::metadata(&self.path).ok().map(|m| m.len()))
-            .and_then(|(logical, file)| logical.max(file).checked_mul(2))
-            .and_then(|n| n.checked_add(1024 * 1024 * 1024));
+            .and_then(|(logical, file)| logical.max(file).checked_add(1024 * 1024 * 1024));
         let available = (self.purge_policy.space)(&self.path);
         self.stats.free_space_required_bytes = required;
         self.stats.free_space_available_bytes = available;
         let admitted = required.zip(available).map(|(r, a)| a >= r);
         self.stats.free_space_admitted = admitted;
         ensure!(admitted == Some(true), "state_v2_vacuum_space");
-        // VACUUM may generate a DB-sized WAL. Count it separately from ordinary
-        // saves; neither the 64 MiB alarm nor the work budget is a WAL cap.
         let started = Instant::now();
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
+        // A busy or partial TRUNCATE fails the attempt before any copy exists.
+        let mut truncated = self.wal_checkpoint(CheckpointMode::Purge);
+        if truncated.state != CheckpointState::Complete {
+            return Ok(truncated);
+        }
 
         // Interrupted VACUUM restarts from scratch. Increase its work allowance
         // after failures, with a hard pause bound; never loop until it succeeds.
@@ -349,9 +356,21 @@ impl Sqlite {
             .max(self.purge_policy.work)
             .saturating_mul(1_u32 << failures.saturating_sub(1).min(5))
             .min(Duration::from_secs(60));
-        let result = limited(self.conn()?, budget, || {
-            Ok(self.conn()?.execute_batch("VACUUM")?)
-        });
+        let identity = self.read_control::<Identity>("identity")?;
+        let identity = identity.context("state_v2_identity_missing")?;
+        let generation = self.stamp()?.0;
+        let tmp = sidecar(&self.path, ".vacuum");
+        let mut result = self.vacuum_copy(&tmp, &identity, generation, budget);
+        if result.is_err() {
+            // The live store is untouched; the next attempt also deletes these.
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                let _ = fence::remove_artifact(&sidecar(&tmp, suffix));
+            }
+        } else {
+            result = self.vacuum_publish(&tmp, &identity, generation);
+            // Past the close, only a cold open of the current name is safe.
+            self.reload |= result.is_err();
+        }
         self.stats.vacuum_latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
@@ -359,10 +378,59 @@ impl Sqlite {
             self.stats.vacuum_wal_peak_bytes =
                 Some(self.stats.vacuum_wal_peak_bytes.unwrap_or(0).max(bytes));
         }
-        if result.is_err() {
+        if let Err(error) = &result {
             self.stats.vacuum_failures = self.stats.vacuum_failures.saturating_add(1);
+            self.erasure_failed(sqlite_cause(error).unwrap_or("swap_io"));
+            truncated.state = CheckpointState::Failed;
         }
-        result
+        Ok(truncated)
+    }
+    /// Build the erasure copy and run the shared database/connection
+    /// validation on it (`open_locked`), against the `live` generation. The
+    /// outer checks are held from the live open, not re-run. The live store is
+    /// only read.
+    fn vacuum_copy(&self, tmp: &Path, id: &Identity, live: u64, work: Duration) -> Result<()> {
+        // Dropped on return: no descriptor on the copy outlives SQLite's locks.
+        let file = fence::create_private(tmp)?;
+        let name = tmp.to_str().context("state_v2_vacuum_path")?;
+        limited(self.conn()?, work, || {
+            Ok(self.conn()?.execute("VACUUM INTO ?1", [name])?)
+        })?;
+        // The copy has a rollback journal; the store is a WAL database.
+        // `open_locked` refuses any mode but WAL.
+        let raw = Connection::open(tmp)?;
+        raw.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        raw.close().map_err(|(_, error)| error)?;
+        let (conn, _owner) = Sqlite::open_locked(tmp, id, Some(live), true)?;
+        conn.close().map_err(|(_, error)| error)?;
+        swap_point("W2b", tmp)?;
+        let stale = fence::exists(&sidecar(tmp, "-wal"))? || fence::exists(&sidecar(tmp, "-shm"))?;
+        ensure!(!stale, "state_v2_vacuum_sidecar");
+        file.sync_all()?;
+        let mut header = [0_u8; 20];
+        std::io::Read::read_exact(&mut File::open(tmp)?, &mut header)?;
+        ensure!(header[18..20] == [2, 2], "state_v2_journal_refused");
+        Ok(())
+    }
+    /// The point of no return: close the store, then rename the copy over it.
+    fn vacuum_publish(&mut self, tmp: &Path, id: &Identity, generation: u64) -> Result<()> {
+        swap_point("close", tmp)?;
+        let live = self.conn.take().map(Connection::close).transpose();
+        live.map_err(|(_, error)| error)?;
+        ensure!(self.wal_bytes() == Some(0), "state_v2_vacuum_wal");
+        for suffix in ["-wal", "-shm"] {
+            fence::remove_artifact(&sidecar(&self.path, suffix))?;
+        }
+        // The copy never pairs with the old sidecars, even after a power loss.
+        super::super::super::sync_checkpoint_parent(&self.path)?;
+        swap_point("W3", tmp)?;
+        fs::rename(tmp, &self.path)?;
+        swap_point("W4", tmp)?;
+        super::super::super::sync_checkpoint_parent(&self.path)?;
+        let (conn, owner) = Sqlite::open_locked(&self.path, id, Some(generation), false)?;
+        self.conn = Some(conn);
+        self.owner = owner;
+        Ok(())
     }
 
     fn logical_bytes(&self) -> Result<u64> {

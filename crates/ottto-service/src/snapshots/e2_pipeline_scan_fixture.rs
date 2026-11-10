@@ -365,6 +365,15 @@ pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
         .for_each(age);
 }
 
+/// `path`'s verification aged past the audit interval: its sampled audit is
+/// overdue, as a growing file's marker that never settles reads.
+pub(crate) fn overdue_audit_for_test(index: &mut ScanIndex, path: &Path) {
+    let due = sampled_scan::now_seconds() - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    let entry = index.files.get_mut(&local_index_key(path)).unwrap();
+    entry.set_unverified_deadline(due - 1);
+    assert!(entry.audit_requires_full(sampled_scan::now_seconds()));
+}
+
 /// The state database `index` is bound to, if any.
 pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
     state_v2::runtime_path(index).ok().flatten()
@@ -486,7 +495,8 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
-        let mut scan = OwnedSourceScan::new_with_identity_capture(
+        let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
+        let mut scan = OwnedSourceScan::new_with_recovery_priority(
             SnapshotSource::ClaudeCode,
             roots,
             index,
@@ -496,10 +506,12 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
+            &mut ListingRequest::default(),
             self.capture_claude_identity,
+            &[],
+            sampled.then_some((self.cache.as_ref(), &scope)),
         );
         if sampled {
-            let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         // The same synthetic root births reach the page's staged twin probes,
@@ -542,7 +554,8 @@ impl E2ScanFixture {
         index.activate_effective_upload_body_witness_revision(
             crate::snapshot_sync::effective_upload_body_witness_revision(source),
         );
-        let mut scan = OwnedSourceScan::new(
+        let (scope, _) = scan_binding(source);
+        let mut scan = OwnedSourceScan::new_with_recovery_priority(
             source,
             roots,
             index,
@@ -552,9 +565,12 @@ impl E2ScanFixture {
             Some(support),
             hints,
             false,
+            &mut ListingRequest::default(),
+            false,
+            &[],
+            sampled.then_some((self.cache.as_ref(), &scope)),
         );
         if sampled {
-            let (scope, _) = scan_binding(source);
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         if let Some(versions) = self.versions.as_ref() {

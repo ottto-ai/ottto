@@ -156,3 +156,4 @@ crates/ottto-service/src/lib.rs	snapshots::compact_index_tests::held_slots_cross
 crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::snapshot_file_entity_set_digest_is_pinned	snapshots::scan_index::file_set_digest::tests::snapshot_file_entity_set_digest_is_pinned
 crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::snapshot_file_upload_body_set_digest_is_pinned	snapshots::scan_index::file_set_digest::tests::snapshot_file_upload_body_set_digest_is_pinned
 crates/ottto-service/src/lib.rs	snapshots::file_set_digest_tests::file_set_digest_domains_are_distinct	snapshots::scan_index::file_set_digest::tests::file_set_digest_domains_are_distinct
+crates/ottto-service/src/lib.rs	snapshot_sync::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::root_twin_scoped_family	snapshot_sync::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::root_twin_scope_tests::root_twin_scoped_family

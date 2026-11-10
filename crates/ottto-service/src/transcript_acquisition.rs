@@ -126,6 +126,18 @@ impl FileStamp {
 pub(crate) enum SourceStamp {
     Absent,
     File(FileStamp),
+    Sqlite {
+        target: std::path::PathBuf,
+        main: FileStamp,
+        wal: SqliteWal,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) enum SqliteWal {
+    Absent,
+    Empty,
+    Frames(FileStamp),
 }
 
 impl SourceStamp {
@@ -137,10 +149,70 @@ impl SourceStamp {
         }
     }
 
+    /// None is noncacheable, not an acquisition failure. The caller keeps
+    /// today's plain read for journals, hard links and uninspectable inputs.
+    pub(crate) fn capture_sqlite(path: &std::path::Path) -> Option<Self> {
+        let target = match std::fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Some(Self::Absent),
+                    _ => None,
+                };
+            }
+            Err(_) => return None,
+        };
+        let sidecar = |suffix| {
+            let mut name = target.as_os_str().to_os_string();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        };
+        if !matches!(std::fs::symlink_metadata(sidecar("-journal")), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&target).ok()?;
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            return None;
+        }
+        let main = FileStamp::capture(metadata).ok()?;
+        let wal = match std::fs::symlink_metadata(sidecar("-wal")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => SqliteWal::Absent,
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => SqliteWal::Empty,
+            Ok(metadata) => SqliteWal::Frames(FileStamp::capture(metadata).ok()?),
+            Err(_) => return None,
+        };
+        Some(Self::Sqlite { target, main, wal })
+    }
+
     pub(crate) fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Absent, Self::Absent) => true,
             (Self::File(a), Self::File(b)) => a.same_content(b),
+            (
+                Self::Sqlite {
+                    target: a,
+                    main: am,
+                    wal: aw,
+                },
+                Self::Sqlite {
+                    target: b,
+                    main: bm,
+                    wal: bw,
+                },
+            ) => {
+                a == b
+                    && am.same_content(bm)
+                    && match (aw, bw) {
+                        (SqliteWal::Frames(a), SqliteWal::Frames(b)) => a.same_content(b),
+                        (
+                            SqliteWal::Absent | SqliteWal::Empty,
+                            SqliteWal::Absent | SqliteWal::Empty,
+                        ) => true,
+                        _ => false,
+                    }
+            }
             _ => false,
         }
     }
@@ -1295,6 +1367,29 @@ impl crate::heap_layout_bound::HeapLayoutBound for Scope {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(value, c)
     }
 }
+
+impl crate::heap_layout_bound::HeapLayoutBound for SourceStamp {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Absent => Some(()),
+            Self::File(stamp) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(stamp, c),
+            Self::Sqlite { target, .. } => {
+                crate::heap_layout_bound::HeapLayoutBound::heap_bound(target, c)
+            }
+        }
+    }
+}
+impl<
+        K: crate::heap_layout_bound::HeapLayoutBound,
+        F: crate::heap_layout_bound::HeapLayoutBound,
+        S: crate::heap_layout_bound::HeapLayoutBound,
+    > crate::heap_layout_bound::HeapLayoutBound for StampedFacts<K, F, S>
+{
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.kept, c)
+    }
+}
+
 crate::heap_layout_bound::fields!(AuditDebt; due_unix_seconds);
 crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(unix)] inode,
     #[cfg(unix)] modified, #[cfg(unix)] changed);

@@ -145,7 +145,7 @@ impl OwnedSourceScan {
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
-            claude_twin_only_family_reparses,
+            claude_twin_schedule,
             claude_family_shadow,
             mut identified_candidates,
             active_file: active_frame,
@@ -192,6 +192,11 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if let Some(context) = sampling.as_ref() {
+                        // The inventory's lookups count in this scan's window;
+                        // the page clock still ticks at `note_page`.
+                        codex_page.open_window(&context.cache);
+                    }
                     if !inventory.step_selected(
                         &codex_title_metadata,
                         index,
@@ -3792,20 +3797,17 @@ impl OwnedSourceScan {
                 pending!();
             }
             let mut source_change = None;
-            let (mut decision, mut parse_reason) = match claude_index_path_family_member(
-                &candidate.path,
-            )
-            .filter(|(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id))
+            let (mut decision, mut parse_reason) = match claude_twin_schedule
+                .forced(&forced_claude_family_reparses, &candidate.path)
             {
                 // A twin-only forced member that owes only adoption keeps that
                 // reason, so the history gate can hold the whole twin group.
-                Some((root_session_id, _))
-                    if claude_twin_only_family_reparses.contains(&root_session_id)
-                        && index.candidate_decision_with_reason_at(&candidate, audit_now)
-                            == (
-                                CandidateDecision::Parse,
-                                Some(CandidateParseReason::BodyWitnessAdoption),
-                            ) =>
+                Some(true)
+                    if index.candidate_decision_with_reason_at(&candidate, audit_now)
+                        == (
+                            CandidateDecision::Parse,
+                            Some(CandidateParseReason::BodyWitnessAdoption),
+                        ) =>
                 {
                     (
                         CandidateDecision::Parse,
@@ -4304,11 +4306,14 @@ impl OwnedSourceScan {
                             .observe(protected_entry.is_some());
                         let protected =
                             protected_entry.is_some_and(ScanIndexEntry::codex_history_is_protected);
-                        let forced_family = claude_index_path_family_member(&candidate.path)
-                            .is_some_and(|(root, _)| {
-                                forced_claude_family_reparses.contains(&root)
-                                    || index.claude_usage_authority_quarantine.contains_key(&root)
-                            });
+                        let forced_family = claude_twin_schedule
+                            .forced(&forced_claude_family_reparses, &candidate.path)
+                            .is_some()
+                            || claude_index_path_family_member(&candidate.path).is_some_and(
+                                |(root, _)| {
+                                    index.claude_usage_authority_quarantine.contains_key(&root)
+                                },
+                            );
                         // Audit population/deadlines never gate ordinary
                         // restore. The legacy prefix/proof paths retain their
                         // own rules. A same-process `e2`-held read may
@@ -4837,7 +4842,7 @@ impl OwnedSourceScan {
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
-            claude_twin_only_family_reparses,
+            claude_twin_schedule,
             claude_family_shadow,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(

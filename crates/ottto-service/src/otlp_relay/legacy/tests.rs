@@ -595,12 +595,9 @@ fn with_endpoint<T>(endpoint: Endpoint, run: impl FnOnce() -> T) -> T {
 }
 
 fn hook_supervisor(mut supervisor: Supervisor) -> (Endpoint, thread::JoinHandle<Supervisor>) {
-    let (sender, receiver) = mpsc::channel();
-    let endpoint = Endpoint {
-        sender,
-        admission: supervisor.admission.clone(),
-    };
+    let (endpoint, receiver, wake) = Endpoint::channel(supervisor.admission.clone()).unwrap();
     let worker = thread::spawn(move || {
+        let _wake = wake;
         let command = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         supervisor.handle_command(command).unwrap();
         supervisor
@@ -917,12 +914,9 @@ pub(crate) fn with_running_listener_for_test(run: impl FnOnce()) -> (usize, usiz
         .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert_eq!(supervisor.open.len(), 1);
-    let (sender, receiver) = mpsc::channel();
-    let endpoint = Endpoint {
-        sender,
-        admission: supervisor.admission.clone(),
-    };
+    let (endpoint, receiver, wake) = Endpoint::channel(supervisor.admission.clone()).unwrap();
     let worker = thread::spawn(move || {
+        let _wake = wake;
         while let Ok(command) = receiver.recv() {
             supervisor.handle_command(command).unwrap();
         }
@@ -1022,4 +1016,341 @@ fn revoke_between_approval_read_and_bind_fences_the_new_listener() {
                 .is_none());
         });
     });
+}
+
+fn waiting_supervisor(
+    mut supervisor: Supervisor,
+) -> (
+    Endpoint,
+    mpsc::Receiver<()>,
+    mpsc::Receiver<()>,
+    thread::JoinHandle<Supervisor>,
+) {
+    let (endpoint, receiver, mut wake) = Endpoint::channel(supervisor.admission.clone()).unwrap();
+    let (waiting, waits) = mpsc::channel();
+    let (accepted, accepts) = mpsc::channel();
+    supervisor.waiting = Some(waiting);
+    let worker = thread::spawn(move || {
+        let mut health = Instant::now() + Duration::from_secs(1);
+        loop {
+            supervisor.flush_activity(now_seconds()).unwrap();
+            supervisor.accept_ready(Instant::now(), |_, _| {
+                accepted.send(()).unwrap();
+            });
+            if !supervisor
+                .wait_for_events(
+                    &mut wake,
+                    &receiver,
+                    now_seconds() + RETRY_SECONDS,
+                    &mut health,
+                )
+                .unwrap()
+            {
+                return supervisor;
+            }
+        }
+    });
+    (endpoint, waits, accepts, worker)
+}
+
+/// [behaviour] An unannounced fd replacement is fenced by the idle health deadline.
+#[test]
+fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
+    for replacement_kind in [0, 1, 2] {
+        let (dir, mut supervisor) = scratch();
+        let (reservation, port) = reserve_port();
+        supervisor
+            .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        let old = supervisor.open[&port].activity.clone();
+        let fd = supervisor.open[&port]
+            .listener
+            .as_ref()
+            .unwrap()
+            .as_raw_fd();
+        // Open replacements before waiting, so the mutation itself sends no
+        // command or traffic and does not allocate another descriptor.
+        let file_path = dir.join("replacement");
+        std::fs::write(&file_path, b"preserved").unwrap();
+        let file = std::fs::File::open(file_path).unwrap();
+        let listener = socket::bind(0).unwrap();
+        let replacement = if replacement_kind == 2 {
+            listener.as_raw_fd()
+        } else {
+            file.as_raw_fd()
+        };
+        let (endpoint, waits, _accepts, worker) = waiting_supervisor(supervisor);
+        // The notification proves arrival at the wait boundary, before poll.
+        waits.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        // SAFETY: both fds are live; intentionally replace the supervisor fd.
+        if replacement_kind == 0 {
+            // SAFETY: this intentionally models silent external fd loss.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        } else {
+            assert_eq!(unsafe { libc::dup2(replacement, fd) }, fd);
+        }
+        let deadline = started + Duration::from_millis(1250); // 1 s + CI scheduling tolerance
+        while old.live.load(Ordering::SeqCst) {
+            waits
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_millis(1250));
+        with_request_approval(Some(APPROVED), || {
+            assert!(old
+                .export_if_approved(|| panic!("replaced worker exported"))
+                .is_none());
+        });
+        drop(endpoint);
+        let mut supervisor = worker.join().unwrap();
+        assert!(supervisor.open.is_empty());
+        assert!(ports(&supervisor.record).contains(&port));
+        // SAFETY: release relinquished this descriptor; the test owns it now.
+        if replacement_kind != 0 {
+            let preserved = unsafe { OwnedFd::from_raw_fd(fd) };
+            if replacement_kind == 2 {
+                let preserved = TcpListener::from(preserved);
+                assert_eq!(
+                    preserved.local_addr().unwrap(),
+                    listener.local_addr().unwrap()
+                );
+            } else {
+                let mut preserved = std::fs::File::from(preserved);
+                let mut body = String::new();
+                preserved.read_to_string(&mut body).unwrap();
+                assert_eq!(body, "preserved");
+            }
+        }
+        // Advance the existing reconciliation clock, without a 60 s test sleep.
+        reservation.handoff();
+        supervisor
+            .tick_current(160, Approval::Approved(APPROVED), 0, &[APPROVED, port], &[])
+            .unwrap();
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut served = false;
+        retry_would_block(|| {
+            supervisor.accept_ready(Instant::now(), |_, _| served = true);
+            served.then_some(()).ok_or(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap();
+        assert!(served);
+    }
+}
+
+/// [behaviour] A healthy connection wakes the idle supervisor before its safety tick.
+#[test]
+fn readiness_serves_a_healthy_connection_promptly() {
+    let (_dir, mut supervisor) = scratch();
+    let (_reservation, port) = reserve_port();
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    let (endpoint, waits, accepts, worker) = waiting_supervisor(supervisor);
+    waits.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    accepts.recv_timeout(Duration::from_millis(500)).unwrap();
+    drop(endpoint);
+    worker.join().unwrap();
+}
+
+/// [behaviour] Release and revoke wake an idle supervisor and ACK after fencing.
+#[test]
+fn idle_release_and_revoke_wake_without_traffic() {
+    for revoke in [false, true] {
+        let (_dir, mut supervisor) = scratch();
+        let (reservation, port) = reserve_port();
+        supervisor
+            .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .unwrap();
+        let old = supervisor.open[&port].activity.clone();
+        let (endpoint, waits, _accepts, worker) = waiting_supervisor(supervisor);
+        waits.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        with_endpoint(endpoint, || {
+            if revoke {
+                revoke_now();
+            } else {
+                release_for_primary(port);
+            }
+        });
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let supervisor = worker.join().unwrap();
+        assert!(supervisor.open.is_empty());
+        assert!(!old.live.load(Ordering::SeqCst));
+        assert_eq!(supervisor.record.retired.contains(&port), revoke);
+        reservation.assert_released();
+    }
+}
+
+/// [behaviour] A command enqueued during wake draining cannot lose its signal.
+#[test]
+fn command_enqueued_while_draining_is_handled_and_wake_failure_is_reported() {
+    struct EnqueueDuringRead<'a> {
+        wake: &'a mut UnixStream,
+        endpoint: &'a Endpoint,
+        ack: Option<mpsc::SyncSender<()>>,
+    }
+    impl Read for EnqueueDuringRead<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let result = self.wake.read(bytes);
+            if matches!(result, Ok(n) if n > 0) {
+                if let Some(ack) = self.ack.take() {
+                    self.endpoint
+                        .send(Command::Release(APPROVED, ack))
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            result
+        }
+    }
+    let (_dir, mut supervisor) = scratch();
+    let (endpoint, receiver, mut wake) = Endpoint::channel(supervisor.admission.clone()).unwrap();
+    (&*endpoint.wake).write_all(&[1]).unwrap();
+    let (ack, done) = mpsc::sync_channel(1);
+    assert!(supervisor
+        .drain_commands(
+            EnqueueDuringRead {
+                wake: &mut wake,
+                endpoint: &endpoint,
+                ack: Some(ack)
+            },
+            &receiver
+        )
+        .unwrap());
+    done.try_recv().unwrap();
+    // A full nonblocking wake is already signalled, so sending still succeeds.
+    while (&*endpoint.wake).write(&[0; 4096]).is_ok() {}
+    let (ack, done) = mpsc::sync_channel(1);
+    endpoint
+        .send(Command::Release(APPROVED, ack))
+        .unwrap()
+        .unwrap();
+    assert!(supervisor.drain_commands(&mut wake, &receiver).unwrap());
+    done.try_recv().unwrap();
+    drop(wake);
+    let (ack, _) = mpsc::sync_channel(1);
+    assert!(endpoint
+        .send(Command::Release(APPROVED, ack))
+        .unwrap()
+        .is_err());
+}
+
+/// [behaviour] A readable listener in backoff waits until its retry, without spinning.
+#[test]
+fn readable_listener_in_backoff_waits_until_retry() {
+    let (_dir, mut supervisor) = scratch();
+    let (_reservation, port) = reserve_port();
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    supervisor.flush_activity(now_seconds()).unwrap();
+    let retry = Instant::now() + Duration::from_millis(250);
+    supervisor.open.get_mut(&port).unwrap().accepts.retry_at = Some(retry);
+    let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let (endpoint, receiver, mut wake) = Endpoint::channel(supervisor.admission.clone()).unwrap();
+    let mut health = Instant::now() + Duration::from_secs(1);
+    assert!(supervisor
+        .wait_for_events(
+            &mut wake,
+            &receiver,
+            now_seconds() + RETRY_SECONDS,
+            &mut health
+        )
+        .unwrap());
+    assert!(Instant::now() >= retry);
+    let mut served = false;
+    supervisor.accept_ready(Instant::now(), |_, _| served = true);
+    assert!(served);
+    // Earlier event wakes leave the fixed health deadline untouched.
+    let fixed = health;
+    (&*endpoint.wake).write_all(&[1]).unwrap();
+    assert!(supervisor
+        .wait_for_events(
+            &mut wake,
+            &receiver,
+            now_seconds() + RETRY_SECONDS,
+            &mut health
+        )
+        .unwrap());
+    assert_eq!(health, fixed);
+}
+
+/// [regress] A failed wake still waits for an enqueued command's ACK, with a timeout.
+#[test]
+fn send_and_wait_reports_wake_failure_after_ack_or_timeout() {
+    for acknowledge in [true, false] {
+        let (endpoint, receiver, wake) = Endpoint::channel(Arc::new(Admission::default())).unwrap();
+        drop(wake);
+        let (finished, returned) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let Command::Release(_, ack) = receiver.recv().unwrap() else {
+                panic!("expected release");
+            };
+            if acknowledge {
+                // A zero-capacity ACK succeeds only while the caller waits.
+                ack.send(())
+                    .expect("caller skipped the enqueued command's ACK");
+            } else {
+                // Keep the ACK sender alive until the caller's bounded wait ends.
+                returned.recv_timeout(Duration::from_secs(4)).unwrap();
+                drop(ack);
+            }
+        });
+        let started = Instant::now();
+        let error = send_and_wait(&endpoint, |ack| Command::Release(APPROVED, ack)).unwrap_err();
+        assert!(error.downcast_ref::<io::Error>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        if !acknowledge {
+            assert!(started.elapsed() >= Duration::from_secs(2));
+            finished.send(()).unwrap();
+        }
+        worker.join().unwrap();
+    }
+}
+
+/// [regress] The flush deadline wakes the wait even with no listeners or traffic.
+#[test]
+fn idle_wait_flushes_on_time_independently_of_reconcile_and_listeners() {
+    for listening in [false, true] {
+        let (_dir, mut supervisor) = scratch();
+        let (_reservation, port) = reserve_port();
+        if listening {
+            supervisor
+                .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+                .unwrap();
+        }
+        supervisor.record.seeded = true;
+        supervisor.activity_dirty = true;
+        let now = now_seconds();
+        supervisor.last_flush = now - REQUEST_FLUSH_SECONDS + 1;
+        let (_endpoint, receiver, mut wake) =
+            Endpoint::channel(supervisor.admission.clone()).unwrap();
+        let mut health = Instant::now() + Duration::from_secs(10);
+        let started = Instant::now();
+        assert!(supervisor
+            .wait_for_events(&mut wake, &receiver, now + RETRY_SECONDS, &mut health)
+            .unwrap());
+        supervisor.flush_activity(now_seconds()).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1250));
+        assert!(!supervisor.activity_dirty);
+        assert!(
+            Supervisor::load(
+                supervisor.path.clone(),
+                supervisor.counters.clone(),
+                now_seconds()
+            )
+            .unwrap()
+            .record
+            .seeded
+        );
+        // An overdue flush also returns promptly rather than underflowing.
+        supervisor.last_flush = now_seconds() - REQUEST_FLUSH_SECONDS - 1;
+        let started = Instant::now();
+        assert!(supervisor
+            .wait_for_events(&mut wake, &receiver, now + RETRY_SECONDS, &mut health)
+            .unwrap());
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
 }

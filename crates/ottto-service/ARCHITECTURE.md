@@ -143,6 +143,31 @@ unchanged. Held cache-head probes and quarantine origins use structured diagnost
 with fingerprint and body-witness hash8 values only, plus source and saved-head
 presence for probes.
 
+Claude Desktop title sweeps keep compact parsed session facts in the shared RAM
+cache while each regular file's device, inode, length and nanosecond mtime match.
+Every eligible sweep still lists the store, evicts unlisted facts and reconstructs
+account and original identity from the current path. Failed loads are never kept;
+loading holds no cache lock. Census, refusal, pruning and retry rules are unchanged,
+and callers without a shared cache load cold. The status lane keeps its separate
+Desktop metadata cache.
+
+## Codex sidecar facts
+
+The process-owned transcript cache retains complete Codex home facts in RAM,
+using the shared file stamp for the resolved SQLite main file and its WAL.
+Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
+completeness and path fingerprints. Roster changes, changed inputs and partial
+loads reload the complete title group. Changed thread databases use one
+streaming census with independent staging for title, usage and created rows.
+Raw title equality uses an optional digest; a SHA midstate preserves the exact
+existing fingerprint bytes after the merged title prefix is known.
+
+Recent logs still use the existing full reader on every pass at both log
+locations, including its time window, ts-DESC result limit and incompleteness
+rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
+scan diagnostics include reuse/reload counts for state, history and session
+index facts, plus absent roots. An incremental logs reader is deferred.
+
 ## CLI status metadata
 
 Codex login state and bundled model metadata are cached in RAM per home while the
@@ -159,6 +184,12 @@ Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi
 model listings remain uncached because their output depends on Pi config/auth.
+
+The status read of each source's active-session reconciliation uses the same
+helper, keyed by its cache file. Every local request builds status, so the
+parsed reconciliation is reused while the file stamp is unchanged; a reconcile
+always replaces the file, and the next read parses it again.
+
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
 
