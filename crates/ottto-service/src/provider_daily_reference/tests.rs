@@ -88,12 +88,12 @@ fn relay_transport_reacquires_after_authorization_rejection() {
             for (status, body) in [
                 (
                     200,
-                    r#"{"token":"daily-reference-old","expires_at":"2099-01-01T00:00:00Z"}"#,
+                    r#"{"token":"daily-ref-old","expires_at":"2099-01-01T00:00:00Z"}"#,
                 ),
                 (rejected, "{}"),
                 (
                     200,
-                    r#"{"token":"daily-reference-new","expires_at":"2099-01-01T00:00:00Z"}"#,
+                    r#"{"token":"daily-ref-new","expires_at":"2099-01-01T00:00:00Z"}"#,
                 ),
                 (200, r#"{"accepted":true}"#),
                 (200, r#"{"accepted":true}"#),
@@ -162,11 +162,9 @@ fn relay_transport_reacquires_after_authorization_rejection() {
         );
         let uploads = server.join().unwrap();
         assert_eq!(uploads.len(), 3);
-        assert!(uploads[0]
-            .0
-            .contains("Authorization: Bearer daily-reference-old"));
+        assert!(uploads[0].0.contains("Authorization: Bearer daily-ref-old"));
         for (headers, body) in &uploads[1..] {
-            assert!(headers.contains("Authorization: Bearer daily-reference-new"));
+            assert!(headers.contains("Authorization: Bearer daily-ref-new"));
             assert_eq!(body, &batch);
         }
         assert_eq!(uploads[0].1, batch);
