@@ -524,15 +524,17 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
 /// [regress] Header facts a warm process cache carries from earlier durable
 /// lookups keep each page's money: every appended page's bodies and placement
 /// equal a cold Full's, on one warm cache and with a restart (empty cache,
-/// reloaded store; also what an upgrade leaves) between pages. The warm third
-/// page looks up fewer heads than the restarted one. [money] Two accounts, a
-/// side call in archived_sessions, an evidence gap and a mid-session switch.
+/// reloaded store; also what an upgrade leaves) between pages. Once the
+/// accepted debt has settled, the warm last page looks up fewer heads than the
+/// restarted one. [money] Two accounts, a side call in archived_sessions, an
+/// evidence gap and a mid-session switch.
 #[test]
 fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut third_page_lookups = Vec::new();
+    // Per arm, each page's (head lookups, header reuse hits).
+    let mut counts = Vec::new();
     for restart in [false, true] {
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
@@ -555,11 +557,12 @@ fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
             }
         };
         let mut index = prior;
-        for page_number in 0..3 {
+        let mut arm = Vec::new();
+        for page_number in 0..5 {
             match page_number {
                 0 => {}
                 1 => append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched")))),
-                _ => append(&c.path(MAIN), &turn(4)),
+                n => append(&c.path(MAIN), &turn(2 + n)),
             }
             if restart {
                 index = ScanIndex::load(session.path()).unwrap();
@@ -578,19 +581,21 @@ fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
                 cold.snapshots.retain(|s| s.source_session_id == MAIN);
             }
             money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &scan, posts));
-            if page_number == 2 {
-                let lookups = emitted_header_lookups(&logs)
+            let window = emitted_header_lookups(&logs);
+            let sum = |name: &str| {
+                window
                     .iter()
-                    .filter_map(|window| window["lookups"].as_u64())
-                    .sum::<u64>();
-                third_page_lookups.push(lookups);
-            }
+                    .filter_map(|record| record[name].as_u64())
+                    .sum::<u64>()
+            };
+            arm.push((sum("lookups"), sum("reuse_hits")));
         }
+        counts.push(arm);
         drop(session);
     }
     assert!(
-        third_page_lookups[0] < third_page_lookups[1],
-        "warm carried lookups {third_page_lookups:?}"
+        counts[0][4].0 < counts[1][4].0,
+        "warm vs restarted (lookups, reuse hits) per page: {counts:?}"
     );
 }
 
