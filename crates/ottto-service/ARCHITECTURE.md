@@ -110,6 +110,7 @@ newer usage. Earlier refusals stay counted as owed, with their dispositions
 unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
 use retained bodies; transcripts are read again only for changed input. Unknown
 non-permanent reasons hold their entity without invalidating sibling ACKs.
+Eligible superseded quarantines that become current again resume their remaining ordinary retry budget, saved before source acquisition.
 
 **Refusal custody.** A fresh permanent `accepted_log_stale_older_upload` refusal
 follows the existing dominated, terminal residue path and never becomes an
