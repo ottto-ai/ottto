@@ -362,7 +362,6 @@ mod readiness_tests {
     fn route_burst_coalesces_into_one_wake() {
         let (peer, reader) = UnixDatagram::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
-        let control = reader.try_clone().unwrap();
         let socket = RouteSocket {
             fd: reader.into_raw_fd(),
         };
@@ -417,7 +416,9 @@ mod readiness_tests {
         assert!(rebuilt >= transition_at + TRANSITION_QUIET_PERIOD);
         assert!(rebuilt < resumed + Duration::from_millis(500));
         next_pause();
-        control.shutdown(std::net::Shutdown::Read).unwrap();
+        // An empty datagram reads as 0 bytes (EOF) on Linux and macOS and ends
+        // the observer. Linux keeps SHUT_RD dgram sockets readable but EAGAIN.
+        peer.send(&[]).unwrap();
         drop(resume_tx);
         observer.join().unwrap();
         assert_eq!(rebuilt_rx.try_iter().count(), 0);
