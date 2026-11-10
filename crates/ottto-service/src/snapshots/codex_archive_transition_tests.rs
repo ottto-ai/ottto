@@ -521,6 +521,113 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     }
 }
 
+/// [regress] Header facts a warm process cache carries from earlier durable
+/// lookups keep each page's money: every appended page's bodies and placement
+/// equal a cold Full's, on one warm cache and with a restart (empty cache,
+/// reloaded store; also what an upgrade leaves) between pages. Once the
+/// accepted debt has settled, the warm last page looks up fewer heads than the
+/// restarted one. [money] Two accounts with named creator slots (tagged
+/// rows), a side call in archived_sessions, an evidence gap and a mid-session
+/// switch.
+#[test]
+fn carried_header_facts_keep_money_on_warm_and_restarted_pages() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Named creator slots for both accounts, so rows carry account tags.
+    let hash = |kind: &str, account: &str| {
+        let value = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{value}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
+    // Per arm, each page's (head lookups, header reuse hits).
+    let mut counts = Vec::new();
+    for restart in [false, true] {
+        let page = |c: &Corpus, index, cache| {
+            page_observed_with_limit(&c.roots(), index, cache, 100, &slots, |_| {})
+        };
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let side = c.path(SIDE);
+        fs::rename(&side, c.archived.join(side.file_name().unwrap())).unwrap();
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let warm = Arc::new(sampled_scan::SharedCache::default());
+        let cache = || {
+            if restart {
+                Arc::default()
+            } else {
+                warm.clone()
+            }
+        };
+        let mut index = prior;
+        let mut arm = Vec::new();
+        for page_number in 0..5 {
+            match page_number {
+                0 => {}
+                1 => append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched")))),
+                n => append(&c.path(MAIN), &turn(2 + n)),
+            }
+            if restart {
+                index = ScanIndex::load(session.path()).unwrap();
+            }
+            let before = index.clone();
+            let (working, scan, _, _, logs) = page(&c, index, cache());
+            let (next, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+            index = next;
+            assert_eq!(posts.len(), 1, "page {page_number}");
+            let (_, mut cold, _, _, _) = page(
+                &c,
+                ScanIndex::default(),
+                Arc::new(sampled_scan::SharedCache::default()),
+            );
+            if page_number > 0 {
+                cold.snapshots.retain(|s| s.source_session_id == MAIN);
+            } else {
+                assert!(
+                    cold.snapshots
+                        .iter()
+                        .flat_map(|item| &item.model_usage)
+                        .any(|row| row.account_identifier_hash.is_some()),
+                    "tagged positive control"
+                );
+            }
+            money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &scan, posts));
+            let window = emitted_header_lookups(&logs);
+            let sum = |name: &str| {
+                window
+                    .iter()
+                    .filter_map(|record| record[name].as_u64())
+                    .sum::<u64>()
+            };
+            arm.push((sum("lookups"), sum("reuse_hits")));
+        }
+        counts.push(arm);
+        drop(session);
+    }
+    assert!(
+        counts[0][4].0 < counts[1][4].0,
+        "warm vs restarted (lookups, reuse hits) per page: {counts:?}"
+    );
+}
+
 /// [regress] A rollout created in an unrelated Codex home while a page is
 /// open leaves that page's checkpoint valid: the page uploads and saves.
 #[test]

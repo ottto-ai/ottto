@@ -70,7 +70,7 @@ use kinds::KindCx;
 pub(in crate::snapshots) use runtime::tail_route::{
     carry_tail, erase_tail, legacy_archive_was_seen, load_head, load_revisions, load_tail,
     observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys,
-    tail_route_path, tail_set_aside, unstage_tail,
+    tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};

@@ -22,6 +22,9 @@ pub(super) struct KindCx {
     pub(super) carry: Option<(String, tail::PathCarry)>,
     /// This save rolled back a staged file's graph rows with its Tail rows.
     pub(super) tail_rolled_back: bool,
+    /// Files whose head this save's commit may write or remove, taken by the
+    /// save's owner after the attempt (`note_head_writes`).
+    pub(super) head_writes: Vec<Vec<u8>>,
     /// Rows of retired kinds this hydrate found, by key only: their values are
     /// never read. The baseline names them, so the next save removes them.
     pub(super) retired: BTreeSet<RowKey>,
@@ -247,8 +250,16 @@ pub(super) fn delta(
             closure.extend(rows.take_closure(to.as_bytes())?);
             tail::write_closure(rows.tx()?, &closure)?;
             tail::move_tail(rows.tx()?, to.as_bytes(), carry)?;
+            cx.head_writes
+                .extend([carry.from.as_bytes().to_vec(), to.as_bytes().to_vec()]);
         }
         let retired = tail::removed_files(&rows.old);
+        cx.head_writes.extend(
+            retired
+                .iter()
+                .chain(cx.tail.iter().flat_map(tail::TailStage::touched))
+                .cloned(),
+        );
         cx.tail_rolled_back = tail::apply(&mut rows, cx.tail.as_ref(), &retired)?;
         let digests = rows.finish()?;
         Ok(Baseline {
@@ -329,6 +340,7 @@ pub(super) fn save_graph(
         // No speculative encoder metadata survives any failed attempt.
         committed.ambiguous = true;
         committed.tail = pending.tail.take();
+        committed.head_writes = std::mem::take(&mut pending.head_writes);
         if !published {
             next.generation = generation;
         }
