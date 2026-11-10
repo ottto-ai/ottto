@@ -2122,7 +2122,7 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
                 }
             );
             let text = serde_json::to_string(record).unwrap();
-            assert!(text.len() < 2048);
+            assert!(text.len() < crate::local_resource_diagnostics::NATIVE_PAGE_RECORD_TEST_LIMIT);
             assert!(!text.contains("fixture-model") && !text.contains("padding"));
             let (_, full, _) =
                 production_scan(&f, source, ScanIndex::default(), None, "resource-fixture");
