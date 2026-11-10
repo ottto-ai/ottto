@@ -1365,6 +1365,7 @@ fn lone_413_keeps_money_pending_until_exact_ack() {
         );
         assert!(accounts(&cold).len() >= 2);
         let before = progress.accepted_fingerprints.clone();
+        let accepted_bodies = progress.accepted_body_witnesses.clone();
         progress.fresh_context_body_acks.clear();
         let receipts = progress.fresh_context_body_acks.clone();
         for _ in 0..2 {
@@ -1385,11 +1386,12 @@ fn lone_413_keeps_money_pending_until_exact_ack() {
             assert!(progress.permanent_rejections.is_empty());
             assert!(progress.active_quarantine_retries.is_empty());
             assert_eq!(progress.accepted_fingerprints, before);
+            assert_eq!(progress.accepted_body_witnesses, accepted_bodies);
             assert_eq!(progress.fresh_context_body_acks, receipts);
             assert!(progress.quarantined_fingerprints.is_empty());
             progress = serde_json::from_value(serde_json::to_value(&progress).unwrap()).unwrap();
         }
-        let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &lone);
+        let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &[]);
         held.accepted = prior.accepted.clone();
         money_oracle::assert_held(ROOT, &prior, &held, &cold);
         let (outcome, sent, _) = upload(&lone, &mut progress, ack);

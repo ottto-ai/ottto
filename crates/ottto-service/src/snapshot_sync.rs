@@ -4179,7 +4179,11 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        deadlines.insert(source.api_slug(), Instant::now() + retry_after);
+        let deadline = Instant::now() + retry_after;
+        deadlines
+            .entry(source.api_slug())
+            .and_modify(|existing| *existing = (*existing).max(deadline))
+            .or_insert(deadline);
     }
 }
 

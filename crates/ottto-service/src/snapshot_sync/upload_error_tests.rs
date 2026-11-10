@@ -16,6 +16,8 @@ fn activity_hint_sheds_preserve_retry_after() {
         (503, "Retry-After: invalid\r\n", None),
     ] {
         clear_source_upload_deadlines_for_test();
+        defer_source_uploads(SnapshotSource::Pi, Duration::from_secs(600));
+        let previous_deadline = source_upload_deadlines().lock().unwrap()["pi"];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let server = std::thread::spawn(move || {
@@ -34,6 +36,7 @@ fn activity_hint_sheds_preserve_retry_after() {
         assert_eq!(shed.status, status);
         assert_eq!(shed.retry_after.map(|v| v.as_secs()), expected);
         assert_eq!(source_shed_streaks().lock().unwrap().get("pi"), Some(&1));
+        assert!(source_upload_deadlines().lock().unwrap()["pi"] >= previous_deadline);
         server.join().unwrap();
     }
     clear_source_upload_deadlines_for_test();
