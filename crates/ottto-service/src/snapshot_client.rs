@@ -2502,6 +2502,15 @@ impl SnapshotApiClient {
             .map(|(budget, _)| budget.gzip_enabled(default_gzip))
             .unwrap_or(default_gzip);
         let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
+        // Counts only for the server's logs: why each item is sent.
+        let version = crate::snapshots::collector_version();
+        let reasons = crate::local_resource_diagnostics::change_reason::request_header(
+            &request.source,
+            request
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.as_str()),
+        );
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
                 validate()?;
@@ -2515,7 +2524,13 @@ impl SnapshotApiClient {
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
                 .set("Accept", "application/json")
                 .set("Content-Type", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"));
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .set("X-Ottto-Daemon-Version", &version);
+            let request = if reasons.is_empty() {
+                request
+            } else {
+                request.set("X-Ottto-Upload-Reason", &reasons)
+            };
             Ok(match timeout {
                 Some(timeout) => request.timeout(timeout),
                 None => request,
@@ -4227,6 +4242,66 @@ mod tests {
         assert!(headers
             .lines()
             .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
+    /// [behaviour] Every snapshot POST names the daemon version and its
+    /// items' attempted tags; an empty request names no reason.
+    #[test]
+    fn snapshot_post_names_daemon_version_and_item_reasons() {
+        let first = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        let mut second = first.clone();
+        second.source_session_id = "synthetic-second-session".into();
+        second.snapshot_fingerprint = "synthetic-second-fingerprint".into();
+        crate::local_resource_diagnostics::change_reason::attempted(
+            "codex",
+            &first.snapshot_fingerprint,
+            None,
+            Some(crate::local_resource_diagnostics::change_reason::Token::AckRecovery),
+            1,
+        );
+        for (snapshots, reasons) in [
+            (Vec::new(), None),
+            (vec![first, second], Some("ack_recovery=1,unattributed=1")),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                let body =
+                    r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                request
+            });
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "synthetic-machine".into(),
+                collector_version: None,
+                snapshots,
+                upload_policy: Default::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            let _ = client.upload_batch("synthetic-relay", &request, false);
+            let captured = server.join().unwrap();
+            let headers = captured
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .0
+                .to_ascii_lowercase();
+            let header = |name: &str| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+                    .map(str::to_string)
+            };
+            assert_eq!(
+                header("x-ottto-daemon-version"),
+                Some(crate::snapshots::collector_version().to_ascii_lowercase())
+            );
+            assert_eq!(header("x-ottto-upload-reason").as_deref(), reasons);
+        }
     }
 
     #[test]
