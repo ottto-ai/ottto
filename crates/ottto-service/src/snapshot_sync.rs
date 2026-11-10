@@ -4013,7 +4013,15 @@ fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
         .clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
 }
 
-/// Remaining wait for `source`, or `None` when it is due now.
+/// When `source`'s paced scan may run; `None` without one or under backoff.
+fn source_paced_due(source: SnapshotSource) -> Option<Instant> {
+    source_upload_backoff_remaining(source)
+        .is_none()
+        .then(|| with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten())
+        .flatten()
+}
+
+/// The earliest paced scan across sources, for the cycle's wake time.
 fn paced_scan_due() -> Option<Instant> {
     [
         SnapshotSource::ClaudeCode,
@@ -4021,8 +4029,7 @@ fn paced_scan_due() -> Option<Instant> {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .filter(|source| source_upload_backoff_remaining(*source).is_none())
-    .filter_map(|source| with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten())
+    .filter_map(source_paced_due)
     .min()
 }
 
@@ -5234,22 +5241,6 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _paced_qos = if paced_scan_due().is_some_and(|due| due <= Instant::now()) {
-        let qos = continuation::resident_background();
-        if qos.is_none() {
-            if let Ok(mut cadences) = source_cadences().lock() {
-                for cadence in cadences
-                    .values_mut()
-                    .filter(|cadence| cadence.paced_scan_due().is_some())
-                {
-                    cadence.clear_continuation();
-                }
-            }
-        }
-        qos
-    } else {
-        None
-    };
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
     // Declared after the guard, so it settles before the lock is released.
@@ -5306,6 +5297,7 @@ fn sync_once_with_retry(
         failed_sources: &mut failed_sources,
         started: Instant::now(),
         codex_started: None,
+        paced_qos: None,
         account_witness,
         retry,
     };
@@ -5496,6 +5488,9 @@ struct SnapshotCycleOwner<'a> {
     /// When this cycle's Codex preparation began, for a continuation ticket's
     /// measured work. Only written while continuation pages are enabled.
     codex_started: Option<Instant>,
+    /// Background QoS for the one source whose paced scan is due, held from
+    /// its prepare through its finish; its outcome (or unwind) restores.
+    paced_qos: Option<continuation::MacPlatformSignals>,
 }
 impl SnapshotCycleOwner<'_> {
     fn finish_completed(
@@ -5539,6 +5534,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
+        drop(self.paced_qos.take());
+        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
         if source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
             // K2: this prepare's policy replaces any older cached inputs.
@@ -5635,6 +5632,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         finished
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
+        drop(self.paced_qos.take());
         if source == SnapshotSource::Codex && result.is_err() {
             continuation::after_ordinary_codex_failure();
         }
