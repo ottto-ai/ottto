@@ -3,13 +3,15 @@
 use super::*;
 
 impl StreamedChecks {
-    /// One enrichment against both references: the whole-corpus fold, then
-    /// the page as one evidence chunk (reads not compared: a scope root two
-    /// chunks name is decoded by each; only the chunk counters move).
+    /// One enrichment against the references: the whole-corpus fold, the
+    /// page as one evidence chunk (reads not compared: a scope root two
+    /// chunks name is decoded by each; only the chunk counters move), and the
+    /// same packing releasing emitted folds once at page end (exact, with the
+    /// released folds' counters).
     pub(super) fn compare_references(
         &mut self,
         terminal: bool,
-        [whole, one]: [ComparedSide<'_>; 2],
+        [whole, one, page_end]: [ComparedSide<'_>; 3],
         packed: ComparedSide<'_>,
         chunks: usize,
     ) {
@@ -17,9 +19,15 @@ impl StreamedChecks {
         self.compare_reference(terminal, context_only, whole, packed);
         let counted = *self;
         self.compare_reference(terminal, context_only, one, packed);
+        self.compare(terminal, page_end, packed);
+        assert_eq!(page_end.0.released, packed.0.released, "released folds");
+        let emitted = (packed.0.scan.snapshots.iter()).any(|item| {
+            crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+        });
         *self = Self {
             chunked: counted.chunked + usize::from(chunks > 1),
             max_chunks: counted.max_chunks.max(chunks),
+            released_per_chunk: counted.released_per_chunk + usize::from(chunks > 1 && emitted),
             ..counted
         };
     }
@@ -244,8 +252,13 @@ const SMALLER: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 /// Three unrelated roots on one page: BIG with six paired requests, SMALL and
 /// SMALLER with two each. Returns the corpus and its scanner.
 pub(super) fn three_family_page(name: &str) -> (Corpus, E2ScanFixture) {
+    family_page(name, &[(BIG, 6), (SMALL, 2), (SMALLER, 2)])
+}
+
+/// Unrelated roots on one page, each with its paired requests.
+fn family_page(name: &str, families: &[(&str, usize)]) -> (Corpus, E2ScanFixture) {
     let mut c = Corpus::new(name);
-    for (session, requests) in [(BIG, 6), (SMALL, 2), (SMALLER, 2)] {
+    for &(session, requests) in families {
         let ids = (0..requests)
             .map(|at| format!("{}-{at}", &session[..4]))
             .collect::<Vec<_>>();
@@ -422,6 +435,7 @@ fn chunked_evidence_equals_one_chunk() {
     assert!(
         checks.chunked > 0
             && checks.max_chunks >= 2
+            && checks.released_per_chunk > 0
             && checks.non_terminal > 0
             && checks.terminal > 0,
         "the arm must compare packed pages on non-terminal and terminal passes: {checks:?}"
@@ -448,5 +462,106 @@ fn multi_root_ids_change_only_the_context_posture() {
     assert!(
         checks.chunked == 2 && checks.terminal == 2,
         "both sweeps compare a packed terminal page: {checks:?}"
+    );
+}
+
+/// BIG with twelve paired requests and four small roots with two each.
+const ONE_LARGE_FOUR_SMALL: [(&str, usize); 5] = [
+    (BIG, 12),
+    (SMALL, 2),
+    (SMALLER, 2),
+    ("9338a80a-f36e-4cbc-a5bb-50fc66430ba5", 2),
+    ("a338a80a-f36e-4cbc-a5bb-50fc66430ba5", 2),
+];
+
+/// The footprint that leaves `budget` side-file bytes under the peak line.
+fn footprint_leaving(budget: u64) -> u64 {
+    let used_mib = crate::snapshots::PEAK_LINE_MIB as f64
+        - budget as f64 / 1e6 * crate::snapshot_sync::EVIDENCE_MIB_PER_PAIR_MB;
+    (used_mib * (1 << 20) as f64) as u64
+}
+
+/// The large-and-small page enriched with `footprint` seeded (two and a half
+/// small families' bytes left when `Some`): each evidence read's (families,
+/// side-file bytes), the budget and BIG's bytes.
+fn footprint_packing(seeded: bool) -> (Vec<(u64, u64)>, u64, u64) {
+    with_e2(|| {
+        let (c, scanner) = family_page("e2-evidence-footprint", &ONE_LARGE_FOUR_SMALL);
+        let pair = |session: &str| {
+            let stem = crate::claude_local_otel::telemetry_stem(session);
+            (crate::claude_local_otel::telemetry_pair_bytes(&c.support, &stem))
+                .unwrap()
+                .unwrap()
+        };
+        let budget = pair(SMALL) * 5 / 2;
+        let seed = seeded.then(|| footprint_leaving(budget));
+        crate::snapshot_sync::EVIDENCE_FOOTPRINT.with(|footprint| footprint.set(seed));
+        let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+        assert_eq!(page.scan.snapshots.len(), 5, "one page holds all roots");
+        let (_, records) = crate::local_resource_diagnostics::capture(|| page.enrich(&c));
+        crate::snapshot_sync::EVIDENCE_FOOTPRINT.with(|footprint| footprint.set(None));
+        let reads = (records.iter())
+            .filter(|record| record["stage"] == "evidence_read")
+            .map(|record| &record["counts"]["evidence_mem"])
+            .map(|mem| {
+                (
+                    mem["groups"].as_u64().unwrap(),
+                    mem["side_file_bytes"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        (reads, budget, pair(BIG))
+    })
+}
+
+/// [behaviour] A live footprint bounds a chunk's side-file bytes by what the
+/// peak line leaves (over the working set per byte): the four small families
+/// pack two per chunk within that budget, BIG (over it) runs alone and no
+/// family is split. An unavailable footprint packs to the largest family as
+/// before: BIG, then all four small ones.
+#[test]
+fn live_footprint_bounds_evidence_chunks() {
+    let (reads, budget, big) = footprint_packing(true);
+    assert_eq!(
+        reads.iter().map(|(groups, _)| groups).sum::<u64>(),
+        5,
+        "no family split: {reads:?}"
+    );
+    assert_eq!(
+        reads.len(),
+        3,
+        "BIG alone, then two chunks of two: {reads:?}"
+    );
+    assert!(
+        big > budget && reads.contains(&(1, big)),
+        "BIG runs alone: {reads:?}"
+    );
+    assert!(
+        (reads.iter())
+            .filter(|read| **read != (1, big))
+            .all(|&(groups, bytes)| groups == 2 && bytes <= budget),
+        "the small families pack within the budget: {reads:?}"
+    );
+    let (reads, _, big) = footprint_packing(false);
+    assert_eq!(
+        reads.len(),
+        2,
+        "unavailable: up to the largest family: {reads:?}"
+    );
+    assert_eq!(reads[0], (1, big));
+    assert_eq!(reads[1].0, 4);
+}
+
+/// [money] The footprint-bounded packing emits exactly what the page as one
+/// chunk, the whole-corpus fold and the page-end release emit
+/// (`StreamedChecks`).
+#[test]
+fn footprint_packing_equals_one_chunk() {
+    let checks = streamed_checks(|| {
+        footprint_packing(true);
+    });
+    assert!(
+        checks.max_chunks == 3 && checks.released_per_chunk == 1,
+        "the arm compares the three-chunk page: {checks:?}"
     );
 }

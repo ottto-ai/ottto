@@ -5512,7 +5512,7 @@ impl SnapshotCycleOwner<'_> {
             },
         )?;
         let source = preparation.source;
-        finish_sync_source(
+        let finished = finish_sync_source(
             preparation,
             index,
             scan,
@@ -5526,7 +5526,15 @@ impl SnapshotCycleOwner<'_> {
             self.daemon,
             self.transport_cycle,
             self.retry,
-        )
+        );
+        // Page end: return the page's freed allocator pages, so the next
+        // page's live footprint (its evidence chunk budget) is not read as
+        // floor.
+        #[cfg(target_os = "macos")]
+        if source == SnapshotSource::ClaudeCode {
+            crate::local_resource_diagnostics::release_free_memory();
+        }
+        finished
     }
 }
 
@@ -9232,6 +9240,19 @@ thread_local! {
     static ONE_EVIDENCE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Packed chunks run on this thread, reference arms excluded.
     static EVIDENCE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The release-timing reference: emitted folds released once at page end.
+    static PAGE_END_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The live footprint packing sees; tests never read the real one.
+    static EVIDENCE_FOOTPRINT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Emitted folds released once at page end: the release-timing reference.
+fn page_end_release() -> bool {
+    #[cfg(test)]
+    if PAGE_END_RELEASE.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -9259,10 +9280,16 @@ struct ClaudeEvidenceChunk {
     side_file_bytes: Option<u64>,
 }
 
+/// Evidence-chunk working set: MiB of footprint per MB of side-file pair
+/// bytes. Placeholder; set from measured evidence chunks.
+const EVIDENCE_MIB_PER_PAIR_MB: f64 = 1.6;
+
 /// Next-fit packing of the page's families, in page order, into the chunks the
 /// evidence body runs once each. The batch size is the page's largest family
-/// by side-file bytes (file metadata only): a family is never split, and one
-/// whose size cannot be read runs alone. An empty page is one empty chunk.
+/// by side-file bytes (file metadata only), lowered to what the live footprint
+/// leaves under the peak line; an unavailable footprint keeps the largest
+/// family. A family is never split: one over the batch, or whose size cannot
+/// be read, runs alone. An empty page is one empty chunk.
 fn pack_claude_evidence_families(
     support_dir: &Path,
     items: &[SnapshotItem],
@@ -9276,7 +9303,16 @@ fn pack_claude_evidence_families(
         })
         .collect::<Vec<_>>();
     families.sort_unstable_by_key(|(slots, _)| slots[0]);
-    let batch = families.iter().filter_map(|(_, bytes)| *bytes).max();
+    #[cfg(test)]
+    let footprint = EVIDENCE_FOOTPRINT.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let footprint = crate::local_resource_diagnostics::state_v2_memory().phys_footprint_bytes;
+    let headroom = footprint.map(|bytes| {
+        let left_mib = crate::snapshots::PEAK_LINE_MIB as f64 - bytes as f64 / (1 << 20) as f64;
+        (left_mib.max(0.0) / EVIDENCE_MIB_PER_PAIR_MB * 1e6) as u64
+    });
+    let batch = (families.iter().filter_map(|(_, bytes)| *bytes).max())
+        .map(|largest| headroom.map_or(largest, |headroom| largest.min(headroom)));
     let fits = |total: Option<u64>| {
         one_evidence_chunk()
             || total
@@ -9321,8 +9357,8 @@ struct ClaudeEvidencePage<'p> {
 
 /// The evidence stage over one page: its families are packed into chunks and
 /// the evidence body runs once per chunk, so one chunk's rows are resident at
-/// a time. Copy decisions, original carriers, census health and the release
-/// of emitted folds run once over the page.
+/// a time. Copy decisions, original carriers and census health run once over
+/// the page; each chunk's emitted folds are released when it ends.
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -9378,7 +9414,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     );
     let chunks = pack_claude_evidence_families(support_dir, &scan_result.snapshots);
     #[cfg(test)]
-    if !one_evidence_chunk() {
+    if !one_evidence_chunk() && !page_end_release() {
         EVIDENCE_CHUNKS.with(|count| count.set(count.get() + chunks.len()));
     }
     // Each session's first page slot: chunk outputs go back in page order.
@@ -9439,6 +9475,16 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             survivors.next().is_none(),
             "the evidence body only removes items"
         );
+        // After the restore, which matches on the folds: no later chunk or
+        // page step reads an emitted fold, so its inputs go with its chunk.
+        if !page_end_release() {
+            release_emitted_folds(
+                chunk
+                    .slots
+                    .iter()
+                    .filter_map(|&slot| restored[slot].as_mut()),
+            );
+        }
     }
     scan_result.snapshots = restored.into_iter().flatten().collect();
     disposition
@@ -9498,21 +9544,23 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    // All local consumers (finalizer, identity, account qualification and the
-    // optional shadow) have finished. Release native inputs only for emitted
-    // `e2` bodies before upload clones/checkpoints.
-    // Held and legacy bodies retain their inputs for their existing owners.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
+    if page_end_release() {
+        release_emitted_folds(scan_result.snapshots.iter_mut());
     }
     drop(evidence_window);
     (disposition, census_withheld, stats)
+}
+
+/// All local consumers of a chunk's bodies (finalizer, identity, account
+/// qualification and the optional shadow) have finished. Release native
+/// inputs only for emitted `e2` bodies before upload clones/checkpoints;
+/// held and legacy bodies retain their inputs for their existing owners.
+fn release_emitted_folds<'i>(items: impl Iterator<Item = &'i mut SnapshotItem>) {
+    for item in items {
+        #[cfg(test)]
+        crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+        crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
+    }
 }
 
 /// The evidence body over one chunk (`scan_result`'s snapshots), from the API
