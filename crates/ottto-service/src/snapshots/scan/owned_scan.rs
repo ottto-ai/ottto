@@ -1001,7 +1001,10 @@ impl OwnedSourceScan {
                     && traversal.counts.unreadable_path_count == 0
                     && traversal.counts.disappeared_file_count == 0
             });
-        if claude_family_membership_is_authoritative {
+        // The map's only consumer is the quarantine loop below.
+        if claude_family_membership_is_authoritative
+            && !index.claude_usage_authority_quarantine.is_empty()
+        {
             let current_members_by_root = index
                 .traversal
                 .as_ref()

@@ -28,9 +28,10 @@ pub(super) fn hydrate_txn(
 ) -> Result<()> {
     // One typed record per row (the census record decoder), with no entry,
     // byte or hash budget. An undecodable row fails the load, unchanged
-    // here and not a goal: none has been observed.
+    // here and not a goal: none has been observed. Its decode digest seeds
+    // the baseline, as for every typed map.
     let rows: BTreeMap<String, super::super::claude_request_census::ClaudeRequestCensusRecord> =
-        mapper::read_map(tx, "file.census", None, None)?;
+        mapper::read_map(tx, "file.census", None, Some(&mut cx.digests))?;
     for (name, record) in rows {
         ensure!(
             super::super::claude_request_census::admits_entry_key(&name),
