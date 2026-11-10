@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use ottto_protocol::{AgentCreditBalance, CreditBalanceKind};
+use ottto_protocol::{AgentCreditBalance, CreditAmount, CreditBalanceKind};
 use serde_json::Value;
 
 use super::json_u64;
@@ -310,7 +310,7 @@ impl CodexCreditTracker {
         else {
             return Vec::new();
         };
-        let provider_count = balance.remaining;
+        let provider_count = balance.remaining.and_then(CreditAmount::whole_units);
         if let (Some(rows), Some(observed_at)) = (rows, read.observed_at) {
             let diagnostics = build_grants(ListObservation::Read {
                 provider: Provider::OpenAi,
@@ -698,7 +698,7 @@ mod tests {
             },
             freshness: AgentQuotaWindowFreshness::Fresh,
             unit: AgentCreditBalanceUnit::Resets,
-            remaining: Some(count),
+            remaining: CreditAmount::whole(count),
             unlimited: Some(false),
             kind: Some(CreditBalanceKind::SavedResets),
             ..Default::default()
