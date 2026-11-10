@@ -679,28 +679,43 @@ impl HeaderInventory {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
                 });
-            // An earlier durable lookup's facts stand in for this one while the
-            // object is the same and no commit since may have changed the head.
+            // One cache read per member, under the object's current stamp. A
+            // durable entry stands in for its lookup (its store has dropped every
+            // key a commit since may have changed); a file-derived one is the RAM
+            // fallback after a durable miss.
             let route = cache.and_then(|_| state_v2::runtime_path(index).ok().flatten());
-            let carried = cache.zip(route.as_deref()).and_then(|(cache, route)| {
-                let consumer = std::ptr::from_ref::<sampled_scan::SharedCache>(cache).addr();
-                let changed = state_v2::take_head_writes(route, consumer).ok().flatten();
-                cache
-                    .with_cursor(|cursor| {
-                        cursor.headers.forget_durable(route, changed);
-                        cursor.headers.get(&key)
-                    })
-                    .flatten()
-                    .filter(|cached| {
-                        cached.durable == Some(joined)
-                            && cached.stamp.same_object(&stamp)
-                            && cached.stamp.same_content(&stamp)
-                    })
-                    .map(|cached| CachedHeader {
+            let cached = cache
+                .and_then(|cache| {
+                    let consumer = std::ptr::from_ref::<sampled_scan::SharedCache>(cache).addr();
+                    let changed = route.as_deref().map(|route| {
+                        (
+                            route,
+                            state_v2::take_head_writes(route, consumer).ok().flatten(),
+                        )
+                    });
+                    cache
+                        .with_cursor(|cursor| {
+                            if let Some((route, changed)) = changed {
+                                cursor.headers.forget_durable(route, changed);
+                            }
+                            cursor.headers.get(&key)
+                        })
+                        .flatten()
+                })
+                .filter(|cached| {
+                    cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp)
+                });
+            let (carried, fallback) = match cached {
+                Some(cached) if cached.durable.is_none() => (None, Some(cached)),
+                Some(cached) if route.is_some() && cached.durable == Some(joined) => (
+                    Some(CachedHeader {
                         stamp: stamp.clone(),
                         ..cached
-                    })
-            });
+                    }),
+                    None,
+                ),
+                _ => (None, None),
+            };
             let carried_hit = carried.is_some();
             let joined_archive = if !carried_hit && joined {
                 lookups += 1;
@@ -755,23 +770,13 @@ impl HeaderInventory {
             if let Some((cache, facts)) = keep.zip(durable.as_ref()) {
                 cache.refresh_header(key.clone(), Some(facts.clone()));
             }
-            let reused = durable
-                .or_else(|| {
-                    let cached = cache?
-                        .with_cursor(|cursor| cursor.headers.get(&key))
-                        .flatten()?;
-                    (cached.durable.is_none()
-                        && cached.stamp.same_object(&stamp)
-                        && cached.stamp.same_content(&stamp))
-                    .then_some(cached)
-                })
-                .map(|facts| {
-                    self.reuse_hits += 1;
-                    self.reuse_misses -= 1;
-                    self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
-                    reused_bytes = Some(facts.read_bytes);
-                    (facts, metadata_witness(&current))
-                });
+            let reused = durable.or(fallback).map(|facts| {
+                self.reuse_hits += 1;
+                self.reuse_misses -= 1;
+                self.bytes_avoided = self.bytes_avoided.saturating_add(facts.read_bytes);
+                reused_bytes = Some(facts.read_bytes);
+                (facts, metadata_witness(&current))
+            });
             let (facts, witness) = match reused {
                 Some(header) => header,
                 None => {
