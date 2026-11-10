@@ -9478,12 +9478,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         // After the restore, which matches on the folds: no later chunk or
         // page step reads an emitted fold, so its inputs go with its chunk.
         if !page_end_release() {
-            release_emitted_folds(
-                chunk
-                    .slots
-                    .iter()
-                    .filter_map(|&slot| restored[slot].as_mut()),
-            );
+            for &slot in &chunk.slots {
+                if let Some(item) = restored[slot].as_mut() {
+                    release_emitted(item);
+                }
+            }
         }
     }
     scan_result.snapshots = restored.into_iter().flatten().collect();
@@ -9545,7 +9544,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         scan_result.scan_cap_hit = true;
     }
     if page_end_release() {
-        release_emitted_folds(scan_result.snapshots.iter_mut());
+        scan_result.snapshots.iter_mut().for_each(release_emitted);
     }
     drop(evidence_window);
     (disposition, census_withheld, stats)
@@ -9555,12 +9554,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 /// qualification and the optional shadow) have finished. Release native
 /// inputs only for emitted `e2` bodies before upload clones/checkpoints;
 /// held and legacy bodies retain their inputs for their existing owners.
-fn release_emitted_folds<'i>(items: impl Iterator<Item = &'i mut SnapshotItem>) {
-    for item in items {
-        #[cfg(test)]
-        crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
-        crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-    }
+fn release_emitted(item: &mut SnapshotItem) {
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
 /// The evidence body over one chunk (`scan_result`'s snapshots), from the API
