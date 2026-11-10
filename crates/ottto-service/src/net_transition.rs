@@ -183,18 +183,19 @@ fn observe_route_messages(
             }
         };
         readable = message.is_some();
-        // Measure wake handling and rebuild work, never the blocking readiness wait.
+        let relevant = message.is_some_and(|length| is_transition(&buffer[..length]));
+        // Measure transitions and rebuilds, never route chatter or readiness waits.
         #[cfg(target_os = "macos")]
-        let _stage = (message.is_some() || pending_since.is_some())
-            .then(|| StageWindow::begin("unknown", "offpass_network_transition"));
-        if let Some(length) = message {
-            if is_transition(&buffer[..length]) {
-                // Quiet-period debounce: each new message re-arms the timer so
-                // the rebuild lands after the flurry settles.
-                pending_since = Some(Instant::now());
-            }
+        let _stage = relevant.then(|| StageWindow::begin("unknown", "offpass_network_transition"));
+        if relevant {
+            // Quiet-period debounce: each transition re-arms the timer so
+            // the rebuild lands after the flurry settles.
+            pending_since = Some(Instant::now());
         }
         if transition_ready(&mut pending_since, &mut last_rebuild_at, Instant::now()) {
+            #[cfg(target_os = "macos")]
+            let _rebuild_stage =
+                (!relevant).then(|| StageWindow::begin("unknown", "offpass_network_transition"));
             rebuild();
         }
     }
@@ -321,6 +322,25 @@ mod readiness_tests {
         let _ = peer.shutdown(std::net::Shutdown::Both);
         waiter.join().unwrap();
         assert_eq!(ready.unwrap(), Some(1));
+    }
+
+    /// [regress] Ignored route chatter creates no diagnostic stage work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn route_chatter_begins_no_stage() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let socket = RouteSocket {
+            fd: reader.into_raw_fd(),
+        };
+        peer.write_all(&[0; 8]).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            observe_route_messages(socket, |_| false, || panic!("unexpected rebuild"));
+            crate::local_resource_diagnostics::source_prepare("unknown", || (), |_| false);
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "source_prepare");
     }
 
     /// [behaviour] Quiet fires without another message, re-arms only for relevant
