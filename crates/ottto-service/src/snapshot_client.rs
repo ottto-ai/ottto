@@ -2103,7 +2103,6 @@ type NicknameGenerations = std::sync::Arc<
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     nickname_generations: NicknameGenerations,
-    cloud_upload_gzip: std::sync::Arc<AtomicBool>,
     api_base_url: String,
     #[cfg(test)]
     bounded_retry_loopback_http_for_test: bool,
@@ -2141,7 +2140,6 @@ impl SnapshotApiClient {
         let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
             nickname_generations: Default::default(),
-            cloud_upload_gzip: std::sync::Arc::new(AtomicBool::new(true)),
             api_base_url: api_base_url.into(),
             #[cfg(test)]
             bounded_retry_loopback_http_for_test: false,
@@ -3021,6 +3019,7 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &Value,
         timeout: Duration,
+        gzip_enabled: &AtomicBool,
     ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         let body = serde_json::to_vec(request)?;
@@ -3051,7 +3050,7 @@ impl SnapshotApiClient {
         // 415 explicitly refuses the encoding. A general semantic 400/422
         // does not negotiate gzip. Never change local snapshot gzip state.
         if compressed.is_some() && matches!(&outcome, Err(ureq::Error::Status(415, _))) {
-            self.cloud_upload_gzip.store(false, Ordering::Relaxed);
+            gzip_enabled.store(false, Ordering::Relaxed);
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
@@ -4094,12 +4093,14 @@ mod tests {
                 }
                 captured
             });
+            let cloud_gzip = AtomicBool::new(true);
             let local_gzip = snapshot_upload_gzip_enabled();
             let body = json!({"synthetic": "content-free"});
             let result = client.upload_cloud_session_changes_with_timeout(
                 "fixture-relay",
                 &body,
                 Duration::from_secs(5),
+                &cloud_gzip,
             );
             if status == 415 {
                 result.unwrap();
@@ -4108,6 +4109,7 @@ mod tests {
                         "fixture-relay",
                         &body,
                         Duration::from_secs(5),
+                        &cloud_gzip,
                     )
                     .unwrap();
             } else {
@@ -4130,8 +4132,7 @@ mod tests {
                     assert_eq!(serde_json::from_str::<Value>(bytes).unwrap(), body);
                 }
             }
-            let other = SnapshotApiClient::new("https://api.ottto.net");
-            assert!(other.cloud_upload_gzip.load(Ordering::Relaxed));
+            assert_eq!(cloud_gzip.load(Ordering::Relaxed), status != 415);
         }
     }
 

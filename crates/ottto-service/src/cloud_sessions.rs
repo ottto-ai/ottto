@@ -1511,6 +1511,7 @@ pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
     device_secret: String,
+    gzip_enabled: AtomicBool,
 }
 
 impl RelayCloudSessionTransport {
@@ -1523,6 +1524,7 @@ impl RelayCloudSessionTransport {
             client: crate::snapshot_client::SnapshotApiClient::new(api_base_url),
             device,
             device_secret,
+            gzip_enabled: AtomicBool::new(true),
         }
     }
 
@@ -1603,7 +1605,12 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         request.validate()?;
         let body = serde_json::to_value(request)?;
         let value = self.with_relay_retry(timeout, |client, token, request_timeout| {
-            client.upload_cloud_session_changes_with_timeout(token, &body, request_timeout)
+            client.upload_cloud_session_changes_with_timeout(
+                token,
+                &body,
+                request_timeout,
+                &self.gzip_enabled,
+            )
         })?;
         serde_json::from_value(value)
             .map_err(|error| anyhow!("invalid cloud-session changes ACK: {error}"))
@@ -3526,6 +3533,15 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
                     OffsetDateTime::now_utc(),
                     last_local_codex_activity(),
                 );
+                let wake_at = wake_at.map(|deadline| {
+                    let mut random = [0_u8; 8];
+                    let seconds = if random_fill(&mut random).is_ok() {
+                        u64::from_ne_bytes(random) % 21
+                    } else {
+                        0
+                    };
+                    deadline + Duration::from_secs(seconds)
+                });
                 if COLLECTOR_WAKE.wait(wake_at, &mut seen) {
                     collector.reset();
                 }
