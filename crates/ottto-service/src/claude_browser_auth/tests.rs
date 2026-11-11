@@ -56,8 +56,8 @@ fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
     let (root, _support_dir, _support) = with_support("auth-code-state");
     let operation_id = "claude_setup_c0dec0dec0dec0dec0dec0dec0dec0de";
     let store = FileClaudeConfigSlotSettingsStore::default();
-    let status = prepare_generic(store.load().expect("registry"), operation_id)
-        .expect("prepare generic");
+    let status =
+        prepare_generic(store.load().expect("registry"), operation_id).expect("prepare generic");
     set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
     let (_registration, submissions) =
         register_code_submissions(operation_id).expect("submission channel");
@@ -124,8 +124,7 @@ fn authorization_code_rejects_wrong_operation_and_unbounded_or_multiline_input()
             .expect_err("wrong operation")
             .contains("active operation")
     );
-    let (_registration, _rx) =
-        register_code_submissions(operation_id).expect("submission channel");
+    let (_registration, _rx) = register_code_submissions(operation_id).expect("submission channel");
 
     for invalid in [
         "",
@@ -360,12 +359,10 @@ fn active_replay_shortcut_requires_exact_sealed_core_sidecar_binding() {
     changed.mode = PersistedMode::Reconnect;
     cases.push(("sidecar kind", core.clone(), changed, Some(operation_id)));
     let mut changed_core = core.clone();
-    changed_core.setup_operation.kind =
-        ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot;
+    changed_core.setup_operation.kind = ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot;
     cases.push(("core kind", changed_core, base.clone(), Some(operation_id)));
     let mut changed = base.clone();
-    changed.target_id =
-        Some("claude_anchor_target_ffffffffffffffffffffffffffffffff".to_string());
+    changed.target_id = Some("claude_anchor_target_ffffffffffffffffffffffffffffffff".to_string());
     cases.push(("target", core.clone(), changed, Some(operation_id)));
     let mut changed = base.clone();
     changed.expected_account_identifier_hash = Some("c".repeat(64));
@@ -707,11 +704,9 @@ fn pre_core_target_placeholder_releases_exact_reusable_claim_without_quarantinin
         state.quarantined_roots.push(QuarantinedRoot {
             root_id: "claude_slot_06060606060606060606060606060606".to_string(),
             config_dir: reusable.to_string_lossy().into_owned(),
-            service_alias: ClaudeConfigDirSlot::registered(
-                reusable.to_string_lossy().into_owned(),
-            )
-            .expect("slot")
-            .service_name(),
+            service_alias: ClaudeConfigDirSlot::registered(reusable.to_string_lossy().into_owned())
+                .expect("slot")
+                .service_name(),
             pending_registry_removal: false,
             claimed_by: Some(operation_id.to_string()),
         });
@@ -817,8 +812,7 @@ fn each_sign_in_run_is_one_provider_call_line() {
     fs::create_dir_all(&config_dir).expect("slot");
     fs::write(
         config_dir.join(".claude.json"),
-        serde_json::json!({"oauthAccount": {"accountUuid": "sign-in-account-uuid"}})
-            .to_string(),
+        serde_json::json!({"oauthAccount": {"accountUuid": "sign-in-account-uuid"}}).to_string(),
     )
     .expect("account");
     let account =
@@ -1443,9 +1437,8 @@ fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
         .external_slots[0]
         .slot_id
         .clone();
-    let account =
-        ottto_core::billing_identity_hash("anthropic", "account", "account-uuid-gmail")
-            .expect("account hash");
+    let account = ottto_core::billing_identity_hash("anthropic", "account", "account-uuid-gmail")
+        .expect("account hash");
     let organization =
         ottto_core::billing_identity_hash("anthropic", "organization", "org-uuid-gmail")
             .expect("organization hash");
@@ -1498,9 +1491,8 @@ fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
         read_operation(operation_id).and_then(|operation| operation.outcome),
         Some(ClaudeBrowserAuthOutcomeV1::Complete)
     );
-    let status = crate::agent_status::annotate_claude_accounts_status(
-        store.load().expect("registry after"),
-    );
+    let status =
+        crate::agent_status::annotate_claude_accounts_status(store.load().expect("registry after"));
     let admitted = status
         .managed_slots
         .iter()
@@ -1556,9 +1548,8 @@ fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
         },
     )
     .expect("old slot refresh failed");
-    let later = crate::agent_status::annotate_claude_accounts_status(
-        store.load().expect("registry later"),
-    );
+    let later =
+        crate::agent_status::annotate_claude_accounts_status(store.load().expect("registry later"));
     assert_eq!(
         later
             .external_slots
@@ -2000,9 +1991,7 @@ fn provider_child_retains_lifetime_lock_after_supervisor_guard_is_gone() {
     assert!(provider_process_active(operation_id).expect("child retains lock"));
     kill_owned_process(&mut child);
     let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline
-        && provider_process_active(operation_id).expect("lock state")
-    {
+    while Instant::now() < deadline && provider_process_active(operation_id).expect("lock state") {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(!provider_process_active(operation_id).expect("released with provider exit"));
@@ -2021,8 +2010,7 @@ fn pinned_root_detects_child_and_ancestor_swaps() {
     let managed = managed_parent.join("claude_slot_f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0");
     fs::create_dir_all(&managed).expect("root");
     fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-    fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700))
-        .expect("parent mode");
+    fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700)).expect("parent mode");
     fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("root mode");
     let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     let pinned = pin_managed_root(managed.to_str().expect("utf8")).expect("pinned root");
@@ -2067,8 +2055,7 @@ fn unchanged_witness_cannot_finalize_recovery() {
     let managed = managed_parent.join("claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     fs::create_dir_all(&managed).expect("root");
     fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
-    fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700))
-        .expect("parent mode");
+    fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700)).expect("parent mode");
     fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("root mode");
     let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     let baseline =
@@ -2338,9 +2325,8 @@ fn browser_reconnect_cancel_never_falls_through_and_releases_after_teardown() {
             .state,
         ClaudeAccountSetupOperationState::WaitingForUserLogin
     );
-    assert!(read_operation(operation_id).is_some_and(|operation| {
-        operation.cancel_requested && operation.outcome.is_none()
-    }));
+    assert!(read_operation(operation_id)
+        .is_some_and(|operation| { operation.cancel_requested && operation.outcome.is_none() }));
     drop(provider);
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline
@@ -2790,8 +2776,7 @@ fn target_registry_exposure_is_fenced_before_sidecar_binding_is_sealed() {
         fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
         fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700))
             .expect("managed parent mode");
-        fs::set_permissions(&reusable, fs::Permissions::from_mode(0o700))
-            .expect("reusable mode");
+        fs::set_permissions(&reusable, fs::Permissions::from_mode(0o700)).expect("reusable mode");
     }
     let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     let operation_id = "claude_setup_81818181818181818181818181818181";
@@ -2803,11 +2788,9 @@ fn target_registry_exposure_is_fenced_before_sidecar_binding_is_sealed() {
         state.quarantined_roots.push(QuarantinedRoot {
             root_id: "claude_slot_81818181818181818181818181818181".to_string(),
             config_dir: reusable.to_string_lossy().into_owned(),
-            service_alias: ClaudeConfigDirSlot::registered(
-                reusable.to_string_lossy().into_owned(),
-            )
-            .expect("slot")
-            .service_name(),
+            service_alias: ClaudeConfigDirSlot::registered(reusable.to_string_lossy().into_owned())
+                .expect("slot")
+                .service_name(),
             pending_registry_removal: false,
             claimed_by: Some(operation_id.to_string()),
         });
@@ -3297,8 +3280,7 @@ fn target_mismatch_retires_candidate_and_preserves_exact_root_for_reuse() {
         Some(ClaudeBrowserAuthIdentityMismatchV1::Account)
     );
     assert!(Path::new(&config_dir).is_dir());
-    let cleared: serde_json::Value =
-        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    let cleared: serde_json::Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
     assert_eq!(cleared["env"], serde_json::json!({"USER_FLAG":"keep"}));
     let retry_id = "claude_setup_d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
     let reused = claim_reusable_root(retry_id)
@@ -3493,8 +3475,8 @@ exit 1
         .expect("registry");
     prepare_generic(status, operation_id).expect("prepare");
     let operation = read_operation(operation_id).expect("operation");
-    let baseline = crate::agent_status::claude_auth_ceremony_witness(&operation.config_dir)
-        .expect("baseline");
+    let baseline =
+        crate::agent_status::claude_auth_ceremony_witness(&operation.config_dir).expect("baseline");
     transact(|state| {
         let persisted = state
             .operations
@@ -3696,8 +3678,7 @@ fn fallback_state_write_failure_preserves_nonterminal_claim() {
     fs::create_dir(state_path()).expect("block state write");
 
     assert!(
-        terminalize_fallback_operation(&operation, ClaudeBrowserAuthOutcomeV1::TimedOut)
-            .is_err()
+        terminalize_fallback_operation(&operation, ClaudeBrowserAuthOutcomeV1::TimedOut).is_err()
     );
     fs::remove_dir(state_path()).expect("remove blocker");
     fs::write(state_path(), state).expect("restore state");
