@@ -72,10 +72,9 @@ run the advisory workflow normally, normal Linux tests, then money equivalence
 on the final head. The advisory bootstrap keeps a private symlinked TMPDIR but needs no apt/zsh
 install: SQLite is bundled and metadata commands are Python stubs.
 Resource tests are ignored in ordinary discovery and selected
-explicitly, serially, without retries. The advisory build uses basic optimization
-only for the service test crate (`--config profile.test.package.ottto-service.opt-level=1`),
-retaining test debug assertions/overflow checks and the workspace's existing
-optimized dependencies ([Cargo profile overrides](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)). That profile is pinned in B. It changes neither native
+explicitly, serially, without retries. The advisory build uses the ordinary service test profile with the workspace's
+existing optimized dependencies, debug assertions and overflow checks. Two
+Cargo jobs limit compile concurrency. That profile is pinned in B. It changes neither native
 Mac nor money builds. Command wall time is CI overhead evidence. Calibration exceeded the initial
 40-minute total estimate, so the single advisory job allows 75 minutes. This
 adds no resource-test execution or timeout change to required shards; it does

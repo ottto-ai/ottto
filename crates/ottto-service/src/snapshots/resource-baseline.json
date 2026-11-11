@@ -38,10 +38,11 @@
       "build_profile": {
         "rust": "1.99.1",
         "profile": "test",
-        "ottto-service_opt_level": 1,
+        "ottto-service_opt_level": 0,
         "dependency_opt_level": 2,
         "debug_assertions": true,
-        "overflow_checks": true
+        "overflow_checks": true,
+        "cargo_build_jobs": 2
       }
     },
     "macos_rc": {
