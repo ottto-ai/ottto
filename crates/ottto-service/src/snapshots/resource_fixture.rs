@@ -1051,7 +1051,9 @@ mod native_qos;
 fn resource_hint_active_drain() {
     let corpus = Corpus::generate([4, 8, 2]);
     let mut driver = seed(&corpus, 0);
-    driver.page_limit = 1;
+    // Native selection reserves one slot for census progress; the second
+    // slot admits the changed watcher path without starving that census.
+    driver.page_limit = 2;
     e2_pipeline_scan_fixture::age_listing_for_test(&mut driver.index);
     driver.page(2000);
     let before = driver.counts.parser_consumed_bytes;
