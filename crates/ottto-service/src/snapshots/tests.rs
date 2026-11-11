@@ -21482,6 +21482,34 @@ fn content_hash_moves_with_every_policy_neutral_component() {
     );
 }
 
+/// A minimal synthetic traversal checkpoint: one Claude scan root, nothing
+/// queued, zero counts.
+pub(super) fn traversal_checkpoint() -> ScanTraversalCheckpoint {
+    ScanTraversalCheckpoint {
+        context_fingerprint: "context".to_string(),
+        census_window_end: "2026-10-30T00:00:00Z".to_string(),
+        scan_roots: vec![PathBuf::from("/synthetic/projects")],
+        pending_directories: VecDeque::new(),
+        pending_candidates: VecDeque::new(),
+        observed_index_keys: Default::default(),
+        oversized_discovery: Default::default(),
+        codex_rollout_paths: BTreeSet::new(),
+        codex_join_directory_census: None,
+        reconciliation_upper_bound: None,
+        reconciliation_after: None,
+        reconciliation_started: false,
+        watcher_hint_seen: false,
+        codex_freshness_yield: false,
+        retired_codex_parent_resolution_retry_required: serde::de::IgnoredAny,
+        unhealthy_retry_attempt: 0,
+        unhealthy_retry_not_before_unix_seconds: None,
+        counts: ScanTraversalCounts::default(),
+        residue: ScanTraversalResidue::default(),
+        listing_started_unix_seconds: None,
+        listing_owed_requeued_unix_seconds: Default::default(),
+    }
+}
+
 pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
     ScanIndexEntry {
         codex_fragment: None,

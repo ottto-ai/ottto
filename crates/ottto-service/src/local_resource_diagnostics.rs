@@ -1875,14 +1875,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
-/// Shadow, once per Claude page: per-family census completion counts
-/// (`family_census_complete`, `family_census_incomplete{reason}`,
-/// `family_complete_deferred{quantum}`), `pending_census_members`, the
-/// skipped-set digest and predicate cost. Counts only; never an authority
-/// input, no path, id or wire event.
-pub(crate) fn claude_family_census_shadow(counts: &impl Serialize) {
-    traversal_point("claude_family_census_shadow", "claude_code", counts);
-}
 static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

@@ -122,9 +122,6 @@ use ownership_diagnostics as ownership;
 pub(crate) use scan::ownership_diagnostics;
 #[cfg(test)]
 mod admission_reoffer_window_tests;
-mod claude_family_census_shadow;
-#[cfg(test)]
-mod claude_family_census_shadow_tests;
 #[cfg(test)]
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
