@@ -2242,24 +2242,35 @@ impl CloudCollector {
         today: Date,
         crawl_completed: &mut Option<Date>,
     ) -> Option<SliceError> {
-        let start_crawl = due.crawl && self.schedule.crawl.is_none();
+        let start_crawl = due.crawl
+            && self
+                .schedule
+                .crawl
+                .as_ref()
+                .is_none_or(|crawl| crawl.cursor.is_none());
         if due.head || start_crawl {
-            // A head that failed with a backoff stays due: the backoff, not
-            // the idle cadence, decides when it is retried.
+            self.schedule.last_head_attempt = Some(now);
             let page = match work.page(None) {
                 Ok(page) => page,
                 Err(error) => {
-                    if !matches!(error.kind, SliceErrorKind::Backoff(_)) {
-                        self.schedule.last_head_attempt = Some(now);
+                    if start_crawl {
+                        // Page zero remains owed, paced like any unfinished
+                        // crawl. Backoff cannot turn it into an immediate loop.
+                        self.schedule.crawl = Some(Crawl {
+                            cursor: None,
+                            pages_seen: 0,
+                            cycle: Default::default(),
+                            next_slice: now + CRAWL_CONTINUATION_INTERVAL,
+                        });
                     }
                     return Some(error);
                 }
             };
-            self.schedule.last_head_attempt = Some(now);
             // A failed head keeps the previous predicate; a deep page never
             // changes it.
             self.schedule.head_nonterminal = page.nonterminal;
             if start_crawl {
+                self.schedule.crawl = None;
                 match page.next {
                     Some(cursor) if !page.ambiguous => {
                         let mut crawl = Crawl {

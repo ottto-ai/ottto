@@ -2701,3 +2701,47 @@ fn cloud_retry_after_starts_when_the_authority_request_finishes() {
     assert!(retry > slice_start);
     assert_eq!(cli.calls(), 0);
 }
+
+/// [behaviour] Backoff defers planned work; it never accelerates head
+/// polling. A failed first crawl page is owed at the continuation cadence.
+#[test]
+fn failed_provider_pages_keep_their_planned_work_opportunity() {
+    struct Offline;
+    impl CloudSessionRunner for Offline {
+        fn list_page(&self, _: Option<&str>, _: usize) -> Result<String> {
+            Err(anyhow!("offline"))
+        }
+    }
+    let (_root, grants, checkpoints) = stores("failure-cadence");
+    enabled(&grants);
+    let server = Server::new();
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    let cli = Cli::head(page("terminal", None));
+    assert_eq!(
+        slice(
+            &mut collector,
+            &inputs(&grants, &checkpoints, &cli, &server),
+            t0,
+            Duration::ZERO
+        ),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let offline = inputs(&grants, &checkpoints, &Offline, &server);
+    assert_eq!(
+        slice(&mut collector, &offline, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(
+        collector
+            .next_wake(t0 + 6 * HOUR, midnight() + 6 * HOUR, None)
+            .unwrap()
+            >= t0 + 12 * HOUR
+    );
+    let mut startup = CloudCollector::default();
+    assert_eq!(
+        slice(&mut startup, &offline, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(startup.next_wake(t0, midnight(), None).unwrap() >= t0 + 5 * MINUTE);
+}
