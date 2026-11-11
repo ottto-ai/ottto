@@ -783,8 +783,7 @@ fn resource_virtual_scenarios() {
                             );
                         }
                     }
-                    if seconds > 0 && seconds.is_multiple_of(300) {
-                        if let Some(s) = active {
+                    if seconds > 0 && seconds.is_multiple_of(300) && let Some(s) = active {
                             appended += 1;
                             corpus.append(s, appended + 1);
                             if s == 1 {
@@ -803,7 +802,6 @@ fn resource_virtual_scenarios() {
                                 assert_eq!(changed, 1, "real active Codex WAL mutation");
                             }
                             schedule::event(SOURCES[s]);
-                        }
                     }
                     if case == "reselect" && seconds == 1800 {
                         assert!(!reselected);
@@ -908,8 +906,7 @@ fn resource_virtual_scenarios() {
         println!("resource_case_done {case}");
     }
     for (phase, counters) in &receipts {
-        if !phase.starts_with("reselect/") && phase.contains("/h") {
-            if let Some(passes) = counters.get("passes") {
+        if !phase.starts_with("reselect/") && phase.contains("/h") && let Some(passes) = counters.get("passes") {
                 let limit =
                     if phase.starts_with("quiet_battery/") || phase.starts_with("quiet_lpm/") {
                         4

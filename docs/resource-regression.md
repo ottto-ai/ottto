@@ -66,7 +66,11 @@ revision before committing B. A record-mode run skips the B comparison and is
 **calibration only**. PR and nightly runs compare B by default. After updating B,
 run the advisory workflow normally, normal Linux tests, then money equivalence
 on the final head. Resource tests are ignored in ordinary discovery and selected
-explicitly, serially, without retries. Command wall time is CI overhead evidence.
+explicitly, serially, without retries. The advisory build uses basic optimization
+only for the service test crate (`--config profile.test.package.ottto-service.opt-level=1`),
+retaining test debug assertions/overflow checks and the workspace's existing
+optimized dependencies. That profile is pinned in B. It changes neither native
+Mac nor money builds. Command wall time is CI overhead evidence.
 
 The off-pass replay uses the same native aggregation and formatter, flushing
 each event in the replay. The paced-rewalk replay requests another native paced

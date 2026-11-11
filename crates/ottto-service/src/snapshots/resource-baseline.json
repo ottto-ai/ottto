@@ -34,6 +34,14 @@
       "fallbacks": {
         "sqlite_cache_write_pages": "encoded_bytes from existing save_work tally; pages unavailable on this revision",
         "sidecar_read_bytes": "existing per-kind reload counts; no native sidecar byte tally on this revision"
+      },
+      "build_profile": {
+        "rust": "1.99.1",
+        "profile": "test",
+        "ottto-service_opt_level": 1,
+        "dependency_opt_level": 2,
+        "debug_assertions": true,
+        "overflow_checks": true
       }
     },
     "macos_rc": {
