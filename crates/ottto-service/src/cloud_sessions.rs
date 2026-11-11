@@ -4420,5 +4420,4 @@ fn cycle_jitter() -> Duration {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
