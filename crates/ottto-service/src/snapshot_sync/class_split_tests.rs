@@ -40,6 +40,9 @@ fn body(name: &str, patch: Option<CacheObservations>) -> SnapshotItem {
         item.cache_observations_state = None;
     }
     item.cache_observations = patch;
+    if let Some(patch) = item.cache_observations.as_ref() {
+        item.cache_observations_state = crate::snapshots::cache_state_from_patch(None, patch);
+    }
     item.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
@@ -81,14 +84,20 @@ fn sessions(wire: &Value) -> Vec<String> {
 /// admission is the backend's own receiver test. An ordinary request skips
 /// CAS. Under the head-CAS contract a changed body whose base is not the
 /// current head conflicts with a fresh challenge unless it answers the
-/// current one. An exact repeat is unchanged; a conflict stores nothing.
+/// current one. An exact repeat (same fingerprint and body witness, so a
+/// stripped probe and its patched body differ) is unchanged and echoes the
+/// stored witness; a conflict stores nothing. Stored refs echo the cache
+/// state under `cache_state_ack:v1`.
 #[derive(Clone, Default)]
-struct HeadStore {
-    /// session -> (head etag, stored body content identity)
-    heads: BTreeMap<String, (String, String)>,
+pub(in crate::snapshot_sync) struct HeadStore {
+    /// session -> (head etag, stored body fingerprint)
+    pub(in crate::snapshot_sync) heads: BTreeMap<String, (String, String)>,
+    /// session -> (stored body witness, stored wire body)
+    pub(in crate::snapshot_sync) bodies: BTreeMap<String, (String, Value)>,
+    cache_states: BTreeMap<String, Value>,
     challenges: BTreeMap<String, String>,
     minted: u64,
-    stored: Vec<String>,
+    pub(in crate::snapshot_sync) stored: Vec<String>,
 }
 
 impl HeadStore {
@@ -105,8 +114,13 @@ impl HeadStore {
         head
     }
 
-    fn post(&mut self, request: &SnapshotBatchRequest, wire: &Value) -> SnapshotBatchResponse {
+    pub(in crate::snapshot_sync) fn post(
+        &mut self,
+        request: &SnapshotBatchRequest,
+        wire: &Value,
+    ) -> SnapshotBatchResponse {
         let cas = wire["head_cas_contract"].is_string();
+        let echo_state = wire["cache_state_ack_contract"].as_str() == Some("cache_state_ack:v1");
         let mut ack = empty_ack();
         for (item, sent) in request
             .snapshots
@@ -114,20 +128,32 @@ impl HeadStore {
             .zip(wire["snapshots"].as_array().unwrap())
         {
             let envelope = &sent["semantic_envelope"];
-            let witness = snapshot_upload_body_witness(item);
+            let session = item.source_session_id.clone();
+            let state = item.cache_observations.as_ref().map(|patch| {
+                crate::snapshots::cache_state_from_patch(self.cache_states.get(&session), patch)
+                    .expect("valid stored state and patch")
+            });
+            let mut completed = item.clone();
+            completed.cache_observations_state = state.clone();
+            let witness = snapshot_upload_body_witness(&completed);
             let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
-            let echo = SnapshotEntityRef {
+            let echo = |digest: String, state: Option<Value>| SnapshotEntityRef {
                 body_witness_version: version,
-                body_witness_digest: version.map(|_| witness.clone()),
+                body_witness_digest: version.map(|_| digest),
+                cache_observations_state: state
+                    .filter(|_| echo_state && item.cache_observations.is_some()),
                 ..reference(item)
             };
-            let session = item.source_session_id.clone();
             if let Some((head, held)) = self.heads.get(&session).cloned() {
-                if held == item.snapshot_fingerprint {
+                let held_witness = self.bodies.get(&session).map(|(held, _)| held.clone());
+                if held == item.snapshot_fingerprint && held_witness.as_ref() == Some(&witness) {
                     ack.accepted += 1;
                     ack.unchanged_entities.push(SnapshotEntityRef {
                         head_etag: cas.then_some(head),
-                        ..echo
+                        ..echo(
+                            held_witness.unwrap(),
+                            self.cache_states.get(&session).cloned(),
+                        )
                     });
                     continue;
                 }
@@ -149,12 +175,17 @@ impl HeadStore {
                 session.clone(),
                 (head.clone(), item.snapshot_fingerprint.clone()),
             );
+            self.bodies
+                .insert(session.clone(), (witness.clone(), bare(sent)));
+            if let Some(state) = state.clone() {
+                self.cache_states.insert(session.clone(), state);
+            }
             self.challenges.remove(&session);
             self.stored.push(session);
             ack.accepted += 1;
             ack.accepted_entities.push(SnapshotEntityRef {
                 head_etag: cas.then_some(head),
-                ..echo
+                ..echo(witness, state)
             });
         }
         ack
@@ -227,11 +258,10 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
             .insert(cache_session_key(&item.source_session_id), head);
     }
     store.seed(&birth.source_session_id);
-    let head = store.mint();
-    store.heads.insert(
-        repeat.source_session_id.clone(),
-        (head, repeat.snapshot_fingerprint.clone()),
-    );
+    let repeated = request(vec![repeat.clone()]);
+    let repeat_wire = serde_json::to_value(&repeated).unwrap();
+    store.post(&repeated, &repeat_wire);
+    store.stored.clear();
     let items = [
         patched.clone(),
         birth.clone(),
@@ -476,7 +506,6 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
             &probes,
             SCOPE,
             &mut progress,
-            true,
             |batch, enforce_head_cas| {
                 let request = request(batch);
                 let wire = if enforce_head_cas {
@@ -1130,7 +1159,6 @@ fn probe_stages(
         &probes,
         SCOPE,
         progress,
-        true,
         |batch, enforce_head_cas| {
             let request = request(batch);
             let wire = if enforce_head_cas {
@@ -1152,13 +1180,13 @@ fn probe_stages(
 }
 
 /// The money oracle's settled view: each exact accepted body, the accepted
-/// cache states and identity buckets (placement), and the body each session
-/// head stores on the server. Head token values are excluded.
+/// cache states and identity buckets (placement), and the exact body (witness
+/// and bytes) each session head stores on the server. Head tokens excluded.
 type Settled = (
     BTreeMap<String, String>,
     BTreeMap<String, Value>,
     crate::snapshots::claude_request_identity::AcceptedBuckets,
-    BTreeMap<String, String>,
+    BTreeMap<String, (String, Value)>,
 );
 
 fn settled(progress: &SnapshotUploadProgress, store: &HeadStore) -> Settled {
@@ -1166,17 +1194,13 @@ fn settled(progress: &SnapshotUploadProgress, store: &HeadStore) -> Settled {
         progress.accepted_body_witnesses.clone(),
         progress.accepted_cache_states.clone(),
         progress.accepted_identity_buckets.clone(),
-        store
-            .heads
-            .iter()
-            .map(|(session, (_, body))| (session.clone(), body.clone()))
-            .collect(),
+        store.bodies.clone(),
     )
 }
 
 /// A POSTed body outside its head-CAS envelope: usage, cache patch, identity.
-fn bare(wire: &Value) -> Value {
-    let mut body = wire["snapshots"][0].clone();
+fn bare(sent: &Value) -> Value {
+    let mut body = sent.clone();
     body.as_object_mut().unwrap().remove("semantic_envelope");
     body
 }
@@ -1255,7 +1279,11 @@ fn a_new_session_bootstraps_its_head_with_one_whole_cas_write() {
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(probe_wires.len() + old_wires.len(), 3);
     assert_eq!(settled(&progress, &store), settled(&old, &old_store));
-    assert_eq!(bare(&wires[0]), bare(&old_wires[0]), "same body bytes");
+    assert_eq!(
+        bare(&wires[0]["snapshots"][0]),
+        bare(&old_wires[0]["snapshots"][0]),
+        "same body bytes"
+    );
     assert_no_smaller_body(&wires, &new);
 }
 
@@ -1501,6 +1529,7 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     }
     assert_eq!(old_store.heads["copied"].1, store.heads["copied"].1);
+    assert_eq!(old_store.bodies["copied"].0, store.bodies["copied"].0);
 }
 
 /// A 503 route-unavailable shed (head CAS lacks accepted-log admission,

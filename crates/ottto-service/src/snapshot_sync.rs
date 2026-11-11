@@ -147,7 +147,6 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
@@ -155,7 +154,6 @@ fn bootstrap_cache_heads(
         probes,
         poison_scope,
         progress,
-        ordinary_bootstrap,
         &mut InplaceRetryBudget::default(),
         upload,
         persist,
@@ -169,7 +167,6 @@ fn bootstrap_cache_heads_with_budget(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
@@ -185,12 +182,9 @@ fn bootstrap_cache_heads_with_budget(
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
-        let stages: &[bool] = if ordinary_bootstrap {
-            &[false, true]
-        } else {
-            &[true]
-        };
-        for &enforce_head_cas in stages {
+        // A headless patched body reaches here only when head CAS is optional
+        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        for enforce_head_cas in [false, true] {
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
@@ -8205,15 +8199,10 @@ fn finish_sync_source(
                 }
             }
         };
-        let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
-            && probes
-                .iter()
-                .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
         let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
-            ordinary_bootstrap,
             &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = snapshot_batch_request(
@@ -13271,7 +13260,6 @@ mod tests {
             &[probe.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -13492,7 +13480,6 @@ mod tests {
             &ordinary,
             &scope,
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -13789,7 +13776,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14284,7 +14270,6 @@ mod tests {
             &off.snapshots,
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
             |state| state.save(&progress_path),
         )
@@ -14491,7 +14476,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 stages.push(enforce);
                 let request = SnapshotBatchRequest {
@@ -14627,7 +14611,6 @@ mod tests {
             &[current.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 assert!(items[0].cache_observations.is_none());
                 let incoming = revision(&items[0]);
@@ -14688,25 +14671,6 @@ mod tests {
             "e".repeat(64)
         );
         assert_eq!(server_revision, current_revision);
-        // Mandatory-CAS policy cannot take the optional ordinary stage.
-        let mut progress = test_upload_progress();
-        let mut attempts = Vec::new();
-        assert!(bootstrap_cache_heads(
-            &[current],
-            &unique_poison_scope(),
-            &mut progress,
-            false,
-            |_, enforce| {
-                attempts.push(enforce);
-                Err(anyhow!(
-                    "server rejects grown body without predecessor authority"
-                ))
-            },
-            |_| Ok(())
-        )
-        .is_err());
-        assert_eq!(attempts, [true]);
-        assert!(progress.accepted_cache_heads.is_empty());
     }
 
     /// An `unchanged` ACK whose
@@ -14973,7 +14937,6 @@ mod tests {
                 &[item.clone()],
                 &unique_poison_scope(),
                 &mut progress,
-                true,
                 |items, enforce| {
                     stages.push(enforce);
                     assert!(enforce, "ordinary exact bytes were already acknowledged");
@@ -16739,7 +16702,7 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
-    mod class_split_tests {
+    pub(in crate::snapshot_sync) mod class_split_tests {
         use super::*;
         include!("snapshot_sync/class_split_tests.rs");
     }
@@ -23821,7 +23784,6 @@ mod tests {
                     &f.items[..1],
                     &unique_poison_scope(),
                     &mut f.progress,
-                    false,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
                         post(items.as_slice());

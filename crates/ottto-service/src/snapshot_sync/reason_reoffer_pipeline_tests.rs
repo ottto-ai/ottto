@@ -45,6 +45,9 @@ enum Answer {
     /// `unchanged` with an `unchanged_basis`: the server did not store it.
     Unstored,
     Conflict,
+    /// The server stores the bodies, but its reply proves no entity (a lost
+    /// ACK).
+    Lost,
 }
 
 struct ReofferServer {
@@ -54,7 +57,20 @@ struct ReofferServer {
     answer: Arc<Mutex<Answer>>,
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+    stored: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
     cache_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Each snapshot request's (head_cas_contract, cache_state_ack_contract).
+    contracts: Arc<Mutex<Vec<(serde_json::Value, serde_json::Value)>>>,
+    /// Another writer saves this upload ledger during the next snapshot POST,
+    /// so the daemon's own post-ACK save loses its compare-and-swap.
+    rival_save: Arc<Mutex<Option<PathBuf>>>,
+}
+
+/// The cache state a server holding no prior state completes `item`'s patch
+/// into.
+fn completed_cache_state(item: &serde_json::Value) -> Option<serde_json::Value> {
+    let patch = serde_json::from_value(item.get("cache_observations")?.clone()).unwrap();
+    crate::snapshots::cache_state_from_patch(None, &patch)
 }
 
 fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
@@ -68,14 +84,21 @@ fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
             payload.insert(key.into(), value.clone());
         }
     }
+    let state = completed_cache_state(item);
+    if let Some(state) = &state {
+        payload.insert("cache_observations_state".into(), state.clone());
+    }
     let exclusive = item
         .get("usage_accounting_contract")
         .and_then(|value| value.as_str())
         == Some("session_exclusive_reported_usage:v1");
-    let version = item
-        .get("session_account_evidence")
-        .is_some()
-        .then_some(if exclusive { 8u64 } else { 7u64 });
+    let version = if state.is_some() {
+        Some(if exclusive { 14u64 } else { 13u64 })
+    } else {
+        item.get("session_account_evidence")
+            .is_some()
+            .then_some(if exclusive { 8u64 } else { 7u64 })
+    };
     let digest = format!(
         "{:x}",
         Sha256::digest(
@@ -103,8 +126,14 @@ impl ReofferServer {
         let bodies = offered.clone();
         let terminal = Arc::new(Mutex::new(Vec::new()));
         let statuses = terminal.clone();
+        let stored = Arc::new(Mutex::new(BTreeMap::<String, serde_json::Value>::new()));
+        let saved_bodies = stored.clone();
         let cache_enabled = Arc::new(AtomicBool::new(false));
         let cache = cache_enabled.clone();
+        let contracts = Arc::new(Mutex::new(Vec::new()));
+        let requests = contracts.clone();
+        let rival_save = Arc::new(Mutex::new(None::<PathBuf>));
+        let rival = rival_save.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -146,6 +175,21 @@ impl ReofferServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    requests.lock().unwrap().push((
+                        value["head_cas_contract"].clone(),
+                        value["cache_state_ack_contract"].clone(),
+                    ));
+                    let rival_ledger = rival
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .and_then(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)));
+                    if let Some((path, bytes)) = rival_ledger {
+                        let mut ledger: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        ledger["generation"] = (ledger["generation"].as_u64().unwrap() + 1).into();
+                        std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+                        *rival.lock().unwrap() = None;
+                    }
                     let references = items
                         .iter()
                         .map(|item| {
@@ -175,10 +219,40 @@ impl ReofferServer {
                                 })
                                 .collect();
                         }
-                        Answer::Accept => {
-                            outcome["accepted"] = items.len().into();
-                            outcome["sessions_reconciled"] = items.len().into();
-                            outcome["accepted_entities"] = items.iter().map(entity_ack).collect();
+                        Answer::Accept | Answer::Lost => {
+                            let cas = value.get("head_cas_contract").is_some();
+                            let echo = value["cache_state_ack_contract"] == "cache_state_ack:v1";
+                            for item in items {
+                                let fingerprint = fingerprint_of(item);
+                                let mut body = item.clone();
+                                body.as_object_mut().unwrap().remove("semantic_envelope");
+                                let mut stored = saved_bodies.lock().unwrap();
+                                let unchanged = stored.get(&fingerprint) == Some(&body);
+                                stored.insert(fingerprint.clone(), body);
+                                // Lost replies retain the stored body without
+                                // acknowledging it; the retry echoes stored proof.
+                                if answer == Answer::Lost {
+                                    continue;
+                                }
+                                let held = &stored[&fingerprint];
+                                let mut reference = entity_ack(held);
+                                if cas {
+                                    reference["head_etag"] = "e".repeat(64).into();
+                                }
+                                if let Some(state) = completed_cache_state(held).filter(|_| echo) {
+                                    reference["cache_observations_state"] = state;
+                                }
+                                let kind = if unchanged {
+                                    "unchanged_entities"
+                                } else {
+                                    "accepted_entities"
+                                };
+                                outcome[kind].as_array_mut().unwrap().push(reference);
+                            }
+                            if answer == Answer::Accept {
+                                outcome["accepted"] = items.len().into();
+                                outcome["sessions_reconciled"] = items.len().into();
+                            }
                         }
                         Answer::Unstored => {
                             outcome["accepted"] = items.len().into();
@@ -212,7 +286,10 @@ impl ReofferServer {
             answer,
             offered,
             terminal,
+            stored,
             cache_enabled,
+            contracts,
+            rival_save,
         }
     }
 
@@ -2360,19 +2437,26 @@ fn returning_history_obeys_the_move_hold() {
 
 thread_local! {
     static FINALIZED_PROBE_ITEMS: std::cell::RefCell<Option<Vec<SnapshotItem>>> = const { std::cell::RefCell::new(None) };
+    /// Supply the producer patch with no owed challenge: a new session.
+    static NEW_PATCHED_SESSION: Cell<bool> = const { Cell::new(false) };
 }
 
 // Supply the producer patch before real finalization, only for these scoped
 // probe cycles. The ordinary synthetic Claude session has no cache evidence.
-// Each session also owes a base-less challenge, as one an older writer left:
-// that keeps it on the probe path (`cas_bootstrap_bodies`) and changes no wire.
+// Each probe session also owes a base-less challenge, as one an older writer
+// left: that keeps it on the probe path (`cas_bootstrap_bodies`) and changes
+// no wire. A new patched session owes nothing.
 pub(in crate::snapshot_sync) fn prepare_probe_for_test(
     items: &mut [SnapshotItem],
     progress: &mut SnapshotUploadProgress,
 ) {
-    if FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow().is_some()) {
+    let probe = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow().is_some());
+    if probe || NEW_PATCHED_SESSION.with(Cell::get) {
         for item in items {
             item.cache_observations = pending_head_index_item().1.cache_observations;
+            if !probe {
+                continue;
+            }
             progress
                 .head_conflict_challenges
                 .entry(cache_session_key(&item.source_session_id))
@@ -2785,4 +2869,130 @@ fn held_probe_rearm_keeps_uncovered_and_aligned_files() {
 // The re-armed legacy file reached by a kept generation's due re-listing.
 mod held_probe_listing_tests {
     include!("held_probe_listing_tests.rs");
+}
+
+/// [money] [regress] A new patched session on the real prepare/finish route.
+/// Its first delivery is one whole token-less head-CAS write (no probe). Its
+/// debt survives a lost ACK (the server stored the body) and a lost post-ACK
+/// save (another writer saved the ledger first): each later cycle re-offers
+/// the same whole body. Only the exact ACK, saved, settles the receipt, head
+/// and cache state, once; a quiet cycle then sends nothing.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved() {
+    if !supported("a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved") {
+        return;
+    }
+    struct NewSession;
+    impl Drop for NewSession {
+        fn drop(&mut self) {
+            NEW_PATCHED_SESSION.with(|slot| slot.set(false));
+        }
+    }
+    NEW_PATCHED_SESSION.with(|slot| slot.set(true));
+    let _new_session = NewSession;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("cas-bootstrap-first-delivery", Answer::Lost, t0);
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let unsettled = |cycle: &CycleResult, fingerprint: &str| {
+        assert!(cycle.cache_enabled);
+        assert!(!cycle
+            .progress
+            .accepted_body_witnesses
+            .contains_key(fingerprint));
+        assert!(!cycle
+            .progress
+            .permanent_rejections
+            .contains_key(fingerprint));
+        assert!(cycle.progress.accepted_cache_heads.is_empty());
+        assert!(cycle.progress.accepted_cache_states.is_empty());
+        assert!(!cycle
+            .index
+            .accepted_snapshot_fingerprint_recorded(fingerprint));
+        assert!(cycle
+            .index
+            .files
+            .values()
+            .all(|entry| entry.upload_context_receipt.is_none()));
+    };
+    // Every offer is the same whole token-less CAS body.
+    let whole = |offer: &serde_json::Value, first: &serde_json::Value| {
+        assert_eq!(fingerprint_of(offer), fingerprint_of(first));
+        assert_eq!(usage_of(offer), usage_of(first));
+        assert_eq!(
+            offer, first,
+            "same complete usage, placement and patch bytes"
+        );
+        assert!(offer["cache_observations"].is_object(), "the whole patch");
+        assert_ne!(offer["cache_observations"]["full_replacement"], true);
+        assert!(offer["semantic_envelope"].get("base_head_etag").is_none());
+    };
+
+    let lost = pipeline.cycle(t0);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1, "one whole write, no probe stages");
+    let first = offered[0].clone();
+    whole(&first, &first);
+    let fingerprint = fingerprint_of(&first);
+    unsettled(&lost, &fingerprint);
+    assert_eq!(
+        pipeline.server.stored.lock().unwrap().len(),
+        1,
+        "lost ACK kept the body"
+    );
+    assert!(lost.progress_path.exists());
+
+    pipeline.server.answer(Answer::Accept);
+    *pipeline.server.rival_save.lock().unwrap() = Some(lost.progress_path.clone());
+    let unsaved = pipeline.cycle(t0 + 600);
+    assert!(unsaved.result.is_err(), "the post-ACK save lost its swap");
+    assert!(
+        pipeline.server.rival_save.lock().unwrap().is_none(),
+        "the rival saved during the POST"
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "re-offered after the lost ACK");
+    whole(&offered[1], &first);
+    unsettled(&unsaved, &fingerprint);
+
+    let saved = pipeline.cycle(t0 + 1200);
+    assert!(saved.result.is_ok(), "{:?}", saved.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3, "re-offered after the lost save");
+    whole(&offered[2], &first);
+    let key = cache_session_key(first["source_session_id"].as_str().unwrap());
+    assert!(saved
+        .progress
+        .accepted_body_witnesses
+        .contains_key(&fingerprint));
+    assert_eq!(saved.progress.accepted_cache_heads[&key], "e".repeat(64));
+    assert!(saved.progress.accepted_cache_states.contains_key(&key));
+    assert!(saved.progress.head_conflict_challenges.is_empty());
+    assert!(saved
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert!(saved
+        .index
+        .files
+        .values()
+        .any(|entry| entry.upload_context_receipt.is_some()));
+    assert_eq!(
+        pipeline.server.stored.lock().unwrap().len(),
+        1,
+        "one stored whole body"
+    );
+    let contracts = pipeline.server.contracts.lock().unwrap().clone();
+    assert_eq!(contracts.len(), 3);
+    assert!(contracts
+        .iter()
+        .all(|(cas, ack)| cas.is_string() && ack == "cache_state_ack:v1"));
+
+    let quiet = pipeline.cycle(t0 + 1800);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(pipeline.server.offered().len(), 3, "nothing owed");
 }
