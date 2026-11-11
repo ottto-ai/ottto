@@ -47,6 +47,19 @@ def companions(log: str) -> dict:
     return result
 
 
+def manifest(log: str) -> dict:
+    marker = "resource_manifest "
+    rows = [line.split(marker, 1)[1] for line in log.splitlines() if marker in line]
+    if len(rows) != 1:
+        raise ValueError("exactly one native corpus manifest required")
+    value = json.loads(rows[0])
+    if value.get("files") != [12000, 5500, 500] or not re.fullmatch(r"[0-9a-f]{64}", value.get("content_sha256", "")):
+        raise ValueError("corpus profile/digest mismatch")
+    if len(value.get("bytes", [])) != 3 or any(type(n) is not int or n <= 0 for n in value["bytes"]):
+        raise ValueError("source byte observations required")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, required=True)
@@ -59,6 +72,7 @@ def main():
     log = args.log.read_text()
     baseline["counts"] = extract(log)
     baseline["companion_counts"] = companions(log)
+    baseline["corpus"] = manifest(log)
     args.baseline.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
     print(f"Imported {len(baseline['counts'])} count phases; baseline changes require review")
 

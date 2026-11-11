@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
 import unittest
-from resource_baseline import extract, companions
+from resource_baseline import extract, companions, manifest
 
 
 class ReceiptTests(unittest.TestCase):
@@ -31,6 +31,13 @@ class ReceiptTests(unittest.TestCase):
         for missing in ('', log.split('\n', 1)[1], log + '\n' + log):
             with self.assertRaises(ValueError):
                 companions(missing)
+
+    def test_manifest_binds_full_profile(self):
+        value = {"files": [12000, 5500, 500], "bytes": [1, 2, 3], "content_sha256": "a" * 64}
+        self.assertEqual(manifest("prefix resource_manifest " + json.dumps(value)), value)
+        for bad in ({}, dict(value, files=[1, 2, 3]), dict(value, content_sha256="")):
+            with self.assertRaises(ValueError):
+                manifest("resource_manifest " + json.dumps(bad))
 
 
 if __name__ == '__main__':

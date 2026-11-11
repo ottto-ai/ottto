@@ -26,7 +26,7 @@ context debt. Metadata companions cover successful stderr login and the native
 ## Linux work counters and baseline
 
 `crates/ottto-service/src/snapshots/resource-baseline.json` is the single baseline
-B. Its header pins the current-main production revision and generator seed and
+B. Its header pins the current-main production revision, generator seed and exact corpus manifest, and
 explicitly lists Linux counters, source-specific counters, exclusions and the
 separate macOS RC metric set. Each observed scenario/source/phase/hour count must
 be at most `1.20 * B`, using exact integer comparison. Baseline increases require
@@ -69,7 +69,7 @@ on the final head. Resource tests are ignored in ordinary discovery and selected
 explicitly, serially, without retries. The advisory build uses basic optimization
 only for the service test crate (`--config profile.test.package.ottto-service.opt-level=1`),
 retaining test debug assertions/overflow checks and the workspace's existing
-optimized dependencies. That profile is pinned in B. It changes neither native
+optimized dependencies ([Cargo profile overrides](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)). That profile is pinned in B. It changes neither native
 Mac nor money builds. Command wall time is CI overhead evidence.
 
 The off-pass replay uses the same native aggregation and formatter, flushing

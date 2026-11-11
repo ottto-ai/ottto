@@ -722,6 +722,17 @@ fn resource_virtual_scenarios() {
         "resource_manifest {}",
         serde_json::to_string(&corpus.manifest).unwrap()
     );
+    if std::env::var("OTTTO_RESOURCE_RECORD_BASELINE").as_deref() != Ok("1") {
+        let baseline: Value = serde_json::from_str(include_str!("resource-baseline.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&corpus.manifest).unwrap(),
+            baseline
+                .get("corpus")
+                .cloned()
+                .expect("reviewed corpus manifest required"),
+            "input drift requires reviewed baseline regeneration"
+        );
+    }
     let mut drivers: Vec<_> = (0..3).map(|s| seed(&corpus, s)).collect();
     let mut receipts = BTreeMap::<String, BTreeMap<String, u64>>::new();
     for (s, driver) in drivers.iter_mut().enumerate() {
@@ -768,6 +779,7 @@ fn resource_virtual_scenarios() {
             let mut reselect_bodies = 0;
             let mut appended = 0;
             let mut active_bytes = 0;
+            let mut wal_updates = 0;
             for seconds in (0..7200).step_by(30) {
                 with_scan_clock(EPOCH + offset + seconds, || {
                     if case == "account_switch" {
@@ -801,6 +813,7 @@ fn resource_virtual_scenarios() {
                                 )
                                 .unwrap();
                             assert_eq!(changed, 1, "real active Codex WAL mutation");
+                            wal_updates += changed;
                         }
                         schedule::event(SOURCES[s]);
                     }
@@ -857,6 +870,12 @@ fn resource_virtual_scenarios() {
             }
             if let Some(s) = active {
                 assert_eq!(appended, 23);
+                if s == 1 {
+                    assert_eq!(
+                        wal_updates, 23,
+                        "every active Codex event mutates its native WAL"
+                    );
+                }
                 drivers[s].page(offset + 7200);
                 active_bytes += drivers[s].counts.parser_consumed_bytes;
                 accumulate(

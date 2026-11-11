@@ -110,10 +110,10 @@ fn resource_native_ordinary_stage_qos() {
             );
             drop(background);
             assert_eq!(schedule::native_qos().0, 0x11);
-            let error = (|| -> Result<(), &'static str> {
+            let error: Result<(), &'static str> = {
                 let _qos = schedule::native_background();
                 Err("synthetic finish error")
-            })();
+            };
             assert!(error.is_err());
             assert_eq!(schedule::native_qos().0, 0x11, "error restores");
             assert!(std::panic::catch_unwind(|| {
