@@ -1,7 +1,7 @@
 use super::*;
 use crate::snapshots::state_v2::sqlite_sidecar as sidecar;
 use crate::snapshots::state_v2::upload_history::{
-    MMAP_BYTES_FOR_TEST, QUERIES_FOR_TEST, RETENTION_NS,
+    CLOUD_QUERIES_FOR_TEST, MMAP_BYTES_FOR_TEST, QUERIES_FOR_TEST, RETENTION_NS,
 };
 use crate::test_scratch::ScratchDir;
 use std::os::fd::AsRawFd;
@@ -662,6 +662,142 @@ fn query_plans_use_the_rowid_and_named_indexes() {
                 assert!(plan.contains("upload_history_src"), "{plan}");
             }
             _ => unreachable!(),
+        }
+    }
+}
+
+/// [regress] A schema-1 history (before the cloud-task ACK cache) upgrades in
+/// place: receipt rows stay, the cloud tables appear in the same transaction
+/// as the version bump, cloud rows never enter receipt pages, and a newer
+/// schema is refused rather than rewritten.
+#[test]
+fn schema_one_history_upgrades_in_place_and_a_newer_schema_is_refused() {
+    let dir = temp_dir();
+    {
+        let mut store = open(&dir);
+        store.append(&row(T0, SourceKind::Codex, 3), T0).unwrap();
+        store
+            .conn_for_test()
+            .execute_batch(
+                "DROP TABLE cloud_task_acks; DROP TABLE cloud_collector_state; PRAGMA user_version=1;",
+            )
+            .unwrap();
+    }
+    let mut store = open(&dir);
+    let version: i64 = store
+        .conn_for_test()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(all(&store).len(), 1);
+
+    let scope = [7_u8; 32];
+    let other_scope = [8_u8; 32];
+    let key = format!("hmac-sha256:{}", "ab".repeat(32));
+    let etag = "c".repeat(64);
+    let now = 1_800_000_000_i64;
+    store
+        .cloud_commit(
+            &scope,
+            &[CloudAckWrite {
+                entity_key: &key,
+                digest: [1; 32],
+                head_etag: Some(&etag),
+            }],
+            Some("2026-07-21"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        store.cloud_read_acks(&scope, &[key.as_str()], now).unwrap()[&key],
+        CloudAck {
+            digest: [1; 32],
+            head_etag: Some(etag.clone()),
+        }
+    );
+    assert!(store
+        .cloud_read_acks(&other_scope, &[key.as_str()], now)
+        .unwrap()
+        .is_empty());
+    // Entries expire 30 days after their ACK.
+    assert!(store
+        .cloud_read_acks(&scope, &[key.as_str()], now + 30 * 24 * 60 * 60)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.cloud_crawl_completed_date(&scope).unwrap().as_deref(),
+        Some("2026-07-21")
+    );
+    assert_eq!(all(&store).len(), 1);
+    store.cloud_erase_all().unwrap();
+    assert!(store
+        .cloud_read_acks(&scope, &[key.as_str()], now)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.cloud_crawl_completed_date(&scope).unwrap(), None);
+    assert_eq!(all(&store).len(), 1);
+
+    store
+        .conn_for_test()
+        .execute_batch("PRAGMA user_version=3;")
+        .unwrap();
+    drop(store);
+    assert!(Store::open(&Store::path(&dir.join("snapshots"))).is_err());
+}
+
+/// [behaviour] Expired cloud rows are pruned a bounded page per commit.
+#[test]
+fn expired_cloud_acks_are_pruned_in_bounded_pages() {
+    let dir = temp_dir();
+    let mut store = open(&dir);
+    let scope = [3_u8; 32];
+    let keys = (0..450)
+        .map(|index| format!("hmac-sha256:{index:064x}"))
+        .collect::<Vec<_>>();
+    let writes = keys
+        .iter()
+        .map(|key| CloudAckWrite {
+            entity_key: key,
+            digest: [2; 32],
+            head_etag: None,
+        })
+        .collect::<Vec<_>>();
+    store.cloud_commit(&scope, &writes, None, 0).unwrap();
+    let count = |store: &Store| -> i64 {
+        store
+            .conn_for_test()
+            .query_row("SELECT count(*) FROM cloud_task_acks", [], |r| r.get(0))
+            .unwrap()
+    };
+    let later = 31 * 24 * 60 * 60;
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    assert_eq!(count(&store), 250);
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[test]
+fn cloud_query_plans_use_the_primary_key_and_expiry_index() {
+    let dir = temp_dir();
+    let store = open(&dir);
+    for (name, sql) in CLOUD_QUERIES_FOR_TEST {
+        let mut statement = store
+            .conn_for_test()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let nulls = vec![rusqlite::types::Null; statement.parameter_count()];
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        eprintln!("cloud_ack_plan {name}: {plan}");
+        assert!(!plan.contains("SCAN cloud_"), "{name} scans: {plan}");
+        assert!(plan.contains("USING PRIMARY KEY"), "{name}: {plan}");
+        if name == "prune" {
+            assert!(plan.contains("cloud_task_acks_expiry"), "{plan}");
         }
     }
 }

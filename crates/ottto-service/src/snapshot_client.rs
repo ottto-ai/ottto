@@ -27,9 +27,6 @@ const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbeat_ack.v1";
-const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
-const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
 /// A payload rejection carries only validated request-local locations, never
 /// response text. Locations are transient and are not acknowledgement evidence.
@@ -467,6 +464,25 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
+/// The server answered that this cloud-session route or grant epoch is not
+/// available: an older server, or a grant this installation must re-consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionRouteUnsupported {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionRouteUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend does not offer this cloud-session route or grant: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionRouteUnsupported {}
+
 /// The provider-daily-reference ingest route refused the principal or the
 /// build. Kept typed and distinct from a contract rejection because
 /// "this collector version is not admitted yet" is the expected steady state
@@ -516,40 +532,6 @@ impl std::fmt::Display for ProviderDailyReferenceContractRejected {
 }
 
 impl std::error::Error for ProviderDailyReferenceContractRejected {}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionHeartbeatAckV1 {
-    schema_version: String,
-    accepted: bool,
-    observations_written: u32,
-    noop: bool,
-    grant_status: String,
-    fresh_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionScanChunkAckV1 {
-    schema_version: String,
-    accepted: bool,
-    scan_id: String,
-    chunk_index: u8,
-    chunk_identity_digest: String,
-    chunk_semantic_digest: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionScanFinalizeAckV1 {
-    schema_version: String,
-    accepted: bool,
-    scan_id: String,
-    chunk_count: u8,
-    unique_entity_count: u32,
-    inventory_digest: String,
-    epoch_digest: String,
-}
 
 /// The backend refused to mint a relay token for this local device. Keep this
 /// typed so the daemon can mark canonical local health as an auth/rebind issue
@@ -2078,9 +2060,11 @@ fn relay_token_upload_response(
     }
 }
 
-/// A failed cloud-session request: 401/403 is an authorization rejection,
-/// 400/404/409/422 a contract rejection; any other status or a transport
-/// failure carries upload diagnostics. Response bodies are never kept.
+/// A failed cloud-session request: 401/403 is an authorization rejection;
+/// 404/405/409/410 means this server does not offer the route or this grant
+/// epoch; 400/415/422 a contract rejection; 408/429/503 a shed with its
+/// `Retry-After`; any other status or a transport failure carries upload
+/// diagnostics. Response bodies are never kept.
 fn cloud_session_request_error(
     error: ureq::Error,
     operation: &'static str,
@@ -2090,8 +2074,18 @@ fn cloud_session_request_error(
         ureq::Error::Status(code @ (401 | 403), _response) => {
             anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
         }
-        ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response) => {
+        ureq::Error::Status(code @ (404 | 405 | 409 | 410), _response) => {
+            anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
+        }
+        ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
             anyhow::Error::new(CloudSessionContractRejected { status: code })
+        }
+        ureq::Error::Status(status @ (408 | 429 | 503), response) => {
+            anyhow::Error::new(UploadShed {
+                status,
+                retry_after: response_retry_after(&response),
+                code: None,
+            })
         }
         ureq::Error::Status(code, response) => anyhow::Error::new(UploadFailureDiagnostics::http(
             operation, endpoint, code, &response,
@@ -3017,10 +3011,10 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
     }
-    /// Upload one bounded, content-free cloud-session batch using the same
-    /// source-scoped relay principal as local snapshots. Response bodies are
-    /// never retained on auth/contract failures.
-    pub fn upload_cloud_session_batch_with_timeout(
+    /// Upload one `cloud_session_changes.v1` request with the same
+    /// source-scoped relay principal as local snapshots. Only the parsed ACK
+    /// is returned; response bodies of refusals are never kept.
+    pub fn upload_cloud_session_changes_with_timeout(
         &self,
         relay_token: &str,
         request: &Value,
@@ -3030,34 +3024,30 @@ impl SnapshotApiClient {
         match relay_sent(
             relay_token,
             agent
-                .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
+                .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
                 .timeout(request_timeout)
                 .set("Accept", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
                 .send_json(request),
         ) {
-            Ok(response) => {
-                let receipt = require_cloud_session_success(
-                    response,
-                    "cloud-session upload",
-                    "cloud_session_batch",
-                )?
-                .into_json()
-                .map_err(|error| anyhow!("parse cloud-session batch response failed: {error}"))?;
-                validate_cloud_session_heartbeat_receipt(request, &receipt)?;
-                Ok(receipt)
-            }
+            Ok(response) => require_cloud_session_success(
+                response,
+                "cloud-session changes upload",
+                "cloud_session_changes",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse cloud-session changes response failed: {error}")),
             Err(error) => Err(cloud_session_request_error(
                 error,
-                "cloud-session upload",
-                "cloud_session_batch",
+                "cloud-session changes upload",
+                "cloud_session_changes",
             )),
         }
     }
 
-    /// Read one exact, relay-device-bound cloud grant epoch. This endpoint is
-    /// deliberately not a list and never accepts browser authentication.
-    pub fn get_cloud_session_grant_authority_with_timeout(
+    /// Read one exact, relay-device-bound cloud grant epoch on the
+    /// `cloud_session_changes.v1` authority. Not a list; never browser auth.
+    pub fn get_cloud_session_authority_with_timeout(
         &self,
         relay_token: &str,
         grant_id: &str,
@@ -3069,7 +3059,7 @@ impl SnapshotApiClient {
         }
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
         let path = format!(
-            "/api/v1/cloud-session-observations/grants/{grant_id}/authority?grant_version={grant_version}"
+            "/api/v1/cloud-sessions/grants/{grant_id}/authority?grant_version={grant_version}"
         );
         match relay_sent(
             relay_token,
@@ -3091,103 +3081,6 @@ impl SnapshotApiClient {
                 error,
                 "cloud-session authority read",
                 "cloud_session_authority",
-            )),
-        }
-    }
-
-    /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
-    #[cfg(test)]
-    pub fn upload_cloud_session_scan_chunk(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_chunk_with_timeout(
-            relay_token,
-            scan_id,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
-    pub fn upload_cloud_session_scan_chunk_with_timeout(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_request(
-            relay_token,
-            scan_id,
-            "chunks",
-            request,
-            "cloud_session_scan_chunk",
-            timeout,
-        )
-    }
-
-    /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
-    pub fn finalize_cloud_session_scan_with_timeout(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_request(
-            relay_token,
-            scan_id,
-            "finalize",
-            request,
-            "cloud_session_scan_finalize",
-            timeout,
-        )
-    }
-
-    fn upload_cloud_session_scan_request(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        action: &str,
-        request: &Value,
-        operation: &'static str,
-        timeout: Duration,
-    ) -> Result<Value> {
-        if !crate::hex::is_uuid(scan_id)
-            || request.get("scan_id").and_then(Value::as_str) != Some(scan_id)
-        {
-            return Err(anyhow!(
-                "cloud-session scan path and payload scan_id are invalid or do not match"
-            ));
-        }
-        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        let path = format!("/api/v1/cloud-sessions/scans/{scan_id}/{action}");
-        match relay_sent(
-            relay_token,
-            agent
-                .post(&self.api_url(&path))
-                .timeout(request_timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
-                .send_json(request),
-        ) {
-            Ok(response) => {
-                let receipt = require_cloud_session_success(
-                    response,
-                    "cloud-session scan upload",
-                    operation,
-                )?
-                .into_json()
-                .map_err(|error| anyhow!("parse cloud-session scan response failed: {error}"))?;
-                validate_cloud_session_scan_receipt(action, request, &receipt)?;
-                Ok(receipt)
-            }
-            Err(error) => Err(cloud_session_request_error(
-                error,
-                "cloud-session scan upload",
-                operation,
             )),
         }
     }
@@ -3378,92 +3271,6 @@ fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
         "pi" => ottto_protocol::SourceKind::Pi,
         _ => ottto_protocol::SourceKind::Codex,
     }
-}
-
-fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {
-    let ack: CloudSessionHeartbeatAckV1 = serde_json::from_value(receipt.clone())
-        .map_err(|error| anyhow!("invalid cloud-session heartbeat receipt: {error}"))?;
-    let collected_at = request
-        .get("collected_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing collected_at"))?;
-    let observed_at = request
-        .pointer("/health/observed_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing health.observed_at"))?;
-    if ack.schema_version != CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION
-        || !ack.accepted
-        || ack.observations_written != 0
-        || !ack.noop
-        || ack.grant_status != "enabled"
-        || ack.fresh_at != collected_at
-        || ack.fresh_at != observed_at
-        || OffsetDateTime::parse(&ack.fresh_at, &Rfc3339).is_err()
-    {
-        return Err(anyhow!(
-            "cloud-session heartbeat receipt does not acknowledge the exact heartbeat"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_cloud_session_scan_receipt(
-    action: &str,
-    request: &Value,
-    receipt: &Value,
-) -> Result<()> {
-    let request_string = |field: &str| {
-        request
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("cloud-session scan request is missing {field}"))
-    };
-    match action {
-        "chunks" => {
-            let ack: CloudSessionScanChunkAckV1 = serde_json::from_value(receipt.clone())
-                .map_err(|error| anyhow!("invalid cloud-session chunk receipt: {error}"))?;
-            let chunk_index = request
-                .get("chunk_index")
-                .and_then(Value::as_u64)
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or_else(|| anyhow!("cloud-session chunk request is missing chunk_index"))?;
-            if ack.schema_version != CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION
-                || !ack.accepted
-                || ack.scan_id != request_string("scan_id")?
-                || ack.chunk_index != chunk_index
-                || ack.chunk_identity_digest != request_string("chunk_identity_digest")?
-                || ack.chunk_semantic_digest != request_string("chunk_semantic_digest")?
-            {
-                return Err(anyhow!(
-                    "cloud-session chunk receipt does not acknowledge the exact request"
-                ));
-            }
-        }
-        "finalize" => {
-            let ack: CloudSessionScanFinalizeAckV1 = serde_json::from_value(receipt.clone())
-                .map_err(|error| anyhow!("invalid cloud-session finalize receipt: {error}"))?;
-            let request_u64 = |field: &str| {
-                request
-                    .get(field)
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("cloud-session finalize request is missing {field}"))
-            };
-            if ack.schema_version != CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION
-                || !ack.accepted
-                || ack.scan_id != request_string("scan_id")?
-                || u64::from(ack.chunk_count) != request_u64("chunk_count")?
-                || u64::from(ack.unique_entity_count) != request_u64("unique_entity_count")?
-                || ack.inventory_digest != request_string("inventory_digest")?
-                || ack.epoch_digest != request_string("epoch_digest")?
-            {
-                return Err(anyhow!(
-                    "cloud-session finalize receipt does not acknowledge the exact request"
-                ));
-            }
-        }
-        _ => return Err(anyhow!("unsupported cloud-session scan action")),
-    }
-    Ok(())
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
@@ -4071,19 +3878,6 @@ mod tests {
             diagnostics.safe_message(),
             "relay token request failed (endpoint=relay_token, status_family=transport_dns, retryable=true, request_id=absent)"
         );
-    }
-
-    #[test]
-    fn cloud_scan_path_rejects_mismatched_payload_scan_id_before_io() {
-        let client = SnapshotApiClient::new("http://127.0.0.1:1");
-        let error = client
-            .upload_cloud_session_scan_chunk(
-                "relay-token",
-                "00000000-0000-4000-8000-000000000001",
-                &json!({"scan_id":"00000000-0000-4000-8000-000000000002"}),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("scan_id are invalid"));
     }
 
     #[test]

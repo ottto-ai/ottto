@@ -4988,6 +4988,15 @@ fn cloud_sessions_control_with_stores(
                 )
             })?;
     }
+    if action == CloudSessionsControlAction::Revoke {
+        // Admission is closed and admitted I/O has drained, so no racing ACK
+        // can recreate a row. The server cutoff, not this cache, prevents
+        // revival; a failed erase leaves rows that expire on their own.
+        let _ = checkpoints.erase_cache();
+    }
+    if action != CloudSessionsControlAction::Status {
+        crate::cloud_sessions::wake_cloud_session_collector();
+    }
 
     if action == CloudSessionsControlAction::Revoke {
         // Collector-I/O idle waiting happens without the lifecycle lock.
@@ -25279,7 +25288,7 @@ for line in sys.stdin:
         policy_grants.grant_create_request(device_id).unwrap();
         let policy_pending = policy_grants.load().unwrap().unwrap();
         let mut disabled = cloud_control_backend_grant(&policy_pending, device_id, "enabled", 1);
-        disabled.server_policy_state = ottto_protocol::CloudSessionServerPolicyState::Disabled;
+        disabled.can_collect = Some(false);
         policy_grants
             .bind_backend_grant(&disabled, device_id)
             .unwrap();
@@ -25867,13 +25876,12 @@ for line in sys.stdin:
         let account_path = root.join("account.json");
         let device_path = root.join("device.json");
         let grant_path = root.join("grant.json");
-        let checkpoint_path = root.join("checkpoint.json");
         let token_path = root.join("control-token-uses.json");
         let accounts = FileAccountStore::new(&account_path);
         let devices = FileDeviceStore::new(&device_path);
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(&grant_path);
         let checkpoints = Arc::new(crate::cloud_sessions::CloudSessionCheckpointStore::new(
-            &checkpoint_path,
+            &root,
         ));
         let device_id = "00000000-0000-4000-8000-000000000001";
         accounts.save(&connected_account()).unwrap();
@@ -25984,8 +25992,7 @@ for line in sys.stdin:
         let accounts = FileAccountStore::new(root.join("account.json"));
         let devices = FileDeviceStore::new(root.join("device.json"));
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
-        let checkpoints =
-            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let checkpoints = crate::cloud_sessions::CloudSessionCheckpointStore::new(&root);
         let token_path = root.join("control-token-uses.json");
         let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(&token_path);
         accounts.save(&connected_account()).unwrap();
@@ -26026,6 +26033,7 @@ for line in sys.stdin:
         let create = prepared.backend_create_request.unwrap();
         assert_eq!(create.installation_id, device_id);
         assert_eq!(create.source, "codex");
+        assert_eq!(create.schema_version, "cloud_session_changes.v1");
         assert!(create.consent);
         let local = grants.load().unwrap().unwrap();
         let enabled_response = cloud_control_backend_grant(&local, device_id, "enabled", 1);
@@ -26535,8 +26543,7 @@ for line in sys.stdin:
         let accounts = FileAccountStore::new(root.join("account.json"));
         let devices = FileDeviceStore::new(root.join("device.json"));
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
-        let checkpoints =
-            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let checkpoints = crate::cloud_sessions::CloudSessionCheckpointStore::new(&root);
         let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
             root.join("control-token-uses.json"),
         );
@@ -32374,15 +32381,14 @@ X-API-Key = "otel_redacted"
             installation_id: device_id.to_string(),
             source: "codex".to_string(),
             collector_id: "cloud_sessions".to_string(),
-            schema_version: "cloud_session_observations.v1".to_string(),
-            collector_version: compiled_release_version(),
-            release_lane: "supported".to_string(),
+            schema_version: "cloud_session_changes.v1".to_string(),
             disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
             grant_scope_fingerprint: local.grant_scope_id.clone(),
             account_fingerprint: local.account_fingerprint.clone(),
             status: status.to_string(),
             grant_version,
-            server_policy_state: ottto_protocol::CloudSessionServerPolicyState::Approved,
+            can_collect: Some(status == "enabled"),
+            ..Default::default()
         }
     }
 

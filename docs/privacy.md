@@ -156,59 +156,64 @@ private annotations are excluded from diagnostics and uploaded payloads.
 
 The optional Codex Cloud Sessions collector is experimental and disabled by
 default. It uses an officially documented, upstream-experimental Codex CLI
-surface. Its single daemon supervisor starts normally but remains inert until
-the user grants the exact local device/user/organization scope and server
-policy approves that same versioned grant. Newly granted consent activates on
-the next bounded cycle without a daemon restart. The collector invokes only
+surface. Its single daemon supervisor starts normally but stays idle until the
+user grants the exact local device/user/organization scope and the server
+authorizes collection for that same versioned grant. New consent wakes the
+supervisor at once without a daemon restart. The collector invokes only
 `codex cloud list --json` as the effective user and
 derives opaque HMAC entity/account keys plus lifecycle, timestamps, attempt
-count, safe environment kind, coverage, and freshness. It never reads
+count, safe environment kind and coverage. It never reads
 `~/.codex/auth.json`, calls private provider endpoints, or uploads raw CLI JSON,
 titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths,
 raw provider ids, or cursors. Its local grant is versioned and can be paused or
 revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency
-kill switch and overrides consent and server policy. The collector is isolated
-from snapshot sync, bounded by page/item/
-wall-time limits, and uses semantic no-ops plus circuit-breaking backoff. Active
-full scans are bounded to 2,000 unique entities, 100 provider pages, and ten
-ordered chunks of at most 200 observations. The current cursor, raw response,
-and scan inventory exist only in the long-lived collector process; restart
-drops them, creates a new local UUID, and starts again from page zero.
+kill switch and overrides consent and server authority. The collector is
+isolated from local snapshot delivery: it has its own backoff, never writes
+upload receipts, and a cloud failure never delays a local upload.
 
-Cursor pagination proves positive observations only. Only explicit official
-`cursor: null` proves terminal enumeration. Absence can be considered only by
-the server after one such response containing at most 20 entities; multi-page
-official terminal scans are labeled `unstable_cursor`. Fieldless objects, root
-arrays, and alias-only nulls may preserve valid nonempty positive facts but
-never finalize or authorize absence; empty ambiguous responses fail closed.
-Cap, cursor churn, malformed/truncated response, timeout, cancellation, or
-error paths can upload bounded positive chunks but never finalize an
-absence-capable epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
-content-free SHA-256 values; semantic digests exclude observation/collection
-time. Identical response-loss retries reuse the exact chunk or finalize body.
+The collector uploads a task only when it changed since that task's last exact
+server acknowledgement (`cloud_session_changes.v1`, at most 200 tasks per
+request). A local digest over the task's content-free facts decides "changed";
+the digest itself never leaves the machine. Each acknowledged task's digest and
+the server's head etag are cached in the local upload-history file for 30 days,
+scoped to the backend destination, local identity, grant epoch and contract;
+unchanged polls never rewrite or extend an entry. A lost response or lost cache
+write only causes the same task to be offered again, which the server answers
+as unchanged. A per-task refusal is remembered for exactly that content. When
+the server reports a different head, the collector lists the page again once
+and offers the fresh facts against that head. A local revoke, and a revoke the
+server reports, erase this cache.
 
-The collector polls no more often than every five minutes plus up to 20 seconds
-of jitter. Normal polls read one head page; unchanged heads produce zero
-observation/ingest upload, though mandatory backend grant revalidation still
-occurs, and allow an observation-empty v1 heartbeat hourly. A full scan runs
-daily and until one has completed. Every provider page, chunk, finalize, and
-heartbeat is preceded by local kill/pause/revoke checks and exact backend
-grant/policy revalidation. Revalidation uses a short-lived source-scoped relay
-token and an exact grant UUID/version authority read; it never lists another
-grant or carries the browser JWT. Only a strictly decoded
-`server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or
-unknown policy, disabled/revoked state, backend absence, authentication failure,
-and network or parse errors stop before provider access. A nonempty CLI page
-with any missing/invalid task identity or status string is classified locally
-as `provider_payload_invalid`; it neither fabricates mandatory status coverage
-nor becomes an empty healthy observation. The wire emits only the backend's
-allowed coarse `provider_error` category, never detailed local diagnostics.
-The raw installation id is discarded after deriving grant-local HMAC
-fingerprints. Grant state is stored with private-directory and exclusive 0600
-atomic-write semantics. Earlier v1 grants migrate on first read, removing their
-raw installation id while preserving pause and revoke controls. The Codex
-subprocess receives no provider API keys and does not start an interactive
-shell.
+Timing: the newest provider page is read every five minutes while it holds a
+queued, running or unknown task, every 30 minutes while local Codex is active,
+and otherwise every six hours. One daily crawl walks every page, ten pages per
+work slice and continuing five minutes later where it stopped, across UTC
+midnight, until it reaches an explicit official `cursor: null`. There is no
+page or task ceiling. A cursor chain that repeats or cycles (detected in
+constant memory), or a response without terminal proof, ends that day's
+traversal without claiming completion. The raw cursor lives only in process
+memory; after a restart the crawl starts again from the newest page and the
+cache suppresses tasks already acknowledged. Without consent, while paused, or
+against a server that does not offer this contract, the collector makes no
+provider call and rechecks only every six hours or on a local consent change.
+
+Each due work slice first makes one bounded authority read of the exact bound
+grant UUID/version over a short-lived source-scoped relay token; it never lists
+another grant or carries the browser JWT. Only `status: "enabled"` with
+`can_collect: true` on this contract permits that slice to invoke Codex. A
+remote pause leaves local consent untouched; a remote revoke revokes locally.
+After an erasure, only tasks whose provider creation time is after the server's
+cutoff are offered. Authentication failure, network or parse errors stop before
+provider access and back off with jitter. A nonempty CLI page with no valid
+task identity and status is classified locally as `provider_payload_invalid`;
+it never becomes an empty healthy page. A malformed row is skipped alone and
+its valid siblings are still processed. The raw installation id is discarded
+after deriving grant-local HMAC fingerprints. Grant state is stored with
+private-directory and exclusive 0600 atomic-write semantics. Earlier v1 grants
+migrate on first read, removing their raw installation id while preserving
+pause and revoke controls. A grant bound before this contract does not collect
+until consent is given again. The Codex subprocess receives no provider API
+keys and does not start an interactive shell.
 
 The uploaded `account_fingerprint` is an opaque local Ottto organization/user
 collector scope, not an OpenAI or Codex provider-account identity. The
@@ -232,16 +237,16 @@ exact local install. Concurrent Cloud-session admission and account/device
 writes fail retryably; the old backend device is never rotated while cleanup is
 pending, and no provider or backend call runs under the lifecycle mutex.
 
-The strict v2 chunk/finalize relay, exact relay authority read, and backend DTOs
-are composed only in that explicit experimental lane. Before touching Keychain,
+The changes relay, exact relay authority read, and backend DTOs are composed
+only in that explicit experimental lane. Before touching Keychain,
 the daemon requires a current enabled or policy-disabled grant and exact HMAC
 matches for the connected local device, organization, and user. It also
 requires the device and persisted connection to share the same machine binding
 and validates the backend destination before reading the relay device secret.
 A loopback destination is accepted only when the daemon process carries the
 exact same developer override. The transport is then kept only in process and
-cannot invoke Codex until the backend revalidates the exact grant UUID/version
-as enabled and policy-approved. No browser JWT crosses this boundary.
+cannot invoke Codex until the backend authority read confirms the exact grant
+UUID/version as enabled and collecting. No browser JWT crosses this boundary.
 
 Authenticated companion/UI code owns backend grant create/delete. Before a
 create handoff the daemon persists only a content-free exact-scope descriptor,
@@ -249,7 +254,7 @@ never the raw installation id. A timeout or restart retries that same
 idempotent create until the backend grant UUID is bound; one intervening list
 absence cannot clear the tombstone or permit replacement while the original
 POST may still commit. The daemon stores only the opaque grant
-UUID/version/server-policy response and rejects stale pre-revoke epochs.
+UUID/version/authority state and rejects stale pre-revoke epochs.
 
 Browser consent controls use one short-lived backend-signed token bound to the
 action, organization, effective user, Codex relay device, and source. The daemon
@@ -258,8 +263,8 @@ the connected local account/device, and atomically consumes it before a side
 effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
 the JWT and raw token id are never persisted. Pause/revoke persists stopped
 state to close the shared provider/relay admission fence, then waits for every
-already admitted bounded provider subprocess or chunk/finalize/heartbeat/failure
-write to finish before returning the exact backend DELETE target. Exact bind-response retries
+already admitted bounded provider subprocess, changes upload or cache write to
+finish before returning the exact backend DELETE target. Exact bind-response retries
 are local no-ops and cannot change timestamps or resurrect pause/revoke. If an
 authenticated grant POST commits immediately before rollout removal blocks
 bind, the independently permitted revoke action may carry that exact
