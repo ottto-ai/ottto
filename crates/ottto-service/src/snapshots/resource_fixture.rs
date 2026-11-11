@@ -783,25 +783,28 @@ fn resource_virtual_scenarios() {
                             );
                         }
                     }
-                    if seconds > 0 && seconds.is_multiple_of(300) && let Some(s) = active {
-                            appended += 1;
-                            corpus.append(s, appended + 1);
-                            if s == 1 {
-                                let changed = codex_writer
-                                    .as_ref()
-                                    .expect("active native WAL writer")
-                                    .execute(
-                                        "UPDATE threads SET title=?1, updated_at=?2 WHERE id=?3",
-                                        rusqlite::params![
-                                            format!("sample-project {appended}"),
-                                            EPOCH + offset + seconds,
-                                            session(0)
-                                        ],
-                                    )
-                                    .unwrap();
-                                assert_eq!(changed, 1, "real active Codex WAL mutation");
-                            }
-                            schedule::event(SOURCES[s]);
+                    if seconds > 0
+                        && seconds.is_multiple_of(300)
+                        && let Some(s) = active
+                    {
+                        appended += 1;
+                        corpus.append(s, appended + 1);
+                        if s == 1 {
+                            let changed = codex_writer
+                                .as_ref()
+                                .expect("active native WAL writer")
+                                .execute(
+                                    "UPDATE threads SET title=?1, updated_at=?2 WHERE id=?3",
+                                    rusqlite::params![
+                                        format!("sample-project {appended}"),
+                                        EPOCH + offset + seconds,
+                                        session(0)
+                                    ],
+                                )
+                                .unwrap();
+                            assert_eq!(changed, 1, "real active Codex WAL mutation");
+                        }
+                        schedule::event(SOURCES[s]);
                     }
                     if case == "reselect" && seconds == 1800 {
                         assert!(!reselected);
@@ -906,17 +909,18 @@ fn resource_virtual_scenarios() {
         println!("resource_case_done {case}");
     }
     for (phase, counters) in &receipts {
-        if !phase.starts_with("reselect/") && phase.contains("/h") && let Some(passes) = counters.get("passes") {
-                let limit =
-                    if phase.starts_with("quiet_battery/") || phase.starts_with("quiet_lpm/") {
-                        4
-                    } else if phase.starts_with("account_switch/") {
-                        13
-                    } else {
-                        12
-                    };
-                assert!(*passes <= limit, "passes/hour {phase}: {passes} > {limit}");
-            }
+        if !phase.starts_with("reselect/")
+            && phase.contains("/h")
+            && let Some(passes) = counters.get("passes")
+        {
+            let limit = if phase.starts_with("quiet_battery/") || phase.starts_with("quiet_lpm/") {
+                4
+            } else if phase.starts_with("account_switch/") {
+                13
+            } else {
+                12
+            };
+            assert!(*passes <= limit, "passes/hour {phase}: {passes} > {limit}");
         }
     }
     println!(
