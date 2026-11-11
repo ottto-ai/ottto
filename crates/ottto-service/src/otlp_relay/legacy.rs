@@ -505,7 +505,7 @@ impl OpenPort {
             .as_ref()
             .expect("owned listener")
             .try_clone()?;
-        if listener.local_addr().ok() != self.bound_addr || !is_listening(&listener) {
+        if !names_bound_listener(&listener, self.bound_addr) {
             return Err(io::Error::from_raw_os_error(libc::ENOTSOCK));
         }
         let (stream, _) = listener.accept()?;
@@ -937,8 +937,7 @@ impl Supervisor {
                 .iter()
                 .filter_map(|(&port, open)| {
                     let listener = open.listener.as_ref().expect("owned listener");
-                    (listener.local_addr().ok() != open.bound_addr || !is_listening(listener))
-                        .then_some(port)
+                    (!names_bound_listener(listener, open.bound_addr)).then_some(port)
                 })
                 .collect();
             for port in broken {
