@@ -75,3 +75,219 @@ fn stale_parent_positive_survives_growth_current_and_restart() {
         }
     });
 }
+
+fn refold(path: &Path) {
+    // Ordinary provider growth with no additional usage changes the revision.
+    append(
+        path,
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
+    );
+}
+fn child_page(c: &Corpus, index: ScanIndex, path: &Path) -> Page {
+    let scanner = E2ScanFixture::capturing_identity();
+    let mut p = c.raw(&scanner, index, 1, true, &[path.to_path_buf()]);
+    assert_eq!(scanner.paths(), vec![path.to_path_buf()], "one child page");
+    p.enrich(c);
+    p
+}
+
+/// [money] With no census the copy counts, including an accepted legacy +1.
+/// Parsing the root then ordinary child growth offers one correction and goes quiet.
+#[test]
+fn first_sighting_and_legacy_overcount_converge_on_the_next_child_fold() {
+    with_e2(|| {
+        let mut c = corpus("family-census-first-sighting");
+        let root = c.root(ROOT, &line(ROOT, "fork", AT, 10));
+        let path = copied(&mut c);
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let first = child_page(&c, index, &path);
+        assert!(first
+            .index
+            .claude_request_census
+            .get(root.to_str().unwrap())
+            .is_none());
+        assert_eq!(body(&first, &child()).unwrap().request_count, 2);
+        let prior = commit(&session, first);
+        let parent = hinted(&c, prior, 100, true, std::slice::from_ref(&root));
+        assert!(body(&parent, ROOT).is_some());
+        let prior = commit(&session, parent);
+        refold(&path);
+        let corrected = child_page(&c, prior, &path);
+        let b = body(&corrected, &child()).unwrap();
+        assert_eq!((b.request_count, b.removed_request_count), (1, Some(1)));
+        let cold = result(
+            &only_child(page(&c, ScanIndex::default(), 100, false)),
+            Mode::ColdFull,
+        );
+        money_oracle::assert_equivalent(&cold, &result(&corrected, Mode::Restart));
+        let mut offered = twin(&corrected);
+        offered.finish();
+        assert_eq!(offered.scan.snapshots.len(), 1, "one corrective offer");
+        let prior = commit(&session, corrected);
+        let (mut quiet, bytes) = fixture::observe_consumed(|| page(&c, prior, 100, true));
+        quiet.finish();
+        assert!(quiet.scan.snapshots.is_empty(), "no repeated correction");
+        assert_eq!(bytes, 0, "quiet restart reads no transcript bytes");
+        money_oracle::assert_quiet_restart_zero_bytes(&result(&quiet, Mode::Restart));
+    });
+}
+
+/// [money] A completed rewrite replaces positive membership. Only the next
+/// child fold restores its first response; the old positive is not unioned forever.
+#[test]
+fn root_rewrite_removing_the_id_restores_the_child_response() {
+    with_e2(|| {
+        let mut c = corpus("family-census-rewrite");
+        let root = c.root(ROOT, &line(ROOT, "fork", AT, 10));
+        let path = copied(&mut c);
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let seed = page(&c, index, 100, true);
+        assert_eq!(body(&seed, &child()).unwrap().request_count, 1);
+        let prior = commit(&session, seed);
+        std::fs::write(&root, line(ROOT, "replacement", "2026-08-02T07:02:00Z", 31)).unwrap();
+        let rewritten = hinted(&c, prior, 100, true, std::slice::from_ref(&root));
+        assert!(body(&rewritten, ROOT).is_some());
+        let prior = commit(&session, rewritten);
+        refold(&path);
+        let restored = child_page(&c, prior, &path);
+        assert_eq!(body(&restored, &child()).unwrap().request_count, 2);
+        let cold = result(
+            &only_child(page(&c, ScanIndex::default(), 100, false)),
+            Mode::ColdFull,
+        );
+        money_oracle::assert_equivalent(&cold, &result(&restored, Mode::Restart));
+    });
+}
+
+/// [money] Local membership is not an ACK. The child temporarily lacks the
+/// root's response at the destination, then converges when the root is delivered.
+#[test]
+fn never_uploaded_root_exposes_transient_undercount_then_converges() {
+    with_e2(|| {
+        let mut c = corpus("family-census-unuploaded");
+        let root = c.root(ROOT, &line(ROOT, "fork", AT, 10));
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let mut unsent = page(&c, index, 100, true);
+        unsent.finish();
+        assert!(unsent.delivered.is_none());
+        let mut prior = session.save_reload(&mut unsent.index);
+        assert!(prior.files[root.to_str().unwrap()]
+            .upload_context_receipt
+            .is_none());
+        stale(&mut prior, &root);
+        let path = copied(&mut c);
+        let child_only = child_page(&c, prior, &path);
+        assert_eq!(
+            body(&child_only, &child()).unwrap().request_count,
+            1,
+            "the root response is not yet at the server"
+        );
+        let cold_child = result(
+            &only_child(page(&c, ScanIndex::default(), 100, false)),
+            Mode::ColdFull,
+        );
+        money_oracle::assert_equivalent(&cold_child, &result(&child_only, Mode::Ram));
+        let prior = commit(&session, child_only);
+        append(
+            &root,
+            &line(ROOT, "delivered-later", "2026-08-02T07:02:00Z", 30),
+        );
+        refold(&path);
+        let converged = hinted(&c, prior, 100, true, &[root, path]);
+        assert_eq!(total(&converged), 3, "root 2 plus child 1 before exact ACK");
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        money_oracle::assert_equivalent(&cold, &result(&converged, Mode::Restart));
+        let _ = commit(&session, converged);
+    });
+}
+
+/// [money] The corrected duplicate leaves its own account grain. Native twin
+/// restoration still precedes family removal; all retained rows and ACK buckets
+/// agree with cold Full across a switch, side call and evidence gap.
+#[test]
+fn stale_family_proof_preserves_two_account_placement_and_twin_order() {
+    with_e2(|| {
+        let mut c = corpus("family-census-placement-twin");
+        let root = c.root(ROOT, &line(ROOT, "fork", AT, 10));
+        let text = line(ROOT, "fork", AT, 10)
+            + &line(ROOT, "a", "2026-08-02T07:01:00Z", 20)
+            + &line(ROOT, "b", "2026-08-02T07:02:00Z", 30)
+            + &line(ROOT, "gap", "2026-08-02T07:03:00Z", 7);
+        let path = c.agent(0, &text);
+        c.evidence(
+            &[
+                api_login(ROOT, "fork", 10, '1', Some('7')),
+                api_login(ROOT, "a", 20, '1', Some('7')),
+                api_login(ROOT, "b", 30, '2', Some('8')),
+                api_login(ROOT, "side", 4, '2', Some('8')),
+            ],
+            &[
+                trace("fork", ""),
+                trace("a", "agent-000"),
+                trace("b", "agent-000"),
+                trace("side", "agent-000"),
+            ],
+        );
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let mut prior = commit(&session, page(&c, index, 100, true));
+        stale(&mut prior, &root);
+        refold(&path);
+        let warm = child_page(&c, prior, &path);
+        assert_eq!(
+            body(&warm, &child()).unwrap().request_count,
+            4,
+            "own a, b, gap and side; parent copy removed once"
+        );
+        let cold = result(
+            &only_child(page(&c, ScanIndex::default(), 100, false)),
+            Mode::ColdFull,
+        );
+        assert!(accounts(&cold).len() >= 2, "nonempty two-account control");
+        let actual = result(&warm, Mode::Restart);
+        assert!(!actual
+            .accepted_identity_buckets
+            .as_ref()
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
+        money_oracle::assert_equivalent(&cold, &actual);
+        // A same-member path twin whose old first response has no earlier
+        // eligible page holder is restored by the twin rule before family dedup.
+        c.write_at(
+            &format!("other/{ROOT}.jsonl"),
+            &line(ROOT, "fork", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("other/{ROOT}/subagents/agent-000.jsonl"),
+            &text,
+            "2026-08-02T07:00:30Z",
+        );
+        let twins = page(&c, ScanIndex::default(), 100, false);
+        assert_eq!(
+            body(&twins, &child()).unwrap().removed_request_count,
+            Some(2),
+            "both family copies removed after native twin restoration"
+        );
+        let twin_route = result(&twins, Mode::ColdFull);
+        let restored = page(&c, ScanIndex::default(), 100, true);
+        money_oracle::assert_equivalent(&twin_route, &result(&restored, Mode::Restart));
+    });
+}

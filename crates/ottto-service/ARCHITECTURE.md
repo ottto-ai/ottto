@@ -312,6 +312,13 @@ same-member page fold holds that id and the occurrence's usable provider timesta
 or after 2026-11-05T00:00:00Z. Other requests and idless copies count through the existing
 restoration path; the parent-repeat rule and listed-family behavior remain unchanged.
 
+A forked child's copied first response counts at its root when the same root
+path's page or valid persisted request census holds that id. Census freshness
+does not revoke positive membership. With no witness the child counts it until
+its next fold can prove the copy. A root rewrite replaces the census; the child's
+next fold then follows that replacement. Membership proves local source presence,
+not server acceptance. No extra reads or persisted fields implement this rule.
+
 ## Module map: snapshots/ (target; migration in progress)
 
 `snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
