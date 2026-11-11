@@ -616,7 +616,8 @@ impl CloudSessionGrantStore {
         )?;
         if !state.grant.backend_create_pending {
             validate_backend_grant_response(&state, response)?;
-            if response.installation_id != expected_installation_id || response.status != "enabled"
+            if response.installation_id != expected_installation_id
+                || !matches!(response.status.as_str(), "enabled" | "paused")
             {
                 return Err(anyhow!("backend cloud-session grant does not match"));
             }
@@ -628,7 +629,6 @@ impl CloudSessionGrantStore {
             if existing.grant_id == response.id
                 && existing.grant_version == response.grant_version
                 && !existing.backend_revoked
-                && existing.server_policy_state == authority_policy(response)
                 && existing.collection_contract.as_deref()
                     == (response.schema_version == CHANGES_SCHEMA_VERSION)
                         .then_some(CHANGES_SCHEMA_VERSION)
@@ -657,8 +657,8 @@ impl CloudSessionGrantStore {
         if response.installation_id != expected_installation_id {
             return Err(anyhow!("backend cloud-session grant scope does not match"));
         }
-        if response.status != "enabled" {
-            return Err(anyhow!("backend cloud-session grant is not enabled"));
+        if !matches!(response.status.as_str(), "enabled" | "paused") {
+            return Err(anyhow!("backend cloud-session grant is not consented"));
         }
         if let Some(existing) = &state.grant.backend_binding {
             if existing.grant_id != response.id {

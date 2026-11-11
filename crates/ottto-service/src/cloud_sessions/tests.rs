@@ -2781,3 +2781,54 @@ fn head_status_controls_cadence_independently_of_delivery() {
     );
     assert!(!collector.schedule.head_nonterminal);
 }
+
+/// [behaviour] Idempotent create may return a paused row. It binds without
+/// collecting and remains compensatable if local revoke raced the response.
+#[test]
+fn paused_create_responses_reconcile_without_resurrecting_collection() {
+    for revoked in [false, true] {
+        let (_root, grants, checkpoints) = stores("paused-create");
+        let local = grants.enable(&setup(), now()).unwrap();
+        grants.grant_create_request(INSTALLATION_ID).unwrap();
+        if revoked {
+            grants.revoke(now()).unwrap();
+        }
+        let paused = backend_grant(&local, "paused", 1);
+        let bound = grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap();
+        assert_eq!(
+            bound.status,
+            if revoked {
+                CloudSessionGrantStatus::Revoked
+            } else {
+                CloudSessionGrantStatus::PolicyDisabled
+            }
+        );
+        assert_eq!(
+            grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap(),
+            bound
+        );
+        let cli = Cli::head(page("must-not-collect", None));
+        let server = Server::new();
+        server.authority.set(Authority::Paused);
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&grants, &checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO,
+        );
+        assert_eq!(cli.calls(), 0);
+        if revoked {
+            assert_eq!(grants.grant_revoke_target().unwrap().grant_id, GRANT_ID);
+        } else {
+            let current = grants
+                .apply_backend_authority(&authority(&bound, "enabled"))
+                .unwrap();
+            assert_eq!(current.status, CloudSessionGrantStatus::Enabled);
+            // An old bind response never overwrites fresher authority state.
+            assert_eq!(
+                grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap(),
+                current
+            );
+        }
+    }
+}
