@@ -82,16 +82,30 @@ fn launcher_permissions_symlinks_and_content() {
         root,
         Path::new("/Applications/Ottto's 雪 $(x)`/ottto"),
         "synthetic",
+        Provider::ClaudeCode,
+        Path::new("/synthetic/project"),
     )
     .unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
     assert!(text.contains("launch-check --exec"));
     assert!(text.contains(&id));
-    assert!(!text.contains("project"));
+    assert!(text.contains("Starting Claude Code in project…"));
+    assert!(!text.contains("/synthetic/project"));
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap().len(),
+        "claude-12345678.command".len()
+    );
+    assert!(path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("claude-"));
     assert!(!text.contains("CLAUDE_CONFIG_DIR"));
     assert!(text.contains("Ottto'\\''s"));
-    assert_eq!(text.lines().count(), 3);
+    assert!(text.starts_with("#!/bin/sh\nprintf '\\033[3J\\033[H\\033[2J'\n"));
+    assert_eq!(text.lines().count(), 5);
     fs::set_permissions(
         root.join("session-launch"),
         fs::Permissions::from_mode(0o755),
@@ -112,6 +126,204 @@ fn launcher_permissions_symlinks_and_content() {
         launcher_directory(root, true).unwrap_err().reason,
         Reason::LauncherDirUnsafe
     );
+}
+
+/// [regress] Terminal launchers clear the echoed handoff and show only a safe
+/// folder basename, without interpreting shell metacharacters or account data.
+#[test]
+fn launcher_shows_a_safe_line_and_deletes_itself() {
+    let scratch = crate::test_scratch::ScratchDir::new("launcher-greeting");
+    let root = scratch.as_ref();
+    let directory = launcher_directory(root, true).unwrap();
+    let ottto = root.join("fake-ottto");
+    fs::write(
+        &ottto,
+        "#!/bin/sh\n[ \"$1\" = launch-check ] && [ \"$2\" = --exec ]\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ottto, fs::Permissions::from_mode(0o700)).unwrap();
+    for (provider, label, slug) in [
+        (Provider::ClaudeCode, "Claude Code", "claude"),
+        (Provider::Codex, "Codex", "codex"),
+    ] {
+        for folder in [
+            "project",
+            "雪 $(exit 99)`exit 99`%s",
+            "it's",
+            "a\"b",
+            "a\nb",
+            "a\u{1b}b",
+        ] {
+            let cwd = root.join("private-parent").join(folder);
+            let (id, path) =
+                write_launcher(&directory, root, &ottto, "synthetic-secret", provider, &cwd)
+                    .unwrap();
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            assert!(filename.starts_with(&format!("{slug}-")));
+            assert_eq!(filename.len(), slug.len() + 17);
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("private-parent"));
+            assert!(!text.contains("account@example.invalid"));
+            assert!(!text.contains("nickname"));
+            assert!(!text.contains("slot-id"));
+            let output = Command::new("/bin/sh").arg(&path).output().unwrap();
+            assert!(output.status.success());
+            let suffix = if folder
+                .chars()
+                .any(|c| c.is_control() || c == '\'' || c == '"')
+            {
+                String::new()
+            } else {
+                format!(" in {folder}")
+            };
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("\u{1b}[3J\u{1b}[H\u{1b}[2JStarting {label}{suffix}…\n")
+            );
+            assert!(output.stderr.is_empty());
+            assert!(!path.exists());
+            assert!(!filename.contains(&id));
+        }
+    }
+}
+
+/// [behaviour] Startup removes both generations of launchers without following
+/// a symlink or deleting unrelated files in the owner-only launcher directory.
+#[test]
+fn startup_cleans_short_and_legacy_launcher_names() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-recovery");
+    let root = scratch.as_ref();
+    let _directory = launcher_directory(root, true).unwrap();
+    let dir = root.join("session-launch");
+    let outside = root.join("keep");
+    fs::write(&outside, "synthetic").unwrap();
+    for name in [
+        "claude-1234abcd.command",
+        "codex-1234abcd.command",
+        "ottto-lch_legacy.command",
+    ] {
+        symlink(&outside, dir.join(name)).unwrap();
+    }
+    fs::write(dir.join("keep.txt"), "synthetic").unwrap();
+    unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root) };
+    recover_at_startup();
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert!(dir.join("keep.txt").exists());
+    assert_eq!(fs::read_to_string(outside).unwrap(), "synthetic");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+}
+
+/// [regress] Prepare tolerates one in-place update, symlink swap or overloaded
+/// version probe; a repeated failure refuses and unsupported output never retries.
+#[test]
+fn prepare_cli_retries_transient_failures_once() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-cli-retry");
+    let root = scratch.canonicalize().unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
+    let binding = fixture_binding(&root);
+    let cli = bin.join("claude");
+    let witness = root.join("probes");
+    let flag = root.join("updated");
+    let quote = |path: &Path| quote_launch_executable(path.to_str().unwrap()).unwrap();
+    for case in [
+        "symlink",
+        "in-place",
+        "timeout-once",
+        "changed-twice",
+        "timeout-twice",
+        "unsupported",
+    ] {
+        let _ = fs::remove_file(&cli);
+        let _ = fs::remove_file(&witness);
+        let _ = fs::remove_file(&flag);
+        let initial = root.join("initial");
+        let next = root.join("next");
+        let swapped = bin.join("swapped");
+        let success = "printf '2.1.322 (Claude Code)\\n'\n";
+        let action = match case {
+            "symlink" => format!(
+                "/bin/ln -s {} {}\n/bin/mv -f {} {}\n",
+                quote(&next),
+                quote(&swapped),
+                quote(&swapped),
+                quote(&cli)
+            ),
+            "in-place" | "changed-twice" => "printf '# updated\\n' >> \"$0\"\n".into(),
+            "timeout-once" => format!(
+                "[ -f {} ] || {{ printf 'first\\n' > {}; /bin/sleep 30; }}\n",
+                quote(&flag),
+                quote(&flag)
+            ),
+            "timeout-twice" => "/bin/sleep 30\n".into(),
+            "unsupported" => String::new(),
+            _ => unreachable!(),
+        };
+        // Mutate just once for the in-place recovery case, always for refusal.
+        let action = if case == "in-place" {
+            format!(
+                "[ -f {} ] || {{ {action}/usr/bin/touch {}; }}\n",
+                quote(&flag),
+                quote(&flag)
+            )
+        } else {
+            action
+        };
+        let version = if case == "unsupported" {
+            "printf 'unsupported\\n'\n"
+        } else {
+            success
+        };
+        fs::write(
+            &initial,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> {}\n{action}{version}",
+                quote(&witness)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &next,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> {}\n{success}",
+                quote(&witness)
+            ),
+        )
+        .unwrap();
+        for path in [&initial, &next] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        symlink(&initial, &cli).unwrap();
+        let result = prepare_cli(&binding, &root);
+        match case {
+            "changed-twice" => assert_eq!(result.err().unwrap().reason, Reason::CliChanged),
+            "timeout-twice" | "unsupported" => {
+                assert_eq!(result.err().unwrap().reason, Reason::CliVersionUnsupported)
+            }
+            _ => {
+                let prepared = result.ok().unwrap();
+                assert_eq!(prepared.version, "2.1.322");
+                assert_eq!(
+                    prepared.program,
+                    if case == "symlink" { next } else { initial }
+                );
+                assert!(program_identity(&prepared.program).as_ref() == Some(&prepared.identity));
+            }
+        }
+        let probes = fs::read_to_string(&witness).unwrap();
+        assert_eq!(
+            probes.lines().filter(|line| *line == "probe").count(),
+            if case == "unsupported" { 1 } else { 2 }
+        );
+    }
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
 }
 
 #[test]
