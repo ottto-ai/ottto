@@ -2092,6 +2092,7 @@ impl CloudCollector {
                     return self.settle_failure(
                         inputs,
                         SliceError::backoff("ack_cache_unavailable"),
+                        now,
                         now + started.elapsed(),
                     );
                 }
@@ -2159,7 +2160,7 @@ impl CloudCollector {
                     CloudSessionCycleOutcome::Noop
                 }
             }
-            Some(error) => self.settle_failure(inputs, error, now + started.elapsed()),
+            Some(error) => self.settle_failure(inputs, error, now, now + started.elapsed()),
         }
     }
 
@@ -2168,6 +2169,7 @@ impl CloudCollector {
         inputs: &SliceInputs<'_>,
         error: SliceError,
         now: Instant,
+        failed_at: Instant,
     ) -> CloudSessionCycleOutcome {
         match error.kind {
             SliceErrorKind::Backoff(retry_after) => {
@@ -2177,7 +2179,9 @@ impl CloudCollector {
                         self.schedule.consecutive_failures,
                     ),
                 };
-                self.schedule.note_failure(now, backoff);
+                // Retry-After begins at failure receipt. Unsupported feature
+                // rechecks below keep their ordinary planned opportunity.
+                self.schedule.note_failure(failed_at, backoff);
                 let _ = inputs
                     .grants
                     .record_health("failing", "stale", Some(error.category));
@@ -2222,7 +2226,7 @@ impl CloudCollector {
             Ok(response) => response,
             Err(error) => {
                 let error = SliceError::from_request(&error, deadline);
-                return Err(self.settle_failure(inputs, error, now + started.elapsed()));
+                return Err(self.settle_failure(inputs, error, now, now + started.elapsed()));
             }
         };
         let current = match inputs.grants.apply_backend_authority(&response) {
