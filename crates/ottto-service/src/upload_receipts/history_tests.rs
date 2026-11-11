@@ -801,3 +801,58 @@ fn cloud_query_plans_use_the_primary_key_and_expiry_index() {
         }
     }
 }
+
+/// [behaviour] A fixed provider page reads and retains the same ACK working
+/// set at 1x/10x/100x history. Historical cache rows never hydrate a graph.
+#[test]
+fn cloud_cache_history_does_not_expand_the_active_page() {
+    let mut active_heap = None;
+    for history_rows in [200, 2_000, 20_000] {
+        let dir = temp_dir();
+        let mut store = open(&dir);
+        let scope = [9_u8; 32];
+        let keys = (0..history_rows)
+            .map(|index| format!("hmac-sha256:{index:064x}"))
+            .collect::<Vec<_>>();
+        let etag = "e".repeat(64);
+        let writes = keys
+            .iter()
+            .map(|key| CloudAckWrite {
+                entity_key: key,
+                digest: [3; 32],
+                head_etag: Some(&etag),
+            })
+            .collect::<Vec<_>>();
+        store.cloud_commit(&scope, &writes, None, 0).unwrap();
+        let page = keys[..20].iter().map(String::as_str).collect::<Vec<_>>();
+        let probe = crate::local_resource_diagnostics::StateV2Probe::begin();
+        let found = store.cloud_read_acks(&scope, &page, 0).unwrap();
+        let (cpu_us, steady, peak) = probe.finish();
+        assert_eq!(found.len(), page.len());
+        let heap = found.capacity() * std::mem::size_of::<(String, CloudAck)>()
+            + found
+                .iter()
+                .map(|(key, ack)| {
+                    key.capacity() + ack.head_etag.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>();
+        assert_eq!(*active_heap.get_or_insert(heap), heap);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "cloud_cache_resource_receipt": 1,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "seed": 0,
+                "history_rows": history_rows,
+                "active_rows": found.len(),
+                "retained_page_bytes": heap,
+                "parent_cpu_us": cpu_us,
+                "parent_steady_bytes": steady,
+                "parent_peak_bytes": peak,
+                "cli_calls": 0,
+                "scope": "indexed ACK read only; provider and mixed local workload not measured"
+            })
+        );
+    }
+}

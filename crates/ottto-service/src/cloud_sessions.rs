@@ -1593,8 +1593,13 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                 request_timeout,
             )
         })?;
+        if value.get("schema_version").and_then(Value::as_str) != Some(AUTHORITY_SCHEMA_VERSION) {
+            return Err(
+                crate::snapshot_client::CloudSessionRouteUnsupported { status: 200 }.into(),
+            );
+        }
         serde_json::from_value(value)
-            .map_err(|error| anyhow!("invalid cloud-session authority response: {error}"))
+            .map_err(|_| anyhow!("invalid cloud-session authority response"))
     }
 
     fn send_changes(
@@ -3522,10 +3527,7 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
                     &mut active_transport,
                     Instant::now(),
                 );
-                if matches!(
-                    outcome,
-                    CloudSessionCycleOutcome::Failed | CloudSessionCycleOutcome::Unsupported
-                ) {
+                if outcome == CloudSessionCycleOutcome::Failed {
                     eprintln!("codex_cloud_session_collector outcome={outcome:?}");
                 }
                 let wake_at = collector.next_wake(
