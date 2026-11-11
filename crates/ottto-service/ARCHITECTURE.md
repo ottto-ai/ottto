@@ -391,3 +391,26 @@ server capability or the replay directive; the upload filter applies them at sen
 keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
 file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
 applies to bodies from then on, never retroactively.
+
+### Collector approval continuity
+
+Daily provider reporting and cloud-session approvals survive daemon updates and
+sign-ins to the same Ottto account on the same physical Mac. An enabled bound
+approval can rebind to the current relay device through its collector-specific
+`grants/{id}/rebind` endpoint, authenticated with that target device's relay token.
+The request sends the stored grant version, new scope fingerprint, live hardware
+hash and original disclosure; the server resolves the previous device. Successful
+rebind preserves the grant epoch, consent-time build, account fingerprint and
+exclusions. The local grant is replaced atomically. It never replays transcripts.
+
+Live hardware must match the saved identity before collection and rebind. Missing
+hardware proof stops collection. A revoked or disabled approval is never rebound.
+Terminal refusals stop retries for that binding until the binding changes or the
+service restarts. HTTP 404 retains the stopped-binding behavior for servers that
+have not deployed rebind yet. Transport, 429 and server errors use normal polling.
+
+Cloud uploads, scan chunks, finalize and health report the running build; authority
+reads include `collector_version`. Producer admission remains server-controlled.
+Older daemons retain their existing upload contracts. The minimum capable daemon
+is the first release containing this implementation; release publication assigns
+the exact version.

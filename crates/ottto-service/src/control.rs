@@ -250,7 +250,13 @@ fn reserve_identity_mutation_locked(
     {
         return Err(LocalApiError::IdentityMutationInProgress);
     }
-    Ok(IdentityMutationReservation { id, snapshot })
+    let reservation = IdentityMutationReservation { id, snapshot };
+    // The reservation closes new provider/upload admission. Drain work already
+    // admitted before replacing local identity; consent itself remains intact.
+    crate::cloud_sessions::CloudSessionCheckpointStore::default()
+        .wait_for_collector_io_idle(crate::cloud_sessions::COLLECTOR_IO_STOP_TIMEOUT)
+        .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
+    Ok(reservation)
 }
 
 fn require_identity_mutation_reservation(
@@ -7528,12 +7534,29 @@ fn require_cloud_session_cleanup_before_identity_change_without_pause(
 }
 
 fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
-    grant.status == crate::cloud_sessions::CloudSessionGrantStatus::Revoked
-        && !grant.backend_create_pending
-        && match grant.backend_binding.as_ref() {
-            Some(binding) => binding.backend_revoked,
-            None => true,
-        }
+    use crate::cloud_sessions::CloudSessionGrantStatus;
+    if grant.backend_create_pending {
+        return false;
+    }
+    if matches!(
+        grant.status,
+        CloudSessionGrantStatus::Enabled
+            | CloudSessionGrantStatus::Paused
+            | CloudSessionGrantStatus::PolicyDisabled
+    ) && grant
+        .backend_binding
+        .as_ref()
+        .is_some_and(|binding| !binding.backend_revoked)
+    {
+        // A stable approval may become dormant across logout or sign-in.
+        // Current local identity and relay authority are proved at every I/O.
+        return true;
+    }
+    grant.status == CloudSessionGrantStatus::Revoked
+        && grant
+            .backend_binding
+            .as_ref()
+            .is_none_or(|binding| binding.backend_revoked)
 }
 
 fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApiError {
@@ -25240,16 +25263,10 @@ for line in sys.stdin:
         let pending = grants.load().unwrap().unwrap();
         let enabled = cloud_control_backend_grant(&pending, device_id, "enabled", 1);
         grants.bind_backend_grant(&enabled, device_id).unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&grants).unwrap();
 
         grants.pause(time::OffsetDateTime::now_utc()).unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&grants).unwrap();
 
         grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
         assert!(matches!(
@@ -25283,15 +25300,12 @@ for line in sys.stdin:
         policy_grants
             .bind_backend_grant(&disabled, device_id)
             .unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&policy_grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&policy_grants).unwrap();
     }
 
     #[test]
     #[serial]
-    fn auth_reset_preserves_identity_until_cloud_session_cleanup_is_confirmed() {
+    fn auth_reset_keeps_a_bound_cloud_session_approval() {
         let support_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup");
         let secret_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup-secrets");
         fs::create_dir_all(&secret_root).unwrap();
@@ -25339,40 +25353,14 @@ for line in sys.stdin:
                 forget_installation: false,
             },
         };
-        for local_only in [false, true] {
-            let blocked = handle_request(&daemon, request(local_only));
-            assert!(!blocked.ok);
-            let error = blocked.error.unwrap();
-            assert_eq!(error.code, CliErrorCode::NeedsUserAction);
-            assert_eq!(
-                error.details.get("reason_code"),
-                Some(&RedactedValue::String(
-                    "cloud_session_cleanup_required".to_string()
-                ))
-            );
-        }
-        assert_eq!(FileAccountStore::default().load().unwrap(), account);
-        assert_eq!(
-            FileDeviceStore::default()
-                .load()
-                .unwrap()
-                .unwrap()
-                .device_id,
-            device_id
-        );
-        assert_eq!(
-            grants.load().unwrap().unwrap().status,
-            crate::cloud_sessions::CloudSessionGrantStatus::Paused
-        );
-
-        grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
-        let revoked =
-            cloud_control_backend_grant(&grants.load().unwrap().unwrap(), device_id, "revoked", 2);
-        grants
-            .apply_backend_revocation(&revoked, device_id)
-            .unwrap();
+        let before = grants.load().unwrap().unwrap();
         let allowed = handle_request(&daemon, request(true));
         assert!(allowed.ok, "{allowed:?}");
+        assert_eq!(
+            grants.load().unwrap().unwrap(),
+            before,
+            "logout retains the approval for authenticated rebind after sign-in"
+        );
         assert_eq!(
             FileAccountStore::default().load().unwrap().state,
             LocalAccountState::NotConnected
@@ -25382,7 +25370,7 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn account_and_device_replacement_paths_require_cloud_session_cleanup() {
+    fn account_and_device_replacement_keep_bound_cloud_session_consent() {
         let support_root = telemetry_key_store_root("cloud-session-identity-replacement");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
@@ -25414,39 +25402,27 @@ for line in sys.stdin:
 
         let mut next_account = old_account.clone();
         next_account.organization.as_mut().unwrap().id = "org_new".to_string();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_account_replacement(&next_account),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(require_cloud_session_cleanup_before_account_replacement(&next_account).is_ok());
         let next_device = LocalDeviceBinding {
             device_id: "00000000-0000-4000-8000-000000000003".to_string(),
             machine_id: Some("machine_new".to_string()),
             sources: vec!["codex".to_string()],
         };
-        assert!(matches!(
-            save_relay_device_binding(&next_device),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(save_relay_device_binding(&next_device).is_ok());
         assert_eq!(
             FileDeviceStore::default()
                 .load()
                 .unwrap()
                 .unwrap()
                 .device_id,
-            old_device_id
+            next_device.device_id
         );
 
         FileAccountStore::default().reset().unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_account_replacement(&next_account),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(require_cloud_session_cleanup_before_account_replacement(&next_account).is_ok());
         FileAccountStore::default().save(&old_account).unwrap();
         FileDeviceStore::default().reset().unwrap();
-        assert!(matches!(
-            save_relay_device_binding(&next_device),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(save_relay_device_binding(&next_device).is_ok());
         FileDeviceStore::default()
             .save(&LocalDeviceBinding {
                 device_id: old_device_id.to_string(),
@@ -25593,26 +25569,22 @@ for line in sys.stdin:
             }
             drop(lifecycle_lock);
 
-            assert!(matches!(
-                reset.join().unwrap(),
-                Err(LocalApiError::CloudSessionCleanupRequired)
-            ));
-            assert_eq!(FileAccountStore::default().load().unwrap(), account);
-            assert_eq!(
-                FileDeviceStore::default()
-                    .load()
-                    .unwrap()
-                    .unwrap()
-                    .device_id,
-                device_id
-            );
+            let reset_result = reset.join().unwrap();
             let retained = grants.load().unwrap().unwrap();
-            assert!(retained.backend_create_pending || retained.backend_binding.is_some());
             if bind_backend {
+                reset_result.unwrap();
                 assert_eq!(
                     retained.status,
-                    crate::cloud_sessions::CloudSessionGrantStatus::Paused
+                    crate::cloud_sessions::CloudSessionGrantStatus::Enabled
                 );
+                assert!(FileDeviceStore::default().load().unwrap().is_none());
+            } else {
+                assert!(matches!(
+                    reset_result,
+                    Err(LocalApiError::CloudSessionCleanupRequired)
+                ));
+                assert_eq!(FileAccountStore::default().load().unwrap(), account);
+                assert!(retained.backend_create_pending);
             }
         }
     }
@@ -25654,9 +25626,9 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn claim_completion_never_mutates_backend_before_cloud_cleanup() {
+    fn claim_completion_keeps_pending_create_cleanup_authority() {
         let _guard = lock_backend_test_env();
-        for bind_backend in [false, true] {
+        for bind_backend in [false] {
             let root = telemetry_key_store_root(if bind_backend {
                 "claim-reservation-active-grant"
             } else {

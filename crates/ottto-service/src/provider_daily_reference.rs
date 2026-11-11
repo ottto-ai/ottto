@@ -25,6 +25,7 @@
 //!   The backend separately applies its collector-build admission list to each
 //!   upload and stores nothing from an unadmitted build.
 
+use crate::grant_rebind::{self, GrantKind, RebindProposal, RebindRequest};
 use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
 use crate::local_resource_diagnostics::StageWindow;
 use anyhow::{anyhow, Context, Result};
@@ -521,6 +522,7 @@ impl GrantStore {
     /// Mirror the backend's durable exclusion locally so future cycles stop
     /// before contacting the provider rather than repeating a refused upload.
     pub fn set_account_excluded(&self, account_fingerprint: &str, excluded: bool) -> Result<()> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         if !is_fingerprint(account_fingerprint) {
             return Err(anyhow!("account fingerprint is invalid"));
         }
@@ -542,6 +544,7 @@ impl GrantStore {
     /// Record local consent. The grant is not live until the backend binds it:
     /// `backend_create_pending` is set, so [`grant_runtime_ready`] refuses it.
     pub fn enable(&self, setup: &GrantSetup, now: OffsetDateTime) -> Result<DailyReferenceGrant> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         if !is_uuid(&setup.installation_id) {
             return Err(anyhow!("installation id is not a device uuid"));
         }
@@ -615,6 +618,61 @@ impl GrantStore {
         })
     }
 
+    fn prepare_rebind(
+        &self,
+        setup: &GrantSetup,
+        hardware_id: String,
+    ) -> Result<Option<RebindProposal<DailyReferenceGrant>>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        if !grant_runtime_ready(&state.grant) {
+            return Ok(None);
+        }
+        let key = decode_hex(&state.hmac_key_hex).ok_or_else(|| anyhow!("invalid grant key"))?;
+        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
+        if installation_fingerprint == state.grant.installation_fingerprint {
+            return Ok(None);
+        }
+        if state.grant.disclosure_version == DISCLOSURE_VERSION_V1
+            && opaque_key(&key, &setup.provider_account_scope) != state.grant.account_fingerprint
+        {
+            return Err(anyhow!("v1 account binding changed"));
+        }
+        let scope = if state.grant.disclosure_version == DISCLOSURE_VERSION_V1 {
+            opaque_key(
+                &key,
+                &format!(
+                    "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+                    setup.installation_id,
+                    setup.organization_scope,
+                    setup.effective_user_scope,
+                    setup.provider_account_scope,
+                    COLLECTOR_ID
+                ),
+            )
+        } else {
+            grant_scope_fingerprint(&key, setup)
+        };
+        let version = state
+            .grant
+            .backend_binding
+            .as_ref()
+            .expect("runtime-ready binding")
+            .grant_version;
+        Ok(Some(RebindProposal {
+            expected: state.grant.clone(),
+            installation_fingerprint,
+            request: RebindRequest {
+                installation_id: setup.installation_id.clone(),
+                grant_version: version,
+                grant_scope_fingerprint: scope,
+                hardware_id: Some(hardware_id),
+                disclosure_version: state.grant.disclosure_version,
+            },
+        }))
+    }
+
     /// Bind the server's answer. This is the only writer of `collector_version`
     /// and of the backend binding. Build governance remains server-owned: each
     /// upload reports the running release for backend admission.
@@ -623,11 +681,40 @@ impl GrantStore {
         response: &GrantResponse,
         expected_installation_id: &str,
     ) -> Result<DailyReferenceGrant> {
+        self.bind_backend_grant_with_rebind(response, expected_installation_id, None)
+    }
+
+    fn bind_backend_grant_with_rebind(
+        &self,
+        response: &GrantResponse,
+        expected_installation_id: &str,
+        rebind: Option<&RebindProposal<DailyReferenceGrant>>,
+    ) -> Result<DailyReferenceGrant> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         let mut state = self
             .read()?
             .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
         let key = decode_hex(&state.hmac_key_hex)
             .ok_or_else(|| anyhow!("stored grant key is invalid"))?;
+        if let Some(proposal) = rebind {
+            if !grant_runtime_ready(&state.grant)
+                || state.grant.backend_binding != proposal.expected.backend_binding
+                || state.grant.installation_fingerprint
+                    != proposal.expected.installation_fingerprint
+                || state.grant.grant_scope_fingerprint != proposal.expected.grant_scope_fingerprint
+                || state.grant.account_fingerprint != proposal.expected.account_fingerprint
+                || state.grant.disclosure_version != proposal.expected.disclosure_version
+                || state.grant.collector_version != proposal.expected.collector_version
+                || response.grant_version != proposal.request.grant_version
+                || response.status != "enabled"
+                || response.server_policy_state != ServerPolicyState::Approved
+                || response.collector_version != state.grant.collector_version
+            {
+                return Err(anyhow!("rebind consent changed"));
+            }
+            state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
+            state.grant.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+        }
         if opaque_key(&key, expected_installation_id) != state.grant.installation_fingerprint {
             return Err(anyhow!(
                 "installation id does not match the recorded consent"
@@ -640,6 +727,22 @@ impl GrantStore {
             .as_ref()
             .map(|binding| binding.grant_version)
             .unwrap_or(0);
+        if response.grant_version == previous_version
+            && state.grant.backend_binding.as_ref().is_some_and(|binding| {
+                binding.grant_id == response.id
+                    && !binding.backend_revoked
+                    && binding.server_policy_state == response.server_policy_state
+            })
+            && state.grant.status == GrantStatus::Enabled
+            && response.status == "enabled"
+            && state.grant.collector_version == response.collector_version
+        {
+            if rebind.is_some() {
+                state.grant.last_error_category = None;
+                atomic_json_write(&self.path, &state)?;
+            }
+            return Ok(state.grant);
+        }
         if response.grant_version <= previous_version {
             return Err(anyhow!(
                 "backend grant epoch did not advance past the recorded epoch"
@@ -680,6 +783,7 @@ impl GrantStore {
     }
 
     pub fn revoke(&self, now: OffsetDateTime) -> Result<()> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         let Some(mut state) = self.read()? else {
             return Ok(());
         };
@@ -719,6 +823,7 @@ impl GrantStore {
         response: &GrantResponse,
         expected_installation_id: &str,
     ) -> Result<DailyReferenceGrant> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         let mut state = self
             .read()?
             .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
@@ -760,6 +865,7 @@ impl GrantStore {
 
     /// Record collector health. Never resurrects a non-enabled grant.
     fn record_health(&self, success_at: Option<&str>, error_category: Option<&str>) -> Result<()> {
+        let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         let Some(mut state) = self.read()? else {
             return Ok(());
         };
@@ -784,7 +890,7 @@ fn validate_grant_response(
         || response.collector_id != COLLECTOR_ID
         || response.schema_version != SCHEMA_VERSION
         || response.release_lane != RELEASE_LANE
-        || response.disclosure_version != DISCLOSURE_VERSION
+        || response.disclosure_version != grant.disclosure_version
         || response.grant_scope_fingerprint != grant.grant_scope_fingerprint
         || response.account_fingerprint != grant.account_fingerprint
         || !is_uuid(&response.id)
@@ -826,7 +932,10 @@ pub fn grant_runtime_block_reason(grant: &DailyReferenceGrant) -> Option<&'stati
     if grant.collector_id != COLLECTOR_ID {
         return Some("collector_id_mismatch");
     }
-    if grant.disclosure_version != DISCLOSURE_VERSION {
+    if !matches!(
+        grant.disclosure_version.as_str(),
+        DISCLOSURE_VERSION | DISCLOSURE_VERSION_V1
+    ) {
         return Some("disclosure_version_mismatch");
     }
     if grant.backend_create_pending {
@@ -982,6 +1091,21 @@ pub fn status_with_live_binding(
     if status.runtime_state != RuntimeState::Enabled {
         return status;
     }
+    if let Some(reason) = grants
+        .load()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|grant| grant.last_error_category.as_deref())
+        .and_then(grant_rebind::status_reason)
+    {
+        return CollectorStatusV1 {
+            runtime_state: RuntimeState::ConsentRequired,
+            provider_read_permitted: false,
+            reason_code: reason.to_string(),
+            ..status
+        };
+    }
     let Some(runtime) = runtime else {
         return status;
     };
@@ -1027,7 +1151,13 @@ fn live_binding_mismatch(grants: &GrantStore, runtime: &Runtime) -> Option<&'sta
     let stored = grants.load().ok().flatten()?;
     if let Ok(Some(installation)) = grants.installation_fingerprint_for(&runtime.installation_id) {
         if installation != stored.installation_fingerprint {
-            return Some("installation_mismatch");
+            return Some(
+                stored
+                    .last_error_category
+                    .as_deref()
+                    .and_then(grant_rebind::status_reason)
+                    .unwrap_or("rebinding"),
+            );
         }
     }
     if stored.disclosure_version == DISCLOSURE_VERSION_V1 {
@@ -3381,6 +3511,76 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     else {
         return deferred("device_credentials_unavailable");
     };
+    let hardware = match grant_rebind::verified_live_hardware() {
+        Ok(hardware) => hardware,
+        Err(reason) => {
+            let _ = collector.grants.record_health(None, Some(reason));
+            return deferred(reason);
+        }
+    };
+    let account = match FileAccountStore::default().load() {
+        Ok(account) => account,
+        Err(_) => return deferred("account_state_unreadable"),
+    };
+    let (Some(organization), Some(user)) = (account.organization.as_ref(), account.user.as_ref())
+    else {
+        return deferred("account_not_connected");
+    };
+    if device.device_id != runtime.installation_id {
+        return deferred("local_binding_changed");
+    }
+    let setup = GrantSetup {
+        installation_id: runtime.installation_id.clone(),
+        organization_scope: organization.id.clone(),
+        effective_user_scope: user.id.clone(),
+        provider_account_scope: runtime.provider_account_scope.clone(),
+    };
+    let proposal = match collector.grants.prepare_rebind(&setup, hardware) {
+        Ok(proposal) => proposal,
+        Err(_) => return deferred("account_mismatch"),
+    };
+    if let Some(proposal) = proposal {
+        let _ = collector.grants.record_health(None, Some("rebinding"));
+        let binding = proposal
+            .expected
+            .backend_binding
+            .as_ref()
+            .expect("bound grant");
+        let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url.clone());
+        match grant_rebind::rebind(
+            &client,
+            GrantKind::DailyReference,
+            &binding.grant_id,
+            &proposal.request,
+            &device,
+            &device_secret,
+            UPLOAD_TIMEOUT,
+        ) {
+            Ok(value) => {
+                let response = serde_json::from_value::<GrantResponse>(value);
+                if response
+                    .ok()
+                    .and_then(|response| {
+                        collector
+                            .grants
+                            .bind_backend_grant_with_rebind(
+                                &response,
+                                &runtime.installation_id,
+                                Some(&proposal),
+                            )
+                            .ok()
+                    })
+                    .is_none()
+                {
+                    return deferred("stale_binding");
+                }
+            }
+            Err(failure) => {
+                let _ = collector.grants.record_health(None, Some(failure.code));
+                return deferred(failure.code);
+            }
+        }
+    }
     let transport = RelayTransport::new(api_base_url, device, device_secret);
     let reader = ChatGptDailyUsageReader::new(credential);
     collector.collect_once(&runtime, &reader, &transport, now)

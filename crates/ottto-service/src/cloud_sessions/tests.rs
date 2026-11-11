@@ -2719,3 +2719,91 @@ fn v2_wire_and_persisted_checkpoint_never_contain_provider_cursor_or_raw_identit
         .keys()
         .any(|key| key == "raw-provider-private-id"));
 }
+
+/// [format] A sign-in rebind repeats safely after server commit and before local save.
+#[test]
+fn sign_in_rebind_recovers_without_a_new_epoch() {
+    let (store, _) = stores("rebind-crash");
+    enabled(&store);
+    store.record_health("healthy", "current", None).unwrap();
+    let original = store.read().unwrap().unwrap();
+    let target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000084".to_owned(),
+        organization_scope: "org_fixture".to_owned(),
+        effective_user_scope: "user_fixture".to_owned(),
+    };
+    let proposal = store
+        .prepare_rebind(&target, "hardware-fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = backend_grant(&original.grant, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    let reopened = CloudSessionGrantStore::new(store.path());
+    let recovered = reopened
+        .prepare_rebind(&target, "hardware-fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&proposal.request).unwrap(),
+        serde_json::to_value(&recovered.request).unwrap()
+    );
+    let rebound = reopened
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+        .unwrap();
+    assert_eq!(rebound.backend_binding, original.grant.backend_binding);
+    assert_eq!(
+        rebound.account_fingerprint,
+        original.grant.account_fingerprint
+    );
+    assert_eq!(rebound.granted_at, original.grant.granted_at);
+    assert_eq!(
+        rebound.last_collector_health,
+        original.grant.last_collector_health
+    );
+    assert_eq!(
+        reopened.read().unwrap().unwrap().hmac_key_hex,
+        original.hmac_key_hex
+    );
+    let bytes = fs::read(reopened.path()).unwrap();
+    reopened
+        .bind_backend_grant(&response, &target.installation_id)
+        .unwrap();
+    assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
+    assert!(reopened.runtime_candidate_for(&target).unwrap().is_some());
+    reopened.revoke(now()).unwrap();
+    assert!(reopened
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+        .is_err());
+}
+
+/// [regress] Updating the producer preserves approval and reports the current build.
+#[test]
+fn update_preserves_consent_time_build_and_uses_current_payload_build() {
+    let (store, _) = stores("update-approval");
+    enabled(&store);
+    let mut state = store.read().unwrap().unwrap();
+    state.grant.collector_version = "0.0.1".to_owned();
+    store.write(&state).unwrap();
+    assert!(cloud_grant_runtime_ready(&state.grant));
+    assert!(cloud_grant_preflight_eligible(&state.grant));
+    let batch = build_observation_batch(
+        &state.grant,
+        Vec::new(),
+        now(),
+        CloudSessionBatchKind::Heartbeat,
+        false,
+        CloudSessionCollectorHealthV1 {
+            state: "healthy".to_owned(),
+            observed_at: timestamp(now()),
+            error_category: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(batch.collector_version, compiled_release_version());
+    assert_eq!(store.load().unwrap().unwrap().collector_version, "0.0.1");
+}
