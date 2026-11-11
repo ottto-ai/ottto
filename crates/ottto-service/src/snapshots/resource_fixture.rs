@@ -226,8 +226,11 @@ impl Corpus {
     }
 
     fn append(&self, source: usize, turn: u64) {
-        let path = &self.files[source][0];
-        let mut body = serde_json::to_vec(&record(SOURCES[source], &session(0), turn)).unwrap();
+        self.append_n(source, 0, turn);
+    }
+    fn append_n(&self, source: usize, file: usize, turn: u64) {
+        let path = &self.files[source][file];
+        let mut body = serde_json::to_vec(&record(SOURCES[source], &session(file), turn)).unwrap();
         assert!(body.len() < 2048);
         body.resize(2047, b' ');
         body.push(b'\n');
@@ -267,6 +270,8 @@ struct Driver<'a> {
     counts: Counts,
     paced: bool,
     active_tokens: Option<u64>,
+    pending_hints: Vec<PathBuf>,
+    page_limit: usize,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
@@ -292,6 +297,8 @@ impl<'a> Driver<'a> {
             counts: Counts::default(),
             paced: false,
             active_tokens: None,
+            pending_hints: Vec::new(),
+            page_limit: 500,
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
@@ -350,10 +357,10 @@ impl<'a> Driver<'a> {
                     &self.corpus.roots[self.source],
                     &self.corpus.support,
                     index,
-                    500,
+                    self.page_limit,
                     true,
                     &self.corpus.births,
-                    &[],
+                    &self.pending_hints,
                 )
             } else {
                 self.fixture.scan_other_page(
@@ -362,11 +369,13 @@ impl<'a> Driver<'a> {
                     &self.corpus.support,
                     index,
                     true,
-                    500,
-                    &[],
+                    self.page_limit,
+                    &self.pending_hints,
                 )
             }
         });
+        let read = self.fixture.paths();
+        self.pending_hints.retain(|path| !read.contains(path));
         assert_eq!(scan.malformed_json_line_count, 0);
         assert_eq!(scan.invalid_utf8_line_count, 0);
         assert_eq!(scan.unreadable_path_count, 0);
@@ -799,6 +808,10 @@ fn resource_virtual_scenarios() {
                     {
                         appended += 1;
                         corpus.append(s, appended + 1);
+                        let hint = corpus.files[s][0].clone();
+                        if !drivers[s].pending_hints.contains(&hint) {
+                            drivers[s].pending_hints.push(hint);
+                        }
                         if s == 1 {
                             let changed = codex_writer
                                 .as_ref()
@@ -884,10 +897,8 @@ fn resource_virtual_scenarios() {
                         .or_default(),
                     numbers(&std::mem::take(&mut drivers[s].counts), s),
                 );
-                assert!(
-                    active_bytes >= appended * 2048,
-                    "every appended native byte drained"
-                );
+                assert!(active_bytes >= appended * 2048,
+                    "{case}: every appended native byte drained: observed={active_bytes}, expected={}", appended * 2048);
                 assert_eq!(
                     drivers[s].active_tokens,
                     Some((appended + 1) * 100),
@@ -1032,3 +1043,29 @@ fn resource_paced_rewalk_replay() {
 }
 
 mod native_qos;
+
+/// [regress] A real watcher hint drains the changed last file ahead of an
+/// unfinished native census. A cadence-only event cannot substitute for it.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_hint_active_drain() {
+    let corpus = Corpus::generate([4, 8, 2]);
+    let mut driver = seed(&corpus, 0);
+    driver.page_limit = 1;
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut driver.index);
+    driver.page(2000);
+    let before = driver.counts.parser_consumed_bytes;
+    corpus.append_n(0, 3, 2);
+    let target = corpus.files[0][3].clone();
+    driver.pending_hints.push(target.clone());
+    driver.page(2300);
+    assert!(
+        driver.fixture.paths().contains(&target),
+        "native changed file must win the pending census"
+    );
+    assert!(
+        driver.counts.parser_consumed_bytes >= before + 2048,
+        "the actual appended bytes drain"
+    );
+    assert!(driver.pending_hints.is_empty(), "delivered hint settled");
+}

@@ -70,7 +70,11 @@ explicitly, serially, without retries. The advisory build uses basic optimizatio
 only for the service test crate (`--config profile.test.package.ottto-service.opt-level=1`),
 retaining test debug assertions/overflow checks and the workspace's existing
 optimized dependencies ([Cargo profile overrides](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)). That profile is pinned in B. It changes neither native
-Mac nor money builds. Command wall time is CI overhead evidence.
+Mac nor money builds. Command wall time is CI overhead evidence. Calibration exceeded the initial
+40-minute total estimate, so the single advisory job allows 75 minutes. This
+adds no resource-test execution or timeout change to required shards; it does
+consume a Linux slot for substantially longer than the original estimate.
+Keep the check advisory and review duration drift before promotion.
 
 The off-pass replay uses the same native aggregation and formatter, flushing
 each event in the replay. The paced-rewalk replay requests another native paced
@@ -92,7 +96,7 @@ The native Mac PR runner invokes `scripts/resource_native_qos_pr.sh <PR-number>`
 It requires Darwin, a PR context and an exact PR-head match. Linux compiles and
 type-checks the test, then explicitly excludes its module from execution. The test is ignored
 by ordinary, scheduled and merge-group discovery and requires the runner's PR
-binding. No paid hosted Mac workflow is added. A Linux pass is not native Mac
+binding; zero-match runs fail. No paid hosted Mac workflow is added. A Linux pass is not native Mac
 evidence; record the native runner receipt separately.
 
 ## Stable candidate RC scorecard
