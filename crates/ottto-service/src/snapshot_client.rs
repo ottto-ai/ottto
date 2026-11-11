@@ -3075,6 +3075,7 @@ impl SnapshotApiClient {
             relay_token,
             agent
                 .get(&self.api_url(&path))
+                .query("collector_version", &ottto_core::compiled_release_version())
                 .timeout(request_timeout)
                 .set("Accept", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
@@ -3092,6 +3093,43 @@ impl SnapshotApiClient {
                 "cloud-session authority read",
                 "cloud_session_authority",
             )),
+        }
+    }
+
+    /// Rebind an existing enabled grant using the target relay credential.
+    pub(crate) fn rebind_collector_grant(
+        &self,
+        kind: crate::grant_rebind::GrantKind,
+        grant_id: &str,
+        relay_token: &str,
+        request: &crate::grant_rebind::RebindRequest,
+        timeout: Duration,
+    ) -> std::result::Result<Value, crate::grant_rebind::RebindFailure> {
+        use crate::grant_rebind::RebindFailure;
+        if !crate::hex::is_uuid(grant_id) || request.grant_version == 0 {
+            return Err(RebindFailure::http(422, None));
+        }
+        let (agent, request_timeout) =
+            cloud_session_deadline_agent(timeout).map_err(|_| RebindFailure::unavailable())?;
+        let path = format!("/api/v1/{}/grants/{grant_id}/rebind", kind.route());
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url(&path))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
+            Ok(response) if response.status() == 200 => response
+                .into_json()
+                .map_err(|_| RebindFailure::http(422, None)),
+            Ok(response) => Err(RebindFailure::http(response.status(), None)),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_json::<Value>().ok();
+                Err(RebindFailure::http(status, body.as_ref()))
+            }
+            Err(_) => Err(RebindFailure::unavailable()),
         }
     }
 
