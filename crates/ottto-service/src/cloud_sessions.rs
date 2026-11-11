@@ -1299,11 +1299,12 @@ impl CloudSessionCheckpointStore {
         crate::upload_receipts::cloud_read_acks(&self.state_dir, scope, keys, now_unix)
     }
 
-    fn crawl_completed(&self, scope: &[u8; 32]) -> Option<Date> {
-        let raw = crate::upload_receipts::cloud_crawl_completed_date(&self.state_dir, scope)
-            .ok()
-            .flatten()?;
-        Date::parse(&raw, &time::format_description::well_known::Iso8601::DATE).ok()
+    fn crawl_completed(&self, scope: &[u8; 32]) -> Result<Option<Date>> {
+        Ok(
+            crate::upload_receipts::cloud_crawl_completed_date(&self.state_dir, scope)?.and_then(
+                |raw| Date::parse(&raw, &time::format_description::well_known::Iso8601::DATE).ok(),
+            ),
+        )
     }
 
     /// Commit one slice's settled tasks under an I/O lease, so a commit racing
@@ -2079,12 +2080,25 @@ impl CloudCollector {
         }
         let scope = cache_scope(inputs.destination, &state.grant, &binding);
         self.schedule.reset_for_scope(scope);
+        let today = wall.date();
+        let opportunity = self.schedule.due(now, today, inputs.last_activity);
+        if !opportunity.head && !opportunity.crawl {
+            return CloudSessionCycleOutcome::NotDue;
+        }
         if !self.schedule.crawl_completed_loaded {
-            self.schedule.crawl_completed = inputs.checkpoints.crawl_completed(&scope);
+            self.schedule.crawl_completed = match inputs.checkpoints.crawl_completed(&scope) {
+                Ok(date) => date,
+                Err(_) => {
+                    return self.settle_failure(
+                        inputs,
+                        SliceError::backoff("ack_cache_unavailable"),
+                        now + started.elapsed(),
+                    );
+                }
+            };
             self.schedule.crawl_completed_loaded = true;
             inputs.checkpoints.retire_legacy_checkpoint();
         }
-        let today = wall.date();
         let due = self.schedule.due(now, today, inputs.last_activity);
         if !due.head && !due.crawl {
             return CloudSessionCycleOutcome::NotDue;
@@ -2467,15 +2481,15 @@ impl SliceWork<'_, '_> {
             .map(|change| change.entity_key.as_str())
             .filter(|key| !self.settled.contains_key(*key))
             .collect::<Vec<_>>();
-        // A cache that cannot be read remembers nothing; the server answers
-        // noop for unchanged tasks.
+        // A cache failure defers this page through cloud-only backoff.
+        // Retain no unbounded in-memory replacement and do not hammer the server.
         let cached = if keys.is_empty() {
             HashMap::new()
         } else {
             self.inputs
                 .checkpoints
                 .read_acks(&self.scope, &keys, self.wall.unix_timestamp())
-                .unwrap_or_default()
+                .map_err(|_| SliceError::backoff("ack_cache_unavailable"))?
         };
         let mut offer = Vec::new();
         for mut change in unique {

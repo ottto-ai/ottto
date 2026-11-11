@@ -3028,12 +3028,14 @@ impl SnapshotApiClient {
                 "cloud-session changes exceed the decoded request budget"
             ));
         }
-        let compressed = self
-            .cloud_upload_gzip
+        let compressed = gzip_enabled
             .load(Ordering::Relaxed)
             .then(|| gzip(&body))
             .flatten();
-        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+        let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
         let post = agent
             .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
             .timeout(request_timeout)
