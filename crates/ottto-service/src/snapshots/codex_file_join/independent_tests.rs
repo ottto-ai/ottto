@@ -112,7 +112,6 @@ fn compressed_revert_sums_are_order_independent_and_read_each_member_once() {
             let mut job = boot
                 .into_job(JobInputs {
                     metadata: &metadata,
-                    traces: None,
                     index: &index,
                     cache: Some(&cache),
                 })
@@ -187,7 +186,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
-            traces: None,
             index: &index,
             cache: Some(&cache),
         })
@@ -216,7 +214,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
-            traces: None,
             index: &index,
             cache: Some(&cache),
         })
@@ -346,7 +343,6 @@ fn independent_members_keep_tools_distinct_activity_and_artifacts() {
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
-            traces: None,
             index: &index,
             cache: Some(&cache),
         })
@@ -732,7 +728,6 @@ fn independent_fold_keeps_the_original_certified_evidence() {
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
-            traces: None,
             index: &index,
             cache: Some(&cache),
         })

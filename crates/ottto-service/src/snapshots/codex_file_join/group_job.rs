@@ -28,7 +28,6 @@ pub(in crate::snapshots) fn new_group_parser(
     file: File,
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
     let mut parser = OwnedJsonlParser::new(
@@ -37,7 +36,6 @@ pub(in crate::snapshots) fn new_group_parser(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(metadata),
-        traces,
     )?;
     codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
@@ -826,25 +824,12 @@ impl GroupBoot {
         let tee = if independent {
             None
         } else {
-            legacy_tee(
-                &legacy_expected,
-                &first,
-                &file,
-                inputs.metadata,
-                inputs.traces.clone(),
-            )?
+            legacy_tee(&legacy_expected, &first, &file, inputs.metadata)?
         };
         let mut parser = if independent {
-            independent_fold::parser(
-                file,
-                &first,
-                inputs.metadata,
-                inputs.traces,
-                inputs.index,
-                inputs.cache,
-            )?
+            independent_fold::parser(file, &first, inputs.metadata, inputs.index, inputs.cache)?
         } else {
-            new_group_parser(file, &first, inputs.metadata, inputs.traces, evidence)
+            new_group_parser(file, &first, inputs.metadata, evidence)
                 .map_err(|_| GroupEnd::Strict)?
         };
         let v2 = group_counting_is_v2(&parser.accumulator);
@@ -918,7 +903,6 @@ impl GroupBoot {
 /// Scan facts a group job is built with.
 pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
-    pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
 }
@@ -940,7 +924,6 @@ fn legacy_tee(
     member: &CandidateFile,
     file: &File,
     metadata: &CodexTitleMetadata,
-    traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
@@ -952,7 +935,6 @@ fn legacy_tee(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(metadata),
-        traces,
     )
     .map(|tee| Some(Box::new(tee)))
     .map_err(|_| GroupEnd::Strict)
@@ -1002,33 +984,6 @@ crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, d
 impl GroupJob {
     pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
         std::mem::take(&mut self.legacy_baselines)
-    }
-
-    /// The tee's live source-wide inputs (a paused job holds none).
-    pub(in crate::snapshots) fn take_tee_inputs(
-        &mut self,
-    ) -> Option<sampled_jsonl::LiveReductionInputs> {
-        self.tee
-            .as_mut()
-            .map(|tee| tee.take_live_reduction_inputs())
-    }
-
-    pub(in crate::snapshots) fn restore_tee_inputs(
-        &mut self,
-        inputs: Option<sampled_jsonl::LiveReductionInputs>,
-    ) {
-        if let (Some(tee), Some(inputs)) = (self.tee.as_mut(), inputs) {
-            tee.restore_live_reduction_inputs(inputs);
-        }
-    }
-
-    pub(in crate::snapshots) fn reinstall_tee_inputs(
-        &mut self,
-        traces: Option<Arc<CodexTurnTraceMap>>,
-    ) {
-        if let Some(tee) = self.tee.as_mut() {
-            tee.accumulator.codex_turn_traces = traces;
-        }
     }
 }
 
@@ -1370,7 +1325,6 @@ fn independent_member_eof(
     if opened.opened_object_identity != next.opened_object_identity {
         return Err(GroupEnd::Changed);
     }
-    let traces = active.parser.accumulator.codex_turn_traces.clone();
     // Drop the completed decoder before funding the next one. Finish uses only
     // its held descriptor's metadata after EOF, so an inert plain wrapper is safe.
     let held = active
@@ -1382,14 +1336,8 @@ fn independent_member_eof(
         .map_err(|_| GroupEnd::Strict)?;
     let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
     input.close();
-    let parser = independent_fold::parser(
-        file,
-        &next,
-        inputs.metadata,
-        traces,
-        inputs.index,
-        inputs.cache,
-    )?;
+    let parser =
+        independent_fold::parser(file, &next, inputs.metadata, inputs.index, inputs.cache)?;
     let mut old = std::mem::replace(&mut active.parser, parser);
     active
         .parser
@@ -1505,13 +1453,7 @@ fn open_member(
     } else if opened.opened_object_identity != member.opened_object_identity {
         return Err(GroupEnd::Changed);
     }
-    let tee = legacy_tee(
-        &group.legacy_expected,
-        &member,
-        &file,
-        inputs.metadata,
-        active.parser.accumulator.codex_turn_traces.clone(),
-    )?;
+    let tee = legacy_tee(&group.legacy_expected, &member, &file, inputs.metadata)?;
     group.tee = tee;
     // The copy budget keeps counting across the swap: no walk per member.
     group.consumed_before = group

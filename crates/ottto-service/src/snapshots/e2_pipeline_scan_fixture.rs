@@ -848,7 +848,6 @@ pub(super) fn parse_ordinary_with_metadata(
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         None,
-        None,
     )?;
     while !parser.step()? {}
     let index = ordinary_index(ScanIndex::default());

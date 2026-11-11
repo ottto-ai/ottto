@@ -725,7 +725,6 @@ pub(in crate::snapshots) mod tests {
             SnapshotSource::Codex,
             apply_codex_line,
             Some(&CodexTitleMetadata::default()),
-            None,
         )
         .unwrap()
     }

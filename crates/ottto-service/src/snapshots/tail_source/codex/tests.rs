@@ -217,7 +217,7 @@ fn every_codex_field_home_round_trips_through_head_and_pages() {
         acc.codex_dictionary_slots.open_calls.ordered()
     );
     // Live inputs never come back from storage.
-    assert!(back.codex_turn_traces.is_none() && back.codex_tier_replay.is_none());
+    assert!(back.codex_tier_replay.is_none());
     assert_reencodes(&reduction, &certificate, &staged);
 }
 
@@ -609,16 +609,11 @@ fn install_live_installs_when_evidence_holds() {
         .codex_observed_priority_turns
         .as_mut()
         .unwrap()
-        .extend([("priority".to_owned(), true), ("plain".to_owned(), false)]);
-    let mut traces = CodexTurnTraceMap::default();
-    traces.priority_turns.insert("priority".into());
+        .insert("plain".to_owned(), false);
     let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
-    live.codex_turn_traces = Some(Arc::new(traces));
     live.codex_sidecar_projected_next_ordinal = Some(7);
     assert_eq!(install(&mut stored, &live), Ok(()));
     assert_eq!(stored.codex_sidecar_projected_next_ordinal, Some(7));
-    assert!(stored.codex_turn_traces.is_some());
-    assert!(live.codex_turn_traces.is_some());
 }
 
 /// [money] The stored projected ordinal against this read's: a missing one
@@ -648,8 +643,9 @@ fn install_live_compares_the_projected_ordinal() {
     assert_eq!(grown.codex_sidecar_projected_next_ordinal, Some(6));
 }
 
-/// [money] The counting rule and the priority decisions decide reuse: absent or
-/// incomplete evidence waits, evidence that disagrees rebuilds.
+/// [money] The counting rule and the priority decisions decide reuse: evidence
+/// that disagrees rebuilds. A priority decision an earlier build applied from
+/// Codex logs no longer holds, so its read rebuilds under its tier receipt.
 #[test]
 fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     let live = SnapshotAccumulator::new(SnapshotSource::Codex);
@@ -681,30 +677,10 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     };
     assert_eq!(
         install(&mut decided(true), &live),
-        Err(LiveLoadError::Unavailable),
-        "no traces cannot prove a change"
+        incompatible(INCOMPATIBLE_PRIORITY_DECISION),
+        "a logs-derived decision no longer holds"
     );
     assert_eq!(install(&mut decided(false), &live), Ok(()));
-
-    let with_traces = |incomplete: bool| {
-        let traces = CodexTurnTraceMap {
-            incomplete,
-            ..Default::default()
-        };
-        let mut live = SnapshotAccumulator::new(SnapshotSource::Codex);
-        live.codex_turn_traces = Some(Arc::new(traces));
-        live
-    };
-    assert_eq!(
-        install(&mut decided(true), &with_traces(false)),
-        incompatible(INCOMPATIBLE_PRIORITY_DECISION),
-        "complete traces prove the change"
-    );
-    assert_eq!(
-        install(&mut decided(true), &with_traces(true)),
-        Err(LiveLoadError::Unavailable),
-        "incomplete traces do not"
-    );
 }
 
 /// [behaviour] Each `install_live` refusal counts under its own label: a
@@ -729,13 +705,12 @@ fn install_live_labels_each_incompatible_check() {
         ("incompatible_priority_witness", |stored, _| {
             stored.codex_observed_priority_turns = None;
         }),
-        ("incompatible_priority_decision", |stored, live| {
+        ("incompatible_priority_decision", |stored, _| {
             stored
                 .codex_observed_priority_turns
                 .as_mut()
                 .unwrap()
                 .insert("t".into(), true);
-            live.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap::default()));
         }),
         ("incompatible_ordinal", |stored, live| {
             stored.codex_sidecar_projected_next_ordinal = Some(5);

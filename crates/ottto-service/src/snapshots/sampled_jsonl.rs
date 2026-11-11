@@ -4,11 +4,6 @@ use super::*;
 use crate::transcript_acquisition::{AuditDebt, Checkpoint, FullReason, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
 
-// Dependency witnesses: an excessive or nonstandard identifier drops the
-// witness set, which declines continuation without cloning it.
-pub(super) const MAX_PRIORITY_WITNESSES: usize = 256;
-pub(super) const MAX_PRIORITY_WITNESS_ID_BYTES: usize = 128;
-
 /// Disclosed terminal loss can settle native output, but cannot verify source
 /// history. Both acquisition certificates and ordinary full completion use
 /// this same rule; settlement's intentionally broader predicate stays native.
@@ -106,23 +101,7 @@ pub(super) enum SideCertificate {
     Uncertified,
 }
 
-// Source-scan dependencies are refreshed on reuse and never retained in a
-// checkpoint or a paused job's charge.
-pub(super) struct LiveReductionInputs {
-    traces: Option<Arc<CodexTurnTraceMap>>,
-}
-
 impl OwnedJsonlParser {
-    pub(super) fn take_live_reduction_inputs(&mut self) -> LiveReductionInputs {
-        LiveReductionInputs {
-            traces: self.accumulator.codex_turn_traces.take(),
-        }
-    }
-
-    pub(super) fn restore_live_reduction_inputs(&mut self, inputs: LiveReductionInputs) {
-        self.accumulator.codex_turn_traces = inputs.traces;
-    }
-
     /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
     /// durable debt must be supplied by the existing source/index authority.
     pub(super) fn prepare_acquisition(
@@ -164,16 +143,7 @@ impl OwnedJsonlParser {
                     .accumulator
                     .codex_observed_priority_turns
                     .as_ref()
-                    .is_some_and(|observed| {
-                        observed.iter().all(|(turn, priority)| {
-                            *priority
-                                == self
-                                    .accumulator
-                                    .codex_turn_traces
-                                    .as_ref()
-                                    .is_some_and(|traces| traces.is_priority_turn(turn))
-                        })
-                    }))
+                    .is_some_and(sampled_scan::codex_cursor::priority_decisions_hold))
         });
         if !reusable {
             old = None;
@@ -213,13 +183,11 @@ impl OwnedJsonlParser {
                 positive_usage_evidence,
             } = old.take().expect("continued acquisition").state;
             // These are live native inputs, not immutable retained history.
-            // Known prior trace decisions were compared above; fresh suffixes
-            // use this cycle's traces. Projected EOF advances with appends.
+            // Projected EOF advances with appends.
             let mut accumulator = accumulator;
             accumulator
                 .claude_file_birth
                 .refresh_opened(&self.accumulator.claude_file_birth);
-            accumulator.codex_turn_traces = self.accumulator.codex_turn_traces.take();
             accumulator.codex_sidecar_projected_next_ordinal =
                 self.accumulator.codex_sidecar_projected_next_ordinal;
             self.accumulator = accumulator;
@@ -260,15 +228,11 @@ impl OwnedJsonlParser {
     }
 
     /// Offline durable-record controls need a real reduction: the
-    /// accumulator without this cycle's live, shared inputs, plus the report
-    /// scalars.
+    /// accumulator plus the report scalars.
     #[cfg(test)]
     pub(super) fn durable_test_reduction_copy(&mut self) -> CachedJsonlReduction {
-        let inputs = self.take_live_reduction_inputs();
-        let accumulator = self.accumulator.clone();
-        self.restore_live_reduction_inputs(inputs);
         CachedJsonlReduction {
-            accumulator,
+            accumulator: self.accumulator.clone(),
             report: self.reader.report,
             recognized_usage_drop_count: self.recognized_usage_drop_count,
             positive_recognized_usage_count: self.positive_recognized_usage_count,

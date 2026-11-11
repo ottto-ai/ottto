@@ -163,11 +163,11 @@ streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
 
-Recent logs still use the existing full reader on every pass at both log
-locations, including its time window, ts-DESC result limit and incompleteness
-rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
-scan diagnostics include reuse/reload counts for state, history and session
-index facts, plus absent roots. An incremental logs reader is deferred.
+Codex logs are not read. Priority comes only from rollout thread settings; a
+row an earlier build priced from logs keeps that tier through its protected
+tier receipt. Sidecar facts are never persisted; a restart fully loads them.
+Terminal scan diagnostics include reuse/reload counts for state, history and
+session index facts, plus absent roots.
 
 ## CLI status metadata
 

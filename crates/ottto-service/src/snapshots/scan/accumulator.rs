@@ -328,21 +328,16 @@ pub(in crate::snapshots) struct SnapshotAccumulator {
     // with that turn's token_count.
     pub(in crate::snapshots) latest_reasoning_effort: Option<String>,
     // Most-recently-observed Codex turn id (from `turn_context.payload.turn_id`).
-    // The token_count event carries no turn id, so the running turn id is what
-    // joins each usage row to its `logs_2` fast-mode signal. Raw id (class L):
-    // never uploaded except where the upload contract already carries it;
-    // persisted only in the local durable-tail store.
+    // The token_count event carries no turn id, so the running turn id keys
+    // each usage row's protected tier replay. Raw id (class L): never uploaded
+    // except where the upload contract already carries it; persisted only in
+    // the local durable-tail store.
     pub(in crate::snapshots) latest_turn_id: Option<String>,
-    // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
-    // read-only across every session file in the cycle via `Arc`.
-    pub(in crate::snapshots) codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
-    // Keyed by raw turn id (class L): never uploaded except where the upload
-    // contract already carries it; persisted only in the local durable-tail
-    // store.
+    // Per-turn priority decisions an earlier build applied from Codex logs,
+    // restored from the durable-tail store; a new read records none. Keyed by
+    // raw turn id (class L): never uploaded except where the upload contract
+    // already carries it; persisted only in the local durable-tail store.
     pub(in crate::snapshots) codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
-    /// A paged cursor job keeps every turn witness, charged by bytes in its
-    /// slot; every other reader keeps the cache-only witness caps.
-    pub(in crate::snapshots) codex_priority_witnesses_uncapped: bool,
     pub(in crate::snapshots) codex_tier_replay: Option<codex_file_join::TierReplay>,
     // Usage-counting V2 state. `None` (unconfigured) and a Legacy decision
     // keep today's counting byte for byte.
@@ -805,37 +800,6 @@ impl SnapshotAccumulator {
         self.dropped_usage_record_count = self.dropped_usage_record_count.saturating_add(1);
     }
 
-    /// True when the running turn (`latest_turn_id`) paid for Codex fast mode,
-    /// per the `logs_2` request tier. Used to stamp `service_tier=priority` onto
-    /// that turn's usage row only — never onto `current_selector`, so the signal
-    /// does not bleed into later standard turns of the same session.
-    pub(in crate::snapshots) fn current_turn_is_priority(&mut self) -> bool {
-        let Some(turn_id) = self.latest_turn_id.as_ref() else {
-            return false;
-        };
-        let priority = self
-            .codex_turn_traces
-            .as_ref()
-            .is_some_and(|traces| traces.is_priority_turn(turn_id));
-        if let Some(observed) = self.codex_observed_priority_turns.as_mut() {
-            if !self.codex_priority_witnesses_uncapped
-                && (turn_id.len() > sampled_jsonl::MAX_PRIORITY_WITNESS_ID_BYTES
-                    || (observed.len() >= sampled_jsonl::MAX_PRIORITY_WITNESSES
-                        && !observed.contains_key(turn_id)))
-            {
-                // Dropping a dependency witness disables future retention,
-                // never the native usage decision or durable audit obligation.
-                self.codex_observed_priority_turns = None;
-            } else {
-                if self.source == SnapshotSource::Codex {
-                    self.codex_dictionary_slots.priority_turns.note(turn_id);
-                }
-                observed.insert(turn_id.clone(), priority);
-            }
-        }
-        priority
-    }
-
     /// Replace the running requested tier from one in-epoch thread-settings
     /// snapshot. Only an explicit non-default tier sets it; anything else
     /// clears it, adds no `service_tier` and prices as standard, so an earlier
@@ -876,8 +840,8 @@ impl SnapshotAccumulator {
     }
 
     /// Stamp one in-epoch request with its requested-tier estimate. Runs after
-    /// `logs_2` and the protected replay, whose tiers win; the replay never
-    /// sees this stamp, so it files no applied-tier receipt.
+    /// the protected replay, whose tier wins; the replay never sees this stamp,
+    /// so it files no applied-tier receipt.
     pub(in crate::snapshots) fn stamp_codex_thread_tier(
         &self,
         selector: &mut SelectorCapture,
@@ -1413,7 +1377,7 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
         }
     }
 }
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, repository_binding, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, codex_dictionary_slots, codex_sidecar_binding);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, repository_binding, latest_model, latest_reasoning_effort, latest_turn_id, codex_observed_priority_turns, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_fork_parent, claude_money, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, claude_line_clocks, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start, codex_dictionary_slots, codex_sidecar_binding);
 crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, last_activity_at);
 crate::durable_tail_codec::durable_struct!(UsageBucketState {
     D rows: BTreeMap<RowKey, BucketRowAccumulator>,

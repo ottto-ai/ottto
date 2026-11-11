@@ -459,7 +459,7 @@ pub(in crate::snapshots) trait TailSource {
     }
     /// Installs the live inputs of this read into a validated stored state,
     /// before the load publishes it as reused. `live` is the read's fresh
-    /// accumulator, configured before any line (traces, sidecar projection,
+    /// accumulator, configured before any line (sidecar projection,
     /// counting rule); a load never parses with it.
     /// By default a source's live inputs join at finish, never into the
     /// stored state.
@@ -1053,9 +1053,17 @@ head_fields! {
         U latest_model: Option<String>,
         U latest_reasoning_effort: Option<String>,
         L latest_turn_id: Option<String>,
-        I codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    }
+    retired {
+        I retired_codex_turn_traces: serde::de::IgnoredAny = serde::de::IgnoredAny => codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    }
+    {
         I codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
-        N codex_priority_witnesses_uncapped: bool,
+    }
+    retired {
+        N retired_codex_priority_witnesses_uncapped: bool = false => codex_priority_witnesses_uncapped: bool,
+    }
+    {
         I codex_tier_replay: Option<codex_file_join::TierReplay>,
         D codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
         D current_selector: SelectorCapture,
