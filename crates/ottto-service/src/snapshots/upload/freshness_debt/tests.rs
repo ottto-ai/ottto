@@ -407,6 +407,120 @@ fn listed_history_held_leaves_the_age_alarm_unless_refused() {
         f.close();
     }
 }
+/// A resumed walk keeps the held-history exemption for its already listed
+/// files, while refused or newly grown files keep their age alarm.
+#[test]
+fn resumed_walk_keeps_listed_history_held_exemption() {
+    for variant in ["unchanged", "refused", "grown"] {
+        let mut f = Fixture::new(Source::Claude, "resumed-listed-history");
+        let first = f.file("first.jsonl", 100);
+        let other_root = f.dir.join("other-root");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let second = other_root.join("second.jsonl");
+        std::fs::write(&second, [b'x'; 100]).unwrap();
+        let roots = [f.root.clone(), other_root];
+        let activate = |index: &mut ScanIndex| {
+            index.activate_effective_upload_body_witness_revision(3);
+            index.claude_reemission_exclusions =
+                claude_reemission_exclusions::ReemissionExclusions::listing_every_family_for_test();
+            index.activate_file_upload_context(SnapshotSource::ClaudeCode, CONTEXT.into());
+        };
+        for file in [&first, &second] {
+            age(file, 7 * HOUR);
+            let key = local_index_key(file);
+            f.index.files.insert(key.clone(), entry(file));
+            let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+            item.source_file_fingerprint =
+                Some(f.index.files[&key].source_file_fingerprint.clone());
+            item.snapshot_fingerprint = snapshot_fingerprint(f.source, &item);
+            let body = snapshot_upload_body_witness(&item);
+            f.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .last_upload_body_witness = Some(snapshot_file_upload_body_set_hex([body.clone()]));
+            if variant == "refused" && file == &first {
+                let fingerprint = item.snapshot_fingerprint.clone();
+                let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+                record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+                record.retry_after_unix_seconds = 0;
+                record.upload_body_witness = Some(body);
+                f.index
+                    .file_snapshot_fingerprints
+                    .insert(key, BTreeSet::from([fingerprint.clone()]));
+                f.index
+                    .quarantined_snapshot_fingerprints
+                    .insert(fingerprint, record);
+            }
+        }
+        activate(&mut f.index);
+        // Commit both files' held debt and establish a recent complete discovery.
+        walk(f.source, &roots, &mut f.index);
+        f.save();
+        activate(&mut f.index);
+        f.index.traversal = None;
+        ensure_bounded_traversal(
+            f.source,
+            &roots,
+            &mut f.index,
+            "2026-10-30T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            advance_bounded_directory_traversal_with_budget(
+                f.source,
+                &mut f.index,
+                BACKFILL_WINDOW_DAYS,
+                1,
+                None,
+                |_| {},
+            )
+        });
+        assert!(rows.iter().all(|row| row["stage"] != "freshness_alarm"));
+        let pending = &f.index.traversal.as_ref().unwrap().pending_directories;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, roots[1]);
+        f.save();
+        restart();
+        activate(&mut f.index);
+        if variant == "grown" {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&first)
+                .unwrap()
+                .write_all(b"new bytes")
+                .unwrap();
+        }
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            advance_bounded_directory_traversal_with_budget(
+                f.source,
+                &mut f.index,
+                BACKFILL_WINDOW_DAYS,
+                1,
+                None,
+                |_| {},
+            )
+        });
+        let rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row["stage"] == "freshness_alarm")
+            .collect();
+        assert_eq!(rows.len(), 1, "{variant}");
+        let counts = &rows[0]["counts"];
+        let aged = u64::from(variant != "unchanged");
+        assert_eq!(
+            counts["debt"]["listed_history_held_files"],
+            2 - aged,
+            "{variant}"
+        );
+        assert_eq!(counts["debt"]["over_6h_files"], aged, "{variant}");
+        assert_eq!(counts["debt"]["outstanding_files"], 2, "{variant}");
+        assert_eq!(counts["debt"]["held_files"], 2, "{variant}");
+        assert_eq!(counts["debt"]["alarm"], aged != 0, "{variant}");
+        assert_eq!(counts["alarm"], aged != 0, "{variant}");
+        f.close();
+    }
+}
 /// [money] Positive control, persisted: after a newer suffix, the exact
 /// receipt of the stored prefix retires that prefix and nothing more; the
 /// suffix keeps its own first change and bytes.
