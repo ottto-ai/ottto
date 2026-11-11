@@ -91,6 +91,10 @@
       "excluded": [
         "linux_synthetic_logical_work"
       ]
+    },
+    "fixture": {
+      "receipt_window_days": 183,
+      "replay_window": "native scan_request_window_days(receipt_window_days, true), until census completion"
     }
   },
   "counts": {}

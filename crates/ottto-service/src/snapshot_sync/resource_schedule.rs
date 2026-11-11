@@ -65,8 +65,8 @@ impl Switch {
         true
     }
 }
-pub(crate) fn collection_window(replay: bool) -> u64 {
-    scan_request_window_days(crate::snapshots::BACKFILL_WINDOW_DAYS, replay)
+pub(crate) fn collection_window(receipt_window_days: u64, replay: bool) -> u64 {
+    scan_request_window_days(receipt_window_days, replay)
 }
 pub(crate) fn needs_pacing(scan: &SourceScanResult) -> bool {
     continuation::resident_scan_requested(scan)
