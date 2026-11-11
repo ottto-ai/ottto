@@ -1153,6 +1153,22 @@ fn maintenance_cache_counters_are_optional_counts() {
     }
 }
 
+/// [regress] A write transaction prints one maintenance row, after its commit.
+#[test]
+fn write_transaction_prints_only_the_commit_maintenance_row() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        put(&mut tx, &traversal("one".into()), b"x");
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    });
+    let stats = rows
+        .iter()
+        .filter(|r| r["counts"].get("cache_used_bytes").is_some());
+    assert_eq!(stats.count(), 1, "{rows:?}");
+}
+
 /// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {

@@ -396,6 +396,10 @@ fn cli_metadata_cache_hit_skips_spawn() {
             |_| false,
         );
     });
+    let with_children = rows
+        .iter()
+        .filter(|r| r["observation"].get("cli_children").is_some());
+    assert!(with_children.all(|r| r["stage"] == "source_prepare"));
     let children = rows.last().unwrap()["observation"]["cli_children"]
         .as_array()
         .unwrap();
