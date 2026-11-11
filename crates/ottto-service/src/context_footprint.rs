@@ -377,7 +377,9 @@ fn harvest_source(
     let mint = || client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode);
     let identity = destination_identity(device, machine_id, api_base_url);
     let marker = org_disabled_marker_path(support_dir);
-    match client.get_activity_hint(&relay_token) {
+    match crate::snapshot_sync::small_source_upload(SnapshotSource::ClaudeCode, || {
+        client.get_activity_hint(&relay_token)
+    }) {
         Ok(hint) => {
             if !hint.context_footprint_harvest_enabled {
                 write_marker(&marker, &identity);

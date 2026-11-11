@@ -4234,8 +4234,25 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        deadlines.insert(source.api_slug(), Instant::now() + retry_after);
+        let deadline = Instant::now() + retry_after;
+        deadlines
+            .entry(source.api_slug())
+            .and_modify(|existing| *existing = (*existing).max(deadline))
+            .or_insert(deadline);
     }
+}
+
+/// Small-route errors keep their typed diagnostics while sharing source backoff.
+/// Terminal reports and heartbeats still send during an existing batch backoff.
+pub(crate) fn small_source_upload<T>(
+    source: SnapshotSource,
+    send: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    send().inspect_err(|error| {
+        if let Some(shed) = error.downcast_ref::<UploadShed>() {
+            defer_source_uploads(source, note_shed_and_backoff(source, shed.retry_after));
+        }
+    })
 }
 
 /// Remaining backoff for `source`, or `None` when it may upload now.
@@ -6143,6 +6160,10 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         if source_snapshots.is_empty() {
             continue;
         }
+        if source_upload_backoff_remaining(source).is_some() {
+            failed_sources.push(source.api_slug());
+            continue;
+        }
         let relay_token = match client.issue_status_relay_token(&device, &device_secret, source) {
             Ok(token) => token,
             Err(error) => {
@@ -6554,7 +6575,7 @@ fn prepare_sync_source_inner(
     }
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
-    let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    let mut activity_hint = small_source_upload(source, || client.get_activity_hint(&relay_token))?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can
@@ -6621,6 +6642,9 @@ fn prepare_sync_source_inner(
         ) {
             transport_cycle.note_error(&error);
             eprintln!("local agent status upload skipped: {}", safe_error(&error));
+            if error.downcast_ref::<UploadShed>().is_some() {
+                return Err(error);
+            }
         }
     }
 
@@ -10244,10 +10268,12 @@ fn is_shed_failure(error: &anyhow::Error) -> bool {
         .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
 }
 
-fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
+fn is_snapshot_batch_split_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
-        .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
+        .is_some_and(|diagnostics| {
+            diagnostics.is_snapshot_batch_deadline() || diagnostics.is_snapshot_batch_too_large()
+        })
 }
 
 /// The wait before resending a failed batch in place, with the HTTP status
@@ -11371,7 +11397,7 @@ where
             Err(error)
                 if indices.len() > 1
                     && adaptive_splits < SNAPSHOT_ADAPTIVE_SPLIT_LIMIT
-                    && is_snapshot_batch_deadline_failure(&error) =>
+                    && is_snapshot_batch_split_failure(&error) =>
             {
                 adaptive_splits += 1;
                 let midpoint = indices.len() / 2;
@@ -11431,7 +11457,20 @@ where
                     retry_after: shed.retry_after,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if indices.len() == 1
+                    && error
+                        .downcast_ref::<UploadFailureDiagnostics>()
+                        .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_too_large)
+                {
+                    crate::local_resource_diagnostics::traversal_point(
+                        "quarantine_retry",
+                        poison_scope,
+                        &serde_json::json!({"status": 413, "count": 1}),
+                    );
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -11536,7 +11575,9 @@ fn upload_agent_status(
             .map(AgentStatusSnapshot::redacted_for_backend)
             .collect(),
     };
-    let response = client.upload_agent_status(relay_token, &request)?;
+    let response = small_source_upload(snapshot_source_of_kind(&snapshots[0].source), || {
+        client.upload_agent_status(relay_token, &request)
+    })?;
     persist_machine_icon(&response);
     crate::net_resilience::note_upstream_upload_succeeded("agent_status");
     Ok(response.accepted as usize)
@@ -11797,8 +11838,9 @@ struct TerminalReceiptPolicy {
 fn current_terminal_receipt_policy(
     client: &SnapshotApiClient,
     relay_token: &str,
+    source: SnapshotSource,
 ) -> Result<TerminalReceiptPolicy> {
-    let activity_hint = client.get_activity_hint(relay_token)?;
+    let activity_hint = small_source_upload(source, || client.get_activity_hint(relay_token))?;
     Ok(TerminalReceiptPolicy {
         receipt_window_days: validated_receipt_window_days(activity_hint.backfill_window_days)?,
         census_residue_status_admitted: activity_hint.census_residue_status_contract.as_deref()
@@ -11806,8 +11848,12 @@ fn current_terminal_receipt_policy(
     })
 }
 
-fn current_receipt_window_days(client: &SnapshotApiClient, relay_token: &str) -> Result<u64> {
-    Ok(current_terminal_receipt_policy(client, relay_token)?.receipt_window_days)
+fn current_receipt_window_days(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+    source: SnapshotSource,
+) -> Result<u64> {
+    Ok(current_terminal_receipt_policy(client, relay_token, source)?.receipt_window_days)
 }
 
 fn refresh_terminal_manifest(
@@ -11853,7 +11899,7 @@ fn report_status_with_fresh_relay_token(
     let TerminalReceiptPolicy {
         receipt_window_days,
         census_residue_status_admitted,
-    } = current_terminal_receipt_policy(client, &relay_token)?;
+    } = current_terminal_receipt_policy(client, &relay_token, source)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     status.counts.backfill_window_days = receipt_window_days;
     if receipt_window_days == 0 {
@@ -11875,7 +11921,7 @@ fn report_status_with_fresh_relay_token(
         status,
         census_residue_status_admitted,
     )?;
-    client.report_status(&relay_token, &request)?;
+    small_source_upload(source, || client.report_status(&relay_token, &request))?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
     let line = (request.enabled, request.last_error_code);
@@ -12045,7 +12091,7 @@ fn report_checkin_status(
         // outside a serving daemon process.
         control_plane: crate::control_plane_health::snapshot(),
     };
-    client.report_status(relay_token, &request)?;
+    small_source_upload(source, || client.report_status(relay_token, &request))?;
     Ok(())
 }
 
@@ -12058,7 +12104,7 @@ fn report_checkin_status_with_fresh_relay_token(
     scan_started_at: Option<&str>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    let receipt_window_days = current_receipt_window_days(client, &relay_token)?;
+    let receipt_window_days = current_receipt_window_days(client, &relay_token, source)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     report_checkin_status(
         client,
@@ -12963,6 +13009,9 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod upload_error_tests {
+        include!("snapshot_sync/upload_error_tests.rs");
+    }
     pub(super) mod codex_archive_tests {
         include!("snapshot_sync/codex_archive_tests.rs");
     }
@@ -17346,7 +17395,7 @@ mod tests {
         )
         .expect_err("persistent timeout stops after checkpointing the first page");
 
-        assert!(is_snapshot_batch_deadline_failure(&first_error));
+        assert!(is_snapshot_batch_split_failure(&first_error));
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         let mut resumed = SnapshotUploadProgress::load(
             &path,

@@ -1207,7 +1207,9 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeF
     let identity = destination_identity(&device, &machine_id, &api_base_url);
     let marker = support_dir.join(STATE_DIR).join("org_disabled");
     // Same backend opt-out cascade as the Claude Code footprint.
-    let rules = match client.get_activity_hint(&relay_token) {
+    let rules = match crate::snapshot_sync::small_source_upload(SnapshotSource::Codex, || {
+        client.get_activity_hint(&relay_token)
+    }) {
         Ok(hint) => {
             if !hint.context_footprint_harvest_enabled {
                 write_json_atomic(&marker, &identity);
