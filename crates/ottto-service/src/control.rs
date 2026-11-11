@@ -24162,8 +24162,9 @@ for line in sys.stdin:
             ("agent_status_refresh", "agent_status_refresh"),
             ("auth_status", "other"),
         ] {
-            let json =
-                format!(r#"{{"request_id":"r","protocol_version":10,"command":"{command}"}}"#);
+            let json = format!(
+                r#"{{"request_id":"r","protocol_version":{PROTOCOL_VERSION},"token":"wrong","command":"{command}"}}"#
+            );
             handle_request_json_with_peer(&daemon(), &json, None);
             let counts = crate::local_resource_diagnostics::take_control();
             assert_eq!(counts, BTreeMap::from([(class, 1)]), "{command}");
