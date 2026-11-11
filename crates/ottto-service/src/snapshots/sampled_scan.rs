@@ -494,10 +494,7 @@ pub(super) fn now_seconds() -> u64 {
     if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
         return now;
     }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
+    crate::scan_clock::utc_seconds()
 }
 
 pub(super) struct ParserOptions<'a> {

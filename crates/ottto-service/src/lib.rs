@@ -54,6 +54,7 @@ pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
 mod relay_auth;
 mod retry_tls;
+mod scan_clock;
 pub mod session_attribution;
 pub mod session_launch;
 pub mod snapshot_audit;

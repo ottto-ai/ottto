@@ -90,6 +90,7 @@ evidence_path = Path(sys.argv[2]).resolve()
 stable_manifest_path = Path(sys.argv[3]).resolve() if sys.argv[3] else None
 
 REQUIRED_CHECKS = [
+    "resource_soak",
     "release_gate",
     "public_surface_ci",
     "candidate_manifest_download",
@@ -316,3 +317,5 @@ if stable_manifest_path is not None:
 
 print(f"stable-candidate-rc-gate: passed for {candidate_version} ({candidate_commit})")
 PY
+
+python3 "$ROOT/scripts/resource_scorecard.py" "$EVIDENCE" >/dev/null

@@ -1274,7 +1274,7 @@ pub(crate) fn with_scan_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
         }
     }
     let _reset = Reset(super::TEST_NOW.with(|clock| clock.replace(Some(now))));
-    run()
+    crate::scan_clock::with_clock(now, run)
 }
 
 /// [format] scan clock restores after nested scope and unwind.

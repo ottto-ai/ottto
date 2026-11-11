@@ -3550,10 +3550,7 @@ fn current_unix_seconds() -> u64 {
         return now;
     }
 
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    crate::scan_clock::utc_seconds()
 }
 
 pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
@@ -4082,7 +4079,7 @@ fn paced_scan_due() -> Option<Instant> {
 }
 
 fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
         .unwrap_or(Duration::ZERO);
     (!wait.is_zero()).then_some(wait)
@@ -4234,7 +4231,7 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        let deadline = Instant::now() + retry_after;
+        let deadline = crate::scan_clock::now() + retry_after;
         deadlines
             .entry(source.api_slug())
             .and_modify(|existing| *existing = (*existing).max(deadline))
@@ -4259,7 +4256,7 @@ pub(crate) fn small_source_upload<T>(
 fn source_upload_backoff_remaining(source: SnapshotSource) -> Option<Duration> {
     let mut deadlines = source_upload_deadlines().lock().ok()?;
     let deadline = *deadlines.get(source.api_slug())?;
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     if deadline <= now {
         deadlines.remove(source.api_slug());
         return None;
@@ -4921,7 +4918,7 @@ struct ContinuationLoop<'a> {
 
 impl continuation::LoopHost for ContinuationLoop<'_> {
     fn now(&mut self) -> Instant {
-        Instant::now()
+        crate::scan_clock::now()
     }
     fn wait(&mut self, wait: Duration) -> bool {
         collect_file_activity_for(
@@ -4983,15 +4980,15 @@ fn collect_file_activity_with_retry(
     mut retry_boundary: impl FnMut(Instant) -> Instant,
     mut read_account: impl FnMut() -> Option<String>,
 ) -> bool {
-    let deadline = Instant::now() + wait;
+    let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
         let wake = retry_boundary(deadline).min(deadline);
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
@@ -5001,7 +4998,7 @@ fn collect_file_activity_with_retry(
             Some(Ok(event)) => {
                 let _stage = StageWindow::begin(event.source.api_slug(), "offpass_hint");
                 with_source_cadence(event.source, |cadence| {
-                    cadence.record_file_event(Instant::now())
+                    cadence.record_file_event(crate::scan_clock::now())
                 });
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
@@ -5011,10 +5008,10 @@ fn collect_file_activity_with_retry(
                 watcher = None;
             }
         }
-        if account_switch.observe(Instant::now(), &mut read_account) {
+        if account_switch.observe(crate::scan_clock::now(), &mut read_account) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
-                cadence.record_account_switch(Instant::now())
+                cadence.record_account_switch(crate::scan_clock::now())
             });
             return true;
         }
@@ -5195,7 +5192,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                 // from the initial delay.
                 schedules.retain(|schedule| failed.contains(&schedule.source));
                 for source in failed {
-                    let now = std::time::Instant::now();
+                    let now = crate::scan_clock::now();
                     let Some(schedule) = schedules
                         .iter_mut()
                         .find(|schedule| schedule.source == source)
@@ -5222,7 +5219,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                         ),
                     }
                     schedule.completed_attempts = schedule.completed_attempts.saturating_add(1);
-                    schedule.next_attempt_at = std::time::Instant::now()
+                    schedule.next_attempt_at = crate::scan_clock::now()
                         + reverify_backoff_delay(schedule.completed_attempts);
                 }
             }
@@ -5360,7 +5357,7 @@ fn sync_once_with_retry(
         daemon,
         transport_cycle: &mut transport_cycle,
         failed_sources: &mut failed_sources,
-        started: Instant::now(),
+        started: crate::scan_clock::now(),
         codex_started: None,
         paced_qos: None,
         account_witness,
@@ -5602,7 +5599,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         drop(self.paced_qos.take());
         self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
         if source == SnapshotSource::Codex {
-            self.codex_started = Some(Instant::now());
+            self.codex_started = Some(crate::scan_clock::now());
             // K2: this prepare's policy replaces any older cached inputs.
             continuation::invalidate_on_ordinary_prepare();
         }

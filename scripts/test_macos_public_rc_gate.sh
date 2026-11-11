@@ -327,6 +327,7 @@ jq \
    | .checks |= with_entries(.value = "passed")
    | .operator_notes = ["redacted stable-candidate RC evidence"]' \
   "$template_evidence" > "$passed_evidence"
+python3 "$ROOT/scripts/test_resource_scorecard.py" --fixture "$passed_evidence"
 "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$passed_evidence" >/dev/null
 
 bad_app_commit_evidence="$TMP_DIR/bad-app-commit-stable-candidate-rc-qa.json"

@@ -3409,7 +3409,7 @@ fn codex_cli_meta(
                 Err(())
             }
         },
-        Instant::now(),
+        crate::scan_clock::now(),
         !reuse_login
             || crate::provider_calls::current_trigger()
                 == Some(crate::provider_calls::Trigger::Setup),
@@ -3445,7 +3445,7 @@ fn claude_version_detected() -> bool {
                 Err(())
             }
         },
-        Instant::now(),
+        crate::scan_clock::now(),
         false,
     )
     .is_ok()
