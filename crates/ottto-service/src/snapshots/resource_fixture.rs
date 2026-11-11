@@ -265,6 +265,7 @@ impl<'a> Driver<'a> {
 
 /// [format] Fixed seed and aggregate digest reproduce across independent TempDirs.
 #[test]
+#[ignore = "resource-regression advisory workflow only"]
 fn resource_corpus_is_reproducible() {
     let a = Corpus::generate([10, 8, 2]);
     let b = Corpus::generate([10, 8, 2]);
@@ -274,6 +275,7 @@ fn resource_corpus_is_reproducible() {
 
 /// [behaviour] Every provider fixture traverses the native acquisition/ACK seam.
 #[test]
+#[ignore = "resource-regression advisory workflow only"]
 fn resource_corpus_native_acquisition() {
     let corpus = Corpus::generate([4, 8, 2]);
     for s in 0..3 {

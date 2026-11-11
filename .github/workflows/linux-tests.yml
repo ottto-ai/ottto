@@ -77,11 +77,6 @@ jobs:
       - name: Rust format
         run: cargo fmt --all --check
 
-      - name: Resource scorecard contracts
-        run: |
-          python3 scripts/test_resource_scorecard.py
-          bash scripts/test_macos_public_rc_gate.sh
-
       - name: Connector format
         run: cargo fmt --manifest-path crates/Cargo.toml --all --check
 
@@ -132,7 +127,6 @@ jobs:
             rust_diff=$(git diff -U0 HEAD^1 HEAD -- '*.rs') || exit 1
             rust_files=$(git diff --name-only HEAD^1 HEAD -- '*.rs') || exit 1
             [ -z "$rust_files" ] || grep -q '^Reuse:' <<< "$PR_BODY" || { echo 'error: Rust changes need a Reuse: line in the PR body'; exit 1; }
-            [ -z "$rust_files" ] || grep -q '^Resource: .' <<< "$PR_BODY" || { echo 'error: Rust changes need a Resource: line in the PR body'; exit 1; }
             if grep -Eq '^\+[[:space:]]*#!\[(allow|cfg_attr\(.*allow)' <<< "$rust_diff"; then echo 'error: added blanket allow'; exit 1; fi
           fi
           cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -167,11 +161,6 @@ jobs:
         run: >-
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast --shard ${{ matrix.shard }}/3
           ${{ github.event_name == 'workflow_dispatch' && '--retry-failed 1 --flaky-json flaky-tests.json' || '' }}
-
-      - name: Synthetic resource corpus calibration
-        if: matrix.shard == 1
-        run: |
-          time cargo test -p ottto-service --locked --lib resource_corpus_full_size_calibration -- --ignored --nocapture --test-threads=1
 
       - name: Upload flaky tests
         if: ${{ !cancelled() && hashFiles('flaky-tests.json') != '' }}

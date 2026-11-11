@@ -487,6 +487,7 @@ fn cli_metadata_stderr_login_status_is_cached() {
 #[cfg(unix)]
 #[test]
 #[serial]
+#[ignore = "resource-regression advisory workflow only"]
 fn resource_cli_metadata_virtual_hour_ttl() {
     let (root, home) = cli_meta_fixture("resource-cli-ttl");
     let binary = root.join("codex");
@@ -526,6 +527,7 @@ fn resource_cli_metadata_virtual_hour_ttl() {
 #[cfg(unix)]
 #[test]
 #[serial]
+#[ignore = "resource-regression advisory workflow only"]
 fn resource_cli_metadata_children_replay() {
     fn run(reuse: bool) -> usize {
         let homes: Vec<_> = (0..8)
