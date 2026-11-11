@@ -91,7 +91,6 @@ fn native_parser_with(
             SnapshotSource::Pi => apply_pi_line,
         },
         Some(metadata),
-        None,
     )
     .unwrap();
     (parser, expected, scope)
@@ -632,7 +631,6 @@ fn lineage_oracle(fixture: &Fixture, metadata: &CodexTitleMetadata) -> Value {
         NOW,
         "native-fixture".into(),
         metadata,
-        None,
     )
     .unwrap();
     apply_upload_policy(
@@ -1135,68 +1133,6 @@ fn finish_production_scan_page(
     }
 }
 
-#[test]
-fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let fixture = ScanFixture::new(SnapshotSource::Codex);
-    fixture
-        .file
-        .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
-    fixture
-        .file
-        .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let setup = |scan: &mut OwnedSourceScan| {
-        let traces = Arc::new(CodexTurnTraceMap {
-            since_epoch: 0,
-            priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
-            incomplete: false,
-        });
-        assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
-        scan.codex_turn_traces = Some(traces);
-    };
-    let (index, _, _, _) = production_scan_at_with_setup(
-        &fixture,
-        SnapshotSource::Codex,
-        ScanIndex::default(),
-        Some(cache.clone()),
-        "live-inputs",
-        NOW,
-        setup,
-    );
-    fixture
-        .file
-        .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
-    let (_, tail, modes, bytes) = production_scan_at_with_setup(
-        &fixture,
-        SnapshotSource::Codex,
-        index,
-        Some(cache),
-        "live-inputs",
-        NOW,
-        setup,
-    );
-    assert_eq!(modes, (0, 1, 0), "unrelated live traces");
-    let full_bytes = fixture.file.0.metadata().unwrap().len();
-    assert!(bytes.0 + bytes.1 < full_bytes);
-    let (_, full, _, _) = production_scan_at_with_setup(
-        &fixture,
-        SnapshotSource::Codex,
-        ScanIndex::default(),
-        None,
-        "live-inputs",
-        NOW,
-        setup,
-    );
-    assert_eq!(
-        production_body(SnapshotSource::Codex, tail),
-        production_body(SnapshotSource::Codex, full)
-    );
-    eprintln!("SAMPLED_LIVE_INPUTS inputs=traces full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
-}
-
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     serde_json::to_value(scan.snapshots).unwrap()
@@ -1560,8 +1496,11 @@ fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
     );
     assert!(!audited.files[&key].has_unverified_source());
 }
+/// [money] A retained reduction whose priority decisions all hold reuses; one
+/// holding a priority decision an earlier build applied from Codex logs re-reads
+/// in full, where its protected tier receipt keeps the tier.
 #[test]
-fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
+fn sampled_native_logs_priority_decision_rereads_in_full() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1570,24 +1509,21 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
     let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
-    parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
-        since_epoch: 0,
-        priority_turns: BTreeSet::from(["unrelated-turn".into()]),
-        incomplete: false,
-    }));
     assert_eq!(
         parser
             .prepare_acquisition(old.map(Box::new), &scope, None, 101)
             .unwrap(),
         ReadMode::Unchanged
     );
-    let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
+    let (mut old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
+    old.as_mut()
+        .unwrap()
+        .state
+        .accumulator_for_test()
+        .codex_observed_priority_turns
+        .get_or_insert_with(Default::default)
+        .insert("this-turn".into(), true);
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
-    parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
-        since_epoch: 0,
-        priority_turns: BTreeSet::from(["this-turn".into()]),
-        incomplete: false,
-    }));
     assert!(matches!(
         parser
             .prepare_acquisition(old.map(Box::new), &scope, None, 101)
@@ -1893,66 +1829,6 @@ fn sampled_production_missing_index_entry_requires_full_even_with_warm_ram() {
         assert_eq!(
             production_body(source, recovered),
             production_body(source, full)
-        );
-    }
-}
-
-#[test]
-fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let source = SnapshotSource::Codex;
-    for oversized_id in [false, true] {
-        let fixture = Fixture::new(source);
-        let count = if oversized_id {
-            1
-        } else {
-            sampled_jsonl::MAX_PRIORITY_WITNESSES + 1
-        };
-        for id in 0..count {
-            let turn = if oversized_id {
-                "x".repeat(sampled_jsonl::MAX_PRIORITY_WITNESS_ID_BYTES + 1)
-            } else {
-                format!("turn-{id}")
-            };
-            fixture.append(&json!({"type":"turn_context", "payload":{"turn_id":turn}}));
-            fixture.append(&usage(source, 100 + id as u64, id, "fixture-model"));
-        }
-        let (mut ordinary, expected, scope) = native_parser(&fixture, source);
-        while !ordinary.step().unwrap() {}
-        assert!(
-            ordinary.accumulator.codex_observed_priority_turns.is_none(),
-            "ordinary full reader must not grow optimization-owned dependency state"
-        );
-        drop(ordinary);
-        let (mut sampled, _, _) = native_parser(&fixture, source);
-        sampled
-            .prepare_acquisition(None, &scope, None, 100)
-            .unwrap();
-        while !sampled.step().unwrap() {}
-        assert!(sampled.accumulator.codex_observed_priority_turns.is_none());
-        let completed = sampled.retain_reduction(&scope, 100).unwrap().unwrap();
-        assert!(
-            completed.checkpoint.audit_debt().is_none(),
-            "completed full read remains verified despite copy refusal"
-        );
-        let mut items = sampled
-            .finish(
-                &expected,
-                &fixture.0,
-                NOW,
-                "native-fixture".into(),
-                Some(&CodexTitleMetadata::default()),
-                None,
-                None,
-            )
-            .unwrap()
-            .snapshots;
-        apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
-        assert_eq!(
-            serde_json::to_value(items).unwrap(),
-            oracle(&fixture, source)
         );
     }
 }

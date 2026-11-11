@@ -419,16 +419,15 @@ pub(crate) struct CodexContinuationEvidence {
     // The page's roster; a minted ticket keeps only the paused job's share.
     pub(in crate::snapshots) inventory: codex_file_join::HeaderInventory,
     pub(in crate::snapshots) codex: CodexTitleMetadata,
-    pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
 }
-crate::heap_layout_bound::fields!(CodexContinuationEvidence; inventory, codex, traces);
+crate::heap_layout_bound::fields!(CodexContinuationEvidence; inventory, codex);
 impl CodexContinuationEvidence {
     pub(crate) fn content_unchanged(&self) -> bool {
         self.inventory.content_unchanged()
     }
     /// The paused singleton's share of its page's evidence: the rows its
-    /// path's reduction fingerprint reads and its owner's headers. Traces stay whole
-    /// for turns not yet read. None, counted `not_mintable`, unless the share
+    /// path's reduction fingerprint reads and its owner's headers. None,
+    /// counted `not_mintable`, unless the share
     /// gives the resume check the full fingerprint, so a continuation never
     /// fails a check its page's evidence would pass.
     pub(in crate::snapshots) fn for_paused_job(
@@ -456,7 +455,6 @@ impl CodexContinuationEvidence {
             Some(Self {
                 inventory: self.inventory,
                 codex,
-                traces: self.traces,
             })
         });
         if narrowed.is_none() {

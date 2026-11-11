@@ -2974,9 +2974,10 @@ impl SnapshotUploadProgress {
     fn retain_current_quarantines_with_diagnostics(
         &mut self,
         current: &BTreeSet<String>,
+        index: &ScanIndex,
         diagnostic: Option<&mut CodexScanDiagnostics>,
     ) -> bool {
-        let changed = self.retain_current_quarantines(current);
+        let changed = self.retain_current_quarantines(current, index);
         if let Some(diagnostic) = diagnostic {
             for (fingerprint, record) in &self.quarantined_fingerprints {
                 let fingerprint_digest = codex_scan_diagnostics::digest(fingerprint);
@@ -2991,10 +2992,29 @@ impl SnapshotUploadProgress {
         changed
     }
 
-    fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
+    fn retain_current_quarantines(
+        &mut self,
+        current: &BTreeSet<String>,
+        index: &ScanIndex,
+    ) -> bool {
+        let eligible = index
+            .eligible_snapshot_fingerprint_refs()
+            .collect::<BTreeSet<_>>();
         let before = self.quarantined_fingerprints.clone();
         for (fingerprint, record) in &mut self.quarantined_fingerprints {
-            if !current.contains(fingerprint)
+            if current.contains(fingerprint)
+                && eligible.contains(fingerprint.as_str())
+                && !index.decode_holds_entity(fingerprint)
+                && !self.permanent_rejections.contains_key(fingerprint)
+                && record.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+                && record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record
+                    .contract_retry_claims
+                    .is_none_or(|n| n < crate::snapshots::terminal_contract_retry::MAX_CLAIMS)
+            {
+                record.disposition = SnapshotQuarantineDisposition::RetryPending;
+                record.retry_after_unix_seconds = 0;
+            } else if !current.contains(fingerprint)
                 && !self
                     .permanent_rejections
                     .get(fingerprint)
@@ -3659,6 +3679,34 @@ pub(crate) fn decode_hold_manifest_published_for_test(
         "2026-10-22T00:00:00Z",
     )?;
     Ok(cached_source_manifest(namespace, source).is_some())
+}
+
+/// Freshness fixtures exercise the real returning-quarantine and exact ACK path.
+#[cfg(test)]
+pub(crate) fn ack_current_again_quarantines_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+) -> BTreeMap<String, String> {
+    use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+    let source = SnapshotSource::ClaudeCode;
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(source));
+    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    assert!(progress.retain_current_quarantines(&index.current_snapshot_fingerprints(), index));
+    assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+    let (status, batches, _) = upload_source_under(
+        source,
+        SnapshotUploadPolicy::default(),
+        items,
+        &mut progress,
+        ack,
+    );
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(batches.len(), 1);
+    assert!(progress.quarantined_fingerprints.is_empty());
+    index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    progress.fresh_context_body_acks
 }
 
 #[cfg(test)]
@@ -7870,6 +7918,7 @@ fn finish_sync_source(
     let current_fingerprints = index.current_snapshot_fingerprints();
     if upload_progress.retain_current_quarantines_with_diagnostics(
         &current_fingerprints,
+        &index,
         scan_result.local_codex_diagnostics.as_mut(),
     ) {
         upload_progress.save(&upload_progress_path)?;
@@ -8971,8 +9020,8 @@ fn finish_sync_source(
     Ok(())
 }
 
-/// Contract-origin progress claims were saved by the caller. Mirror those
-/// claims before source acquisition, then bind every selected retry to one file.
+/// Progress claims were saved by the caller. Mirror claims and current-again
+/// ordinary retries before source acquisition, then bind each retry to one file.
 /// Ordinary offered/queued retries stay due; source-held ones use ordinary backoff.
 fn save_terminal_contract_claims_for_scan(
     index: &mut ScanIndex,
@@ -8981,10 +9030,32 @@ fn save_terminal_contract_claims_for_scan(
 ) -> Result<Vec<PathBuf>> {
     let mut changed = index.merge_terminal_contract_claims(&progress.quarantined_fingerprints);
     for (fingerprint, record) in &progress.quarantined_fingerprints {
-        if record
-            .upload_body_witness
-            .as_deref()
-            .is_some_and(|body| progress.owed_stale_body(fingerprint, body))
+        let current_again = progress.active_quarantine_retries.contains(fingerprint)
+            && index
+                .eligible_snapshot_fingerprint_refs()
+                .any(|current| current == fingerprint)
+            && !index.decode_holds_entity(fingerprint)
+            && !progress.permanent_rejections.contains_key(fingerprint)
+            && record.contract_retry_claims.is_none()
+            && record.disposition == SnapshotQuarantineDisposition::RetryPending
+            && record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+            && index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|old| {
+                    let mut pending = old.clone();
+                    pending.disposition = record.disposition;
+                    pending.retry_after_unix_seconds = record.retry_after_unix_seconds;
+                    pending.witness = record.witness.clone();
+                    old.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+                        && old.witness.same_retry_contract(&record.witness)
+                        && pending == *record
+                });
+        if (current_again
+            || record
+                .upload_body_witness
+                .as_deref()
+                .is_some_and(|body| progress.owed_stale_body(fingerprint, body)))
             && index.quarantined_snapshot_fingerprints.get(fingerprint) != Some(record)
         {
             index
@@ -16431,7 +16502,7 @@ mod tests {
         let mut revised_items = items[1..].to_vec();
         revised_items.push(replacement_fingerprint.clone());
         let revised_fingerprints = revised_items.iter().cloned().collect::<BTreeSet<_>>();
-        assert!(progress.retain_current_quarantines(&revised_fingerprints));
+        assert!(progress.retain_current_quarantines(&revised_fingerprints, &ScanIndex::default()));
         let mut revision_accepted = 0;
         let mut revision_uploads = Vec::new();
         let revision_result = upload_resumable_batches(
@@ -17995,6 +18066,36 @@ mod tests {
         assert_eq!(attempts, 0);
         assert_eq!(accepted, 0);
 
+        let mut failed = progress.clone();
+        assert!(failed.retain_current_quarantines(&BTreeSet::new(), &ScanIndex::default()));
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "session.jsonl".into(),
+            BTreeSet::from([fingerprint.clone()]),
+        );
+        assert!(failed.retain_current_quarantines(&index.current_snapshot_fingerprints(), &index));
+        failed.prepare_quarantine_retries(&BTreeMap::new());
+        failed.quarantine_body(&fingerprint, &fingerprint);
+        let record = failed.quarantined_fingerprints[&fingerprint].clone();
+        assert_eq!(record.failed_reconstruction_count, 2);
+        assert!(record.retry_after_unix_seconds > current_unix_seconds());
+        assert!(!failed.retain_current_quarantines(&index.current_snapshot_fingerprints(), &index));
+        assert!(!failed.prepare_quarantine_retries(&BTreeMap::new()));
+        upload_resumable_batches(
+            std::slice::from_ref(&fingerprint),
+            &unique_poison_scope(),
+            &mut failed,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                attempts += 1;
+                Ok(accepted_batch(1))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((attempts, accepted), (0, 0));
+
         progress
             .quarantined_fingerprints
             .get_mut(&fingerprint)
@@ -18160,15 +18261,40 @@ mod tests {
         )
         .unwrap();
         assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        // Save progress first, then crash before the terminal index is updated.
+        let terminal = index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap();
+        terminal.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        terminal.retry_after_unix_seconds = 0;
         progress
             .quarantined_fingerprints
-            .get_mut(&fingerprint)
-            .unwrap()
-            .retry_after_unix_seconds = 0;
+            .insert(fingerprint.clone(), terminal.clone());
+        index.save(&index_path).unwrap();
+        assert!(progress.retain_current_quarantines(&index.current_snapshot_fingerprints(), &index));
+        progress.save(&progress_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        )
+        .unwrap();
+        assert_eq!(
+            index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         let hints =
             save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
         assert_eq!(hints, vec![session_path.clone()]);
+        assert_eq!(
+            ScanIndex::load(&index_path)
+                .unwrap()
+                .quarantined_snapshot_fingerprints[&fingerprint],
+            progress.quarantined_fingerprints[&fingerprint]
+        );
         let (pending, reads) =
             crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
                 crate::snapshots::scan_source_roots_with_test_limit_and_hints(
@@ -18660,34 +18786,114 @@ mod tests {
         assert!(!progress.active_quarantine_retries.contains(&fingerprint));
     }
 
+    /// [regress] A returned entity owes one retry, keeping its original budget.
     #[test]
-    fn supersede_while_quarantined_records_terminal_counter_and_cannot_rearm() {
+    fn a_superseded_quarantine_rearms_when_current_again() {
+        let fingerprint = "b".repeat(64);
+        let current = BTreeSet::from([fingerprint.clone()]);
+        let mut index = ScanIndex::default();
+        index
+            .file_snapshot_fingerprints
+            .insert("session.jsonl".into(), current.clone());
+        let mut progress = test_upload_progress();
+        progress.quarantine([fingerprint.as_str()]);
+        assert!(progress.retain_current_quarantines(&BTreeSet::new(), &index));
+        let terminal = progress.quarantined_fingerprints[&fingerprint].clone();
+        assert!(progress.retain_current_quarantines(&current, &index));
+        let mut expected = terminal;
+        expected.disposition = SnapshotQuarantineDisposition::RetryPending;
+        expected.retry_after_unix_seconds = 0;
+        assert_eq!(progress.quarantined_fingerprints[&fingerprint], expected);
+        assert!(!progress.retain_current_quarantines(&current, &index));
+    }
+
+    #[test]
+    fn supersede_while_quarantined_preserves_absence_holds_and_retry_budgets() {
         let current = "a".repeat(64);
         let stale = "b".repeat(64);
         let mut progress = test_upload_progress();
         progress.quarantine([current.as_str(), stale.as_str()]);
-
-        assert!(progress.retain_current_quarantines(&BTreeSet::from([current.clone()])));
-        assert_eq!(progress.quarantined_fingerprints.len(), 2);
-        assert_eq!(
-            progress
-                .quarantined_fingerprints
-                .get(&stale)
-                .expect("superseded fingerprint remains explicitly accounted")
-                .disposition,
-            SnapshotQuarantineDisposition::SupersededTerminal
-        );
+        let deadline = progress.quarantined_fingerprints[&current].retry_after_unix_seconds;
         let mut index = ScanIndex::default();
-        index.file_snapshot_fingerprints.insert(
-            "current.jsonl".to_string(),
-            BTreeSet::from([current.clone()]),
-        );
+        index
+            .file_snapshot_fingerprints
+            .insert("current.jsonl".into(), BTreeSet::from([current.clone()]));
+        let current_set = index.current_snapshot_fingerprints();
+        assert!(progress.retain_current_quarantines(&current_set, &index));
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         assert_eq!(index.snapshot_superseded_terminal_count(), 1);
         assert!(!index
             .legacy_settlement_reconciliation_pending_fingerprints()
             .contains(&stale));
-        assert!(!progress.retain_current_quarantines(&BTreeSet::from(["a".repeat(64)])));
+        assert!(!progress.retain_current_quarantines(&current_set, &index));
+        assert_eq!(
+            progress.quarantined_fingerprints[&current].retry_after_unix_seconds,
+            deadline
+        );
+        assert_eq!(
+            progress.quarantined_fingerprints[&stale].disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
+
+        for guard in [
+            "decode",
+            "entity_decode",
+            "refused",
+            "stale_debt",
+            "failures",
+            "claims",
+        ] {
+            let mut index = ScanIndex::default();
+            index
+                .file_snapshot_fingerprints
+                .insert("returned.jsonl".into(), BTreeSet::from([stale.clone()]));
+            let mut blocked = progress.clone();
+            match guard {
+                "decode" => crate::snapshots::e2_pipeline_scan_fixture::hold_file_decode_for_test(
+                    &mut index,
+                    "returned.jsonl",
+                ),
+                "entity_decode" => {
+                    crate::snapshots::e2_pipeline_scan_fixture::hold_entity_decode_for_test(
+                        &mut index, &stale,
+                    )
+                }
+                "refused" | "stale_debt" => {
+                    let reason = if guard == "stale_debt" {
+                        "accepted_log_stale_older_upload"
+                    } else {
+                        "usage_accounting_authority_downgrade"
+                    };
+                    blocked.quarantine_permanent_body(&stale, &stale, reason);
+                    let record = blocked.quarantined_fingerprints.get_mut(&stale).unwrap();
+                    record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+                    record.failed_reconstruction_count = 1;
+                }
+                "failures" => {
+                    blocked
+                        .quarantined_fingerprints
+                        .get_mut(&stale)
+                        .unwrap()
+                        .failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                }
+                "claims" => {
+                    blocked
+                        .quarantined_fingerprints
+                        .get_mut(&stale)
+                        .unwrap()
+                        .contract_retry_claims =
+                        Some(crate::snapshots::terminal_contract_retry::MAX_CLAIMS)
+                }
+                _ => unreachable!(),
+            }
+            let before = blocked.quarantined_fingerprints[&stale].clone();
+            blocked.retain_current_quarantines(
+                &BTreeSet::from([current.clone(), stale.clone()]),
+                &index,
+            );
+            assert_eq!(blocked.quarantined_fingerprints[&stale], before, "{guard}");
+            assert!(blocked.active_reason_reoffers.is_empty());
+        }
     }
 
     #[test]
@@ -22711,7 +22917,7 @@ mod tests {
                 usize::from(priority)
             );
             if priority {
-                std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+                crate::snapshots::older_build_logs_expired();
             }
             let mut loaded = ScanIndex::load(&index_path).unwrap();
             let quiet = prepare_codex_union_fixture(&root, &mut loaded);
@@ -22817,7 +23023,7 @@ mod tests {
                     && entry.codex_joined_member_set.is_none()
                     && entry.codex_applied_tier_receipt.is_none()));
             assert!(captured.current_snapshot_fingerprints().is_empty());
-            std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+            crate::snapshots::older_build_logs_expired();
             // Crash after capture, before POST: the capture must retain the old
             // selector without advancing membership or suppressing this upload.
             working = captured;

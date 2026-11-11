@@ -224,7 +224,7 @@ fn grown_unretained_history_is_read_in_the_next_rss_round() {
         let mut file = BufWriter::new(File::create(&path).unwrap());
         let mut records = 0;
         write_row(&mut file, &header(PENDING), &mut records);
-        let turns = sampled_jsonl::MAX_PRIORITY_WITNESSES as u64 + 1;
+        let turns = 257;
         for n in 1..=turns {
             let turn = format!("closed-{n}");
             for value in [
@@ -249,7 +249,10 @@ fn grown_unretained_history_is_read_in_the_next_rss_round() {
                 &mut observed,
                 NOW,
             );
-            assert!(observed.max_priority_witnesses > sampled_jsonl::MAX_PRIORITY_WITNESSES);
+            assert_eq!(
+                observed.max_priority_witnesses, 0,
+                "a new read records no witness"
+            );
             assert!(cache.counters_for_test().jobs_paused > 0);
             let cold = out.clone();
             let mut tail = BufWriter::new(File::create(root.join("tail.jsonl")).unwrap());

@@ -22,7 +22,7 @@ use super::{
 };
 use crate::durable_tail_codec::{durable_struct, Durable, HDigest, Refuse};
 use crate::snapshots::codex_dictionary_slots::{CodexCountMap, StableSlots};
-use crate::snapshots::sampled_scan::codex_cursor::{priority_decisions, PriorityDecisions};
+use crate::snapshots::sampled_scan::codex_cursor::priority_decisions_hold;
 use crate::snapshots::state_v2::Collection;
 use crate::snapshots::*;
 use crate::transcript_acquisition::DurableCertificate;
@@ -464,7 +464,7 @@ impl TailSource for Codex {
     /// file (`Unavailable`), changed or incompatible evidence is a counted
     /// reconstruction, labelled with the check that refused it
     /// (`INCOMPATIBLE_*`). Never a silent success. In order: the counting rule,
-    /// the priority decisions, the sidecar's projected ordinal; then the traces and file
+    /// the priority decisions, the sidecar's projected ordinal; then the file
     /// birth. Last, the file's lineage (D131): the stored head continues only
     /// the session its owning header named when it was written, so a header
     /// rewritten to another id is another file (a counted `Identity`
@@ -495,10 +495,8 @@ impl TailSource for Codex {
         let Some(observed) = stored.codex_observed_priority_turns.as_ref() else {
             return Err(incompatible(INCOMPATIBLE_PRIORITY_WITNESS));
         };
-        match priority_decisions(observed, live.codex_turn_traces.as_ref()) {
-            PriorityDecisions::Hold => {}
-            PriorityDecisions::Unavailable => return Err(LiveLoadError::Unavailable),
-            PriorityDecisions::Changed => return Err(incompatible(INCOMPATIBLE_PRIORITY_DECISION)),
+        if !priority_decisions_hold(observed) {
+            return Err(incompatible(INCOMPATIBLE_PRIORITY_DECISION));
         }
         // The projection only advances with the sidecar; a lower one is
         // another sidecar.
@@ -521,7 +519,6 @@ impl TailSource for Codex {
         stored
             .claude_file_birth
             .refresh_opened(&live.claude_file_birth);
-        stored.codex_turn_traces = live.codex_turn_traces.clone();
         Ok(())
     }
 }

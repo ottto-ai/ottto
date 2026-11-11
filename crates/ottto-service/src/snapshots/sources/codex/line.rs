@@ -316,8 +316,8 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.latest_reasoning_effort = Some(effort);
     }
     // Track the running turn id from `turn_context` (the token_count event that
-    // emits usage carries none). It joins each usage row to its `logs_2`
-    // fast-mode signal. Lines without a turn id leave the running value intact.
+    // emits usage carries none). It keys each usage row's protected tier
+    // replay. Lines without a turn id leave the running value intact.
     if let Some(turn_id) = string_at(value, &["turn_context", "payload", "turn_id"])
         .or_else(|| string_at(value, &["payload", "turn_id"]))
     {
@@ -405,18 +405,15 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         } else {
             Some(1)
         };
-        // Stamp the fast-mode tier onto THIS turn's usage row only — passed as
-        // the per-line selector, never merged into current_selector — so a fast
-        // turn prices at the priority rate without leaking into later standard
-        // turns of the same session.
+        // Tier stamps go onto THIS turn's usage row only — the per-line
+        // selector, never merged into current_selector — so they never leak
+        // into later turns of the same session.
         let mut usage_selector = selector;
-        if accumulator.current_turn_is_priority() {
-            usage_selector.insert(
-                "service_tier",
-                "priority".to_string(),
-                "derived_from_logs_2",
-            );
-        }
+        #[cfg(test)]
+        crate::snapshots::older_build_logs_tier(
+            &mut usage_selector,
+            accumulator.latest_turn_id.as_deref(),
+        );
         let model = string_at(value, &["token_count", "info", "model"])
             .or_else(|| string_at(value, &["payload", "info", "model"]))
             .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
