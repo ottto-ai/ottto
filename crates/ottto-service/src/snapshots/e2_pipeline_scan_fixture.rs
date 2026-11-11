@@ -418,6 +418,7 @@ pub(crate) struct E2ScanFixture {
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
     collection_clock: bool,
+    collection_window_days: Option<u64>,
     attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
 }
 impl E2ScanFixture {
@@ -428,6 +429,10 @@ impl E2ScanFixture {
             collection_clock: true,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_collection_window_days(&mut self, days: u64) {
+        self.collection_window_days = Some(days);
     }
 
     fn collection_time(&self, fallback: &str) -> String {
@@ -527,7 +532,7 @@ impl E2ScanFixture {
             roots,
             index,
             &self.collection_time("2026-08-02T08:00:00Z"),
-            183,
+            self.collection_window_days.unwrap_or(183),
             limit,
             Some(support),
             hints,
@@ -586,7 +591,7 @@ impl E2ScanFixture {
             roots,
             index,
             &self.collection_time("2026-10-27T08:00:00Z"),
-            183,
+            self.collection_window_days.unwrap_or(183),
             limit,
             Some(support),
             hints,

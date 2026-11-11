@@ -308,6 +308,7 @@ struct Driver<'a> {
     active_tokens: Option<u64>,
     pending_hints: Vec<PathBuf>,
     reselect_pending: bool,
+    reselect_active: bool,
     page_limit: usize,
     last_codex_diagnostic: Option<crate::codex_scan_diagnostics::CodexScanDiagnostics>,
 }
@@ -337,6 +338,7 @@ impl<'a> Driver<'a> {
             active_tokens: None,
             pending_hints: Vec::new(),
             reselect_pending: false,
+            reselect_active: false,
             page_limit: 500,
             last_codex_diagnostic: None,
         }
@@ -391,11 +393,17 @@ impl<'a> Driver<'a> {
                         // Delivery context alone deliberately reads nothing.
                         // The native replay owner invalidates once and owns
                         // the bounded reselect; its hydration is observed here.
+                        self.reselect_active = true;
                         index.activate_upload_context("synthetic-next-context".into());
                         assert!(
                             index.prepare_historical_replay("synthetic-reselect-generation".into())
                         );
                     }
+                    self.fixture.set_collection_window_days(
+                        crate::snapshot_sync::resource_schedule::collection_window(
+                            self.reselect_active,
+                        ),
+                    );
                     self.fixture
                         .begin_pass(source, &self.corpus.support, self.session.path());
                 },
@@ -461,6 +469,9 @@ impl<'a> Driver<'a> {
         );
         let acks = exact_acks_for_test(&scan.snapshots);
         accept_upload_context_acks_for_test(&mut index, &scan.snapshots, &acks);
+        if scan.census_complete {
+            self.reselect_active = false;
+        }
         for item in &scan.snapshots {
             if item.source_session_id == session(0) {
                 self.active_tokens = Some(item.input_tokens);
