@@ -1322,6 +1322,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for Probe {
 struct Observation {
     observed_unix_ms: Option<u64>,
     wall_elapsed_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes: Option<u64>,
     shared_process_cpu_delta_us: Option<u64>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
@@ -1342,6 +1344,7 @@ impl Observation {
                 .ok()
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
+            malloc_in_use_bytes: None,
             footprint: Default::default(),
             cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
@@ -1365,6 +1368,7 @@ pub(crate) fn source_prepare<T>(
 ) -> T {
     flush_offpass();
     let probe = Probe::start();
+    let malloc_in_use_bytes = footprint::malloc_in_use();
     let footprint = footprint::Stage::begin();
     let result = inner();
     if source == "claude_code" && v2_active(&result) {
@@ -1375,7 +1379,10 @@ pub(crate) fn source_prepare<T>(
         process_id: std::process::id(),
         stage: "source_prepare",
         source: Source::from_slug(source),
-        observation: probe.stage_observation(footprint.as_ref()),
+        observation: Observation {
+            malloc_in_use_bytes,
+            ..probe.stage_observation(footprint.as_ref())
+        },
         counts: BTreeMap::<&str, u64>::new(),
     });
     result
@@ -2906,6 +2913,11 @@ mod tests {
                 assert_eq!(record["counts"], serde_json::json!({}));
                 assert!(record["observation"]["footprint_sample_failures"].is_u64());
                 let row = &record["observation"];
+                if cfg!(target_os = "macos") && record["stage"] == "source_prepare" {
+                    assert!(row["malloc_in_use_bytes"].is_u64());
+                } else {
+                    assert!(row.get("malloc_in_use_bytes").is_none());
+                }
                 if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
                     for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
                         if let Some(bytes) = row[endpoint].as_u64() {
@@ -2923,6 +2935,7 @@ mod tests {
         let page = serde_json::to_value(Probe::start().observation()).unwrap();
         for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
             for field in [
+                "malloc_in_use_bytes",
                 "stage_peak_footprint_bytes",
                 "stage_start_footprint_bytes",
                 "stage_end_footprint_bytes",
