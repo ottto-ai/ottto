@@ -531,7 +531,7 @@ fn resource_cli_metadata_virtual_hour_ttl() {
 fn resource_cli_metadata_children_replay() {
     fn run(reuse: bool) -> usize {
         let homes: Vec<_> = (0..8)
-            .map(|_| cli_meta_fixture("resource-cli-children"))
+            .map(|n| cli_meta_fixture(&format!("resource-cli-children-{n}")))
             .collect();
         let binary = homes[0].0.join("codex");
         let script = fs::read_to_string(&binary).unwrap().replace(
@@ -543,6 +543,15 @@ fn resource_cli_metadata_children_replay() {
             "OTTTO_COMMAND_SEARCH_PATH",
             homes[0].0.as_os_str().to_os_string(),
         );
+        let child_counts = || {
+            let rows = crate::local_resource_diagnostics::cli_children::starts_for_test();
+            ["codex login status", "codex models"].map(|kind| {
+                *rows
+                    .get(kind)
+                    .expect("native fixed-kind start observation required")
+            })
+        };
+        let before = child_counts();
         for round in 0..24 {
             crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(
                 round * 300,
@@ -556,6 +565,8 @@ fn resource_cli_metadata_children_replay() {
                 },
             );
         }
+        let after = child_counts();
+        let native = std::array::from_fn::<_, 2, _>(|i| after[i].checked_sub(before[i]).unwrap());
         let children = homes
             .iter()
             .map(|(_, home)| {
@@ -565,6 +576,16 @@ fn resource_cli_metadata_children_replay() {
                     .count()
             })
             .sum();
+        assert_eq!(
+            native[0] + native[1],
+            children as u64,
+            "actual spawn observer matches executed stub commands"
+        );
+        assert_eq!(native[0], native[1], "one login/models pair per load");
+        println!(
+            "resource_cli_children reuse={reuse} login_starts={} model_starts={}",
+            native[0], native[1]
+        );
         for (root, _) in homes {
             fs::remove_dir_all(root).unwrap();
         }

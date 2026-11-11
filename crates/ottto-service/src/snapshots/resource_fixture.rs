@@ -9,6 +9,32 @@ use sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
+// Actual state-v2 physical decode hook; independent of diagnostic serialization.
+thread_local! {
+    static HYDRATED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+pub(in crate::snapshots) fn record_hydrated(rows: u64) {
+    HYDRATED.with(|count| {
+        if let Some(value) = count.get() {
+            count.set(Some(value.checked_add(rows).unwrap()));
+        }
+    });
+}
+fn observe_hydrated<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HYDRATED.with(|count| count.set(self.0));
+        }
+    }
+    let _reset = Reset(HYDRATED.with(|count| count.replace(Some(0))));
+    let result = run();
+    (
+        result,
+        HYDRATED.with(|count| count.get().expect("hydration observer installed")),
+    )
+}
+
 const SEED: u64 = 0x5219_7402;
 const EPOCH: u64 = 1_785_657_600; // 2026-08-02T08:00:00Z
 const SOURCES: [SnapshotSource; 3] = [
@@ -169,6 +195,8 @@ struct Counts {
     scanned_files: u64,
     emitted_bodies: u64,
     parser_consumed_bytes: u64,
+    hydrated_rows: Option<u64>,
+    sidecar_reuse: Option<BTreeMap<&'static str, [u64; 2]>>,
     // Raw I/O includes guards, headers, sidecars, DB/WAL/checkpoint and logs.
     // These remain absent until every boundary is observed. Never invent zero.
     raw_read_bytes: Option<u64>,
@@ -208,38 +236,65 @@ impl<'a> Driver<'a> {
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
+        let (scanned, rows) = with_scan_clock(EPOCH + seconds, || {
+            observe_hydrated(|| self.page_at_clock())
+        });
+        self.counts.hydrated_rows = Some(
+            self.counts
+                .hydrated_rows
+                .unwrap_or(0)
+                .checked_add(rows)
+                .unwrap(),
+        );
+        scanned
+    }
+    fn page_at_clock(&mut self) -> usize {
         let source = SOURCES[self.source];
         let index = std::mem::take(&mut self.index);
-        let ((mut index, mut scan, _), bytes) = with_scan_clock(EPOCH + seconds, || {
-            observe_consumed(|| {
-                self.fixture
-                    .begin_pass(source, &self.corpus.support, self.session.path());
-                if source == SnapshotSource::ClaudeCode {
-                    self.fixture.scan(
-                        &self.corpus.roots[self.source],
-                        &self.corpus.support,
-                        index,
-                        500,
-                        true,
-                        &self.corpus.births,
-                        &[],
-                    )
-                } else {
-                    self.fixture.scan_other_page(
-                        source,
-                        &self.corpus.roots[self.source],
-                        &self.corpus.support,
-                        index,
-                        true,
-                        500,
-                        &[],
-                    )
-                }
-            })
+        let ((mut index, mut scan, _), bytes) = observe_consumed(|| {
+            self.fixture
+                .begin_pass(source, &self.corpus.support, self.session.path());
+            if source == SnapshotSource::ClaudeCode {
+                self.fixture.scan(
+                    &self.corpus.roots[self.source],
+                    &self.corpus.support,
+                    index,
+                    500,
+                    true,
+                    &self.corpus.births,
+                    &[],
+                )
+            } else {
+                self.fixture.scan_other_page(
+                    source,
+                    &self.corpus.roots[self.source],
+                    &self.corpus.support,
+                    index,
+                    true,
+                    500,
+                    &[],
+                )
+            }
         });
         assert_eq!(scan.malformed_json_line_count, 0);
         assert_eq!(scan.invalid_utf8_line_count, 0);
         assert_eq!(scan.unreadable_path_count, 0);
+        if source == SnapshotSource::Codex {
+            let diagnostic = scan
+                .local_codex_diagnostics
+                .as_ref()
+                .expect("Codex sidecar observations required");
+            let counters = self.counts.sidecar_reuse.get_or_insert_with(BTreeMap::new);
+            for (kind, facts) in [
+                ("state_5", &diagnostic.state_titles),
+                ("thread_history_1", &diagnostic.rollout_extents),
+                ("session_index", &diagnostic.session_index),
+            ] {
+                let count = counters.entry(kind).or_default();
+                count[0] += facts.reused_roots as u64;
+                count[1] += facts.reloaded_roots as u64;
+            }
+        }
         finalize_scan_after_policy(source, &mut scan, &mut index);
         let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(source);
         ledger.deliver(&scan.snapshots);
@@ -282,6 +337,14 @@ fn resource_corpus_native_acquisition() {
         let mut driver = Driver::new(&corpus, s);
         assert!(driver.page(0) > 0, "positive native acquisition control");
         assert!(driver.counts.emitted_bodies > 0, "positive usage control");
+        assert!(
+            driver
+                .counts
+                .hydrated_rows
+                .expect("row decode observation required")
+                > 0,
+            "native persisted rows exercise the decode observer"
+        );
         let before = driver.counts.parser_consumed_bytes;
         corpus.append(s, 2);
         driver.page(300);
@@ -319,4 +382,53 @@ fn resource_corpus_full_size_calibration() {
             serde_json::to_string(&driver.counts).unwrap()
         );
     }
+}
+
+/// [regress] All-quiet sidecar homes reuse native facts. Discarding those facts
+/// in the test replays a cold reload and must trip the same 95% floor.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_corpus_all_quiet_sidecar_replay() {
+    fn meets_floor(counts: &Counts) -> bool {
+        let observed = counts
+            .sidecar_reuse
+            .as_ref()
+            .expect("sidecar observations required");
+        ["state_5", "thread_history_1", "session_index"]
+            .into_iter()
+            .all(|kind| {
+                let [reused, reloaded] = *observed
+                    .get(kind)
+                    .expect("sidecar kind observation required");
+                let total = reused + reloaded;
+                assert!(
+                    total > 0,
+                    "eligible all-quiet homes must supply a nonzero denominator"
+                );
+                reused * 100 >= total * 95
+            })
+    }
+    let corpus = Corpus::generate([4, 8, 2]);
+    let mut driver = Driver::new(&corpus, 1);
+    driver.page(0);
+    driver.counts = Counts::default();
+    driver.page(300);
+    println!(
+        "resource_sidecar_quiet {}",
+        serde_json::to_string(&driver.counts).unwrap()
+    );
+    assert!(meets_floor(&driver.counts));
+    // Test-only loss of reusable facts, with the same homes and native loader.
+    driver.fixture.cache = Arc::default();
+    driver.fixture.on_committed_route(driver.session.path());
+    driver.counts = Counts::default();
+    driver.page(600);
+    println!(
+        "resource_sidecar_replay {}",
+        serde_json::to_string(&driver.counts).unwrap()
+    );
+    assert!(
+        !meets_floor(&driver.counts),
+        "reintroduced cold reload must trip reuse floor"
+    );
 }

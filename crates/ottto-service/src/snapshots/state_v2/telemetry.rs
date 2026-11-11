@@ -429,6 +429,8 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
 /// Successful physical decodes, including repeated reads for checks/encoding.
 /// Thread-local counters never carry record keys and reset at prepare.
 pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_hydrated(rows);
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.decoded.rows = pass.decoded.rows.saturating_add(rows);
