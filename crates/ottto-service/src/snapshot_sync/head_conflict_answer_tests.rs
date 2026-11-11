@@ -1019,8 +1019,8 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     assert_eq!(progress.accepted_cache_heads[&key], "2".repeat(64));
     assert!(progress.head_conflict_challenges.is_empty());
 
-    // A body whose cache patch was withheld sends no CAS contract, so it
-    // keeps today's wire even while a challenge is owed.
+    // A body whose cache patch was withheld still declares head CAS through
+    // its saved base, so it answers an owed challenge too.
     progress.head_conflict_challenges.insert(
         key.clone(),
         HeadConflictChallenge {
@@ -1075,9 +1075,10 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     withheld[0].cache_observations_state = None;
     assert_eq!(
         attach_head_conflict_answers(&mut withheld, &progress, 1_000, |_| true),
-        0
+        1
     );
-    assert!(withheld[0].cache_conflict_answer.is_none());
+    assert!(withheld[0].cache_conflict_answer.is_some());
+    assert!(crate::snapshot_client::declares_head_cas(&withheld[0]));
     let mut no_base = vec![item.clone()];
     no_base[0].cache_base_head_etag = None;
     assert_eq!(

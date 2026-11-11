@@ -7912,6 +7912,7 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
         &mut scan_result.snapshots,
+        &mut upload_progress,
     );
     finalize_scan_after_policy_with_body_witness(
         source,

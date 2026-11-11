@@ -656,8 +656,8 @@ fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
 
 /// [money] A lost ACK keeps the debt; the replay is an exact repeat
 /// (unchanged, no second store); a repeat pass sends no POST; a fresh
-/// challenge from a later CAS conflict is recorded and cleared again by the
-/// next ordinary accept.
+/// challenge from a later CAS conflict is recorded and answered by the next
+/// revision, which keeps the stale saved base and so declares head CAS.
 #[test]
 fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     let none = BTreeSet::new();
@@ -724,15 +724,20 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
         progress.head_conflict_challenges[&key].challenge,
         store.challenges["owed"]
     );
-    // The next unpatched revision goes ordinary, is accepted, and clears it.
+    // The next unpatched revision answers it under CAS and keeps the head.
+    let owed_challenge = progress.head_conflict_challenges[&key].challenge.clone();
     let next = revised(&owed, 2);
     let (result, wires) = page(&mut progress, &[next], &none, |request, wire| {
         Ok(store.post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert!(wires[0].get("head_cas_contract").is_none());
+    assert!(wires[0]["head_cas_contract"].is_string());
+    assert_eq!(
+        envelope(&wires[0])["conflict_head_challenge"],
+        owed_challenge
+    );
     assert!(progress.head_conflict_challenges.is_empty());
-    assert!(!progress.accepted_cache_heads.contains_key(&key));
+    assert_eq!(progress.accepted_cache_heads[&key], store.heads["owed"].0);
     assert_eq!(store.stored, ["owed", "owed"]);
 }
 
@@ -1364,6 +1369,7 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
         progress.accepted_cache_heads[&key], store.heads["headed"].0,
         "the fresh head is kept"
     );
+    let fresh = progress.accepted_cache_heads[&key].clone();
     let mut next = vec![patched.clone()];
     assert!(cas_bootstrap_bodies(&progress, &next).is_empty());
     assert!(
@@ -1376,10 +1382,7 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(wires.len(), 1, "no probe");
-    assert_eq!(
-        envelope(&wires[0])["base_head_etag"],
-        store.heads["headed"].0.clone()
-    );
+    assert_eq!(envelope(&wires[0])["base_head_etag"], fresh);
 
     // Control: the ordinary write drops the head; the patch probes again.
     old.accepted_cache_heads.remove(&key);

@@ -2364,10 +2364,24 @@ thread_local! {
 
 // Supply the producer patch before real finalization, only for these scoped
 // probe cycles. The ordinary synthetic Claude session has no cache evidence.
-pub(in crate::snapshot_sync) fn prepare_probe_for_test(items: &mut [SnapshotItem]) {
+// Each session also owes a base-less challenge, as one an older writer left:
+// that keeps it on the probe path (`cas_bootstrap_bodies`) and changes no wire.
+pub(in crate::snapshot_sync) fn prepare_probe_for_test(
+    items: &mut [SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
+) {
     if FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow().is_some()) {
         for item in items {
             item.cache_observations = pending_head_index_item().1.cache_observations;
+            progress
+                .head_conflict_challenges
+                .entry(cache_session_key(&item.source_session_id))
+                .or_insert_with(|| HeadConflictChallenge {
+                    challenge: "c".repeat(64),
+                    stale_revision_v2_hash: "d".repeat(64),
+                    answer_attempts: 0,
+                    last_answer_unix: 0,
+                });
         }
     }
 }
