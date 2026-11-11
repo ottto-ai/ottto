@@ -2057,9 +2057,13 @@ fn backend_binding_requires_exact_scope_and_monotonic_reconsent_epoch() {
         .is_err());
     let mut different_policy = first_response;
     different_policy.can_collect = Some(false);
-    assert!(grants
-        .bind_backend_grant(&different_policy, INSTALLATION_ID)
-        .is_err());
+    assert_eq!(
+        grants
+            .bind_backend_grant(&different_policy, INSTALLATION_ID)
+            .unwrap(),
+        first_bound
+    );
+    assert_eq!(fs::read(grants.path()).unwrap(), bound_bytes);
 
     let cli = Cli::head(page("one", None));
     let server = Server::new();
