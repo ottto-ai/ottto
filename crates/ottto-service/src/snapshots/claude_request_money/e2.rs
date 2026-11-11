@@ -46,7 +46,7 @@ pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// Same bound the earlier holder walk used. A census walk that hits it cannot
 /// decide: the affected sessions or families are held, never counted.
-const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
+pub(in crate::snapshots) const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 /// Revision 3 keeps a listed family on ordinary (pre-`e2`) money. With the
 /// gate on, `e2` applies to every other family, also while the list pauses
@@ -2056,7 +2056,6 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
 pub(crate) struct CopyRemovalUpdates {
     state: Option<super::copy_removals::CopyRemovals>,
     added: u64,
-    incomplete: BTreeMap<String, String>,
 }
 impl CopyRemovalUpdates {
     /// The replacement carries stored decisions and retry debt in the same
@@ -2064,17 +2063,6 @@ impl CopyRemovalUpdates {
     pub(crate) fn apply(self, index: &mut ScanIndex) {
         if let Some(state) = self.state {
             index.claude_copy_removals = state;
-        }
-        // A deadline is not a money decision. Keep the ordinary history debt
-        // through this page's finalization without aging the prefix retry.
-        for (key, fingerprint) in self.incomplete {
-            let to = index
-                .active_effective_upload_body_witness_revision
-                .saturating_sub(1);
-            index.re_owe_effective_upload_body_witness_revision(&key, to);
-            index.exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from(
-                [fingerprint],
-            ));
         }
         diag("copy_removal_stored", self.added);
         record_counts(Counts::removal_store(self.added));
@@ -2791,6 +2779,10 @@ fn decide_holders(
             unwalked.insert(folder);
         }
     }
+    let on_page = page
+        .iter()
+        .filter_map(|item| item.claude_money.as_deref()?.location_key())
+        .collect::<BTreeSet<_>>();
     // (A) The copy's own session, then (B) the in-folder holder's
     // session in every folder. These indexed lookups need no census walk.
     for file in &mut wanted {
@@ -2807,7 +2799,12 @@ fn decide_holders(
                         continue;
                     }
                     if let Some(holder) =
-                        census_copy_holder(index, key, session, hash).filter(|&h| h < file.order)
+                        census_copy_holder(index, key, session, hash).filter(|&h| {
+                            h < file.order
+                                && (session != &file.session
+                                    || !file.resumed
+                                    || on_page.contains(&h.1))
+                        })
                     {
                         let earliest = file.covered.entry(hash).or_insert(holder);
                         *earliest = (*earliest).min(holder);
@@ -2820,8 +2817,12 @@ fn decide_holders(
     // positives are safe; absence is usable only when the walk completes.
     let mut unresolved = BTreeMap::<u64, Vec<usize>>::new();
     for (at, file) in wanted.iter().enumerate() {
+        if file.waiting {
+            continue;
+        }
         for &hash in &file.hashes {
-            if !file.covered.contains_key(&hash)
+            if !file.stale.contains(&hash)
+                && !file.covered.contains_key(&hash)
                 && !file.stored.contains(&hash)
                 && !file.twin_held.contains(&hash)
             {
@@ -2839,7 +2840,9 @@ fn decide_holders(
                 };
                 for &at in &unresolved[&hash] {
                     let file = &mut wanted[at];
-                    if holder < file.order {
+                    if holder < file.order
+                        && (root != file.session || !file.resumed || on_page.contains(&holder.1))
+                    {
                         let earliest = file.covered.entry(hash).or_insert(holder);
                         *earliest = (*earliest).min(holder);
                     }
@@ -2891,15 +2894,6 @@ fn decide_holders(
         // the file after its own-turn ACK, even when it is unchanged; its
         // third decision emits any remaining unproven requests flagged.
         if !uncovered.is_empty() && (!complete || unwalked.contains(&wanted.folder)) {
-            if let (Some(&key), Some(fingerprint)) = (
-                live.get_or_init(|| indexed_main_files(index))
-                    .get(&wanted.order.1),
-                items[wanted.at].source_file_fingerprint.as_ref(),
-            ) {
-                updates
-                    .incomplete
-                    .insert(key.to_owned(), fingerprint.clone());
-            }
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -3073,7 +3067,9 @@ fn defer_prefix(
         return;
     }
     let age = state.hold_age(file);
-    if reason != "held_copy_deadline" && !state.advance_hold(file) {
+    if reason == "held_copy_deadline" {
+        state.keep_pending(file);
+    } else if !state.advance_hold(file) {
         record_wait_settled(Settled::Expired, age);
         restore_uncovered(item, &ids);
         if let Some(fold) = item.claude_money.as_deref_mut() {
@@ -4161,7 +4157,13 @@ pub(crate) fn finish_page(
                 && fold.entity.removed_requests > 0
                 && fold.entity.totals().1 == 0
                 && !fold.entity.held
-                && fold.prefix.held_requests == 0;
+                && fold.prefix.held_requests == 0
+                && fold.location_key().is_some_and(|here| {
+                    index
+                        .claude_money_birth_store
+                        .observations(&item.source_session_id)
+                        .any(|(location, _)| location != here)
+                });
             *drop_copies
                 .entry(item.source_session_id.clone())
                 .or_insert(true) &= covered;

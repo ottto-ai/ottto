@@ -1484,9 +1484,8 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
     }
 }
 
-/// [money] Forward only: an unlisted writer's resume whose own turns start
-/// before the cutoff keeps the count it had (its copied prefix counted on
-/// both paths), also once it grows past the cutoff.
+/// [money] A same-session accepted holder supersedes the old forward-only
+/// cutoff. Growth declares and removes the earlier copied request.
 #[test]
 fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
     with_e2(|| {
@@ -1513,7 +1512,7 @@ fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
         literal(&grown);
         assert_eq!(
             (total(&grown), grown.scan.snapshots[0].removed_request_count),
-            (4, Some(0))
+            (3, Some(1))
         );
         assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
     });
@@ -5412,20 +5411,13 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
                 "copy_prefix_hold_expired",
                 "copy_prefix_accepted_session_holds",
             ];
-            for pass in 1..=3 {
+            for _ in 1..=3 {
                 let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
                 e2::take_diag();
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
                     page.enrich_with(&c, Some(&mut ledger));
                 });
-                if pass == 3 {
-                    let copy = body(&page, COPY).expect("the bound expires flagged");
-                    assert_eq!(
-                        (copy.request_count, copy.removed_request_count),
-                        (3, Some(0))
-                    );
-                    assert_eq!(copy_diag(&keys), [0, 2, 0]);
-                } else if accepted {
+                if accepted {
                     assert_withheld(&page, COPY, "accepted prefix hold");
                     assert_eq!(copy_diag(&keys), [2, 0, 1]);
                 } else {
@@ -5439,6 +5431,13 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
                 prior = settle(&c, &prior, page, &mut progress);
             }
             assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved);
+            let mut completed = c.raw(&scanner, prior, 100, false, &[]);
+            completed.enrich_with(&c, Some(&mut ledger));
+            let copy = body(&completed, COPY).expect("a complete walk decides the accepted origin");
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (1, Some(2))
+            );
         });
     }
 }

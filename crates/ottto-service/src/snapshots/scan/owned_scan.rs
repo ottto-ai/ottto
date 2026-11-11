@@ -1145,53 +1145,6 @@ impl OwnedSourceScan {
                 .flatten()
                 .map(|(key, _)| key.clone())
                 .collect();
-            let content_seeds = identified_candidates
-                .iter()
-                .filter(|candidate| {
-                    let key = local_index_key(&candidate.path);
-                    index
-                        .claude_request_census
-                        .get(&key)
-                        .is_some_and(|r| r.is_twin())
-                        && !sampled_audit::growth_full_paced(index, &key, growth_now)
-                })
-                .filter_map(|candidate| {
-                    let mut twin = candidate.clone();
-                    prepare_candidate_context(&mut twin);
-                    let seed = open_and_identify_scan_candidate_at(
-                        source,
-                        twin,
-                        &mut ScanCensus::default(),
-                        CandidateWindow {
-                            census_unix_seconds,
-                            backfill_window_days,
-                            retention: discovery_retention!(
-                                index,
-                                &resource_probe.discovery_growth
-                            ),
-                            growth: sampled_audit::growth_active(index)
-                                .then_some(&index.v2().growth_retention),
-                        },
-                    )
-                    .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, audit_now));
-                    seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
-                        .then_some(candidate.path.as_path())
-                })
-                .collect::<Vec<_>>();
-            let closed = claude_history_upgrade::claude_read_closure(
-                content_seeds.iter().copied(),
-                std::iter::empty(),
-                twin_groups,
-                &BTreeSet::new(),
-                index,
-            );
-            claude_twin_schedule.root_homes.extend(
-                closed
-                    .into_iter()
-                    .filter(|path| !content_seeds.contains(&path.as_path()))
-                    .map(|path| local_index_key(&path)),
-            );
-
             let paced_twins = paced_twins
                 .into_iter()
                 .map(|(path, ..)| path.to_path_buf())

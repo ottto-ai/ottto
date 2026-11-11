@@ -100,8 +100,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   main file stay removed, including same-session resumes and origins in another
   folder. A file's own stored removals never prove another copy. These decisions
   use the existing removal store. An incomplete census walk keeps only the
-  unresolved prefix out of totals and leaves the file owed through ordinary
-  body-witness revision debt, without advancing the bounded proof-wait counter.
+  unresolved prefix out of totals and leaves its existing prefix lease pending.
+  The first deadline registers that lease at age one; subsequent deadlines
+  preserve its age instead of advancing the bounded proof wait.
   An all-covered copy-only page drops its items; own turns still publish.
   A selected content twin pulls at most its earliest accepted holder. The seed
   set is fixed before those holders are added, so pulls never cascade.

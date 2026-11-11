@@ -407,7 +407,10 @@ pub(super) fn claude_read_closure<'a>(
                 .get(key)
                 .is_some_and(|record| record.is_twin())
         }),
-        None,
+        Some(
+            std::time::Instant::now()
+                + crate::snapshots::claude_request_money::e2::SIDE_CALL_DEADLINE,
+        ),
         false,
     )
     .unwrap_or_default();

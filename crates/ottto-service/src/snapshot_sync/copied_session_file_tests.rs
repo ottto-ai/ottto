@@ -102,7 +102,9 @@ fn copied_content_and_path_twins_count_once() {
                         .sum::<usize>(),
                     2
                 );
-                prior = settle(&c, &prior, page, &mut e2_progress());
+                // Persist the decision without finalizing files whose
+                // snapshots this composition arm deliberately filtered out.
+                prior = c.reload(&mut page.index);
             }
             append(&copy, &resumed(ROOT, &[C]));
             owe(&mut prior);
@@ -156,7 +158,7 @@ fn resumed_file_uses_the_in_folder_holders_session() {
 }
 
 /// [money] A forced incomplete all-folder walk preserves own turns, advances
-/// no completed-decision counter, and keeps revision debt across restart.
+/// no further retry age, and keeps the pending lease across restart.
 #[test]
 fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
     with_e2(|| {
@@ -181,10 +183,11 @@ fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
             );
             assert_eq!(
                 page.index.claude_copy_removals.hold_age(location_key(&key)),
-                0
+                1
             );
             prior = settle(&c, &prior, page, &mut e2_progress());
-            assert!(prior.files[&key].effective_upload_body_witness_revision < 3);
+            assert!(prior.claude_copy_removals.pending(location_key(&key)));
+            assert_eq!(prior.files[&key].effective_upload_body_witness_revision, 3);
         }
         let completed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
         let item = body(&completed, COPY).unwrap();

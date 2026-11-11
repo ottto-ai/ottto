@@ -144,7 +144,7 @@ impl OwnedSourceScan {
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
-            claude_twin_schedule,
+            mut claude_twin_schedule,
             claude_family_shadow,
             mut identified_candidates,
             active_file: active_frame,
@@ -3957,6 +3957,69 @@ impl OwnedSourceScan {
                     &mut identified_candidates,
                 );
                 pending!();
+            }
+            // A content twin pulls its holder only after ordinary identity,
+            // decision and admission. Reuse that acquisition: no seed pre-open.
+            // A proving holder is never a census twin, so this cannot cascade.
+            if source == SnapshotSource::ClaudeCode
+                && index
+                    .claude_request_census
+                    .get(&local_index_key(&candidate.path))
+                    .is_some_and(|record| record.is_twin())
+            {
+                let closed = claude_history_upgrade::claude_read_closure(
+                    [candidate.path.as_path()],
+                    std::iter::empty(),
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    index,
+                );
+                for path in closed.into_iter().filter(|path| *path != candidate.path) {
+                    let key = local_index_key(&path);
+                    if claude_twin_schedule.root_homes.contains(&key)
+                        || snapshots.iter().any(|item| {
+                            item.claude_money
+                                .as_deref()
+                                .and_then(claude_request_money::e2::FileFold::location_key)
+                                == Some(claude_money_birth_store::location_key(&key))
+                        })
+                    {
+                        continue;
+                    }
+                    claude_twin_schedule.root_homes.insert(key);
+                    if identified_candidates
+                        .iter()
+                        .any(|queued| queued.path == path)
+                    {
+                        continue;
+                    }
+                    let Some(scan_root) = roots
+                        .iter()
+                        .filter(|root| path.starts_with(root))
+                        .max_by_key(|root| root.components().count())
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let mut discovery =
+                        CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
+                    if let Some(holder) = candidate_from_traversal_path_at(
+                        source,
+                        disappearance_diagnostics::Site::CandidateForcedIndex,
+                        ScanTraversalPath {
+                            scan_root,
+                            path,
+                            census_member: false,
+                            watcher_hint: false,
+                        },
+                        &mut census,
+                        census_unix_seconds,
+                        backfill_window_days,
+                        &mut discovery,
+                    ) {
+                        identified_candidates.push_back(holder);
+                    }
+                }
             }
             #[cfg(test)]
             sampled_scan::test_hooks::after_selection(index, parse_reason);

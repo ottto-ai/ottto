@@ -1314,7 +1314,7 @@ fn e2_pipeline_incomplete_census_keeps_prefix_owed_after_restart() {
                     &c.root.join(file(COPY)).to_string_lossy()
                 )
             ),
-            0
+            1
         );
         let completed = ready(&c, &scanner, prior, 100, true);
         assert_eq!(
