@@ -55,6 +55,11 @@ fn matches(trace: &[(String, String, u32)], source: SnapshotSource, class: u32) 
 #[test]
 #[ignore = "native macOS PR validation only; never merge_group"]
 fn resource_native_ordinary_stage_qos() {
+    assert_eq!(
+        std::env::consts::OS,
+        "macos",
+        "native QoS is excluded from Linux execution"
+    );
     let pr = std::env::var("OTTTO_RESOURCE_QOS_PR")
         .expect("native PR runner must validate PR/head first");
     assert!(pr.parse::<u64>().is_ok_and(|n| n > 0));

@@ -89,7 +89,8 @@ placement. They use native acquisition/stage owners and the production paced-QoS
 policy; the HTTP/control-plane cycle is outside this fixture's scope.
 
 The native Mac PR runner invokes `scripts/resource_native_qos_pr.sh <PR-number>`.
-It requires Darwin, a PR context and an exact PR-head match. The test is ignored
+It requires Darwin, a PR context and an exact PR-head match. Linux compiles and
+type-checks the test, then explicitly excludes its module from execution. The test is ignored
 by ordinary, scheduled and merge-group discovery and requires the runner's PR
 binding. No paid hosted Mac workflow is added. A Linux pass is not native Mac
 evidence; record the native runner receipt separately.

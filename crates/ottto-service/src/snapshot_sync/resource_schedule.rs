@@ -69,21 +69,21 @@ pub(crate) fn needs_pacing(scan: &SourceScanResult) -> bool {
     continuation::resident_scan_requested(scan)
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn native_source_qos(
     source: SnapshotSource,
 ) -> Option<continuation::MacPlatformSignals> {
-    let mut qos = None;
-    continuation::enter_source_qos(&mut qos, source);
-    qos
+    if cfg!(target_os = "macos") {
+        let mut qos = None;
+        continuation::enter_source_qos(&mut qos, source);
+        qos
+    } else {
+        None // Linux has no requested-QoS class; explicitly excluded by B.
+    }
 }
-#[cfg(target_os = "macos")]
 pub(crate) fn native_qos() -> (u32, i32) {
     continuation::resource_qos().expect("native QoS observation missing")
 }
-#[cfg(target_os = "macos")]
 pub(crate) struct NativeQos((u32, i32));
-#[cfg(target_os = "macos")]
 impl Drop for NativeQos {
     fn drop(&mut self) {
         assert!(continuation::resource_set_qos(
@@ -92,18 +92,15 @@ impl Drop for NativeQos {
         ));
     }
 }
-#[cfg(target_os = "macos")]
 pub(crate) fn native_set_qos(class: u32) -> NativeQos {
     let prior = native_qos();
     assert!(continuation::resource_set_qos(class, 0));
     NativeQos(prior)
 }
-#[cfg(target_os = "macos")]
 pub(crate) fn native_background() -> continuation::MacPlatformSignals {
     continuation::MacPlatformSignals::background()
         .expect("native background QoS observation missing")
 }
-#[cfg(target_os = "macos")]
 pub(crate) fn native_worker<T: Send>(run: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         std::thread::Builder::new()

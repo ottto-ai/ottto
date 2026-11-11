@@ -43,7 +43,6 @@ struct Work {
 thread_local! {
     static WORK: std::cell::RefCell<Option<Work>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(target_os = "macos")]
 pub(crate) fn record_native_stage(json: &str) {
     native_qos::record_stage(json);
 }
@@ -299,7 +298,6 @@ impl<'a> Driver<'a> {
         let before = crate::local_resource_diagnostics::cli_children::starts_for_test();
         let ((scanned, rows), bytes, save, records) = observe_work(|| {
             with_scan_clock(EPOCH + seconds, || {
-                #[cfg(target_os = "macos")]
                 let _qos = crate::snapshot_sync::resource_schedule::native_source_qos(
                     SOURCES[self.source],
                 );
@@ -1014,5 +1012,4 @@ fn resource_paced_rewalk_replay() {
     );
 }
 
-#[cfg(target_os = "macos")]
 mod native_qos;

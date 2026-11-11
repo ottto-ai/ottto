@@ -66,5 +66,5 @@ jobs:
         env:
           OTTTO_RESOURCE_RECORD_BASELINE: ${{ inputs.record_baseline && '1' || '0' }}
         run: |
-          time cargo --config 'profile.test.package.ottto-service.opt-level=1' test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --nocapture --test-threads=1
+          time cargo --config 'profile.test.package.ottto-service.opt-level=1' test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --skip snapshots::resource_fixture::native_qos:: --nocapture --test-threads=1
           time cargo --config 'profile.test.package.ottto-service.opt-level=1' test -p ottto-service --locked --lib agent_status::tests::cli_metadata_tests::resource_cli_metadata_ -- --ignored --nocapture --test-threads=1
