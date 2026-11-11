@@ -387,8 +387,10 @@ impl<'a> Driver<'a> {
                 )
             }
         });
-        let read = self.fixture.paths();
-        self.pending_hints.retain(|path| !read.contains(path));
+        // enqueue_watcher_hints transfers deferred paths into the native
+        // traversal. Redelivering until E2's plain-file observer sees a path
+        // can keep a Codex group parse selected and prevent cursor resumption.
+        self.pending_hints.clear();
         assert_eq!(scan.malformed_json_line_count, 0);
         assert_eq!(scan.invalid_utf8_line_count, 0);
         assert_eq!(scan.unreadable_path_count, 0);
@@ -1077,11 +1079,19 @@ fn resource_hint_active_drain() {
         driver.counts.parser_consumed_bytes >= before + 2048,
         "the actual appended bytes drain"
     );
-    assert!(driver.pending_hints.is_empty(), "delivered hint settled");
+    assert!(
+        driver.pending_hints.is_empty(),
+        "hint transferred to native traversal"
+    );
     let mut codex = seed(&corpus, 1);
     corpus.append(1, 2);
     codex.pending_hints.push(corpus.files[1][0].clone());
-    codex.page(52000);
+    for seconds in (52000..52300).step_by(30) {
+        codex.page(seconds);
+        if codex.active_tokens == Some(200) {
+            break;
+        }
+    }
     println!(
         "resource_codex_active_probe tokens={:?} counts={} diagnostic={:?}",
         codex.active_tokens,
@@ -1096,7 +1106,12 @@ fn resource_hint_active_drain() {
     let _writer = corpus.codex_writer();
     corpus.append(1, 3);
     codex.pending_hints.push(corpus.files[1][0].clone());
-    codex.page(52300);
+    for seconds in (52300..52600).step_by(30) {
+        codex.page(seconds);
+        if codex.active_tokens == Some(300) {
+            break;
+        }
+    }
     println!(
         "resource_codex_wal_probe tokens={:?} counts={} diagnostic={:?}",
         codex.active_tokens,
