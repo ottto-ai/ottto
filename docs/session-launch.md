@@ -36,11 +36,23 @@ macOS uses `MNT_LOCAL`; portable Linux tests refuse known network/FUSE types.
 
 Launchers live in the owner-checked `session-launch/` support subdirectory at
 0700. The daemon opens the directory without following its final symlink and
-creates each 0700 launcher with `openat(O_EXCL|O_NOFOLLOW)`. Its entire content
-is a shebang, `rm -f -- "$0"`, and an `exec` of the quoted, pinned Ottto CLI
-path with `launch-check --exec`, the opaque launch id and its one-time secret.
-No folder or provider account configuration is written into the launcher.
-Startup removes stale launcher files after acquiring the daemon state lock.
+creates each 0700 launcher with `openat(O_EXCL|O_NOFOLLOW)`. Names are
+`claude-<8 hex>.command` or `codex-<8 hex>.command`, with collisions retried;
+the launch id and independent one-time secret remain full length. The script
+clears the terminal and scrollback, prints `Starting Claude Code…` or `Starting
+Codex…`, self-deletes with `rm -f -- "$0"`, and executes the quoted, pinned Ottto
+CLI with `launch-check --exec`, the opaque launch id and its one-time secret.
+Only a folder basename may be included in the greeting; quotes, control
+characters or non-UTF-8 names omit it. The greeting is a literal argument to
+`printf`, never shell code. No full working-folder path or provider account
+configuration is written into the launcher. Startup removes stale launcher
+files, including the earlier long names, after acquiring the daemon state lock.
+
+Prepare gives each `--version` probe eight seconds. If the probe times out or
+the executable/install symlink changes during it, prepare pauses 1.5 seconds,
+re-resolves the CLI and probes once more. A second failure refuses the launch;
+other version failures refuse immediately. Consume retains its strict pinned
+executable identity check and never retries or selects a replacement.
 
 Consume is token-authenticated and CLI-only. The registry claims the first
 attempt atomically, even on failure. It rechecks the secret, monotonic
