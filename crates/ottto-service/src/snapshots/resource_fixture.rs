@@ -432,3 +432,62 @@ fn resource_corpus_all_quiet_sidecar_replay() {
         "reintroduced cold reload must trip reuse floor"
     );
 }
+
+/// Stage byte observations must be present numeric counts, including genuine
+/// zero. Parser consumption and absent platform measurements cannot substitute.
+fn required_stage_disk_bytes(row: &Value) -> Result<[u64; 2], &'static str> {
+    let observation = row.get("observation").ok_or("stage observation missing")?;
+    Ok([
+        observation
+            .get("disk_read_bytes")
+            .and_then(Value::as_u64)
+            .ok_or("disk_read_bytes observation missing")?,
+        observation
+            .get("disk_written_bytes")
+            .and_then(Value::as_u64)
+            .ok_or("disk_written_bytes observation missing")?,
+    ])
+}
+
+/// [behaviour] Missing, null and malformed observations fail; observed zero
+/// remains zero. This validates the carrier, not fabricated runtime evidence.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_corpus_stage_disk_schema_is_fail_closed() {
+    let valid = json!({"observation":{"disk_read_bytes":0,"disk_written_bytes":0}});
+    assert_eq!(required_stage_disk_bytes(&valid), Ok([0, 0]));
+    assert!(required_stage_disk_bytes(&json!({})).is_err());
+    for field in ["disk_read_bytes", "disk_written_bytes"] {
+        let mut missing = valid.clone();
+        missing["observation"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(required_stage_disk_bytes(&missing).is_err());
+        for bad in [Value::Null, json!(-1), json!(true), json!("0")] {
+            let mut missing = valid.clone();
+            missing["observation"][field] = bad;
+            assert!(required_stage_disk_bytes(&missing).is_err());
+        }
+    }
+}
+
+/// [behaviour] The real prepare carrier must provide disk bytes for each source.
+/// This deliberately refuses unavailable platform observations before expensive
+/// calibration, rather than publishing a successful incomplete resource check.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_corpus_stage_disk_fields_are_observed() {
+    for source in SOURCES {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            crate::local_resource_diagnostics::source_prepare(source.api_slug(), || (), |_| false)
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "source_prepare" && row["source"] == source.api_slug())
+            .expect("real source_prepare stage row required");
+        required_stage_disk_bytes(row).unwrap_or_else(|missing| {
+            panic!("resource counter coverage unavailable for {}: {missing}; a platform stage measurement is required, never parser bytes or zero", source.api_slug())
+        });
+    }
+}

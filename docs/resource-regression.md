@@ -27,8 +27,13 @@ The calibration reports actual parser-consumed bytes, decoded state rows,
 sidecar reuse/reload counts, native CLI child starts and scan calls. Parser
 consumption does **not** measure raw I/O: guards, prefetch, headers, sidecars,
 SQLite, WAL and checkpoints have additional work. Unobserved read/write/page
-metrics remain `null`. Current calibration is not a complete resource-budget
-check, and a successful calibration run is not a complete resource receipt.
+metrics remain `null`. The advisory job first requires numeric `disk_read_bytes` and
+`disk_written_bytes` on real source-prepare stage rows. Missing platform
+observations fail that coverage step before corpus generation. Current main
+does not supply these observations on Linux, so the check cannot pass until a
+shared Linux-capable stage measurement is available. Parser bytes and a
+fabricated zero are never substituted. The remaining calibration is not a
+complete resource-budget receipt.
 
 A resource baseline may contain only observed counts for the exact corpus,
 scenario, source, phase and hour, pinned to the production-main revision used
