@@ -78,6 +78,9 @@ class ResourceScorecardTests(unittest.TestCase):
         for metric in METRICS:
             with self.subTest(metric=metric):
                 card = fixture()
+                if card["previous_stable"]["metrics"][metric] == 0:
+                    card["previous_stable"]["metrics"][metric] = 1
+                    card["previous_stable_sha256"] = canonical_sha(card["previous_stable"])
                 card["candidate"]["metrics"][metric] = (
                     0.8 if metric == "sidecar_reuse_ratio"
                     else card["previous_stable"]["metrics"][metric] * 1.21 + 0.001)

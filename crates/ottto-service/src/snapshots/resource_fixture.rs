@@ -63,7 +63,7 @@ impl Corpus {
         let roots = [
             vec![temp.join("home/.claude/projects/-sample-project")],
             (0..8)
-                .map(|n| temp.join(format!("home-{n}/.codex")))
+                .map(|n| temp.join(format!("home-{n}/.codex/sessions")))
                 .collect(),
             vec![temp.join("home/.pi/agent/sessions/--sample-project--")],
         ];
@@ -75,7 +75,7 @@ impl Corpus {
             for n in 0..counts[s] {
                 let id = session(n);
                 let dir = if s == 1 {
-                    roots[s][n % 8].join("sessions/2026/08/02")
+                    roots[s][n % 8].join("2026/08/02")
                 } else {
                     roots[s][0].clone()
                 };
@@ -117,6 +117,20 @@ impl Corpus {
                 births.insert(path.clone(), i128::from(EPOCH - 3600) * 1_000_000_000);
                 files[s].push(path);
             }
+        }
+        // Five sidecar homes plus three transcript-only homes. SQLite is
+        // generated and closed natively; no provider database is copied.
+        for root in roots[1].iter().take(5) {
+            fs::create_dir_all(root).unwrap();
+            let home = root.parent().unwrap();
+            for (name, ddl) in [
+                ("state_5.sqlite", "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, archived INTEGER, created_at INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT, thread_source TEXT, first_user_message TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);"),
+                ("thread_history_1.sqlite", "CREATE TABLE thread_history_projection_state (thread_id TEXT NOT NULL, next_rollout_byte_offset INTEGER NOT NULL, next_rollout_ordinal INTEGER NOT NULL);"),
+                ("logs_2.sqlite", "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT);"),
+            ] {
+                rusqlite::Connection::open(home.join(name)).unwrap().execute_batch(ddl).unwrap();
+            }
+            fs::write(home.join("session_index.jsonl"), b"").unwrap();
         }
         let manifest = Manifest {
             seed: SEED,

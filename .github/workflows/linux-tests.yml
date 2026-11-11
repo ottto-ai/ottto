@@ -168,6 +168,11 @@ jobs:
           python3 scripts/ci_runtime_tests.py --threads 3 --serial-threads 1 --no-fail-fast --shard ${{ matrix.shard }}/3
           ${{ github.event_name == 'workflow_dispatch' && '--retry-failed 1 --flaky-json flaky-tests.json' || '' }}
 
+      - name: Synthetic resource corpus calibration
+        if: matrix.shard == 1
+        run: |
+          time cargo test -p ottto-service --locked --lib resource_corpus_full_size_calibration -- --ignored --nocapture --test-threads=1
+
       - name: Upload flaky tests
         if: ${{ !cancelled() && hashFiles('flaky-tests.json') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

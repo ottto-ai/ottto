@@ -481,3 +481,97 @@ fn cli_metadata_stderr_login_status_is_cached() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// [regress] Stderr login success reuses metadata until the shared clock's
+/// 60-minute TTL, then reloads exactly one command pair without sleeping.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn resource_cli_metadata_virtual_hour_ttl() {
+    let (root, home) = cli_meta_fixture("resource-cli-ttl");
+    let binary = root.join("codex");
+    let script = fs::read_to_string(&binary).unwrap().replace(
+        "print(\"Logged in\")",
+        "print(\"Logged in using ChatGPT\", file=sys.stderr)",
+    );
+    fs::write(binary, script).unwrap();
+    let _commands =
+        EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+    let read = |seconds| {
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(seconds, || {
+            assert!(codex_cli_meta(&home, false, true).0.is_ok());
+        });
+    };
+    let starts = || {
+        fs::read_to_string(home.join("starts"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    read(0);
+    assert_eq!(starts(), 2);
+    read(3599);
+    assert_eq!(starts(), 2, "unchanged successful stderr result is reused");
+    read(3600);
+    assert_eq!(starts(), 4, "TTL boundary reloads each command once");
+    read(7199);
+    assert_eq!(starts(), 4);
+    read(7200);
+    assert_eq!(starts(), 6, "second virtual hour reloads once");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// [regress] Replay an uncached metadata lookup on eight quiet homes. The
+/// native child count crosses the same 180/hour gate; no fabricated count.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn resource_cli_metadata_children_replay() {
+    fn run(reuse: bool) -> usize {
+        let homes: Vec<_> = (0..8)
+            .map(|_| cli_meta_fixture("resource-cli-children"))
+            .collect();
+        let binary = homes[0].0.join("codex");
+        let script = fs::read_to_string(&binary).unwrap().replace(
+            "print(\"Logged in\")",
+            "print(\"Logged in using ChatGPT\", file=sys.stderr)",
+        );
+        fs::write(binary, script).unwrap();
+        let _commands = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            homes[0].0.as_os_str().to_os_string(),
+        );
+        for round in 0..24 {
+            crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(
+                round * 300,
+                || {
+                    for (_, home) in &homes {
+                        let result = codex_cli_meta(home, false, reuse);
+                        if reuse {
+                            assert!(result.0.is_ok());
+                        }
+                    }
+                },
+            );
+        }
+        let children = homes
+            .iter()
+            .map(|(_, home)| {
+                fs::read_to_string(home.join("starts"))
+                    .unwrap()
+                    .lines()
+                    .count()
+            })
+            .sum();
+        for (root, _) in homes {
+            fs::remove_dir_all(root).unwrap();
+        }
+        children
+    }
+    let ordinary = run(true);
+    assert_eq!(ordinary, 32, "warmup plus one TTL pair for eight homes");
+    let uncached = run(false);
+    assert_eq!(uncached, 384);
+    assert!(ordinary <= 180 * 2);
+    assert!(uncached > 180 * 2, "native replay must trip children/hour");
+}
