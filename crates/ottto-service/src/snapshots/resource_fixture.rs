@@ -65,8 +65,8 @@ fn session(n: usize) -> String {
 fn record(source: SnapshotSource, id: &str, turn: u64) -> Value {
     match source {
         SnapshotSource::ClaudeCode => json!({"type":"assistant", "sessionId":id,
-            "uuid":format!("assistant-{turn}"), "requestId":format!("request-{turn}"),
-            "timestamp":"2026-08-02T07:59:00Z", "message":{"id":format!("message-{turn}"),
+            "uuid":format!("assistant-{id}-{turn}"), "requestId":format!("request-{id}-{turn}"),
+            "timestamp":"2026-08-02T07:59:00Z", "message":{"id":format!("message-{id}-{turn}"),
             "role":"assistant", "model":"claude-sonnet-4-6", "usage":{
             "input_tokens":100,"output_tokens":10,"cache_read_input_tokens":20,
             "cache_creation_input_tokens":0}}}),
@@ -74,9 +74,9 @@ fn record(source: SnapshotSource, id: &str, turn: u64) -> Value {
             "payload":{"type":"token_count", "info":{"model":"gpt-5.2",
             "total_token_usage":{"input_tokens":100*turn,"output_tokens":10*turn},
             "last_token_usage":{"input_tokens":100,"output_tokens":10}}}}),
-        SnapshotSource::Pi => json!({"type":"message", "id":format!("entry-{turn}"),
+        SnapshotSource::Pi => json!({"type":"message", "id":format!("entry-{id}-{turn}"),
             "timestamp":"2026-08-02T07:59:00Z", "message":{"role":"assistant",
-            "provider":"openai", "model":"gpt-5.4", "responseId":format!("response-{turn}"),
+            "provider":"openai", "model":"gpt-5.4", "responseId":format!("response-{id}-{turn}"),
             "timestamp":1785657540000u64, "usage":{"input":100,"output":10,"cacheRead":20,"cacheWrite":0}}}),
     }
 }
@@ -336,6 +336,11 @@ fn resource_corpus_native_acquisition() {
     for s in 0..3 {
         let mut driver = Driver::new(&corpus, s);
         assert!(driver.page(0) > 0, "positive native acquisition control");
+        assert_eq!(
+            driver.fixture.paths().len(),
+            corpus.manifest.files[s],
+            "native path observations cover the small cold corpus"
+        );
         assert!(driver.counts.emitted_bodies > 0, "positive usage control");
         assert!(
             driver
@@ -370,13 +375,31 @@ fn resource_corpus_full_size_calibration() {
     );
     for s in 0..3 {
         let mut driver = Driver::new(&corpus, s);
-        // Bound by generated population, never by an elapsed-time assertion.
-        for page in 0..(corpus.manifest.files[s].div_ceil(500) + 2) {
-            if driver.page(page as u64 * 30) == 0 {
+        let mut seen = BTreeSet::new();
+        // Resident admission can defer before the file limit. Drain by observed
+        // progress, not ceil(population / requested_limit), and prove every file.
+        for page in 0..=corpus.manifest.files[s] {
+            let before = seen.len();
+            let scanned = driver.page(page as u64 * 30);
+            seen.extend(driver.fixture.paths());
+            if seen.len() == corpus.manifest.files[s] {
                 break;
             }
+            assert!(
+                scanned > 0 && seen.len() > before,
+                "native cold seed stalled with {} unobserved files",
+                corpus.manifest.files[s] - seen.len()
+            );
         }
-        assert!(driver.counts.emitted_bodies > 0);
+        assert_eq!(
+            seen,
+            corpus.files[s].iter().cloned().collect(),
+            "all generated files must actually reach the native reader"
+        );
+        assert_eq!(
+            driver.counts.emitted_bodies, corpus.manifest.files[s] as u64,
+            "each synthetic session must emit and earn a native ACK exactly once"
+        );
         println!(
             "resource_calibration {}",
             serde_json::to_string(&driver.counts).unwrap()
