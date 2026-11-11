@@ -225,6 +225,17 @@ impl Corpus {
         }
     }
 
+    fn codex_writer(&self) -> rusqlite::Connection {
+        let db = self.roots[1][0].parent().unwrap().join("state_5.sqlite");
+        let writer = rusqlite::Connection::open(db).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer.execute("INSERT INTO threads (id,title,tokens_used,archived,created_at,updated_at,model,rollout_path,thread_source,first_user_message) VALUES (?1,'sample-project',100,0,1785657540,1785657540,'gpt-5.2',?2,'cli','synthetic')",
+            rusqlite::params![session(0), self.files[1][0].to_str().unwrap()]).unwrap();
+        writer
+    }
+
     fn append(&self, source: usize, turn: u64) {
         self.append_n(source, 0, turn);
     }
@@ -272,6 +283,7 @@ struct Driver<'a> {
     active_tokens: Option<u64>,
     pending_hints: Vec<PathBuf>,
     page_limit: usize,
+    last_codex_diagnostic: Option<crate::codex_scan_diagnostics::CodexScanDiagnostics>,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
@@ -299,6 +311,7 @@ impl<'a> Driver<'a> {
             active_tokens: None,
             pending_hints: Vec::new(),
             page_limit: 500,
+            last_codex_diagnostic: None,
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
@@ -384,6 +397,7 @@ impl<'a> Driver<'a> {
                 .local_codex_diagnostics
                 .as_ref()
                 .expect("Codex sidecar observations required");
+            self.last_codex_diagnostic = Some(*diagnostic);
             let counters = self.counts.sidecar_reuse.get_or_insert_with(BTreeMap::new);
             for (kind, facts) in [
                 ("state_5", &diagnostic.state_titles),
@@ -767,14 +781,7 @@ fn resource_virtual_scenarios() {
     let mut codex_writer: Option<rusqlite::Connection> = None;
     for (case_n, (case, power, active)) in cases.into_iter().enumerate() {
         if active == Some(1) {
-            let db = corpus.roots[1][0].parent().unwrap().join("state_5.sqlite");
-            let writer = rusqlite::Connection::open(db).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                .unwrap();
-            writer.execute("INSERT INTO threads (id,title,tokens_used,archived,created_at,updated_at,model,rollout_path,thread_source,first_user_message) VALUES (?1,'sample-project',100,0,1785657540,1785657540,'gpt-5.2',?2,'cli','synthetic')",
-                rusqlite::params![session(0), corpus.files[1][0].to_str().unwrap()]).unwrap();
-            codex_writer = Some(writer);
+            codex_writer = Some(corpus.codex_writer());
         }
         let offset = 2000 + case_n as u64 * 10000;
         schedule::with_power(power, || {
@@ -902,7 +909,8 @@ fn resource_virtual_scenarios() {
                 assert_eq!(
                     drivers[s].active_tokens,
                     Some((appended + 1) * 100),
-                    "all active usage reaches an exact ACK"
+                    "{case}: all active usage reaches an exact ACK; native diagnostic={:?}",
+                    drivers[s].last_codex_diagnostic
                 );
             }
             if reselected {
@@ -1070,4 +1078,34 @@ fn resource_hint_active_drain() {
         "the actual appended bytes drain"
     );
     assert!(driver.pending_hints.is_empty(), "delivered hint settled");
+    let mut codex = seed(&corpus, 1);
+    corpus.append(1, 2);
+    codex.pending_hints.push(corpus.files[1][0].clone());
+    codex.page(52000);
+    println!(
+        "resource_codex_active_probe tokens={:?} counts={} diagnostic={:?}",
+        codex.active_tokens,
+        serde_json::to_string(&codex.counts).unwrap(),
+        codex.last_codex_diagnostic
+    );
+    assert_eq!(
+        codex.active_tokens,
+        Some(200),
+        "native active Codex usage drains before a WAL mutation"
+    );
+    let _writer = corpus.codex_writer();
+    corpus.append(1, 3);
+    codex.pending_hints.push(corpus.files[1][0].clone());
+    codex.page(52300);
+    println!(
+        "resource_codex_wal_probe tokens={:?} counts={} diagnostic={:?}",
+        codex.active_tokens,
+        serde_json::to_string(&codex.counts).unwrap(),
+        codex.last_codex_diagnostic
+    );
+    assert_eq!(
+        codex.active_tokens,
+        Some(300),
+        "native active Codex usage drains after its WAL changes"
+    );
 }
