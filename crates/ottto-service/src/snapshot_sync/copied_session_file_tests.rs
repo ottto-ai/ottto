@@ -2,7 +2,9 @@
 use super::*;
 use crate::snapshots::claude_money_birth_store::location_key;
 use crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test;
-use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode, RouteResult};
+use crate::snapshots::sampled_scan::transition_fixture::{
+    money_oracle, observe_consumed, Mode, RouteResult,
+};
 
 const BORN: &str = "2026-08-02T07:03:00Z";
 
@@ -18,11 +20,32 @@ fn owe(index: &mut ScanIndex) {
     }
 }
 fn captured(page: &Page, mode: Mode) -> RouteResult {
-    let (status, wire, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
+    let mut progress = e2_progress();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let (status, wire, _) = upload(&page.scan.snapshots, &mut progress, ack);
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     let mut result =
         RouteResult::emitted(mode, SnapshotSource::ClaudeCode, wire, &page.scan.snapshots);
     result.modes = page.modes;
+    result.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
     result
 }
 
@@ -126,7 +149,7 @@ fn resumed_file_uses_the_in_folder_holders_session() {
             assert!(!page
                 .index
                 .claude_copy_removals
-                .pending(location_key(&copy.to_string_lossy().into_owned())));
+                .pending(location_key(&copy.to_string_lossy())));
             prior = settle(&c, &prior, page, &mut e2_progress());
         }
     });
@@ -261,6 +284,23 @@ fn copied_file_routes_preserve_money_and_placement() {
                 sampled,
             );
             page.finish();
+            let accounts = page
+                .scan
+                .snapshots
+                .iter()
+                .flat_map(|item| &item.usage_buckets)
+                .flat_map(|bucket| &bucket.model_usage)
+                .filter_map(|row| row.account_identifier_hash.as_ref())
+                .collect::<BTreeSet<_>>();
+            assert!(
+                accounts.len() >= 2,
+                "placement control needs two tagged accounts"
+            );
+            assert_eq!(
+                body(&page, ROOT).unwrap().request_count,
+                5,
+                "four own turns and one side call"
+            );
             routes.push(captured(&page, mode));
         }
         for route in &routes[1..] {
@@ -273,15 +313,79 @@ fn copied_file_routes_preserve_money_and_placement() {
 fn responses(session: &str, from: usize, count: usize, tokens: u64, at: &str) -> String {
     (0..count)
         .map(|n| {
-            line_by(
+            let mut value: serde_json::Value = serde_json::from_str(&line_by(
                 session,
                 &format!("r-{}", from + n),
                 at,
                 tokens / count as u64 + u64::from((n as u64) < tokens % count as u64),
                 OLD_WRITER,
-            )
+            ))
+            .unwrap();
+            // A meaningful token decrease for the receiver's million-token floor.
+            value["message"]["usage"]["cache_read_input_tokens"] = json!(50_000);
+            value.to_string() + "\n"
         })
         .collect()
+}
+
+/// Receiver model: strict activity fence, head CAS and the literal decrease
+/// rule. A large decrease passes only when the new removal delta explains it.
+fn receiver_accepts(head: &SnapshotItem, candidate: &SnapshotItem, etag: &str) -> bool {
+    let activity = |item: &SnapshotItem| {
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| {
+                [
+                    bucket.first_activity_at.as_deref(),
+                    bucket.last_activity_at.as_deref(),
+                ]
+            })
+            .chain([
+                item.source_started_at.as_deref(),
+                item.source_ended_at.as_deref(),
+                item.source_last_activity_at.as_deref(),
+            ])
+            .flatten()
+            .map(nanos)
+            .max()
+    };
+    if activity(candidate) < activity(head)
+        || candidate.cache_base_head_etag.as_deref() != Some(etag)
+    {
+        return false;
+    }
+    let total = |item: &SnapshotItem| {
+        item.input_tokens
+            + item.output_tokens
+            + item.cache_read_tokens
+            + item.cache_creation_5m_tokens
+            + item.cache_creation_1h_tokens
+            + item.reasoning_output_tokens
+            + item.unattributed_total_tokens
+    };
+    let removed = |item: &SnapshotItem| {
+        item.removed_usage.as_ref().map_or(0, |u| {
+            u.input_tokens
+                + u.output_tokens
+                + u.cache_read_tokens
+                + u.cache_creation_5m_tokens
+                + u.cache_creation_1h_tokens
+                + u.reasoning_output_tokens
+                + u.unattributed_total_tokens
+        })
+    };
+    let lost_requests = head.request_count.saturating_sub(candidate.request_count);
+    let lost_tokens = total(head).saturating_sub(total(candidate));
+    let explained = lost_requests
+        <= candidate
+            .removed_request_count
+            .unwrap_or(0)
+            .saturating_sub(head.removed_request_count.unwrap_or(0))
+        && lost_tokens
+            <= removed(candidate).saturating_sub(removed(head)) + (total(head) / 100).max(10_000);
+    let below_floor = head.request_count < 10 || lost_tokens < 1_000_000;
+    let large = lost_requests * 2 >= head.request_count || lost_tokens * 2 >= total(head);
+    below_floor || !large || explained
 }
 
 /// [money] An over-counted accepted head is corrected once by version three,
@@ -349,7 +453,9 @@ fn copied_file_version_three_converges_once() {
                 [0],
                 "no second re-owe after restart"
             );
-            let corrected = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            let mut corrected = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+            corrected.enrich(&c);
+            corrected.finish();
             let item = body(&corrected, session).unwrap();
             assert_eq!(
                 (item.request_count, item.output_tokens),
@@ -368,11 +474,46 @@ fn copied_file_version_three_converges_once() {
                 item.removed_usage.as_ref().unwrap().output_tokens
                     >= head.output_tokens - item.output_tokens
             );
+            let etag = snapshot_upload_body_witness(&head);
+            let item = corrected
+                .scan
+                .snapshots
+                .iter_mut()
+                .find(|item| item.source_session_id == session)
+                .unwrap();
+            item.cache_base_head_etag = Some(etag.clone());
+            assert!(receiver_accepts(&head, item, &etag));
+            assert!(
+                !receiver_accepts(&head, item, &"f".repeat(64)),
+                "CAS rejects the wrong head"
+            );
+            if shape == 2 {
+                let mut unexplained = item.clone();
+                unexplained.removed_request_count = Some(0);
+                unexplained.removed_usage = None;
+                assert!(
+                    !receiver_accepts(&head, &unexplained, &etag),
+                    "a large unexplained decrease holds"
+                );
+            }
             let mut progress = e2_progress();
-            let (status, _, _) = upload(&corrected.scan.snapshots, &mut progress, ack);
+            let mut corrected_posts = 0;
+            let (status, _, _) = upload(&corrected.scan.snapshots, &mut progress, |batch| {
+                for item in batch
+                    .iter()
+                    .filter(|item| item.source_session_id == session)
+                {
+                    assert!(receiver_accepts(&head, item, &etag));
+                    corrected_posts += 1;
+                }
+                ack(batch)
+            });
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            assert_eq!(corrected_posts, 1);
             prior = settle(&c, &prior, corrected, &mut progress);
-            let quiet = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+            let (quiet, consumed) =
+                observe_consumed(|| ready(&c, &E2ScanFixture::default(), prior, 100, false));
+            assert_eq!(consumed, 0, "quiet restart parses no transcript bytes");
             assert!(
                 quiet.scan.snapshots.is_empty(),
                 "quiet convergence uploads nothing"
