@@ -226,14 +226,39 @@ impl Corpus {
     }
 
     fn codex_writer(&self) -> rusqlite::Connection {
-        let db = self.roots[1][0].parent().unwrap().join("state_5.sqlite");
+        // The guarded native reader refuses a process-local writable SHM
+        // mapping at its read path. Use the existing external-provider WAL
+        // image helper, with the writer outside the scanned home.
+        let db = self.support.join("provider-state-writer.sqlite");
+        fs::copy(
+            self.roots[1][0].parent().unwrap().join("state_5.sqlite"),
+            &db,
+        )
+        .unwrap();
         let writer = rusqlite::Connection::open(db).unwrap();
         writer
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
             .unwrap();
         writer.execute("INSERT INTO threads (id,title,tokens_used,archived,created_at,updated_at,model,rollout_path,thread_source,first_user_message) VALUES (?1,'sample-project',100,0,1785657540,1785657540,'gpt-5.2',?2,'cli','synthetic')",
             rusqlite::params![session(0), self.files[1][0].to_str().unwrap()]).unwrap();
+        self.publish_codex_wal();
         writer
+    }
+
+    fn publish_codex_wal(&self) {
+        let target = self.roots[1][0].parent().unwrap().join("state_5.sqlite");
+        codex_sqlite_read::tests::copy_database(
+            &self.support.join("provider-state-writer.sqlite"),
+            &target,
+            true,
+        );
+        assert!(
+            fs::metadata(target.with_file_name("state_5.sqlite-wal"))
+                .unwrap()
+                .len()
+                > 0,
+            "actual uncheckpointed provider WAL image required"
+        );
     }
 
     fn append(&self, source: usize, turn: u64) {
@@ -835,6 +860,7 @@ fn resource_virtual_scenarios() {
                                 )
                                 .unwrap();
                             assert_eq!(changed, 1, "real active Codex WAL mutation");
+                            corpus.publish_codex_wal();
                             wal_updates += changed;
                         }
                         schedule::event(SOURCES[s]);
