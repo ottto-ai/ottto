@@ -166,11 +166,16 @@ fn first_sighting_and_legacy_overcount_converge_on_the_next_child_fold() {
         offered.finish();
         assert_eq!(offered.scan.snapshots.len(), 1, "one corrective offer");
         let prior = commit(&session, corrected);
-        let (mut quiet, bytes) = fixture::observe_consumed(|| page(&c, prior, 100, true));
+        // Plain Claude uses the same observed object/parser seams as the
+        // existing resident-wave quiet control. Never fabricate zero I/O.
+        let (mut quiet, io) = fixture::observe_codex_quiet(|| page(&c, prior, 100, true));
         quiet.finish();
         assert!(quiet.scan.snapshots.is_empty(), "no repeated correction");
-        assert_eq!(bytes, 0, "quiet restart reads no transcript bytes");
-        money_oracle::assert_quiet_restart_zero_bytes(&result(&quiet, Mode::Restart));
+        assert_eq!(io.consumed, 0, "quiet restart reads no transcript bytes");
+        let mut quiet_route = result(&quiet, Mode::Restart);
+        quiet_route.io = io;
+        quiet_route.modes = quiet.modes;
+        money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
     });
 }
 
