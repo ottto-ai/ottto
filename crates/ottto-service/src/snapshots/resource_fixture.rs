@@ -287,7 +287,7 @@ struct Driver<'a> {
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
-        let fixture = E2ScanFixture::default();
+        let fixture = E2ScanFixture::clocked_collection();
         let kind = match SOURCES[source] {
             SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
             SnapshotSource::Codex => scan_index_persistence::Source::Codex,
@@ -845,7 +845,6 @@ fn resource_virtual_scenarios() {
                         drivers[0]
                             .index
                             .activate_upload_context("synthetic-next-context".into());
-                        e2_pipeline_scan_fixture::age_listing_for_test(&mut drivers[0].index);
                         schedule::event(SOURCES[0]);
                     }
                     if seconds.is_multiple_of(60) {
@@ -1064,7 +1063,6 @@ fn resource_hint_active_drain() {
     // Native selection reserves one slot for census progress; the second
     // slot admits the changed watcher path without starving that census.
     driver.page_limit = 2;
-    e2_pipeline_scan_fixture::age_listing_for_test(&mut driver.index);
     driver.page(2000);
     let before = driver.counts.parser_consumed_bytes;
     corpus.append_n(0, 3, 2);

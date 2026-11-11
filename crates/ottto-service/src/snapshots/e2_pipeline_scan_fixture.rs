@@ -417,9 +417,31 @@ pub(crate) struct E2ScanFixture {
     full_reasons: Mutex<[usize; 11]>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
+    collection_clock: bool,
     attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
 }
 impl E2ScanFixture {
+    /// Resource scenarios opt in to the shared virtual collection window.
+    /// Existing fixtures keep their fixed timestamps and historical bytes.
+    pub(crate) fn clocked_collection() -> Self {
+        Self {
+            collection_clock: true,
+            ..Self::default()
+        }
+    }
+
+    fn collection_time(&self, fallback: &str) -> String {
+        if !self.collection_clock {
+            return fallback.to_owned();
+        }
+        time::OffsetDateTime::from_unix_timestamp(
+            crate::scan_clock::utc_seconds().try_into().unwrap(),
+        )
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+    }
+
     pub(crate) fn mark_sidecar_sweep_incomplete(index: &mut ScanIndex) {
         index.claude_desktop_store_retry_not_before_unix_seconds = Some(0);
     }
@@ -504,7 +526,7 @@ impl E2ScanFixture {
             SnapshotSource::ClaudeCode,
             roots,
             index,
-            "2026-08-02T08:00:00Z",
+            &self.collection_time("2026-08-02T08:00:00Z"),
             183,
             limit,
             Some(support),
@@ -563,7 +585,7 @@ impl E2ScanFixture {
             source,
             roots,
             index,
-            "2026-10-27T08:00:00Z",
+            &self.collection_time("2026-10-27T08:00:00Z"),
             183,
             limit,
             Some(support),

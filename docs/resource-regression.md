@@ -13,8 +13,9 @@ The exact 90/9/1% mix is 4KiB/64KiB/1MiB. Native acquisition, policy, exact ACK,
 accepted fingerprint, state save and reload helpers seed the corpus. No live
 provider input, auth material or generated transcript is checked in.
 
-One shared virtual UTC/monotonic clock drives real cadence and account-switch
-owners. The measured half-open window is `[0,7200)` seconds, with separate cold
+One shared virtual UTC/monotonic clock drives real cadence, account-switch
+owners and native collection/census windows. Watcher hints transfer once into
+the native traversal, which retains deferred work for cursor follow-up. The measured half-open window is `[0,7200)` seconds, with separate cold
 seed and active-drain receipts. Cases cover quiet AC/Battery/Low Power/Unknown,
 one active session per source with 2KiB appended each five minutes (including
 real Codex SQLite WAL mutations), one minute-30
