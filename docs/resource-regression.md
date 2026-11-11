@@ -69,7 +69,9 @@ Review the resulting counts, corpus receipt, source/phase coverage and pinned
 revision before committing B. A record-mode run skips the B comparison and is
 **calibration only**. PR and nightly runs compare B by default. After updating B,
 run the advisory workflow normally, normal Linux tests, then money equivalence
-on the final head. Resource tests are ignored in ordinary discovery and selected
+on the final head. The advisory bootstrap keeps a private symlinked TMPDIR but needs no apt/zsh
+install: SQLite is bundled and metadata commands are Python stubs.
+Resource tests are ignored in ordinary discovery and selected
 explicitly, serially, without retries. The advisory build uses basic optimization
 only for the service test crate (`--config profile.test.package.ottto-service.opt-level=1`),
 retaining test debug assertions/overflow checks and the workspace's existing

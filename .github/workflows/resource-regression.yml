@@ -53,10 +53,18 @@ jobs:
           bash scripts/test_macos_public_rc_gate.sh
           bash scripts/test_resource_native_qos_pr.sh
 
+      # SQLite is bundled and selected resource tests use Python CLI stubs,
+      # so no apt/zsh bootstrap is needed. Preserve the existing private,
+      # symlinked TMPDIR contract used by state/credential path validation.
+      - name: Private resource temp directory
+        run: |
+          install -d -m 0700 "$RUNNER_TEMP/private/var/tmp"
+          ln -s private/var "$RUNNER_TEMP/var"
+          echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
+
       - name: Rust setup
         uses: ./.github/actions/rust-setup
         with:
-          linux-test-env: 'true'
           cache-key: linux-tests
           cache-save: 'false'
 
