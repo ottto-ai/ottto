@@ -20,8 +20,9 @@ seed and active-drain receipts. Cases cover quiet AC/Battery/Low Power/Unknown,
 one active session per source with 2KiB appended each five minutes (including
 real Codex SQLite WAL mutations through the existing external-provider WAL-image
 helper, avoiding process-local writable SHM at the read path), one minute-30
-context invalidation reselect, and an account switch forcing an immediate pass.
-The reselect must finish every generated Claude file exactly once and leave no
+native historical-replay reselect, and an account switch forcing an immediate pass.
+Delivery context changes alone deliberately trigger no acquisition; the reselect
+uses the native replay owner once at prepare, with its hydration counted. It must finish every generated Claude file exactly once and leave no
 context debt. Metadata companions cover successful stderr login and the native
 60-minute TTL. Tests use no sleeps or elapsed-time assertions.
 

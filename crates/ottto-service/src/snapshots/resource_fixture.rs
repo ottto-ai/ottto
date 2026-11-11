@@ -307,6 +307,7 @@ struct Driver<'a> {
     paced: bool,
     active_tokens: Option<u64>,
     pending_hints: Vec<PathBuf>,
+    reselect_pending: bool,
     page_limit: usize,
     last_codex_diagnostic: Option<crate::codex_scan_diagnostics::CodexScanDiagnostics>,
 }
@@ -335,6 +336,7 @@ impl<'a> Driver<'a> {
             paced: false,
             active_tokens: None,
             pending_hints: Vec::new(),
+            reselect_pending: false,
             page_limit: 500,
             last_codex_diagnostic: None,
         }
@@ -380,11 +382,20 @@ impl<'a> Driver<'a> {
     }
     fn page_at_clock(&mut self) -> usize {
         let source = SOURCES[self.source];
-        let index = std::mem::take(&mut self.index);
+        let mut index = std::mem::take(&mut self.index);
         let ((mut index, mut scan, _), bytes) = observe_consumed(|| {
             crate::local_resource_diagnostics::source_prepare(
                 source.api_slug(),
                 || {
+                    if std::mem::take(&mut self.reselect_pending) {
+                        // Delivery context alone deliberately reads nothing.
+                        // The native replay owner invalidates once and owns
+                        // the bounded reselect; its hydration is observed here.
+                        index.activate_upload_context("synthetic-next-context".into());
+                        assert!(
+                            index.prepare_historical_replay("synthetic-reselect-generation".into())
+                        );
+                    }
                     self.fixture
                         .begin_pass(source, &self.corpus.support, self.session.path());
                 },
@@ -868,9 +879,7 @@ fn resource_virtual_scenarios() {
                     if case == "reselect" && seconds == 1800 {
                         assert!(!reselected);
                         reselected = true;
-                        drivers[0]
-                            .index
-                            .activate_upload_context("synthetic-next-context".into());
+                        drivers[0].reselect_pending = true;
                         schedule::event(SOURCES[0]);
                     }
                     if seconds.is_multiple_of(60) {
@@ -1146,5 +1155,25 @@ fn resource_hint_active_drain() {
         codex.active_tokens,
         Some(300),
         "native active Codex usage drains after its WAL changes"
+    );
+    let before = driver.counts.emitted_bodies;
+    driver.reselect_pending = true;
+    for seconds in (53000..53300).step_by(30) {
+        driver.page(seconds);
+        if driver.counts.emitted_bodies - before == corpus.manifest.files[0] as u64 {
+            break;
+        }
+    }
+    assert_eq!(
+        driver.counts.emitted_bodies - before,
+        corpus.manifest.files[0] as u64,
+        "one native replay fully reselects the small corpus"
+    );
+    assert!(!driver.reselect_pending);
+    assert!(
+        corpus.files[0].iter().all(
+            |path| !e2_pipeline_scan_fixture::upload_context_owed_for_test(&driver.index, path)
+        ),
+        "native reselect leaves no context debt"
     );
 }
