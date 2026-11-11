@@ -10,6 +10,11 @@ on:
   schedule:
     - cron: '30 4 * * *'
   workflow_dispatch:
+    inputs:
+      record_baseline:
+        description: 'Emit calibration counts without comparing B (never passing budget evidence)'
+        type: boolean
+        default: false
 
 concurrency:
   group: resource-regression-${{ github.event.pull_request.number || github.ref }}
@@ -51,15 +56,11 @@ jobs:
           cache-key: linux-tests
           cache-save: 'false'
 
-      # Missing physical disk observations are a coverage failure, not zero.
-      # Check the native carrier before generating the full corpus.
-      - name: Required stage disk observations
-        run: |
-          cargo test -p ottto-service --locked --lib snapshots::resource_fixture::resource_corpus_stage_disk_fields_are_observed -- --exact --ignored --nocapture --test-threads=1
-
       # Ignored in ordinary Linux/Mac suites so this advisory calibration never
       # becomes a required check indirectly. One serial run; no retries.
-      - name: Native resource calibration
+      - name: Native resource gate
+        env:
+          OTTTO_RESOURCE_RECORD_BASELINE: ${{ inputs.record_baseline && '1' || '0' }}
         run: |
-          time cargo test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --nocapture --test-threads=1 --skip snapshots::resource_fixture::resource_corpus_stage_disk_fields_are_observed
+          time cargo test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --nocapture --test-threads=1
           time cargo test -p ottto-service --locked --lib agent_status::tests::cli_metadata_tests::resource_cli_metadata_ -- --ignored --nocapture --test-threads=1

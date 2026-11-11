@@ -1637,6 +1637,11 @@ fn flush_offpass() {
         emit(&row);
     }
 }
+#[cfg(all(test, unix))]
+pub(crate) fn flush_offpass_for_resource_test() {
+    flush_offpass();
+}
+
 /// The page's largest listed or read file size, without paths or read
 /// admission decisions.
 pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
@@ -2343,6 +2348,13 @@ fn emit(record: &impl Serialize) {
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
+                #[cfg(unix)]
+                {
+                    // Count the actual formatter/writer bytes, including prefix/newline.
+                    let mut sink = Vec::new();
+                    write_line(&json, &mut sink);
+                    crate::snapshots::resource_fixture::record_log(sink.len() as u64);
+                }
                 true
             } else {
                 false

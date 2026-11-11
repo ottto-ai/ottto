@@ -24712,3 +24712,6 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 #[cfg(test)]
 mod codex_sidecar_reuse_tests;
+
+#[cfg(all(test, unix))]
+pub(crate) mod resource_schedule;

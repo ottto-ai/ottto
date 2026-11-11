@@ -572,6 +572,8 @@ pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
 /// One bounded sample per save attempt; rejected work is visible too. Gauges
 /// share the claude_state_v2 diagnostic row and contain counts/bytes only.
 pub(super) fn save_work(rows: u64, bytes: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_save(rows, bytes);
     if let Ok(mut stats) = stats().lock() {
         stats.save_dirty_rows.observe(rows);
         stats.save_dirty_bytes.observe(bytes);

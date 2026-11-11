@@ -305,6 +305,10 @@ impl MacPlatformSignals {
 }
 impl PlatformGates for MacPlatformSignals {
     fn power(&mut self) -> PlatformState {
+        #[cfg(all(test, unix))]
+        if let Some(power) = super::resource_schedule::test_power() {
+            return power;
+        }
         #[cfg(target_os = "macos")]
         let answer = unsafe { ottto_power_state() };
         #[cfg(not(target_os = "macos"))]

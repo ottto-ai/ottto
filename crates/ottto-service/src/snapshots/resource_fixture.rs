@@ -35,6 +35,54 @@ fn observe_hydrated<T>(run: impl FnOnce() -> T) -> (T, u64) {
     )
 }
 
+#[derive(Default)]
+struct Work {
+    logs: u64,
+    saves: Option<[u64; 3]>,
+}
+thread_local! {
+    static WORK: std::cell::RefCell<Option<Work>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn record_log(bytes: u64) {
+    WORK.with(|slot| {
+        if let Some(work) = slot.borrow_mut().as_mut() {
+            work.logs += bytes;
+        }
+    });
+}
+pub(in crate::snapshots) fn record_save(rows: u64, bytes: u64) {
+    WORK.with(|slot| {
+        if let Some(work) = slot.borrow_mut().as_mut() {
+            let sums = work.saves.get_or_insert([0; 3]);
+            for (sum, value) in sums.iter_mut().zip([1, rows, bytes]) {
+                *sum += value;
+            }
+        }
+    });
+}
+fn observe_work<T>(
+    run: impl FnOnce() -> (T, Vec<Value>),
+) -> (T, u64, Option<[u64; 3]>, Vec<Value>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WORK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    WORK.with(|slot| assert!(slot.borrow_mut().replace(Work::default()).is_none()));
+    let _reset = Reset;
+    let (result, records) = run();
+    let work = WORK.with(|slot| slot.borrow_mut().take().unwrap());
+    (result, work.logs, work.saves, records)
+}
+fn required(row: &Value, key: &str) -> u64 {
+    row.get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing logical observation: {key}"))
+}
+
 const SEED: u64 = 0x5219_7402;
 const EPOCH: u64 = 1_785_657_600; // 2026-08-02T08:00:00Z
 const SOURCES: [SnapshotSource; 3] = [
@@ -197,11 +245,15 @@ struct Counts {
     parser_consumed_bytes: u64,
     hydrated_rows: Option<u64>,
     sidecar_reuse: Option<BTreeMap<&'static str, [u64; 2]>>,
-    // Raw I/O includes guards, headers, sidecars, DB/WAL/checkpoint and logs.
-    // These remain absent until every boundary is observed. Never invent zero.
-    raw_read_bytes: Option<u64>,
-    raw_written_bytes: Option<u64>,
-    sqlite_pages_written: Option<u64>,
+    native_bytes: u64,
+    full_native_bytes: u64,
+    guard_bytes: u64,
+    encoded_bytes: u64,
+    dirty_rows: u64,
+    save_attempts: u64,
+    log_bytes: u64,
+    hydrated_rows_max: u64,
+    children: BTreeMap<String, u64>,
 }
 struct Driver<'a> {
     corpus: &'a Corpus,
@@ -210,6 +262,7 @@ struct Driver<'a> {
     source: usize,
     index: ScanIndex,
     counts: Counts,
+    paced: bool,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
@@ -233,27 +286,57 @@ impl<'a> Driver<'a> {
             session,
             index,
             counts: Counts::default(),
+            paced: false,
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
-        let (scanned, rows) = with_scan_clock(EPOCH + seconds, || {
-            observe_hydrated(|| self.page_at_clock())
+        let before = crate::local_resource_diagnostics::cli_children::starts_for_test();
+        let ((scanned, rows), bytes, save, records) = observe_work(|| {
+            with_scan_clock(EPOCH + seconds, || {
+                let ((scanned, rows), records) = crate::local_resource_diagnostics::capture(|| {
+                    observe_hydrated(|| self.page_at_clock())
+                });
+                ((scanned, rows), records)
+            })
         });
-        self.counts.hydrated_rows = Some(
-            self.counts
-                .hydrated_rows
-                .unwrap_or(0)
-                .checked_add(rows)
-                .unwrap(),
-        );
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .expect("native collection page observation required");
+        let reads = &page["counts"]["sampled_acquisition"];
+        self.counts.native_bytes += required(reads, "completed_native_bytes");
+        self.counts.full_native_bytes += required(reads, "completed_full_native_bytes");
+        self.counts.guard_bytes += required(reads, "completed_guard_bytes");
+        let [attempts, dirty_rows, encoded] = save.expect("native save observation required");
+        assert!(attempts > 0, "save hook must actually run");
+        self.counts.save_attempts += attempts;
+        self.counts.dirty_rows += dirty_rows;
+        self.counts.encoded_bytes += encoded;
+        self.counts.log_bytes += bytes;
+        self.counts.hydrated_rows_max = self.counts.hydrated_rows_max.max(rows);
+        self.counts.hydrated_rows = Some(self.counts.hydrated_rows.unwrap_or(0) + rows);
+        let after = crate::local_resource_diagnostics::cli_children::starts_for_test();
+        for (kind, start) in before {
+            let end = after
+                .get(kind)
+                .expect("fixed child kind observation required");
+            *self.counts.children.entry(kind.to_owned()).or_default() +=
+                end.checked_sub(start).unwrap();
+        }
         scanned
     }
     fn page_at_clock(&mut self) -> usize {
         let source = SOURCES[self.source];
         let index = std::mem::take(&mut self.index);
         let ((mut index, mut scan, _), bytes) = observe_consumed(|| {
-            self.fixture
-                .begin_pass(source, &self.corpus.support, self.session.path());
+            crate::local_resource_diagnostics::source_prepare(
+                source.api_slug(),
+                || {
+                    self.fixture
+                        .begin_pass(source, &self.corpus.support, self.session.path());
+                },
+                |_| false,
+            );
             if source == SnapshotSource::ClaudeCode {
                 self.fixture.scan(
                     &self.corpus.roots[self.source],
@@ -295,6 +378,7 @@ impl<'a> Driver<'a> {
                 count[1] += facts.reloaded_roots as u64;
             }
         }
+        self.paced = crate::snapshot_sync::resource_schedule::needs_pacing(&scan);
         finalize_scan_after_policy(source, &mut scan, &mut index);
         let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(source);
         ledger.deliver(&scan.snapshots);
@@ -313,7 +397,13 @@ impl<'a> Driver<'a> {
         self.counts.emitted_bodies += scan.snapshots.len() as u64;
         self.counts.parser_consumed_bytes += bytes;
         self.index =
-            e2_pipeline_scan_fixture::save_reload_for_test(&mut index, self.session.path());
+            crate::local_resource_diagnostics::source_finish(source.api_slug(), false, || {
+                Ok(e2_pipeline_scan_fixture::save_reload_for_test(
+                    &mut index,
+                    self.session.path(),
+                ))
+            })
+            .unwrap();
         scan.scanned_file_count
     }
 }
@@ -356,49 +446,6 @@ fn resource_corpus_native_acquisition() {
         assert!(
             driver.counts.parser_consumed_bytes > before,
             "native append read"
-        );
-        println!(
-            "resource_calibration {}",
-            serde_json::to_string(&driver.counts).unwrap()
-        );
-    }
-}
-
-/// [format] Full-size corpus is generated transiently; no checked-in transcript.
-#[test]
-#[ignore = "CI calibration only; full resource observer coverage is not yet complete"]
-fn resource_corpus_full_size_calibration() {
-    let corpus = Corpus::generate([12_000, 5_500, 500]);
-    println!(
-        "resource_manifest {}",
-        serde_json::to_string(&corpus.manifest).unwrap()
-    );
-    for s in 0..3 {
-        let mut driver = Driver::new(&corpus, s);
-        let mut seen = BTreeSet::new();
-        // Resident admission can defer before the file limit. Drain by observed
-        // progress, not ceil(population / requested_limit), and prove every file.
-        for page in 0..=corpus.manifest.files[s] {
-            let before = seen.len();
-            let scanned = driver.page(page as u64 * 30);
-            seen.extend(driver.fixture.paths());
-            if seen.len() == corpus.manifest.files[s] {
-                break;
-            }
-            assert!(
-                scanned > 0 && seen.len() > before,
-                "native cold seed stalled with {} unobserved files",
-                corpus.manifest.files[s] - seen.len()
-            );
-        }
-        assert_eq!(
-            seen,
-            corpus.files[s].iter().cloned().collect(),
-            "all generated files must actually reach the native reader"
-        );
-        assert_eq!(
-            driver.counts.emitted_bodies, corpus.manifest.files[s] as u64,
-            "each synthetic session must emit and earn a native ACK exactly once"
         );
         println!(
             "resource_calibration {}",
@@ -456,61 +503,360 @@ fn resource_corpus_all_quiet_sidecar_replay() {
     );
 }
 
-/// Stage byte observations must be present numeric counts, including genuine
-/// zero. Parser consumption and absent platform measurements cannot substitute.
-fn required_stage_disk_bytes(row: &Value) -> Result<[u64; 2], &'static str> {
-    let observation = row.get("observation").ok_or("stage observation missing")?;
-    Ok([
-        observation
-            .get("disk_read_bytes")
-            .and_then(Value::as_u64)
-            .ok_or("disk_read_bytes observation missing")?,
-        observation
-            .get("disk_written_bytes")
-            .and_then(Value::as_u64)
-            .ok_or("disk_written_bytes observation missing")?,
-    ])
+fn numbers(counts: &Counts, source: usize) -> BTreeMap<String, u64> {
+    let mut result = BTreeMap::new();
+    let json = serde_json::to_value(counts).unwrap();
+    for key in [
+        "passes",
+        "scanned_files",
+        "emitted_bodies",
+        "parser_consumed_bytes",
+        "hydrated_rows",
+        "hydrated_rows_max",
+        "native_bytes",
+        "full_native_bytes",
+        "guard_bytes",
+        "encoded_bytes",
+        "dirty_rows",
+        "save_attempts",
+        "log_bytes",
+    ] {
+        result.insert(key.to_owned(), required(&json, key));
+    }
+    result.insert(
+        "tail_native_bytes".into(),
+        counts
+            .native_bytes
+            .checked_sub(counts.full_native_bytes)
+            .unwrap(),
+    );
+    assert!(
+        !counts.children.is_empty(),
+        "native fixed-kind observations required"
+    );
+    for (kind, value) in &counts.children {
+        result.insert(format!("children.{kind}"), *value);
+    }
+    if source == 1 {
+        let sidecars = counts
+            .sidecar_reuse
+            .as_ref()
+            .expect("Codex loader observations required");
+        for kind in ["state_5", "thread_history_1", "session_index"] {
+            let [reused, reloaded] = sidecars.get(kind).expect("sidecar kind required");
+            result.insert(format!("reused.{kind}"), *reused);
+            result.insert(format!("reloaded.{kind}"), *reloaded);
+        }
+    }
+    result
 }
-
-/// [behaviour] Missing, null and malformed observations fail; observed zero
-/// remains zero. This validates the carrier, not fabricated runtime evidence.
-#[test]
-#[ignore = "resource-regression advisory workflow only"]
-fn resource_corpus_stage_disk_schema_is_fail_closed() {
-    let valid = json!({"observation":{"disk_read_bytes":0,"disk_written_bytes":0}});
-    assert_eq!(required_stage_disk_bytes(&valid), Ok([0, 0]));
-    assert!(required_stage_disk_bytes(&json!({})).is_err());
-    for field in ["disk_read_bytes", "disk_written_bytes"] {
-        let mut missing = valid.clone();
-        missing["observation"]
-            .as_object_mut()
-            .unwrap()
-            .remove(field);
-        assert!(required_stage_disk_bytes(&missing).is_err());
-        for bad in [Value::Null, json!(-1), json!(true), json!("0")] {
-            let mut missing = valid.clone();
-            missing["observation"][field] = bad;
-            assert!(required_stage_disk_bytes(&missing).is_err());
+fn accumulate(target: &mut BTreeMap<String, u64>, page: BTreeMap<String, u64>) {
+    for (key, value) in page {
+        let total = target.entry(key.clone()).or_default();
+        if key == "hydrated_rows_max" {
+            *total = (*total).max(value);
+        } else {
+            *total += value;
+        }
+    }
+}
+fn within_bound(actual: u64, baseline: u64) -> bool {
+    u128::from(actual) * 5 <= u128::from(baseline) * 6
+}
+fn check_baseline(actual: &BTreeMap<String, BTreeMap<String, u64>>, baseline: &Value) {
+    let expected = baseline["counts"]
+        .as_object()
+        .expect("baseline counts required");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "scenario/source/phase/hour coverage changed"
+    );
+    for (phase, observed) in actual {
+        let expected = expected
+            .get(phase)
+            .and_then(Value::as_object)
+            .expect("baseline phase required");
+        assert_eq!(
+            observed.len(),
+            expected.len(),
+            "counter coverage changed: {phase}"
+        );
+        for (key, value) in observed {
+            let bound = expected
+                .get(key)
+                .and_then(Value::as_u64)
+                .expect("reviewed counter baseline required");
+            assert!(
+                within_bound(*value, bound),
+                "resource bound tripped: {phase}/{key}: {value} > 1.20 * {bound}"
+            );
+        }
+    }
+}
+fn quiet_reuse(counts: &Counts) {
+    let facts = counts
+        .sidecar_reuse
+        .as_ref()
+        .expect("quiet sidecar observations");
+    for kind in ["state_5", "thread_history_1", "session_index"] {
+        let [reused, reloaded] = facts.get(kind).expect("sidecar kind observation");
+        assert!(
+            reused + reloaded > 0 && reused * 100 >= (reused + reloaded) * 95,
+            "quiet reuse floor: {kind}"
+        );
+    }
+}
+fn seed<'a>(corpus: &'a Corpus, source: usize) -> Driver<'a> {
+    let mut driver = Driver::new(corpus, source);
+    let mut seen = BTreeSet::new();
+    for page in 0..=corpus.manifest.files[source] {
+        let before = seen.len();
+        driver.page(page as u64 * 30);
+        seen.extend(driver.fixture.paths());
+        if seen.len() == corpus.manifest.files[source] {
+            break;
+        }
+        assert!(seen.len() > before, "native cold seed stalled");
+    }
+    assert_eq!(seen, corpus.files[source].iter().cloned().collect());
+    assert_eq!(
+        driver.counts.emitted_bodies, corpus.manifest.files[source] as u64,
+        "every native session earns an exact ACK"
+    );
+    driver
+}
+fn offpass(minute: u64, flush_each: bool) {
+    use crate::local_resource_diagnostics::{flush_offpass_for_resource_test, StageWindow};
+    for (stage, hourly) in [
+        ("offpass_agent_status", 88),
+        ("offpass_control", 1900),
+        ("offpass_telemetry", 3800),
+        ("offpass_network", 10000),
+    ] {
+        let n = hourly * (minute % 60 + 1) / 60 - hourly * (minute % 60) / 60;
+        for _ in 0..n {
+            drop(StageWindow::begin("unknown", stage));
+            if flush_each {
+                flush_offpass_for_resource_test();
+            }
         }
     }
 }
 
-/// [behaviour] The real prepare carrier must provide disk bytes for each source.
-/// This deliberately refuses unavailable platform observations before expensive
-/// calibration, rather than publishing a successful incomplete resource check.
+/// [regress] Native full corpus, cadence, acquisitions, exact ACKs and saves;
+/// clock jumps replace only waiting/platform power, never the collection work.
 #[test]
 #[ignore = "resource-regression advisory workflow only"]
-fn resource_corpus_stage_disk_fields_are_observed() {
-    for source in SOURCES {
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            crate::local_resource_diagnostics::source_prepare(source.api_slug(), || (), |_| false)
-        });
-        let row = rows
-            .iter()
-            .find(|row| row["stage"] == "source_prepare" && row["source"] == source.api_slug())
-            .expect("real source_prepare stage row required");
-        required_stage_disk_bytes(row).unwrap_or_else(|missing| {
-            panic!("resource counter coverage unavailable for {}: {missing}; a platform stage measurement is required, never parser bytes or zero", source.api_slug())
-        });
+fn resource_virtual_scenarios() {
+    use crate::snapshot_sync::resource_schedule as schedule;
+    let corpus = Corpus::generate([12_000, 5_500, 500]);
+    println!(
+        "resource_manifest {}",
+        serde_json::to_string(&corpus.manifest).unwrap()
+    );
+    let mut drivers: Vec<_> = (0..3).map(|s| seed(&corpus, s)).collect();
+    let mut receipts = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    for (s, driver) in drivers.iter_mut().enumerate() {
+        receipts.insert(
+            format!("seed/{}/warmup", SOURCES[s].api_slug()),
+            numbers(&driver.counts, s),
+        );
+        driver.counts = Counts::default();
     }
+    let cases = [
+        ("quiet_ac", "ac", None),
+        ("quiet_battery", "battery", None),
+        ("quiet_lpm", "lpm", None),
+        ("quiet_unknown", "unknown", None),
+        ("active_claude", "ac", Some(0)),
+        ("active_codex", "ac", Some(1)),
+        ("active_pi", "ac", Some(2)),
+        ("reselect", "ac", None),
+        ("account_switch", "ac", None),
+    ];
+    for (case_n, (case, power, active)) in cases.into_iter().enumerate() {
+        let offset = 2000 + case_n as u64 * 10000;
+        schedule::with_power(power, || {
+            with_scan_clock(EPOCH + offset, || {
+                for source in SOURCES {
+                    schedule::finished(source, 1, false);
+                }
+            });
+            let mut switched = schedule::Switch::new();
+            let mut reselected = false;
+            let mut reselect_bodies = 0;
+            let mut appended = 0;
+            let mut active_bytes = 0;
+            for seconds in (0..7200).step_by(30) {
+                with_scan_clock(EPOCH + offset + seconds, || {
+                    if case == "account_switch" {
+                        let changed =
+                            switched.observe(if seconds < 60 { "first" } else { "second" });
+                        assert_eq!(changed, seconds == 60, "one real account switch");
+                    }
+                    if seconds > 0 && seconds % 300 == 0 {
+                        if let Some(s) = active {
+                            appended += 1;
+                            corpus.append(s, appended + 1);
+                            schedule::event(SOURCES[s]);
+                        }
+                    }
+                    if case == "reselect" && seconds == 1800 {
+                        assert!(!reselected);
+                        reselected = true;
+                        drivers[0]
+                            .index
+                            .activate_upload_context("synthetic-next-context".into());
+                        e2_pipeline_scan_fixture::age_listing_for_test(&mut drivers[0].index);
+                        schedule::event(SOURCES[0]);
+                    }
+                    if seconds % 60 == 0 {
+                        let (_, bytes, _, _) = observe_work(|| {
+                            crate::local_resource_diagnostics::capture(|| {
+                                offpass(seconds / 60, false)
+                            })
+                        });
+                        *receipts
+                            .entry(format!("{case}/offpass/h{}", seconds / 3600))
+                            .or_default()
+                            .entry("log_bytes".into())
+                            .or_default() += bytes;
+                    }
+                    for (s, driver) in drivers.iter_mut().enumerate() {
+                        if !schedule::due(SOURCES[s]) {
+                            continue;
+                        }
+                        driver.page(offset + seconds);
+                        if s == 1 && active != Some(1) {
+                            quiet_reuse(&driver.counts);
+                        }
+                        let bodies = driver.counts.emitted_bodies;
+                        if case == "reselect" && s == 0 && reselected {
+                            reselect_bodies += bodies;
+                        }
+                        if active == Some(s) {
+                            active_bytes += driver.counts.parser_consumed_bytes;
+                        }
+                        schedule::finished(SOURCES[s], bodies, driver.paced);
+                        let values = numbers(&std::mem::take(&mut driver.counts), s);
+                        accumulate(
+                            receipts
+                                .entry(format!(
+                                    "{case}/{}/h{}",
+                                    SOURCES[s].api_slug(),
+                                    seconds / 3600
+                                ))
+                                .or_default(),
+                            values,
+                        );
+                    }
+                });
+            }
+            if let Some(s) = active {
+                assert_eq!(appended, 23);
+                drivers[s].page(offset + 7200);
+                active_bytes += drivers[s].counts.parser_consumed_bytes;
+                accumulate(
+                    receipts
+                        .entry(format!("{case}/{}/drain", SOURCES[s].api_slug()))
+                        .or_default(),
+                    numbers(&std::mem::take(&mut drivers[s].counts), s),
+                );
+                assert!(
+                    active_bytes >= appended * 2048,
+                    "every appended native byte drained"
+                );
+            }
+            if reselected {
+                assert_eq!(
+                    reselect_bodies, corpus.manifest.files[0] as u64,
+                    "mass reselect fully drains exactly once inside two hours"
+                );
+                assert!(
+                    corpus.files[0].iter().all(|path| {
+                        !e2_pipeline_scan_fixture::upload_context_owed_for_test(
+                            &drivers[0].index,
+                            path,
+                        )
+                    }),
+                    "no context debt remains"
+                );
+            }
+        });
+        for source in SOURCES {
+            for hour in 0..2 {
+                let phase = format!("{case}/{}/h{hour}", source.api_slug());
+                assert!(
+                    receipts
+                        .get(&phase)
+                        .and_then(|row| row.get("passes"))
+                        .copied()
+                        .expect("source/hour observations required")
+                        > 0
+                );
+            }
+        }
+        println!("resource_case_done {case}");
+    }
+    for (phase, counters) in &receipts {
+        if !phase.starts_with("reselect/") && phase.contains("/h") {
+            if let Some(passes) = counters.get("passes") {
+                let limit =
+                    if phase.starts_with("quiet_battery/") || phase.starts_with("quiet_lpm/") {
+                        4
+                    } else if phase.starts_with("account_switch/") {
+                        13
+                    } else {
+                        12
+                    };
+                assert!(*passes <= limit, "passes/hour {phase}: {passes} > {limit}");
+            }
+        }
+    }
+    println!(
+        "resource_baseline_counts {}",
+        serde_json::to_string(&receipts).unwrap()
+    );
+    if std::env::var("OTTTO_RESOURCE_RECORD_BASELINE").as_deref() != Ok("1") {
+        let baseline: Value = serde_json::from_str(include_str!("resource-baseline.json")).unwrap();
+        check_baseline(&receipts, &baseline);
+    }
+}
+
+/// [regress] Existing per-event offpass logging is expensive despite quiet homes.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_offpass_replay() {
+    fn run(flush_each: bool) -> u64 {
+        let (_, bytes, _, _) = observe_work(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                for minute in 0..60 {
+                    offpass(minute, flush_each);
+                }
+                crate::local_resource_diagnostics::flush_offpass_for_resource_test();
+            })
+        });
+        bytes
+    }
+    let folded = run(false);
+    let per_event = run(true);
+    println!("resource_log_replay folded={folded} per_event={per_event}");
+    assert!(folded > 0 && folded <= 2 * 1024 * 1024);
+    assert!(
+        per_event > 2 * 1024 * 1024,
+        "native replay trips log bytes/hour"
+    );
+}
+
+/// [behaviour] Missing logical observations and baseline entries fail; observed
+/// zero is accepted, and integer comparison enforces exactly 1.20 (no rounding).
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_observation_contract() {
+    assert!(std::panic::catch_unwind(|| required(&json!({}), "native_bytes")).is_err());
+    assert_eq!(required(&json!({"native_bytes":0}), "native_bytes"), 0);
+    assert!(within_bound(120, 100));
+    assert!(!within_bound(121, 100));
+    assert!(!within_bound(1, 0));
 }

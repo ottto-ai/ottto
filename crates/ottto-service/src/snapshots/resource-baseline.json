@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "production_main": "8ecbbcbf1a396690a7538615257d0316b188ecbb",
+  "generator_seed": 1377399810,
+  "_contract": {
+    "linux": {
+      "judged": [
+        "passes",
+        "scanned_files",
+        "emitted_bodies",
+        "parser_consumed_bytes",
+        "hydrated_rows",
+        "hydrated_rows_max",
+        "native_bytes",
+        "full_native_bytes",
+        "tail_native_bytes",
+        "guard_bytes",
+        "encoded_bytes",
+        "dirty_rows",
+        "save_attempts",
+        "log_bytes",
+        "children.*",
+        "reused.*",
+        "reloaded.*"
+      ],
+      "excluded": [
+        "disk_read_bytes",
+        "disk_written_bytes",
+        "sqlite_cache_write_pages",
+        "sidecar_read_bytes"
+      ],
+      "fallbacks": {
+        "sqlite_cache_write_pages": "encoded_bytes from existing save_work tally; pages unavailable on this revision",
+        "sidecar_read_bytes": "existing per-kind reload counts; no native sidecar byte tally on this revision"
+      }
+    },
+    "macos_rc": {
+      "judged": [
+        "cpu_with_children_s_per_h",
+        "battery_energy_mw",
+        "reads_gib_per_h",
+        "writes_gib_per_h",
+        "footprint_p50_mib",
+        "footprint_peak_mib",
+        "above_500mib_s_per_h",
+        "wakeups",
+        "logs",
+        "children",
+        "sidecar_reuse"
+      ],
+      "excluded": []
+    },
+    "source_specific": {
+      "claude_code": [],
+      "pi": [],
+      "codex": [
+        "reused.state_5",
+        "reloaded.state_5",
+        "reused.thread_history_1",
+        "reloaded.thread_history_1",
+        "reused.session_index",
+        "reloaded.session_index"
+      ]
+    },
+    "limit": "Each measured count <= 1.20 * B; quiet sidecar reuse >=95% with positive denominator; observed zero remains zero, missing defined-platform observations fail.",
+    "regeneration": "CI only: dispatch resource-regression.yml with record_baseline=true on current-main production plus these test adapters; extract resource_baseline_counts JSON. Review exact counts and pinned main SHA; baseline raises require a reviewed PR. Physical process I/O is macOS sampler_v6 RC evidence only."
+  },
+  "counts": {}
+}
