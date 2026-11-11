@@ -698,7 +698,7 @@ mod ops_tests {
         decoded(13, 0, 0);
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             ScanIndex::load(&path).unwrap();
-            plateau(Default::default());
+            plateau();
         });
         let record = records
             .iter()
@@ -733,7 +733,7 @@ mod ops_tests {
             save_work(1, 1);
             decoded(5, 0, 0);
             event("hold", &"none");
-            plateau(Default::default());
+            plateau();
         });
         let (_, outside) = crate::local_resource_diagnostics::capture(|| {
             event("hold", &"none");
@@ -828,7 +828,7 @@ mod ops_tests {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             pass_start();
             baseline(Path::new("/synthetic-missing-baseline/scan-index.json"));
-            plateau(Default::default());
+            plateau();
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
         assert_eq!(records.len(), 1, "{records:?}");
@@ -859,7 +859,7 @@ mod ops_tests {
             }
             tail_stage(2, 100, 100);
             tail_stage(5, 40, 100);
-            plateau(Default::default());
+            plateau();
         });
         let tail = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous).tail);
         let rows: Vec<_> = records
@@ -927,7 +927,7 @@ mod ops_tests {
                 drop(Stage::new(Kind::Save));
             }
             save_work(1, 1);
-            plateau(Default::default());
+            plateau();
             PASS.with(|pass| *pass.borrow_mut() = previous);
             let mut window = crate::local_resource_diagnostics::StageSum::begin(
                 "claude_code",
