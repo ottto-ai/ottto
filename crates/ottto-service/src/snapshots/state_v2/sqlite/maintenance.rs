@@ -86,6 +86,8 @@ pub(in super::super) struct MaintenanceStats {
     commit_outcomes: [u64; 4],
     commit_latency_us: CommitLatency,
     cache_used_bytes: Option<u64>,
+    cache_hit: Option<u64>,
+    cache_miss: Option<u64>,
     db_bytes: Option<u64>,
     pub(super) encoded_bytes_per_save: u64,
     pub(super) dirty_rows_per_save: u64,
@@ -592,23 +594,33 @@ impl Sqlite {
             .zip(fs::metadata(&self.path).ok())
             .map(|(logical, m)| logical.max(m.len()));
         self.stats.db_size_alarm = self.stats.db_bytes.is_some_and(|n| n > 1_000_000_000);
-        self.stats.cache_used_bytes = self.conn().ok().and_then(|conn| {
-            let (mut current, mut high) = (0, 0);
-            let rc = unsafe {
-                rusqlite::ffi::sqlite3_db_status(
-                    conn.handle(),
-                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
-                    &mut current,
-                    &mut high,
-                    0,
-                )
-            };
-            if rc == rusqlite::ffi::SQLITE_OK {
-                u64::try_from(current).ok()
-            } else {
-                None
-            }
+        let [cache_used_bytes, cache_hit, cache_miss] = [
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED, 0),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, 1),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, 1),
+        ]
+        .map(|(op, reset)| {
+            self.conn().ok().and_then(|conn| {
+                let (mut current, mut high) = (0, 0);
+                let rc = unsafe {
+                    rusqlite::ffi::sqlite3_db_status(
+                        conn.handle(),
+                        op,
+                        &mut current,
+                        &mut high,
+                        reset,
+                    )
+                };
+                if rc == rusqlite::ffi::SQLITE_OK {
+                    u64::try_from(current).ok()
+                } else {
+                    None
+                }
+            })
         });
+        self.stats.cache_used_bytes = cache_used_bytes;
+        self.stats.cache_hit = cache_hit;
+        self.stats.cache_miss = cache_miss;
         crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         result
     }

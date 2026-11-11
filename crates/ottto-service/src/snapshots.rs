@@ -2349,8 +2349,10 @@ pub(crate) fn state_v2_prepare_observed() {
 pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
     state_v2::telemetry::Window::begin("finish")
 }
-pub(crate) fn state_v2_post_pass_observed() {
-    state_v2::telemetry::plateau();
+pub(crate) fn state_v2_post_pass_observed(
+    relief: crate::local_resource_diagnostics::AllocatorRelief,
+) {
+    state_v2::telemetry::plateau(relief);
 }
 
 pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {
