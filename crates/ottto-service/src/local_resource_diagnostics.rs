@@ -984,6 +984,39 @@ impl Source {
 struct ProcessSample {
     cpu_us: u64,
     lifetime_max_rss_bytes: u64,
+    disk: Option<DiskBytes>,
+}
+/// Process-wide disk bytes: cumulative in a sample, a delta on a window row.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct DiskBytes {
+    pub(crate) disk_read_bytes: u64,
+    pub(crate) disk_written_bytes: u64,
+}
+impl DiskBytes {
+    /// macOS `proc_pid_rusage` only; `None` elsewhere or on a failed read.
+    pub(crate) fn now() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: a plain C struct that proc_pid_rusage fills on success.
+            let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            let read = (&raw mut usage).cast();
+            (unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, read) } == 0)
+                .then_some(Self {
+                    disk_read_bytes: usage.ri_diskio_bytesread,
+                    disk_written_bytes: usage.ri_diskio_byteswritten,
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+    /// `None` when either sample is unavailable or a counter regressed.
+    fn between(before: Option<ProcessSample>, after: Option<ProcessSample>) -> Option<Self> {
+        let (a, b) = before?.disk.zip(after?.disk)?;
+        Some(Self {
+            disk_read_bytes: b.disk_read_bytes.checked_sub(a.disk_read_bytes)?,
+            disk_written_bytes: b.disk_written_bytes.checked_sub(a.disk_written_bytes)?,
+        })
+    }
 }
 
 fn process_sample() -> Option<ProcessSample> {
@@ -1024,6 +1057,7 @@ fn process_usage() -> Option<(ProcessSample, StateV2Cpu)> {
         };
         Some((
             ProcessSample {
+                disk: DiskBytes::now(),
                 cpu_us: split.cpu_user_us.checked_add(split.cpu_sys_us)?,
                 lifetime_max_rss_bytes: if cfg!(target_os = "macos") {
                     raw_rss
@@ -1325,6 +1359,8 @@ struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
     malloc_in_use_bytes: Option<u64>,
     shared_process_cpu_delta_us: Option<u64>,
+    #[serde(flatten)]
+    shared_process_disk_delta: Option<DiskBytes>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
@@ -1350,6 +1386,7 @@ impl Observation {
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
+            shared_process_disk_delta: DiskBytes::between(before, after),
             process_lifetime_max_rss_bytes: after.map(|sample| sample.lifetime_max_rss_bytes),
             process_lifetime_max_rss_before_bytes: before.zip(after).and_then(|(before, after)| {
                 (before.lifetime_max_rss_bytes <= after.lifetime_max_rss_bytes)
@@ -1580,6 +1617,14 @@ fn aggregate_offpass(mut row: Record<OffpassCounts>) {
             ] {
                 *sum = sum.zip(prior).map(|(a, b)| a + b);
             }
+            row.observation.shared_process_disk_delta = row
+                .observation
+                .shared_process_disk_delta
+                .zip(previous.observation.shared_process_disk_delta)
+                .map(|(a, b)| DiskBytes {
+                    disk_read_bytes: a.disk_read_bytes + b.disk_read_bytes,
+                    disk_written_bytes: a.disk_written_bytes + b.disk_written_bytes,
+                });
             row.observation.wall_elapsed_us += previous.observation.wall_elapsed_us;
             row.observation.process_lifetime_max_rss_before_bytes =
                 previous.observation.process_lifetime_max_rss_before_bytes;
@@ -2856,6 +2901,12 @@ mod tests {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 assert!(row["counts"][field].is_u64());
             }
+            // Disk byte deltas: macOS only, absent elsewhere.
+            for field in ["disk_read_bytes", "disk_written_bytes"] {
+                let present = row["observation"].get(field).is_some();
+                assert_eq!(present, cfg!(target_os = "macos"));
+                assert_eq!(row["observation"][field].is_u64(), present);
+            }
             assert!(row["observation"].get("footprint_samples").is_none());
             assert!(row["observation"]
                 .get("footprint_sample_failures")
@@ -3444,11 +3495,15 @@ mod tests {
     }
 
     #[test]
-    fn resource_unavailable_or_regressing_cpu_is_unknown_not_zero() {
-        let sample = |cpu_us| {
+    fn resource_unavailable_or_regressing_cpu_and_disk_are_unknown_not_zero() {
+        let sample = |cpu_us: u64| {
             Some(ProcessSample {
                 cpu_us,
                 lifetime_max_rss_bytes: 4096,
+                disk: Some(DiskBytes {
+                    disk_read_bytes: cpu_us * 100,
+                    disk_written_bytes: cpu_us,
+                }),
             })
         };
         for (before, after) in [
@@ -3460,9 +3515,15 @@ mod tests {
                 Observation::between(12, before, after).shared_process_cpu_delta_us,
                 None
             );
+            let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
+            assert!(record.get("disk_read_bytes").is_none());
+            assert!(record.get("disk_written_bytes").is_none());
         }
         let result = Observation::between(12, sample(10), sample(17));
         assert_eq!(result.shared_process_cpu_delta_us, Some(7));
+        let record = serde_json::to_value(&result).unwrap();
+        assert_eq!(record["disk_read_bytes"], 700);
+        assert_eq!(record["disk_written_bytes"], 7);
         assert_eq!(result.process_lifetime_max_rss_bytes, Some(4096));
         assert_eq!(result.process_lifetime_max_rss_before_bytes, Some(4096));
         for (before, after) in [
@@ -3473,11 +3534,13 @@ mod tests {
                 Some(ProcessSample {
                     cpu_us: 17,
                     lifetime_max_rss_bytes: 2048,
+                    disk: None,
                 }),
             ),
         ] {
             let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
             assert!(record["process_lifetime_max_rss_before_bytes"].is_null());
+            assert!(record.get("disk_written_bytes").is_none());
         }
         let rising = Observation::between(
             12,
@@ -3485,6 +3548,7 @@ mod tests {
             Some(ProcessSample {
                 cpu_us: 17,
                 lifetime_max_rss_bytes: 8192,
+                disk: None,
             }),
         );
         assert_eq!(rising.process_lifetime_max_rss_before_bytes, Some(4096));
@@ -3744,6 +3808,9 @@ impl StateV2Probe {
     }
     pub(crate) fn wall_us(&self) -> u64 {
         wall_us(self.started)
+    }
+    pub(crate) fn disk(&self) -> Option<DiskBytes> {
+        DiskBytes::between(self.cpu, process_sample())
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         self.footprint
