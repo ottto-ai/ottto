@@ -2348,6 +2348,8 @@ fn emit(record: &impl Serialize) {
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
+                #[cfg(target_os = "macos")]
+                crate::snapshots::resource_fixture::record_native_stage(&json);
                 #[cfg(unix)]
                 {
                     // Count the actual formatter/writer bytes, including prefix/newline.

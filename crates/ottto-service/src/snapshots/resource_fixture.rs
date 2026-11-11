@@ -43,6 +43,10 @@ struct Work {
 thread_local! {
     static WORK: std::cell::RefCell<Option<Work>> = const { std::cell::RefCell::new(None) };
 }
+#[cfg(target_os = "macos")]
+pub(crate) fn record_native_stage(json: &str) {
+    native_qos::record_stage(json);
+}
 pub(crate) fn record_log(bytes: u64) {
     WORK.with(|slot| {
         if let Some(work) = slot.borrow_mut().as_mut() {
@@ -293,6 +297,10 @@ impl<'a> Driver<'a> {
         let before = crate::local_resource_diagnostics::cli_children::starts_for_test();
         let ((scanned, rows), bytes, save, records) = observe_work(|| {
             with_scan_clock(EPOCH + seconds, || {
+                #[cfg(target_os = "macos")]
+                let _qos = crate::snapshot_sync::resource_schedule::native_source_qos(
+                    SOURCES[self.source],
+                );
                 let ((scanned, rows), records) = crate::local_resource_diagnostics::capture(|| {
                     observe_hydrated(|| self.page_at_clock())
                 });
@@ -694,6 +702,12 @@ fn resource_virtual_scenarios() {
                         let changed =
                             switched.observe(if seconds < 60 { "first" } else { "second" });
                         assert_eq!(changed, seconds == 60, "one real account switch");
+                        if changed {
+                            assert!(
+                                schedule::due(SOURCES[0]),
+                                "account switch forces immediate pass"
+                            );
+                        }
                     }
                     if seconds > 0 && seconds % 300 == 0 {
                         if let Some(s) = active {
@@ -860,3 +874,46 @@ fn resource_observation_contract() {
     assert!(!within_bound(121, 100));
     assert!(!within_bound(1, 0));
 }
+
+/// [regress] Test-only option-A replay asks the native cadence for another
+/// paced rewalk even after the quiet page has no debt. Stop at the first trip.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_paced_rewalk_replay() {
+    use crate::snapshot_sync::resource_schedule as schedule;
+    fn run(rewalk: bool) -> u64 {
+        let corpus = Corpus::generate([4, 8, 2]);
+        let mut driver = seed(&corpus, 0);
+        driver.counts = Counts::default();
+        schedule::with_power("ac", || {
+            with_scan_clock(EPOCH + 2000, || schedule::finished(SOURCES[0], 1, rewalk));
+            for seconds in (30..3600).step_by(30) {
+                with_scan_clock(EPOCH + 2000 + seconds, || {
+                    if schedule::due(SOURCES[0]) {
+                        driver.page(2000 + seconds);
+                        schedule::finished(
+                            SOURCES[0],
+                            driver.counts.emitted_bodies,
+                            rewalk || driver.paced,
+                        );
+                    }
+                });
+                if driver.counts.passes > 12 {
+                    break;
+                }
+            }
+            driver.counts.passes
+        })
+    }
+    let ordinary = run(false);
+    let replay = run(true);
+    println!("resource_rewalk_replay ordinary={ordinary} replay={replay}");
+    assert!(ordinary > 0 && ordinary <= 12);
+    assert_eq!(
+        replay, 13,
+        "native replay trips quiet prepares/hour on the first excess pass"
+    );
+}
+
+#[cfg(target_os = "macos")]
+mod native_qos;

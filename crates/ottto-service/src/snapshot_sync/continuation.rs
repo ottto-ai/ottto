@@ -1174,3 +1174,12 @@ fn page_on_worker(
 #[cfg(test)]
 #[path = "continuation_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn resource_qos() -> Option<(u32, i32)> {
+    query_qos()
+}
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn resource_set_qos(class: u32, relative: i32) -> bool {
+    set_qos(class, relative)
+}

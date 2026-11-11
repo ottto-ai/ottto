@@ -36,17 +36,18 @@
     },
     "macos_rc": {
       "judged": [
-        "cpu_with_children_s_per_h",
-        "battery_energy_mw",
-        "reads_gib_per_h",
-        "writes_gib_per_h",
+        "cpu_seconds_per_hour",
+        "energy_mw",
+        "reads_gib_per_hour",
+        "writes_gib_per_hour",
         "footprint_p50_mib",
         "footprint_peak_mib",
-        "above_500mib_s_per_h",
-        "wakeups",
-        "logs",
-        "children",
-        "sidecar_reuse"
+        "seconds_above_500mib_per_hour",
+        "interrupt_wakeups_per_hour",
+        "package_wakeups_per_hour",
+        "log_bytes_per_hour",
+        "children_per_hour",
+        "sidecar_reuse_ratio"
       ],
       "excluded": []
     },

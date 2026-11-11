@@ -68,3 +68,48 @@ impl Switch {
 pub(crate) fn needs_pacing(scan: &SourceScanResult) -> bool {
     continuation::resident_scan_requested(scan)
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn native_source_qos(
+    source: SnapshotSource,
+) -> Option<continuation::MacPlatformSignals> {
+    continuation::paced_source_qos(source, continuation::resident_background)
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn native_qos() -> (u32, i32) {
+    continuation::resource_qos().expect("native QoS observation missing")
+}
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeQos((u32, i32));
+#[cfg(target_os = "macos")]
+impl Drop for NativeQos {
+    fn drop(&mut self) {
+        assert!(continuation::resource_set_qos(
+            if self.0 .0 == 0 { 0x15 } else { self.0 .0 },
+            self.0 .1
+        ));
+    }
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn native_set_qos(class: u32) -> NativeQos {
+    let prior = native_qos();
+    assert!(continuation::resource_set_qos(class, 0));
+    NativeQos(prior)
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn native_background() -> continuation::MacPlatformSignals {
+    continuation::MacPlatformSignals::background()
+        .expect("native background QoS observation missing")
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn native_worker<T: Send>(run: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("resource-qos-pr".into())
+            .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
+            .spawn_scoped(scope, run)
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+}
