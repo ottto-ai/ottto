@@ -178,25 +178,42 @@ struct Counts {
 struct Driver<'a> {
     corpus: &'a Corpus,
     fixture: E2ScanFixture,
+    session: StateV2ColdSession,
     source: usize,
     index: ScanIndex,
     counts: Counts,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
+        let fixture = E2ScanFixture::default();
+        let kind = match SOURCES[source] {
+            SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
+            SnapshotSource::Codex => scan_index_persistence::Source::Codex,
+            SnapshotSource::Pi => scan_index_persistence::Source::Pi,
+        };
+        let (session, mut index) = StateV2ColdSession::publish(
+            kind,
+            &ScanIndex::default(),
+            &corpus.support.join(SOURCES[source].api_slug()),
+        );
+        fixture.on_committed_route(session.path());
+        index.activate_upload_context("resource-fixture".into());
         Self {
             corpus,
             source,
-            fixture: E2ScanFixture::default(),
-            index: ScanIndex::default(),
+            fixture,
+            session,
+            index,
             counts: Counts::default(),
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
         let source = SOURCES[self.source];
         let index = std::mem::take(&mut self.index);
-        let ((mut index, scan, _), bytes) = with_scan_clock(EPOCH + seconds, || {
+        let ((mut index, mut scan, _), bytes) = with_scan_clock(EPOCH + seconds, || {
             observe_consumed(|| {
+                self.fixture
+                    .begin_pass(source, &self.corpus.support, self.session.path());
                 if source == SnapshotSource::ClaudeCode {
                     self.fixture.scan(
                         &self.corpus.roots[self.source],
@@ -223,13 +240,25 @@ impl<'a> Driver<'a> {
         assert_eq!(scan.malformed_json_line_count, 0);
         assert_eq!(scan.invalid_utf8_line_count, 0);
         assert_eq!(scan.unreadable_path_count, 0);
+        finalize_scan_after_policy(source, &mut scan, &mut index);
+        let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(source);
+        ledger.deliver(&scan.snapshots);
+        assert!(scan.snapshots.iter().all(|item| ledger.settled(item)));
+        index.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
         let acks = exact_acks_for_test(&scan.snapshots);
         accept_upload_context_acks_for_test(&mut index, &scan.snapshots, &acks);
         self.counts.passes += 1;
         self.counts.scanned_files += scan.scanned_file_count as u64;
         self.counts.emitted_bodies += scan.snapshots.len() as u64;
         self.counts.parser_consumed_bytes += bytes;
-        self.index = index;
+        self.index =
+            e2_pipeline_scan_fixture::save_reload_for_test(&mut index, self.session.path());
         scan.scanned_file_count
     }
 }
