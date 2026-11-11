@@ -19,7 +19,7 @@ fn copied(c: &mut Corpus) -> PathBuf {
 fn stale(index: &mut ScanIndex, root: &Path) {
     let key = root.to_string_lossy();
     let record = index
-        .claude_request_census
+        .claude_request_census_for_test()
         .get(key.as_ref())
         .unwrap()
         .clone();
@@ -107,7 +107,7 @@ fn first_sighting_and_legacy_overcount_converge_on_the_next_child_fold() {
         let first = child_page(&c, index, &path);
         assert!(first
             .index
-            .claude_request_census
+            .claude_request_census_for_test()
             .get(root.to_str().unwrap())
             .is_none());
         assert_eq!(body(&first, &child()).unwrap().request_count, 2);
