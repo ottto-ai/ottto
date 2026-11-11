@@ -999,9 +999,11 @@ fn default_occurrence_count() -> u64 {
     1
 }
 
-/// A body that carries a cache patch declares head CAS for its whole request.
+/// A body that carries a cache patch (legal only under CAS) or its session's
+/// saved head declares head CAS for its whole request. An accepted CAS write
+/// returns a fresh head with or without a patch, so a headed session keeps it.
 pub(crate) fn declares_head_cas(item: &crate::snapshots::SnapshotItem) -> bool {
-    item.cache_observations.is_some()
+    item.cache_observations.is_some() || item.cache_base_head_etag.is_some()
 }
 
 /// The existing public ACK version for additive body evidence. Keep synthetic

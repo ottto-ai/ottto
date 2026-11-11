@@ -1149,15 +1149,14 @@ fn probe_stages(
 /// The money oracle's settled view: each exact accepted body, the accepted
 /// cache states and identity buckets (placement), and the body each session
 /// head stores on the server. Head token values are excluded.
-fn settled(
-    progress: &SnapshotUploadProgress,
-    store: &HeadStore,
-) -> (
+type Settled = (
     BTreeMap<String, String>,
     BTreeMap<String, Value>,
     crate::snapshots::claude_request_identity::AcceptedBuckets,
     BTreeMap<String, String>,
-) {
+);
+
+fn settled(progress: &SnapshotUploadProgress, store: &HeadStore) -> Settled {
     (
         progress.accepted_body_witnesses.clone(),
         progress.accepted_cache_states.clone(),
@@ -1620,9 +1619,4 @@ fn only_never_settled_patched_sessions_skip_the_probe_stages() {
     assert!(!progress
         .accepted_cache_heads
         .contains_key(&cache_session_key("plain")));
-}
-
-/// Red-run shim: the base selects no CAS bootstrap body.
-fn cas_bootstrap_bodies(_: &SnapshotUploadProgress, _: &[SnapshotItem]) -> BTreeSet<String> {
-    BTreeSet::new()
 }

@@ -249,7 +249,7 @@ impl Serialize for SnapshotBatchRequest {
             self,
             self.snapshots
                 .iter()
-                .any(|item| item.cache_observations.is_some()),
+                .any(crate::snapshot_client::declares_head_cas),
             serializer,
         )
     }
