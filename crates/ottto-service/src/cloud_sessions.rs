@@ -1998,7 +1998,6 @@ impl SliceError {
 struct PageFacts {
     next: Option<String>,
     ambiguous: bool,
-    nonterminal: bool,
 }
 
 /// One slice's working memory: only ACK metadata of tasks it settled.
@@ -2013,6 +2012,7 @@ struct SliceWork<'a, 'b> {
     wall: OffsetDateTime,
     pages: usize,
     offered: usize,
+    observed_head_nonterminal: Option<bool>,
     settled: HashMap<String, ([u8; 32], Option<String>)>,
 }
 
@@ -2125,6 +2125,7 @@ impl CloudCollector {
             wall,
             pages: 0,
             offered: 0,
+            observed_head_nonterminal: None,
             settled: HashMap::new(),
         };
         let mut crawl_completed = None;
@@ -2268,7 +2269,14 @@ impl CloudCollector {
                 .is_none_or(|crawl| crawl.cursor.is_none());
         if due.head || start_crawl {
             self.schedule.last_head_attempt = Some(now);
-            let page = match work.page(None) {
+            let listed = work.page(None);
+            // Provider facts remain valid when their delivery fails. A failed
+            // provider read preserves the previous predicate; deep pages never
+            // set this head-only observation.
+            if let Some(nonterminal) = work.observed_head_nonterminal {
+                self.schedule.head_nonterminal = nonterminal;
+            }
+            let page = match listed {
                 Ok(page) => page,
                 Err(error) => {
                     if start_crawl {
@@ -2284,9 +2292,6 @@ impl CloudCollector {
                     return Some(error);
                 }
             };
-            // A failed head keeps the previous predicate; a deep page never
-            // changes it.
-            self.schedule.head_nonterminal = page.nonterminal;
             if start_crawl {
                 self.schedule.crawl = None;
                 match page.next {
@@ -2412,15 +2417,15 @@ impl SliceWork<'_, '_> {
         let raw = self.list(cursor)?;
         let parsed = self.parse(&raw)?;
         drop(raw);
+        if cursor.is_none() {
+            self.observed_head_nonterminal = Some(parsed.has_nonterminal());
+        }
         let facts = PageFacts {
             next: match &parsed.cursor {
                 CloudPageCursor::Next(next) => Some(next.clone()),
                 _ => None,
             },
             ambiguous: parsed.cursor == CloudPageCursor::Ambiguous,
-            nonterminal: parsed.changes.iter().any(|change| {
-                matches!(change.lifecycle.as_str(), "queued" | "running" | "unknown")
-            }),
         };
         let conflicts = self.deliver(parsed.changes)?;
         if conflicts.is_empty()
@@ -2435,6 +2440,9 @@ impl SliceWork<'_, '_> {
             Ok(fresh) => fresh,
             Err(_) => return Ok(facts),
         };
+        if cursor.is_none() {
+            self.observed_head_nonterminal = Some(fresh.has_nonterminal());
+        }
         let retry = fresh
             .changes
             .into_iter()
@@ -2630,6 +2638,14 @@ struct ParsedPage {
     changes: Vec<CloudSessionChangeV1>,
     cursor: CloudPageCursor,
     source_item_count: usize,
+}
+
+impl ParsedPage {
+    fn has_nonterminal(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|change| matches!(change.lifecycle.as_str(), "queued" | "running" | "unknown"))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

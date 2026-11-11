@@ -2745,3 +2745,39 @@ fn failed_provider_pages_keep_their_planned_work_opportunity() {
     );
     assert!(startup.next_wake(t0, midnight(), None).unwrap() >= t0 + 5 * MINUTE);
 }
+
+/// [behaviour] A successfully listed running head keeps fast polling even
+/// when its upload loses an ACK. Delivery failure cannot erase provider facts.
+#[test]
+fn head_status_controls_cadence_independently_of_delivery() {
+    let (_root, grants, checkpoints) = stores("head-delivery-isolation");
+    enabled(&grants);
+    let cli = Cli::head(page("changing", None));
+    let server = Server::new();
+    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    cli.set(None, page_of(vec![task("changing", "running")], None));
+    server.lose_acks.set(1);
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(collector.schedule.head_nonterminal);
+    assert_eq!(
+        collector.next_wake(t0 + 6 * HOUR, midnight() + 6 * HOUR, None),
+        Some(t0 + 6 * HOUR + 5 * MINUTE)
+    );
+    // A later valid terminal head slows the schedule even if its ACK is lost.
+    cli.set(None, page_of(vec![task("changing", "error")], None));
+    server.lose_acks.set(1);
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 6 * HOUR + 5 * MINUTE),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(!collector.schedule.head_nonterminal);
+}
