@@ -7502,7 +7502,7 @@ fn require_cloud_session_cleanup_before_identity_change(
     else {
         return Ok(());
     };
-    if cloud_session_cleanup_is_confirmed(&grant) {
+    if cloud_session_identity_change_allowed(&grant) {
         return Ok(());
     }
     // A logout/switch/identity-rotation attempt is itself a stop intent. Close
@@ -7524,7 +7524,7 @@ fn require_cloud_session_cleanup_before_identity_change_without_pause(
         .load()
         .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
     if match grant.as_ref() {
-        Some(grant) => cloud_session_cleanup_is_confirmed(grant),
+        Some(grant) => cloud_session_identity_change_allowed(grant),
         None => true,
     } {
         Ok(())
@@ -7533,7 +7533,7 @@ fn require_cloud_session_cleanup_before_identity_change_without_pause(
     }
 }
 
-fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
+fn cloud_session_identity_change_allowed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
     use crate::cloud_sessions::CloudSessionGrantStatus;
     if grant.backend_create_pending {
         return false;
@@ -25628,12 +25628,8 @@ for line in sys.stdin:
     #[serial]
     fn claim_completion_keeps_pending_create_cleanup_authority() {
         let _guard = lock_backend_test_env();
-        for bind_backend in [false] {
-            let root = telemetry_key_store_root(if bind_backend {
-                "claim-reservation-active-grant"
-            } else {
-                "claim-reservation-pending-grant"
-            });
+        {
+            let root = telemetry_key_store_root("claim-reservation-pending-grant");
             let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
             let account = connected_account();
             let device = LocalDeviceBinding {
@@ -25644,7 +25640,7 @@ for line in sys.stdin:
             FileAccountStore::default().save(&account).unwrap();
             FileDeviceStore::default().save(&device).unwrap();
             let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
-            let local = grants
+            grants
                 .enable(
                     &crate::cloud_sessions::CloudSessionGrantSetup {
                         installation_id: device.device_id.clone(),
@@ -25655,14 +25651,6 @@ for line in sys.stdin:
                 )
                 .unwrap();
             grants.grant_create_request(&device.device_id).unwrap();
-            if bind_backend {
-                grants
-                    .bind_backend_grant(
-                        &cloud_control_backend_grant(&local, &device.device_id, "enabled", 1),
-                        &device.device_id,
-                    )
-                    .unwrap();
-            }
             let before = grants.load().unwrap().unwrap();
             let (api_base, observed) = observed_cross_account_claim_completion_server();
             let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
@@ -25692,11 +25680,7 @@ for line in sys.stdin:
             let after = grants.load().unwrap().unwrap();
             assert_eq!(
                 after.status,
-                if bind_backend {
-                    crate::cloud_sessions::CloudSessionGrantStatus::Paused
-                } else {
-                    crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired
-                }
+                crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired
             );
             assert_eq!(after.grant_scope_id, before.grant_scope_id);
             assert_eq!(after.account_fingerprint, before.account_fingerprint);

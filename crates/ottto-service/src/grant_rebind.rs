@@ -65,7 +65,7 @@ impl RebindFailure {
         };
         Self {
             code,
-            retryable: status == 429 || status >= 500,
+            retryable: status == 429 || (500..=599).contains(&status),
         }
     }
 
@@ -295,7 +295,7 @@ mod tests {
         for status in [401, 422, 404, 429, 500, 503] {
             assert_eq!(
                 RebindFailure::http(status, None).retryable,
-                status == 429 || status >= 500
+                status == 429 || (500..=599).contains(&status)
             );
         }
         assert_eq!(RebindFailure::http(404, None).code, "installation_mismatch");

@@ -1232,7 +1232,7 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
         serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
             .expect("decode");
     persisted["grant"]["disclosure_version"] =
-        serde_json::Value::String(DISCLOSURE_VERSION_V1.to_string());
+        serde_json::Value::String("provider_daily_reference_disclosure.future".to_string());
     fs::write(
         collector.grants().path(),
         serde_json::to_vec_pretty(&persisted).expect("encode"),
