@@ -663,7 +663,11 @@ impl CloudSessionGrantStore {
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
         if let Some(proposal) = rebind {
-            if !cloud_grant_runtime_ready(&state.grant)
+            if !(cloud_grant_runtime_ready(&state.grant)
+                || matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
+                ))
                 || !same_runtime_grant_identity(&state.grant, &proposal.expected)
                 || state.grant.backend_binding != proposal.expected.backend_binding
                 || response.grant_version != proposal.request.grant_version
@@ -679,7 +683,9 @@ impl CloudSessionGrantStore {
                 .as_mut()
                 .expect("bound grant")
                 .server_policy_state = response.server_policy_state.clone();
-            if response.server_policy_state == CloudSessionServerPolicyState::Disabled {
+            if response.server_policy_state == CloudSessionServerPolicyState::Disabled
+                && state.grant.status == CloudSessionGrantStatus::Enabled
+            {
                 state.grant.status = CloudSessionGrantStatus::PolicyDisabled;
             }
         }

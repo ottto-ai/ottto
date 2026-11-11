@@ -42,6 +42,7 @@ pub(crate) struct RebindProposal<G> {
 pub(crate) struct RebindFailure {
     pub code: &'static str,
     pub retryable: bool,
+    http_status: Option<u16>,
 }
 
 impl RebindFailure {
@@ -66,6 +67,7 @@ impl RebindFailure {
         Self {
             code,
             retryable: status == 429 || (500..=599).contains(&status),
+            http_status: Some(status),
         }
     }
 
@@ -73,6 +75,7 @@ impl RebindFailure {
         Self {
             code: "rebind_unavailable",
             retryable: true,
+            http_status: None,
         }
     }
 }
@@ -128,33 +131,58 @@ pub(crate) fn rebind(
     timeout: Duration,
 ) -> Result<Value, RebindFailure> {
     attempt(kind, grant_id, request, || {
-        // Recheck immediately before rebind, in addition to the collection fence.
-        let hardware = verified_live_hardware().map_err(|code| RebindFailure {
-            code,
-            retryable: false,
-        })?;
-        if request.hardware_id.as_deref() != Some(hardware.as_str())
-            || request.installation_id != device.device_id
-        {
-            return Err(RebindFailure {
-                code: "hardware_changed",
-                retryable: false,
-            });
-        }
         let started = std::time::Instant::now();
-        let token = client
-            .issue_relay_token_with_timeout(
-                device,
-                secret,
-                crate::snapshots::SnapshotSource::Codex,
-                timeout,
-            )
-            .map_err(|_| RebindFailure::unavailable())?;
-        let remaining = timeout
-            .checked_sub(started.elapsed())
-            .ok_or_else(RebindFailure::unavailable)?;
-        client.rebind_collector_grant(kind, grant_id, &token, request, remaining)
+        with_relay_token_retry(
+            || {
+                let remaining = timeout
+                    .checked_sub(started.elapsed())
+                    .ok_or_else(RebindFailure::unavailable)?;
+                client
+                    .issue_relay_token_with_timeout(
+                        device,
+                        secret,
+                        crate::snapshots::SnapshotSource::Codex,
+                        remaining,
+                    )
+                    .map_err(|_| RebindFailure::unavailable())
+            },
+            |token| {
+                // Every POST, including a bounded authorization refresh, has
+                // its own live hardware fence and shares the original deadline.
+                let hardware = verified_live_hardware().map_err(|code| RebindFailure {
+                    code,
+                    retryable: false,
+                    http_status: None,
+                })?;
+                if request.hardware_id.as_deref() != Some(hardware.as_str())
+                    || request.installation_id != device.device_id
+                {
+                    return Err(RebindFailure {
+                        code: "hardware_changed",
+                        retryable: false,
+                        http_status: None,
+                    });
+                }
+                let remaining = timeout
+                    .checked_sub(started.elapsed())
+                    .ok_or_else(RebindFailure::unavailable)?;
+                client.rebind_collector_grant(kind, grant_id, token, request, remaining)
+            },
+        )
     })
+}
+
+fn with_relay_token_retry(
+    mut token: impl FnMut() -> Result<String, RebindFailure>,
+    mut send: impl FnMut(&str) -> Result<Value, RebindFailure>,
+) -> Result<Value, RebindFailure> {
+    let first = token()?;
+    match send(&first) {
+        // relay_sent evicts the rejected cached token. Issue once more, just
+        // like the existing collector transports, then honor the final result.
+        Err(failure) if failure.http_status == Some(401) => send(&token()?),
+        result => result,
+    }
 }
 
 /// Read the current physical machine. Never fall back to a saved hardware hash.
@@ -326,6 +354,47 @@ mod tests {
             }
             assert_eq!(calls.get(), expected);
         }
+    }
+
+    /// [regress] A rejected cached JWT gets one fresh token; domain refusals never trigger refresh.
+    #[test]
+    fn cached_relay_authorization_gets_one_bounded_refresh() {
+        for (status, expected_tokens) in [(401, 2), (403, 1)] {
+            let tokens = Cell::new(0);
+            let sends = Cell::new(0);
+            let result = with_relay_token_retry(
+                || {
+                    tokens.set(tokens.get() + 1);
+                    Ok(format!("fixture-{}", tokens.get()))
+                },
+                |token| {
+                    sends.set(sends.get() + 1);
+                    if sends.get() == 1 {
+                        Err(RebindFailure::http(status, None))
+                    } else {
+                        assert_eq!(token, "fixture-2");
+                        Ok(json!({"accepted": true}))
+                    }
+                },
+            );
+            assert_eq!(tokens.get(), expected_tokens);
+            assert_eq!(sends.get(), expected_tokens);
+            assert_eq!(result.is_ok(), status == 401);
+        }
+        let tokens = Cell::new(0);
+        let refused = with_relay_token_retry(
+            || {
+                tokens.set(tokens.get() + 1);
+                Ok("fixture-token".to_owned())
+            },
+            |_| Err(RebindFailure::http(401, None)),
+        );
+        assert_eq!(
+            tokens.get(),
+            2,
+            "persistent authorization rejection is bounded"
+        );
+        assert_eq!(refused.unwrap_err().http_status, Some(401));
     }
 
     /// [behaviour] A saved or migrated hash is proof only when LIVE hardware agrees.

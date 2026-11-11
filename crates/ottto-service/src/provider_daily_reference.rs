@@ -697,8 +697,16 @@ impl GrantStore {
         let key = decode_hex(&state.hmac_key_hex)
             .ok_or_else(|| anyhow!("stored grant key is invalid"))?;
         if let Some(proposal) = rebind {
-            if !grant_runtime_ready(&state.grant)
-                || state.grant.backend_binding != proposal.expected.backend_binding
+            let mut consent_binding = state.grant.backend_binding.clone();
+            if state.grant.status == GrantStatus::Revoked {
+                // A successful in-flight response may only advance cleanup
+                // identity; local revocation and its timestamp remain final.
+                if let Some(binding) = consent_binding.as_mut() {
+                    binding.backend_revoked = false;
+                }
+            }
+            if !(grant_runtime_ready(&state.grant) || state.grant.status == GrantStatus::Revoked)
+                || consent_binding != proposal.expected.backend_binding
                 || state.grant.installation_fingerprint
                     != proposal.expected.installation_fingerprint
                 || state.grant.grant_scope_fingerprint != proposal.expected.grant_scope_fingerprint
@@ -730,10 +738,12 @@ impl GrantStore {
         if response.grant_version == previous_version
             && state.grant.backend_binding.as_ref().is_some_and(|binding| {
                 binding.grant_id == response.id
-                    && !binding.backend_revoked
+                    && (!binding.backend_revoked
+                        || (rebind.is_some() && state.grant.status == GrantStatus::Revoked))
                     && binding.server_policy_state == response.server_policy_state
             })
-            && state.grant.status == GrantStatus::Enabled
+            && (state.grant.status == GrantStatus::Enabled
+                || (rebind.is_some() && state.grant.status == GrantStatus::Revoked))
             && response.status == "enabled"
             && state.grant.collector_version == response.collector_version
         {

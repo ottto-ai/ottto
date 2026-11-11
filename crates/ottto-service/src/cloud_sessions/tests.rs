@@ -3022,3 +3022,64 @@ fn refused_approval_can_be_replaced_and_old_device_revocation_can_be_confirmed()
         CloudSessionGrantStatus::ConsentRequired
     );
 }
+
+/// [regress] A committed in-flight rebind updates cleanup identity while a local stop remains final.
+#[test]
+fn a_stop_racing_rebind_completion_preserves_cleanup_without_resurrection() {
+    for stop in [
+        CloudSessionGrantStatus::Paused,
+        CloudSessionGrantStatus::Revoked,
+    ] {
+        let (store, _) = stores("rebind-raced-stop");
+        enabled(&store);
+        let original = store.load().unwrap().unwrap();
+        let target = CloudSessionGrantSetup {
+            installation_id: "00000000-0000-4000-8000-000000000090".to_owned(),
+            organization_scope: "org_fixture".to_owned(),
+            effective_user_scope: "user_fixture".to_owned(),
+        };
+        let proposal = store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        let mut response = backend_grant(&original, "enabled", 1);
+        response.installation_id = target.installation_id.clone();
+        response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+        store.change_status(stop.clone(), now()).unwrap();
+        assert!(store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .is_none());
+        let retained = store
+            .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+            .unwrap();
+        assert_eq!(retained.status, stop);
+        assert!(!cloud_grant_runtime_ready(&retained));
+        assert!(store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .is_none());
+        if stop == CloudSessionGrantStatus::Revoked {
+            assert_eq!(retained.revoked_at, Some(timestamp(now())));
+            response.status = "revoked".to_owned();
+            response.grant_version = 2;
+            store
+                .apply_backend_revocation(&response, &target.installation_id)
+                .unwrap();
+            assert!(
+                store
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .backend_binding
+                    .unwrap()
+                    .backend_revoked
+            );
+        } else {
+            assert_eq!(
+                store.enable(&target, now()).unwrap().status,
+                CloudSessionGrantStatus::Enabled
+            );
+        }
+    }
+}

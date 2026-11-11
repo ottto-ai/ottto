@@ -1943,10 +1943,23 @@ fn revoked_or_disabled_daily_grants_never_rebind() {
         .prepare_rebind(&target, "fixture".to_owned())
         .unwrap()
         .is_none());
-    assert!(collector
+    let retained = collector
         .grants
         .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
-        .is_err());
+        .unwrap();
+    assert_eq!(retained.status, GrantStatus::Revoked);
+    assert_eq!(
+        retained.revoked_at.as_deref(),
+        Some(timestamp(now()).as_str())
+    );
+    assert!(!grant_runtime_ready(&retained));
+    let mut deletion = response.clone();
+    deletion.status = "revoked".to_owned();
+    deletion.grant_version = 2;
+    collector
+        .grants
+        .apply_backend_revocation(&deletion, &target.installation_id)
+        .unwrap();
     assert_eq!(
         collector.grants.load().unwrap().unwrap().status,
         GrantStatus::Revoked
