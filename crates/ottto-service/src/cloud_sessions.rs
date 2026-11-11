@@ -12,6 +12,7 @@
 //! (`cloud_session_changes.v1`). When it calls the provider is in
 //! [`schedule`]; the ACK cache lives in the upload-history SQLite file.
 
+use crate::grant_rebind::{self, GrantKind, RebindProposal, RebindRequest};
 use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
 use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::FileLock;
@@ -495,16 +496,45 @@ impl CloudSessionGrantStore {
                 return Ok(state.grant);
             }
             if state.grant.backend_create_pending
-                || state
-                    .grant
-                    .backend_binding
-                    .as_ref()
-                    .is_some_and(|binding| !binding.backend_revoked)
+                || (state.grant.status == CloudSessionGrantStatus::Revoked
+                    && state
+                        .grant
+                        .backend_binding
+                        .as_ref()
+                        .is_some_and(|binding| !binding.backend_revoked))
             {
-                return Err(anyhow!(
-                    "existing cloud-session grant must be locally stopped and backend-revoked before scope replacement"
-                ));
+                return Err(anyhow!("pending cloud-session consent mutation must be reconciled before scope replacement"));
             }
+            let same_owner = state.grant.organization_fingerprint
+                == opaque_key(&key, &setup.organization_scope)
+                && state.grant.effective_user_fingerprint
+                    == opaque_key(&key, &setup.effective_user_scope);
+            let can_resume = same_owner
+                && binding_contract_current(&state.grant)
+                && state.grant.backend_binding.as_ref().is_some_and(|binding| {
+                    !binding.backend_revoked
+                        && binding.server_policy_state == CloudSessionServerPolicyState::Approved
+                })
+                && matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::Paused
+                )
+                && matches!(
+                    state.grant.last_error_category.as_deref(),
+                    None | Some("rebinding" | "rebind_unavailable")
+                );
+            if can_resume {
+                // Explicit resume restores admission to the original approval;
+                // the supervisor rebinds it before any provider execution.
+                state.grant.status = CloudSessionGrantStatus::Enabled;
+                state.grant.paused_at = None;
+                state.grant.last_error_category = Some("rebinding".to_string());
+                self.write(&state)?;
+                return Ok(state.grant);
+            }
+            // Explicit approval for another owner, or after a terminal refusal,
+            // replaces the sole local approval. It never authorizes collection
+            // until the ordinary-browser create response has been bound.
         }
         let key = random_key()?;
         let installation_fingerprint = opaque_key(&key, &setup.installation_id);
@@ -596,6 +626,49 @@ impl CloudSessionGrantStore {
         Ok(backend_create_request(installation_id, &pending))
     }
 
+    fn prepare_rebind(
+        &self,
+        setup: &CloudSessionGrantSetup,
+        hardware_id: String,
+    ) -> Result<Option<RebindProposal<CloudSessionGrant>>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        if !cloud_grant_runtime_ready(&state.grant) {
+            return Ok(None);
+        }
+        let key = decode_hex(&state.hmac_key_hex)
+            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+        if !is_uuid(&setup.installation_id)
+            || state.grant.organization_fingerprint != opaque_key(&key, &setup.organization_scope)
+            || state.grant.effective_user_fingerprint
+                != opaque_key(&key, &setup.effective_user_scope)
+        {
+            return Err(anyhow!("cloud-session rebind owner changed"));
+        }
+        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
+        if installation_fingerprint == state.grant.installation_fingerprint {
+            return Ok(None);
+        }
+        let version = state
+            .grant
+            .backend_binding
+            .as_ref()
+            .expect("runtime-ready binding")
+            .grant_version;
+        Ok(Some(RebindProposal {
+            expected: state.grant.clone(),
+            installation_fingerprint,
+            request: RebindRequest {
+                installation_id: setup.installation_id.clone(),
+                grant_version: version,
+                grant_scope_fingerprint: grant_scope_fingerprint(&key, setup),
+                hardware_id: Some(hardware_id),
+                disclosure_version: state.grant.disclosure_version,
+            },
+        }))
+    }
+
     /// Bind an authenticated backend grant response. Exact scope matching and
     /// monotonic grant versions prevent a pre-revoke batch epoch from being
     /// resurrected after re-consent.
@@ -604,10 +677,47 @@ impl CloudSessionGrantStore {
         response: &CloudSessionBackendGrantResponseV1,
         expected_installation_id: &str,
     ) -> Result<CloudSessionGrant> {
+        self.bind_backend_grant_with_rebind(response, expected_installation_id, None)
+    }
+
+    fn bind_backend_grant_with_rebind(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        expected_installation_id: &str,
+        rebind: Option<&RebindProposal<CloudSessionGrant>>,
+    ) -> Result<CloudSessionGrant> {
         let _lock = self.lock()?;
         let mut state = self
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
+        if let Some(proposal) = rebind {
+            if !(cloud_grant_runtime_ready(&state.grant)
+                || matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
+                ))
+                || !same_runtime_grant_identity(&state.grant, &proposal.expected)
+                || state.grant.backend_binding != proposal.expected.backend_binding
+                || response.grant_version != proposal.request.grant_version
+                || response.status != "enabled"
+                || response.schema_version != CHANGES_SCHEMA_VERSION
+            {
+                return Err(anyhow!("cloud-session rebind consent changed"));
+            }
+            state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
+            state.grant.grant_scope_id = proposal.request.grant_scope_fingerprint.clone();
+            state
+                .grant
+                .backend_binding
+                .as_mut()
+                .expect("bound grant")
+                .server_policy_state = authority_policy(response);
+            if authority_policy(response) == CloudSessionServerPolicyState::Disabled
+                && state.grant.status == CloudSessionGrantStatus::Enabled
+            {
+                state.grant.status = CloudSessionGrantStatus::PolicyDisabled;
+            }
+        }
         let local_status = state.grant.status.clone();
         validate_local_installation_binding(
             &state,
@@ -636,6 +746,10 @@ impl CloudSessionGrantStore {
                 // Lost loopback responses retry the exact authenticated bind.
                 // Return the current local state without rewriting timestamps
                 // or resurrecting a later pause/revoke.
+                if rebind.is_some() {
+                    state.grant.last_error_category = None;
+                    self.write(&state)?;
+                }
                 return Ok(state.grant);
             }
             return Err(anyhow!(
@@ -730,12 +844,12 @@ impl CloudSessionGrantStore {
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
         validate_local_installation_binding(
             &state,
-            expected_installation_id,
+            &response.installation_id,
             "backend cloud-session revocation",
         )?;
         validate_backend_grant_response(&state, response)?;
-        if response.installation_id != expected_installation_id {
-            return Err(anyhow!("backend cloud-session grant scope does not match"));
+        if !is_uuid(expected_installation_id) {
+            return Err(anyhow!("current cloud-session installation is invalid"));
         }
         let existing = state
             .grant
@@ -1027,7 +1141,7 @@ impl Default for CloudSessionGrantStore {
 
 /// Waits for an exclusive flock on `<state_path>.lock` (0600) in an owner-only
 /// (0700) directory.
-fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
+pub(crate) fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = state_path
         .parent()
@@ -1090,14 +1204,24 @@ pub fn cloud_session_collector_status(
             .unwrap_or(CloudSessionGrantStatus::Off)
     };
     let transport_configured = transport.is_configured();
+    let continuity_reason = stored_grant
+        .as_ref()
+        .and_then(|grant| grant.last_error_category.as_deref())
+        .and_then(grant_rebind::status_reason);
     let provider_cli_invocation_permitted =
         stored_grant.as_ref().is_some_and(cloud_grant_runtime_ready)
             && transport_configured
+            && continuity_reason.is_none()
             && !kill_switch_enabled();
     let (runtime_state, reason_code) = if kill_switch_enabled() {
         (
             CloudSessionRuntimeState::PolicyDisabled,
             "policy_disabled".to_string(),
+        )
+    } else if let Some(reason) = continuity_reason {
+        (
+            CloudSessionRuntimeState::ConsentRequired,
+            reason.to_string(),
         )
     } else if grant_status == CloudSessionGrantStatus::Enabled && !transport_configured {
         (
@@ -1241,13 +1365,28 @@ impl CloudSessionCheckpointStore {
         &'a self,
         grants: &CloudSessionGrantStore,
         expected: &CloudSessionGrant,
+        transport: &dyn CloudSessionTransport,
     ) -> Result<Option<CloudSessionIoLease<'a>>> {
+        self.begin_io(|| {
+            transport.local_binding_current(expected) && grant_still_current(grants, expected)
+        })
+    }
+
+    /// Serialize admission with identity mutation, then release that lock
+    /// before I/O. Identity changes close admission and drain these leases.
+    fn begin_io(&self, current: impl FnOnce() -> bool) -> Result<Option<CloudSessionIoLease<'_>>> {
+        let _identity_lock = crate::control::lock_setup_run_binding();
+        if crate::control::identity_mutation_in_progress() || kill_switch_enabled() {
+            return Ok(None);
+        }
         let mut active = self
             .collector_io
             .active_io
             .lock()
             .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
-        if kill_switch_enabled() || !grant_still_current(grants, expected) {
+        // Keep the stop check and lease registration under the same mutex
+        // used by the drain, so a pause cannot return between them.
+        if !current() {
             return Ok(None);
         }
         *active = active.saturating_add(1);
@@ -1311,7 +1450,7 @@ impl CloudSessionCheckpointStore {
     /// a local revoke either finishes before the revoke's erase or is refused.
     fn commit(
         &self,
-        grants: &CloudSessionGrantStore,
+        inputs: &SliceInputs<'_>,
         expected: &CloudSessionGrant,
         scope: &[u8; 32],
         settled: &HashMap<String, ([u8; 32], Option<String>)>,
@@ -1321,7 +1460,8 @@ impl CloudSessionCheckpointStore {
         if settled.is_empty() && crawl_completed.is_none() {
             return Ok(());
         }
-        let Some(lease) = self.begin_collector_io(grants, expected)? else {
+        let Some(lease) = self.begin_collector_io(inputs.grants, expected, inputs.transport)?
+        else {
             return Ok(());
         };
         let acks = settled
@@ -1436,6 +1576,11 @@ pub trait CloudSessionTransport {
     fn is_configured(&self) -> bool {
         true
     }
+    /// Current local device/account authority must still match at every I/O fence.
+    fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
+        true
+    }
+
     /// One bounded relay-authenticated read of the exact bound grant epoch on
     /// the `cloud_session_changes.v1` authority. Fails closed on any network,
     /// authentication, parsing or absence error.
@@ -1572,6 +1717,27 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         !self.device_secret.is_empty()
             && is_uuid(&self.device.device_id)
             && self.device.sources.iter().any(|source| source == "codex")
+    }
+
+    fn local_binding_current(&self, grant: &CloudSessionGrant) -> bool {
+        if grant_rebind::verified_live_hardware().is_err() {
+            return false;
+        }
+        load_cloud_session_runtime_binding(
+            &CloudSessionGrantStore::default(),
+            &FileAccountStore::default(),
+            &FileDeviceStore::default(),
+            &FileConnectionStore::default(),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|candidate| {
+            candidate.binding.device == self.device
+                && self
+                    .client
+                    .matches_api_base(&candidate.binding.api_base_url)
+                && same_runtime_grant_identity(&candidate.grant, grant)
+        })
     }
 
     fn read_authority(
@@ -2086,6 +2252,16 @@ impl CloudCollector {
             return CloudSessionCycleOutcome::NotDue;
         }
         if !self.schedule.crawl_completed_loaded {
+            let lease = match inputs.checkpoints.begin_io(|| {
+                inputs.transport.local_binding_current(&state.grant)
+                    && preflight_grant_still_current(inputs.grants, &state.grant)
+            }) {
+                Ok(Some(lease)) => lease,
+                _ => {
+                    self.schedule.clear();
+                    return CloudSessionCycleOutcome::Disabled;
+                }
+            };
             self.schedule.crawl_completed = match inputs.checkpoints.crawl_completed(&scope) {
                 Ok(date) => date,
                 Err(_) => {
@@ -2099,6 +2275,7 @@ impl CloudCollector {
             };
             self.schedule.crawl_completed_loaded = true;
             inputs.checkpoints.retire_legacy_checkpoint();
+            drop(lease);
         }
         let due = self.schedule.due(now, today, inputs.last_activity);
         if !due.head && !due.crawl {
@@ -2133,7 +2310,7 @@ impl CloudCollector {
         let cache_unavailable = inputs
             .checkpoints
             .commit(
-                inputs.grants,
+                inputs,
                 &work.grant,
                 &scope,
                 &work.settled,
@@ -2223,7 +2400,19 @@ impl CloudCollector {
         let Some(timeout) = remaining_relay_budget(deadline) else {
             return Err(CloudSessionCycleOutcome::NotDue);
         };
-        let response = match inputs.transport.read_authority(expected, timeout) {
+        let lease = match inputs.checkpoints.begin_io(|| {
+            inputs.transport.local_binding_current(expected)
+                && preflight_grant_still_current(inputs.grants, expected)
+        }) {
+            Ok(Some(lease)) => lease,
+            _ => {
+                self.schedule.clear();
+                return Err(CloudSessionCycleOutcome::Disabled);
+            }
+        };
+        let result = inputs.transport.read_authority(expected, timeout);
+        drop(lease);
+        let response = match result {
             Ok(response) => response,
             Err(error) => {
                 let error = SliceError::from_request(&error, deadline);
@@ -2377,7 +2566,7 @@ impl SliceWork<'_, '_> {
         let lease = self
             .inputs
             .checkpoints
-            .begin_collector_io(self.inputs.grants, &self.grant)
+            .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
             .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
             .ok_or(SliceError {
                 category: "stopped",
@@ -2498,6 +2687,15 @@ impl SliceWork<'_, '_> {
         let cached = if keys.is_empty() {
             HashMap::new()
         } else {
+            let _lease = self
+                .inputs
+                .checkpoints
+                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+                .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
+                .ok_or(SliceError {
+                    category: "stopped",
+                    kind: SliceErrorKind::Stopped,
+                })?;
             self.inputs
                 .checkpoints
                 .read_acks(&self.scope, &keys, self.wall.unix_timestamp())
@@ -2557,7 +2755,7 @@ impl SliceWork<'_, '_> {
             let lease = self
                 .inputs
                 .checkpoints
-                .begin_collector_io(self.inputs.grants, &self.grant)
+                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
                 .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
                 .ok_or(SliceError {
                     category: "stopped",
@@ -3037,6 +3235,15 @@ fn authority_binding(
     }
 }
 
+fn preflight_grant_still_current(
+    store: &CloudSessionGrantStore,
+    expected: &CloudSessionGrant,
+) -> bool {
+    store.load().ok().flatten().is_some_and(|current| {
+        cloud_grant_preflight_eligible(&current) && same_runtime_grant_identity(&current, expected)
+    })
+}
+
 fn grant_still_current(store: &CloudSessionGrantStore, expected: &CloudSessionGrant) -> bool {
     store.load().ok().flatten().is_some_and(|current| {
         cloud_grant_runtime_ready(&current)
@@ -3179,6 +3386,7 @@ struct CloudSessionRuntimeBinding {
 
 struct CloudSessionRuntimeCandidate {
     binding: CloudSessionRuntimeBinding,
+    grant: CloudSessionGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3204,6 +3412,32 @@ fn load_cloud_session_runtime_binding(
     if !grant_preflight_eligible(grants) {
         return Ok(None);
     }
+    let (setup, api_base_url, device) =
+        load_cloud_session_local_identity(accounts, devices, connections)?;
+    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
+        return Ok(None);
+    };
+    let backend = grant
+        .backend_binding
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
+    Ok(Some(CloudSessionRuntimeCandidate {
+        binding: CloudSessionRuntimeBinding {
+            api_base_url,
+            device,
+            grant_id: backend.grant_id.clone(),
+            grant_version: backend.grant_version,
+            grant_scope_id: grant.grant_scope_id.clone(),
+        },
+        grant,
+    }))
+}
+
+fn load_cloud_session_local_identity(
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+) -> Result<(CloudSessionGrantSetup, String, LocalDeviceBinding)> {
     let account = accounts.load()?;
     let user_id = account
         .user
@@ -3245,22 +3479,7 @@ fn load_cloud_session_runtime_binding(
         organization_scope: organization_id.to_string(),
         effective_user_scope: user_id.to_string(),
     };
-    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
-        return Ok(None);
-    };
-    let backend = grant
-        .backend_binding
-        .as_ref()
-        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
-    Ok(Some(CloudSessionRuntimeCandidate {
-        binding: CloudSessionRuntimeBinding {
-            api_base_url,
-            device,
-            grant_id: backend.grant_id.clone(),
-            grant_version: backend.grant_version,
-            grant_scope_id: grant.grant_scope_id.clone(),
-        },
-    }))
+    Ok((setup, api_base_url, device))
 }
 
 fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
@@ -3322,6 +3541,112 @@ fn collect_composed_cloud_sessions_once(
     let accounts = FileAccountStore::default();
     let devices = FileDeviceStore::default();
     let connections = FileConnectionStore::default();
+    let wall = OffsetDateTime::now_utc();
+    let last_activity = last_local_codex_activity();
+    if collector
+        .next_wake(now, wall, last_activity)
+        .is_some_and(|wake| wake > now)
+    {
+        return CloudSessionCycleOutcome::NotDue;
+    }
+    if !kill_switch_enabled() && grant_preflight_eligible(grants) {
+        let hardware = match grant_rebind::verified_live_hardware() {
+            Ok(hardware) => hardware,
+            Err(reason) => {
+                active_transport.take();
+                collector.schedule.crawl = None;
+                let _ = grants.record_health("unavailable", "unavailable", Some(reason));
+                collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                return CloudSessionCycleOutcome::Disabled;
+            }
+        };
+        let identity = load_cloud_session_local_identity(&accounts, &devices, &connections);
+        if let Ok((setup, api_base_url, device)) = identity {
+            let proposal = grants.prepare_rebind(&setup, hardware);
+            if let Ok(Some(proposal)) = proposal {
+                active_transport.take();
+                collector.schedule.crawl = None;
+                let _ = grants.record_health("unavailable", "unavailable", Some("rebinding"));
+                let lease = checkpoints.begin_io(|| {
+                    grant_still_current(grants, &proposal.expected)
+                        && load_cloud_session_local_identity(&accounts, &devices, &connections)
+                            .is_ok_and(|(current, base, target)| {
+                                current.installation_id == setup.installation_id
+                                    && current.organization_scope == setup.organization_scope
+                                    && current.effective_user_scope == setup.effective_user_scope
+                                    && base == api_base_url
+                                    && target == device
+                            })
+                });
+                let Ok(Some(lease)) = lease else {
+                    collector.reset();
+                    return CloudSessionCycleOutcome::Disabled;
+                };
+                let credentials = crate::snapshot_client::load_snapshot_device_credentials();
+                let result = match credentials {
+                    Ok((credential_device, secret)) if credential_device == device => {
+                        let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url);
+                        let binding = proposal
+                            .expected
+                            .backend_binding
+                            .as_ref()
+                            .expect("bound grant");
+                        grant_rebind::rebind(
+                            &client,
+                            GrantKind::CloudSessions,
+                            &binding.grant_id,
+                            &proposal.request,
+                            &device,
+                            &secret,
+                            COMMAND_TIMEOUT,
+                        )
+                    }
+                    _ => Err(grant_rebind::RebindFailure::unavailable()),
+                };
+                // Bind before releasing the lease: a concurrent local stop
+                // must retain the committed target identity for cleanup.
+                match result {
+                    Ok(value) => {
+                        let response =
+                            serde_json::from_value::<CloudSessionBackendGrantResponseV1>(value);
+                        if response
+                            .ok()
+                            .and_then(|response| {
+                                grants
+                                    .bind_backend_grant_with_rebind(
+                                        &response,
+                                        &setup.installation_id,
+                                        Some(&proposal),
+                                    )
+                                    .ok()
+                            })
+                            .is_none()
+                        {
+                            let _ = grants.record_health(
+                                "unavailable",
+                                "unavailable",
+                                Some("stale_binding"),
+                            );
+                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                            return CloudSessionCycleOutcome::Failed;
+                        }
+                        collector.reset();
+                    }
+                    Err(failure) => {
+                        let _ =
+                            grants.record_health("unavailable", "unavailable", Some(failure.code));
+                        if failure.retryable {
+                            collector.defer_after_local_failure(Instant::now());
+                        } else {
+                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                        }
+                        return CloudSessionCycleOutcome::Disabled;
+                    }
+                }
+                drop(lease);
+            }
+        }
+    }
     collect_composed_cloud_sessions_once_with(
         collector,
         active_transport,

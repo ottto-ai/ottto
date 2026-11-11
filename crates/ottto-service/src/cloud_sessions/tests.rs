@@ -2836,3 +2836,532 @@ fn paused_create_responses_reconcile_without_resurrecting_collection() {
         }
     }
 }
+
+/// [format] A sign-in rebind repeats safely after server commit and before local save.
+#[test]
+fn sign_in_rebind_recovers_without_a_new_epoch() {
+    let (_root, store, checkpoints) = stores("rebind-crash");
+    enabled(&store);
+    store.record_health("healthy", "current", None).unwrap();
+    let local = store.load().unwrap().unwrap();
+    let mut proof = authority(&local, "enabled");
+    proof.collect_not_before = Some("2026-01-01T00:00:00Z".to_owned());
+    store.apply_backend_authority(&proof).unwrap();
+    let cli = Cli::head(page("cached-before-rebind", None));
+    let server = Server::new();
+    server
+        .collect_not_before
+        .replace(proof.collect_not_before.clone());
+    slice(
+        &mut CloudCollector::default(),
+        &inputs(&store, &checkpoints, &cli, &server),
+        Instant::now(),
+        Duration::ZERO,
+    );
+    let original = store.read().unwrap().unwrap();
+    let scope = cache_scope(
+        DEFAULT_API_BASE_URL,
+        &original.grant,
+        original.grant.backend_binding.as_ref().unwrap(),
+    );
+    let entity = server.requests.borrow()[0].observations[0]
+        .entity_key
+        .clone();
+    let saved_ack = checkpoints
+        .read_acks(&scope, &[&entity], midnight().unix_timestamp())
+        .unwrap();
+    assert_eq!(saved_ack.len(), 1);
+    let target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000084".to_owned(),
+        organization_scope: "org_fixture".to_owned(),
+        effective_user_scope: "user_fixture".to_owned(),
+    };
+    let proposal = store
+        .prepare_rebind(&target, "hardware-fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = backend_grant(&original.grant, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    let value = serde_json::to_value(&response).unwrap();
+    let mut value = value.as_object().unwrap().clone();
+    for key in ["server_policy_state", "release_lane"] {
+        value.remove(key);
+    }
+    value.insert("can_read_cloud_sessions".into(), json!(true));
+    let response =
+        serde_json::from_value::<CloudSessionBackendGrantResponseV1>(Value::Object(value)).unwrap();
+    let reopened = CloudSessionGrantStore::new(store.path());
+    let recovered = reopened
+        .prepare_rebind(&target, "hardware-fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&proposal.request).unwrap(),
+        serde_json::to_value(&recovered.request).unwrap()
+    );
+    let before = fs::read(reopened.path()).unwrap();
+    let mut legacy = response.clone();
+    legacy.schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_owned();
+    assert!(reopened
+        .bind_backend_grant_with_rebind(&legacy, &target.installation_id, Some(&recovered))
+        .is_err());
+    assert_eq!(fs::read(reopened.path()).unwrap(), before);
+    let rebound = reopened
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+        .unwrap();
+    assert_eq!(rebound.backend_binding, original.grant.backend_binding);
+    assert_eq!(
+        checkpoints
+            .read_acks(&scope, &[&entity], midnight().unix_timestamp())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .prepare_rebind(
+            &CloudSessionGrantSetup {
+                effective_user_scope: "foreign-owner".to_owned(),
+                ..target.clone()
+            },
+            "fixture".to_owned()
+        )
+        .is_err());
+    assert_eq!(
+        rebound.account_fingerprint,
+        original.grant.account_fingerprint
+    );
+    assert_eq!(rebound.granted_at, original.grant.granted_at);
+    assert_eq!(
+        rebound.last_collector_health,
+        original.grant.last_collector_health
+    );
+    assert_eq!(
+        reopened.read().unwrap().unwrap().hmac_key_hex,
+        original.hmac_key_hex
+    );
+    let bytes = fs::read(reopened.path()).unwrap();
+    reopened
+        .bind_backend_grant(&response, &target.installation_id)
+        .unwrap();
+    assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
+    assert!(reopened.runtime_candidate_for(&target).unwrap().is_some());
+    reopened.revoke(now()).unwrap();
+    assert!(reopened
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+        .is_err());
+}
+
+/// [regress] Updating the producer preserves approval and reports the current build.
+#[test]
+fn update_preserves_consent_time_build_and_uses_current_payload_build() {
+    let (_root, store, checkpoints) = stores("update-approval");
+    enabled(&store);
+    let mut state = store.read().unwrap().unwrap();
+    state.grant.collector_version = "0.0.1".to_owned();
+    store.write(&state).unwrap();
+    assert!(cloud_grant_runtime_ready(&state.grant));
+    assert!(cloud_grant_preflight_eligible(&state.grant));
+    let cli = Cli::head(page("current-build", None));
+    let server = Server::new();
+    assert_eq!(
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&store, &checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO
+        ),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(
+        server.requests.borrow()[0].collector_version,
+        compiled_release_version()
+    );
+    assert_eq!(store.load().unwrap().unwrap().collector_version, "0.0.1");
+}
+
+/// [behaviour] The shared HTTP client dispatches both grant kinds and omits predecessor UUIDs.
+#[test]
+fn collector_rebind_http_and_authority_send_exact_current_identity() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    for kind in [GrantKind::DailyReference, GrantKind::CloudSessions] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            for (status, body) in [
+                ("200 OK", "{}"),
+                (
+                    "409 Conflict",
+                    r#"{"detail":{"code":"hardware_changed","message":"refused","retryable":false}}"#,
+                ),
+                ("200 OK", "{}"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.push(read_http_request(&mut stream));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            captured
+        });
+        let client = crate::snapshot_client::SnapshotApiClient::new(format!("http://{address}"));
+        let request = RebindRequest {
+            installation_id: INSTALLATION_ID.to_owned(),
+            grant_version: 1,
+            grant_scope_fingerprint: format!("hmac-sha256:{}", "a".repeat(64)),
+            hardware_id: Some(format!("oth_{}", "a".repeat(32))),
+            disclosure_version: match kind {
+                GrantKind::DailyReference => "provider_daily_reference_disclosure.v2",
+                GrantKind::CloudSessions => "cloud_sessions_disclosure.v1",
+            }
+            .to_owned(),
+        };
+        assert_eq!(
+            client
+                .rebind_collector_grant(
+                    kind,
+                    GRANT_ID,
+                    "fixture-relay-token",
+                    &request,
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
+            json!({})
+        );
+        let refusal = client
+            .rebind_collector_grant(
+                kind,
+                GRANT_ID,
+                "fixture-relay-token",
+                &request,
+                Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "hardware_changed");
+        assert!(!refusal.retryable);
+        client
+            .get_cloud_session_authority_with_timeout(
+                "fixture-relay-token",
+                GRANT_ID,
+                1,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let captured = server.join().unwrap();
+        for raw in &captured[..2] {
+            assert!(raw.starts_with(&format!(
+                "POST /api/v1/{}/grants/{GRANT_ID}/rebind ",
+                kind.route()
+            )));
+            assert!(raw
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-relay-token"));
+            let (_, body) = raw.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body, serde_json::to_value(&request).unwrap());
+            assert!(body.get("previous_installation_id").is_none());
+        }
+        assert!(captured[2].starts_with(&format!(
+            "GET /api/v1/cloud-sessions/grants/{GRANT_ID}/authority?grant_version=1 HTTP/1.1"
+        )));
+    }
+}
+
+/// [behaviour] A valid same-epoch rebind can deny collection without enabling it.
+#[test]
+fn successful_rebind_retains_a_disabled_server_policy() {
+    let (_root, store, _) = stores("rebind-disabled-policy");
+    enabled(&store);
+    let original = store.load().unwrap().unwrap();
+    let target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000085".to_owned(),
+        organization_scope: "org_fixture".to_owned(),
+        effective_user_scope: "user_fixture".to_owned(),
+    };
+    let proposal = store
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = backend_grant(&original, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    response.can_collect = Some(false);
+    let rebound = store
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+        .unwrap();
+    assert_eq!(rebound.status, CloudSessionGrantStatus::PolicyDisabled);
+    assert!(!cloud_grant_runtime_ready(&rebound));
+    assert!(store
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    assert_eq!(rebound.backend_binding.as_ref().unwrap().grant_version, 1);
+}
+
+/// [regress] Paused same-owner consent resumes after sign-in without a new browser approval.
+#[test]
+fn paused_approval_resumes_via_rebind_and_account_switch_requires_new_consent() {
+    let (_root, store, _) = stores("rebind-resume-account-switch");
+    enabled(&store);
+    let original = store.read().unwrap().unwrap();
+    store.pause(now()).unwrap();
+    let mut target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000086".to_owned(),
+        organization_scope: "org_fixture".to_owned(),
+        effective_user_scope: "user_fixture".to_owned(),
+    };
+    let resumed = store.enable(&target, now()).unwrap();
+    assert_eq!(resumed.status, CloudSessionGrantStatus::Enabled);
+    assert_eq!(resumed.backend_binding, original.grant.backend_binding);
+    assert!(!resumed.backend_create_pending);
+    let proposal = store
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = backend_grant(&original.grant, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    store
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+        .unwrap();
+    assert_eq!(
+        store.read().unwrap().unwrap().hmac_key_hex,
+        original.hmac_key_hex
+    );
+    target.installation_id = "00000000-0000-4000-8000-000000000087".to_owned();
+    target.effective_user_scope = "another-user".to_owned();
+    let new_owner = store.enable(&target, now()).unwrap();
+    assert_eq!(new_owner.status, CloudSessionGrantStatus::ConsentRequired);
+    assert!(new_owner.backend_binding.is_none());
+    assert!(!cloud_grant_runtime_ready(&new_owner));
+    assert_ne!(
+        new_owner.account_fingerprint,
+        original.grant.account_fingerprint
+    );
+    store.grant_create_request(&target.installation_id).unwrap();
+    let mut approved = backend_grant(&new_owner, "enabled", 1);
+    approved.installation_id = target.installation_id.clone();
+    store
+        .bind_backend_grant(&approved, &target.installation_id)
+        .unwrap();
+    target.effective_user_scope = "user_fixture".to_owned();
+    let returned = store.enable(&target, now()).unwrap();
+    assert_eq!(returned.status, CloudSessionGrantStatus::ConsentRequired);
+    assert!(
+        returned.backend_binding.is_none(),
+        "returning to the former owner requires approval"
+    );
+}
+
+/// [regress] A terminal rebind refusal permits explicit replacement; a raced revoke still reconciles exactly.
+#[test]
+fn refused_approval_can_be_replaced_and_old_device_revocation_can_be_confirmed() {
+    let (_root, store, _) = stores("rebind-refusal-new-consent");
+    enabled(&store);
+    let mut target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000088".to_owned(),
+        organization_scope: "org_fixture".to_owned(),
+        effective_user_scope: "user_fixture".to_owned(),
+    };
+    store
+        .record_health("unavailable", "unavailable", Some("installation_reset"))
+        .unwrap();
+    let pending = store.enable(&target, now()).unwrap();
+    assert_eq!(pending.status, CloudSessionGrantStatus::ConsentRequired);
+    assert!(pending.backend_binding.is_none());
+    store.grant_create_request(&target.installation_id).unwrap();
+    let mut response = backend_grant(&pending, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    store
+        .bind_backend_grant(&response, &target.installation_id)
+        .unwrap();
+    store.revoke(now()).unwrap();
+    let mut revoked = response;
+    revoked.status = "revoked".to_owned();
+    revoked.grant_version = 2;
+    target.installation_id = "00000000-0000-4000-8000-000000000089".to_owned();
+    assert!(
+        store.enable(&target, now()).is_err(),
+        "unconfirmed revoke remains protected"
+    );
+    store
+        .apply_backend_revocation(&revoked, &target.installation_id)
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().unwrap().status,
+        CloudSessionGrantStatus::Revoked
+    );
+    assert_eq!(
+        store.enable(&target, now()).unwrap().status,
+        CloudSessionGrantStatus::ConsentRequired
+    );
+}
+
+/// [regress] A committed in-flight rebind updates cleanup identity while a local stop remains final.
+#[test]
+fn a_stop_racing_rebind_completion_preserves_cleanup_without_resurrection() {
+    for stop in [
+        CloudSessionGrantStatus::Paused,
+        CloudSessionGrantStatus::Revoked,
+    ] {
+        let (_root, store, _) = stores("rebind-raced-stop");
+        enabled(&store);
+        let original = store.load().unwrap().unwrap();
+        let target = CloudSessionGrantSetup {
+            installation_id: "00000000-0000-4000-8000-000000000090".to_owned(),
+            organization_scope: "org_fixture".to_owned(),
+            effective_user_scope: "user_fixture".to_owned(),
+        };
+        let proposal = store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        let mut response = backend_grant(&original, "enabled", 1);
+        response.installation_id = target.installation_id.clone();
+        response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+        store.change_status(stop.clone(), now()).unwrap();
+        assert!(store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .is_none());
+        let retained = store
+            .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+            .unwrap();
+        assert_eq!(retained.status, stop);
+        assert!(!cloud_grant_runtime_ready(&retained));
+        assert!(store
+            .prepare_rebind(&target, "fixture".to_owned())
+            .unwrap()
+            .is_none());
+        if stop == CloudSessionGrantStatus::Revoked {
+            assert_eq!(retained.revoked_at, Some(timestamp(now())));
+            response.status = "revoked".to_owned();
+            response.grant_version = 2;
+            store
+                .apply_backend_revocation(&response, &target.installation_id)
+                .unwrap();
+            assert!(
+                store
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .backend_binding
+                    .unwrap()
+                    .backend_revoked
+            );
+        } else {
+            assert_eq!(
+                store.enable(&target, now()).unwrap().status,
+                CloudSessionGrantStatus::Enabled
+            );
+        }
+    }
+}
+
+/// [regress] Identity changes stop the new authority/page/send/cache paths;
+/// an ACK admitted before a change cannot repopulate its cache afterwards.
+#[test]
+fn current_binding_fences_every_results_io_boundary() {
+    struct Fenced<'a> {
+        server: Server,
+        current: &'a Cell<bool>,
+        stop_after_send: bool,
+    }
+    impl CloudSessionTransport for Fenced<'_> {
+        fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
+            self.current.get()
+        }
+        fn read_authority(
+            &self,
+            grant: &CloudSessionGrant,
+            timeout: Duration,
+        ) -> Result<CloudSessionGrantAuthorityV1> {
+            self.server.read_authority(grant, timeout)
+        }
+        fn send_changes(
+            &self,
+            request: &CloudSessionChangesV1,
+            timeout: Duration,
+        ) -> Result<CloudSessionChangesAckV1> {
+            let ack = self.server.send_changes(request, timeout);
+            if self.stop_after_send {
+                self.current.set(false);
+            }
+            ack
+        }
+    }
+    struct ChangingCli<'a> {
+        cli: Cli,
+        current: &'a Cell<bool>,
+        stop_after_list: bool,
+    }
+    impl CloudSessionRunner for ChangingCli<'_> {
+        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
+            let page = self.cli.list_page(cursor, limit);
+            if self.stop_after_list {
+                self.current.set(false);
+            }
+            page
+        }
+    }
+    for stop in ["before-slice", "after-provider", "after-send"] {
+        let (_root, grants, checkpoints) = stores("binding-fence");
+        enabled(&grants);
+        let current = Cell::new(stop != "before-slice");
+        let cli = ChangingCli {
+            cli: Cli::head(page("identity-fence", None)),
+            current: &current,
+            stop_after_list: stop == "after-provider",
+        };
+        let server = Fenced {
+            server: Server::new(),
+            current: &current,
+            stop_after_send: stop == "after-send",
+        };
+        let grant = grants.load().unwrap().unwrap();
+        let scope = cache_scope(
+            DEFAULT_API_BASE_URL,
+            &grant,
+            grant.backend_binding.as_ref().unwrap(),
+        );
+        let key = parse_cloud_page(
+            &page("identity-fence", None),
+            &decode_hex(&grants.read().unwrap().unwrap().hmac_key_hex).unwrap(),
+            now(),
+        )
+        .unwrap()
+        .changes[0]
+            .entity_key
+            .clone();
+        CloudCollector::default().run_slice(
+            &SliceInputs {
+                grants: &grants,
+                checkpoints: &checkpoints,
+                runner: &cli,
+                transport: &server,
+                destination: DEFAULT_API_BASE_URL,
+                last_activity: None,
+            },
+            Instant::now(),
+            midnight(),
+        );
+        assert_eq!(
+            server.server.authority_calls.get(),
+            usize::from(stop != "before-slice")
+        );
+        assert_eq!(cli.cli.calls(), usize::from(stop != "before-slice"));
+        assert_eq!(server.server.offered(), usize::from(stop == "after-send"));
+        assert!(checkpoints
+            .read_acks(&scope, &[&key], midnight().unix_timestamp())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            grants.load().unwrap().unwrap().status,
+            CloudSessionGrantStatus::Enabled
+        );
+    }
+}
