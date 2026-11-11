@@ -24155,19 +24155,39 @@ for line in sys.stdin:
     /// [behaviour] Each decoded XPC command counts once under its class.
     #[test]
     fn raw_local_control_json_counts_command_class() {
+        let status = LocalControlCommand::Status {
+            refresh_agent_status: false,
+            retry_relay_authorization: false,
+        };
+        let refresh = LocalControlCommand::AgentStatusRefresh {
+            source: None,
+            quota_refresh: false,
+        };
         for (command, class) in [
-            ("status", "status"),
-            ("claude_accounts_status", "claude_accounts_status"),
-            ("codex_accounts_status", "codex_accounts_status"),
-            ("agent_status_refresh", "agent_status_refresh"),
-            ("auth_status", "other"),
+            (status, "status"),
+            (
+                LocalControlCommand::ClaudeAccountsStatus,
+                "claude_accounts_status",
+            ),
+            (
+                LocalControlCommand::CodexAccountsStatus,
+                "codex_accounts_status",
+            ),
+            (refresh, "agent_status_refresh"),
+            (LocalControlCommand::AuthStatus, "other"),
         ] {
-            let json = format!(
-                r#"{{"request_id":"r","protocol_version":{PROTOCOL_VERSION},"token":"wrong","command":"{command}"}}"#
-            );
+            let request = LocalControlRequest {
+                request_id: "r".to_string(),
+                protocol_version: ottto_protocol::expected_local_control_protocol_version(&command),
+                token: Some("wrong".to_string()),
+                client_kind: None,
+                client_install_owner: None,
+                command,
+            };
+            let json = serde_json::to_string(&request).unwrap();
             handle_request_json_with_peer(&daemon(), &json, None);
             let counts = crate::local_resource_diagnostics::take_control();
-            assert_eq!(counts, BTreeMap::from([(class, 1)]), "{command}");
+            assert_eq!(counts, BTreeMap::from([(class, 1)]), "{class}");
         }
     }
 
