@@ -3385,17 +3385,25 @@ fn newest_account_ties_require_nonzero_usage() {
         at,
     );
     let (_, baseline) = displayed(&[known]);
-    for (identity, counted, reason) in [
-        (RequestIdentity::Missing, false, None),
+    for (identity, counted, tie_at, reason) in [
+        (RequestIdentity::Missing, false, at, None),
         (
             RequestIdentity::Missing,
             true,
+            at,
             Some("latest_request_unidentified"),
         ),
         (
             login_org('b', Some('d'), identity::TELEMETRY),
             true,
+            at,
             Some("conflicting_latest_requests"),
+        ),
+        (
+            RequestIdentity::Missing,
+            false,
+            Some("2026-09-01T10:06:00Z"),
+            Some("latest_request_unidentified"),
         ),
     ] {
         let requests = [
@@ -3406,7 +3414,7 @@ fn newest_account_ties_require_nonzero_usage() {
                 login_org('a', Some('d'), identity::TELEMETRY),
                 at,
             ),
-            display_request(Some("max"), HOUR_10, 7, identity, at),
+            display_request(Some("max"), HOUR_10, 7, identity, tie_at),
         ];
         let (mut item, mut contributions) = display_item(if counted {
             &requests[..]
@@ -3417,14 +3425,12 @@ fn newest_account_ties_require_nonzero_usage() {
             let mut empty = contributions[0].clone();
             empty.0.identity = RequestIdentity::Missing;
             empty.0.usage = UsageTotals::default();
+            empty.1 = tie_at;
             contributions.push(empty);
         }
         identity::apply_timed(&mut item, &contributions).expect("reproduces");
         let display = item.claude_account_display.as_deref().expect("display");
-        assert_eq!(
-            display.current.latest_request_at,
-            baseline.current.latest_request_at
-        );
+        assert_eq!(display.current.latest_request_at.as_deref(), tie_at);
         if reason.is_none() {
             assert_eq!(display, &baseline);
         } else {
@@ -3435,7 +3441,7 @@ fn newest_account_ties_require_nonzero_usage() {
                     .iter()
                     .map(|use_| use_.request_count)
                     .sum::<u64>(),
-                2
+                if counted { 2 } else { 1 }
             );
         }
     }

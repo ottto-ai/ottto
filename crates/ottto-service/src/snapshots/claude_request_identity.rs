@@ -2138,7 +2138,7 @@ fn account_display(grouping: &Grouping, withheld: bool) -> AccountDisplay {
                     .map(|(triple, _)| triple.clone()),
             );
         }
-        if triples.iter().any(|(account, _, _)| account.is_none()) {
+        if triples.is_empty() || triples.iter().any(|(account, _, _)| account.is_none()) {
             Err(LATEST_UNIDENTIFIED)
         } else if triples.len() != 1 {
             Err(LATEST_CONFLICTING)
