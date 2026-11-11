@@ -1388,40 +1388,6 @@ pub(crate) fn source_prepare<T>(
     result
 }
 
-/// Counts-only endpoint samples; no native footprint measurement off macOS.
-#[derive(Clone, Copy, Default, Serialize)]
-pub(crate) struct AllocatorRelief {
-    #[cfg(target_os = "macos")]
-    before_footprint_bytes: Option<u64>,
-    #[cfg(target_os = "macos")]
-    after_footprint_bytes: Option<u64>,
-    #[cfg(target_os = "macos")]
-    wall_us: u64,
-}
-pub(crate) fn release_memory() -> AllocatorRelief {
-    #[cfg(target_os = "macos")]
-    {
-        let before_footprint_bytes = footprint::current().phys_footprint_bytes;
-        let started = Instant::now();
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone requests relief from all system malloc zones.
-        unsafe {
-            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-        }
-        AllocatorRelief {
-            before_footprint_bytes,
-            after_footprint_bytes: footprint::current().phys_footprint_bytes,
-            wall_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        AllocatorRelief::default()
-    }
-}
-
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 #[cfg(test)]
@@ -1456,11 +1422,8 @@ fn source_finish_inner<T>(
         .flatten();
     let result = inner();
     drop(v2_window);
-    // The consuming finish has released page inputs and all store locks.
-    let relief = release_memory();
-    window.allocator_relief = Some(relief);
     if v2_active {
-        crate::snapshots::state_v2_post_pass_observed(relief);
+        crate::snapshots::state_v2_post_pass_observed();
     }
     drop(window);
     result
@@ -1474,7 +1437,6 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
-    allocator_relief: Option<AllocatorRelief>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
@@ -1533,7 +1495,6 @@ impl StageWindow {
             footprint: (!offpass).then(footprint::Stage::begin).flatten(),
             jsonl: None,
             evidence_mem: None,
-            allocator_relief: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
         }
     }
@@ -1577,8 +1538,6 @@ impl Drop for StageWindow {
             jsonl: Option<jsonl::Counts>,
             #[serde(skip_serializing_if = "Option::is_none")]
             evidence_mem: Option<EvidenceMem>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            allocator_relief: Option<AllocatorRelief>,
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
@@ -1590,7 +1549,6 @@ impl Drop for StageWindow {
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
-                allocator_relief: self.allocator_relief.filter(|_| cfg!(target_os = "macos")),
             },
         });
     }
@@ -2824,13 +2782,7 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        if cfg!(target_os = "macos") {
-            for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                assert!(record["counts"]["allocator_relief"][field].is_u64());
-            }
-        } else {
-            assert_eq!(record["counts"], serde_json::json!({}));
-        }
+        assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -2958,13 +2910,7 @@ mod tests {
             assert_eq!(records[1]["stage"], "source_prepare");
             for record in records {
                 assert_eq!(record["source"], source);
-                if record["stage"] == "source_finish" && cfg!(target_os = "macos") {
-                    for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                        assert!(record["counts"]["allocator_relief"][field].is_u64());
-                    }
-                } else {
-                    assert_eq!(record["counts"], serde_json::json!({}));
-                }
+                assert_eq!(record["counts"], serde_json::json!({}));
                 assert!(record["observation"]["footprint_sample_failures"].is_u64());
                 let row = &record["observation"];
                 if cfg!(target_os = "macos") && record["stage"] == "source_prepare" {

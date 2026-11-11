@@ -387,7 +387,7 @@ pub(in super::super) fn retained_pass_end(index: &ScanIndex) {
         retained(index, "active_graph");
     }
 }
-pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::AllocatorRelief) {
+pub(in super::super) fn plateau() {
     if !PASS.with(|pass| pass.borrow().active) {
         return;
     }
@@ -395,7 +395,6 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
         "post_pass_plateau",
         MemoryWindow {
             current: crate::local_resource_diagnostics::state_v2_memory(),
-            allocator_relief: cfg!(target_os = "macos").then_some(relief),
             ..Default::default()
         },
     );
@@ -494,8 +493,6 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 
 #[derive(Default, Serialize)]
 struct MemoryWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allocator_relief: Option<crate::local_resource_diagnostics::AllocatorRelief>,
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -806,9 +803,8 @@ mod ops_tests {
             }
             for _ in 0..2 {
                 pass_start();
-                let relief = crate::local_resource_diagnostics::release_memory();
-                plateau(relief);
-                plateau(relief); // A completed pass cannot emit a second end row.
+                plateau();
+                plateau(); // A completed pass cannot emit a second end row.
             }
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
@@ -820,13 +816,7 @@ mod ops_tests {
         for record in &records[10..] {
             let plateau = &record["counts"]["stage_memory"]["post_pass_plateau"];
             assert!(plateau.is_object());
-            if cfg!(target_os = "macos") {
-                for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                    assert!(plateau["allocator_relief"][field].is_u64());
-                }
-            } else {
-                assert!(plateau.get("allocator_relief").is_none());
-            }
+            assert!(plateau.get("allocator_relief").is_none());
         }
     }
 
