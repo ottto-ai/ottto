@@ -1,6 +1,10 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 
+// Collection fixtures enter the process-wide identity admission fence. Use
+// the default serial_test key shared by control's identity-mutation tests;
+// separate temporary stores alone do not isolate that global reservation.
+
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
 fn temp_dir(name: &str) -> PathBuf {
@@ -619,6 +623,7 @@ fn slice(
 /// heads, active local Codex 48, a running head task 288. A deep unfinished
 /// task does not speed up the head.
 #[test]
+#[serial_test::serial]
 fn a_day_of_provider_calls_follows_the_schedule() {
     let day = 24 * HOUR;
     let run = |name: &str,
@@ -720,6 +725,7 @@ fn a_day_of_provider_calls_follows_the_schedule() {
 /// [behaviour] A deep crawl is paced, not truncated: ten pages per slice,
 /// continuing five minutes later where it stopped.
 #[test]
+#[serial_test::serial]
 fn daily_crawl_takes_ten_pages_then_continues_five_minutes_later() {
     let (_root, grants, checkpoints) = stores("crawl-paced");
     enabled(&grants);
@@ -759,13 +765,14 @@ fn daily_crawl_takes_ten_pages_then_continues_five_minutes_later() {
 /// [regress] More than 100 pages and 2,000 tasks: the crawl reaches the
 /// tail and every task is offered exactly once.
 #[test]
+#[serial_test::serial]
 fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
     let (_root, grants, checkpoints) = stores("crawl-deep");
     enabled(&grants);
     let cli = Cli::new(chain(120, PAGE_LIMIT, "applied"));
     let server = Server::new();
     let mut collector = CloudCollector::default();
-    drive(
+    let outcomes = drive(
         &mut collector,
         &inputs(&grants, &checkpoints, &cli, &server),
         Instant::now(),
@@ -773,7 +780,7 @@ fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
         2 * HOUR,
         false,
     );
-    assert_eq!(cli.calls(), 120);
+    assert_eq!(cli.calls(), 120, "slice outcomes: {outcomes:?}");
     let keys = server
         .requests
         .borrow()
@@ -794,6 +801,7 @@ fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
 /// restart starts over from the head and the cache suppresses every task the
 /// first run already settled.
 #[test]
+#[serial_test::serial]
 fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
     let (_root, grants, checkpoints) = stores("crawl-midnight");
     enabled(&grants);
@@ -855,6 +863,7 @@ fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
 /// [regress] A cursor chain that loops ends the day's traversal without
 /// claiming completion and without repeating it.
 #[test]
+#[serial_test::serial]
 fn cycling_cursor_chain_ends_the_day_without_completion() {
     let (_root, grants, checkpoints) = stores("crawl-cycle");
     enabled(&grants);
@@ -912,6 +921,7 @@ fn cursor_cycle_detector_finds_every_loop_length() {
 /// poll never rewrites its entry: the 30-day expiry still counts from the
 /// exact ACK, after which the task is offered once and answered noop.
 #[test]
+#[serial_test::serial]
 fn unchanged_tasks_are_not_uploaded_or_rewritten() {
     let (_root, grants, checkpoints) = stores("cache-noop");
     enabled(&grants);
@@ -969,6 +979,7 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
 /// [behaviour] One changed task in a page of three is the only one offered,
 /// with the head etag of its last exact ACK as the predecessor.
 #[test]
+#[serial_test::serial]
 fn one_changed_sibling_is_the_only_task_offered() {
     let (_root, grants, checkpoints) = stores("cache-sibling");
     enabled(&grants);
@@ -1024,6 +1035,7 @@ fn one_changed_sibling_is_the_only_task_offered() {
 /// [behaviour] A lost response or a lost cache commit is resent and settles
 /// as noop; nothing is double-counted and the cache then holds.
 #[test]
+#[serial_test::serial]
 fn lost_ack_or_lost_commit_is_resent_and_settles_noop() {
     let (_root, grants, checkpoints) = stores("cache-lost-ack");
     enabled(&grants);
@@ -1080,6 +1092,7 @@ fn lost_ack_or_lost_commit_is_resent_and_settles_noop() {
 /// [regress] An ACK that misses, invents or under-specifies a task settles
 /// nothing; the next attempt offers the same tasks again.
 #[test]
+#[serial_test::serial]
 fn partial_or_malformed_ack_settles_nothing() {
     for fault in [AckFault::DropOne, AckFault::NoEtag, AckFault::Unsolicited] {
         let (_root, grants, checkpoints) = stores("cache-bad-ack");
@@ -1112,6 +1125,7 @@ fn partial_or_malformed_ack_settles_nothing() {
 /// [behaviour] A per-task refusal is remembered for exactly that content, so
 /// it is not offered again until the task changes.
 #[test]
+#[serial_test::serial]
 fn rejected_task_is_not_reoffered_until_it_changes() {
     let (_root, grants, checkpoints) = stores("cache-rejected");
     enabled(&grants);
@@ -1143,6 +1157,7 @@ fn grant_key(grants: &CloudSessionGrantStore) -> Vec<u8> {
 /// [behaviour] A conflict re-lists the same page once and retries with the
 /// server's head as the predecessor.
 #[test]
+#[serial_test::serial]
 fn conflict_relists_once_and_retries_with_the_server_head() {
     let (_root, grants, checkpoints) = stores("conflict");
     enabled(&grants);
@@ -1187,6 +1202,7 @@ fn conflict_relists_once_and_retries_with_the_server_head() {
 /// [behaviour] After an erasure the server's cutoff applies: only tasks the
 /// provider created after it are offered.
 #[test]
+#[serial_test::serial]
 fn erasure_cutoff_filters_older_and_undated_tasks() {
     let (_root, grants, checkpoints) = stores("cutoff");
     enabled(&grants);
@@ -1218,6 +1234,7 @@ fn erasure_cutoff_filters_older_and_undated_tasks() {
 /// [behaviour] A remote revoke revokes locally, erases the cache and stops
 /// all provider calls; a local revoke stops them before any call.
 #[test]
+#[serial_test::serial]
 fn revoke_erases_the_cache_and_stops_collection() {
     let (_root, grants, checkpoints) = stores("revoke-remote");
     enabled(&grants);
@@ -1287,6 +1304,7 @@ fn revoke_erases_the_cache_and_stops_collection() {
 /// [behaviour] An older server without this contract: the feature is absent,
 /// the collector is idle and quiet, and a local consent change rechecks now.
 #[test]
+#[serial_test::serial]
 fn older_server_leaves_the_collector_idle_without_errors() {
     let (_root, grants, checkpoints) = stores("older-server");
     enabled(&grants);
@@ -1363,6 +1381,7 @@ fn older_server_leaves_the_collector_idle_without_errors() {
 /// [behaviour] A remote pause or policy-disabled answer stops provider calls
 /// without touching local consent; an enabled answer resumes collection.
 #[test]
+#[serial_test::serial]
 fn remote_pause_gates_collection_until_enabled_again() {
     let (_root, grants, checkpoints) = stores("remote-pause");
     enabled(&grants);
@@ -1395,6 +1414,7 @@ fn remote_pause_gates_collection_until_enabled_again() {
 /// [behaviour] Cloud failures back off on their own clock; nothing of the
 /// local delivery path (receipts, local backoff) is touched.
 #[test]
+#[serial_test::serial]
 fn cloud_collection_is_isolated_from_local_delivery() {
     let (root, grants, checkpoints) = stores("isolation");
     enabled(&grants);
@@ -1428,6 +1448,7 @@ fn cloud_collection_is_isolated_from_local_delivery() {
 /// [behaviour] A nonempty provider page with no valid task is a provider
 /// failure, never an empty healthy page.
 #[test]
+#[serial_test::serial]
 fn nonempty_page_without_a_valid_task_is_a_provider_failure() {
     let (_root, grants, checkpoints) = stores("invalid-page");
     enabled(&grants);
@@ -1453,6 +1474,7 @@ fn nonempty_page_without_a_valid_task_is_a_provider_failure() {
 }
 
 #[test]
+#[serial_test::serial]
 fn deferred_transport_never_calls_the_provider() {
     let (_root, grants, checkpoints) = stores("deferred");
     enabled(&grants);
@@ -1471,6 +1493,7 @@ fn deferred_transport_never_calls_the_provider() {
 }
 
 #[test]
+#[serial_test::serial]
 fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
     use std::sync::mpsc;
 
@@ -1527,6 +1550,7 @@ fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
 }
 
 #[test]
+#[serial_test::serial]
 fn revocation_at_relay_admission_stops_the_upload() {
     let (_root, grants, checkpoints) = stores("relay-admission-race");
     enabled(&grants);
@@ -1618,6 +1642,7 @@ fn emitted_wire_is_content_free_and_opaque() {
 /// [format] Requests validate strictly; a raw or uppercase key, an open
 /// lifecycle, unsorted coverage or an oversize batch is refused before I/O.
 #[test]
+#[serial_test::serial]
 fn changes_request_rejects_raw_keys_open_values_and_oversize_batches() {
     let (_root, grants, checkpoints) = stores("wire-validate");
     enabled(&grants);
@@ -1964,6 +1989,7 @@ fn legacy_v1_grant_is_privately_migrated_and_remains_revocable() {
 /// [regress] A grant bound before this contract does not collect; consent
 /// on the new grants API re-binds the same epoch onto it.
 #[test]
+#[serial_test::serial]
 fn grant_bound_on_the_previous_contract_needs_fresh_consent() {
     let (_root, grants, checkpoints) = stores("contract-upgrade");
     enabled(&grants);
@@ -2004,6 +2030,7 @@ fn grant_bound_on_the_previous_contract_needs_fresh_consent() {
 }
 
 #[test]
+#[serial_test::serial]
 fn backend_binding_requires_exact_scope_and_monotonic_reconsent_epoch() {
     let (_root, grants, checkpoints) = stores("grant-epoch");
     let local = grants.enable(&setup(), now()).unwrap();
@@ -2244,6 +2271,7 @@ fn collector_supervisor_has_one_process_owner_under_concurrency() {
 /// [behaviour] No consent touches nothing beyond the local grant read: no
 /// credentials, relay, provider call or cache file.
 #[test]
+#[serial_test::serial]
 fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
     let (root, grants, checkpoints) = stores("runtime-consent");
     let (accounts, devices, connections) =
@@ -2435,6 +2463,7 @@ fn relay_token_redirect_never_forwards_the_device_secret() {
 /// the exact validated body, and retries it once after a 401 with a fresh
 /// relay token. A 404 on the authority route reads as an older server.
 #[test]
+#[serial_test::serial]
 fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
     use std::io::Write;
     use std::net::TcpListener;
@@ -2595,6 +2624,7 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
 /// [regress] Upgrade preserves exact old pending creates, with or without
 /// an explicit descriptor, and permits compensation without legacy collection.
 #[test]
+#[serial_test::serial]
 fn legacy_pending_create_survives_upgrade_until_compensating_revoke() {
     for descriptor in [true, false] {
         let (_root, grants, checkpoints) = stores("legacy-pending-create");
@@ -2666,6 +2696,7 @@ fn legacy_pending_create_survives_upgrade_until_compensating_revoke() {
 /// [regress] A delayed refusal anchors Retry-After to response receipt,
 /// even when the injected slice clock is older than the real test clock.
 #[test]
+#[serial_test::serial]
 fn cloud_retry_after_starts_when_the_authority_request_finishes() {
     struct Shed;
     impl CloudSessionTransport for Shed {
@@ -2709,6 +2740,7 @@ fn cloud_retry_after_starts_when_the_authority_request_finishes() {
 /// [behaviour] Backoff defers planned work; it never accelerates head
 /// polling. A failed first crawl page is owed at the continuation cadence.
 #[test]
+#[serial_test::serial]
 fn failed_provider_pages_keep_their_planned_work_opportunity() {
     struct Offline;
     impl CloudSessionRunner for Offline {
@@ -2753,6 +2785,7 @@ fn failed_provider_pages_keep_their_planned_work_opportunity() {
 /// [behaviour] A successfully listed running head keeps fast polling even
 /// when its upload loses an ACK. Delivery failure cannot erase provider facts.
 #[test]
+#[serial_test::serial]
 fn head_status_controls_cadence_independently_of_delivery() {
     let (_root, grants, checkpoints) = stores("head-delivery-isolation");
     enabled(&grants);
@@ -2789,6 +2822,7 @@ fn head_status_controls_cadence_independently_of_delivery() {
 /// [behaviour] Idempotent create may return a paused row. It binds without
 /// collecting and remains compensatable if local revoke raced the response.
 #[test]
+#[serial_test::serial]
 fn paused_create_responses_reconcile_without_resurrecting_collection() {
     for revoked in [false, true] {
         let (_root, grants, checkpoints) = stores("paused-create");
@@ -2839,6 +2873,7 @@ fn paused_create_responses_reconcile_without_resurrecting_collection() {
 
 /// [format] A sign-in rebind repeats safely after server commit and before local save.
 #[test]
+#[serial_test::serial]
 fn sign_in_rebind_recovers_without_a_new_epoch() {
     let (_root, store, checkpoints) = stores("rebind-crash");
     enabled(&store);
@@ -2999,6 +3034,7 @@ fn sign_in_rebind_recovers_without_a_new_epoch() {
 
 /// [regress] Updating the producer preserves approval and reports the current build.
 #[test]
+#[serial_test::serial]
 fn update_preserves_consent_time_build_and_uses_current_payload_build() {
     let (_root, store, checkpoints) = stores("update-approval");
     enabled(&store);
@@ -3306,6 +3342,7 @@ fn a_stop_racing_rebind_completion_preserves_cleanup_without_resurrection() {
 /// [regress] Identity changes stop the new authority/page/send/cache paths;
 /// an ACK admitted before a change cannot repopulate its cache afterwards.
 #[test]
+#[serial_test::serial]
 fn current_binding_fences_every_results_io_boundary() {
     struct Fenced<'a> {
         server: Server,
