@@ -216,6 +216,7 @@ fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<Pat
         keys.iter().copied(),
         &twins,
         &BTreeSet::new(),
+        index,
     );
     // Authority quarantine can independently force a native family. Scheduling
     // its complete family is conservative and makes the forecast exact too.
@@ -230,6 +231,7 @@ fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<Pat
         keys.iter().copied(),
         &twins,
         &forced,
+        index,
     );
     let listed_paths = paths.into_iter().collect::<BTreeSet<_>>();
     let added_by_twins = twin_set

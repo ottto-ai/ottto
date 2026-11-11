@@ -96,6 +96,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
+- **Claude copied history.** Pre-birth request ids held by an earlier accepted
+  main file stay removed, including same-session resumes and origins in another
+  folder. A file's own stored removals never prove another copy. These decisions
+  use the existing removal store. An incomplete census walk keeps only the
+  unresolved prefix out of totals and leaves the file owed through ordinary
+  body-witness revision debt, without advancing the bounded proof-wait counter.
+  An all-covered copy-only page drops its items; own turns still publish.
+  A selected content twin pulls at most its earliest accepted holder. The seed
+  set is fixed before those holders are added, so pulls never cascade.
+  Money rule three selects content twins, path twins and disclosed main files
+  once, using eight smallest census hashes per candidate and one complete
+  deadline-bounded census walk. It re-owes only a matching copy and its earliest
+  holder, and stamps the rule version in the same save. An incomplete walk
+  stamps nothing and retries next cycle.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not

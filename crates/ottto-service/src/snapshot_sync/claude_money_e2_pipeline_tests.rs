@@ -725,7 +725,7 @@ fn streamed_evidence_equals_whole_corpus() {
         // A queued, stale copy holder.
         copy_waits_for_queued_holder(true);
         // A prefix hold expiring.
-        e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions();
+        e2_pipeline_incomplete_census_emits_own_turns_without_expiring();
         // Retired and departed holders.
         e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires();
         e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index();
@@ -4178,7 +4178,7 @@ fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
 }
 
 #[test]
-fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions() {
+fn e2_pipeline_incomplete_census_emits_own_turns_without_expiring() {
     for sampled in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-prefix-expiry");
@@ -4193,7 +4193,7 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 &resumed(COPY, &[A, B, C]),
                 "2026-08-02T07:03:00Z",
             );
-            for pass in 1..=3 {
+            for _ in 1..=3 {
                 let mut page = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
                 e2::take_diag();
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
@@ -4204,7 +4204,7 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
                 assert_eq!(
                     (copy.request_count, copy.removed_request_count),
-                    (if pass < 3 { 1 } else { 3 }, Some(0))
+                    (1, Some(0))
                 );
                 assert_eq!(
                     copy_diag(&[
@@ -4212,16 +4212,16 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                         "copy_prefix_hold_expired",
                         "copy_prefix_unproven"
                     ]),
-                    if pass < 3 { [2, 0, 0] } else { [0, 2, 2] }
+                    [2, 0, 0]
                 );
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
-            // The expired hold's body went on its own pass, a stored re-fold
-            // sent as an ordinary update (L02); nothing selects afterwards.
+            // A complete census decision now removes the prefix.
             let quiet = ready(&c, &scanner, prior, 100, sampled);
-            assert!(
-                body(&quiet, COPY).is_none(),
-                "expired retry debt never selects forever"
+            let copy = body(&quiet, COPY).expect("incomplete census keeps the file owed");
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (1, Some(2))
             );
         });
     }
@@ -5524,3 +5524,5 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
 }
 
 mod desktop_depth_tests;
+
+mod copied_session_file_tests;

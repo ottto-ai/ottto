@@ -70,11 +70,11 @@ fn listed_writer_copy_needs_a_holder() {
     }
 }
 
-/// [behaviour] Only a holder in the copy's folder proves its prefix: a
-/// holder in a folder whose name extends the copy's proves nothing.
+/// [money] An accepted earlier origin in another folder proves its prefix
+/// through the complete all-folder census walk.
 #[test]
-fn holder_outside_the_copys_folder_proves_nothing() {
-    for (neighbour, removed) in [(false, 2), (true, 0)] {
+fn accepted_holder_in_another_folder_proves_the_copy() {
+    for (neighbour, removed) in [(false, 2), (true, 2)] {
         let dir = scratch();
         let path = copy_at(&dir);
         let holder_dir = if neighbour {
