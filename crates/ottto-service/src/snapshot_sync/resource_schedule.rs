@@ -73,7 +73,9 @@ pub(crate) fn needs_pacing(scan: &SourceScanResult) -> bool {
 pub(crate) fn native_source_qos(
     source: SnapshotSource,
 ) -> Option<continuation::MacPlatformSignals> {
-    continuation::paced_source_qos(source, continuation::resident_background)
+    let mut qos = None;
+    continuation::enter_source_qos(&mut qos, source);
+    qos
 }
 #[cfg(target_os = "macos")]
 pub(crate) fn native_qos() -> (u32, i32) {

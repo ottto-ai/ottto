@@ -2,8 +2,9 @@
 //! never ordinary test discovery or a merge-group/scheduled invocation.
 use super::*;
 use crate::snapshot_sync::resource_schedule as schedule;
+type Trace = Vec<(String, String, u32)>;
 thread_local! {
-    static TRACE: std::cell::RefCell<Option<Vec<(String, String, u32)>>> = const { std::cell::RefCell::new(None) };
+    static TRACE: std::cell::RefCell<Option<Trace>> = const { std::cell::RefCell::new(None) };
 }
 pub(super) fn record_stage(json: &str) {
     TRACE.with(|trace| {
@@ -24,7 +25,7 @@ pub(super) fn record_stage(json: &str) {
         }
     });
 }
-fn observed(driver: &mut Driver<'_>, seconds: u64) -> Vec<(String, String, u32)> {
+fn observed(driver: &mut Driver<'_>, seconds: u64) -> Trace {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

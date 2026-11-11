@@ -47,6 +47,7 @@ jobs:
       - name: Resource scorecard contracts
         run: |
           python3 scripts/test_resource_scorecard.py
+          python3 scripts/test_resource_baseline.py
           bash scripts/test_macos_public_rc_gate.sh
 
       - name: Rust setup
@@ -55,6 +56,9 @@ jobs:
           linux-test-env: 'true'
           cache-key: linux-tests
           cache-save: 'false'
+
+      - name: Build resource tests
+        run: cargo test -p ottto-service --locked --lib --no-run
 
       # Ignored in ordinary Linux/Mac suites so this advisory calibration never
       # becomes a required check indirectly. One serial run; no retries.

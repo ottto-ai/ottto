@@ -1,72 +1,116 @@
-# Resource calibration and RC scorecards
+# Resource regression checks
 
-Resource calibration runs in the **Resource regression (advisory)** workflow on
-`ubuntu-latest`: pull requests touching `crates/ottto-service/**`, a nightly run,
-and manual branch dispatch. It is independent of required Linux checks and is
-not selected by `merge_group`. Its job name is not a required status check.
+**Resource regression (advisory)** runs on `ubuntu-latest` for pull requests
+that touch `crates/ottto-service/**`, nightly, and manual dispatch. It has no
+merge-group trigger, required-check dependency or required-check ruleset entry.
+A daemon PR includes a nonblank `Resource:` body line describing its evidence
+and limitations. That line never waives a failing budget.
 
-A daemon pull request includes a nonblank `Resource:` body line. Describe the
-measured scope and limitations, or use `Resource: none; reason=<scope>` when the
-change does not affect resources. The line discloses evidence; it does not waive
-a resource failure. Workflow code reads the PR body as data.
+The generated fixed-seed corpus has 12,000 Claude, 5,500 Codex and 500 Pi
+transcripts, eight Codex homes and five homes with synthetic SQLite sidecars.
+All files live in private temporary directories and are removed on fixture drop.
+The exact 90/9/1% mix is 4KiB/64KiB/1MiB. Native acquisition, policy, exact ACK,
+accepted fingerprint, state save and reload helpers seed the corpus. No live
+provider input, auth material or generated transcript is checked in.
 
-The workflow creates a deterministic synthetic corpus inside private temporary
-directories, reuses native acquisition and durable acknowledgement helpers,
-and removes the corpus when fixtures drop. The full profile has 12,000 Claude,
-5,500 Codex and 500 Pi transcripts, eight Codex homes and five homes with
-sidecars. Transcript byte sizes use a fixed 90%/9%/1% mix of 4 KiB, 64 KiB and
-1 MiB. The content digest excludes temporary directory names.
+One shared virtual UTC/monotonic clock drives real cadence and account-switch
+owners. The measured half-open window is `[0,7200)` seconds, with separate cold
+seed and active-drain receipts. Cases cover quiet AC/Battery/Low Power/Unknown,
+one active session per source with 2KiB appended each five minutes (including
+real Codex SQLite WAL mutations), one minute-30
+context invalidation reselect, and an account switch forcing an immediate pass.
+The reselect must finish every generated Claude file exactly once and leave no
+context debt. Metadata companions cover successful stderr login and the native
+60-minute TTL. Tests use no sleeps or elapsed-time assertions.
 
-Resource tests are ignored by ordinary test discovery, so calibration does not
-become required indirectly. The advisory workflow explicitly selects the corpus
-module and metadata tests, serially and without retry. It reports command wall
-time as CI overhead evidence; test decisions use virtual time and work counts.
-The shared clock defaults to native UTC and monotonic clocks in production.
+## Linux work counters and baseline
 
-The calibration reports actual parser-consumed bytes, decoded state rows,
-sidecar reuse/reload counts, native CLI child starts and scan calls. Parser
-consumption does **not** measure raw I/O: guards, prefetch, headers, sidecars,
-SQLite, WAL and checkpoints have additional work. Unobserved read/write/page
-metrics remain `null`. The advisory job first requires numeric `disk_read_bytes` and
-`disk_written_bytes` on real source-prepare stage rows. Missing platform
-observations fail that coverage step before corpus generation. Current main
-does not supply these observations on Linux, so the check cannot pass until a
-shared Linux-capable stage measurement is available. Parser bytes and a
-fabricated zero are never substituted. The remaining calibration is not a
-complete resource-budget receipt.
+`crates/ottto-service/src/snapshots/resource-baseline.json` is the single baseline
+B. Its header pins the current-main production revision and generator seed and
+explicitly lists Linux counters, source-specific counters, exclusions and the
+separate macOS RC metric set. Each observed scenario/source/phase/hour count must
+be at most `1.20 * B`, using exact integer comparison. Baseline increases require
+a reviewed PR. A missing defined-platform counter, phase or source fails; an
+observed zero remains zero. Source-specific sidecar fields apply to Codex only.
+Quiet sidecar reuse additionally requires >=95% with a positive denominator for
+each native loader kind.
 
-A resource baseline may contain only observed counts for the exact corpus,
-scenario, source, phase and hour, pinned to the production-main revision used
-for calibration. Missing observations cannot be filled with zero. A baseline
-increase requires a reviewed pull request; a previous PR's run is not a baseline.
-No complete checked-in baseline exists yet.
+Linux judges native/Full/Tail and guard read bytes from the actual page row,
+parser consumption, physical decoded rows, existing save-work encoded bytes and
+dirty rows, native child starts by kind, actual diagnostic formatter/writer
+bytes including prefix/newline, and per-kind sidecar reload/reuse counts. The
+save observer includes every existing `save_work` call in the measured pass.
+Counter scopes include native prepare, collection, ACK, save, and reload.
 
-## Stable candidate resource scorecard
+These are **logical work counters**. Native page read bytes exclude discovery,
+failed plans, joins and sidecars; parser bytes have their narrower existing
+meaning. This production revision has no sidecar byte tally or maintenance
+`cache_write` page counter. The header excludes those absent metrics explicitly:
+sidecar reload counts and encoded save bytes are the nearest existing counters.
+Encoded bytes are not SQLite pages, WAL/checkpoint bytes or physical disk I/O.
+No new production counters are introduced. `DiskBytes`/`proc_pid_rusage` are
+macOS-only RC observations and are excluded from Linux budgets.
 
-`scripts/resource_scorecard.py <stable-candidate-rc-qa.json>` validates the
-`resource_scorecard` embedded in existing RC evidence. The evidence template
-starts with `resource_soak: not_run`. The RC gate validates the scorecard, and
-the stable release binding validates it before marking RC evidence passed.
+Regenerate in CI against the pinned current-main production plus these test
+adapters: dispatch `resource-regression.yml` with `record_baseline=true`, download
+the completed log, then run:
 
-The validator requires sampler version 6, at least two battery hours after
-15 minutes of startup exclusion, at least 99% sample coverage, gaps no longer
-than two seconds, one verified process instance and no restart. CPU includes
-child-process CPU. Footprint peak uses interval maxima; time above 500 MiB
-uses instantaneous readings. Candidate manifest and executable hashes must
-match the parent evidence. A canonical JSON SHA-256 binds the embedded previous
-stable scorecard; comparable host, OS, architecture, power, workload, duration
-and source input counts are required.
+```sh
+python3 scripts/resource_baseline.py --log calibration.log \
+  --production-main <40-character-main-sha>
+```
 
-Absolute ceilings are 180 CPU seconds/hour, 100 mW battery energy,
-0.25 GiB written/hour, 150 MiB median footprint, 600 MiB peak footprint and
-60 seconds/hour above 500 MiB. An adverse increase over 20% also fails against
-the previous stable, including reads, wakeups, logs and children. Reuse uses the
-inverse direction. A zero baseline uses the metric's explicit absolute bound;
-without such a bound, a nonzero result fails. Reads above 3 GiB/hour raise an
-alarm without becoming another absolute failure. Missing, nonfinite, negative
-or mismatched observations fail; supplied pass flags are not trusted.
+This imports exactly one counts-only receipt and preserves the reviewed header.
+Review the resulting counts, corpus receipt, source/phase coverage and pinned
+revision before committing B. A record-mode run skips the B comparison and is
+**calibration only**. PR and nightly runs compare B by default. After updating B,
+run the advisory workflow normally, normal Linux tests, then money equivalence
+on the final head. Resource tests are ignored in ordinary discovery and selected
+explicitly, serially, without retries. Command wall time is CI overhead evidence.
 
-The validator consumes reviewed aggregates; it does not run a sampler or verify
-live process identity itself. Collect and verify candidate PID/start/digest and
-previous-stable provenance before producing evidence. Keep raw local samples
-and provider data out of public artifacts.
+The off-pass replay uses the same native aggregation and formatter, flushing
+each event in the replay. The paced-rewalk replay requests another native paced
+pass after a quiet completed page. Both must breach their original resource
+bounds; the CLI bypass and sidecar cache-loss replays use real native loaders.
+
+## Native macOS PR QoS
+
+The ignored `resource_native_ordinary_stage_qos` test uses native pthread QoS
+inside native fixture prepare/page/finish on a scan-sized worker. Ordinary
+stages must keep utility; stages explicitly requested as resident-paced must
+keep background, and another source must retain utility. It checks restoration
+on normal return, error and unwind. A test-only cycle-wide demotion must trip
+the same ordinary-class predicate. These tests measure requested QoS, not core
+placement. They use native acquisition/stage owners and the production paced-QoS
+policy; the HTTP/control-plane cycle is outside this fixture's scope.
+
+The native Mac PR runner invokes `scripts/resource_native_qos_pr.sh <PR-number>`.
+It requires Darwin, a PR context and an exact PR-head match. The test is ignored
+by ordinary, scheduled and merge-group discovery and requires the runner's PR
+binding. No paid hosted Mac workflow is added. A Linux pass is not native Mac
+evidence; record the native runner receipt separately.
+
+## Stable candidate RC scorecard
+
+`scripts/resource_scorecard.py <stable-candidate-rc-qa.json>` validates existing
+RC evidence; `resource_soak` starts `not_run`. Both the RC gate and stable-release
+binding recompute validation before marking candidate evidence passed.
+
+Required: sampler_v6; two battery hours after 15 minutes startup exclusion;
+>=99% coverage and <=2s gaps; one verified process instance, no restart;
+candidate manifest/executable SHA binding; child-inclusive CPU; and previous
+stable evidence bound by canonical SHA-256. Host, OS, architecture, power,
+workload, duration and source input counts must match the comparator.
+
+Absolute ceilings: 180 CPU seconds/hour, 100mW battery energy, 0.25GiB written/hour,
+150MiB median footprint, 600MiB peak, and 60 seconds/hour above 500MiB. Every
+adverse metric regression >20% also fails, including physical reads/writes,
+wakeups, logs and children; reuse compares in the inverse direction. A zero
+baseline uses an explicit absolute bound, otherwise any nonzero value fails.
+Reads >3GiB/hour are an alarm. Missing/nonfinite/negative or mismatched evidence
+fails. Supplied pass flags are not trusted.
+
+The validator consumes reviewed aggregates; it neither runs the real Mac soak
+nor independently verifies live process identity. Verify candidate PID/start/
+digest and previous-stable provenance before producing evidence. Keep raw
+sampler/provider data local; publish aggregates only.

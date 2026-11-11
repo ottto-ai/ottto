@@ -593,8 +593,18 @@ fn resource_cli_metadata_children_replay() {
     }
     let ordinary = run(true);
     assert_eq!(ordinary, 32, "warmup plus one TTL pair for eight homes");
+    crate::snapshots::resource_fixture::companion_bound("cli_login_starts", ordinary as u64 / 2);
+    crate::snapshots::resource_fixture::companion_bound("cli_model_starts", ordinary as u64 / 2);
     let uncached = run(false);
     assert_eq!(uncached, 384);
+    crate::snapshots::resource_fixture::replay_companion_bound(
+        "cli_login_starts",
+        uncached as u64 / 2,
+    );
+    crate::snapshots::resource_fixture::replay_companion_bound(
+        "cli_model_starts",
+        uncached as u64 / 2,
+    );
     assert!(ordinary <= 180 * 2);
     assert!(uncached > 180 * 2, "native replay must trip children/hour");
 }

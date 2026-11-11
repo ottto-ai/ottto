@@ -5596,8 +5596,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
-        drop(self.paced_qos.take());
-        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
+        continuation::enter_source_qos(&mut self.paced_qos, source);
         if source == SnapshotSource::Codex {
             self.codex_started = Some(crate::scan_clock::now());
             // K2: this prepare's policy replaces any older cached inputs.

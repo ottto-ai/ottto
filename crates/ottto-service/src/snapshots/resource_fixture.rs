@@ -267,6 +267,7 @@ struct Driver<'a> {
     index: ScanIndex,
     counts: Counts,
     paced: bool,
+    active_tokens: Option<u64>,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
@@ -291,6 +292,7 @@ impl<'a> Driver<'a> {
             index,
             counts: Counts::default(),
             paced: false,
+            active_tokens: None,
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
@@ -400,6 +402,11 @@ impl<'a> Driver<'a> {
         );
         let acks = exact_acks_for_test(&scan.snapshots);
         accept_upload_context_acks_for_test(&mut index, &scan.snapshots, &acks);
+        for item in &scan.snapshots {
+            if item.source_session_id == session(0) {
+                self.active_tokens = Some(item.input_tokens);
+            }
+        }
         self.counts.passes += 1;
         self.counts.scanned_files += scan.scanned_file_count as u64;
         self.counts.emitted_bodies += scan.snapshots.len() as u64;
@@ -571,7 +578,56 @@ fn accumulate(target: &mut BTreeMap<String, u64>, page: BTreeMap<String, u64>) {
 fn within_bound(actual: u64, baseline: u64) -> bool {
     u128::from(actual) * 5 <= u128::from(baseline) * 6
 }
+pub(crate) fn companion_bound(key: &str, observed: u64) {
+    if std::env::var("OTTTO_RESOURCE_RECORD_BASELINE").as_deref() == Ok("1") {
+        return;
+    }
+    let baseline: Value = serde_json::from_str(include_str!("resource-baseline.json")).unwrap();
+    let expected = baseline["companion_counts"]
+        .get(key)
+        .and_then(Value::as_u64)
+        .expect("reviewed companion observation required");
+    assert!(
+        within_bound(observed, expected),
+        "companion resource bound tripped: {key}: {observed} > 1.20 * {expected}"
+    );
+}
+pub(crate) fn replay_companion_bound(key: &str, observed: u64) {
+    if std::env::var("OTTTO_RESOURCE_RECORD_BASELINE").as_deref() == Ok("1") {
+        return;
+    }
+    assert!(
+        std::panic::catch_unwind(|| companion_bound(key, observed)).is_err(),
+        "reintroduced cause must trip the same reviewed bound: {key}"
+    );
+}
 fn check_baseline(actual: &BTreeMap<String, BTreeMap<String, u64>>, baseline: &Value) {
+    assert_eq!(baseline["schema"], 1);
+    let excluded = baseline["_contract"]["linux"]["excluded"]
+        .as_array()
+        .expect("explicit Linux exclusions required");
+    for absent in [
+        "disk_read_bytes",
+        "disk_written_bytes",
+        "sqlite_cache_write_pages",
+        "sidecar_read_bytes",
+    ] {
+        assert!(
+            excluded.iter().any(|key| key == absent),
+            "platform-absent metric must be explicitly excluded: {absent}"
+        );
+        assert!(
+            actual.values().all(|row| !row.contains_key(absent)),
+            "excluded metrics must never be fabricated as zero"
+        );
+    }
+    for metric in ["reads_gib_per_hour", "writes_gib_per_hour"] {
+        assert!(baseline["_contract"]["macos_rc"]["judged"]
+            .as_array()
+            .expect("Mac RC contract required")
+            .iter()
+            .any(|key| key == metric));
+    }
     let expected = baseline["counts"]
         .as_object()
         .expect("baseline counts required");
@@ -632,6 +688,11 @@ fn seed<'a>(corpus: &'a Corpus, source: usize) -> Driver<'a> {
         driver.counts.emitted_bodies, corpus.manifest.files[source] as u64,
         "every native session earns an exact ACK"
     );
+    assert_eq!(
+        driver.active_tokens,
+        Some(100),
+        "positive native money control"
+    );
     driver
 }
 fn offpass(minute: u64, flush_each: bool) {
@@ -683,7 +744,20 @@ fn resource_virtual_scenarios() {
         ("reselect", "ac", None),
         ("account_switch", "ac", None),
     ];
+    // Keep the native WAL writer alive through later quiet cases: closing it
+    // would checkpoint/change stamps at the boundary and cease to be quiet.
+    let mut codex_writer: Option<rusqlite::Connection> = None;
     for (case_n, (case, power, active)) in cases.into_iter().enumerate() {
+        if active == Some(1) {
+            let db = corpus.roots[1][0].parent().unwrap().join("state_5.sqlite");
+            let writer = rusqlite::Connection::open(db).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer.execute("INSERT INTO threads (id,title,tokens_used,archived,created_at,updated_at,model,rollout_path,thread_source,first_user_message) VALUES (?1,'sample-project',100,0,1785657540,1785657540,'gpt-5.2',?2,'cli','synthetic')",
+                rusqlite::params![session(0), corpus.files[1][0].to_str().unwrap()]).unwrap();
+            codex_writer = Some(writer);
+        }
         let offset = 2000 + case_n as u64 * 10000;
         schedule::with_power(power, || {
             with_scan_clock(EPOCH + offset, || {
@@ -709,10 +783,25 @@ fn resource_virtual_scenarios() {
                             );
                         }
                     }
-                    if seconds > 0 && seconds % 300 == 0 {
+                    if seconds > 0 && seconds.is_multiple_of(300) {
                         if let Some(s) = active {
                             appended += 1;
                             corpus.append(s, appended + 1);
+                            if s == 1 {
+                                let changed = codex_writer
+                                    .as_ref()
+                                    .expect("active native WAL writer")
+                                    .execute(
+                                        "UPDATE threads SET title=?1, updated_at=?2 WHERE id=?3",
+                                        rusqlite::params![
+                                            format!("sample-project {appended}"),
+                                            EPOCH + offset + seconds,
+                                            session(0)
+                                        ],
+                                    )
+                                    .unwrap();
+                                assert_eq!(changed, 1, "real active Codex WAL mutation");
+                            }
                             schedule::event(SOURCES[s]);
                         }
                     }
@@ -725,7 +814,7 @@ fn resource_virtual_scenarios() {
                         e2_pipeline_scan_fixture::age_listing_for_test(&mut drivers[0].index);
                         schedule::event(SOURCES[0]);
                     }
-                    if seconds % 60 == 0 {
+                    if seconds.is_multiple_of(60) {
                         let (_, bytes, _, _) = observe_work(|| {
                             crate::local_resource_diagnostics::capture(|| {
                                 offpass(seconds / 60, false)
@@ -780,6 +869,11 @@ fn resource_virtual_scenarios() {
                 assert!(
                     active_bytes >= appended * 2048,
                     "every appended native byte drained"
+                );
+                assert_eq!(
+                    drivers[s].active_tokens,
+                    Some((appended + 1) * 100),
+                    "all active usage reaches an exact ACK"
                 );
             }
             if reselected {
@@ -857,6 +951,8 @@ fn resource_offpass_replay() {
     let per_event = run(true);
     println!("resource_log_replay folded={folded} per_event={per_event}");
     assert!(folded > 0 && folded <= 2 * 1024 * 1024);
+    companion_bound("offpass_folded_log_bytes", folded);
+    replay_companion_bound("offpass_folded_log_bytes", per_event);
     assert!(
         per_event > 2 * 1024 * 1024,
         "native replay trips log bytes/hour"
@@ -909,6 +1005,8 @@ fn resource_paced_rewalk_replay() {
     let replay = run(true);
     println!("resource_rewalk_replay ordinary={ordinary} replay={replay}");
     assert!(ordinary > 0 && ordinary <= 12);
+    companion_bound("ordinary_passes_h0", ordinary);
+    replay_companion_bound("ordinary_passes_h0", replay);
     assert_eq!(
         replay, 13,
         "native replay trips quiet prepares/hour on the first excess pass"

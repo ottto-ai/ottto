@@ -94,6 +94,11 @@ pub(super) fn paced_source_qos(
     }
     qos
 }
+/// Shared ordinary-owner entry seam; preserve drop-before-enter ordering.
+pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: SnapshotSource) {
+    drop(slot.take());
+    *slot = paced_source_qos(source, resident_background);
+}
 pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
     scan.charge_deferred
         || (scan.page_file_limit_hit && scan.census_status.pending_work && !scan.routine_recensus)
