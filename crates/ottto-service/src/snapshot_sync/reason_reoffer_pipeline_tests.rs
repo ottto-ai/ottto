@@ -2975,10 +2975,21 @@ fn a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved() 
     assert_eq!(offered.len(), 3, "re-offered after the lost save");
     whole(&offered[2], &first);
     let key = cache_session_key(first["source_session_id"].as_str().unwrap());
-    assert!(saved
-        .progress
-        .accepted_body_witnesses
-        .contains_key(&fingerprint));
+    // Successful finish retires the transient upload ACK after the index
+    // adopts its exact proof. Check that durable destination-bound stamp.
+    let proof = serde_json::to_value(&saved.index.upload_context_proof).unwrap();
+    assert_eq!(
+        proof["entity_stamps"][&fingerprint]["body_witness"],
+        entity_ack(&first)["body_witness_digest"],
+        "the durable index owns the exact stored-body proof"
+    );
+    assert!(
+        !saved
+            .progress
+            .accepted_body_witnesses
+            .contains_key(&fingerprint),
+        "the adopted ACK retires only after the index save"
+    );
     assert_eq!(saved.progress.accepted_cache_heads[&key], "e".repeat(64));
     assert!(saved.progress.accepted_cache_states.contains_key(&key));
     assert!(saved.progress.head_conflict_challenges.is_empty());
