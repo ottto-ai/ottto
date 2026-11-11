@@ -3372,6 +3372,75 @@ fn owned(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+/// [regress] Empty unnamed newest ties cannot hide the account that holds
+/// every request. Nonempty unnamed ties and conflicting known ties stay unknown.
+#[test]
+fn newest_account_ties_require_nonzero_usage() {
+    let at = Some("2026-09-01T10:05:00Z");
+    let known = display_request(
+        Some("max"),
+        HOUR_10,
+        500,
+        login_org('a', Some('d'), identity::TELEMETRY),
+        at,
+    );
+    let (_, baseline) = displayed(&[known]);
+    for (identity, counted, reason) in [
+        (RequestIdentity::Missing, false, None),
+        (
+            RequestIdentity::Missing,
+            true,
+            Some("latest_request_unidentified"),
+        ),
+        (
+            login_org('b', Some('d'), identity::TELEMETRY),
+            true,
+            Some("conflicting_latest_requests"),
+        ),
+    ] {
+        let requests = [
+            display_request(
+                Some("max"),
+                HOUR_10,
+                500,
+                login_org('a', Some('d'), identity::TELEMETRY),
+                at,
+            ),
+            display_request(Some("max"), HOUR_10, 7, identity, at),
+        ];
+        let (mut item, mut contributions) = display_item(if counted {
+            &requests[..]
+        } else {
+            &requests[..1]
+        });
+        if !counted {
+            let mut empty = contributions[0].clone();
+            empty.0.identity = RequestIdentity::Missing;
+            empty.0.usage = UsageTotals::default();
+            contributions.push(empty);
+        }
+        identity::apply_timed(&mut item, &contributions).expect("reproduces");
+        let display = item.claude_account_display.as_deref().expect("display");
+        assert_eq!(
+            display.current.latest_request_at,
+            baseline.current.latest_request_at
+        );
+        if reason.is_none() {
+            assert_eq!(display, &baseline);
+        } else {
+            assert_eq!(current_of(display), ("unknown", None, None, None, reason));
+            assert_eq!(
+                display
+                    .history
+                    .iter()
+                    .map(|use_| use_.request_count)
+                    .sum::<u64>(),
+                2
+            );
+        }
+    }
+}
+
 /// A newer unidentified request makes the current account unknown; it never
 /// falls back to the previous or the most-used account. Totals stay whole.
 #[test]
