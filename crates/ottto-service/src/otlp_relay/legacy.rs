@@ -497,7 +497,18 @@ struct OpenPort {
 
 impl OpenPort {
     fn accept(&self) -> io::Result<TcpStream> {
-        let (stream, _) = self.listener.as_ref().expect("owned listener").accept()?;
+        // Pin the descriptor's current socket before checking it: a closed fd
+        // can be reused by a blocking listener before the idle health check.
+        // Accept only from the checked duplicate, even if the original changes.
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("owned listener")
+            .try_clone()?;
+        if listener.local_addr().ok() != self.bound_addr || !is_listening(&listener) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSOCK));
+        }
+        let (stream, _) = listener.accept()?;
         // Accepted sockets can inherit nonblocking mode on some platforms.
         // Workers must use the primary's blocking I/O timeout semantics.
         stream.set_nonblocking(false)?;
