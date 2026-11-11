@@ -2075,7 +2075,7 @@ fn persist_identity(
         .map_err(|error| error.to_string())
 }
 
-fn collect_allowed_quota(store: &FileClaudeConfigSlotSettingsStore, slot_id: &str) {
+pub(crate) fn collect_allowed_quota(store: &FileClaudeConfigSlotSettingsStore, slot_id: &str) {
     let Ok(status) = store.load() else { return };
     if status.consent != ottto_protocol::ClaudeAccountUpkeepConsentState::Granted {
         return;
@@ -2085,6 +2085,7 @@ fn collect_allowed_quota(store: &FileClaudeConfigSlotSettingsStore, slot_id: &st
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| captured_at.clone());
     let quota = crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+        crate::agent_status::request_claude_explicit_refresh();
         crate::agent_status::collect_registered_claude_slot_status(slot_id, captured_at, expires_at)
     });
     // Identity admission is durable independently of quota availability.
