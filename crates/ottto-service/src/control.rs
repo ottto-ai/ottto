@@ -4946,11 +4946,15 @@ fn cloud_sessions_control_with_stores(
         CloudSessionsControlAction::Pause => grants.pause(time::OffsetDateTime::now_utc()),
         CloudSessionsControlAction::Revoke => grants.revoke(time::OffsetDateTime::now_utc()),
         CloudSessionsControlAction::ConfirmRevoked => grants
-            .apply_backend_revocation(
+            .reconcile_backend_revocation(
                 backend_grant
                     .as_ref()
                     .expect("backend grant presence validated"),
-                &device.device_id,
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device.device_id.clone(),
+                    organization_scope: local_organization_id.to_string(),
+                    effective_user_scope: local_user_id.to_string(),
+                },
             )
             .map(|_| ()),
         CloudSessionsControlAction::Status => Ok(()),

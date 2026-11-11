@@ -2910,7 +2910,16 @@ fn sign_in_rebind_recovers_without_a_new_epoch() {
     let rebound = reopened
         .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
         .unwrap();
-    assert_eq!(rebound.backend_binding, original.grant.backend_binding);
+    let mut expected_binding = original.grant.backend_binding.clone().unwrap();
+    expected_binding.cache_origin = Some(CloudSessionCacheOrigin {
+        installation_fingerprint: original.grant.installation_fingerprint.clone(),
+        grant_scope_id: original.grant.grant_scope_id.clone(),
+    });
+    assert_eq!(rebound.backend_binding.as_ref(), Some(&expected_binding));
+    assert_eq!(
+        cache_scope(DEFAULT_API_BASE_URL, &rebound, &expected_binding),
+        scope
+    );
     assert_eq!(
         checkpoints
             .read_acks(&scope, &[&entity], midnight().unix_timestamp())
@@ -2946,6 +2955,38 @@ fn sign_in_rebind_recovers_without_a_new_epoch() {
         .unwrap();
     assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
     assert!(reopened.runtime_candidate_for(&target).unwrap().is_some());
+    // Reopen with the rebound identity and poll unchanged facts: the accepted
+    // cache remains accessible, so no second upload is sent.
+    assert_eq!(
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&reopened, &checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO
+        ),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(server.offered(), 1);
+    let mut next_target = target.clone();
+    next_target.installation_id = "00000000-0000-4000-8000-000000000094".to_owned();
+    let next = reopened
+        .prepare_rebind(&next_target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut next_response = response.clone();
+    next_response.installation_id = next_target.installation_id.clone();
+    next_response.grant_scope_fingerprint = next.request.grant_scope_fingerprint.clone();
+    let twice = reopened
+        .bind_backend_grant_with_rebind(&next_response, &next_target.installation_id, Some(&next))
+        .unwrap();
+    assert_eq!(
+        cache_scope(
+            DEFAULT_API_BASE_URL,
+            &twice,
+            twice.backend_binding.as_ref().unwrap()
+        ),
+        scope
+    );
     reopened.revoke(now()).unwrap();
     assert!(reopened
         .prepare_rebind(&target, "fixture".to_owned())
@@ -3364,4 +3405,73 @@ fn current_binding_fences_every_results_io_boundary() {
             CloudSessionGrantStatus::Enabled
         );
     }
+}
+
+/// [regress] A lost rebind reply followed by local revoke reconciles the exact
+/// DELETE response, without re-enabling consent or retrying a revoked rebind.
+#[test]
+fn lost_rebind_reply_can_be_revoked_using_the_current_owner_proof() {
+    let (_root, grants, _) = stores("lost-rebind-revoke");
+    enabled(&grants);
+    let original = grants.load().unwrap().unwrap();
+    let target = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000095".to_owned(),
+        ..setup()
+    };
+    let proposal = grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    // Server commits target binding; its response never reaches local bind.
+    let mut deleted = backend_grant(&original, "revoked", 2);
+    deleted.installation_id = target.installation_id.clone();
+    deleted.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    grants.revoke(now()).unwrap();
+    assert!(grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    let bytes = fs::read(grants.path()).unwrap();
+    let foreign = CloudSessionGrantSetup {
+        effective_user_scope: "foreign".to_owned(),
+        ..target.clone()
+    };
+    assert!(grants
+        .reconcile_backend_revocation(&deleted, &foreign)
+        .is_err());
+    for field in ["id", "scope", "status", "epoch"] {
+        let mut invalid = deleted.clone();
+        match field {
+            "id" => invalid.id = "00000000-0000-4000-8000-000000000096".to_owned(),
+            "scope" => invalid.grant_scope_fingerprint = original.grant_scope_id.clone(),
+            "status" => invalid.status = "enabled".to_owned(),
+            "epoch" => invalid.grant_version = 0,
+            _ => unreachable!(),
+        }
+        assert!(grants
+            .reconcile_backend_revocation(&invalid, &target)
+            .is_err());
+        assert_eq!(fs::read(grants.path()).unwrap(), bytes);
+    }
+    // Another sign-in can replace the relay device again before cleanup.
+    // Prove the DELETE target using its returned UUID and the current owner.
+    let current = CloudSessionGrantSetup {
+        installation_id: "00000000-0000-4000-8000-000000000097".to_owned(),
+        ..target.clone()
+    };
+    let stopped = grants
+        .reconcile_backend_revocation(&deleted, &current)
+        .unwrap();
+    assert_eq!(stopped.status, CloudSessionGrantStatus::Revoked);
+    assert_eq!(stopped.revoked_at, Some(timestamp(now())));
+    assert!(stopped.backend_binding.as_ref().unwrap().backend_revoked);
+    assert!(!cloud_grant_runtime_ready(&stopped));
+    assert!(grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        grants.enable(&target, now()).unwrap().status,
+        CloudSessionGrantStatus::ConsentRequired
+    );
 }

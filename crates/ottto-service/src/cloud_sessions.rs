@@ -171,6 +171,16 @@ pub struct CloudSessionBackendGrantBindingV1 {
     /// The server's provider-creation cutoff after an erasure, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collect_not_before: Option<String>,
+    /// Original consent identity for cache isolation across verified same-epoch
+    /// relay rebinds. No raw device id is retained. Absent on older grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_origin: Option<CloudSessionCacheOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSessionCacheOrigin {
+    pub installation_fingerprint: String,
+    pub grant_scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -704,14 +714,16 @@ impl CloudSessionGrantStore {
             {
                 return Err(anyhow!("cloud-session rebind consent changed"));
             }
+            let binding = state.grant.backend_binding.as_mut().expect("bound grant");
+            binding
+                .cache_origin
+                .get_or_insert_with(|| CloudSessionCacheOrigin {
+                    installation_fingerprint: state.grant.installation_fingerprint.clone(),
+                    grant_scope_id: state.grant.grant_scope_id.clone(),
+                });
+            binding.server_policy_state = authority_policy(response);
             state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
             state.grant.grant_scope_id = proposal.request.grant_scope_fingerprint.clone();
-            state
-                .grant
-                .backend_binding
-                .as_mut()
-                .expect("bound grant")
-                .server_policy_state = authority_policy(response);
             if authority_policy(response) == CloudSessionServerPolicyState::Disabled
                 && state.grant.status == CloudSessionGrantStatus::Enabled
             {
@@ -838,10 +850,50 @@ impl CloudSessionGrantStore {
         response: &CloudSessionBackendGrantResponseV1,
         expected_installation_id: &str,
     ) -> Result<CloudSessionGrant> {
+        self.apply_backend_revocation_inner(response, expected_installation_id, None)
+    }
+
+    /// Reconcile a DELETE after a rebind committed but its reply was lost.
+    /// This only proves cleanup of the known grant; it never enables consent.
+    pub(crate) fn reconcile_backend_revocation(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        setup: &CloudSessionGrantSetup,
+    ) -> Result<CloudSessionGrant> {
+        self.apply_backend_revocation_inner(response, &setup.installation_id, Some(setup))
+    }
+
+    fn apply_backend_revocation_inner(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        expected_installation_id: &str,
+        current: Option<&CloudSessionGrantSetup>,
+    ) -> Result<CloudSessionGrant> {
         let _lock = self.lock()?;
         let mut state = self
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
+        if let Some(setup) = current {
+            let key = decode_hex(&state.hmac_key_hex)
+                .filter(|key| key.len() == 32)
+                .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+            let rebound = CloudSessionGrantSetup {
+                installation_id: response.installation_id.clone(),
+                ..setup.clone()
+            };
+            if response.grant_scope_fingerprint == grant_scope_fingerprint(&key, &rebound)
+                && state.grant.status == CloudSessionGrantStatus::Revoked
+                && state.grant.organization_fingerprint
+                    == opaque_key(&key, &setup.organization_scope)
+                && state.grant.effective_user_fingerprint
+                    == opaque_key(&key, &setup.effective_user_scope)
+            {
+                // The authenticated exact DELETE response proves where the
+                // known grant ended up, without retrying rebind after revoke.
+                state.grant.installation_fingerprint = opaque_key(&key, &response.installation_id);
+                state.grant.grant_scope_id = response.grant_scope_fingerprint.clone();
+            }
+        }
         validate_local_installation_binding(
             &state,
             &response.installation_id,
@@ -2814,16 +2866,28 @@ fn cache_scope(
     grant: &CloudSessionGrant,
     binding: &CloudSessionBackendGrantBindingV1,
 ) -> [u8; 32] {
+    let installation = binding
+        .cache_origin
+        .as_ref()
+        .map_or(grant.installation_fingerprint.as_str(), |origin| {
+            origin.installation_fingerprint.as_str()
+        });
+    let grant_scope = binding
+        .cache_origin
+        .as_ref()
+        .map_or(grant.grant_scope_id.as_str(), |origin| {
+            origin.grant_scope_id.as_str()
+        });
     let mut framed = Vec::new();
     for part in [
         b"ottto.cloud-session.cache-scope.v1".as_slice(),
         destination.as_bytes(),
-        grant.installation_fingerprint.as_bytes(),
+        installation.as_bytes(),
         grant.organization_fingerprint.as_bytes(),
         grant.effective_user_fingerprint.as_bytes(),
         binding.grant_id.as_bytes(),
         &binding.grant_version.to_be_bytes(),
-        grant.grant_scope_id.as_bytes(),
+        grant_scope.as_bytes(),
         grant.account_fingerprint.as_bytes(),
         CHANGES_SCHEMA_VERSION.as_bytes(),
     ] {
@@ -3232,6 +3296,7 @@ fn authority_binding(
         collection_contract: (response.schema_version == CHANGES_SCHEMA_VERSION)
             .then(|| CHANGES_SCHEMA_VERSION.to_string()),
         collect_not_before: None,
+        cache_origin: None,
     }
 }
 

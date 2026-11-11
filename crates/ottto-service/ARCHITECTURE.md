@@ -441,7 +441,13 @@ collection contract independently of the binary version. Each due slice reads
 `cloud-sessions/grants/{id}/authority?grant_version=N` once. Rebind accepts the
 same-epoch management DTO using `can_collect`, preserving the bound collection
 contract and provider-creation cutoff. It drops transient traversal and transport
-state, retaining accepted ACK cache entries. Every authority, provider, send and
-cache admission validates current local identity; identity changes close admission
+state, retaining the original consent's cache namespace through optional opaque
+origin fingerprints in the binding. The grant file update preserves that namespace
+atomically with the rebound identity, so unchanged tasks stay suppressed after a
+restart. Destination, owner, grant epoch, account and contract still isolate cache
+entries. A lost rebind reply does not require another rebind after revoke: trusted
+local control can reconcile the exact authenticated DELETE response against the
+current same-owner HMAC scope, leaving consent revoked. Every authority, provider,
+send and cache admission validates current local identity; identity changes close admission
 and drain admitted I/O before replacing account or device state. Older daemons
 receive disabled legacy authority and cannot upload through retired routes.
