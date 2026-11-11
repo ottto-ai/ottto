@@ -44,6 +44,9 @@ parser consumption, physical decoded rows, existing save-work encoded bytes and
 dirty rows, native child starts by kind, actual diagnostic formatter/writer
 bytes including prefix/newline, and per-kind sidecar reload/reuse counts. The
 save observer includes every existing `save_work` call in the measured pass.
+The `encoded_bytes` fixture field records that tally's dirty-byte charge,
+including row/key overhead. It is not exact serialized payload size. The log
+counter covers the resource-diagnostic writer, excluding other stderr.
 Counter scopes include native prepare, collection, ACK, save, and reload.
 
 These are **logical work counters**. Native page read bytes exclude discovery,
@@ -51,7 +54,7 @@ failed plans, joins and sidecars; parser bytes have their narrower existing
 meaning. This production revision has no sidecar byte tally or maintenance
 `cache_write` page counter. The header excludes those absent metrics explicitly:
 sidecar reload counts and encoded save bytes are the nearest existing counters.
-Encoded bytes are not SQLite pages, WAL/checkpoint bytes or physical disk I/O.
+These dirty-byte charges are not SQLite pages, WAL/checkpoint bytes or physical disk I/O.
 No new production counters are introduced. `DiskBytes`/`proc_pid_rusage` are
 macOS-only RC observations and are excluded from Linux budgets.
 
@@ -69,11 +72,11 @@ Review the resulting counts, corpus receipt, source/phase coverage and pinned
 revision before committing B. A record-mode run skips the B comparison and is
 **calibration only**. PR and nightly runs compare B by default. After updating B,
 run the advisory workflow normally, normal Linux tests, then money equivalence
-on the final head. The advisory bootstrap keeps a private symlinked TMPDIR but needs no apt/zsh
-install: SQLite is bundled and metadata commands are Python stubs.
+on the final head. The advisory bootstrap keeps a private symlinked TMPDIR
+but needs no apt/zsh install: SQLite is bundled and metadata commands are Python stubs.
 Resource tests are ignored in ordinary discovery and selected
-explicitly, serially, without retries. The advisory build uses the ordinary service test profile with the workspace's
-existing optimized dependencies, debug assertions and overflow checks. Two
+explicitly, serially, without retries. The advisory build uses the ordinary
+service test profile with the workspace's existing optimized dependencies, debug assertions and overflow checks. Two
 Cargo jobs limit compile concurrency. That profile is pinned in B. It changes neither native
 Mac nor money builds. Command wall time is CI overhead evidence. Calibration exceeded the initial
 40-minute total estimate, so the single advisory job allows 75 minutes. This
