@@ -598,10 +598,13 @@ impl Sqlite {
             .zip(fs::metadata(&self.path).ok())
             .map(|(logical, m)| logical.max(m.len()));
         self.stats.db_size_alarm = self.stats.db_bytes.is_some_and(|n| n > 1_000_000_000);
+        // Hit/miss reset only where a row prints, so that row counts every
+        // access since the previous printed row.
+        let reset = i32::from(print);
         let [cache_used_bytes, cache_hit, cache_miss] = [
             (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED, 0),
-            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, 1),
-            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, 1),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, reset),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, reset),
         ]
         .map(|(op, reset)| {
             self.conn().ok().and_then(|conn| {
@@ -629,6 +632,24 @@ impl Sqlite {
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         }
         result
+    }
+    /// Connection cache hits plus misses since the last reset, read without reset.
+    #[cfg(test)]
+    pub(in super::super) fn cache_accesses_for_test(&self) -> u64 {
+        let ops = [
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ];
+        ops.map(|op| {
+            let (mut current, mut high) = (0, 0);
+            let conn = self.conn().unwrap();
+            unsafe {
+                rusqlite::ffi::sqlite3_db_status(conn.handle(), op, &mut current, &mut high, 0)
+            };
+            u64::try_from(current).unwrap()
+        })
+        .iter()
+        .sum()
     }
     /// Daily counts on any between-cycles window, under its own budget, so
     /// neither a busy store nor a slow reference check can starve it. One
