@@ -154,8 +154,7 @@ head tokens, request bodies, local paths and credentials are not retained.
 Public receipt responses keep their existing abbreviated identifiers, and
 private annotations are excluded from diagnostics and uploaded payloads.
 
-The optional Codex Cloud Sessions collector is experimental and disabled by
-default. It uses an officially documented, upstream-experimental Codex CLI
+The optional Codex Cloud Sessions collector requires explicit consent. It uses an officially documented, upstream-experimental Codex CLI
 surface. Its single daemon supervisor starts normally but stays idle until the
 user grants the exact local device/user/organization scope and the server
 authorizes collection for that same versioned grant. New consent wakes the
@@ -238,7 +237,7 @@ writes fail retryably; the old backend device is never rotated while cleanup is
 pending, and no provider or backend call runs under the lifecycle mutex.
 
 The changes relay, exact relay authority read, and backend DTOs are composed
-only in that explicit experimental lane. Before touching Keychain,
+only for that explicitly consented scope. Before touching Keychain,
 the daemon requires a current enabled or policy-disabled grant and exact HMAC
 matches for the connected local device, organization, and user. It also
 requires the device and persisted connection to share the same machine binding

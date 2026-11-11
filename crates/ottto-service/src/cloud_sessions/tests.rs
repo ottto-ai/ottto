@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
 fn temp_dir(name: &str) -> PathBuf {
-    crate::test_scratch::private_dir(&format!("ottto-cloud-sessions-{name}"))
+    crate::test_scratch::canonical_private_dir(&format!("ottto-cloud-sessions-{name}"))
 }
 fn now() -> OffsetDateTime {
     OffsetDateTime::parse("2026-07-21T12:00:00Z", &Rfc3339).unwrap()
@@ -931,6 +931,25 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
     assert_eq!(
         slice(&mut collector, &inputs, t0, Duration::ZERO),
         CloudSessionCycleOutcome::Uploaded
+    );
+    let grant = grants.load().unwrap().unwrap();
+    let scope = cache_scope(
+        DEFAULT_API_BASE_URL,
+        &grant,
+        grant.backend_binding.as_ref().unwrap(),
+    );
+    let keys = server.requests.borrow()[0]
+        .observations
+        .iter()
+        .map(|item| item.entity_key.clone())
+        .collect::<Vec<_>>();
+    let lookup = keys.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_eq!(
+        checkpoints
+            .read_acks(&scope, &lookup, midnight().unix_timestamp())
+            .unwrap()
+            .len(),
+        3
     );
     for offset in [6 * HOUR, 20 * day] {
         assert_eq!(
@@ -2339,7 +2358,24 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&request).to_string()
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    if headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip"))
+    {
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(&request[header_end..])
+            .read_to_string(&mut decoded)
+            .unwrap();
+        format!("{headers}{decoded}")
+    } else {
+        String::from_utf8_lossy(&request).to_string()
+    }
 }
 
 #[test]
@@ -2550,4 +2586,118 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
     assert!(requests
         .iter()
         .all(|request| !request.contains("device-secret") || request.contains("/relay-token")));
+}
+
+/// [regress] Upgrade preserves exact old pending creates, with or without
+/// an explicit descriptor, and permits compensation without legacy collection.
+#[test]
+fn legacy_pending_create_survives_upgrade_until_compensating_revoke() {
+    for descriptor in [true, false] {
+        let (_root, grants, checkpoints) = stores("legacy-pending-create");
+        let local = grants.enable(&setup(), now()).unwrap();
+        grants.grant_create_request(INSTALLATION_ID).unwrap();
+        let mut saved = grants.read().unwrap().unwrap();
+        saved
+            .grant
+            .pending_backend_create
+            .as_mut()
+            .unwrap()
+            .schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_string();
+        let old = saved.grant.pending_backend_create.clone().unwrap();
+        if !descriptor {
+            saved.grant.pending_backend_create = None;
+        }
+        grants.write(&saved).unwrap();
+        let restarted = CloudSessionGrantStore::new(grants.path());
+        assert!(restarted.enable(&setup(), now()).is_ok());
+        let original = backend_create_request(INSTALLATION_ID, &old);
+        assert_eq!(
+            restarted.grant_create_request(INSTALLATION_ID).unwrap(),
+            original
+        );
+        restarted.revoke(now()).unwrap();
+        assert_eq!(
+            restarted.grant_create_request(INSTALLATION_ID).unwrap(),
+            original
+        );
+        let mut response = backend_grant(&local, "enabled", 1);
+        response.schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_string();
+        response.can_collect = None;
+        assert_eq!(
+            restarted
+                .bind_backend_grant(&response, INSTALLATION_ID)
+                .unwrap()
+                .status,
+            CloudSessionGrantStatus::Revoked
+        );
+        let cli = Cli::head(page("must-not-collect", None));
+        let server = Server::new();
+        assert_eq!(
+            slice(
+                &mut CloudCollector::default(),
+                &inputs(&restarted, &checkpoints, &cli, &server),
+                Instant::now(),
+                Duration::ZERO
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(cli.calls(), 0);
+        assert_eq!(server.authority_calls.get(), 0);
+        response.status = "revoked".to_string();
+        response.grant_version = 2;
+        restarted
+            .apply_backend_revocation(&response, INSTALLATION_ID)
+            .unwrap();
+        restarted.enable(&setup(), now()).unwrap();
+        assert_eq!(
+            restarted
+                .grant_create_request(INSTALLATION_ID)
+                .unwrap()
+                .schema_version,
+            CHANGES_SCHEMA_VERSION
+        );
+    }
+}
+
+/// [regress] A delayed refusal anchors Retry-After to response receipt,
+/// even when the injected slice clock is older than the real test clock.
+#[test]
+fn cloud_retry_after_starts_when_the_authority_request_finishes() {
+    struct Shed;
+    impl CloudSessionTransport for Shed {
+        fn read_authority(
+            &self,
+            _: &CloudSessionGrant,
+            _: Duration,
+        ) -> Result<CloudSessionGrantAuthorityV1> {
+            Err(crate::snapshot_client::UploadShed {
+                status: 503,
+                retry_after: Some(Duration::ZERO),
+                code: None,
+            }
+            .into())
+        }
+        fn send_changes(
+            &self,
+            _: &CloudSessionChangesV1,
+            _: Duration,
+        ) -> Result<CloudSessionChangesAckV1> {
+            unreachable!()
+        }
+    }
+    let (_root, grants, checkpoints) = stores("retry-after-receipt");
+    enabled(&grants);
+    let cli = Cli::head(page("must-not-collect", None));
+    let mut collector = CloudCollector::default();
+    let inputs = inputs(&grants, &checkpoints, &cli, &Shed);
+    let now = Instant::now();
+    // An explicitly old deadline models time spent composing credentials.
+    let slice_start = now - Duration::from_secs(5);
+    let outcome = collector.run_slice(&inputs, slice_start, midnight());
+    assert_eq!(outcome, CloudSessionCycleOutcome::Failed);
+    let retry = collector.schedule.retry_not_before.unwrap();
+    // A zero server delay still begins at receipt, after request execution.
+    // The old code anchored it to slice_start, before that execution.
+    assert!(retry > slice_start);
+    assert_eq!(cli.calls(), 0);
 }

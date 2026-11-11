@@ -2103,6 +2103,7 @@ type NicknameGenerations = std::sync::Arc<
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     nickname_generations: NicknameGenerations,
+    cloud_upload_gzip: std::sync::Arc<AtomicBool>,
     api_base_url: String,
     #[cfg(test)]
     bounded_retry_loopback_http_for_test: bool,
@@ -2140,6 +2141,7 @@ impl SnapshotApiClient {
         let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
             nickname_generations: Default::default(),
+            cloud_upload_gzip: std::sync::Arc::new(AtomicBool::new(true)),
             api_base_url: api_base_url.into(),
             #[cfg(test)]
             bounded_retry_loopback_http_for_test: false,
@@ -3020,16 +3022,52 @@ impl SnapshotApiClient {
         request: &Value,
         timeout: Duration,
     ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let body = serde_json::to_vec(request)?;
+        if body.len() > 512 * 1024 {
+            return Err(anyhow!(
+                "cloud-session changes exceed the decoded request budget"
+            ));
+        }
+        let compressed = self
+            .cloud_upload_gzip
+            .load(Ordering::Relaxed)
+            .then(|| gzip(&body))
+            .flatten();
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        match relay_sent(
-            relay_token,
-            agent
-                .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
-                .timeout(request_timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
-                .send_json(request),
-        ) {
+        let post = agent
+            .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"));
+        let mut outcome = match compressed.as_ref() {
+            Some(encoded) => relay_sent(
+                relay_token,
+                post.set("Content-Encoding", "gzip").send_bytes(encoded),
+            ),
+            None => relay_sent(relay_token, post.send_bytes(&body)),
+        };
+        // 415 explicitly refuses the encoding. A general semantic 400/422
+        // does not negotiate gzip. Never change local snapshot gzip state.
+        if compressed.is_some() && matches!(&outcome, Err(ureq::Error::Status(415, _))) {
+            self.cloud_upload_gzip.store(false, Ordering::Relaxed);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+            let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
+            outcome = relay_sent(
+                relay_token,
+                agent
+                    .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+                    .timeout(request_timeout)
+                    .set("Accept", "application/json")
+                    .set("Content-Type", "application/json")
+                    .set("Authorization", &format!("Bearer {relay_token}"))
+                    .send_bytes(&body),
+            );
+        }
+        match outcome {
             Ok(response) => require_cloud_session_success(
                 response,
                 "cloud-session changes upload",
@@ -4035,6 +4073,66 @@ mod tests {
         assert!(headers
             .lines()
             .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
+    /// [behaviour] Cloud gzip refusal affects this cloud client only. A
+    /// semantic 400 is never retried as encoding negotiation.
+    #[test]
+    fn cloud_gzip_fallback_is_separate_from_local_uploads() {
+        for status in [400, 415] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                for attempt in 0..if status == 415 { 3 } else { 1 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    captured.push(read_complete_http_request(&mut stream));
+                    let code = if attempt == 0 { status } else { 200 };
+                    let body = "{}";
+                    write!(stream, "HTTP/1.1 {code} Result\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").unwrap();
+                }
+                captured
+            });
+            let local_gzip = snapshot_upload_gzip_enabled();
+            let body = json!({"synthetic": "content-free"});
+            let result = client.upload_cloud_session_changes_with_timeout(
+                "fixture-relay",
+                &body,
+                Duration::from_secs(5),
+            );
+            if status == 415 {
+                result.unwrap();
+                client
+                    .upload_cloud_session_changes_with_timeout(
+                        "fixture-relay",
+                        &body,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .downcast_ref::<CloudSessionContractRejected>()
+                    .is_some());
+            }
+            assert_eq!(snapshot_upload_gzip_enabled(), local_gzip);
+            let captured = server.join().unwrap();
+            for (index, request) in captured.iter().enumerate() {
+                let (headers, bytes) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")),
+                    index == 0
+                );
+                if index > 0 {
+                    assert_eq!(serde_json::from_str::<Value>(bytes).unwrap(), body);
+                }
+            }
+            let other = SnapshotApiClient::new("https://api.ottto.net");
+            assert!(other.cloud_upload_gzip.load(Ordering::Relaxed));
+        }
     }
 
     /// [behaviour] Every snapshot POST names the daemon version and its

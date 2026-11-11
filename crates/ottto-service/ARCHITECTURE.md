@@ -391,3 +391,28 @@ server capability or the replay directive; the upload filter applies them at sen
 keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
 file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
 applies to bodies from then on, never retroactively.
+
+## Codex cloud task collection
+
+`cloud_sessions` runs independently of local transcript collection and upload.
+Explicit consent binds one installation/user/organization and the
+`cloud_session_changes.v1` contract. Each due slice reads the exact grant's
+authority once through the source-scoped relay. An older backend leaves the
+collector idle; uploads never fall back to the retired protocol. Backend
+authority is checked again when accepting changes, so a remote pause during a
+slice cannot admit later uploads. Local pause/revoke closes the I/O fence and
+waits for admitted work to finish.
+
+The latest provider page controls head polling: five minutes for queued,
+running or unknown tasks, 30 minutes during recent local Codex filesystem
+activity, six hours otherwise. A daily crawl streams pages and retains only
+its next cursor in memory, continuing five minutes later when its slice
+budget ends. It continues across midnight without a total page/task ceiling.
+Only positive task facts are uploaded; missing tasks never imply deletion.
+
+The existing graph-independent upload-history SQLite connection stores only
+each task's semantic digest and acknowledged head etag, scoped to destination
+and consent epoch. Fixed expiry permits safe re-offering; the server returns
+no-op for an exact repeat even after ACK loss or restart. The cache contains no
+task payloads or raw IDs and never enters local graph load/save or receipt
+settlement. Cloud failures and retry deadlines do not change local delivery.

@@ -4991,8 +4991,10 @@ fn cloud_sessions_control_with_stores(
     if action == CloudSessionsControlAction::Revoke {
         // Admission is closed and admitted I/O has drained, so no racing ACK
         // can recreate a row. The server cutoff, not this cache, prevents
-        // revival; a failed erase leaves rows that expire on their own.
-        let _ = checkpoints.erase_cache();
+        // revival; a failed erase remains a retryable cleanup error.
+        checkpoints.erase_cache().map_err(|_| {
+            LocalApiError::LocalOperationFailed("cloud-session cache cleanup failed".to_string())
+        })?;
     }
     if action != CloudSessionsControlAction::Status {
         crate::cloud_sessions::wake_cloud_session_collector();

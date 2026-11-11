@@ -54,6 +54,7 @@ use wire::{Settled, AUTHORITY_SCHEMA_VERSION, CHANGES_SCHEMA_VERSION, MAX_CHANGE
 
 const COLLECTOR_ID: &str = "cloud_sessions";
 const DISCLOSURE_VERSION: &str = "cloud_sessions_disclosure.v1";
+const LEGACY_COLLECTION_SCHEMA_VERSION: &str = "cloud_session_observations.v1";
 const GRANT_SCHEMA_VERSION: &str = "cloud_session_grant.v1";
 const CONTROL_TOKEN_LEDGER_SCHEMA_VERSION: &str = "cloud_session_control_token_uses.v1";
 const MAX_CONTROL_TOKEN_USES: usize = 64;
@@ -628,7 +629,9 @@ impl CloudSessionGrantStore {
                 && existing.grant_version == response.grant_version
                 && !existing.backend_revoked
                 && existing.server_policy_state == authority_policy(response)
-                && existing.collection_contract.as_deref() == Some(CHANGES_SCHEMA_VERSION)
+                && existing.collection_contract.as_deref()
+                    == (response.schema_version == CHANGES_SCHEMA_VERSION)
+                        .then_some(CHANGES_SCHEMA_VERSION)
             {
                 // Lost loopback responses retry the exact authenticated bind.
                 // Return the current local state without rewriting timestamps
@@ -646,6 +649,11 @@ impl CloudSessionGrantStore {
             .unwrap_or_else(|| pending_backend_create(&state.grant));
         validate_pending_backend_create(&state.grant, &pending)?;
         validate_backend_grant_response(&state, response)?;
+        if response.schema_version != pending.schema_version {
+            return Err(anyhow!(
+                "backend cloud-session grant contract differs from pending create"
+            ));
+        }
         if response.installation_id != expected_installation_id {
             return Err(anyhow!("backend cloud-session grant scope does not match"));
         }
@@ -2029,6 +2037,7 @@ impl CloudCollector {
         now: Instant,
         wall: OffsetDateTime,
     ) -> CloudSessionCycleOutcome {
+        let started = Instant::now();
         if kill_switch_enabled() {
             self.schedule.clear();
             return CloudSessionCycleOutcome::Disabled;
@@ -2069,7 +2078,7 @@ impl CloudCollector {
             return CloudSessionCycleOutcome::NotDue;
         }
         let deadline = Instant::now() + CYCLE_BUDGET;
-        let grant = match self.preflight(inputs, &state.grant, deadline, now) {
+        let grant = match self.preflight(inputs, &state.grant, deadline, now + started.elapsed()) {
             Ok(grant) => grant,
             Err(outcome) => return outcome,
         };
@@ -2121,7 +2130,7 @@ impl CloudCollector {
                     CloudSessionCycleOutcome::Noop
                 }
             }
-            Some(error) => self.settle_failure(inputs, error, now),
+            Some(error) => self.settle_failure(inputs, error, now + started.elapsed()),
         }
     }
 
@@ -2176,6 +2185,7 @@ impl CloudCollector {
         deadline: Instant,
         now: Instant,
     ) -> std::result::Result<CloudSessionGrant, CloudSessionCycleOutcome> {
+        let started = Instant::now();
         let Some(timeout) = remaining_relay_budget(deadline) else {
             return Err(CloudSessionCycleOutcome::NotDue);
         };
@@ -2183,7 +2193,7 @@ impl CloudCollector {
             Ok(response) => response,
             Err(error) => {
                 let error = SliceError::from_request(&error, deadline);
-                return Err(self.settle_failure(inputs, error, now));
+                return Err(self.settle_failure(inputs, error, now + started.elapsed()));
             }
         };
         let current = match inputs.grants.apply_backend_authority(&response) {
@@ -2794,11 +2804,13 @@ fn grant_scope_fingerprint(key: &[u8], setup: &CloudSessionGrantSetup) -> String
     )
 }
 
+/// Older pending tombstones predate the explicit descriptor and used the
+/// retired observation contract. Reconcile that exact request; never upgrade it.
 fn pending_backend_create(grant: &CloudSessionGrant) -> CloudSessionPendingBackendCreateV1 {
     CloudSessionPendingBackendCreateV1 {
         source: "codex".to_string(),
         collector_id: COLLECTOR_ID.to_string(),
-        schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+        schema_version: LEGACY_COLLECTION_SCHEMA_VERSION.to_string(),
         collector_version: grant.collector_version.clone(),
         grant_scope_fingerprint: grant.grant_scope_id.clone(),
         account_fingerprint: grant.account_fingerprint.clone(),
@@ -2812,7 +2824,10 @@ fn validate_pending_backend_create(
 ) -> Result<()> {
     if pending.source != "codex"
         || pending.collector_id != COLLECTOR_ID
-        || pending.schema_version != CHANGES_SCHEMA_VERSION
+        || !matches!(
+            pending.schema_version.as_str(),
+            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
+        )
         || pending.collector_version.trim().is_empty()
         || pending.grant_scope_fingerprint != grant.grant_scope_id
         || pending.account_fingerprint != grant.account_fingerprint
@@ -2871,7 +2886,10 @@ fn validate_backend_grant_response(
         || opaque_key(&key, &response.installation_id) != state.grant.installation_fingerprint
         || response.source != "codex"
         || response.collector_id != COLLECTOR_ID
-        || response.schema_version != CHANGES_SCHEMA_VERSION
+        || !matches!(
+            response.schema_version.as_str(),
+            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
+        )
         || response.disclosure_version != DISCLOSURE_VERSION
         || response.grant_scope_fingerprint != state.grant.grant_scope_id
         || response.account_fingerprint != state.grant.account_fingerprint
@@ -3271,6 +3289,7 @@ where
     FComposeTransport:
         FnOnce(String, LocalDeviceBinding, String) -> Box<dyn CloudSessionTransport + Send>,
 {
+    let started = Instant::now();
     let grants = inputs.grants;
     if kill_switch_enabled() {
         active_transport.take();
@@ -3293,7 +3312,7 @@ where
             active_transport.take();
             let _ =
                 grants.record_health("unavailable", "unavailable", Some("local_binding_invalid"));
-            collector.defer_after_local_failure(now);
+            collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
@@ -3310,14 +3329,14 @@ where
                 "unavailable",
                 Some("relay_credentials_unavailable"),
             );
-            collector.defer_after_local_failure(now);
+            collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
     if credential_device != binding.device || device_secret.trim().is_empty() {
         active_transport.take();
         let _ = grants.record_health("unavailable", "unavailable", Some("local_binding_changed"));
-        collector.defer_after_local_failure(now);
+        collector.defer_after_local_failure(now + started.elapsed());
         return CloudSessionCycleOutcome::Failed;
     }
     let key = CloudSessionRuntimeTransportKey {
@@ -3349,7 +3368,7 @@ where
             destination: &binding.api_base_url,
             last_activity: inputs.last_activity,
         },
-        now,
+        now + started.elapsed(),
         wall,
     );
     if kill_switch_enabled() || !grant_preflight_eligible(grants) {
