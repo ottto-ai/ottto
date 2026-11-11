@@ -62,6 +62,7 @@ fn stale_parent_positive_survives_growth_current_and_restart() {
         let grown = result(&grown_page, Mode::Ram);
         let prior = commit(&session, grown_page);
         refold(&child_path);
+        refold(&root);
         let current_page = hinted(&c, prior, 100, true, &[root.clone(), child_path.clone()]);
         assert!(
             body(&current_page, ROOT).is_some(),
@@ -148,6 +149,7 @@ fn first_sighting_and_legacy_overcount_converge_on_the_next_child_fold() {
             .is_none());
         assert_eq!(body(&first, &child()).unwrap().request_count, 2);
         let prior = commit(&session, first);
+        refold(&root);
         let parent = hinted(&c, prior, 100, true, std::slice::from_ref(&root));
         assert!(body(&parent, ROOT).is_some());
         let prior = commit(&session, parent);
