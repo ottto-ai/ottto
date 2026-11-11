@@ -116,7 +116,7 @@ fn forked_subagents_count_the_copied_parent_response_once_in_the_root() {
 /// [regress] Positive root census proof survives freshness changes: the
 /// copied first response stays removed while the parent is growing.
 #[test]
-fn growing_root_census_keeps_the_copy_removed() {
+fn unread_root_leaves_the_copy_counted_until_its_census_is_current() {
     let dir = ScratchDir::new("e2-family-duplicate-unread");
     let fork = [(fork_path(&dir, "agent-a1"), fork_lines("agent-a1", true, 2))];
     let session = format!("{ROOT}_agent-a1");

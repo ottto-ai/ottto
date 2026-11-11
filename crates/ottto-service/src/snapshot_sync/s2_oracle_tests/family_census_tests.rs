@@ -29,7 +29,7 @@ fn stale(index: &mut ScanIndex, root: &Path) {
 }
 
 /// [money] A stale positive, growing parent, current page and durable restart
-/// all remove exactly the same first response. The parent is really off-page.
+/// all remove exactly the same first response with the parent off the fold page.
 #[test]
 fn stale_parent_positive_survives_growth_current_and_restart() {
     with_e2(|| {
@@ -43,29 +43,39 @@ fn stale_parent_positive_survives_growth_current_and_restart() {
         let mut prior = commit(&session, page(&c, index, 100, true));
         stale(&mut prior, &root);
         let child_path = copied(&mut c);
-        let scanner = E2ScanFixture::capturing_identity();
         let read = |index| {
-            let mut p = c.raw(&scanner, index, 1, true, std::slice::from_ref(&child_path));
-            assert!(
-                !scanner.paths().contains(&root),
-                "root must stay on another page"
-            );
-            p.enrich(&c);
+            let p = child_page(&c, index, &child_path);
             let b = body(&p, &child()).expect("child is folded");
             assert_eq!(
                 (b.request_count, b.removed_request_count),
                 (1, Some(1)),
                 "stale parent positive must remove the copy"
             );
-            only_child(p)
+            p
         };
-        let first = result(&read(prior.clone()), Mode::Ram);
+        let first_page = read(prior);
+        let first = result(&first_page, Mode::Ram);
+        let prior = commit(&session, first_page);
         append(&root, &line(ROOT, "growth", "2026-08-02T07:02:00Z", 30));
-        let grown = result(&read(prior.clone()), Mode::Ram);
-        let mut saved = prior.clone();
+        refold(&child_path);
+        let grown_page = read(prior);
+        let grown = result(&grown_page, Mode::Ram);
+        let prior = commit(&session, grown_page);
+        refold(&child_path);
+        let current_page = hinted(&c, prior, 100, true, &[root.clone(), child_path.clone()]);
+        assert!(
+            body(&current_page, ROOT).is_some(),
+            "current parent is parsed"
+        );
+        let current = result(&only_child(twin(&current_page)), Mode::DiskRestore);
+        let mut saved = commit(&session, current_page);
         let restored = session.save_reload(&mut saved);
-        let restarted = result(&read(restored), Mode::Restart);
-        let current = result(&only_child(page(&c, prior, 100, true)), Mode::DiskRestore);
+        append(
+            &root,
+            &line(ROOT, "restart-growth", "2026-08-02T07:03:00Z", 7),
+        );
+        refold(&child_path);
+        let restarted = result(&child_page(&c, restored, &child_path), Mode::Restart);
         let cold = result(
             &only_child(page(&c, ScanIndex::default(), 100, false)),
             Mode::ColdFull,
@@ -83,10 +93,36 @@ fn refold(path: &Path) {
         "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
     );
 }
-fn child_page(c: &Corpus, index: ScanIndex, path: &Path) -> Page {
-    let scanner = E2ScanFixture::capturing_identity();
-    let mut p = c.raw(&scanner, index, 1, true, &[path.to_path_buf()]);
-    assert_eq!(scanner.paths(), vec![path.to_path_buf()], "one child page");
+fn child_page(c: &Corpus, mut index: ScanIndex, path: &Path) -> Page {
+    let root = c.root.join(format!("{ROOT}.jsonl"));
+    let key = root.to_str().unwrap();
+    let census = index.claude_request_census_for_test().get(key).cloned();
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let mut p = c.raw(
+        &E2ScanFixture::capturing_identity(),
+        index,
+        100,
+        true,
+        &[path.to_path_buf()],
+    );
+    // As in context_posture_survives_a_split_family_refold, reproduce the
+    // deferred-root page at the real fold boundary. The parsers are native;
+    // only the child participates, against the root census saved before it.
+    p.scan
+        .snapshots
+        .retain(|item| item.source_session_id == child());
+    match census {
+        Some(record) => p
+            .index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(key, record),
+        None => p
+            .index
+            .claude_request_census_mut_for_test()
+            .invalidate_keeping_birth_for_test(key),
+    }
+    assert!(body(&p, ROOT).is_none(), "root stays off the fold page");
+    assert!(body(&p, &child()).is_some(), "native child fold");
     p.enrich(c);
     p
 }
