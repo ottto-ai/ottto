@@ -20,7 +20,7 @@ pub(super) const MAX_SLICE_PAGES: usize = 10;
 
 /// Constant-space cursor cycle detection (Brent): a provider cursor chain
 /// that revisits a cursor is reported without retaining the chain.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct CursorCycle {
     tortoise: Option<[u8; 32]>,
     power: u64,
@@ -55,7 +55,7 @@ impl CursorCycle {
 
 /// An unfinished daily crawl. The raw provider cursor lives only here, in
 /// memory; a restart starts a new crawl and the ACK cache suppresses repeats.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct Crawl {
     pub(super) cursor: Option<String>,
     pub(super) pages_seen: u64,
@@ -63,7 +63,7 @@ pub(super) struct Crawl {
     pub(super) next_slice: Instant,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(super) struct CloudSchedule {
     /// The consent scope these facts belong to; a different scope resets all.
     pub(super) scope: Option<[u8; 32]>,

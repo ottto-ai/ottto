@@ -2114,7 +2114,7 @@ impl CloudCollector {
         };
         let mut crawl_completed = None;
         let failure = self.work(&mut work, due, now, today, &mut crawl_completed);
-        if inputs
+        let cache_unavailable = inputs
             .checkpoints
             .commit(
                 inputs.grants,
@@ -2124,18 +2124,21 @@ impl CloudCollector {
                 crawl_completed,
                 wall.unix_timestamp(),
             )
-            .is_err()
-        {
-            // Settled tasks are offered again next time and answered noop;
-            // a completed crawl stays complete for this process.
-            let _ = inputs
-                .grants
-                .record_health("degraded", "fresh", Some("ack_cache_unavailable"));
-        }
+            .is_err();
+        // A cache failure re-offers tasks next time (server no-op). Preserve
+        // its diagnostic instead of overwriting it with an unconditional OK.
         match failure {
             None => {
                 self.schedule.note_success();
-                let _ = inputs.grants.record_health("ok", "fresh", None);
+                if cache_unavailable {
+                    let _ = inputs.grants.record_health(
+                        "degraded",
+                        "fresh",
+                        Some("ack_cache_unavailable"),
+                    );
+                } else {
+                    let _ = inputs.grants.record_health("ok", "fresh", None);
+                }
                 if work.offered > 0 {
                     CloudSessionCycleOutcome::Uploaded
                 } else {
@@ -2600,11 +2603,21 @@ struct ParsedPage {
     source_item_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum CloudPageCursor {
     OfficialTerminal,
     Next(String),
     Ambiguous,
+}
+
+impl std::fmt::Debug for CloudPageCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OfficialTerminal => "OfficialTerminal",
+            Self::Next(_) => "Next(redacted)",
+            Self::Ambiguous => "Ambiguous",
+        })
+    }
 }
 
 fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Result<ParsedPage> {
