@@ -70,8 +70,8 @@ or daemon autostart. It opens the folder, compares descriptor metadata,
 CLI. No launcher shell runs after the environment scrub. Directory and exec
 failures are reported before exit. Launch blocks use exit 60, malformed plans
 use 2, and an unavailable daemon uses 10. It never runs provider doctor, auth
-or login commands. The daemon runs only a bounded, three-second `--version`
-probe at prepare; supported ranges are Claude Code >=2.0 and <3, and Codex
+or login commands. The daemon runs only the bounded `--version` probes described above
+at prepare; supported ranges are Claude Code >=2.0 and <3, and Codex
 >=0.150 and <1. Unknown versions refuse with `cli_version_unsupported`.
 The daemon records the version and executable path, dev/ino, size and mtime.
 Any executable change before consume refuses with `cli_changed`.
