@@ -16,7 +16,6 @@ pub fn parse_codex_jsonl_file(
         collected_at,
         source_file_fingerprint,
         &CodexTitleMetadata::default(),
-        None,
     )
 }
 
@@ -26,14 +25,12 @@ pub(in crate::snapshots) fn parse_codex_jsonl_file_with_title_metadata(
     collected_at: &str,
     source_file_fingerprint: String,
     title_metadata: &CodexTitleMetadata,
-    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> Result<Vec<SnapshotItem>> {
     parse_codex_jsonl_file_with_title_metadata_and_attribution(
         path,
         collected_at,
         source_file_fingerprint,
         title_metadata,
-        codex_turn_traces,
         None,
     )
 }
@@ -44,7 +41,6 @@ pub(in crate::snapshots) fn parse_codex_jsonl_file_with_title_metadata_and_attri
     collected_at: &str,
     source_file_fingerprint: String,
     title_metadata: &CodexTitleMetadata,
-    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
     parse_codex_jsonl_file_with_diagnostics(
@@ -52,7 +48,6 @@ pub(in crate::snapshots) fn parse_codex_jsonl_file_with_title_metadata_and_attri
         collected_at,
         source_file_fingerprint,
         title_metadata,
-        codex_turn_traces,
         attribution_context,
     )
     .map(|parsed| parsed.snapshots)
@@ -64,7 +59,6 @@ fn parse_codex_jsonl_file_with_diagnostics(
     collected_at: &str,
     source_file_fingerprint: String,
     title_metadata: &CodexTitleMetadata,
-    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedSnapshotFile> {
     refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
@@ -76,7 +70,6 @@ fn parse_codex_jsonl_file_with_diagnostics(
         apply_codex_line,
         Some(title_metadata),
         None,
-        codex_turn_traces,
         attribution_context,
     )
 }
@@ -148,7 +141,6 @@ fn parse_claude_code_jsonl_file_with_diagnostics(
         apply_claude_code_line,
         None,
         Some(title_metadata),
-        None,
         attribution_context,
     )
 }
@@ -165,7 +157,6 @@ pub fn parse_pi_jsonl_file(
         source_file_fingerprint,
         SnapshotSource::Pi,
         apply_pi_line,
-        None,
         None,
         None,
         None,
@@ -192,7 +183,6 @@ fn parse_jsonl_file(
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
-    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedSnapshotFile> {
     let mut file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
@@ -208,7 +198,6 @@ fn parse_jsonl_file(
         apply_line,
         codex_title_metadata,
         claude_title_metadata,
-        codex_turn_traces,
         attribution_context,
     )?;
     Ok(ParsedSnapshotFile {
@@ -303,7 +292,6 @@ impl OwnedJsonlParser {
         source: SnapshotSource,
         apply_line: fn(&Value, &mut SnapshotAccumulator),
         codex_title_metadata: Option<&CodexTitleMetadata>,
-        codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     ) -> Result<Self> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
@@ -314,7 +302,6 @@ impl OwnedJsonlParser {
             source,
             apply_line,
             codex_title_metadata,
-            codex_turn_traces,
         )
     }
     /// Every input kind reaches the same line parser through one opened
@@ -326,14 +313,12 @@ impl OwnedJsonlParser {
         source: SnapshotSource,
         apply_line: fn(&Value, &mut SnapshotAccumulator),
         codex_title_metadata: Option<&CodexTitleMetadata>,
-        codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     ) -> Result<Self> {
         // Snapshot semantics come from provider-native session evidence. Mutable
         // current config defaults are useful for live status display, but applying
         // today's defaults to cumulative historical usage would retroactively
         // rewrite old sessions and make a config edit a global replay trigger.
         let mut accumulator = SnapshotAccumulator::new(source);
-        accumulator.codex_turn_traces = codex_turn_traces;
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
                 let file_metadata = match reader.get_ref().metadata() {
@@ -685,11 +670,9 @@ impl OwnedJsonlParser {
                 accumulator.repository_binding = Some(identity.clone());
             }
         }
-        // PRE-finalization seam. The live scan-shared inputs are
-        // detached exactly as a retained copy excludes them, then restored
-        // before any finalization reads them; no early exit lies between.
+        // PRE-finalization seam: the accumulator before any finalization
+        // reads it; no early exit lies between.
         if let Some(pre) = pre {
-            let traces = accumulator.codex_turn_traces.take();
             pre(PreFinalization::new(
                 &accumulator,
                 &report,
@@ -699,7 +682,6 @@ impl OwnedJsonlParser {
                     positive_usage_evidence,
                 ),
             ));
-            accumulator.codex_turn_traces = traces;
         }
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
@@ -941,17 +923,9 @@ pub(in crate::snapshots) fn parse_opened_jsonl_file(
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
-    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedJsonlFile> {
-    let mut parser = OwnedJsonlParser::new(
-        file,
-        path,
-        source,
-        apply_line,
-        codex_title_metadata,
-        codex_turn_traces,
-    )?;
+    let mut parser = OwnedJsonlParser::new(file, path, source, apply_line, codex_title_metadata)?;
     while !parser
         .step()
         .with_context(|| format!("read JSONL {}", path.display()))?

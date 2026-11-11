@@ -79,8 +79,18 @@ impl SidecarFacts {
         let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
         metadata.compact_titles();
         if !reuse {
-            if !metadata.state_census_incomplete && !metadata.sidecar_census_incomplete {
-                for (home, facts) in &metadata.root_sidecars {
+            // Both complete flags already imply no identity conflict; reuse
+            // merges a kept home from its own physical views (merge_roots).
+            if !metadata.state_census_incomplete
+                && !metadata.sidecar_census_incomplete
+                && metadata.identity_conflicts.is_empty()
+            {
+                for (home, facts) in &mut metadata.root_sidecars {
+                    if let Some(unique) = Arc::get_mut(facts) {
+                        // The views hold these rows' merged result.
+                        unique.raw.threads = Vec::new();
+                        unique.raw.history = Vec::new();
+                    }
                     // The helper consumes the captures already made around
                     // acquisition; compaction must finish before sharing.
                     let mut stamps = [witness(&before[home]), after[home].clone()].into_iter();
@@ -104,6 +114,11 @@ impl SidecarFacts {
             self.charge_homes();
         }
         metadata
+    }
+
+    /// The kept homes' heap, as charged on their last insertion.
+    pub(in crate::snapshots) fn heap_bytes(&self) -> usize {
+        self.heap_bytes
     }
 
     fn charge_homes(&mut self) {
@@ -228,7 +243,11 @@ fn load_home(
     raw.evidence[4] = observe(&result, SidecarOpenCounts::default());
     after[2] = SourceStamp::capture_file(&path).ok();
     // Preserve the existing checked integer conversion boundary.
-    let result = apply_extents(&raw.history, &mut BTreeMap::new(), &mut BTreeSet::new());
+    let result = apply_extents(
+        history_extents(&raw.history),
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    );
     if result.is_err() {
         raw.evidence[3] = observe(&result, counts);
     }

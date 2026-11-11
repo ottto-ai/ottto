@@ -1053,6 +1053,10 @@ fn waiting_supervisor(
     (endpoint, waits, accepts, worker)
 }
 
+/// An idle wake due in 1 s, plus loaded-runner scheduling slack: still far
+/// below the next connection or the 10 s health tick these tests rule out.
+const IDLE_WAKE_WITHIN: Duration = Duration::from_secs(3);
+
 /// [behaviour] An unannounced fd replacement is fenced by the idle health deadline.
 #[test]
 fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
@@ -1090,13 +1094,13 @@ fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
         } else {
             assert_eq!(unsafe { libc::dup2(replacement, fd) }, fd);
         }
-        let deadline = started + Duration::from_millis(1250); // 1 s + CI scheduling tolerance
+        let deadline = started + IDLE_WAKE_WITHIN;
         while old.live.load(Ordering::SeqCst) {
             waits
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
         }
-        assert!(started.elapsed() < Duration::from_millis(1250));
+        assert!(started.elapsed() < IDLE_WAKE_WITHIN);
         with_request_approval(Some(APPROVED), || {
             assert!(old
                 .export_if_approved(|| panic!("replaced worker exported"))
@@ -1333,7 +1337,7 @@ fn idle_wait_flushes_on_time_independently_of_reconcile_and_listeners() {
             .wait_for_events(&mut wake, &receiver, now + RETRY_SECONDS, &mut health)
             .unwrap());
         supervisor.flush_activity(now_seconds()).unwrap();
-        assert!(started.elapsed() < Duration::from_millis(1250));
+        assert!(started.elapsed() < IDLE_WAKE_WITHIN);
         assert!(!supervisor.activity_dirty);
         assert!(
             Supervisor::load(

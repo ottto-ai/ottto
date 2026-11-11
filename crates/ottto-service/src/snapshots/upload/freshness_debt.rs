@@ -885,7 +885,22 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
         if complete.is_some() && !index.files.contains_key(&key) {
             gone.push(key);
         } else {
-            report.add(FileDebt::committed(index, &key), now_ms);
+            let mut debt = FileDebt::committed(index, &key);
+            if debt.owed && debt.held {
+                let path = Path::new(&key);
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    debt.listed = listed_history_held(
+                        index,
+                        &key,
+                        &Listing {
+                            path,
+                            metadata: &metadata,
+                            in_window: true,
+                        },
+                    );
+                }
+            }
+            report.add(debt, now_ms);
         }
     }
     if let Some(started_at) = complete {

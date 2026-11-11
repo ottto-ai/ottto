@@ -102,3 +102,47 @@ fn quick_check_over_budget_still_opens() {
         health::SHARD_CODE
     );
 }
+
+/// [contract] A missing connection measurement remains null, never a fabricated zero.
+#[test]
+fn cache_counter_defaults_are_unavailable() {
+    let stats = serde_json::to_value(MaintenanceStats::default()).unwrap();
+    for name in ["cache_used_bytes", "cache_hit", "cache_miss"] {
+        assert!(stats.get(name).unwrap().is_null());
+    }
+}
+
+/// [regress] Maintenance resets hit/miss deltas and keeps the smaller cache target.
+#[test]
+fn cache_counters_reset_at_maintenance() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-cache-counters");
+    let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
+    assert_eq!(
+        db.conn()
+            .unwrap()
+            .query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        -8192
+    );
+    db.maintenance(false).unwrap();
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert!(stats["cache_hit"].as_u64().unwrap() > 0);
+    assert!(stats["cache_miss"].is_u64());
+    for op in [
+        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+    ] {
+        let (mut current, mut high) = (-1, -1);
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                db.conn().unwrap().handle(),
+                op,
+                &mut current,
+                &mut high,
+                0,
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        assert_eq!(current, 0);
+    }
+}

@@ -90,6 +90,8 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
 | `tail_per_pass.{loads,load_bytes_sum,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Completed Tail read transactions since the pass started, their summed decoded reduction-page bytes (excluding heads and revisions), summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
+| `cache_hit`, `cache_miss` | Optional connection cache-hit/miss counts since the previous maintenance sample (`SQLITE_DBSTATUS_CACHE_HIT` / `CACHE_MISS`, reset after reading); null when unavailable. The first sample covers the connection lifetime so far. The cache target is 8 MiB per connection; these counts measure the read tradeoff. |
+| `stage_memory.post_pass_plateau.allocator_relief.{before_footprint_bytes,after_footprint_bytes,wall_us}` | macOS process footprint immediately before/after one allocator relief call after the consuming finish returns, with wall time in microseconds (including the after-sample); footprint is null if unavailable. Also carried in `source_finish` `counts.allocator_relief` for Claude, Codex and Pi. Fields absent elsewhere. The shared helper is a no-op off macOS, including harvest calls. No new wake; relief can return no pages. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
@@ -381,6 +383,7 @@ across the same window, on every windowed stage record: `source_prepare`,
 overlap, so never sum overlapping windows. They are macOS only and absent
 elsewhere, after a failed sample or on a regressing counter. Summed windows
 (`evidence_decode`, `evidence_cross_root`) and point records omit them.
+`source_prepare` also reports `observation.malloc_in_use_bytes` sampled at prepare start on macOS; absent when unavailable.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
 including errors or no-frame returns. Like `source_finish`, it emits no record
@@ -2340,7 +2343,8 @@ and a Claude subagent journal, which the snapshot rule excludes
 from upload. `deleted_unaccepted_files` is the cumulative count of files erased
 while still owed: a complete walk erases the debt of a file it no longer lists
 and whose index entry is gone. `listed_history_held_files` counts owed Claude
-history this walk listed that the history gate holds for the re-emission list:
+history that the history gate holds for the re-emission list, including committed
+heads this walk did not list (for example, when resumed after a restart):
 its stamp matches, its revision is below the active one, the list is active and
 names its family, and no snapshot of it was refused. Such files stay in
 `outstanding_files` and `held_files` but leave `over_6h_files`, `oldest_age_s`

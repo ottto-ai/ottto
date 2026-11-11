@@ -99,7 +99,7 @@ pub(in crate::context_composition) fn spawn_v2_sync() -> Result<()> {
                 }
                 // All daily state, pipe buffers and superseded hourly
                 // metadata have dropped before this single relief call.
-                release_memory();
+                crate::local_resource_diagnostics::release_memory();
                 std::thread::sleep(WAKE_INTERVAL);
             }
         })
@@ -556,7 +556,9 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
         let mut fetched = None;
         if let Some(token) = relay_token.as_deref() {
-            match client.get_activity_hint(token) {
+            match crate::snapshot_sync::small_source_upload(snapshot_source, || {
+                client.get_activity_hint(token)
+            }) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
                     write_marker(&marker, &destination);
                     health.remove(agent_source_label(snapshot_source));
@@ -1263,26 +1265,6 @@ pub(super) fn run_source(
     let mut stats = run_source_inner(run, source, roots, target);
     finish(&mut stats, started, cpu_started);
     stats
-}
-
-pub(super) fn release_memory() {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone requests relief from all system malloc zones.
-        unsafe {
-            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: asks the process allocator to release free pages.
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
 }
 
 fn run_source_inner(

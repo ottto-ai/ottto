@@ -2094,7 +2094,7 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
     // that same body, so it still counts as dominated.
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
-    ledger.retain_current_quarantines(&BTreeSet::new());
+    ledger.retain_current_quarantines(&BTreeSet::new(), &ScanIndex::default());
     assert_eq!(
         PermanentRefusalCounts::of(&ledger),
         PermanentRefusalCounts {

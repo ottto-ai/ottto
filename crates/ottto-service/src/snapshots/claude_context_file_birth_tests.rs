@@ -1580,7 +1580,6 @@ fn native_read(
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         Some(&CodexTitleMetadata::default()),
-        None,
     )
     .expect("parser");
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());

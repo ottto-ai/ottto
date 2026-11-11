@@ -181,7 +181,12 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
-pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
+pub(in crate::snapshots) use codex_file_join::tests::older_build_logs_tier;
+#[cfg(test)]
+pub(crate) use codex_file_join::tests::{
+    counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
+    older_build_logs_priority,
+};
 use sources::claude::response_records as claude_response_records;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
@@ -1067,7 +1072,7 @@ use sources::codex::sidecar::{
 };
 use sources::codex::sidecar::{
     codex_state_thread_field_diffs, CodexPathSidecarCandidate, CodexRolloutExtent,
-    CodexStateThread, CodexTitleMetadata, CodexTurnTraceMap,
+    CodexStateThread, CodexTitleMetadata,
 };
 
 #[cfg(test)]
@@ -2349,8 +2354,10 @@ pub(crate) fn state_v2_prepare_observed() {
 pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
     state_v2::telemetry::Window::begin("finish")
 }
-pub(crate) fn state_v2_post_pass_observed() {
-    state_v2::telemetry::plateau();
+pub(crate) fn state_v2_post_pass_observed(
+    relief: crate::local_resource_diagnostics::AllocatorRelief,
+) {
+    state_v2::telemetry::plateau(relief);
 }
 
 pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {

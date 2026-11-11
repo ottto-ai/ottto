@@ -17,6 +17,8 @@ pub(super) fn seed_sidecars(c: &Corpus) -> rusqlite::Connection {
 
 /// [money] Cached sidecars feed the native Tail, restore, restart-between-pages,
 /// compatible binary upgrade, real post-ACK placement and quiet-restart routes.
+/// A turn an older build priced priority from Codex logs keeps that tier on
+/// every route through its tier receipt.
 #[test]
 fn codex_sidecar_reuse_transition() {
     let _lock = DECODER_TEST_LOCK
@@ -32,20 +34,21 @@ fn codex_sidecar_reuse_transition() {
         c.write(id, account);
     }
     let _db = seed_sidecars(&c);
-    let log_source = c.scratch.join("logs-writer.sqlite");
-    let logs = rusqlite::Connection::open(&log_source).unwrap();
-    logs.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, feedback_log_body TEXT)").unwrap();
-    let now = unix_seconds(SystemTime::now()).unwrap() as i64;
-    logs.execute("INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)", rusqlite::params![now, "turn{turn.id=priority-control}: websocket request: {\"type\":\"response.create\",\"service_tier\":\"priority\"}"]).unwrap();
-    crate::snapshots::codex_sqlite_read::tests::copy_database(
-        &log_source,
-        &c.sessions.parent().unwrap().join("logs_2.sqlite"),
-        true,
-    );
-    assert!(
-        CodexTurnTraceMap::load_from_roots(&c.roots(), BACKFILL_WINDOW_DAYS)
-            .is_priority_turn("priority-control")
-    );
+    // An older build priced MAIN's opening turn priority from Codex logs. The
+    // cold Full below is that build's output; every later route runs after the
+    // logs evidence is gone and must equal it through the tier receipt.
+    let turn_context = |turn: &str| {
+        json!({"type":"turn_context", "timestamp":"2026-10-07T09:30:00Z",
+            "payload":{"turn_id": turn, "model":"gpt-5.2"}})
+        .to_string()
+            + "\n"
+    };
+    fs::write(
+        c.path(MAIN),
+        header(MAIN, Some("a")) + &turn_context("priority-control") + &turn(1) + &turn(2),
+    )
+    .unwrap();
+    crate::snapshots::older_build_logs_priority("priority-control");
     let hash = |kind: &str, account: &str| {
         ottto_core::billing_identity_hash(
             "openai",
@@ -80,6 +83,7 @@ fn codex_sidecar_reuse_transition() {
     let (mut prior, _) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
     // Two independent account streams, native spawned side work, an evidence
     // gap, and a mid-session contradicting creator all pass this loader.
+    append(&c.path(MAIN), &turn_context("later-turn"));
     for id in [MAIN, OTHER, SIDE, GAP] {
         append(&c.path(id), &turn(3));
     }
@@ -109,6 +113,19 @@ fn codex_sidecar_reuse_transition() {
             .is_some_and(|ledger| !ledger.is_null()),
         "actual stored-body ACK ledger"
     );
+    assert!(
+        cold_scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == MAIN)
+            .flat_map(|item| &item.model_usage)
+            .any(|row| {
+                row.selector_sources.get("service_tier").map(String::as_str)
+                    == Some("derived_from_logs_2")
+            }),
+        "priority positive control"
+    );
+    crate::snapshots::older_build_logs_expired();
     let mut committed = None;
     for (label, owner) in [
         ("tail", cache.clone()),
@@ -128,6 +145,8 @@ fn codex_sidecar_reuse_transition() {
             u32::from(label == "tail"),
             "{label}"
         );
+        // Every owner keeps the complete group after this pass.
+        assert!(d.sidecar_facts_heap_bytes > 0, "{label}");
         let actual = crate::snapshot_sync::codex_transition_acked_route(
             &working,
             &scan,

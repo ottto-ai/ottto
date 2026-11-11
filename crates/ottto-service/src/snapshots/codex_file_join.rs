@@ -2288,7 +2288,6 @@ pub(super) mod tests {
     /// Boot and replay one group in page (no cursor) to its last EOF.
     pub(crate) fn replay_group(
         group: Group,
-        traces: Option<Arc<CodexTurnTraceMap>>,
         index: &ScanIndex,
     ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
         let mut boot = GroupBoot::new(group, index);
@@ -2310,7 +2309,6 @@ pub(super) mod tests {
         let metadata = CodexTitleMetadata::default();
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
-            traces,
             cache: None,
             index,
         })?;
@@ -2662,7 +2660,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(group.members.len(), 2);
         assert!(matches!(
-            replay_group(group, None, &ScanIndex::default()),
+            replay_group(group, &ScanIndex::default()),
             Err(GroupEnd::Strict)
         ));
         let affected = inventory.affected_owners();
@@ -3186,7 +3184,7 @@ pub(super) mod tests {
     fn group_replay_uses_native_parser_and_revalidates_both_passes() {
         let (root, inventory) = fixture();
         let group = inventory.groups().into_values().next().unwrap();
-        let job = replay_group(group, None, &ScanIndex::default()).unwrap();
+        let job = replay_group(group, &ScanIndex::default()).unwrap();
         let OwnedActiveFile {
             parser,
             candidate: last,
@@ -3211,6 +3209,30 @@ pub(super) mod tests {
         assert_eq!(parsed.report.parsed_json_line_count, 6);
         fs::remove_dir_all(root).unwrap();
     }
+    thread_local! {
+        static OLDER_BUILD_LOGS_PRIORITY: std::cell::RefCell<BTreeSet<String>> =
+            const { std::cell::RefCell::new(BTreeSet::new()) };
+    }
+    /// The turns an older build priced as priority from Codex logs on this
+    /// test thread, so tests can seed the protected receipts it wrote.
+    pub(crate) fn older_build_logs_priority(turn: &str) {
+        OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow_mut().insert(turn.to_owned()));
+    }
+    /// The older build's logs evidence is gone: only receipts protect it.
+    pub(crate) fn older_build_logs_expired() {
+        OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow_mut().clear());
+    }
+    /// The older build's per-row stamp, where it ran: before tier replay.
+    pub(in crate::snapshots) fn older_build_logs_tier(
+        selector: &mut SelectorCapture,
+        turn: Option<&str>,
+    ) {
+        if turn.is_some_and(|turn| {
+            OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow().contains(turn))
+        }) {
+            selector.insert("service_tier", "priority".into(), "derived_from_logs_2");
+        }
+    }
     pub(crate) fn native_join_fixture_root(priority: bool) -> PathBuf {
         let root = fixture().0;
         if priority {
@@ -3227,12 +3249,7 @@ pub(super) mod tests {
                     .collect::<String>(),
             )
             .unwrap();
-            let connection = Connection::open(root.join("logs_2.sqlite")).unwrap();
-            connection.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT)", []).unwrap();
-            connection.execute("INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)", rusqlite::params![
-                unix_seconds(SystemTime::now()).unwrap() as i64,
-                format!("turn{{turn.id={turn}}}: websocket request: {{\"type\":\"response.create\",\"service_tier\":\"priority\",\"model\":\"gpt-5.2\"}}")
-            ]).unwrap();
+            older_build_logs_priority(turn);
         }
         root
     }
@@ -3260,6 +3277,274 @@ pub(super) mod tests {
             }
         }
         panic!("bounded native scan did not finish");
+    }
+    /// The two-member fixture with b's usage under `turn` and a Codex logs
+    /// database holding a priority request for that turn, as Codex
+    /// 0.119-0.142.x wrote it. `tier`, when set, is on b's usage lines, or
+    /// with `inherited` on its `turn_context` only (the running selector).
+    fn logs_priority_request_fixture(turn: &str, tier: Option<&str>, inherited: bool) -> PathBuf {
+        let (root, _) = fixture();
+        let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
+        if let Some(tier) = tier.filter(|_| !inherited) {
+            for row in &mut rows[1..] {
+                if row["type"] == "token_usage_record" {
+                    row["payload"]["service_tier"] = json!(tier);
+                } else {
+                    row["payload"]["info"]["service_tier"] = json!(tier);
+                }
+            }
+        }
+        let mut context =
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}});
+        if let Some(tier) = tier.filter(|_| inherited) {
+            // An earlier non-usage line's tier, carried by the running selector.
+            context["payload"]["service_tier"] = json!(tier);
+        }
+        rows.insert(1, context);
+        fs::write(
+            root.join("sessions/b.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let connection = rusqlite::Connection::open(root.join("logs_2.sqlite")).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
+                rusqlite::params![
+                    now,
+                    format!(
+                        "turn{{turn.id={turn}}}: websocket request: \
+                         {{\"type\":\"response.create\",\"service_tier\":\"priority\",\
+                         \"model\":\"gpt-5.2\"}}"
+                    )
+                ],
+            )
+            .unwrap();
+        root
+    }
+    /// [money] Codex logs no longer price a turn: a logs priority request for a
+    /// new turn, with no tier receipt, leaves every row at the default tier.
+    #[test]
+    fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
+        let root =
+            logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None, false);
+        let (_, result) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(result.snapshots.len(), 2, "one alias per group member");
+        for item in &result.snapshots {
+            assert_eq!(item.input_tokens, 300);
+            assert!(
+                item.model_usage
+                    .iter()
+                    .all(|row| !row.selector_context.contains_key("service_tier")),
+                "{:?}",
+                item.model_usage
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// [money] An explicit tier on the rollout's own usage lines, or inherited
+    /// from its `turn_context`, now prices its turn beside a logs priority
+    /// request, where the logs stamp used to
+    /// replace it: each explicit value prices at its own (normalized) tier
+    /// under the rollout line's own source; `priority` keeps its price.
+    #[test]
+    fn explicit_rollout_tier_is_no_longer_replaced_by_codex_logs() {
+        for (explicit, tier, inherited) in [false, true].into_iter().flat_map(|inherited| {
+            [
+                ("flex", "flex"),
+                ("priority", "priority"),
+                ("fast", "fast"),
+                ("standard", "standard"),
+                ("default", "standard"),
+            ]
+            .map(|(explicit, tier)| (explicit, tier, inherited))
+        }) {
+            let root = logs_priority_request_fixture(
+                "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+                Some(explicit),
+                inherited,
+            );
+            let (_, result) = scan(&root, ScanIndex::default(), 2);
+            assert_eq!(result.snapshots.len(), 2, "one alias per group member");
+            for item in &result.snapshots {
+                assert_eq!(item.input_tokens, 300);
+                let tiered = item
+                    .model_usage
+                    .iter()
+                    .filter(|row| {
+                        row.selector_context.get("service_tier").map(String::as_str) == Some(tier)
+                    })
+                    .map(|row| row.input_tokens)
+                    .sum::<u64>();
+                assert_eq!(
+                    tiered, 200,
+                    "{tier} (inherited {inherited}): b at its own tier"
+                );
+                assert!(
+                    item.model_usage.iter().all(|row| {
+                        row.selector_sources
+                            .get("service_tier")
+                            .is_none_or(|source| source.starts_with("payload."))
+                    }),
+                    "{tier} (inherited {inherited}): {:?}",
+                    item.model_usage
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    /// Scan `root` as an older build that priced `turn` priority from Codex
+    /// logs, accept the read, save the index, then retire that evidence.
+    /// Returns the saved index path.
+    fn accept_as_older_build(root: &Path, turn: &str) -> PathBuf {
+        older_build_logs_priority(turn);
+        let (mut working, mut first) = scan(root, ScanIndex::default(), 3);
+        assert!(
+            first
+                .snapshots
+                .iter()
+                .flat_map(|item| &item.model_usage)
+                .any(|row| {
+                    row.selector_sources.get("service_tier").map(String::as_str)
+                        == Some("derived_from_logs_2")
+                }),
+            "positive control: the older build priced priority from logs"
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut working);
+        first.finish_codex_capture_boundary(&mut working);
+        let fingerprints = first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut committed =
+            working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
+        let saved = root.join("index.json");
+        committed.save(&saved).unwrap();
+        older_build_logs_expired();
+        saved
+    }
+    /// Input tokens by emitted `service_tier` and its source, over `owner`'s rows.
+    fn tiers_of(
+        scan: &SourceScanResult,
+        owner: &str,
+    ) -> BTreeMap<(Option<String>, Option<String>), u64> {
+        let mut tiers = BTreeMap::new();
+        for row in scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == owner)
+            .flat_map(|item| &item.model_usage)
+        {
+            *tiers
+                .entry((
+                    row.selector_context.get("service_tier").cloned(),
+                    row.selector_sources.get("service_tier").cloned(),
+                ))
+                .or_default() += row.input_tokens;
+        }
+        tiers
+    }
+    /// [money] Rows an older build accepted priority from logs over an explicit
+    /// tier on the rollout's usage lines or inherited from its `turn_context`,
+    /// re-read in a byte-zero replay: an
+    /// explicit `priority` keeps its price under the line's own source; an
+    /// explicit non-priority tier fails the receipt's key match, so the
+    /// replay emits nothing below priority.
+    #[test]
+    fn accepted_logs_priority_over_an_explicit_tier_replays_or_holds() {
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        for (explicit, inherited) in [
+            ("priority", false),
+            ("flex", false),
+            ("priority", true),
+            ("flex", true),
+        ] {
+            let root = logs_priority_request_fixture(turn, Some(explicit), inherited);
+            let saved = accept_as_older_build(&root, turn);
+            let mut loaded = ScanIndex::load(&saved).unwrap();
+            loaded.prepare_historical_replay("logs-explicit-upgrade".into());
+            let (_, replayed) = scan(&root, loaded, 2);
+            let tiers = tiers_of(&replayed, owner);
+            eprintln!(
+                "LOGS_EXPLICIT_REPLAY explicit={explicit} inherited={inherited} emitted={} tiers={tiers:?}",
+                replayed.snapshots.len()
+            );
+            let below_priority = tiers
+                .iter()
+                .filter(|((tier, _), _)| {
+                    tier.as_deref() == Some(explicit) && explicit != "priority"
+                })
+                .map(|(_, tokens)| *tokens)
+                .sum::<u64>();
+            assert_eq!(below_priority, 0, "{explicit}: no smaller re-emit");
+            if explicit == "priority" && !replayed.snapshots.is_empty() {
+                for ((tier, source), tokens) in &tiers {
+                    if tier.as_deref() == Some("priority") {
+                        assert!(
+                            source.as_deref().is_some_and(|s| s.starts_with("payload.")),
+                            "{source:?}"
+                        );
+                        assert_eq!(*tokens, 400, "both aliases keep b's 200 at priority");
+                    }
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    /// [money] A singleton accepted priority from logs whose index entry holds
+    /// no tier receipt and no receipt requirement (an entry from before
+    /// receipts) re-reads at the default tier on a later Full; base would
+    /// have kept priority while the turn's logs request was live.
+    #[test]
+    fn receipt_less_accepted_singleton_prices_default_on_a_later_full() {
+        let owner = "cccccccc-dddd-4eee-8fff-000000000000";
+        let turn = "cccccccc-1111-4111-8111-cccccccccccc";
+        let (root, _) = fixture();
+        let mut rows = member(owner, "r-c", 200, 200);
+        rows.insert(
+            1,
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
+        );
+        let path = root.join("sessions/c.jsonl");
+        fs::write(
+            &path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let saved = accept_as_older_build(&root, turn);
+        let mut legacy = ScanIndex::load(&saved).unwrap();
+        let entry = legacy.files.get_mut(&local_index_key(&path)).unwrap();
+        entry.codex_applied_tier_receipt = None;
+        entry.codex_applied_tier_receipt_required = false;
+        entry.codex_captured_tier_receipt = None;
+        entry.codex_captured_tier_receipt_required = false;
+        legacy.save(&saved).unwrap();
+        let mut loaded = ScanIndex::load(&saved).unwrap();
+        loaded.prepare_historical_replay("receipt-less-upgrade".into());
+        let (_, replayed) = scan(&root, loaded, 3);
+        let tiers = tiers_of(&replayed, owner);
+        eprintln!(
+            "LOGS_RECEIPT_LESS_REPLAY emitted={} tiers={tiers:?}",
+            replayed.snapshots.len()
+        );
+        assert_eq!(tiers, BTreeMap::from([((None, None), 200)]), "default tier");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn production_scanner_aliases_need_common_settlement_and_skip_on_restart() {
@@ -3515,14 +3800,13 @@ pub(super) mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut traces = CodexTurnTraceMap::default();
-        traces.priority_turns.insert(turn.into());
+        older_build_logs_priority(turn);
         let job = replay_group(
             inventory.groups().into_values().next().unwrap(),
-            Some(Arc::new(traces)),
             &ScanIndex::default(),
         )
         .unwrap();
+        older_build_logs_expired();
         let OwnedActiveFile {
             aliases: members,
             applied_receipts: receipts,
@@ -3559,7 +3843,7 @@ pub(super) mod tests {
             while !fresh.step(&CodexTitleMetadata::default()) {}
             ((), fresh)
         };
-        let job = replay_group(fresh.groups().into_values().next().unwrap(), None, &index).unwrap();
+        let job = replay_group(fresh.groups().into_values().next().unwrap(), &index).unwrap();
         let OwnedActiveFile {
             parser,
             candidate: last,
@@ -4462,7 +4746,7 @@ pub(super) mod tests {
         for (name, text) in originals {
             fs::write(root.join("sessions").join(name), text).unwrap();
         }
-        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+        older_build_logs_expired();
         aged.traversal
             .as_mut()
             .unwrap()
@@ -4555,7 +4839,7 @@ pub(super) mod tests {
                 2,
                 "receipt damage must not reset protected state"
             );
-            fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+            older_build_logs_expired();
             let (after, held) = scan(&root, loaded, 2);
             assert!(held.snapshots.is_empty());
             assert_eq!(held.ownership_incomplete_file_count, 2);
@@ -4718,8 +5002,9 @@ pub(super) mod tests {
     }
     /// [regress] T2: a joined group whose priced member grows past the former
     /// 512-tier cap still uploads, with no hold and every priced row priority.
-    /// T3: with logs_2 gone, a replay from the saved index restores every tier
-    /// from the receipt and emits a byte-identical body.
+    /// T3: with the older build's logs evidence gone, a replay from the saved
+    /// index restores every tier from the receipt and emits a byte-identical
+    /// body.
     #[test]
     fn joined_group_past_former_tier_cap_uploads_and_replays_without_downgrade() {
         let root = native_join_fixture_root(true);
@@ -4791,7 +5076,7 @@ pub(super) mod tests {
         let mut loaded = ScanIndex::load(&saved).unwrap();
         assert_eq!(tiers(&loaded), 514);
         // T3: the trace source expires; only the saved receipt can price b.
-        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+        older_build_logs_expired();
         loaded.prepare_historical_replay("tier-cap-replay".into());
         let (_, replayed) = scan(&root, loaded, 2);
         assert_eq!(replayed.ownership_incomplete_file_count, 0);
@@ -4804,6 +5089,75 @@ pub(super) mod tests {
             body,
             "restored from the receipt: no tier downgraded"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// [money] Rows accepted with an older build's logs-derived priority tier
+    /// keep it once Codex logs supply none: a restart re-emits nothing, and an
+    /// upgrade's historical replay (a byte-zero re-read) restores every tier
+    /// from the protected receipt, equal in money and placement to the accepted
+    /// read with no smaller re-emit. A read with no receipt prices the same turn
+    /// at the default tier.
+    #[test]
+    fn logs_priority_receipt_survives_restart_and_replay_money_oracle() {
+        use sampled_scan::transition_fixture::{money_oracle, scan_money};
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let priority = |scan: &SourceScanResult| {
+            scan.snapshots
+                .iter()
+                .flat_map(|item| &item.model_usage)
+                .filter(|row| {
+                    row.selector_context.get("service_tier").map(String::as_str) == Some("priority")
+                })
+                .map(|row| row.input_tokens)
+                .sum::<u64>()
+        };
+        // The joined members' aliases share one body; the wire carries it once.
+        let one_body_each = |scan: &mut SourceScanResult| {
+            let mut seen = BTreeSet::new();
+            scan.snapshots
+                .retain(|item| seen.insert(item.snapshot_fingerprint.clone()));
+            assert_eq!(scan.snapshots.len(), 1);
+        };
+        let root = native_join_fixture_root(true);
+        // The accepted read's raw rows, compared with the replay's raw rows.
+        let (_, mut accepted_rows) = scan(&root, ScanIndex::default(), 2);
+        let (mut working, mut first) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(priority(&first), 400, "positive control: b priced priority");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut working);
+        first.finish_codex_capture_boundary(&mut working);
+        let fingerprints = first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut committed =
+            working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
+        let saved = root.join("index.json");
+        committed.save(&saved).unwrap();
+        // Both routes take their receipt evidence from the saved index, which
+        // the replay reads; what can differ is the replayed rows' money and
+        // placement.
+        one_body_each(&mut accepted_rows);
+        let accepted = scan_money(SnapshotSource::Codex, &committed, &accepted_rows);
+        older_build_logs_expired();
+
+        let (_, restarted) = scan(&root, ScanIndex::load(&saved).unwrap(), 2);
+        assert!(restarted.snapshots.is_empty(), "restart re-emits nothing");
+
+        let mut loaded = ScanIndex::load(&saved).unwrap();
+        loaded.prepare_historical_replay("logs-priority-upgrade".into());
+        let (_, mut replayed) = scan(&root, loaded, 2);
+        assert_eq!(replayed.ownership_incomplete_file_count, 0);
+        assert_eq!(priority(&replayed), 400, "restored from the receipt");
+        one_body_each(&mut replayed);
+        let replayed = scan_money(SnapshotSource::Codex, &committed, &replayed);
+        money_oracle::assert_equivalent(&accepted, &replayed);
+        money_oracle::assert_placement_equivalent(&accepted, &replayed);
+        money_oracle::assert_no_smaller_reemit(owner, &accepted, &replayed, &accepted, false);
+
+        let (_, fresh) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(priority(&fresh), 0, "no receipt: the default tier");
+        assert!(fresh.snapshots.iter().all(|item| item.input_tokens == 300));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -5089,7 +5443,7 @@ pub(super) mod tests {
                 }
                 assert!(previous.current_snapshot_fingerprints().is_empty());
                 if priority {
-                    fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+                    older_build_logs_expired();
                 }
                 let (mut rebuilt, mut result) = scan(&root, previous.clone(), 3);
                 finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut rebuilt);
@@ -5122,10 +5476,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn legacy_index(
-        inventory: &HeaderInventory,
-        traces: Option<Arc<CodexTurnTraceMap>>,
-    ) -> ScanIndex {
+    pub(crate) fn legacy_index(inventory: &HeaderInventory) -> ScanIndex {
         let mut index = ScanIndex::default();
         for member in inventory
             .groups()
@@ -5154,7 +5505,6 @@ pub(super) mod tests {
                 apply_codex_line,
                 Some(&CodexTitleMetadata::default()),
                 None,
-                traces.clone(),
                 None,
             )
             .unwrap();
@@ -5177,7 +5527,7 @@ pub(super) mod tests {
     #[test]
     fn legacy_proof_refreshes_expired_launch_lookup_without_consuming_completed_proof() {
         let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory, None);
+        let previous = legacy_index(&inventory);
         let group = inventory.groups().into_values().next().unwrap();
         let workers = vec![group.owner.clone()];
         let key = base64::Engine::encode(
@@ -5227,7 +5577,6 @@ pub(super) mod tests {
         let mut job = boot
             .into_job(JobInputs {
                 metadata: &metadata,
-                traces: None,
                 cache: None,
                 index: &previous,
             })
@@ -5276,7 +5625,7 @@ pub(super) mod tests {
     #[test]
     fn legacy_first_import_requires_actual_old_output_match_and_allows_healthy_sibling() {
         let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory, None);
+        let previous = legacy_index(&inventory);
         let (mut index, mut result) = scan(&root, previous.clone(), 2);
         assert_eq!(result.codex_legacy_join_baselines.len(), 2);
         result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |_, _| {});
@@ -5297,9 +5646,9 @@ pub(super) mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut traces = CodexTurnTraceMap::default();
-        traces.priority_turns.insert(turn.into());
-        let previous = legacy_index(&inventory, Some(Arc::new(traces)));
+        older_build_logs_priority(turn);
+        let previous = legacy_index(&inventory);
+        older_build_logs_expired();
         let sibling = member(
             "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "r-sibling",

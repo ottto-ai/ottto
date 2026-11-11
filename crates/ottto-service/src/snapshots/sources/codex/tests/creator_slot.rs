@@ -408,7 +408,7 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
 #[test]
 fn codex_legacy_join_groups_uploaded_unknown_stay_unknown_on_upgrade() {
     let (root, inventory) = codex_file_join::tests::fixture();
-    let previous = codex_file_join::tests::legacy_index(&inventory, None);
+    let previous = codex_file_join::tests::legacy_index(&inventory);
     let (mut index, mut result) = codex_file_join::tests::scan(&root, previous.clone(), 2);
     assert_eq!(result.codex_legacy_join_baselines.len(), 2);
     for baseline in &mut result.codex_legacy_join_baselines {

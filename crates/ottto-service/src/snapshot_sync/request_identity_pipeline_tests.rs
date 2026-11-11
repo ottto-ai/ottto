@@ -66,20 +66,31 @@ impl Drop for IdentityPipelineHome {
     }
 }
 
-/// Own only this synthetic Claude cadence slot. The named serial key below
+/// Own this synthetic Claude cadence and upload backoff slot. The named serial key below
 /// excludes cadence tests; the default key excludes environment fixtures.
 /// Restore pre-test state on every exit, including panic.
-struct IdentityPipelineCadence(Option<SourceCadence>);
+struct IdentityPipelineCadence(Option<SourceCadence>, Option<Instant>, Option<u32>);
 
 impl IdentityPipelineCadence {
     fn new() -> Self {
-        Self(source_cadences().lock().unwrap().remove("claude_code"))
+        Self(
+            source_cadences().lock().unwrap().remove("claude_code"),
+            source_upload_deadlines()
+                .lock()
+                .unwrap()
+                .remove("claude_code"),
+            source_shed_streaks().lock().unwrap().remove("claude_code"),
+        )
     }
 
     fn next_due_cycle(&self) {
         // Test-only fresh cadence represents the next already-due cycle. The
         // real prepare gate and all index/ACK/lifecycle state remain unchanged.
         source_cadences().lock().unwrap().remove("claude_code");
+        source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .remove("claude_code");
     }
 }
 
@@ -89,6 +100,16 @@ impl Drop for IdentityPipelineCadence {
         cadences.remove("claude_code");
         if let Some(previous) = self.0.take() {
             cadences.insert("claude_code", previous);
+        }
+        let mut deadlines = source_upload_deadlines().lock().unwrap();
+        deadlines.remove("claude_code");
+        if let Some(previous) = self.1.take() {
+            deadlines.insert("claude_code", previous);
+        }
+        let mut streaks = source_shed_streaks().lock().unwrap();
+        streaks.remove("claude_code");
+        if let Some(previous) = self.2.take() {
+            streaks.insert("claude_code", previous);
         }
     }
 }

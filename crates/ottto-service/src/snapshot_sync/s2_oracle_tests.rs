@@ -1324,3 +1324,255 @@ mod unkept_requeue_oracle_tests;
 
 #[path = "context_posture_refold_tests.rs"]
 mod context_posture_refold_tests;
+
+/// [money] A lone 413 keeps prior accepted money and retries without an ACK or retirement.
+#[test]
+fn lone_413_keeps_money_pending_until_exact_ack() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("lone-413");
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let seed = page(&c, index, 100, true);
+        let mut prior = result(&seed, Mode::ColdFull);
+        accepted(&mut prior, &seed.scan.snapshots);
+        let (index, mut progress) = commit_with_progress(&session, seed);
+        append(&path, &line(ROOT, "after-413", "2026-08-02T07:04:00Z", 6));
+        let candidate = hinted(&c, index, 100, true, &[path]);
+        let lone = candidate
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == ROOT)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(lone.len(), 1);
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold_items = cold_page
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == ROOT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let cold = RouteResult::emitted(
+            Mode::ColdFull,
+            SOURCE,
+            upload(&cold_items, &mut e2_progress(), ack).1,
+            &cold_items,
+        );
+        assert!(accounts(&cold).len() >= 2);
+        let before = progress.accepted_fingerprints.clone();
+        let accepted_bodies = progress.accepted_body_witnesses.clone();
+        progress.fresh_context_body_acks.clear();
+        let receipts = progress.fresh_context_body_acks.clone();
+        for _ in 0..2 {
+            let (outcome, _, _) = upload(&lone, &mut progress, |_| {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    413,
+                    false,
+                )))
+            });
+            let error = outcome.unwrap_err();
+            assert!(error
+                .downcast_ref::<UploadFailureDiagnostics>()
+                .unwrap()
+                .is_snapshot_batch_too_large());
+            assert!(error.downcast_ref::<UploadShed>().is_none());
+            assert!(progress.permanent_rejections.is_empty());
+            assert!(progress.active_quarantine_retries.is_empty());
+            assert_eq!(progress.accepted_fingerprints, before);
+            assert_eq!(progress.accepted_body_witnesses, accepted_bodies);
+            assert_eq!(progress.fresh_context_body_acks, receipts);
+            assert!(progress.quarantined_fingerprints.is_empty());
+            progress = serde_json::from_value(serde_json::to_value(&progress).unwrap()).unwrap();
+        }
+        let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &[]);
+        held.accepted = prior.accepted.clone();
+        money_oracle::assert_held(ROOT, &prior, &held, &cold);
+        let (outcome, sent, _) = upload(&lone, &mut progress, ack);
+        assert_eq!(outcome.unwrap(), ResumableUploadResult::Completed);
+        money_oracle::assert_equivalent(
+            &cold,
+            &RouteResult::emitted(Mode::Restart, SOURCE, sent, &lone),
+        );
+    });
+}
+
+/// [money] Returning quarantines use the same native body and post-ACK placement
+/// as cold Full, including an indexed subagent owner and a progress-first crash.
+#[test]
+fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
+    with_e2(|| {
+        let (c, root_path) = placement_corpus("current-again-quarantines");
+        let child_path = c.root.join(format!("{ROOT}/subagents/agent-000.jsonl"));
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert!(accounts(&cold).len() >= 2);
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        seed.finish();
+        let mut progress = e2_progress();
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        for item in &seed.scan.snapshots {
+            progress.quarantine_body(
+                &item.snapshot_fingerprint,
+                &snapshot_upload_body_witness(item),
+            );
+        }
+        assert!(progress.retain_current_quarantines(&BTreeSet::new(), &seed.index));
+        seed.index
+            .retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        let mut prior = session.save_reload(&mut seed.index);
+        let terminal = prior.quarantined_snapshot_fingerprints.clone();
+        assert!(progress.retain_current_quarantines(&prior.current_snapshot_fingerprints(), &prior));
+        assert!(progress
+            .quarantined_fingerprints
+            .values()
+            .all(|r| r.failed_reconstruction_count == 1 && r.retry_after_unix_seconds == 0));
+        let progress_path = c.base.join("retry-progress.json");
+        progress.save(&progress_path).unwrap();
+        // Crash before index save: progress is pending and the index is terminal.
+        prior = ScanIndex::load(session.path()).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SOURCE),
+        )
+        .unwrap();
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        assert_eq!(prior.quarantined_snapshot_fingerprints, terminal);
+        assert!(progress.prepare_quarantine_retries(&prior.quarantined_snapshot_fingerprints));
+        progress.save(&progress_path).unwrap();
+        let hints =
+            save_terminal_contract_claims_for_scan(&mut prior, &progress, session.path()).unwrap();
+        assert_eq!(
+            hints.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([root_path, child_path.clone()])
+        );
+        let saved = ScanIndex::load(session.path()).unwrap();
+        assert_eq!(
+            saved.quarantined_snapshot_fingerprints,
+            progress.quarantined_fingerprints
+        );
+        prior.activate_quarantine_witness_for_test(SOURCE);
+        let queued = c.raw(&scanner, prior, 0, true, &hints);
+        assert!(queued.scan.snapshots.is_empty());
+        let child_fp = seed
+            .scan
+            .snapshots
+            .iter()
+            .find(|i| i.source_session_id == format!("{ROOT}_agent-000"))
+            .unwrap()
+            .snapshot_fingerprint
+            .clone();
+        assert!(queued.index.quarantine_retry_is_queued(&child_fp));
+        assert!(!progress.defer_held_quarantine_retries(
+            &queued.scan.snapshots,
+            &queued.index,
+            SOURCE
+        ));
+        // A bounded page may leave a family member queued. Resume its retained
+        // queue without re-hinting an already selected owner ahead of its sibling.
+        let mut retry = hinted(&c, queued.index, 100, true, &[]);
+        let mut offered = Vec::new();
+        for _ in 0..8 {
+            retry.finish();
+            assert_eq!(
+                retry.modes.0, 0,
+                "stored Tail retry must not cause a Full read"
+            );
+            offered.append(&mut retry.scan.snapshots);
+            if retry.scan.census_complete {
+                break;
+            }
+            retry = hinted(&c, retry.index, 100, true, &[]);
+        }
+        assert!(
+            retry.scan.census_complete,
+            "drain the retained family queue"
+        );
+        retry.scan.snapshots = offered;
+        assert_eq!(
+            retry
+                .scan
+                .snapshots
+                .iter()
+                .filter(|i| i.snapshot_fingerprint == child_fp)
+                .count(),
+            1
+        );
+        let child_key = child_path.to_str().unwrap();
+        assert!(retry.index.file_snapshot_fingerprints[child_key].contains(&child_fp));
+        let (status, batches, _) = upload(&retry.scan.snapshots, &mut progress, ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        let mut actual =
+            RouteResult::emitted(Mode::Restart, SOURCE, batches, &retry.scan.snapshots);
+        actual.accepted_identity_buckets = Some(
+            serde_json::to_value(
+                retry
+                    .scan
+                    .snapshots
+                    .iter()
+                    .map(|item| {
+                        (
+                            &item.source_session_id,
+                            progress
+                                .accepted_identity_buckets
+                                .get(&item.source_session_id),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        );
+        money_oracle::assert_equivalent(&cold, &actual);
+        progress.save(&progress_path).unwrap();
+        // A second crash after the durable ACK cannot restore the old retry.
+        let mut restored = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            snapshot_quarantine_witness(SOURCE),
+        )
+        .unwrap();
+        assert!(!restored.prepare_quarantine_retries(&saved.quarantined_snapshot_fingerprints));
+        assert!(restored.active_quarantine_retries.is_empty());
+        retry
+            .index
+            .retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        retry
+            .index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        accept_upload_context_acks_for_test(
+            &mut retry.index,
+            &retry.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        assert!(retry.index.files[child_key]
+            .upload_context_receipt
+            .is_some());
+        let mut prior = session.save_reload(&mut retry.index);
+        assert!(
+            save_terminal_contract_claims_for_scan(&mut prior, &restored, session.path())
+                .unwrap()
+                .is_empty()
+        );
+        let mut quiet = page(&c, prior, 100, true);
+        quiet.finish();
+        assert!(quiet.scan.snapshots.is_empty());
+    });
+}

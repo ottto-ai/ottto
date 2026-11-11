@@ -882,7 +882,6 @@ fn codex_occurrences() {
         sampled_scan::ParserOptions {
             source: SnapshotSource::Codex,
             metadata: &metadata,
-            traces: None,
             identity_capture: false,
             cache: None,
         },

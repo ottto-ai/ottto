@@ -1135,6 +1135,24 @@ fn store_growth_samples_stay_separate_per_store() {
     assert_eq!(codex_gauge["kinds"]["scan_state.traversal"]["rows"], 1);
 }
 
+/// [behaviour] Maintenance reports optional, non-negative cache counters each pass.
+#[test]
+fn maintenance_cache_counters_are_optional_counts() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    for _ in 0..2 {
+        let (_, rows) =
+            crate::local_resource_diagnostics::capture(|| db.maintenance(false).unwrap());
+        let row = rows
+            .iter()
+            .find(|row| row["counts"].get("cache_used_bytes").is_some())
+            .unwrap();
+        for name in ["cache_used_bytes", "cache_hit", "cache_miss"] {
+            assert!(row["counts"][name].is_u64());
+        }
+    }
+}
+
 /// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {

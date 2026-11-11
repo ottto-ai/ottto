@@ -522,9 +522,9 @@ pub(in crate::snapshots) fn pace_listing_owed(
 
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
 /// (ctime-only events included) is dropped; a vanished one is kept for the
-/// exact removal path. Owner requests keep their unchanged files: a leased reason re-offer
-/// here, the audit retry by calling the queue directly. A hint never admits a
-/// first read past the first-read bound.
+/// exact removal path. Owner requests keep their unchanged files: leased reason
+/// re-offers and ordinary retries here, the audit retry through the queue directly.
+/// A hint never admits a first read past the first-read bound.
 pub(in crate::snapshots) fn changed_watcher_hints(
     index: &ScanIndex,
     hinted_paths: &[PathBuf],
@@ -537,6 +537,7 @@ pub(in crate::snapshots) fn changed_watcher_hints(
         .iter()
         .filter(|path| {
             index.reason_reoffer_leased(&local_index_key(path))
+                || index.quarantine_retry_leased(&local_index_key(path))
                 || !fs::symlink_metadata(path).is_ok_and(|metadata| {
                     metadata.is_file()
                         && (index.hint_settled(path, &metadata)

@@ -2128,21 +2128,14 @@ impl CursorLease {
         self.suspend(job, |counters| counters.jobs_deferred_inputs += 1)
     }
 
-    /// Charge the job (live source-wide inputs excluded; the resuming scan
-    /// reinstalls them) and fit it in the state budget (K6). A job that does
+    /// Charge the job and fit it in the state budget (K6). A job that does
     /// not fit ends as strict `JoinStateBound` debt.
     fn suspend(self, mut job: Box<OwnedActiveFile>, count: fn(&mut Counters)) -> PauseEnd {
         // The slot charge walks the reader buffer's capacity (S3); shrink it
         // first so one overlong record cannot pin `max_line_bytes`.
         shrink_paused_buffer(&mut job.parser.reader.buf);
-        let inputs = job.parser.take_live_reduction_inputs();
-        let tee_inputs = job.group.as_mut().and_then(|group| group.take_tee_inputs());
         let admitted = paused_charge(&job).and_then(|charge| self.cache.cursor_reserve(charge));
         let Some(credit) = admitted else {
-            job.parser.restore_live_reduction_inputs(inputs);
-            if let Some(group) = job.group.as_mut() {
-                group.restore_tee_inputs(tee_inputs);
-            }
             let disclosure = strict_disclosure(DebtReason::JoinStateBound);
             let stamp = job
                 .group
@@ -2191,8 +2184,6 @@ impl CursorLease {
             });
             return PauseEnd::StateBound(job, disclosure);
         };
-        drop(inputs);
-        drop(tee_inputs);
         self.store(job, credit, count);
         PauseEnd::Paused
     }
@@ -2201,8 +2192,6 @@ impl CursorLease {
     /// longer fits is lost; its path is still pending, so it restarts.
     fn return_job(self, mut job: Box<OwnedActiveFile>) {
         shrink_paused_buffer(&mut job.parser.reader.buf);
-        drop(job.parser.take_live_reduction_inputs());
-        drop(job.group.as_mut().and_then(|group| group.take_tee_inputs()));
         match paused_charge(&job).and_then(|charge| self.cache.cursor_reserve(charge)) {
             Some(credit) => {
                 self.store(job, credit, |counters| counters.jobs_frame_returned += 1);
@@ -2547,7 +2536,6 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
         // the fallback must not publish under this job's identity.
         return false;
     }
-    job.parser.accumulator.codex_priority_witnesses_uncapped = true;
     job.parser
         .reader
         .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
@@ -3554,7 +3542,6 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        job.parser.accumulator.codex_priority_witnesses_uncapped = true;
         // The reader counts from the acquisition start (`s` for a tail).
         job.parser
             .reader
@@ -3642,10 +3629,9 @@ impl SharedCache {
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
-        let accumulator = &mut job.parser.accumulator;
-        accumulator.codex_priority_witnesses_uncapped = true;
         // Resume revalidates every priority decision against the witnesses.
-        accumulator
+        job.parser
+            .accumulator
             .codex_observed_priority_turns
             .get_or_insert_with(BTreeMap::new);
         job.parser.reader.set_extent_limit(boot.extent);
@@ -3950,7 +3936,6 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) codex: &'a CodexTitleMetadata,
     pub(in crate::snapshots) claude: &'a ClaudeTitleMetadata,
     pub(in crate::snapshots) support: Option<&'a Path>,
-    pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
     /// The acquisition scope recomputed under the resuming scan's index.
     pub(in crate::snapshots) scope: Option<Scope>,
@@ -3969,7 +3954,6 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) codex: &'a CodexTitleMetadata,
     pub(in crate::snapshots) claude: &'a ClaudeTitleMetadata,
     pub(in crate::snapshots) support: Option<&'a Path>,
-    pub(in crate::snapshots) traces: Option<Arc<CodexTurnTraceMap>>,
     pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
     /// Selection flags of this page's Codex candidates (`requeue`).
     pub(in crate::snapshots) flags: &'a BTreeMap<String, (bool, bool)>,
@@ -4033,7 +4017,6 @@ pub(in crate::snapshots) fn resume_paused_job(
             codex: context.codex,
             claude: context.claude,
             support: context.support,
-            traces: context.traces,
             inventory: context.inventory,
             scope,
             counting,
@@ -4153,16 +4136,15 @@ pub(in crate::snapshots) enum Resume {
     /// Evidence changed: an invalidation, counted toward `MemberChanged`.
     Changed,
     /// Evidence needed to decide is unavailable this page (incomplete header
-    /// inventory, no reduction dependencies or scope, or no traces while a
-    /// witnessed turn was priority): the job waits, uncounted.
+    /// inventory, no reduction dependencies or scope): the job waits,
+    /// uncounted.
     Unavailable,
 }
 
 /// Singleton subset of the revalidation checklist, run at every resume:
 /// same object without shrink or in-place edit (growth is outside the frozen
 /// extent), unchanged reduction dependencies and scope, still a singleton,
-/// this cycle's traces installed, every priority decision
-/// so far still valid, and a counting view the paused accumulator may
+/// every earlier priority decision still valid, and a counting view the paused accumulator may
 /// continue under (`counting_reusable`, the second restore path K8 names).
 pub(in crate::snapshots) fn revalidate(
     job: &mut OwnedActiveFile,
@@ -4220,7 +4202,7 @@ pub(in crate::snapshots) fn revalidate(
         // A continuation appeared: the owner is now a group, never a singleton.
         return Resume::Changed;
     }
-    revalidate_decisions(job, inputs.traces)
+    revalidate_decisions(job)
 }
 
 /// The group subset of the revalidation checklist (P2): the member being
@@ -4293,66 +4275,29 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
         // A member appeared or vanished: another job.
         return Resume::Changed;
     }
-    let traces = inputs.traces;
-    if let Some(group) = job.group.as_mut() {
-        group.reinstall_tee_inputs(traces.clone());
-    }
-    revalidate_decisions(job, traces)
+    revalidate_decisions(job)
 }
 
-/// What this cycle's traces say about a read's earlier priority decisions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::snapshots) enum PriorityDecisions {
-    Hold,
-    /// Absent or incomplete traces cannot prove a decision changed.
-    Unavailable,
-    Changed,
+/// Whether a read's earlier priority decisions still hold. Codex logs no
+/// longer supply priority, so a decision an earlier build applied from them
+/// is changed evidence: that read re-reads under its protected tier receipt.
+/// Shared by a paused job's resume, a retained reduction's reuse and a Tail
+/// load's LIVE install.
+pub(in crate::snapshots) fn priority_decisions_hold(observed: &BTreeMap<String, bool>) -> bool {
+    observed.values().all(|priority| !*priority)
 }
 
-/// The one comparison of earlier priority decisions with current traces,
-/// shared by a paused job's resume and a Tail load's LIVE install.
-pub(in crate::snapshots) fn priority_decisions(
-    observed: &BTreeMap<String, bool>,
-    traces: Option<&Arc<CodexTurnTraceMap>>,
-) -> PriorityDecisions {
-    if traces.is_none() && observed.values().any(|priority| *priority) {
-        return PriorityDecisions::Unavailable;
-    }
-    let decisions_hold = observed.iter().all(|(turn, priority)| {
-        *priority == traces.is_some_and(|traces| traces.is_priority_turn(turn))
-    });
-    if decisions_hold {
-        PriorityDecisions::Hold
-    } else if traces.is_some_and(|traces| traces.is_incomplete()) {
-        // R2-H1: a failed or capped trace load cannot prove a decision
-        // changed; the read waits for complete evidence.
-        PriorityDecisions::Unavailable
-    } else {
-        PriorityDecisions::Changed
-    }
-}
-
-/// Every priority decision so far still holds under this cycle's traces;
-/// then this cycle's traces are installed.
-fn revalidate_decisions(
-    job: &mut OwnedActiveFile,
-    traces: Option<Arc<CodexTurnTraceMap>>,
-) -> Resume {
-    let Some(observed) = job
+/// Every priority decision so far still holds.
+fn revalidate_decisions(job: &OwnedActiveFile) -> Resume {
+    match job
         .parser
         .accumulator
         .codex_observed_priority_turns
         .as_ref()
-    else {
-        return Resume::Changed;
-    };
-    match priority_decisions(observed, traces.as_ref()) {
-        PriorityDecisions::Hold => {}
-        PriorityDecisions::Unavailable => return Resume::Unavailable,
-        PriorityDecisions::Changed => return Resume::Changed,
+    {
+        Some(observed) if priority_decisions_hold(observed) => Resume::Valid,
+        _ => Resume::Changed,
     }
-    job.parser.accumulator.codex_turn_traces = traces;
-    Resume::Valid
 }
 
 /// A hold whose cause no appended byte can remove: an ambiguous fork, a
