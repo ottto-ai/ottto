@@ -824,7 +824,10 @@ fn cloud_cache_history_does_not_expand_the_active_page() {
             })
             .collect::<Vec<_>>();
         store.cloud_commit(&scope, &writes, None, 0).unwrap();
-        let page = keys[..20].iter().map(String::as_str).collect::<Vec<_>>();
+        let active_keys = keys[..20].to_vec();
+        drop(writes);
+        drop(keys);
+        let page = active_keys.iter().map(String::as_str).collect::<Vec<_>>();
         let probe = crate::local_resource_diagnostics::StateV2Probe::begin();
         let found = store.cloud_read_acks(&scope, &page, 0).unwrap();
         let (cpu_us, steady, peak) = probe.finish();

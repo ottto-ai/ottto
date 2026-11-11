@@ -2104,7 +2104,7 @@ impl CloudCollector {
             return CloudSessionCycleOutcome::NotDue;
         }
         let deadline = Instant::now() + CYCLE_BUDGET;
-        let grant = match self.preflight(inputs, &state.grant, deadline, now + started.elapsed()) {
+        let grant = match self.preflight(inputs, &state.grant, deadline, now, started) {
             Ok(grant) => grant,
             Err(outcome) => return outcome,
         };
@@ -2213,8 +2213,8 @@ impl CloudCollector {
         expected: &CloudSessionGrant,
         deadline: Instant,
         now: Instant,
+        started: Instant,
     ) -> std::result::Result<CloudSessionGrant, CloudSessionCycleOutcome> {
-        let started = Instant::now();
         let Some(timeout) = remaining_relay_budget(deadline) else {
             return Err(CloudSessionCycleOutcome::NotDue);
         };
