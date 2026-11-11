@@ -41,7 +41,8 @@ fn copied_content_and_path_twins_count_once() {
                 format!("other/{ROOT}.jsonl")
             };
             let copy = c.write_at(&relative, &resumed(ROOT, &[A, B]), BORN);
-            let copy_key = crate::snapshots::local_index_key(&copy);
+            let copy_key = copy.to_string_lossy().into_owned();
+            owe(&mut prior);
             let mut page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
             assert_eq!(
                 body(&page, ROOT).unwrap().request_count,
@@ -125,7 +126,7 @@ fn resumed_file_uses_the_in_folder_holders_session() {
             assert!(!page
                 .index
                 .claude_copy_removals
-                .pending(location_key(&crate::snapshots::local_index_key(&copy))));
+                .pending(location_key(&copy.to_string_lossy().into_owned())));
             prior = settle(&c, &prior, page, &mut e2_progress());
         }
     });
@@ -144,7 +145,7 @@ fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
         );
         let mut prior = warm(&c);
         let path = c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), BORN);
-        let key = crate::snapshots::local_index_key(&path);
+        let key = path.to_string_lossy().into_owned();
         for _ in 0..4 {
             let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
             crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
@@ -187,12 +188,13 @@ fn distinct_same_session_file_counts_and_copies_never_prove_copies() {
         let origin = c.root(ROOT, &resumed(ROOT, &[A, B]));
         let mut prior = warm(&c);
         c.write_at(&file(COPY), &resumed(ROOT, &[C]), BORN);
+        owe(&mut prior);
         let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         assert_eq!(body(&page, ROOT).unwrap().request_count, 3);
         prior = settle(&c, &prior, page, &mut e2_progress());
         // The accepted origin itself stores A as a removal: it is no longer
         // an origin for A, even though its positive census still contains A.
-        let origin_key = crate::snapshots::local_index_key(&origin);
+        let origin_key = origin.to_string_lossy().into_owned();
         prior.claude_copy_removals.store(
             location_key(&origin_key),
             BTreeMap::from([(
@@ -323,7 +325,7 @@ fn copied_file_version_three_converges_once() {
                 prefix
             };
             let path = c.write_at(&relative, &text, BORN);
-            let key = crate::snapshots::local_index_key(&path);
+            let key = path.to_string_lossy().into_owned();
             // Model the former completed-but-unaccepted holder wait. It
             // expires once, producing the over-counted body this upgrade fixes.
             prior.claude_copy_removals.advance_hold(location_key(&key));

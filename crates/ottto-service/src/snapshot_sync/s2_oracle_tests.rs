@@ -1311,7 +1311,7 @@ fn e2_pipeline_incomplete_census_keeps_prefix_owed_after_restart() {
         assert_eq!(
             prior.claude_copy_removals.hold_age(
                 crate::snapshots::claude_money_birth_store::location_key(
-                    &crate::snapshots::local_index_key(&c.root.join(file(COPY)))
+                    &c.root.join(file(COPY)).to_string_lossy()
                 )
             ),
             0
