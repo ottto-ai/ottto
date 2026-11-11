@@ -346,7 +346,7 @@ pub(super) fn current() -> StateV2Memory {
 /// Bytes the system allocator holds for live allocations, summed over every
 /// zone (`size_in_use`). Never `max_size_in_use`: it reads 0 on macOS 26.
 #[cfg(target_os = "macos")]
-pub(super) fn malloc_in_use() -> Option<u64> {
+pub(super) fn malloc_zone() -> (Option<u64>, Option<u64>) {
     // SAFETY: a null zone asks for the sum of all zones; `stats` is a
     // writable, correctly typed out pointer.
     let stats = unsafe {
@@ -354,11 +354,14 @@ pub(super) fn malloc_in_use() -> Option<u64> {
         libc::malloc_zone_statistics(std::ptr::null_mut(), &mut stats);
         stats
     };
-    u64::try_from(stats.size_in_use).ok()
+    (
+        u64::try_from(stats.size_in_use).ok(),
+        u64::try_from(stats.size_allocated).ok(),
+    )
 }
 #[cfg(not(target_os = "macos"))]
-pub(super) fn malloc_in_use() -> Option<u64> {
-    None
+pub(super) fn malloc_zone() -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 impl Observation {
@@ -550,4 +553,8 @@ mod tests {
     fn native_reader_returns_current_bytes() {
         assert!(current().rss_bytes.is_some_and(|bytes| bytes > 0));
     }
+}
+
+pub(super) fn malloc_in_use() -> Option<u64> {
+    malloc_zone().0
 }

@@ -991,19 +991,73 @@ struct ProcessSample {
 pub(crate) struct DiskBytes {
     pub(crate) disk_read_bytes: u64,
     pub(crate) disk_written_bytes: u64,
+    #[serde(flatten, serialize_with = "tier_a")]
+    counters: Metrics<7>,
 }
 impl DiskBytes {
     /// macOS `proc_pid_rusage` only; `None` elsewhere or on a failed read.
     pub(crate) fn now() -> Option<Self> {
         #[cfg(target_os = "macos")]
         {
-            // SAFETY: a plain C struct that proc_pid_rusage fills on success.
+            // resource.h v6: UUID followed by 56 uint64_t fields (libc stops at v4).
+            #[repr(C)]
+            struct Usage {
+                uuid: [u8; 16],
+                fields: [u64; 56],
+            }
+            let mut usage = Usage {
+                uuid: [0; 16],
+                fields: [0; 56],
+            };
+            if unsafe { libc::proc_pid_rusage(libc::getpid(), 6, (&raw mut usage).cast()) } == 0 {
+                let f = usage.fields;
+                static TIMEBASE: std::sync::OnceLock<Option<libc::mach_timebase_info_data_t>> =
+                    std::sync::OnceLock::new();
+                let timebase = TIMEBASE.get_or_init(|| {
+                    let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
+                    (unsafe { libc::mach_timebase_info(&mut info) } == 0 && info.denom != 0)
+                        .then_some(info)
+                });
+                let micros = |ticks: Option<u64>| {
+                    ticks.zip(timebase.as_ref()).and_then(|(n, t)| {
+                        u64::try_from(
+                            u128::from(n) * u128::from(t.numer) / u128::from(t.denom) / 1000,
+                        )
+                        .ok()
+                    })
+                };
+                return Some(Self {
+                    disk_read_bytes: f[16],
+                    disk_written_bytes: f[17],
+                    counters: Metrics([
+                        Some(f[40]),
+                        Some(f[41]),
+                        Some(f[3]),
+                        Some(f[2]),
+                        micros(Some(f[21])),
+                        micros(f[19].checked_add(f[20])),
+                        micros(
+                            f[18]
+                                .checked_add(f[22])
+                                .and_then(|n| n.checked_add(f[23]))
+                                .and_then(|n| n.checked_add(f[24])),
+                        ),
+                    ]),
+                });
+            }
+            // Older kernels may reject v6; retain their existing disk measurements.
             let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-            let read = (&raw mut usage).cast();
-            (unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, read) } == 0)
+            (unsafe {
+                libc::proc_pid_rusage(
+                    libc::getpid(),
+                    libc::RUSAGE_INFO_V2,
+                    (&raw mut usage).cast(),
+                )
+            } == 0)
                 .then_some(Self {
                     disk_read_bytes: usage.ri_diskio_bytesread,
                     disk_written_bytes: usage.ri_diskio_byteswritten,
+                    counters: Metrics::default(),
                 })
         }
         #[cfg(not(target_os = "macos"))]
@@ -1015,8 +1069,47 @@ impl DiskBytes {
         Some(Self {
             disk_read_bytes: b.disk_read_bytes.checked_sub(a.disk_read_bytes)?,
             disk_written_bytes: b.disk_written_bytes.checked_sub(a.disk_written_bytes)?,
+            counters: b.counters.delta(a.counters),
         })
     }
+}
+
+const METRIC_KEYS: [&str; 7] = [
+    "energy_nj",
+    "penergy_nj",
+    "interrupt_wkups",
+    "pkg_idle_wkups",
+    "qos_utility_us",
+    "qos_background_us",
+    "qos_default_us",
+];
+#[derive(Clone, Copy, Debug)]
+struct Metrics<const N: usize>([Option<u64>; N]);
+impl<const N: usize> Default for Metrics<N> {
+    fn default() -> Self {
+        Self([None; N])
+    }
+}
+impl<const N: usize> Metrics<N> {
+    fn delta(self, before: Self) -> Self {
+        Self(std::array::from_fn(|i| {
+            self.0[i]?.checked_sub(before.0[i]?)
+        }))
+    }
+}
+impl<const N: usize> Serialize for Metrics<N> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        for (key, value) in METRIC_KEYS.iter().zip(self.0) {
+            if let Some(n) = value {
+                map.serialize_entry(key, &n)?;
+            }
+        }
+        map.end()
+    }
+}
+fn tier_a<S: serde::Serializer>(m: &Metrics<7>, s: S) -> Result<S::Ok, S::Error> {
+    Metrics::<4>(std::array::from_fn(|i| m.0[i])).serialize(s)
 }
 
 fn process_sample() -> Option<ProcessSample> {
@@ -1358,6 +1451,8 @@ struct Observation {
     wall_elapsed_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     malloc_in_use_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes: Option<u64>,
     shared_process_cpu_delta_us: Option<u64>,
     #[serde(flatten)]
     shared_process_disk_delta: Option<DiskBytes>,
@@ -1369,6 +1464,12 @@ struct Observation {
     cli_children: Vec<cli_children::Counts>,
 }
 impl Observation {
+    fn slim(mut self) -> Self {
+        if let Some(disk) = self.shared_process_disk_delta.as_mut() {
+            disk.counters = Metrics::default();
+        }
+        self
+    }
     /// A zero-window event: a timestamp and no resource measurements.
     fn point() -> Self {
         Self::between(0, None, None)
@@ -1381,6 +1482,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             malloc_in_use_bytes: None,
+            malloc_allocated_bytes: None,
             footprint: Default::default(),
             cli_children: cli_children::snapshot(),
             shared_process_cpu_delta_us: before
@@ -1405,7 +1507,16 @@ pub(crate) fn source_prepare<T>(
 ) -> T {
     flush_offpass();
     let probe = Probe::start();
-    let malloc_in_use_bytes = footprint::malloc_in_use();
+    let (malloc_in_use_bytes, malloc_allocated_bytes) = footprint::malloc_zone();
+    if let Some(slot) = source_slot(source) {
+        with_passes(|p| {
+            p.lock().unwrap_or_else(|e| e.into_inner())[slot] = Some((
+                probe.started,
+                probe.process,
+                [malloc_in_use_bytes, malloc_allocated_bytes],
+            ))
+        });
+    }
     let footprint = footprint::Stage::begin();
     let result = inner();
     if source == "claude_code" && v2_active(&result) {
@@ -1418,6 +1529,7 @@ pub(crate) fn source_prepare<T>(
         source: Source::from_slug(source),
         observation: Observation {
             malloc_in_use_bytes,
+            malloc_allocated_bytes,
             ..probe.stage_observation(footprint.as_ref())
         },
         counts: BTreeMap::<&str, u64>::new(),
@@ -1499,8 +1611,51 @@ fn source_finish_inner<T>(
     if v2_active {
         crate::snapshots::state_v2_post_pass_observed(relief);
     }
+    let started = Instant::now();
+    let after = process_sample();
+    let zone_end = footprint::malloc_zone();
+    window.finish_sample = Some(after);
+    window.pass = source_slot(source)
+        .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
+        .map(|(start, before, zone_start)| {
+            let counters = before
+                .and_then(|p| p.disk)
+                .zip(after.and_then(|p| p.disk))
+                .map(|(a, b)| b.counters.delta(a.counters))
+                .unwrap_or_default();
+            PassSummary {
+                wall_us: wall_us(start),
+                cpu_us: before
+                    .zip(after)
+                    .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+                counters,
+                malloc_in_use_bytes_start: zone_start[0],
+                malloc_allocated_bytes_start: zone_start[1],
+                malloc_in_use_bytes: zone_end.0,
+                malloc_allocated_bytes: zone_end.1,
+                sample_cost_us: wall_us(started),
+            }
+        });
     drop(window);
     result
+}
+type PassStart = (Instant, Option<ProcessSample>, [Option<u64>; 2]);
+process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([None; 3]));
+#[derive(Serialize)]
+struct PassSummary {
+    wall_us: u64,
+    cpu_us: Option<u64>,
+    #[serde(flatten)]
+    counters: Metrics<7>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes: Option<u64>,
+    sample_cost_us: u64,
 }
 /// Named stage window, emitted on normal drop; unwinding emits nothing.
 /// `offpass_` stages add CPU split scalars and do not start footprint sampling.
@@ -1513,6 +1668,8 @@ pub(crate) struct StageWindow {
     evidence_mem: Option<EvidenceMem>,
     allocator_relief: Option<AllocatorRelief>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    finish_sample: Option<Option<ProcessSample>>,
+    pass: Option<PassSummary>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
@@ -1571,6 +1728,8 @@ impl StageWindow {
             jsonl: None,
             evidence_mem: None,
             allocator_relief: None,
+            finish_sample: None,
+            pass: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
         }
     }
@@ -1616,17 +1775,36 @@ impl Drop for StageWindow {
             evidence_mem: Option<EvidenceMem>,
             #[serde(skip_serializing_if = "Option::is_none")]
             allocator_relief: Option<AllocatorRelief>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pass: Option<PassSummary>,
+        }
+        let mut observation = match self.finish_sample {
+            Some(after) => {
+                Observation::between(wall_us(self.probe.started), self.probe.process, after)
+            }
+            None => self.probe.observation(),
+        };
+        observation.footprint = self
+            .footprint
+            .as_ref()
+            .map_or_else(footprint::unavailable, footprint::Stage::finish);
+        if !matches!(
+            self.stage,
+            "source_finish" | "claude_local_evidence" | "evidence_read" | "evidence_fold"
+        ) {
+            observation = observation.slim();
         }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: self.stage,
             source: self.source,
-            observation: self.probe.stage_observation(self.footprint.as_ref()),
+            observation,
             counts: Counts {
                 refusal_exposure: self.probe.refusal_exposure,
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
+                pass: self.pass.take(),
                 allocator_relief: self.allocator_relief.filter(|_| cfg!(target_os = "macos")),
             },
         });
@@ -1666,6 +1844,9 @@ fn aggregate_offpass(mut row: Record<OffpassCounts>) {
                 .map(|(a, b)| DiskBytes {
                     disk_read_bytes: a.disk_read_bytes + b.disk_read_bytes,
                     disk_written_bytes: a.disk_written_bytes + b.disk_written_bytes,
+                    counters: Metrics(std::array::from_fn(|i| {
+                        a.counters.0[i]?.checked_add(b.counters.0[i]?)
+                    })),
                 });
             row.observation.wall_elapsed_us += previous.observation.wall_elapsed_us;
             row.observation.process_lifetime_max_rss_before_bytes =
@@ -2367,7 +2548,7 @@ impl Drop for UploadCall {
             process_id: std::process::id(),
             stage: "snapshot_batch_call",
             source: self.source,
-            observation: self.probe.observation(),
+            observation: self.probe.observation().slim(),
             counts: &self.counts,
         });
     }
@@ -2874,7 +3055,7 @@ mod tests {
                 assert!(record["counts"]["allocator_relief"][field].is_u64());
             }
         } else {
-            assert_eq!(record["counts"], serde_json::json!({}));
+            assert!(record["counts"].get("allocator_relief").is_none());
         }
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
@@ -2972,7 +3153,27 @@ mod tests {
                     process_id: std::process::id(),
                     stage: "offpass_cloud_sessions",
                     source: Source::Codex,
-                    observation: Observation::between(7, None, None),
+                    observation: Observation::between(
+                        7,
+                        Some(ProcessSample {
+                            cpu_us: 1,
+                            lifetime_max_rss_bytes: 1,
+                            disk: Some(DiskBytes {
+                                disk_read_bytes: 1,
+                                disk_written_bytes: 1,
+                                counters: Metrics([Some(1); 7]),
+                            }),
+                        }),
+                        Some(ProcessSample {
+                            cpu_us: 2,
+                            lifetime_max_rss_bytes: 1,
+                            disk: Some(DiskBytes {
+                                disk_read_bytes: 2,
+                                disk_written_bytes: 2,
+                                counters: Metrics([Some(2); 7]),
+                            }),
+                        }),
+                    ),
                     counts: OffpassCounts {
                         count: 1,
                         cpu_user_us: Some(2),
@@ -2990,6 +3191,9 @@ mod tests {
             serde_json::json!({"count": 3, "cpu_user_us": 6, "cpu_sys_us": 15, "wall_max_us": 7})
         );
         assert_eq!(rows[0]["observation"]["wall_elapsed_us"], 21);
+        for key in &METRIC_KEYS[..4] {
+            assert_eq!(rows[0]["observation"][key], 3);
+        }
         assert_eq!(rows[1]["stage"], "source_prepare");
     }
 
@@ -3013,6 +3217,15 @@ mod tests {
                     for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
                         assert!(record["counts"]["allocator_relief"][field].is_u64());
                     }
+                }
+                if record["stage"] == "source_finish" {
+                    let pass = &record["counts"]["pass"];
+                    assert!(pass["wall_us"].is_u64() && pass["cpu_us"].is_u64());
+                    assert!(pass["sample_cost_us"].is_u64());
+                    assert_eq!(
+                        pass["malloc_allocated_bytes"].is_u64(),
+                        cfg!(target_os = "macos")
+                    );
                 } else {
                     assert_eq!(record["counts"], serde_json::json!({}));
                 }
@@ -3020,6 +3233,7 @@ mod tests {
                 let row = &record["observation"];
                 if cfg!(target_os = "macos") && record["stage"] == "source_prepare" {
                     assert!(row["malloc_in_use_bytes"].is_u64());
+                    assert!(row["malloc_allocated_bytes"].is_u64());
                 } else {
                     assert!(row.get("malloc_in_use_bytes").is_none());
                 }
@@ -3557,6 +3771,7 @@ mod tests {
                 disk: Some(DiskBytes {
                     disk_read_bytes: cpu_us * 100,
                     disk_written_bytes: cpu_us,
+                    counters: Metrics([Some(cpu_us); 7]),
                 }),
             })
         };
@@ -3572,12 +3787,28 @@ mod tests {
             let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
             assert!(record.get("disk_read_bytes").is_none());
             assert!(record.get("disk_written_bytes").is_none());
+            for key in METRIC_KEYS {
+                assert!(record.get(key).is_none());
+            }
         }
         let result = Observation::between(12, sample(10), sample(17));
         assert_eq!(result.shared_process_cpu_delta_us, Some(7));
         let record = serde_json::to_value(&result).unwrap();
         assert_eq!(record["disk_read_bytes"], 700);
         assert_eq!(record["disk_written_bytes"], 7);
+        for key in &METRIC_KEYS[..4] {
+            assert_eq!(record[key], 7);
+        }
+        for key in &METRIC_KEYS[4..] {
+            assert!(record.get(key).is_none());
+        }
+        let regressing = Metrics([Some(12), Some(1), None, Some(0)]).delta(Metrics([
+            Some(10),
+            Some(2),
+            Some(1),
+            Some(0),
+        ]));
+        assert_eq!(regressing.0, [Some(2), None, None, Some(0)]);
         assert_eq!(result.process_lifetime_max_rss_bytes, Some(4096));
         assert_eq!(result.process_lifetime_max_rss_before_bytes, Some(4096));
         for (before, after) in [
