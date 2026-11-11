@@ -226,6 +226,7 @@ impl ReofferServer {
                                 let fingerprint = fingerprint_of(item);
                                 let mut body = item.clone();
                                 body.as_object_mut().unwrap().remove("semantic_envelope");
+                                body.as_object_mut().unwrap().remove("collected_at");
                                 let mut stored = saved_bodies.lock().unwrap();
                                 let unchanged = stored.get(&fingerprint) == Some(&body);
                                 stored.insert(fingerprint.clone(), body);
@@ -2924,8 +2925,16 @@ fn a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved() 
     let whole = |offer: &serde_json::Value, first: &serde_json::Value| {
         assert_eq!(fingerprint_of(offer), fingerprint_of(first));
         assert_eq!(usage_of(offer), usage_of(first));
+        let stable = |value: &serde_json::Value| {
+            let mut value = value.clone();
+            // Per-pass collection time is metadata, outside the semantic
+            // fingerprint and body witness; compare every other wire field.
+            value.as_object_mut().unwrap().remove("collected_at");
+            value
+        };
         assert_eq!(
-            offer, first,
+            stable(offer),
+            stable(first),
             "same complete usage, placement and patch bytes"
         );
         assert!(offer["cache_observations"].is_object(), "the whole patch");
