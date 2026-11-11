@@ -593,20 +593,13 @@ impl crate::snapshots::CodexContinuationEvidence {
         let mut inventory = codex_file_join::HeaderInventory::new(roots, paths, Some(&directories));
         while !inventory.step(&codex) {}
         assert!(inventory.content_unchanged(), "certified fixture inventory");
-        Self {
-            inventory,
-
-            codex,
-            traces: None,
-        }
+        Self { inventory, codex }
     }
 }
 pub(in crate::snapshots) fn constrain_eof_park(job: &mut OwnedActiveFile) {
     if FAIL_EOF_PARK.with(std::cell::Cell::get) {
         shrink_paused_buffer(&mut job.parser.reader.buf);
-        let inputs = job.parser.take_live_reduction_inputs();
         let charge = paused_charge(job).expect("bounded EOF job");
-        job.parser.restore_live_reduction_inputs(inputs);
         TEST_STATE_BUDGET.with(|limit| limit.set(Some(charge - 1)));
     }
 }
@@ -1503,13 +1496,13 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
     });
 }
 
-/// K1: a session larger than B with more than 256 distinct
-/// usage-bearing turns (UUID-shaped turn ids in `task_started`,
-/// `turn_context`, `token_count`, `task_complete` shapes) keeps every exact
-/// witness in its byte-charged slot, pages to a certificate, publishes once
-/// and matches the unpaged read.
+/// K1: a session larger than B with 400 distinct usage-bearing turns
+/// (UUID-shaped turn ids in `task_started`, `turn_context`, `token_count`,
+/// `task_complete` shapes) pages to a certificate, publishes once and matches
+/// the unpaged read. A new read records no priority decision, so no pause
+/// holds a per-turn witness.
 #[test]
-fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
+fn turn_heavy_session_pages_and_publishes_once() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1566,10 +1559,7 @@ fn turn_heavy_session_pages_past_the_witness_cap_and_publishes_once() {
         }
         panic!("turn-heavy job did not certify: {}", counters(&cache));
     });
-    assert!(
-        widest > sampled_jsonl::MAX_PRIORITY_WITNESSES,
-        "a pause held {widest} exact witnesses"
-    );
+    assert_eq!(widest, 0, "a pause held {widest} witnesses");
     assert_eq!(publishing_pages, 1);
     assert_eq!(counter(&cache, |c| c.jobs_state_bound), 0);
     assert_eq!(counter(&cache, |c| c.jobs_started), 1);

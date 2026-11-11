@@ -29,12 +29,12 @@ Collectors:
   selected workspace id are uploaded only as the agent-status `account_id` and
   `organization_id`, next to their hashes.
 - `cloud_sessions`: an explicit-setup experimental collector for the officially documented, upstream-experimental `codex cloud list --json` metadata surface. One supervisor starts normally but remains inert until the user's versioned local grant exactly matches the connected user, organization, and Codex relay device and the server approves that same grant epoch. Later consent activates on the next cycle without restarting the daemon. Only after those local checks and trusted-destination validation does the collector load Ottto's relay device credential; it never reads provider credentials or passes the device secret through browser control, logs, checkpoints, or observation payloads. Five-minute unchanged head polls produce zero observation/ingest upload; mandatory backend grant revalidation still occurs. Full scans run daily and until completed. A process-memory-only scan continues across cycles, capped at 100 pages/2,000 unique entities and uploaded as ordered v2 chunks of at most 200. Cursor pagination proves positive observations only. Only an explicit official `cursor: null` proves terminal enumeration; one such response of at most 20 entities may be labeled `single_response`. Multi-page official terminal scans are `unstable_cursor`. Fieldless objects, root arrays, and alias-only nulls may preserve valid nonempty positive facts but never finalize or authorize absence; empty ambiguous responses fail closed. Cap, cursor, payload, and timeout failures also never finalize. Restart discards cursor/inventory and begins a new UUID from page zero. Every provider page and upload revalidates local kill/pause/revoke state plus the exact backend grant and policy, then enters a shared provider/relay admission fence; response-loss retries reuse identical DTOs. Pause/revoke persists the stopped state before waiting for already admitted provider or relay I/O, so no new upload can begin and no admitted upload outlives the completed control action. V1 remains only for observation-empty hourly heartbeats. Status reflects local consent, policy, and transport readiness; provider invocation stays forbidden until all local gates pass and exact backend authority is then revalidated before admission.
-- `logs2_trace`: reads the requested per-turn `service_tier` from the undocumented
-  Codex `logs_2.sqlite` debug database (read-only, time-bounded, row-capped,
-  best-effort) to mark fast-mode turns — a turn whose `response.create` request
-  asked for `priority` is billed at the fast rate. Reads only the request type,
-  `service_tier`, and the `turn.id` tracing span; never reads prompt, instruction,
-  response, or tool output, and never uploads raw content.
+- `logs2_trace`: no longer read. The daemon does not open the undocumented
+  Codex `logs_2.sqlite` debug database; fast-mode turns come from rollout thread
+  settings. A row an earlier build marked fast from that database keeps its tier
+  through the daemon's protected tier receipt. The manifest stays declared until
+  the server's collector bindings retire it. It never read prompt, instruction,
+  response, or tool output, and never uploaded raw content.
 
 Raw prompts, responses, tool output, local paths, tokens, and credentials must not be uploaded by these collectors. Local enriched uploads stay aggregate and metadata-only unless a later manifest version explicitly declares a different upload boundary.
 

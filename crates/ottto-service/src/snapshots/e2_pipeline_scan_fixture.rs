@@ -1,8 +1,8 @@
 //! Test-only observation of the real scanner; no alternate parser/finalizer.
-use super::*;
+use crate::snapshots::*;
 use crate::transcript_acquisition::Scope;
 
-pub(crate) use super::g7_debt::tests::assert_file_receipt_retires_debt;
+pub(crate) use crate::snapshots::g7_debt::tests::assert_file_receipt_retires_debt;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
 fn scan_binding(source: SnapshotSource) -> (Scope, bool) {
@@ -638,7 +638,7 @@ pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
 }
 
 pub(crate) fn with_resident_budget<T>(budget: f64, run: impl FnOnce() -> T) -> T {
-    super::claude_history_upgrade::with_resident_budget(budget, run)
+    crate::snapshots::claude_history_upgrade::with_resident_budget(budget, run)
 }
 
 pub(crate) fn with_history_byte_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
@@ -706,9 +706,9 @@ pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str)
         .iter()
         .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
     for entry in index.files.values_mut() {
-        entry.upload_context_receipt = Some(super::upload_context_receipt::Receipt {
+        entry.upload_context_receipt = Some(crate::snapshots::upload_context_receipt::Receipt {
             context_fingerprint: context.into(),
-            replay_generation: super::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+            replay_generation: crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
             source_witness: entry.source_file_fingerprint.clone(),
             body_witness: entry.last_upload_body_witness.clone().unwrap_or_default(),
         });
@@ -720,9 +720,9 @@ pub(crate) fn receipt_acked_files_for_test(index: &mut ScanIndex, context: &str)
 /// the file still owes its own upload exactly as if it had no receipt.
 pub(crate) fn origin_accepted_for_test(index: &mut ScanIndex, key: &str) {
     index.files.get_mut(key).unwrap().upload_context_receipt =
-        Some(super::upload_context_receipt::Receipt {
+        Some(crate::snapshots::upload_context_receipt::Receipt {
             context_fingerprint: "another-upload-context".into(),
-            replay_generation: super::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
+            replay_generation: crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH,
             source_witness: "a".repeat(64),
             body_witness: "b".repeat(64),
         });
@@ -782,7 +782,7 @@ pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &P
                     index.active_upload_context_fingerprint.as_ref()
                         == Some(&receipt.context_fingerprint)
                         && receipt.replay_generation
-                            == super::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+                            == crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
                         && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
                 })
         })
@@ -834,7 +834,7 @@ pub(crate) fn parse_ordinary(
     parse_ordinary_with_metadata(path, at, fingerprint, &ClaudeTitleMetadata::default())
 }
 
-pub(super) fn parse_ordinary_with_metadata(
+pub(in crate::snapshots) fn parse_ordinary_with_metadata(
     path: &Path,
     at: &str,
     fingerprint: String,
@@ -847,7 +847,6 @@ pub(super) fn parse_ordinary_with_metadata(
         path,
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
-        None,
         None,
     )?;
     while !parser.step()? {}
@@ -927,5 +926,19 @@ pub(crate) fn hold_file_decode_for_test(index: &mut ScanIndex, key: &str) {
     index
         .decode_holds
         .v2_insert("files", key.to_owned(), b"null".to_vec(), None, 4)
+        .unwrap();
+}
+
+/// Retain the decoder's exact-entity hold for retry eligibility controls.
+pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &str) {
+    index
+        .decode_holds
+        .v2_insert(
+            "quarantined_snapshot_fingerprints",
+            fingerprint.to_owned(),
+            b"null".to_vec(),
+            None,
+            4,
+        )
         .unwrap();
 }

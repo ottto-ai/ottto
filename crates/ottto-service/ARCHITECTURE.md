@@ -110,6 +110,7 @@ newer usage. Earlier refusals stay counted as owed, with their dispositions
 unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries
 use retained bodies; transcripts are read again only for changed input. Unknown
 non-permanent reasons hold their entity without invalidating sibling ACKs.
+Eligible superseded quarantines that become current again resume their remaining ordinary retry budget, saved before source acquisition.
 
 **Refusal custody.** A fresh permanent `accepted_log_stale_older_upload` refusal
 follows the existing dominated, terminal residue path and never becomes an
@@ -162,11 +163,11 @@ streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
 
-Recent logs still use the existing full reader on every pass at both log
-locations, including its time window, ts-DESC result limit and incompleteness
-rules. Sidecar facts are never persisted; a restart fully loads them. Terminal
-scan diagnostics include reuse/reload counts for state, history and session
-index facts, plus absent roots. An incremental logs reader is deferred.
+Codex logs are not read. Priority comes only from rollout thread settings; a
+row an earlier build priced from logs keeps that tier through its protected
+tier receipt. Sidecar facts are never persisted; a restart fully loads them.
+Terminal scan diagnostics include reuse/reload counts for state, history and
+session index facts, plus absent roots.
 
 ## CLI status metadata
 

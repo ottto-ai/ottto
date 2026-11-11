@@ -1,6 +1,6 @@
-//! Codex sidecar data: the title metadata merged from the session index,
-//! state and logs databases, its per-path, title, state-thread and
-//! rollout-extent rows, and the per-turn priority trace map.
+//! Codex sidecar data: the title metadata merged from the session index and
+//! state databases, and its per-path, title, state-thread and rollout-extent
+//! rows.
 
 use crate::snapshots::*;
 use crate::transcript_acquisition::{ContentStamp, SourceStamp, StampedFacts};
@@ -152,35 +152,6 @@ fn title_prefix(
 pub(in crate::snapshots) struct CodexRolloutExtent {
     pub(in crate::snapshots) next_byte_offset: u64,
     pub(in crate::snapshots) next_ordinal: u64,
-}
-
-/// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
-/// debug DB.
-///
-/// Existing requested-priority signal from recent `logs_2.sqlite` request rows.
-/// The turn id links the tracing span to rollout turn_context. This turn-wide
-/// association is inherited application evidence: mixed requests within one
-/// turn lack a durable response-level selector join. Absence is not positive
-/// proof of standard pricing. File-owned receipts preserve previously applied
-/// decisions after traces expire without extending them to new contributions.
-#[derive(Debug, Clone, Default)]
-pub(in crate::snapshots) struct CodexTurnTraceMap {
-    pub(in crate::snapshots) since_epoch: i64,
-    pub(in crate::snapshots) priority_turns: BTreeSet<String>,
-    /// A present trace DB failed to load, or its row cap was reached: absent
-    /// turns are unknown, not standard (R2-H1). A paged job treats a flipped
-    /// decision under such a map as unavailable evidence, never a change.
-    pub(in crate::snapshots) incomplete: bool,
-}
-
-impl CodexTurnTraceMap {
-    pub(in crate::snapshots) fn is_priority_turn(&self, turn_id: &str) -> bool {
-        self.priority_turns.contains(turn_id)
-    }
-
-    pub(in crate::snapshots) fn is_incomplete(&self) -> bool {
-        self.incomplete
-    }
 }
 
 impl CodexTitleMetadata {
@@ -851,165 +822,6 @@ impl CodexTitleMetadata {
     }
 }
 
-// `logs_2.sqlite` can be ~1GB+ with a live WAL and a concurrent writer (Codex
-// itself). The read is best-effort, read-only, time-bounded, and row-capped so
-// it can never disrupt Codex or stall the snapshot cycle. Any error (missing
-// file, locked DB, schema churn) yields an empty map. Exact file-owned receipts
-// retain protected old decisions; absent new signals keep the existing default.
-const CODEX_LOGS2_MAX_ROWS: i64 = 50_000;
-const CODEX_LOGS2_BUSY_TIMEOUT_MS: u64 = 400;
-// The trace read window pads the session backfill window so a turn near a
-// window edge still finds its request row. Capped so a stale/huge DB can never
-// widen the scan unboundedly.
-const CODEX_LOGS2_WINDOW_PAD_DAYS: u64 = 1;
-const CODEX_LOGS2_MAX_WINDOW_DAYS: u64 = 14;
-
-impl CodexTurnTraceMap {
-    pub(in crate::snapshots) fn load_from_roots(
-        roots: &[PathBuf],
-        backfill_window_days: u64,
-    ) -> Self {
-        let mut map = Self::default();
-        let mut codex_dirs = BTreeSet::new();
-        for root in roots {
-            if let Some(parent) = root.parent() {
-                codex_dirs.insert(parent.to_path_buf());
-            }
-        }
-        let since_epoch = codex_logs2_since_epoch(backfill_window_days);
-        map.since_epoch = since_epoch;
-        for codex_dir in codex_dirs {
-            // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
-            // exists on some installs. Read whichever is present.
-            for db_path in [
-                codex_dir.join("logs_2.sqlite"),
-                codex_dir.join("sqlite").join("logs_2.sqlite"),
-            ] {
-                map.incomplete |= !load_codex_logs2_priority_turns(
-                    &db_path,
-                    since_epoch,
-                    &mut map.priority_turns,
-                );
-            }
-        }
-        map
-    }
-}
-
-fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
-    let window_days = backfill_window_days
-        .saturating_add(CODEX_LOGS2_WINDOW_PAD_DAYS)
-        .min(CODEX_LOGS2_MAX_WINDOW_DAYS);
-    let span = window_days.saturating_mul(86_400);
-    let now = unix_seconds(SystemTime::now()).unwrap_or(0);
-    now.saturating_sub(span) as i64
-}
-
-/// False when a present DB could not be read completely (open, prepare,
-/// query or row error, or the row cap reached); a missing DB is complete.
-fn load_codex_logs2_priority_turns(
-    path: &Path,
-    since_epoch: i64,
-    priority_turns: &mut BTreeSet<String>,
-) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    let Ok(connection) = codex_sqlite_read::CodexSqliteRead::open(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-        std::time::Duration::from_millis(CODEX_LOGS2_BUSY_TIMEOUT_MS),
-    ) else {
-        return false;
-    };
-    let Ok((turns, complete, read)) = connection.read(|connection| {
-        // Only `response.create` request rows carry the *requested* service_tier.
-        // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
-        // then filters to the sparse request rows (hundreds, not the full table).
-        let mut statement = connection.prepare(
-            "SELECT feedback_log_body FROM logs \
-             WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
-             ORDER BY ts DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
-            |row| row.get::<_, String>(0),
-        )?;
-        let mut complete = true;
-        let mut read = 0_u64;
-        let mut turns = Vec::new();
-        for body in rows {
-            let Ok(body) = body else {
-                complete = false;
-                continue;
-            };
-            read += 1;
-            turns.extend(codex_logs2_priority_turn_from_body(&body));
-        }
-        if read == CODEX_LOGS2_MAX_ROWS as u64 {
-            CapCounts::record("codex", 3, 1);
-        }
-        Ok((turns, complete, read))
-    }) else {
-        return false;
-    };
-    priority_turns.extend(turns);
-    complete && read < CODEX_LOGS2_MAX_ROWS as u64
-}
-
-/// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
-/// `response.create` request that asked for `service_tier="priority"`.
-///
-/// Privacy: the row's JSON payload contains the full prompt (`input`,
-/// `instructions`, `tools`). We read ONLY the `type` and `service_tier` fields
-/// and the `turn.id` tracing span; no prompt or output content is retained.
-fn codex_logs2_priority_turn_from_body(body: &str) -> Option<String> {
-    const MARKER: &str = "websocket request:";
-    let idx = body.rfind(MARKER)?;
-    let prefix = &body[..idx];
-    let json_text = body[idx + MARKER.len()..].trim();
-    let value: Value = serde_json::from_str(json_text).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("response.create") {
-        return None;
-    }
-    let tier = value.get("service_tier").and_then(Value::as_str)?;
-    if !tier.eq_ignore_ascii_case("priority") {
-        return None;
-    }
-    codex_logs2_span_field(prefix, "turn.id")
-        .or_else(|| codex_logs2_span_field(prefix, "turn_id"))
-        .filter(|turn_id| !turn_id.is_empty())
-}
-
-/// Extract a `key=value` field from a tracing-span prefix, where the value is
-/// terminated by whitespace, `,`, `{`, or `}`. The key must sit on an
-/// identifier boundary so `turn_id` does not match inside `parent_turn_id`.
-fn codex_logs2_span_field(prefix: &str, key: &str) -> Option<String> {
-    let needle = format!("{key}=");
-    let mut search_start = 0;
-    while let Some(rel) = prefix[search_start..].find(&needle) {
-        let at = search_start + rel;
-        let boundary = at == 0
-            || !prefix[..at]
-                .chars()
-                .next_back()
-                .map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-                .unwrap_or(false);
-        let value_start = at + needle.len();
-        if boundary {
-            let value: String = prefix[value_start..]
-                .chars()
-                .take_while(|c| !c.is_whitespace() && !matches!(c, ',' | '{' | '}'))
-                .collect();
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-        search_start = value_start;
-    }
-    None
-}
-
 fn apply_titles(
     loaded: &[(String, Option<String>)],
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
@@ -1525,7 +1337,6 @@ crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ord
 crate::heap_layout_bound::fields!(CodexStateThread; title, compact_title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
-crate::heap_layout_bound::fields!(CodexTurnTraceMap; since_epoch, priority_turns, incomplete);
 
 #[cfg(test)]
 mod reuse_tests;

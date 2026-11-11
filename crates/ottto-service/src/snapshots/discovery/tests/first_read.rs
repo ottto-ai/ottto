@@ -45,6 +45,7 @@ fn walk_at(f: &mut Fixture, census: &str) -> Value {
             BACKFILL_WINDOW_DAYS,
             64,
             None,
+            |_| {},
         )
     });
     rows.into_iter()

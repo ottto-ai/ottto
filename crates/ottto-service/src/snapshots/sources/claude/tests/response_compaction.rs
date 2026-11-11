@@ -210,7 +210,6 @@ fn native_parser(path: &Path) -> (OwnedJsonlParser, String) {
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         Some(&CodexTitleMetadata::default()),
-        None,
     )
     .unwrap();
     (parser, expected)

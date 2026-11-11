@@ -410,16 +410,16 @@ fn v2_group_with_ui_only_turn_held_until_turn_hook() {
     write_rows(&root.join("sessions/b.jsonl"), &ui_only);
     // Legacy counting: the extra admission has no native in its member.
     assert_eq!(
-        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::UiUnmatched, 1))
     );
     // §k.3 interim: under V2 the UI side is not money; a UI-only turn holds
     // the group at its end until the counting writer's turn hook lands.
-    let held = with_test_v2(|| replay_group(group_of(&root), None, &ScanIndex::default()));
+    let held = with_test_v2(|| replay_group(group_of(&root), &ScanIndex::default()));
     assert_eq!(refused(held), Some((JoinRefusal::V2UiOnlyTurn, 1)));
     write_rows(&root.join("sessions/b.jsonl"), &bound);
     assert!(
-        with_test_v2(|| replay_group(group_of(&root), None, &ScanIndex::default())).is_ok(),
+        with_test_v2(|| replay_group(group_of(&root), &ScanIndex::default())).is_ok(),
         "every admitted turn has a native: the V2 group replays"
     );
     fs::remove_dir_all(root).unwrap();
@@ -445,7 +445,7 @@ fn eze_rows(tail: Vec<Value>) -> Option<(JoinRefusal, usize)> {
     ];
     rows.extend(tail);
     write_rows(&root.join("sessions/b.jsonl"), &rows);
-    let result = refused(replay_group(group_of(&root), None, &ScanIndex::default()));
+    let result = refused(replay_group(group_of(&root), &ScanIndex::default()));
     fs::remove_dir_all(root).unwrap();
     result
 }
@@ -523,7 +523,7 @@ fn duplicate_origin_stub_replayed_first_does_not_change_live_context() {
         0,
     );
     write_rows(&root.join("sessions/main.jsonl"), &main);
-    let job = replay_group(group_of(&root), None, &ScanIndex::default())
+    let job = replay_group(group_of(&root), &ScanIndex::default())
         .expect("a neutral duplicate origin joins as a stub");
     let OwnedActiveFile {
         parser,
@@ -570,7 +570,7 @@ fn duplicate_origin_stub_replayed_first_does_not_change_live_context() {
         ),
     );
     assert_eq!(
-        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::OrdinalRestart, 0))
     );
     fs::remove_dir_all(root).unwrap();
@@ -763,7 +763,7 @@ fn equal_before_tie_held() {
         &member(OWNER, "r-bb", 100, 100),
     );
     assert_eq!(
-        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::EqualBeforeTie, 0))
     );
     let tokens = probe_before(&member(OWNER, "r", 100, 100)[1]);
@@ -904,7 +904,7 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
     rows.remove(3);
     write_rows(&root.join("sessions/b.jsonl"), &rows);
     assert_eq!(
-        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::Gap, 1)),
         "without loss the gap is terminal proof debt"
     );
@@ -924,7 +924,7 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
         .collect::<String>();
     fs::write(root.join("sessions/b.jsonl"), body).unwrap();
     assert!(matches!(
-        replay_group(group_of(&root), None, &ScanIndex::default()),
+        replay_group(group_of(&root), &ScanIndex::default()),
         Err(GroupEnd::Strict)
     ));
     let cache = Arc::new(SharedCache::default());
@@ -1791,10 +1791,10 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
 #[test]
 fn counting_v2_decision_reaches_the_group_proof() {
     let (root, _) = counting_v2_unbound_fixture();
-    assert!(replay_group(group_of(&root), None, &ScanIndex::default()).is_ok());
+    assert!(replay_group(group_of(&root), &ScanIndex::default()).is_ok());
     let _cutover = codex_counting_version::TestCutover::set(0);
     assert_eq!(
-        refused(replay_group(group_of(&root), None, &ScanIndex::default())),
+        refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::V2UnboundUi, 1))
     );
     fs::remove_dir_all(root).unwrap();
@@ -1986,7 +1986,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
     let mut active = boot
         .into_job(JobInputs {
             metadata: &metadata,
-            traces: None,
             cache: None,
             index: &index,
         })

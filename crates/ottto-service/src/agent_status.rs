@@ -3376,7 +3376,15 @@ fn codex_cli_meta(
                 COMMAND_TIMEOUT,
                 allow_legacy_oauth,
             );
-            let parsed_account = parse_codex_account_text(&login.stdout);
+            // Codex prints `login status` to stderr. Admit that text only where
+            // this pass's complete auth read overrides every field it fills;
+            // other homes keep their stdout-only account surface.
+            let login_text = if reuse_login {
+                command_output_text(&login)
+            } else {
+                login.stdout.clone()
+            };
+            let parsed_account = parse_codex_account_text(&login_text);
             let parsed_login = parsed_account
                 .as_ref()
                 .map(|account| account.login_state.clone());
@@ -20112,7 +20120,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
 
 #[cfg(test)]

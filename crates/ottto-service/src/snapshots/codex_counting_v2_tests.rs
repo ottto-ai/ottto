@@ -198,7 +198,6 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
         sampled_scan::ParserOptions {
             source: SnapshotSource::Codex,
             metadata: &metadata,
-            traces: None,
             identity_capture: false,
             cache: None,
         },
@@ -581,22 +580,26 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
     assert_eq!(counts.codex_non_default_thread_tier, 9);
 }
 
-/// [money] `logs_2` and the protected replay win over the running thread tier,
-/// which files no receipt of its own. A receipt filed from state without the
-/// reducer's key, as a record saved before the release holds, still replays.
+/// [money] An older build's logs-derived tier and its protected replay win over
+/// the running thread tier, which files no receipt of its own. A receipt filed
+/// from state without the reducer's key, as a record saved before the release
+/// holds, still replays. A new read with no receipt prices the turn at the
+/// thread tier: Codex logs no longer supply priority.
 #[test]
-fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
+fn codex_thread_tier_yields_to_the_protected_replay() {
     use super::codex_file_join::{AppliedTierReceipt, TierReplay};
     let pass = |values: &[Value],
                 v2: bool,
-                traces: Option<CodexTurnTraceMap>,
+                older_logs: bool,
                 receipt: Option<AppliedTierReceipt>,
                 keyless: bool| {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         if v2 {
             codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
         }
-        accumulator.codex_turn_traces = traces.map(Arc::new);
+        if older_logs {
+            crate::snapshots::older_build_logs_priority("fast-turn");
+        }
         let required = receipt.is_some();
         accumulator.codex_tier_replay = Some(TierReplay::new(receipt, required, "scope".into()));
         for value in values {
@@ -613,6 +616,7 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
                     .remove(CODEX_THREAD_TIER);
             }
         }
+        crate::snapshots::older_build_logs_expired();
         assert_eq!(accumulator.codex_counting_v2(), v2);
         let filed = accumulator
             .codex_tier_replay
@@ -649,8 +653,6 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
         true,
         200,
     );
-    let mut traces = CodexTurnTraceMap::default();
-    traces.priority_turns.insert("fast-turn".into());
     let logs_2 = Some("derived_from_logs_2".to_string());
     let expected = BTreeMap::from([
         (Some("priority".to_string()), (100, logs_2)),
@@ -660,15 +662,24 @@ fn codex_thread_tier_yields_to_logs_2_and_the_protected_replay() {
         ),
     ]);
     for v2 in [false, true] {
-        let (item, receipt) = pass(values.as_slice(), v2, Some(traces.clone()), None, false);
-        assert_eq!(input_by_tier(&item), expected, "logs_2 {v2}");
-        let (item, replayed) = pass(values.as_slice(), v2, None, receipt.clone(), false);
+        let (item, receipt) = pass(values.as_slice(), v2, true, None, false);
+        assert_eq!(input_by_tier(&item), expected, "older build {v2}");
+        let (item, replayed) = pass(values.as_slice(), v2, false, receipt.clone(), false);
         assert_eq!(input_by_tier(&item), expected, "replay {v2}");
         assert_eq!(replayed, receipt, "the thread tier files no receipt {v2}");
-        let (_, old_receipt) = pass(values.as_slice(), v2, Some(traces.clone()), None, true);
+        let (_, old_receipt) = pass(values.as_slice(), v2, true, None, true);
         assert_eq!(
             old_receipt, receipt,
             "the key is outside the replay key {v2}"
+        );
+        let (item, _) = pass(values.as_slice(), v2, false, None, false);
+        assert_eq!(
+            input_by_tier(&item),
+            BTreeMap::from([(
+                Some("flex".to_string()),
+                (300, Some(THREAD_TIER_SOURCE.to_string())),
+            )]),
+            "a new read takes no tier from Codex logs {v2}"
         );
     }
 }

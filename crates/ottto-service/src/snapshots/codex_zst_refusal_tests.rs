@@ -199,15 +199,9 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
     let input =
         OpenedInput::compressed(physical, 1024, compressed_input_credit().unwrap()).unwrap();
     assert!(is_compressed_codex_rollout(Some(&path), Some(&input)));
-    let mut parser = OwnedJsonlParser::new_opened(
-        input,
-        &path,
-        SnapshotSource::Codex,
-        apply_codex_line,
-        None,
-        None,
-    )
-    .unwrap();
+    let mut parser =
+        OwnedJsonlParser::new_opened(input, &path, SnapshotSource::Codex, apply_codex_line, None)
+            .unwrap();
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
         assert!(parser
             .prepare_acquisition(
