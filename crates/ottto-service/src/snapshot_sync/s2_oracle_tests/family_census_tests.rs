@@ -166,17 +166,40 @@ fn first_sighting_and_legacy_overcount_converge_on_the_next_child_fold() {
         offered.finish();
         assert_eq!(offered.scan.snapshots.len(), 1, "one corrective offer");
         let prior = commit(&session, corrected);
-        // Plain Claude uses the same observed object/parser seams as the
-        // existing resident-wave quiet control. Never fabricate zero I/O.
-        let (mut quiet, io) = fixture::observe_codex_quiet(|| page(&c, prior, 100, true));
-        quiet.finish();
-        assert!(quiet.scan.snapshots.is_empty(), "no repeated correction");
-        assert_eq!(io.consumed, 0, "quiet restart reads no transcript bytes");
-        let mut quiet_route = result(&quiet, Mode::Restart);
-        quiet_route.io = io;
-        quiet_route.modes = quiet.modes;
-        money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
+        assert_quiet_restart(&c, prior);
     });
+}
+
+/// Measure the actual restarted Claude owner, including acquisition samples.
+fn assert_quiet_restart(c: &Corpus, prior: ScanIndex) {
+    let owner = E2ScanFixture::capturing_identity();
+    owner
+        .on_committed_route(&crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap());
+    let ((mut quiet, bytes), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
+        fixture::observe_consumed(|| {
+            let mut p = c.raw(&owner, prior, 100, true, &[]);
+            p.enrich(c);
+            p
+        })
+    });
+    let no_transcript = owner.paths().is_empty();
+    assert!(no_transcript, "quiet restart selects no transcript");
+    quiet.finish();
+    assert!(quiet.scan.snapshots.is_empty(), "no repeated offer");
+    let mut route = result(&quiet, Mode::Restart);
+    route.io.consumed = bytes;
+    // As in the existing Claude login/cap controls: no selected transcript
+    // supplies no head/named/other reader; actual acquisition samples are
+    // measured independently rather than inferred from parser consumption.
+    route.io.cheap_checks = no_transcript.then_some(0);
+    route.io.other_reads = no_transcript.then_some(0);
+    route.io.anchor_reads = Some(
+        samples
+            .iter()
+            .map(|read| u64::try_from(read.result.expect("Claude sample read succeeds")).unwrap())
+            .sum(),
+    );
+    money_oracle::assert_quiet_restart_zero_bytes(&route);
 }
 
 /// [money] A completed rewrite replaces positive membership. Only the next
@@ -332,5 +355,139 @@ fn stale_family_proof_preserves_two_account_placement_and_twin_order() {
         let twin_route = result(&twins, Mode::ColdFull);
         let restored = page(&c, ScanIndex::default(), 100, true);
         money_oracle::assert_equivalent(&twin_route, &result(&restored, Mode::Restart));
+    });
+}
+
+/// [money] Exact acceptance of the root closes the temporary destination
+/// undercount by itself: the already accepted child needs no replacement.
+#[test]
+fn root_ack_closes_transient_family_undercount_without_child_reoffer() {
+    with_e2(|| {
+        let mut c = corpus("family-census-root-ack");
+        let root = c.root(ROOT, &line(ROOT, "fork", AT, 10));
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let mut unsent = page(&c, index, 100, true);
+        unsent.finish();
+        assert!(unsent.delivered.is_none());
+        let mut prior = session.save_reload(&mut unsent.index);
+        assert!(prior.files[root.to_str().unwrap()]
+            .upload_context_receipt
+            .is_none());
+        stale(&mut prior, &root);
+        let child_path = copied(&mut c);
+        let child_only = child_page(&c, prior, &child_path);
+        let child_body = body(&child_only, &child()).unwrap();
+        assert_eq!(
+            (child_body.request_count, child_body.removed_request_count),
+            (1, Some(1))
+        );
+        let mut heads = BTreeMap::<String, SnapshotItem>::new();
+        // Inspect exactly the offer the real finalizer makes, then update
+        // server-model heads only after the commit driver's exact body ACKs.
+        let store = |p: Page, heads: &mut BTreeMap<String, SnapshotItem>| {
+            let mut posted = twin(&p);
+            posted.finish();
+            let expected = posted
+                .scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let (next, progress) = commit_with_progress(&session, p);
+            assert_eq!(
+                progress.fresh_context_body_acks, expected,
+                "exact ACKs of every offered body"
+            );
+            let offered = posted
+                .scan
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.clone())
+                .collect::<BTreeSet<_>>();
+            for item in posted.scan.snapshots {
+                heads.insert(item.source_session_id.clone(), item);
+            }
+            (next, offered)
+        };
+        let (prior, offered) = store(child_only, &mut heads);
+        assert_eq!(offered, BTreeSet::from([child()]));
+        assert!(
+            !heads.contains_key(ROOT),
+            "root body has never been accepted"
+        );
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        let count = |heads: &BTreeMap<String, SnapshotItem>| {
+            heads.values().map(|s| s.request_count).sum::<u64>()
+        };
+        let cold_count = |cold: &RouteResult| {
+            cold.snapshots
+                .values()
+                .map(|s| s["request_count"].as_u64().unwrap())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            (count(&heads), cold_count(&cold)),
+            (1, 2),
+            "temporary undercount before root ACK"
+        );
+        let child_fingerprint = heads[&child()].snapshot_fingerprint.clone();
+        // Ordinary new root work drives its Tail and upload. Child bytes
+        // stay unchanged; delivery of the root alone must close the gap.
+        append(&root, &line(ROOT, "root-later", "2026-08-02T07:02:00Z", 30));
+        let owner = E2ScanFixture::capturing_identity();
+        owner.on_committed_route(session.path());
+        let mut root_only = c.raw(&owner, prior, 100, true, std::slice::from_ref(&root));
+        root_only.enrich(&c);
+        assert_eq!(root_only.modes.0, 0, "root delivery needs no extra Full");
+        assert!(root_only.modes.1 > 0, "ordinary root growth uses Tail");
+        assert!(
+            !owner.paths().contains(&child_path),
+            "unchanged child is not read"
+        );
+        assert!(
+            body(&root_only, &child()).is_none(),
+            "no child re-offer before finalize"
+        );
+        let (prior, offered) = store(root_only, &mut heads);
+        assert_eq!(
+            offered,
+            BTreeSet::from([ROOT.to_owned()]),
+            "only the root is offered and ACKed"
+        );
+        assert!(
+            prior.files[root.to_str().unwrap()]
+                .upload_context_receipt
+                .is_some(),
+            "root earned an exact-ACK receipt"
+        );
+        assert_eq!(
+            heads[&child()].snapshot_fingerprint,
+            child_fingerprint,
+            "accepted child head stays unchanged"
+        );
+        assert_eq!(
+            heads[ROOT].request_count, 2,
+            "root head carries its copied response and later work"
+        );
+        let cold_page = page(&c, ScanIndex::default(), 100, false);
+        let cold = result(&cold_page, Mode::ColdFull);
+        assert_eq!(
+            count(&heads),
+            cold_count(&cold),
+            "accepted family total equals cold Full after root ACK"
+        );
+        let mut served = twin(&cold_page);
+        served.scan.snapshots = heads.into_values().collect();
+        money_oracle::assert_equivalent(&cold, &result(&served, Mode::Restart));
+        assert_quiet_restart(&c, prior);
     });
 }
