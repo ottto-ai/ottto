@@ -19753,7 +19753,8 @@ for line in sys.stdin:
             .is_none());
     }
 
-    fn seed_active_default_cloud_session_grant() -> crate::cloud_sessions::CloudSessionGrantStore {
+    fn seed_unconfirmed_default_cloud_session_grant(
+    ) -> crate::cloud_sessions::CloudSessionGrantStore {
         let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
         let device_id = "00000000-0000-4000-8000-000000000001";
         grants
@@ -19774,6 +19775,9 @@ for line in sys.stdin:
         grants
             .bind_backend_grant(&enabled, device_id)
             .expect("bind cleanup grant");
+        grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .expect("unconfirmed cleanup revoke");
         grants
     }
 
@@ -19812,7 +19816,7 @@ for line in sys.stdin:
         FilePendingDeviceCredentialStore::default()
             .save(&pending)
             .expect("save unguarded pending");
-        let grants = seed_active_default_cloud_session_grant();
+        let grants = seed_unconfirmed_default_cloud_session_grant();
         assert_eq!(
             recover_pending_device_credential_at_startup(),
             Err(LocalApiError::CloudSessionCleanupRequired)
@@ -19932,7 +19936,7 @@ for line in sys.stdin:
             })
             .expect("stage account switch")
             .expect("different user switch");
-        let grants = seed_active_default_cloud_session_grant();
+        let grants = seed_unconfirmed_default_cloud_session_grant();
         let authorization = RequestAuthorization::Token("token".to_string());
 
         assert_eq!(

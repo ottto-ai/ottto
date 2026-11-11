@@ -245,7 +245,7 @@ mod tests {
     use serde_json::json;
     use std::cell::Cell;
 
-    /// [behaviour] Both collectors use A1's exact five-field request and typed routes.
+    /// [behaviour] Both collectors use the exact five-field request and typed routes.
     #[test]
     fn request_and_routes_match_the_contract() {
         let request = request("wire");

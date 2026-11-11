@@ -476,16 +476,44 @@ impl CloudSessionGrantStore {
                 return Ok(state.grant);
             }
             if state.grant.backend_create_pending
-                || state
-                    .grant
-                    .backend_binding
-                    .as_ref()
-                    .is_some_and(|binding| !binding.backend_revoked)
+                || (state.grant.status == CloudSessionGrantStatus::Revoked
+                    && state
+                        .grant
+                        .backend_binding
+                        .as_ref()
+                        .is_some_and(|binding| !binding.backend_revoked))
             {
-                return Err(anyhow!(
-                    "existing cloud-session grant must be locally stopped and backend-revoked before scope replacement"
-                ));
+                return Err(anyhow!("pending cloud-session consent mutation must be reconciled before scope replacement"));
             }
+            let same_owner = state.grant.organization_fingerprint
+                == opaque_key(&key, &setup.organization_scope)
+                && state.grant.effective_user_fingerprint
+                    == opaque_key(&key, &setup.effective_user_scope);
+            let can_resume = same_owner
+                && state.grant.backend_binding.as_ref().is_some_and(|binding| {
+                    !binding.backend_revoked
+                        && binding.server_policy_state == CloudSessionServerPolicyState::Approved
+                })
+                && matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::Paused
+                )
+                && matches!(
+                    state.grant.last_error_category.as_deref(),
+                    None | Some("rebinding" | "rebind_unavailable")
+                );
+            if can_resume {
+                // Explicit resume restores admission to the original approval;
+                // the supervisor rebinds it before any provider execution.
+                state.grant.status = CloudSessionGrantStatus::Enabled;
+                state.grant.paused_at = None;
+                state.grant.last_error_category = Some("rebinding".to_string());
+                self.write(&state)?;
+                return Ok(state.grant);
+            }
+            // Explicit approval for another owner, or after a terminal refusal,
+            // replaces the sole local approval. It never authorizes collection
+            // until the ordinary-browser create response has been bound.
         }
         let key = random_key()?;
         let installation_fingerprint = opaque_key(&key, &setup.installation_id);
@@ -640,12 +668,20 @@ impl CloudSessionGrantStore {
                 || state.grant.backend_binding != proposal.expected.backend_binding
                 || response.grant_version != proposal.request.grant_version
                 || response.status != "enabled"
-                || response.server_policy_state != CloudSessionServerPolicyState::Approved
             {
                 return Err(anyhow!("cloud-session rebind consent changed"));
             }
             state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
             state.grant.grant_scope_id = proposal.request.grant_scope_fingerprint.clone();
+            state
+                .grant
+                .backend_binding
+                .as_mut()
+                .expect("bound grant")
+                .server_policy_state = response.server_policy_state.clone();
+            if response.server_policy_state == CloudSessionServerPolicyState::Disabled {
+                state.grant.status = CloudSessionGrantStatus::PolicyDisabled;
+            }
         }
         let local_status = state.grant.status.clone();
         validate_local_installation_binding(
@@ -767,12 +803,12 @@ impl CloudSessionGrantStore {
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
         validate_local_installation_binding(
             &state,
-            expected_installation_id,
+            &response.installation_id,
             "backend cloud-session revocation",
         )?;
         validate_backend_grant_response(&state, response, &state.grant.collector_version)?;
-        if response.installation_id != expected_installation_id {
-            return Err(anyhow!("backend cloud-session grant scope does not match"));
+        if !is_uuid(expected_installation_id) {
+            return Err(anyhow!("current cloud-session installation is invalid"));
         }
         let existing = state
             .grant
@@ -1862,12 +1898,12 @@ pub trait CloudSessionTransport {
     fn is_configured(&self) -> bool {
         true
     }
-    /// Upload wiring alone is insufficient: provider execution also requires
-    /// an ordinary-user authenticated grant-list preflight.
+    /// Current local device/account authority must still match at every I/O fence.
     fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
         true
     }
 
+    /// Provider execution also requires exact relay-authenticated grant authority.
     fn supports_grant_revalidation(&self) -> bool {
         false
     }

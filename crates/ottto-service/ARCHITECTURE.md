@@ -404,7 +404,9 @@ rebind preserves the grant epoch, consent-time build, account fingerprint and
 exclusions. The local grant is replaced atomically. It never replays transcripts.
 
 Live hardware must match the saved identity before collection and rebind. Missing
-hardware proof stops collection. A revoked or disabled approval is never rebound.
+hardware proof stops collection. A copied saved hardware identity requires an explicit
+forget-installation and new pairing before approval on the new Mac; fresh consent
+alone cannot override the hardware check. A revoked or disabled approval is never rebound.
 Terminal refusals stop retries for that binding until the binding changes or the
 service restarts. HTTP 404 retains the stopped-binding behavior for servers that
 have not deployed rebind yet. Transport, 429 and server errors use normal polling.
