@@ -401,6 +401,7 @@ impl<'a> Driver<'a> {
                     }
                     self.fixture.set_collection_window_days(
                         crate::snapshot_sync::resource_schedule::collection_window(
+                            183,
                             self.reselect_active,
                         ),
                     );
