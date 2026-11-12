@@ -319,7 +319,7 @@ impl BackfillState {
                 crate::snapshots::FIRST_READ_WINDOW_DAYS as i64,
             ))?
             .to_offset(time::UtcOffset::UTC);
-        let format = time::format_description::parse(
+        let format = time::format_description::parse_borrowed::<2>(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
         )
         .ok()?;

@@ -20199,7 +20199,6 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             scan_started_at,
