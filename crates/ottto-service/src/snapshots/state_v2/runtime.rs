@@ -139,6 +139,9 @@ struct RouteState {
     pass_written_start: Option<u64>,
     // This pass's unsaved Tail state, published by the next full save or at exit.
     tail: tail::TailStage,
+    // Non-empty Tail stages dropped by a pass owner since process start: a walk
+    // that saw one drop cannot certify its first-read listing.
+    tail_discards: u64,
     // Files whose committed head a commit may have changed since the Codex
     // header inventory's cache (its address) last took them (`take_head_writes`).
     // `None` until it first asks, and again on each new session: then any head
@@ -200,6 +203,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     save_hold: None,
                     pass_written_start: None,
                     tail: Default::default(),
+                    tail_discards: 0,
                     head_writes: None,
                 }))
             })

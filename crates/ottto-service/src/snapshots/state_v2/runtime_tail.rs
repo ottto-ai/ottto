@@ -1,5 +1,6 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
+use super::super::tail::first_read::{Member, Observed, Summary, SummaryEdit};
 use super::super::tail::{
     Collection, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
 };
@@ -120,6 +121,39 @@ pub(in crate::snapshots) fn observe_tails(
         state.tail.observe_all(observations);
         Ok(())
     })
+}
+/// First-read members and the summary edit, committed with this pass's debt.
+pub(in crate::snapshots) fn observe_first_read(
+    path: &Path,
+    members: Vec<(String, Observed)>,
+    edit: Option<SummaryEdit>,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe_first_read(members, edit);
+        Ok(())
+    })
+}
+/// The anchor this pass staged on `path` and has not committed.
+pub(in crate::snapshots) fn staged_first_read_anchor(path: &Path) -> Result<Option<u64>> {
+    with_state(path, |state| Ok(state.tail.staged_first_read_anchor()))
+}
+/// Non-empty stages dropped on `path` since process start.
+pub(in crate::snapshots) fn tail_stage_discards(path: &Path) -> Result<u64> {
+    with_state(path, |state| Ok(state.tail_discards))
+}
+/// The committed first-read summary of this route; `Err` when unreadable.
+pub(in crate::snapshots) fn first_read_summary(index: &ScanIndex) -> Result<Option<Summary>> {
+    Ok(read_txn(index, super::super::tail::first_read::read_summary)?.0)
+}
+/// The committed member row of `key`; `Err` when unreadable.
+pub(in crate::snapshots) fn first_read_member(
+    index: &ScanIndex,
+    key: &str,
+) -> Result<Option<Member>> {
+    Ok(read_txn(index, |tx| {
+        super::super::tail::first_read::read_member(tx, key.as_bytes())
+    })?
+    .0)
 }
 /// Source withdrawal or a foreign scope: every Tail row of `keys`, debt included,
 /// is erased with the next save. A file that still held unaccepted revisions
@@ -274,6 +308,7 @@ pub(super) fn discard_at_exit(path: &Path) {
     let _ = with_state(path, |state| {
         let dropped = std::mem::take(&mut state.tail);
         if !dropped.is_empty() {
+            state.tail_discards = state.tail_discards.saturating_add(1);
             telemetry::event(
                 "tail_stage_dropped",
                 &serde_json::json!({"files": dropped.files(), "bytes": dropped.bytes()}),

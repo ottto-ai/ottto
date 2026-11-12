@@ -264,6 +264,9 @@ pub(super) struct TailStage {
     debt: BTreeMap<Vec<u8>, Observation>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
+    /// First-read members observed this pass; the last observation wins.
+    first_read: BTreeMap<Vec<u8>, first_read::Observed>,
+    first_read_edit: Option<first_read::SummaryEdit>,
     peak_bytes: u64,
 }
 /// A proven representation/path move. Only its route binding and physical
@@ -299,7 +302,11 @@ impl TailStage {
         // A provisional discovery observation is superseded by the proven
         // predecessor, including its logical representation and existing debt.
         self.debt.remove(&to);
+        self.first_read.remove(&to);
         let mut moved = Self::default();
+        if let Some(member) = self.first_read.remove(from) {
+            moved.first_read.insert(to.clone(), member);
+        }
         if let Some(mut debt) = self.debt.remove(from) {
             debt.inventory = Some(carry.inventory.clone());
             moved.debt.insert(to, debt);
@@ -319,6 +326,27 @@ impl TailStage {
             && self.debt.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
+            && self.first_read.is_empty()
+            && self.first_read_edit.is_none()
+    }
+    /// First-read members to commit with this pass's debt; the last wins.
+    pub(super) fn observe_first_read(
+        &mut self,
+        members: Vec<(String, first_read::Observed)>,
+        edit: Option<first_read::SummaryEdit>,
+    ) {
+        for (key, member) in members {
+            self.first_read.insert(key.into_bytes(), member);
+        }
+        if let Some(edit) = edit {
+            self.first_read_edit
+                .get_or_insert_with(Default::default)
+                .merge(edit);
+        }
+    }
+    /// The anchor this pass staged and has not committed yet.
+    pub(super) fn staged_first_read_anchor(&self) -> Option<u64> {
+        self.first_read_edit.and_then(|edit| edit.anchor_at_ms)
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
         self.replace_observation(key, observation);
@@ -1347,6 +1375,7 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
     if let Some(marker) = tx.get(&set_aside_key(from)?)? {
         move_row(tx, &marker, set_aside_key(to)?)?;
     }
+    first_read::carried(tx, from, to)?;
     head.common.inventory = Some(carry.inventory.clone());
     // A metadata-only head stays metadata-only; a reduction remains Tail.
     let reduction = head.reduction.as_ref().map(|_| carry.head.as_slice());
@@ -1379,13 +1408,25 @@ pub(super) fn apply(
     removed: &[Vec<u8>],
 ) -> Result<bool> {
     let mut applied = Applied::default();
+    let edit = stage.and_then(|stage| stage.first_read_edit.as_ref());
+    let mut generation = first_read::Commit::begin(rows.tx()?, edit);
     let keys: BTreeSet<&Vec<u8>> = stage
         .into_iter()
-        .flat_map(|stage| stage.files.keys().chain(stage.debt.keys()))
+        .flat_map(|stage| {
+            stage
+                .files
+                .keys()
+                .chain(stage.debt.keys())
+                .chain(stage.first_read.keys())
+        })
         .collect();
     for file in keys {
         let entry = stage.and_then(|stage| stage.files.get(file));
         let debt = stage.and_then(|stage| stage.debt.get(file));
+        // Member rows are written only while the generation is open.
+        let member = stage
+            .and_then(|stage| stage.first_read.get(file))
+            .filter(|_| generation.open());
         let staged = match entry {
             Some(Entry::File(staged)) => Some(staged),
             _ => None,
@@ -1405,21 +1446,31 @@ pub(super) fn apply(
             Some(Entry::Failed(cause)) => Some(*cause),
             _ => None,
         };
-        if staged.is_some() || debt.is_some() {
+        if staged.is_some() || debt.is_some() || member.is_some() {
             let closure = match staged {
                 Some(_) => rows.take_closure(file)?,
                 None => Vec::new(),
             };
-            // The file's closure boundary: its graph rows, then its Tail rows.
+            // The file's closure boundary: its graph rows, its Tail rows, then
+            // its first-read member, whose counts apply only if all commit.
+            let mut counts = None;
             let result = rows.tx()?.isolated(&mut |tx| {
                 write_closure(tx, &closure)?;
-                applied.absorb(write_file(tx, file, staged, debt)?);
+                if staged.is_some() || debt.is_some() {
+                    applied.absorb(write_file(tx, file, staged, debt)?);
+                }
+                if let Some(member) = member {
+                    counts = Some(generation.write(tx, file, *member)?);
+                }
                 Ok(())
             })?;
             if result.is_err() {
                 applied.rolled_back += u64::from(staged.is_some());
                 rows.revert(closure);
                 failed = Some(SetAsideCause::Row);
+                generation.rolled_back(rows.tx()?, file, member.copied())?;
+            } else if let Some(counts) = counts {
+                generation.committed(counts);
             }
         }
         if let Some(cause) = failed {
@@ -1452,8 +1503,10 @@ pub(super) fn apply(
     for file in stage.into_iter().flat_map(|stage| &stage.erase) {
         delete_rows(tx, file, false)?;
         tx.delete(&set_aside_key(file)?)?;
+        generation.erased(tx, file)?;
         applied.erased += 1;
     }
+    generation.finish(tx, edit)?;
     if applied != Applied::default() {
         telemetry::event("tail_apply", &applied);
     }
@@ -1501,6 +1554,8 @@ pub(super) fn commit_exit(
     Ok(())
 }
 
+#[path = "tail_first_read.rs"]
+pub(super) mod first_read;
 #[cfg(test)]
 #[path = "tail_value_tests.rs"]
 mod value_tests;

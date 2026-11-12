@@ -68,9 +68,15 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carry_tail, erase_tail, legacy_archive_was_seen, load_head, load_revisions, load_tail,
-    observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys,
-    tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
+    carry_tail, erase_tail, first_read_member, first_read_summary, legacy_archive_was_seen,
+    load_head, load_revisions, load_tail, observe_first_read, observe_tail, observe_tails,
+    retire_tail, set_aside_tail, stage_tail, staged_first_read_anchor, tail_head_keys,
+    tail_route_path, tail_set_aside, tail_stage_discards, take_head_writes, unstage_tail,
+};
+pub(in crate::snapshots) use tail::first_read::{
+    Class as FirstReadClass, Counts as FirstReadCounts, Member as FirstReadMember,
+    Observed as FirstReadObserved, Summary as FirstReadSummary,
+    SummaryEdit as FirstReadEdit, BUCKETS as FIRST_READ_BUCKETS,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
