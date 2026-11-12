@@ -929,7 +929,7 @@ fn machine_identity(binding: LocalMachineBinding, hostname: String) -> MachineId
     MachineIdentity {
         machine_id: binding.machine_id,
         installation_id: binding.installation_id,
-        hardware_uuid: binding.hardware_uuid,
+        hardware_uuid: ottto_service::validated_hardware_id(binding.hardware_uuid.as_deref()),
         account_scope,
         display_name: hostname.clone(),
         hostname,
@@ -954,14 +954,7 @@ fn persistent_machine_binding(store: &FileMachineStore) -> Result<LocalMachineBi
 /// `IOPlatformUUID` never leaves `ioplatform_uuid` except as `machine_id`
 /// digest input.
 fn platform_hardware_uuid() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        ioplatform_uuid().map(|raw| ottto_core::hashed_hardware_id(&raw))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    ottto_service::live_hardware_id()
 }
 
 fn fallback_machine_id(hostname: &str) -> String {
@@ -1255,7 +1248,10 @@ mod tests {
 
         let machine = local_machine_in(&store);
 
-        assert_eq!(machine.hardware_uuid.as_deref(), Some(hashed.as_str()));
+        assert!(
+            machine.hardware_uuid.is_none(),
+            "fixture hardware is not this live Mac"
+        );
         assert_eq!(machine.machine_id, "otm_0123456789abcdef0123456789abcdef");
         let encoded = serde_json::to_string(&machine).expect("encode machine");
         assert!(!encoded.contains(raw), "{encoded}");

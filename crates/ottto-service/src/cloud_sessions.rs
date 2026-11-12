@@ -5,11 +5,18 @@
 //! endpoints directly. After exact consent and destination checks, it reads
 //! only Ottto's relay device credential for Ottto backend authentication. Raw
 //! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
-//! memory to derive content-free observations.
+//! memory to derive content-free task facts.
+//!
+//! Each due work slice makes one authority read, lists provider pages and
+//! uploads only tasks whose facts changed since their last exact server ACK
+//! (`cloud_session_changes.v1`). When it calls the provider is in
+//! [`schedule`]; the ACK cache lives in the upload-history SQLite file.
 
+use crate::grant_rebind::{self, GrantKind, RebindProposal, RebindRequest};
 use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
 use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::FileLock;
+use crate::snapshots::state_v2::upload_history::{CloudAck, CloudAckWrite};
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
@@ -19,12 +26,12 @@ use ottto_core::{
 };
 use ottto_protocol::LocalAccountState;
 pub use ottto_protocol::{CloudSessionBackendGrantResponseV1, CloudSessionServerPolicyState};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,30 +40,34 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime, UtcOffset};
+
+mod schedule;
+mod wire;
+use schedule::{
+    CloudSchedule, Crawl, Due, CRAWL_CONTINUATION_INTERVAL, IDLE_HEAD_INTERVAL, MAX_SLICE_PAGES,
+};
+pub use wire::{
+    CloudSessionChangeAckV1, CloudSessionChangeOutcome, CloudSessionChangeV1,
+    CloudSessionChangesAckV1, CloudSessionChangesV1, CloudSessionGrantAuthorityV1,
+};
+use wire::{Settled, AUTHORITY_SCHEMA_VERSION, CHANGES_SCHEMA_VERSION, MAX_CHANGES_PER_REQUEST};
 
 const COLLECTOR_ID: &str = "cloud_sessions";
-const COLLECTOR_VERSION: &str = "cloud_session_observations.v1";
-const CHUNK_SCHEMA_VERSION: &str = "cloud_session_observation_chunk.v2";
-const FINALIZE_SCHEMA_VERSION: &str = "cloud_session_scan_finalize.v2";
+const DISCLOSURE_VERSION: &str = "cloud_sessions_disclosure.v1";
+const LEGACY_COLLECTION_SCHEMA_VERSION: &str = "cloud_session_observations.v1";
 const GRANT_SCHEMA_VERSION: &str = "cloud_session_grant.v1";
-const CHECKPOINT_SCHEMA_VERSION: &str = "cloud_session_checkpoint.v1";
 const CONTROL_TOKEN_LEDGER_SCHEMA_VERSION: &str = "cloud_session_control_token_uses.v1";
 const MAX_CONTROL_TOKEN_USES: usize = 64;
-const MAX_PAGES: usize = 10;
-const MAX_ITEMS: usize = 200;
-const MAX_SCAN_PAGES: usize = 100;
-const MAX_SCAN_ITEMS: usize = 2_000;
-const MAX_SCAN_CHUNKS: usize = 10;
 const PAGE_LIMIT: usize = 20;
+/// Command-safety bound for one CLI page's stdout, not an inventory ceiling;
+/// a page that reaches it fails visibly instead of dropping its suffix.
 const MAX_PAGE_OUTPUT_BYTES: u64 = (PAGE_LIMIT * 256 * 1024) as u64;
+/// Pacing per work slice; a crawl continues where it stopped.
 const CYCLE_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const RELAY_IO_TIMEOUT: Duration = COMMAND_TIMEOUT;
 pub(crate) const COLLECTOR_IO_STOP_TIMEOUT: Duration = Duration::from_secs(15);
-const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const HEALTH_HEARTBEAT_INTERVAL: TimeDuration = TimeDuration::hours(1);
-const MAX_JITTER: Duration = Duration::from_secs(20);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
@@ -152,6 +163,24 @@ pub struct CloudSessionBackendGrantBindingV1 {
     /// Missing policy on an older persisted binding fails closed.
     #[serde(default)]
     pub server_policy_state: CloudSessionServerPolicyState,
+    /// The collection contract the server confirmed for this epoch. A binding
+    /// written before `cloud_session_changes.v1` has none and needs consent
+    /// on the new contract before collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_contract: Option<String>,
+    /// The server's provider-creation cutoff after an erasure, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect_not_before: Option<String>,
+    /// Original consent identity for cache isolation across verified same-epoch
+    /// relay rebinds. No raw device id is retained. Absent on older grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_origin: Option<CloudSessionCacheOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSessionCacheOrigin {
+    pub installation_fingerprint: String,
+    pub grant_scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,7 +461,7 @@ impl CloudSessionGrantStore {
                     return Ok(state.grant);
                 }
                 if state.grant.status == CloudSessionGrantStatus::Paused
-                    && state.grant.collector_version == compiled_release_version()
+                    && binding_contract_current(&state.grant)
                     && state
                         .grant
                         .backend_binding
@@ -459,7 +488,7 @@ impl CloudSessionGrantStore {
                     return Ok(state.grant);
                 }
                 if state.grant.status == CloudSessionGrantStatus::PolicyDisabled
-                    && state.grant.collector_version == compiled_release_version()
+                    && binding_contract_current(&state.grant)
                     && state
                         .grant
                         .backend_binding
@@ -477,16 +506,45 @@ impl CloudSessionGrantStore {
                 return Ok(state.grant);
             }
             if state.grant.backend_create_pending
-                || state
-                    .grant
-                    .backend_binding
-                    .as_ref()
-                    .is_some_and(|binding| !binding.backend_revoked)
+                || (state.grant.status == CloudSessionGrantStatus::Revoked
+                    && state
+                        .grant
+                        .backend_binding
+                        .as_ref()
+                        .is_some_and(|binding| !binding.backend_revoked))
             {
-                return Err(anyhow!(
-                    "existing cloud-session grant must be locally stopped and backend-revoked before scope replacement"
-                ));
+                return Err(anyhow!("pending cloud-session consent mutation must be reconciled before scope replacement"));
             }
+            let same_owner = state.grant.organization_fingerprint
+                == opaque_key(&key, &setup.organization_scope)
+                && state.grant.effective_user_fingerprint
+                    == opaque_key(&key, &setup.effective_user_scope);
+            let can_resume = same_owner
+                && binding_contract_current(&state.grant)
+                && state.grant.backend_binding.as_ref().is_some_and(|binding| {
+                    !binding.backend_revoked
+                        && binding.server_policy_state == CloudSessionServerPolicyState::Approved
+                })
+                && matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::Paused
+                )
+                && matches!(
+                    state.grant.last_error_category.as_deref(),
+                    None | Some("rebinding" | "rebind_unavailable")
+                );
+            if can_resume {
+                // Explicit resume restores admission to the original approval;
+                // the supervisor rebinds it before any provider execution.
+                state.grant.status = CloudSessionGrantStatus::Enabled;
+                state.grant.paused_at = None;
+                state.grant.last_error_category = Some("rebinding".to_string());
+                self.write(&state)?;
+                return Ok(state.grant);
+            }
+            // Explicit approval for another owner, or after a terminal refusal,
+            // replaces the sole local approval. It never authorizes collection
+            // until the ordinary-browser create response has been bound.
         }
         let key = random_key()?;
         let installation_fingerprint = opaque_key(&key, &setup.installation_id);
@@ -496,7 +554,7 @@ impl CloudSessionGrantStore {
             collector_id: COLLECTOR_ID.to_string(),
             collector_version: compiled_release_version(),
             release_lane: "supported".to_string(),
-            disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
+            disclosure_version: DISCLOSURE_VERSION.to_string(),
             status: CloudSessionGrantStatus::ConsentRequired,
             installation_fingerprint,
             grant_scope_id,
@@ -566,7 +624,7 @@ impl CloudSessionGrantStore {
         let pending = CloudSessionPendingBackendCreateV1 {
             source: "codex".to_string(),
             collector_id: COLLECTOR_ID.to_string(),
-            schema_version: COLLECTOR_VERSION.to_string(),
+            schema_version: CHANGES_SCHEMA_VERSION.to_string(),
             collector_version: compiled_release_version(),
             grant_scope_fingerprint: state.grant.grant_scope_id.clone(),
             account_fingerprint: state.grant.account_fingerprint.clone(),
@@ -578,6 +636,49 @@ impl CloudSessionGrantStore {
         Ok(backend_create_request(installation_id, &pending))
     }
 
+    fn prepare_rebind(
+        &self,
+        setup: &CloudSessionGrantSetup,
+        hardware_id: String,
+    ) -> Result<Option<RebindProposal<CloudSessionGrant>>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        if !cloud_grant_runtime_ready(&state.grant) {
+            return Ok(None);
+        }
+        let key = decode_hex(&state.hmac_key_hex)
+            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+        if !is_uuid(&setup.installation_id)
+            || state.grant.organization_fingerprint != opaque_key(&key, &setup.organization_scope)
+            || state.grant.effective_user_fingerprint
+                != opaque_key(&key, &setup.effective_user_scope)
+        {
+            return Err(anyhow!("cloud-session rebind owner changed"));
+        }
+        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
+        if installation_fingerprint == state.grant.installation_fingerprint {
+            return Ok(None);
+        }
+        let version = state
+            .grant
+            .backend_binding
+            .as_ref()
+            .expect("runtime-ready binding")
+            .grant_version;
+        Ok(Some(RebindProposal {
+            expected: state.grant.clone(),
+            installation_fingerprint,
+            request: RebindRequest {
+                installation_id: setup.installation_id.clone(),
+                grant_version: version,
+                grant_scope_fingerprint: grant_scope_fingerprint(&key, setup),
+                hardware_id: Some(hardware_id),
+                disclosure_version: state.grant.disclosure_version,
+            },
+        }))
+    }
+
     /// Bind an authenticated backend grant response. Exact scope matching and
     /// monotonic grant versions prevent a pre-revoke batch epoch from being
     /// resurrected after re-consent.
@@ -586,10 +687,49 @@ impl CloudSessionGrantStore {
         response: &CloudSessionBackendGrantResponseV1,
         expected_installation_id: &str,
     ) -> Result<CloudSessionGrant> {
+        self.bind_backend_grant_with_rebind(response, expected_installation_id, None)
+    }
+
+    fn bind_backend_grant_with_rebind(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        expected_installation_id: &str,
+        rebind: Option<&RebindProposal<CloudSessionGrant>>,
+    ) -> Result<CloudSessionGrant> {
         let _lock = self.lock()?;
         let mut state = self
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
+        if let Some(proposal) = rebind {
+            if !(cloud_grant_runtime_ready(&state.grant)
+                || matches!(
+                    state.grant.status,
+                    CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
+                ))
+                || !same_runtime_grant_identity(&state.grant, &proposal.expected)
+                || state.grant.backend_binding != proposal.expected.backend_binding
+                || response.grant_version != proposal.request.grant_version
+                || response.status != "enabled"
+                || response.schema_version != CHANGES_SCHEMA_VERSION
+            {
+                return Err(anyhow!("cloud-session rebind consent changed"));
+            }
+            let binding = state.grant.backend_binding.as_mut().expect("bound grant");
+            binding
+                .cache_origin
+                .get_or_insert_with(|| CloudSessionCacheOrigin {
+                    installation_fingerprint: state.grant.installation_fingerprint.clone(),
+                    grant_scope_id: state.grant.grant_scope_id.clone(),
+                });
+            binding.server_policy_state = authority_policy(response);
+            state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
+            state.grant.grant_scope_id = proposal.request.grant_scope_fingerprint.clone();
+            if authority_policy(response) == CloudSessionServerPolicyState::Disabled
+                && state.grant.status == CloudSessionGrantStatus::Enabled
+            {
+                state.grant.status = CloudSessionGrantStatus::PolicyDisabled;
+            }
+        }
         let local_status = state.grant.status.clone();
         validate_local_installation_binding(
             &state,
@@ -597,8 +737,9 @@ impl CloudSessionGrantStore {
             "backend cloud-session grant",
         )?;
         if !state.grant.backend_create_pending {
-            validate_backend_grant_response(&state, response, &state.grant.collector_version)?;
-            if response.installation_id != expected_installation_id || response.status != "enabled"
+            validate_backend_grant_response(&state, response)?;
+            if response.installation_id != expected_installation_id
+                || !matches!(response.status.as_str(), "enabled" | "paused")
             {
                 return Err(anyhow!("backend cloud-session grant does not match"));
             }
@@ -610,11 +751,17 @@ impl CloudSessionGrantStore {
             if existing.grant_id == response.id
                 && existing.grant_version == response.grant_version
                 && !existing.backend_revoked
-                && existing.server_policy_state == response.server_policy_state
+                && existing.collection_contract.as_deref()
+                    == (response.schema_version == CHANGES_SCHEMA_VERSION)
+                        .then_some(CHANGES_SCHEMA_VERSION)
             {
                 // Lost loopback responses retry the exact authenticated bind.
                 // Return the current local state without rewriting timestamps
                 // or resurrecting a later pause/revoke.
+                if rebind.is_some() {
+                    state.grant.last_error_category = None;
+                    self.write(&state)?;
+                }
                 return Ok(state.grant);
             }
             return Err(anyhow!(
@@ -627,33 +774,36 @@ impl CloudSessionGrantStore {
             .clone()
             .unwrap_or_else(|| pending_backend_create(&state.grant));
         validate_pending_backend_create(&state.grant, &pending)?;
-        validate_backend_grant_response(&state, response, &pending.collector_version)?;
+        validate_backend_grant_response(&state, response)?;
+        if response.schema_version != pending.schema_version {
+            return Err(anyhow!(
+                "backend cloud-session grant contract differs from pending create"
+            ));
+        }
         if response.installation_id != expected_installation_id {
             return Err(anyhow!("backend cloud-session grant scope does not match"));
         }
-        if response.status != "enabled" {
-            return Err(anyhow!("backend cloud-session grant is not enabled"));
+        if !matches!(response.status.as_str(), "enabled" | "paused") {
+            return Err(anyhow!("backend cloud-session grant is not consented"));
         }
         if let Some(existing) = &state.grant.backend_binding {
             if existing.grant_id != response.id {
                 return Err(anyhow!("backend cloud-session grant identity changed"));
             }
+            // The same epoch may be re-bound only to move a binding written
+            // before this collection contract onto it.
             if response.grant_version < existing.grant_version
                 || (state.grant.status != CloudSessionGrantStatus::Enabled
-                    && response.grant_version == existing.grant_version)
+                    && response.grant_version == existing.grant_version
+                    && existing.collection_contract.as_deref() == Some(CHANGES_SCHEMA_VERSION))
             {
                 return Err(anyhow!("backend cloud-session grant epoch is stale"));
             }
         }
-        state.grant.backend_binding = Some(CloudSessionBackendGrantBindingV1 {
-            grant_id: response.id.clone(),
-            grant_version: response.grant_version,
-            backend_revoked: false,
-            server_policy_state: response.server_policy_state.clone(),
-        });
+        state.grant.backend_binding = Some(authority_binding(response, false));
         state.grant.backend_create_pending = false;
         state.grant.pending_backend_create = None;
-        state.grant.collector_version = response.collector_version.clone();
+        state.grant.collector_version = compiled_release_version();
         if local_status == CloudSessionGrantStatus::Revoked {
             self.write(&state)?;
             // A POST may commit just before local revoke or rollout removal.
@@ -674,14 +824,14 @@ impl CloudSessionGrantStore {
                 "local cloud-session consent changed before backend grant binding"
             ));
         }
-        state.grant.status = match response.server_policy_state {
+        state.grant.status = match authority_policy(response) {
             CloudSessionServerPolicyState::Approved => CloudSessionGrantStatus::Enabled,
             CloudSessionServerPolicyState::Disabled => CloudSessionGrantStatus::PolicyDisabled,
         };
         state.grant.granted_at = Some(timestamp(OffsetDateTime::now_utc()));
         state.grant.revoked_at = None;
         state.grant.last_collector_health = Some(
-            match response.server_policy_state {
+            match authority_policy(response) {
                 CloudSessionServerPolicyState::Approved => "enabled",
                 CloudSessionServerPolicyState::Disabled => "policy_disabled",
             }
@@ -700,18 +850,58 @@ impl CloudSessionGrantStore {
         response: &CloudSessionBackendGrantResponseV1,
         expected_installation_id: &str,
     ) -> Result<CloudSessionGrant> {
+        self.apply_backend_revocation_inner(response, expected_installation_id, None)
+    }
+
+    /// Reconcile a DELETE after a rebind committed but its reply was lost.
+    /// This only proves cleanup of the known grant; it never enables consent.
+    pub(crate) fn reconcile_backend_revocation(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        setup: &CloudSessionGrantSetup,
+    ) -> Result<CloudSessionGrant> {
+        self.apply_backend_revocation_inner(response, &setup.installation_id, Some(setup))
+    }
+
+    fn apply_backend_revocation_inner(
+        &self,
+        response: &CloudSessionBackendGrantResponseV1,
+        expected_installation_id: &str,
+        current: Option<&CloudSessionGrantSetup>,
+    ) -> Result<CloudSessionGrant> {
         let _lock = self.lock()?;
         let mut state = self
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
+        if let Some(setup) = current {
+            let key = decode_hex(&state.hmac_key_hex)
+                .filter(|key| key.len() == 32)
+                .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+            let rebound = CloudSessionGrantSetup {
+                installation_id: response.installation_id.clone(),
+                ..setup.clone()
+            };
+            if response.grant_scope_fingerprint == grant_scope_fingerprint(&key, &rebound)
+                && state.grant.status == CloudSessionGrantStatus::Revoked
+                && state.grant.organization_fingerprint
+                    == opaque_key(&key, &setup.organization_scope)
+                && state.grant.effective_user_fingerprint
+                    == opaque_key(&key, &setup.effective_user_scope)
+            {
+                // The authenticated exact DELETE response proves where the
+                // known grant ended up, without retrying rebind after revoke.
+                state.grant.installation_fingerprint = opaque_key(&key, &response.installation_id);
+                state.grant.grant_scope_id = response.grant_scope_fingerprint.clone();
+            }
+        }
         validate_local_installation_binding(
             &state,
-            expected_installation_id,
+            &response.installation_id,
             "backend cloud-session revocation",
         )?;
-        validate_backend_grant_response(&state, response, &state.grant.collector_version)?;
-        if response.installation_id != expected_installation_id {
-            return Err(anyhow!("backend cloud-session grant scope does not match"));
+        validate_backend_grant_response(&state, response)?;
+        if !is_uuid(expected_installation_id) {
+            return Err(anyhow!("current cloud-session installation is invalid"));
         }
         let existing = state
             .grant
@@ -724,12 +914,7 @@ impl CloudSessionGrantStore {
         {
             return Err(anyhow!("backend cloud-session revocation does not match"));
         }
-        state.grant.backend_binding = Some(CloudSessionBackendGrantBindingV1 {
-            grant_id: response.id.clone(),
-            grant_version: response.grant_version,
-            backend_revoked: true,
-            server_policy_state: response.server_policy_state.clone(),
-        });
+        state.grant.backend_binding = Some(authority_binding(response, true));
         state.grant.backend_create_pending = false;
         state.grant.pending_backend_create = None;
         state.grant.status = CloudSessionGrantStatus::Revoked;
@@ -739,39 +924,54 @@ impl CloudSessionGrantStore {
         Ok(state.grant)
     }
 
-    /// Apply the bounded authenticated grant-list result required immediately
-    /// before each provider collection cycle. Unknown, malformed, stale, or
-    /// mismatched responses are rejected without changing runtime readiness.
-    pub fn apply_backend_grant_revalidation(
+    /// Apply the one authority read made before each due work slice.
+    /// Unknown, malformed, stale, or mismatched responses are rejected without
+    /// changing runtime readiness. A remote pause or policy-disabled answer
+    /// leaves local consent untouched; a remote revoke revokes locally.
+    pub fn apply_backend_authority(
         &self,
-        response: &CloudSessionBackendGrantResponseV1,
+        authority: &CloudSessionGrantAuthorityV1,
     ) -> Result<CloudSessionGrant> {
         let _lock = self.lock()?;
         let mut state = self
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        validate_backend_grant_response(&state, response, &state.grant.collector_version)?;
         let existing = state
             .grant
             .backend_binding
             .as_ref()
             .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-        if response.id != existing.grant_id || response.grant_version != existing.grant_version {
-            return Err(anyhow!(
-                "backend cloud-session grant revalidation does not match"
-            ));
+        if authority.schema_version != AUTHORITY_SCHEMA_VERSION
+            || !is_uuid(&authority.grant_id)
+            || !authority.grant_id.eq_ignore_ascii_case(&existing.grant_id)
+            || authority.grant_version != existing.grant_version
+            || authority.contract_version != CHANGES_SCHEMA_VERSION
+            || authority.disclosure_version != DISCLOSURE_VERSION
+            || !matches!(authority.status.as_str(), "enabled" | "paused" | "revoked")
+            || authority
+                .collect_not_before
+                .as_deref()
+                .is_some_and(|value| !valid_rfc3339(value))
+        {
+            return Err(anyhow!("backend cloud-session authority does not match"));
         }
-        if !matches!(response.status.as_str(), "enabled" | "revoked") {
-            return Err(anyhow!("backend cloud-session grant status is invalid"));
-        }
-        let backend_revoked = response.status == "revoked";
+        let backend_revoked = authority.status == "revoked";
+        let policy = if authority.status == "enabled" && authority.can_collect {
+            CloudSessionServerPolicyState::Approved
+        } else {
+            CloudSessionServerPolicyState::Disabled
+        };
         let before = state.grant.clone();
-        state.grant.backend_binding = Some(CloudSessionBackendGrantBindingV1 {
-            grant_id: response.id.clone(),
-            grant_version: response.grant_version,
-            backend_revoked,
-            server_policy_state: response.server_policy_state.clone(),
-        });
+        // The bound contract is the one consent created; authority never
+        // upgrades a grant created on an earlier contract.
+        let binding = state
+            .grant
+            .backend_binding
+            .as_mut()
+            .expect("binding checked above");
+        binding.backend_revoked = backend_revoked;
+        binding.server_policy_state = policy.clone();
+        binding.collect_not_before = authority.collect_not_before.clone();
         if backend_revoked {
             state.grant.status = CloudSessionGrantStatus::Revoked;
             state.grant.backend_create_pending = false;
@@ -782,18 +982,19 @@ impl CloudSessionGrantStore {
             state.grant.status,
             CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
         ) {
-            state.grant.status = match response.server_policy_state {
+            state.grant.status = match policy {
                 CloudSessionServerPolicyState::Approved => CloudSessionGrantStatus::Enabled,
                 CloudSessionServerPolicyState::Disabled => CloudSessionGrantStatus::PolicyDisabled,
             };
-            state.grant.last_collector_health = Some(
-                match state.grant.status {
-                    CloudSessionGrantStatus::Enabled => "enabled",
-                    _ => "policy_disabled",
-                }
-                .to_string(),
-            );
-            state.grant.last_freshness = Some("unavailable".to_string());
+            if state.grant.status != before.status {
+                state.grant.last_collector_health = Some(
+                    match state.grant.status {
+                        CloudSessionGrantStatus::Enabled => "enabled",
+                        _ => "policy_disabled",
+                    }
+                    .to_string(),
+                );
+            }
         }
         if state.grant != before {
             self.write(&state)?;
@@ -959,7 +1160,11 @@ impl CloudSessionGrantStore {
         let Some(mut state) = self.read_locked()? else {
             return Ok(());
         };
-        if state.grant.status != CloudSessionGrantStatus::Enabled {
+        if state.grant.status != CloudSessionGrantStatus::Enabled
+            || (state.grant.last_collector_health.as_deref() == Some(health)
+                && state.grant.last_freshness.as_deref() == Some(freshness)
+                && state.grant.last_error_category.as_deref() == error_category)
+        {
             return Ok(());
         }
         state.grant.last_collector_health = Some(health.to_string());
@@ -988,7 +1193,7 @@ impl Default for CloudSessionGrantStore {
 
 /// Waits for an exclusive flock on `<state_path>.lock` (0600) in an owner-only
 /// (0700) directory.
-fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
+pub(crate) fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = state_path
         .parent()
@@ -1016,10 +1221,6 @@ pub fn cloud_session_collector_status(
     transport: &dyn CloudSessionTransport,
 ) -> CloudSessionCollectorStatusV1 {
     let stored_grant = grants.load().ok().flatten();
-    let collector_version_rebind_required = stored_grant.as_ref().is_some_and(|grant| {
-        grant.status == CloudSessionGrantStatus::Enabled
-            && grant.collector_version != compiled_release_version()
-    });
     let backend_reconciliation_required = stored_grant
         .as_ref()
         .is_some_and(|grant| grant.backend_create_pending);
@@ -1054,15 +1255,25 @@ pub fn cloud_session_collector_status(
             })
             .unwrap_or(CloudSessionGrantStatus::Off)
     };
-    let transport_configured = transport.is_configured() && transport.supports_grant_revalidation();
+    let transport_configured = transport.is_configured();
+    let continuity_reason = stored_grant
+        .as_ref()
+        .and_then(|grant| grant.last_error_category.as_deref())
+        .and_then(grant_rebind::status_reason);
     let provider_cli_invocation_permitted =
         stored_grant.as_ref().is_some_and(cloud_grant_runtime_ready)
             && transport_configured
+            && continuity_reason.is_none()
             && !kill_switch_enabled();
     let (runtime_state, reason_code) = if kill_switch_enabled() {
         (
             CloudSessionRuntimeState::PolicyDisabled,
             "policy_disabled".to_string(),
+        )
+    } else if let Some(reason) = continuity_reason {
+        (
+            CloudSessionRuntimeState::ConsentRequired,
+            reason.to_string(),
         )
     } else if grant_status == CloudSessionGrantStatus::Enabled && !transport_configured {
         (
@@ -1074,8 +1285,6 @@ pub fn cloud_session_collector_status(
             "backend_grant_reconciliation_required"
         } else if backend_revocation_confirmation_required {
             "backend_revocation_confirmation_required"
-        } else if collector_version_rebind_required {
-            "collector_version_rebind_required"
         } else {
             match grant_status {
                 CloudSessionGrantStatus::Off => "setup_required",
@@ -1147,417 +1356,11 @@ where
             .unwrap_or(false)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionBatchKind {
-    Snapshot,
-    Heartbeat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CloudSessionObservationBatchV1 {
-    pub grant_id: String,
-    pub grant_version: u64,
-    pub grant_scope_fingerprint: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub account_fingerprint: String,
-    pub batch_kind: CloudSessionBatchKind,
-    pub snapshot_complete: bool,
-    pub collected_at: String,
-    pub observations: Vec<CloudSessionObservationEntityV1>,
-    pub health: CloudSessionCollectorHealthV1,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionObservationBatchWireV1 {
-    grant_id: String,
-    grant_version: u64,
-    grant_scope_fingerprint: String,
-    collector_id: String,
-    schema_version: String,
-    collector_version: String,
-    account_fingerprint: String,
-    batch_kind: CloudSessionBatchKind,
-    snapshot_complete: bool,
-    collected_at: String,
-    observations: Vec<CloudSessionObservationEntityV1>,
-    health: CloudSessionCollectorHealthV1,
-}
-
-impl CloudSessionObservationBatchV1 {
-    fn validate_wire_contract(&self) -> Result<()> {
-        if self.observations.len() > MAX_ITEMS {
-            return Err(anyhow!(
-                "cloud-session batch exceeds {MAX_ITEMS} observations"
-            ));
-        }
-        if self.batch_kind == CloudSessionBatchKind::Heartbeat
-            && (!self.observations.is_empty() || self.snapshot_complete)
-        {
-            return Err(anyhow!(
-                "cloud-session heartbeat must be empty and incomplete"
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_relay_wire_contract(&self) -> Result<()> {
-        if self.batch_kind != CloudSessionBatchKind::Heartbeat
-            || self.snapshot_complete
-            || !self.observations.is_empty()
-            || !valid_v2_binding(
-                &self.grant_id,
-                self.grant_version,
-                &self.grant_scope_fingerprint,
-                &self.collector_id,
-                &self.collector_version,
-                &self.account_fingerprint,
-            )
-            || self.schema_version != COLLECTOR_VERSION
-            || !valid_rfc3339(&self.collected_at)
-            || !valid_v1_heartbeat_health(&self.health)
-        {
-            return Err(anyhow!(
-                "cloud-session v1 relay accepts only a strict empty heartbeat"
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl<'de> Deserialize<'de> for CloudSessionObservationBatchV1 {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = CloudSessionObservationBatchWireV1::deserialize(deserializer)?;
-        let batch = Self {
-            grant_id: wire.grant_id,
-            grant_version: wire.grant_version,
-            grant_scope_fingerprint: wire.grant_scope_fingerprint,
-            collector_id: wire.collector_id,
-            schema_version: wire.schema_version,
-            collector_version: wire.collector_version,
-            account_fingerprint: wire.account_fingerprint,
-            batch_kind: wire.batch_kind,
-            snapshot_complete: wire.snapshot_complete,
-            collected_at: wire.collected_at,
-            observations: wire.observations,
-            health: wire.health,
-        };
-        batch
-            .validate_wire_contract()
-            .map_err(serde::de::Error::custom)?;
-        Ok(batch)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudSessionObservationEntityV1 {
-    pub entity_key: String,
-    pub entity_kind: String,
-    pub lifecycle: String,
-    pub attempt_count: Option<u64>,
-    pub environment_kind: String,
-    pub measurement_basis: String,
-    pub coverage: Vec<String>,
-    pub created_at: Option<String>,
-    pub started_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub observed_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudSessionCollectorHealthV1 {
-    pub state: String,
-    pub observed_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_category: Option<String>,
-}
-
-/// One ordered, idempotent positive-observation upload for a bounded v2 scan.
-/// A chunk can never authorize absence; only the server may do that after it
-/// accepts a separately validated finalize request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudSessionObservationChunkV2 {
-    pub grant_id: String,
-    pub grant_version: u64,
-    pub grant_scope_fingerprint: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub account_fingerprint: String,
-    pub scan_id: String,
-    pub scan_started_at: String,
-    pub chunk_index: u8,
-    pub chunk_identity_digest: String,
-    pub chunk_semantic_digest: String,
-    pub observations: Vec<CloudSessionObservationEntityV1>,
-    pub health: CloudSessionCollectorHealthV1,
-}
-
-impl CloudSessionObservationChunkV2 {
-    fn validate_wire_contract(&self) -> Result<()> {
-        let keys_are_strictly_ordered = self
-            .observations
-            .windows(2)
-            .all(|rows| rows[0].entity_key < rows[1].entity_key);
-        let expected_identity_digest = identity_digest(&self.observations);
-        let expected_semantic_digest = observation_semantic_digest(&self.observations)?;
-        if !is_uuid(&self.scan_id)
-            || !valid_v2_binding(
-                &self.grant_id,
-                self.grant_version,
-                &self.grant_scope_fingerprint,
-                &self.collector_id,
-                &self.collector_version,
-                &self.account_fingerprint,
-            )
-            || self.schema_version != CHUNK_SCHEMA_VERSION
-            || !valid_rfc3339(&self.scan_started_at)
-            || usize::from(self.chunk_index) >= MAX_SCAN_CHUNKS
-            || self.observations.is_empty()
-            || self.observations.len() > MAX_ITEMS
-            || !valid_sha256_digest(&self.chunk_identity_digest)
-            || !valid_sha256_digest(&self.chunk_semantic_digest)
-            || !keys_are_strictly_ordered
-            || self.chunk_identity_digest != expected_identity_digest
-            || self.chunk_semantic_digest != expected_semantic_digest
-            || self
-                .observations
-                .iter()
-                .any(|observation| !valid_v2_observation(observation))
-            || !valid_v2_health(&self.health)
-        {
-            return Err(anyhow!("invalid cloud-session v2 observation chunk"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionEnumerationConsistencyV2 {
-    SingleResponse,
-    UnstableCursor,
-}
-
-/// Terminal proof for an already uploaded ordered chunk sequence. The server
-/// owns all absence authority; `single_response` is the only enumeration mode
-/// capable of proving absence and is emitted only for one terminal <=20 row
-/// provider response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudSessionScanFinalizeV2 {
-    pub grant_id: String,
-    pub grant_version: u64,
-    pub grant_scope_fingerprint: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub account_fingerprint: String,
-    pub scan_id: String,
-    pub scan_started_at: String,
-    pub chunk_count: u8,
-    pub unique_entity_count: u32,
-    pub provider_page_count: u16,
-    pub terminal_reached: bool,
-    pub inventory_digest: String,
-    pub epoch_digest: String,
-    pub enumeration_consistency: CloudSessionEnumerationConsistencyV2,
-}
-
-impl CloudSessionScanFinalizeV2 {
-    fn validate_wire_contract(&self) -> Result<()> {
-        if !is_uuid(&self.scan_id)
-            || !valid_v2_binding(
-                &self.grant_id,
-                self.grant_version,
-                &self.grant_scope_fingerprint,
-                &self.collector_id,
-                &self.collector_version,
-                &self.account_fingerprint,
-            )
-            || self.schema_version != FINALIZE_SCHEMA_VERSION
-            || !valid_rfc3339(&self.scan_started_at)
-            || !self.terminal_reached
-            || usize::from(self.chunk_count) > MAX_SCAN_CHUNKS
-            || self.unique_entity_count as usize > MAX_SCAN_ITEMS
-            || self.provider_page_count == 0
-            || usize::from(self.provider_page_count) > MAX_SCAN_PAGES
-            || !valid_sha256_digest(&self.inventory_digest)
-            || !valid_sha256_digest(&self.epoch_digest)
-        {
-            return Err(anyhow!("invalid cloud-session v2 scan finalize"));
-        }
-        if self.enumeration_consistency == CloudSessionEnumerationConsistencyV2::SingleResponse
-            && (self.provider_page_count != 1 || self.unique_entity_count as usize > PAGE_LIMIT)
-        {
-            return Err(anyhow!(
-                "single-response cloud-session finalization exceeds its proof boundary"
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_against_chunks(&self, chunks: &[CloudSessionObservationChunkV2]) -> Result<()> {
-        self.validate_wire_contract()?;
-        if usize::from(self.chunk_count) != chunks.len()
-            || chunks
-                .iter()
-                .enumerate()
-                .any(|(index, chunk)| usize::from(chunk.chunk_index) != index)
-            || chunks.iter().any(|chunk| {
-                chunk.scan_id != self.scan_id
-                    || chunk.scan_started_at != self.scan_started_at
-                    || chunk.grant_id != self.grant_id
-                    || chunk.grant_version != self.grant_version
-                    || chunk.grant_scope_fingerprint != self.grant_scope_fingerprint
-                    || chunk.collector_id != self.collector_id
-                    || chunk.collector_version != self.collector_version
-                    || chunk.account_fingerprint != self.account_fingerprint
-                    || chunk.validate_wire_contract().is_err()
-            })
-        {
-            return Err(anyhow!(
-                "cloud-session finalize does not bind the acknowledged chunk sequence"
-            ));
-        }
-        let observations = chunks
-            .iter()
-            .flat_map(|chunk| chunk.observations.iter())
-            .collect::<Vec<_>>();
-        let unique_keys = observations
-            .iter()
-            .map(|observation| observation.entity_key.as_str())
-            .collect::<HashSet<_>>();
-        if unique_keys.len() != self.unique_entity_count as usize
-            || inventory_digest(
-                observations
-                    .iter()
-                    .map(|observation| &observation.entity_key),
-            ) != self.inventory_digest
-            || epoch_digest(chunks) != self.epoch_digest
-        {
-            return Err(anyhow!(
-                "cloud-session finalize digests do not bind the acknowledged inventory"
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn valid_v2_binding(
-    grant_id: &str,
-    grant_version: u64,
-    grant_scope_fingerprint: &str,
-    collector_id: &str,
-    collector_version: &str,
-    account_fingerprint: &str,
-) -> bool {
-    is_uuid(grant_id)
-        && grant_version > 0
-        && valid_hmac_fingerprint(grant_scope_fingerprint)
-        && collector_id == COLLECTOR_ID
-        && collector_version == compiled_release_version()
-        && valid_hmac_fingerprint(account_fingerprint)
-}
-
-fn valid_v2_observation(observation: &CloudSessionObservationEntityV1) -> bool {
-    let coverage = observation
-        .coverage
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let has_timing = observation.created_at.is_some()
-        || observation.started_at.is_some()
-        || observation.updated_at.is_some()
-        || observation.completed_at.is_some();
-    valid_hmac_fingerprint(&observation.entity_key)
-        && observation.entity_kind == "task"
-        && matches!(
-            observation.lifecycle.as_str(),
-            "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown"
-        )
-        && observation
-            .attempt_count
-            .map_or(true, |attempts| attempts <= 100_000)
-        && matches!(
-            observation.environment_kind.as_str(),
-            "hosted" | "container" | "unknown"
-        )
-        && observation.measurement_basis == "not_itemized"
-        && observation.coverage.len() == coverage.len()
-        && coverage
-            .iter()
-            .all(|field| matches!(*field, "identity" | "status" | "timing" | "attempts"))
-        && coverage.contains("identity")
-        && coverage.contains("status")
-        && coverage.contains("timing") == has_timing
-        && coverage.contains("attempts") == observation.attempt_count.is_some()
-        && valid_rfc3339(&observation.observed_at)
-        && [
-            &observation.created_at,
-            &observation.started_at,
-            &observation.updated_at,
-            &observation.completed_at,
-        ]
-        .into_iter()
-        .flatten()
-        .all(|value| valid_rfc3339(value))
-}
-
-fn valid_v2_health(health: &CloudSessionCollectorHealthV1) -> bool {
-    valid_rfc3339(&health.observed_at)
-        && matches!(
-            (health.state.as_str(), health.error_category.as_deref()),
-            ("healthy", None) | ("degraded", Some("provider_error"))
-        )
-}
-
-fn valid_v1_heartbeat_health(health: &CloudSessionCollectorHealthV1) -> bool {
-    valid_rfc3339(&health.observed_at)
-        && matches!(
-            (health.state.as_str(), health.error_category.as_deref()),
-            ("healthy", None) | ("failing", Some("provider_error"))
-        )
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct CloudSessionCheckpoint {
-    schema_version: String,
-    semantic_digest: Option<String>,
-    /// Digest of the most recent first provider page, never raw page content.
-    #[serde(default)]
-    head_semantic_digest: Option<String>,
-    #[serde(default)]
-    grant_epoch_digest: Option<String>,
-    /// Grant epoch that owns the current circuit-breaker backoff. A new grant
-    /// must not inherit a prior consent epoch's transient failures.
-    #[serde(default)]
-    circuit_grant_epoch_digest: Option<String>,
-    consecutive_failures: u32,
-    circuit_open_until: Option<String>,
-    last_error_category: Option<String>,
-    last_success_at: Option<String>,
-    last_health_upload_at: Option<String>,
-    last_complete_snapshot_at: Option<String>,
-}
-
+/// Process-local collector state shared with local control: the provider and
+/// relay I/O fence, and the support directory whose upload-history file holds
+/// the cloud-task ACK cache.
 pub struct CloudSessionCheckpointStore {
-    path: PathBuf,
-    /// Active scans are intentionally process-memory only. This mutex also
-    /// guarantees one provider subprocess/upload sequence at a time for a
-    /// collector instance. Reconstructing the store after restart drops the
-    /// cursor and starts a new UUID from page zero.
-    runtime: Mutex<CloudSessionScanRuntime>,
+    state_dir: PathBuf,
     collector_io: Arc<CloudSessionIoFence>,
     #[cfg(test)]
     relay_admission_barrier: Mutex<Option<TestRelayAdmissionBarrier>>,
@@ -1598,45 +1401,12 @@ struct TestRelayAdmissionBarrier {
     release: Arc<std::sync::Barrier>,
 }
 
-#[derive(Default)]
-struct CloudSessionScanRuntime {
-    active: Option<ActiveCloudSessionScan>,
-    cycle_in_progress: bool,
-    cancel_requested: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CloudSessionScanMode {
-    Full,
-    Head,
-}
-
-struct ActiveCloudSessionScan {
-    scan_id: String,
-    scan_started_at: String,
-    mode: CloudSessionScanMode,
-    grant: CloudSessionGrant,
-    cursor: Option<String>,
-    seen_cursors: HashSet<String>,
-    observations: BTreeMap<String, CloudSessionObservationEntityV1>,
-    provider_page_count: usize,
-    head_semantic_digest: Option<String>,
-    prepared: Option<PreparedCloudSessionScan>,
-}
-
-struct PreparedCloudSessionScan {
-    chunks: Vec<CloudSessionObservationChunkV2>,
-    finalize: Option<CloudSessionScanFinalizeV2>,
-    next_chunk: usize,
-    head_semantic_digest: Option<String>,
-    mode: CloudSessionScanMode,
-}
-
 impl CloudSessionCheckpointStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    /// `state_dir` is the support directory: the cache is
+    /// `<state_dir>/snapshots/upload_history.sqlite`.
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
-            runtime: Mutex::new(CloudSessionScanRuntime::default()),
+            state_dir: state_dir.into(),
             collector_io: Arc::new(CloudSessionIoFence::default()),
             #[cfg(test)]
             relay_admission_barrier: Mutex::new(None),
@@ -1647,13 +1417,28 @@ impl CloudSessionCheckpointStore {
         &'a self,
         grants: &CloudSessionGrantStore,
         expected: &CloudSessionGrant,
+        transport: &dyn CloudSessionTransport,
     ) -> Result<Option<CloudSessionIoLease<'a>>> {
+        self.begin_io(|| {
+            transport.local_binding_current(expected) && grant_still_current(grants, expected)
+        })
+    }
+
+    /// Serialize admission with identity mutation, then release that lock
+    /// before I/O. Identity changes close admission and drain these leases.
+    fn begin_io(&self, current: impl FnOnce() -> bool) -> Result<Option<CloudSessionIoLease<'_>>> {
+        let _identity_lock = crate::control::lock_setup_run_binding();
+        if crate::control::identity_mutation_in_progress() || kill_switch_enabled() {
+            return Ok(None);
+        }
         let mut active = self
             .collector_io
             .active_io
             .lock()
             .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
-        if kill_switch_enabled() || !grant_still_current(grants, expected) {
+        // Keep the stop check and lease registration under the same mutex
+        // used by the drain, so a pause cannot return between them.
+        if !current() {
             return Ok(None);
         }
         *active = active.saturating_add(1);
@@ -1662,10 +1447,10 @@ impl CloudSessionCheckpointStore {
         }))
     }
 
-    /// Wait until every provider subprocess or relay write admitted before a
-    /// local stop has returned. Persisted pause/revoke state closes admission;
-    /// callers must then complete this wait before reporting the stop or
-    /// deleting backend consent.
+    /// Wait until every provider subprocess, relay write or cache commit
+    /// admitted before a local stop has returned. Persisted pause/revoke state
+    /// closes admission; callers must then complete this wait before reporting
+    /// the stop, erasing the cache or deleting backend consent.
     pub fn wait_for_collector_io_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut active = self
@@ -1688,6 +1473,77 @@ impl CloudSessionCheckpointStore {
             }
         }
         Ok(())
+    }
+
+    /// Erase the cloud-task ACK cache after a local revoke, once collector I/O
+    /// is idle. The server-owned cutoff, not this cache, prevents revival.
+    pub fn erase_cache(&self) -> Result<()> {
+        crate::upload_receipts::cloud_erase_all(&self.state_dir)
+    }
+
+    fn read_acks(
+        &self,
+        scope: &[u8; 32],
+        keys: &[&str],
+        now_unix: i64,
+    ) -> Result<HashMap<String, CloudAck>> {
+        crate::upload_receipts::cloud_read_acks(&self.state_dir, scope, keys, now_unix)
+    }
+
+    fn crawl_completed(&self, scope: &[u8; 32]) -> Result<Option<Date>> {
+        Ok(
+            crate::upload_receipts::cloud_crawl_completed_date(&self.state_dir, scope)?.and_then(
+                |raw| Date::parse(&raw, &time::format_description::well_known::Iso8601::DATE).ok(),
+            ),
+        )
+    }
+
+    /// Commit one slice's settled tasks under an I/O lease, so a commit racing
+    /// a local revoke either finishes before the revoke's erase or is refused.
+    fn commit(
+        &self,
+        inputs: &SliceInputs<'_>,
+        expected: &CloudSessionGrant,
+        scope: &[u8; 32],
+        settled: &HashMap<String, ([u8; 32], Option<String>)>,
+        crawl_completed: Option<Date>,
+        now_unix: i64,
+    ) -> Result<()> {
+        if settled.is_empty() && crawl_completed.is_none() {
+            return Ok(());
+        }
+        let Some(lease) = self.begin_collector_io(inputs.grants, expected, inputs.transport)?
+        else {
+            return Ok(());
+        };
+        let acks = settled
+            .iter()
+            .map(|(entity_key, (digest, head_etag))| CloudAckWrite {
+                entity_key,
+                digest: *digest,
+                head_etag: head_etag.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        let date = crawl_completed.map(|date| date.to_string());
+        let result = crate::upload_receipts::cloud_commit(
+            &self.state_dir,
+            scope,
+            &acks,
+            date.as_deref(),
+            now_unix,
+        );
+        drop(lease);
+        result
+    }
+
+    /// The pre-ACK-cache collector kept a page digest here; it cannot seed
+    /// per-task ACKs, so it is removed once the cache is in use.
+    fn retire_legacy_checkpoint(&self) {
+        let _ = fs::remove_file(
+            self.state_dir
+                .join("cloud_sessions")
+                .join("checkpoint.json"),
+        );
     }
 
     #[cfg(test)]
@@ -1736,30 +1592,12 @@ impl CloudSessionCheckpointStore {
 
     #[cfg(not(test))]
     fn wait_at_relay_admission_barrier_for_test(&self) {}
-    fn load(&self) -> CloudSessionCheckpoint {
-        fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .filter(|state: &CloudSessionCheckpoint| {
-                state.schema_version == CHECKPOINT_SCHEMA_VERSION
-            })
-            .unwrap_or_else(|| CloudSessionCheckpoint {
-                schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
-                ..Default::default()
-            })
-    }
-    fn save(&self, state: &CloudSessionCheckpoint) -> Result<()> {
-        atomic_json_write(&self.path, state)
-    }
 }
 
 impl Default for CloudSessionCheckpointStore {
     fn default() -> Self {
         Self {
-            path: default_support_dir()
-                .join("cloud_sessions")
-                .join("checkpoint.json"),
-            runtime: Mutex::new(CloudSessionScanRuntime::default()),
+            state_dir: default_support_dir(),
             collector_io: default_collector_io_fence(),
             #[cfg(test)]
             relay_admission_barrier: Mutex::new(None),
@@ -1768,10 +1606,10 @@ impl Default for CloudSessionCheckpointStore {
 }
 
 pub trait CloudSessionRunner {
-    /// `cursor` may only be retained by the caller for this single cycle.
+    /// `cursor` may only be retained by the caller in memory.
     fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String>;
 
-    /// Production runners must honor the remaining cycle budget. Test runners
+    /// Production runners must honor the remaining slice budget. Test runners
     /// may use the default because they perform no blocking I/O.
     fn list_page_bounded(
         &self,
@@ -1790,77 +1628,48 @@ pub trait CloudSessionTransport {
     fn is_configured(&self) -> bool {
         true
     }
-    /// Upload wiring alone is insufficient: provider execution also requires
-    /// an ordinary-user authenticated grant-list preflight.
-    fn supports_grant_revalidation(&self) -> bool {
-        false
+    /// Current local device/account authority must still match at every I/O fence.
+    fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
+        true
     }
-    /// Perform one bounded authenticated grant-list lookup and return the
-    /// exact bound grant. Implementations must fail closed on any network,
-    /// authentication, parsing, ambiguity, or absence error.
-    #[cfg(test)]
-    fn revalidate_grant(
+
+    /// One bounded relay-authenticated read of the exact bound grant epoch on
+    /// the `cloud_session_changes.v1` authority. Fails closed on any network,
+    /// authentication, parsing or absence error.
+    fn read_authority(
         &self,
-        _grant: &CloudSessionGrant,
-    ) -> Result<CloudSessionBackendGrantResponseV1> {
-        Err(anyhow!(
-            "cloud-session backend grant revalidation is not configured"
-        ))
-    }
-    fn revalidate_grant_bounded(
+        grant: &CloudSessionGrant,
+        timeout: Duration,
+    ) -> Result<CloudSessionGrantAuthorityV1>;
+    /// Upload one validated request and return its parsed ACK. Matching the
+    /// ACK to the offered tasks is the caller's job.
+    fn send_changes(
         &self,
-        _grant: &CloudSessionGrant,
-        _timeout: Duration,
-    ) -> Result<CloudSessionBackendGrantResponseV1> {
-        Err(anyhow!(
-            "bounded cloud-session grant revalidation is not configured"
-        ))
-    }
-    fn send_scan_chunk(&self, _chunk: &CloudSessionObservationChunkV2) -> Result<()> {
-        Err(anyhow!(
-            "cloud-session v2 chunk transport is not configured"
-        ))
-    }
-    fn send_scan_chunk_bounded(
-        &self,
-        chunk: &CloudSessionObservationChunkV2,
-        _timeout: Duration,
-    ) -> Result<()> {
-        self.send_scan_chunk(chunk)
-    }
-    fn finalize_scan(&self, _finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
-        Err(anyhow!(
-            "cloud-session v2 finalize transport is not configured"
-        ))
-    }
-    fn finalize_scan_bounded(
-        &self,
-        finalize: &CloudSessionScanFinalizeV2,
-        _timeout: Duration,
-    ) -> Result<()> {
-        self.finalize_scan(finalize)
-    }
-    /// V1 is retained only for observation-empty health heartbeats.
-    fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()>;
-    fn send_bounded(
-        &self,
-        batch: &CloudSessionObservationBatchV1,
-        _timeout: Duration,
-    ) -> Result<()> {
-        self.send(batch)
-    }
+        request: &CloudSessionChangesV1,
+        timeout: Duration,
+    ) -> Result<CloudSessionChangesAckV1>;
 }
 
-/// Deliberately keeps production collection disabled. The strict route and
-/// prepared relay transport exist below, but activation remains a separate
-/// backend-deploy, retention, consent-composition, and QA decision.
+/// Used where no relay transport is composed (local control status).
 pub struct DeferredCloudSessionTransport;
 impl CloudSessionTransport for DeferredCloudSessionTransport {
     fn is_configured(&self) -> bool {
         false
     }
 
-    fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+    fn read_authority(
+        &self,
+        _grant: &CloudSessionGrant,
+        _timeout: Duration,
+    ) -> Result<CloudSessionGrantAuthorityV1> {
+        Err(anyhow!("cloud-session authority is not configured"))
+    }
+
+    fn send_changes(
+        &self,
+        _request: &CloudSessionChangesV1,
+        _timeout: Duration,
+    ) -> Result<CloudSessionChangesAckV1> {
         Err(anyhow!("cloud-session ingest endpoint is not configured"))
     }
 }
@@ -1874,24 +1683,33 @@ impl CloudSessionTransport for RuntimeAvailabilityTransport {
         self.0
     }
 
-    fn supports_grant_revalidation(&self) -> bool {
-        self.0
+    fn read_authority(
+        &self,
+        _grant: &CloudSessionGrant,
+        _timeout: Duration,
+    ) -> Result<CloudSessionGrantAuthorityV1> {
+        Err(anyhow!(
+            "cloud-session status transport cannot read authority"
+        ))
     }
 
-    fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+    fn send_changes(
+        &self,
+        _request: &CloudSessionChangesV1,
+        _timeout: Duration,
+    ) -> Result<CloudSessionChangesAckV1> {
         Err(anyhow!("cloud-session status transport cannot send"))
     }
 }
 
-/// Relay transport for the strict backend route. The consent-gated experimental
-/// runtime composes it only after exact local identity/grant checks. Collection
-/// then revalidates that exact grant before every provider or upload boundary.
-/// It acquires through the shared relay-token cache and retries once on 401/403.
+/// Relay transport for the strict backend routes, composed only after exact
+/// local identity/grant checks. It acquires through the shared relay-token
+/// cache and retries once on 401/403 within the caller's deadline.
 pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
     device_secret: String,
-    acknowledged_chunks: Mutex<HashMap<String, Vec<CloudSessionObservationChunkV2>>>,
+    gzip_enabled: AtomicBool,
 }
 
 impl RelayCloudSessionTransport {
@@ -1904,49 +1722,8 @@ impl RelayCloudSessionTransport {
             client: crate::snapshot_client::SnapshotApiClient::new(api_base_url),
             device,
             device_secret,
-            acknowledged_chunks: Mutex::new(HashMap::new()),
+            gzip_enabled: AtomicBool::new(true),
         }
-    }
-
-    fn record_acknowledged_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
-        let mut scans = self
-            .acknowledged_chunks
-            .lock()
-            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?;
-        // The collector owns one active scan. Drop an abandoned partial
-        // sequence when a later scan begins so truncated scans cannot grow
-        // this in-memory receipt ledger without bound.
-        scans.retain(|scan_id, _| scan_id == &chunk.scan_id);
-        let chunks = scans.entry(chunk.scan_id.clone()).or_default();
-        if usize::from(chunk.chunk_index) != chunks.len() {
-            return Err(anyhow!(
-                "cloud-session chunk acknowledgment is out of sequence"
-            ));
-        }
-        chunks.push(chunk.clone());
-        Ok(())
-    }
-
-    fn validate_finalize_sequence(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
-        let mut scans = self
-            .acknowledged_chunks
-            .lock()
-            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?;
-        scans.retain(|scan_id, _| scan_id == &finalize.scan_id);
-        finalize.validate_against_chunks(
-            scans
-                .get(&finalize.scan_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-        )
-    }
-
-    fn clear_finalized_sequence(&self, scan_id: &str) -> Result<()> {
-        self.acknowledged_chunks
-            .lock()
-            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?
-            .remove(scan_id);
-        Ok(())
     }
 
     fn token(&self, deadline: Instant) -> Result<String> {
@@ -1960,7 +1737,7 @@ impl RelayCloudSessionTransport {
         )
     }
 
-    fn send_with_relay_retry<F>(&self, timeout: Duration, send: F) -> Result<()>
+    fn with_relay_retry<F>(&self, timeout: Duration, request: F) -> Result<Value>
     where
         F: Fn(&crate::snapshot_client::SnapshotApiClient, &str, Duration) -> Result<Value>,
     {
@@ -1971,8 +1748,7 @@ impl RelayCloudSessionTransport {
         let token = self.token(deadline)?;
         let request_timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-        match send(&self.client, &token, request_timeout) {
-            Ok(_) => Ok(()),
+        match request(&self.client, &token, request_timeout) {
             Err(error)
                 if error
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
@@ -1981,9 +1757,9 @@ impl RelayCloudSessionTransport {
                 let refreshed = self.token(deadline)?;
                 let retry_timeout = remaining_budget(deadline)
                     .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-                send(&self.client, &refreshed, retry_timeout).map(|_| ())
+                request(&self.client, &refreshed, retry_timeout)
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 }
@@ -1995,18 +1771,32 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
             && self.device.sources.iter().any(|source| source == "codex")
     }
 
-    fn supports_grant_revalidation(&self) -> bool {
-        self.is_configured()
+    fn local_binding_current(&self, grant: &CloudSessionGrant) -> bool {
+        if grant_rebind::verified_live_hardware().is_err() {
+            return false;
+        }
+        load_cloud_session_runtime_binding(
+            &CloudSessionGrantStore::default(),
+            &FileAccountStore::default(),
+            &FileDeviceStore::default(),
+            &FileConnectionStore::default(),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|candidate| {
+            candidate.binding.device == self.device
+                && self
+                    .client
+                    .matches_api_base(&candidate.binding.api_base_url)
+                && same_runtime_grant_identity(&candidate.grant, grant)
+        })
     }
 
-    fn revalidate_grant_bounded(
+    fn read_authority(
         &self,
         grant: &CloudSessionGrant,
         timeout: Duration,
-    ) -> Result<CloudSessionBackendGrantResponseV1> {
-        if !self.is_configured() {
-            return Err(anyhow!("cloud-session relay transport is not source-bound"));
-        }
+    ) -> Result<CloudSessionGrantAuthorityV1> {
         let binding = grant
             .backend_binding
             .as_ref()
@@ -2014,123 +1804,42 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         if !is_uuid(&binding.grant_id) || binding.grant_version == 0 {
             return Err(anyhow!("cloud-session backend grant binding is invalid"));
         }
-        let deadline = Instant::now() + timeout;
-        let token = self.token(deadline)?;
-        let request_timeout = remaining_budget(deadline)
-            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-        let first = self.client.get_cloud_session_grant_authority_with_timeout(
-            &token,
-            &binding.grant_id,
-            binding.grant_version,
-            request_timeout,
-        );
-        let value = match first {
-            Ok(value) => value,
-            Err(error)
-                if error
-                    .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
-                    .is_some() =>
-            {
-                let refreshed = self.token(deadline)?;
-                let retry_timeout = remaining_budget(deadline)
-                    .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-                self.client.get_cloud_session_grant_authority_with_timeout(
-                    &refreshed,
-                    &binding.grant_id,
-                    binding.grant_version,
-                    retry_timeout,
-                )?
-            }
-            Err(error) => return Err(error),
-        };
+        let value = self.with_relay_retry(timeout, |client, token, request_timeout| {
+            client.get_cloud_session_authority_with_timeout(
+                token,
+                &binding.grant_id,
+                binding.grant_version,
+                request_timeout,
+            )
+        })?;
+        if value.get("schema_version").and_then(Value::as_str) != Some(AUTHORITY_SCHEMA_VERSION) {
+            return Err(
+                crate::snapshot_client::CloudSessionRouteUnsupported { status: 200 }.into(),
+            );
+        }
         serde_json::from_value(value)
-            .map_err(|error| anyhow!("invalid cloud-session authority response: {error}"))
+            .map_err(|_| anyhow!("invalid cloud-session authority response"))
     }
 
-    fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
-        self.send_bounded(batch, CYCLE_BUDGET)
-    }
-
-    fn send_bounded(
+    fn send_changes(
         &self,
-        batch: &CloudSessionObservationBatchV1,
+        request: &CloudSessionChangesV1,
         timeout: Duration,
-    ) -> Result<()> {
-        if !self.is_configured() {
-            return Err(anyhow!("cloud-session relay transport is not source-bound"));
-        }
-        batch.validate_relay_wire_contract()?;
-        let request = serde_json::to_value(batch)?;
-        let deadline = Instant::now() + timeout;
-        let token = self.token(deadline)?;
-        let request_timeout = remaining_budget(deadline)
-            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-        match self
-            .client
-            .upload_cloud_session_batch_with_timeout(&token, &request, request_timeout)
-        {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error
-                    .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
-                    .is_some() =>
-            {
-                let refreshed = self.token(deadline)?;
-                let retry_timeout = remaining_budget(deadline)
-                    .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
-                self.client
-                    .upload_cloud_session_batch_with_timeout(&refreshed, &request, retry_timeout)
-                    .map(|_| ())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn send_scan_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
-        self.send_scan_chunk_bounded(chunk, CYCLE_BUDGET)
-    }
-
-    fn send_scan_chunk_bounded(
-        &self,
-        chunk: &CloudSessionObservationChunkV2,
-        timeout: Duration,
-    ) -> Result<()> {
-        chunk.validate_wire_contract()?;
-        let request = serde_json::to_value(chunk)?;
-        self.send_with_relay_retry(timeout, |client, token, request_timeout| {
-            client.upload_cloud_session_scan_chunk_with_timeout(
+    ) -> Result<CloudSessionChangesAckV1> {
+        request.validate()?;
+        let body = serde_json::to_value(request)?;
+        let value = self.with_relay_retry(timeout, |client, token, request_timeout| {
+            client.upload_cloud_session_changes_with_timeout(
                 token,
-                &chunk.scan_id,
-                &request,
+                &body,
                 request_timeout,
+                &self.gzip_enabled,
             )
         })?;
-        self.record_acknowledged_chunk(chunk)
-    }
-
-    fn finalize_scan(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
-        self.finalize_scan_bounded(finalize, CYCLE_BUDGET)
-    }
-
-    fn finalize_scan_bounded(
-        &self,
-        finalize: &CloudSessionScanFinalizeV2,
-        timeout: Duration,
-    ) -> Result<()> {
-        self.validate_finalize_sequence(finalize)?;
-        let request = serde_json::to_value(finalize)?;
-        self.send_with_relay_retry(timeout, |client, token, request_timeout| {
-            client.finalize_cloud_session_scan_with_timeout(
-                token,
-                &finalize.scan_id,
-                &request,
-                request_timeout,
-            )
-        })?;
-        self.clear_finalized_sequence(&finalize.scan_id)
+        serde_json::from_value(value)
+            .map_err(|error| anyhow!("invalid cloud-session changes ACK: {error}"))
     }
 }
-
 pub struct CodexCloudCliRunner;
 
 #[cfg(unix)]
@@ -2416,498 +2125,724 @@ impl CloudSessionRunner for CodexCloudCliRunner {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudSessionCycleOutcome {
+    /// No consent, a local pause or revoke, the kill switch, or no binding:
+    /// no provider or backend call was made.
     Disabled,
-    CircuitOpen,
+    /// Nothing was due yet.
+    NotDue,
+    /// The server does not authorize collection now (remote pause, policy,
+    /// or an older server without this contract). Rechecked at the idle
+    /// cadence or after a local consent change.
+    Unsupported,
+    /// Work ran and no task changed.
     Noop,
-    Heartbeat,
+    /// At least one changed task was offered.
     Uploaded,
+    /// Provider or transport failed; the cloud-only backoff applies.
     Failed,
 }
 
-pub fn collect_cloud_sessions_once(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    runner: &dyn CloudSessionRunner,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
-) -> CloudSessionCycleOutcome {
-    collect_cloud_sessions_once_with_budget(
-        grants,
-        checkpoints,
-        runner,
-        transport,
-        now,
-        CYCLE_BUDGET,
-    )
+/// The collector's in-memory schedule; one per supervisor.
+#[derive(Default)]
+pub struct CloudCollector {
+    schedule: CloudSchedule,
 }
 
-fn collect_cloud_sessions_once_with_budget(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    runner: &dyn CloudSessionRunner,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
-    cycle_budget: Duration,
-) -> CloudSessionCycleOutcome {
-    if kill_switch_enabled() {
-        disable_checkpoint_runtime(checkpoints);
-        return CloudSessionCycleOutcome::Disabled;
-    }
-    let Some(admitted_grant) = grants
-        .load()
-        .ok()
-        .flatten()
-        .filter(cloud_grant_preflight_eligible)
-    else {
-        disable_checkpoint_runtime(checkpoints);
-        return CloudSessionCycleOutcome::Disabled;
-    };
-    if !transport.is_configured() || !transport.supports_grant_revalidation() {
-        let _ = grants.record_health("unavailable", "unavailable", Some("transport_unconfigured"));
-        return CloudSessionCycleOutcome::Noop;
-    }
-    let mut checkpoint = checkpoints.load();
-    reset_stale_circuit_for_grant(&mut checkpoint, &admitted_grant);
-    if circuit_open_for_grant(&checkpoint, &admitted_grant, now) {
-        return CloudSessionCycleOutcome::CircuitOpen;
-    }
-    let mut runtime = match checkpoints.runtime.lock() {
-        Ok(mut shared) => {
-            if shared.cycle_in_progress {
-                return CloudSessionCycleOutcome::Noop;
-            }
-            shared.cycle_in_progress = true;
-            CloudSessionScanRuntime {
-                active: shared.active.take(),
-                ..Default::default()
-            }
-        }
-        Err(_) => return CloudSessionCycleOutcome::Failed,
-    };
-    let deadline = Instant::now() + cycle_budget;
-    let result = collect_enabled_cycle(
-        grants,
-        checkpoints,
-        &checkpoint,
-        &mut runtime,
-        runner,
-        transport,
-        now,
-        deadline,
-    );
-    let preserve_incomplete_health = checkpoint.last_error_category.as_deref()
-        == Some("scan_incomplete")
-        && runtime
-            .active
-            .as_ref()
-            .is_some_and(|scan| scan.mode == CloudSessionScanMode::Full);
-    let mut shared = match checkpoints.runtime.lock() {
-        Ok(shared) => shared,
-        Err(_) => return CloudSessionCycleOutcome::Failed,
-    };
-    if !shared.cancel_requested && !kill_switch_enabled() && grant_preflight_eligible(grants) {
-        shared.active = runtime.active.take();
-    }
-    shared.cycle_in_progress = false;
-    shared.cancel_requested = false;
-    drop(shared);
-    match result {
-        Ok(CycleResult::Deferred) => CloudSessionCycleOutcome::Noop,
-        Ok(CycleResult::Noop) => {
-            checkpoint.consecutive_failures = 0;
-            checkpoint.circuit_open_until = None;
-            checkpoint.circuit_grant_epoch_digest = None;
-            checkpoint.last_success_at = Some(timestamp(now));
-            if !preserve_incomplete_health {
-                checkpoint.last_error_category = None;
-            }
-            let _ = checkpoints.save(&checkpoint);
-            let _ = if preserve_incomplete_health {
-                grants.record_health("degraded", "stale", Some("scan_incomplete"))
-            } else {
-                grants.record_health("ok", "fresh", None)
-            };
-            CloudSessionCycleOutcome::Noop
-        }
-        Ok(CycleResult::Heartbeat) => {
-            checkpoint.consecutive_failures = 0;
-            checkpoint.circuit_open_until = None;
-            checkpoint.circuit_grant_epoch_digest = None;
-            checkpoint.last_error_category = None;
-            checkpoint.last_success_at = Some(timestamp(now));
-            checkpoint.last_health_upload_at = Some(timestamp(now));
-            let _ = checkpoints.save(&checkpoint);
-            let _ = grants.record_health("ok", "fresh", None);
-            CloudSessionCycleOutcome::Heartbeat
-        }
-        Ok(CycleResult::Uploaded {
-            digest,
-            head_semantic_digest,
-            grant_epoch_digest,
-            completed_full_scan,
-            degraded,
-        }) => {
-            if let Some(digest) = digest {
-                checkpoint.semantic_digest = Some(digest);
-            }
-            if let Some(head_digest) = head_semantic_digest {
-                checkpoint.head_semantic_digest = Some(head_digest);
-            }
-            checkpoint.consecutive_failures = 0;
-            checkpoint.circuit_open_until = None;
-            checkpoint.circuit_grant_epoch_digest = None;
-            checkpoint.last_success_at = Some(timestamp(now));
-            checkpoint.last_health_upload_at = Some(timestamp(now));
-            if completed_full_scan {
-                checkpoint.last_complete_snapshot_at = Some(timestamp(now));
-            }
-            if let Some(grant_epoch_digest) = grant_epoch_digest {
-                checkpoint.grant_epoch_digest = Some(grant_epoch_digest);
-            }
-            checkpoint.last_error_category = degraded.then(|| "scan_incomplete".to_string());
-            let _ = checkpoints.save(&checkpoint);
-            let _ = if degraded {
-                grants.record_health("degraded", "stale", Some("scan_incomplete"))
-            } else {
-                grants.record_health("ok", "fresh", None)
-            };
-            CloudSessionCycleOutcome::Uploaded
-        }
-        Err(error) => {
-            checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
-            checkpoint.last_error_category = Some(error.category.to_string());
-            checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(&admitted_grant));
-            checkpoint.circuit_open_until = Some(timestamp(
-                now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
-            ));
-            if error.health_uploaded {
-                checkpoint.last_health_upload_at = Some(timestamp(now));
-            }
-            let _ = checkpoints.save(&checkpoint);
-            let _ = grants.record_health("failing", "stale", Some(error.category));
-            CloudSessionCycleOutcome::Failed
-        }
-    }
+/// Everything one work slice uses.
+pub struct SliceInputs<'a> {
+    pub grants: &'a CloudSessionGrantStore,
+    pub checkpoints: &'a CloudSessionCheckpointStore,
+    pub runner: &'a dyn CloudSessionRunner,
+    pub transport: &'a dyn CloudSessionTransport,
+    /// The validated backend destination; part of the ACK-cache scope.
+    pub destination: &'a str,
+    /// The latest local Codex transcript event the file watcher saw.
+    pub last_activity: Option<Instant>,
 }
 
-fn disable_checkpoint_runtime(checkpoints: &CloudSessionCheckpointStore) {
-    if let Ok(mut runtime) = checkpoints.runtime.lock() {
-        runtime.active = None;
-        runtime.cancel_requested = runtime.cycle_in_progress;
-    }
-}
-
-enum CycleResult {
-    Deferred,
-    Noop,
-    Heartbeat,
-    Uploaded {
-        digest: Option<String>,
-        head_semantic_digest: Option<String>,
-        grant_epoch_digest: Option<String>,
-        completed_full_scan: bool,
-        degraded: bool,
-    },
-}
 #[derive(Debug)]
-struct CycleError {
+struct SliceError {
     category: &'static str,
-    health_uploaded: bool,
+    kind: SliceErrorKind,
 }
 
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
-fn collect_enabled_cycle(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    checkpoint: &CloudSessionCheckpoint,
-    runtime: &mut CloudSessionScanRuntime,
-    runner: &dyn CloudSessionRunner,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
+#[derive(Debug)]
+enum SliceErrorKind {
+    /// Retry after the cloud-only backoff (a `Retry-After` when given).
+    Backoff(Option<Duration>),
+    /// The server does not offer this route or epoch now.
+    Unsupported,
+    /// Local consent closed the I/O fence mid-slice.
+    Stopped,
+    /// The slice budget ran out; the next slice continues.
+    Deferred,
+}
+
+impl SliceError {
+    fn backoff(category: &'static str) -> Self {
+        Self {
+            category,
+            kind: SliceErrorKind::Backoff(None),
+        }
+    }
+
+    fn from_request(error: &anyhow::Error, deadline: Instant) -> Self {
+        if let Some(shed) = error.downcast_ref::<crate::snapshot_client::UploadShed>() {
+            return Self {
+                category: "backend_shed",
+                kind: SliceErrorKind::Backoff(shed.retry_after),
+            };
+        }
+        if error
+            .downcast_ref::<crate::snapshot_client::CloudSessionRouteUnsupported>()
+            .is_some()
+        {
+            return Self {
+                category: "server_unsupported",
+                kind: SliceErrorKind::Unsupported,
+            };
+        }
+        if remaining_budget(deadline).is_none() {
+            return Self {
+                category: "budget_exhausted",
+                kind: SliceErrorKind::Deferred,
+            };
+        }
+        Self::backoff("transport_unavailable")
+    }
+}
+
+/// What one listed page contributed.
+struct PageFacts {
+    next: Option<String>,
+    ambiguous: bool,
+}
+
+/// One slice's working memory: only ACK metadata of tasks it settled.
+struct SliceWork<'a, 'b> {
+    inputs: &'a SliceInputs<'b>,
+    grant: CloudSessionGrant,
+    binding: CloudSessionBackendGrantBindingV1,
+    key: Vec<u8>,
+    scope: [u8; 32],
+    cutoff: Option<OffsetDateTime>,
     deadline: Instant,
-) -> std::result::Result<CycleResult, CycleError> {
-    let state = grants
-        .read()
-        .map_err(|_| CycleError {
-            category: "grant_unavailable",
-            health_uploaded: false,
-        })?
-        .ok_or(CycleError {
-            category: "grant_absent",
-            health_uploaded: false,
-        })?;
-    if kill_switch_enabled() || !cloud_grant_preflight_eligible(&state.grant) {
-        return Ok(CycleResult::Noop);
-    }
-    let key = decode_hex(&state.hmac_key_hex)
-        .filter(|key| key.len() == 32)
-        .ok_or(CycleError {
-            category: "grant_invalid",
-            health_uploaded: false,
-        })?;
-    let mut first_page_prevalidated = false;
-    if runtime.active.is_none() {
-        let current_grant = match revalidate_scan_start(grants, transport, &state.grant, deadline)?
-        {
-            RevalidationOutcome::Granted(grant) => *grant,
-            RevalidationOutcome::Denied => return Ok(CycleResult::Noop),
-            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
-        };
-        first_page_prevalidated = true;
-        runtime.active = Some(ActiveCloudSessionScan {
-            scan_id: random_scan_id().map_err(|_| CycleError {
-                category: "scan_id_unavailable",
-                health_uploaded: false,
-            })?,
-            scan_started_at: timestamp(now),
-            mode: if complete_snapshot_due(checkpoint, now)
-                || checkpoint.grant_epoch_digest.as_deref()
-                    != Some(grant_epoch_digest(&current_grant).as_str())
-            {
-                CloudSessionScanMode::Full
-            } else {
-                CloudSessionScanMode::Head
-            },
-            grant: current_grant,
-            cursor: None,
-            seen_cursors: HashSet::new(),
-            observations: BTreeMap::new(),
-            provider_page_count: 0,
-            head_semantic_digest: None,
-            prepared: None,
-        });
+    wall: OffsetDateTime,
+    pages: usize,
+    offered: usize,
+    observed_head_nonterminal: Option<bool>,
+    settled: HashMap<String, ([u8; 32], Option<String>)>,
+}
+
+impl CloudCollector {
+    /// When the supervisor should next run a slice; `None` waits for a local
+    /// consent change (or the supervisor's idle fallback).
+    pub fn next_wake(
+        &self,
+        now: Instant,
+        wall: OffsetDateTime,
+        last_activity: Option<Instant>,
+    ) -> Option<Instant> {
+        if self.schedule.scope.is_none() {
+            return self.schedule.retry_not_before;
+        }
+        Some(self.schedule.next_due(now, wall.date(), last_activity))
     }
 
-    if runtime
-        .active
-        .as_ref()
-        .is_some_and(|scan| scan.prepared.is_some())
-    {
-        return upload_prepared_scan(grants, checkpoints, runtime, transport, deadline);
+    /// Drop transient work (cursor, backoff, unsupported recheck) after a
+    /// local consent change; the next slice starts with an immediate head.
+    pub fn reset(&mut self) {
+        self.schedule.clear();
     }
 
-    for _ in 0..MAX_PAGES {
-        if Instant::now() >= deadline {
-            break;
+    fn defer_after_local_failure(&mut self, now: Instant) {
+        let backoff = crate::snapshot_sync::full_jitter_backoff(self.schedule.consecutive_failures);
+        self.schedule.note_failure(now, backoff);
+    }
+
+    /// Run whatever is due: one authority read, then the head and/or the
+    /// next crawl pages, uploading only changed tasks, then one cache commit.
+    pub fn run_slice(
+        &mut self,
+        inputs: &SliceInputs<'_>,
+        now: Instant,
+        wall: OffsetDateTime,
+    ) -> CloudSessionCycleOutcome {
+        let started = Instant::now();
+        if kill_switch_enabled() {
+            self.schedule.clear();
+            return CloudSessionCycleOutcome::Disabled;
         }
-        let expected_grant = runtime
-            .active
-            .as_ref()
-            .map(|scan| scan.grant.clone())
-            .ok_or(CycleError {
-                category: "scan_unavailable",
-                health_uploaded: false,
-            })?;
-        if first_page_prevalidated {
-            first_page_prevalidated = false;
-        } else {
-            match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
-                RevalidationOutcome::Granted(_) => {}
-                RevalidationOutcome::Denied => {
-                    runtime.active = None;
-                    return Ok(CycleResult::Noop);
-                }
-                RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
-            }
-        }
-        let cursor = runtime
-            .active
-            .as_ref()
-            .and_then(|scan| scan.cursor.as_deref());
-        let Some(timeout) = remaining_budget(deadline) else {
-            return Ok(CycleResult::Deferred);
-        };
-        let provider_call = checkpoints
-            .begin_collector_io(grants, &expected_grant)
-            .map_err(|_| CycleError {
-                category: "collector_io_fence_unavailable",
-                health_uploaded: false,
-            })?;
-        let Some(provider_call) = provider_call else {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
-        };
-        let raw_result = runner.list_page_bounded(cursor, PAGE_LIMIT, timeout);
-        // The lease represents provider-process activity only. Release it as
-        // soon as the bounded runner returns so pause/revoke never waits on
-        // later backend health or revalidation I/O from an error path.
-        drop(provider_call);
-        let raw = match raw_result {
-            Ok(raw) => raw,
-            Err(_) => {
-                if remaining_budget(deadline).is_none() {
-                    return Ok(CycleResult::Deferred);
-                }
-                if !grant_still_current(grants, &expected_grant) || kill_switch_enabled() {
-                    runtime.active = None;
-                    return Ok(CycleResult::Noop);
-                }
-                if runtime
-                    .active
-                    .as_ref()
-                    .is_some_and(|scan| !scan.observations.is_empty())
-                {
-                    prepare_active_scan(runtime, now, false)?;
-                    break;
-                }
-                runtime.active = None;
-                return match report_provider_failure_revalidated(
-                    grants,
-                    checkpoints,
-                    &expected_grant,
-                    transport,
-                    now,
-                    deadline,
-                )? {
-                    SendOutcome::Sent => Err(CycleError {
-                        category: "provider_unavailable",
-                        health_uploaded: true,
-                    }),
-                    SendOutcome::NotSent => Ok(CycleResult::Noop),
-                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
-                };
-            }
-        };
-        let page = match parse_cloud_page(&raw, &key, now) {
-            Ok(page)
-                if page.invalid_required_rows == 0
-                    && (page.source_item_count == 0 || !page.entities.is_empty()) =>
-            {
-                page
-            }
+        let state = match inputs.grants.read() {
+            Ok(Some(state)) if cloud_grant_preflight_eligible(&state.grant) => state,
             _ => {
-                if runtime
-                    .active
-                    .as_ref()
-                    .is_some_and(|scan| !scan.observations.is_empty())
-                {
-                    prepare_active_scan(runtime, now, false)?;
+                self.schedule.clear();
+                return CloudSessionCycleOutcome::Disabled;
+            }
+        };
+        let (Some(binding), Some(key)) = (
+            state.grant.backend_binding.clone(),
+            decode_hex(&state.hmac_key_hex).filter(|key| key.len() == 32),
+        ) else {
+            self.schedule.clear();
+            return CloudSessionCycleOutcome::Disabled;
+        };
+        if !inputs.transport.is_configured() {
+            let _ = inputs.grants.record_health(
+                "unavailable",
+                "unavailable",
+                Some("transport_unconfigured"),
+            );
+            self.schedule.clear();
+            return CloudSessionCycleOutcome::Disabled;
+        }
+        let scope = cache_scope(inputs.destination, &state.grant, &binding);
+        self.schedule.reset_for_scope(scope);
+        let today = wall.date();
+        let opportunity = self.schedule.due(now, today, inputs.last_activity);
+        if !opportunity.head && !opportunity.crawl {
+            return CloudSessionCycleOutcome::NotDue;
+        }
+        if !self.schedule.crawl_completed_loaded {
+            let lease = match inputs.checkpoints.begin_io(|| {
+                inputs.transport.local_binding_current(&state.grant)
+                    && preflight_grant_still_current(inputs.grants, &state.grant)
+            }) {
+                Ok(Some(lease)) => lease,
+                _ => {
+                    self.schedule.clear();
+                    return CloudSessionCycleOutcome::Disabled;
+                }
+            };
+            self.schedule.crawl_completed = match inputs.checkpoints.crawl_completed(&scope) {
+                Ok(date) => date,
+                Err(_) => {
+                    return self.settle_failure(
+                        inputs,
+                        SliceError::backoff("ack_cache_unavailable"),
+                        now,
+                        now + started.elapsed(),
+                    );
+                }
+            };
+            self.schedule.crawl_completed_loaded = true;
+            inputs.checkpoints.retire_legacy_checkpoint();
+            drop(lease);
+        }
+        let due = self.schedule.due(now, today, inputs.last_activity);
+        if !due.head && !due.crawl {
+            return CloudSessionCycleOutcome::NotDue;
+        }
+        let deadline = Instant::now() + CYCLE_BUDGET;
+        let grant = match self.preflight(inputs, &state.grant, deadline, now, started) {
+            Ok(grant) => grant,
+            Err(outcome) => return outcome,
+        };
+        let binding = grant.backend_binding.clone().unwrap_or(binding);
+        let cutoff = binding
+            .collect_not_before
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+        let mut work = SliceWork {
+            inputs,
+            grant,
+            binding,
+            key,
+            scope,
+            cutoff,
+            deadline,
+            wall,
+            pages: 0,
+            offered: 0,
+            observed_head_nonterminal: None,
+            settled: HashMap::new(),
+        };
+        let mut crawl_completed = None;
+        let failure = self.work(&mut work, due, now, today, &mut crawl_completed);
+        let cache_unavailable = inputs
+            .checkpoints
+            .commit(
+                inputs,
+                &work.grant,
+                &scope,
+                &work.settled,
+                crawl_completed,
+                wall.unix_timestamp(),
+            )
+            .is_err();
+        // A cache failure re-offers tasks next time (server no-op). Preserve
+        // its diagnostic instead of overwriting it with an unconditional OK.
+        match failure {
+            None => {
+                self.schedule.note_success();
+                if cache_unavailable {
+                    let _ = inputs.grants.record_health(
+                        "degraded",
+                        "fresh",
+                        Some("ack_cache_unavailable"),
+                    );
+                } else {
+                    let _ = inputs.grants.record_health("ok", "fresh", None);
+                }
+                if work.offered > 0 {
+                    CloudSessionCycleOutcome::Uploaded
+                } else {
+                    CloudSessionCycleOutcome::Noop
+                }
+            }
+            Some(error) => self.settle_failure(inputs, error, now, now + started.elapsed()),
+        }
+    }
+
+    fn settle_failure(
+        &mut self,
+        inputs: &SliceInputs<'_>,
+        error: SliceError,
+        now: Instant,
+        failed_at: Instant,
+    ) -> CloudSessionCycleOutcome {
+        match error.kind {
+            SliceErrorKind::Backoff(retry_after) => {
+                let backoff = match retry_after {
+                    Some(_) => crate::snapshot_sync::shed_backoff(retry_after),
+                    None => crate::snapshot_sync::full_jitter_backoff(
+                        self.schedule.consecutive_failures,
+                    ),
+                };
+                // Retry-After begins at failure receipt. Unsupported feature
+                // rechecks below keep their ordinary planned opportunity.
+                self.schedule.note_failure(failed_at, backoff);
+                let _ = inputs
+                    .grants
+                    .record_health("failing", "stale", Some(error.category));
+                CloudSessionCycleOutcome::Failed
+            }
+            SliceErrorKind::Unsupported => {
+                self.mark_unsupported(inputs, now);
+                CloudSessionCycleOutcome::Unsupported
+            }
+            SliceErrorKind::Stopped => {
+                self.schedule.clear();
+                CloudSessionCycleOutcome::Disabled
+            }
+            SliceErrorKind::Deferred => CloudSessionCycleOutcome::Noop,
+        }
+    }
+
+    fn mark_unsupported(&mut self, inputs: &SliceInputs<'_>, now: Instant) {
+        self.schedule.crawl = None;
+        self.schedule.retry_not_before = None;
+        self.schedule.unsupported_until = Some(now + IDLE_HEAD_INTERVAL);
+        let _ =
+            inputs
+                .grants
+                .record_health("unavailable", "unavailable", Some("server_unsupported"));
+    }
+
+    /// The one authority read of a due slice. Local pause/revoke never reach
+    /// here; a remote revoke revokes locally and erases the cache.
+    fn preflight(
+        &mut self,
+        inputs: &SliceInputs<'_>,
+        expected: &CloudSessionGrant,
+        deadline: Instant,
+        now: Instant,
+        started: Instant,
+    ) -> std::result::Result<CloudSessionGrant, CloudSessionCycleOutcome> {
+        let Some(timeout) = remaining_relay_budget(deadline) else {
+            return Err(CloudSessionCycleOutcome::NotDue);
+        };
+        let lease = match inputs.checkpoints.begin_io(|| {
+            inputs.transport.local_binding_current(expected)
+                && preflight_grant_still_current(inputs.grants, expected)
+        }) {
+            Ok(Some(lease)) => lease,
+            _ => {
+                self.schedule.clear();
+                return Err(CloudSessionCycleOutcome::Disabled);
+            }
+        };
+        let result = inputs.transport.read_authority(expected, timeout);
+        drop(lease);
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                let error = SliceError::from_request(&error, deadline);
+                return Err(self.settle_failure(inputs, error, now, now + started.elapsed()));
+            }
+        };
+        let current = match inputs.grants.apply_backend_authority(&response) {
+            Ok(current) => current,
+            Err(_) => {
+                self.mark_unsupported(inputs, now);
+                return Err(CloudSessionCycleOutcome::Unsupported);
+            }
+        };
+        if current.status == CloudSessionGrantStatus::Revoked {
+            let _ = inputs.checkpoints.erase_cache();
+            self.schedule.clear();
+            return Err(CloudSessionCycleOutcome::Disabled);
+        }
+        if !same_runtime_grant_identity(&current, expected) {
+            self.schedule.clear();
+            return Err(CloudSessionCycleOutcome::Disabled);
+        }
+        if !cloud_grant_runtime_ready(&current) {
+            self.mark_unsupported(inputs, now);
+            return Err(CloudSessionCycleOutcome::Unsupported);
+        }
+        Ok(current)
+    }
+
+    fn work(
+        &mut self,
+        work: &mut SliceWork<'_, '_>,
+        due: Due,
+        now: Instant,
+        today: Date,
+        crawl_completed: &mut Option<Date>,
+    ) -> Option<SliceError> {
+        let start_crawl = due.crawl
+            && self
+                .schedule
+                .crawl
+                .as_ref()
+                .is_none_or(|crawl| crawl.cursor.is_none());
+        if due.head || start_crawl {
+            self.schedule.last_head_attempt = Some(now);
+            let listed = work.page(None);
+            // Provider facts remain valid when their delivery fails. A failed
+            // provider read preserves the previous predicate; deep pages never
+            // set this head-only observation.
+            if let Some(nonterminal) = work.observed_head_nonterminal {
+                self.schedule.head_nonterminal = nonterminal;
+            }
+            let page = match listed {
+                Ok(page) => page,
+                Err(error) => {
+                    if start_crawl {
+                        // Page zero remains owed, paced like any unfinished
+                        // crawl. Backoff cannot turn it into an immediate loop.
+                        self.schedule.crawl = Some(Crawl {
+                            cursor: None,
+                            pages_seen: 0,
+                            cycle: Default::default(),
+                            next_slice: now + CRAWL_CONTINUATION_INTERVAL,
+                        });
+                    }
+                    return Some(error);
+                }
+            };
+            if start_crawl {
+                self.schedule.crawl = None;
+                match page.next {
+                    Some(cursor) if !page.ambiguous => {
+                        let mut crawl = Crawl {
+                            cursor: Some(cursor.clone()),
+                            pages_seen: 1,
+                            cycle: Default::default(),
+                            next_slice: now,
+                        };
+                        crawl.cycle.repeats(cursor_digest(&cursor));
+                        self.schedule.crawl = Some(crawl);
+                    }
+                    _ if page.ambiguous => self.schedule.crawl_ended = Some(today),
+                    _ => {
+                        self.schedule.crawl_completed = Some(today);
+                        *crawl_completed = Some(today);
+                    }
+                }
+            }
+        }
+        if !(due.crawl || start_crawl) {
+            return None;
+        }
+        let mut crawl = self.schedule.crawl.take()?;
+        let mut failure = None;
+        while work.pages < MAX_SLICE_PAGES && remaining_budget(work.deadline).is_some() {
+            let Some(cursor) = crawl.cursor.clone() else {
+                break;
+            };
+            let page = match work.page(Some(&cursor)) {
+                Ok(page) => page,
+                Err(error) => {
+                    failure = Some(error);
                     break;
                 }
-                runtime.active = None;
-                return match report_provider_failure_revalidated(
-                    grants,
-                    checkpoints,
-                    &expected_grant,
-                    transport,
-                    now,
-                    deadline,
-                )? {
-                    SendOutcome::Sent => Err(CycleError {
-                        category: "provider_payload_invalid",
-                        health_uploaded: true,
-                    }),
-                    SendOutcome::NotSent => Ok(CycleResult::Noop),
-                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
-                };
-            }
-        };
-
-        let page_digest = observation_semantic_digest(&page.entities).map_err(|_| CycleError {
-            category: "digest_failed",
-            health_uploaded: false,
-        })?;
-        let page_terminal = page.cursor == CloudPageCursor::OfficialTerminal;
-        let page_ambiguous = page.cursor == CloudPageCursor::Ambiguous;
-        let page_truncated = page.truncated;
-        let scan = runtime.active.as_mut().ok_or(CycleError {
-            category: "scan_unavailable",
-            health_uploaded: false,
-        })?;
-        scan.provider_page_count += 1;
-        if scan.provider_page_count == 1 {
-            scan.head_semantic_digest = Some(page_digest.clone());
-        }
-        for entity in page.entities {
-            if scan.observations.len() >= MAX_SCAN_ITEMS
-                && !scan.observations.contains_key(&entity.entity_key)
-            {
-                break;
-            }
-            scan.observations.insert(entity.entity_key.clone(), entity);
-        }
-        let next_cursor = match page.cursor {
-            CloudPageCursor::Next(next) => Some(next),
-            CloudPageCursor::OfficialTerminal | CloudPageCursor::Ambiguous => None,
-        };
-        let cursor_churn = next_cursor
-            .as_ref()
-            .is_some_and(|next| !scan.seen_cursors.insert(next.clone()));
-        scan.cursor = next_cursor;
-
-        // Legacy arrays, fieldless objects, and alias-only nulls can preserve
-        // valid positive facts, but only the official `cursor: null` contract
-        // proves terminal enumeration or healthy absence authority.
-        if page_ambiguous {
-            prepare_active_scan(runtime, now, false)?;
-            break;
-        }
-
-        if scan.mode == CloudSessionScanMode::Head {
-            if checkpoint.head_semantic_digest.as_deref() == Some(page_digest.as_str()) {
-                runtime.active = None;
-                if checkpoint.last_error_category.is_none()
-                    && !health_heartbeat_due(checkpoint, now)
-                {
-                    return Ok(CycleResult::Noop);
+            };
+            crawl.pages_seen += 1;
+            match page.next {
+                None if !page.ambiguous => {
+                    // Reached the end: the day's crawl is complete, whatever
+                    // day it started.
+                    self.schedule.crawl_completed = Some(today);
+                    *crawl_completed = Some(today);
+                    return failure;
                 }
-                return match send_heartbeat_revalidated(
-                    grants,
-                    checkpoints,
-                    &expected_grant,
-                    transport,
-                    now,
-                    deadline,
-                )? {
-                    SendOutcome::Sent => Ok(CycleResult::Heartbeat),
-                    SendOutcome::NotSent => Ok(CycleResult::Noop),
-                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
-                };
+                Some(next)
+                    if !page.ambiguous
+                        && next != cursor
+                        && !crawl.cycle.repeats(cursor_digest(&next)) =>
+                {
+                    crawl.cursor = Some(next);
+                }
+                _ => {
+                    // An ambiguous, repeating or cycling cursor chain ends
+                    // this traversal without claiming completion; valid facts
+                    // already uploaded stay. A new crawl starts tomorrow.
+                    self.schedule.crawl_ended = Some(today);
+                    return failure;
+                }
             }
-            prepare_active_scan(
-                runtime,
-                now,
-                page_terminal && !page_truncated && !cursor_churn,
-            )?;
-            break;
         }
+        if matches!(
+            failure.as_ref().map(|error| &error.kind),
+            Some(SliceErrorKind::Unsupported | SliceErrorKind::Stopped)
+        ) {
+            return failure;
+        }
+        crawl.next_slice = now + CRAWL_CONTINUATION_INTERVAL;
+        self.schedule.crawl = Some(crawl);
+        failure
+    }
+}
 
-        if page_terminal && !page_truncated && !cursor_churn {
-            prepare_active_scan(runtime, now, true)?;
-            break;
+impl SliceWork<'_, '_> {
+    fn list(&mut self, cursor: Option<&str>) -> std::result::Result<String, SliceError> {
+        let Some(timeout) = remaining_budget(self.deadline) else {
+            return Err(SliceError {
+                category: "budget_exhausted",
+                kind: SliceErrorKind::Deferred,
+            });
+        };
+        let lease = self
+            .inputs
+            .checkpoints
+            .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+            .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
+            .ok_or(SliceError {
+                category: "stopped",
+                kind: SliceErrorKind::Stopped,
+            })?;
+        self.pages += 1;
+        let result =
+            self.inputs
+                .runner
+                .list_page_bounded(cursor, PAGE_LIMIT, timeout.min(COMMAND_TIMEOUT));
+        // The lease covers provider-process activity only.
+        drop(lease);
+        result.map_err(|_| {
+            if remaining_budget(self.deadline).is_none() {
+                SliceError {
+                    category: "budget_exhausted",
+                    kind: SliceErrorKind::Deferred,
+                }
+            } else {
+                SliceError::backoff("provider_unavailable")
+            }
+        })
+    }
+
+    fn parse(&self, raw: &str) -> std::result::Result<ParsedPage, SliceError> {
+        match parse_cloud_page(raw, &self.key, self.wall) {
+            // A nonempty page with no valid task is a provider failure, not
+            // an empty healthy page.
+            Ok(page) if page.source_item_count == 0 || !page.changes.is_empty() => Ok(page),
+            _ => Err(SliceError::backoff("provider_payload_invalid")),
         }
-        if page_truncated
-            || cursor_churn
-            || scan.observations.len() >= MAX_SCAN_ITEMS
-            || scan.provider_page_count >= MAX_SCAN_PAGES
+    }
+
+    /// List one page, offer its changed tasks, and retry a head conflict
+    /// once with freshly listed facts.
+    fn page(&mut self, cursor: Option<&str>) -> std::result::Result<PageFacts, SliceError> {
+        let raw = self.list(cursor)?;
+        let parsed = self.parse(&raw)?;
+        drop(raw);
+        if cursor.is_none() {
+            self.observed_head_nonterminal = Some(parsed.has_nonterminal());
+        }
+        let facts = PageFacts {
+            next: match &parsed.cursor {
+                CloudPageCursor::Next(next) => Some(next.clone()),
+                _ => None,
+            },
+            ambiguous: parsed.cursor == CloudPageCursor::Ambiguous,
+        };
+        let conflicts = self.deliver(parsed.changes)?;
+        if conflicts.is_empty()
+            || self.pages >= MAX_SLICE_PAGES
+            || remaining_budget(self.deadline).is_none()
         {
-            prepare_active_scan(runtime, now, false)?;
-            break;
+            return Ok(facts);
         }
+        // Fresh re-enumeration before replacing a divergent server head. A
+        // second conflict is left for the next visit.
+        let fresh = match self.list(cursor).and_then(|raw| self.parse(&raw)) {
+            Ok(fresh) => fresh,
+            Err(_) => return Ok(facts),
+        };
+        if cursor.is_none() {
+            self.observed_head_nonterminal = Some(fresh.has_nonterminal());
+        }
+        let retry = fresh
+            .changes
+            .into_iter()
+            .filter(|change| self.admissible(change))
+            .filter_map(|mut change| {
+                let hint = conflicts.get(&change.entity_key)?.clone();
+                change.expected_head_etag = Some(hint);
+                Some(change)
+            })
+            .collect::<Vec<_>>();
+        self.offer(retry)?;
+        Ok(facts)
     }
 
-    if runtime
-        .active
-        .as_ref()
-        .is_some_and(|scan| scan.prepared.is_some())
-    {
-        upload_prepared_scan(grants, checkpoints, runtime, transport, deadline)
-    } else {
-        Ok(CycleResult::Noop)
+    /// After an erasure only tasks with a trustworthy provider creation time
+    /// after the server's cutoff may be offered. The server enforces this too.
+    fn admissible(&self, change: &CloudSessionChangeV1) -> bool {
+        self.cutoff.map_or(true, |cutoff| {
+            change
+                .created_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .is_some_and(|created| created > cutoff)
+        })
     }
-}
 
-enum RevalidationOutcome {
-    Granted(Box<CloudSessionGrant>),
-    Denied,
-    BudgetExpired,
-}
+    /// Offer only tasks whose digest differs from their last exact ACK in
+    /// this slice or the cache. Returns conflict hints by task.
+    fn deliver(
+        &mut self,
+        changes: Vec<CloudSessionChangeV1>,
+    ) -> std::result::Result<HashMap<String, String>, SliceError> {
+        let mut unique = Vec::with_capacity(changes.len());
+        for change in changes {
+            if self.admissible(&change)
+                && !unique
+                    .iter()
+                    .any(|seen: &CloudSessionChangeV1| seen.entity_key == change.entity_key)
+            {
+                unique.push(change);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys = unique
+            .iter()
+            .map(|change| change.entity_key.as_str())
+            .filter(|key| !self.settled.contains_key(*key))
+            .collect::<Vec<_>>();
+        // A cache failure defers this page through cloud-only backoff.
+        // Retain no unbounded in-memory replacement and do not hammer the server.
+        let cached = if keys.is_empty() {
+            HashMap::new()
+        } else {
+            let _lease = self
+                .inputs
+                .checkpoints
+                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+                .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
+                .ok_or(SliceError {
+                    category: "stopped",
+                    kind: SliceErrorKind::Stopped,
+                })?;
+            self.inputs
+                .checkpoints
+                .read_acks(&self.scope, &keys, self.wall.unix_timestamp())
+                .map_err(|_| SliceError::backoff("ack_cache_unavailable"))?
+        };
+        let mut offer = Vec::new();
+        for mut change in unique {
+            let digest = change.semantic_digest();
+            let known = self
+                .settled
+                .get(&change.entity_key)
+                .map(|(digest, etag)| (*digest, etag.clone()))
+                .or_else(|| {
+                    cached
+                        .get(&change.entity_key)
+                        .map(|ack| (ack.digest, ack.head_etag.clone()))
+                });
+            match known {
+                Some((known, _)) if known == digest => continue,
+                Some((_, etag)) => change.expected_head_etag = etag,
+                None => change.expected_head_etag = None,
+            }
+            offer.push(change);
+        }
+        self.offer(offer)
+    }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SendOutcome {
-    Sent,
-    NotSent,
-    BudgetExpired,
+    fn offer(
+        &mut self,
+        changes: Vec<CloudSessionChangeV1>,
+    ) -> std::result::Result<HashMap<String, String>, SliceError> {
+        let mut conflicts = HashMap::new();
+        for chunk in changes.chunks(MAX_CHANGES_PER_REQUEST) {
+            let request = CloudSessionChangesV1 {
+                schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+                grant_id: self.binding.grant_id.clone(),
+                grant_version: self.binding.grant_version,
+                grant_scope_fingerprint: self.grant.grant_scope_id.clone(),
+                account_fingerprint: self.grant.account_fingerprint.clone(),
+                collector_id: COLLECTOR_ID.to_string(),
+                collector_version: compiled_release_version(),
+                collected_at: timestamp(self.wall),
+                observations: chunk.to_vec(),
+            };
+            request
+                .validate()
+                .map_err(|_| SliceError::backoff("request_invalid"))?;
+            self.inputs
+                .checkpoints
+                .wait_at_relay_admission_barrier_for_test();
+            let Some(timeout) = remaining_relay_budget(self.deadline) else {
+                return Err(SliceError {
+                    category: "budget_exhausted",
+                    kind: SliceErrorKind::Deferred,
+                });
+            };
+            let lease = self
+                .inputs
+                .checkpoints
+                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+                .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
+                .ok_or(SliceError {
+                    category: "stopped",
+                    kind: SliceErrorKind::Stopped,
+                })?;
+            let result = self.inputs.transport.send_changes(&request, timeout);
+            drop(lease);
+            let ack = result.map_err(|error| SliceError::from_request(&error, self.deadline))?;
+            let settled = request
+                .settle(&ack)
+                .map_err(|_| SliceError::backoff("ack_invalid"))?;
+            self.offered += chunk.len();
+            for change in chunk {
+                match settled.get(&change.entity_key) {
+                    Some(Settled::Acked { head_etag }) => {
+                        self.settled.insert(
+                            change.entity_key.clone(),
+                            (change.semantic_digest(), Some(head_etag.clone())),
+                        );
+                    }
+                    Some(Settled::Refused) => {
+                        self.settled
+                            .insert(change.entity_key.clone(), (change.semantic_digest(), None));
+                    }
+                    Some(Settled::Conflict {
+                        head_etag: Some(hint),
+                    }) => {
+                        conflicts.insert(change.entity_key.clone(), hint.clone());
+                    }
+                    Some(Settled::Conflict { head_etag: None }) | None => {}
+                }
+            }
+        }
+        Ok(conflicts)
+    }
 }
 
 fn remaining_budget(deadline: Instant) -> Option<Duration> {
@@ -2920,442 +2855,76 @@ fn remaining_relay_budget(deadline: Instant) -> Option<Duration> {
     remaining_budget(deadline).map(|remaining| remaining.min(RELAY_IO_TIMEOUT))
 }
 
-fn revalidate_before_io(
-    grants: &CloudSessionGrantStore,
-    transport: &dyn CloudSessionTransport,
-    expected: &CloudSessionGrant,
-    deadline: Instant,
-) -> std::result::Result<RevalidationOutcome, CycleError> {
-    if kill_switch_enabled() || !grant_still_current(grants, expected) {
-        return Ok(RevalidationOutcome::Denied);
-    }
-    let Some(timeout) = remaining_relay_budget(deadline) else {
-        return Ok(RevalidationOutcome::BudgetExpired);
-    };
-    let response = match transport.revalidate_grant_bounded(expected, timeout) {
-        Ok(response) => response,
-        Err(_) if remaining_budget(deadline).is_none() => {
-            return Ok(RevalidationOutcome::BudgetExpired)
-        }
-        Err(_) => {
-            return Err(CycleError {
-                category: "grant_revalidation_unavailable",
-                health_uploaded: false,
-            })
-        }
-    };
-    grants
-        .apply_backend_grant_revalidation(&response)
-        .map_err(|_| CycleError {
-            category: "grant_revalidation_invalid",
-            health_uploaded: false,
-        })?;
-    if kill_switch_enabled() || !grant_still_current(grants, expected) {
-        return Ok(RevalidationOutcome::Denied);
-    }
-    let current = grants.load().map_err(|_| CycleError {
-        category: "grant_unavailable",
-        health_uploaded: false,
-    })?;
-    Ok(match current {
-        Some(grant) => RevalidationOutcome::Granted(Box::new(grant)),
-        None => RevalidationOutcome::Denied,
-    })
+fn cursor_digest(cursor: &str) -> [u8; 32] {
+    Sha256::digest(cursor.as_bytes()).into()
 }
 
-fn revalidate_scan_start(
-    grants: &CloudSessionGrantStore,
-    transport: &dyn CloudSessionTransport,
-    expected: &CloudSessionGrant,
-    deadline: Instant,
-) -> std::result::Result<RevalidationOutcome, CycleError> {
-    if kill_switch_enabled() || !cloud_grant_preflight_eligible(expected) {
-        return Ok(RevalidationOutcome::Denied);
-    }
-    let Some(timeout) = remaining_relay_budget(deadline) else {
-        return Ok(RevalidationOutcome::BudgetExpired);
-    };
-    let response = match transport.revalidate_grant_bounded(expected, timeout) {
-        Ok(response) => response,
-        Err(_) if remaining_budget(deadline).is_none() => {
-            return Ok(RevalidationOutcome::BudgetExpired)
-        }
-        Err(_) => {
-            return Err(CycleError {
-                category: "grant_revalidation_unavailable",
-                health_uploaded: false,
-            })
-        }
-    };
-    grants
-        .apply_backend_grant_revalidation(&response)
-        .map_err(|_| CycleError {
-            category: "grant_revalidation_invalid",
-            health_uploaded: false,
-        })?;
-    let current = grants
-        .load()
-        .map_err(|_| CycleError {
-            category: "grant_unavailable",
-            health_uploaded: false,
-        })?
-        .filter(cloud_grant_runtime_ready);
-    if kill_switch_enabled()
-        || current
-            .as_ref()
-            .is_some_and(|grant| !same_runtime_grant_identity(grant, expected))
-    {
-        return Ok(RevalidationOutcome::Denied);
-    }
-    Ok(match current {
-        Some(grant) => RevalidationOutcome::Granted(Box::new(grant)),
-        None => RevalidationOutcome::Denied,
-    })
-}
-
-fn prepare_active_scan(
-    runtime: &mut CloudSessionScanRuntime,
-    now: OffsetDateTime,
-    terminal_reached: bool,
-) -> std::result::Result<(), CycleError> {
-    let scan = runtime.active.as_mut().ok_or(CycleError {
-        category: "scan_unavailable",
-        health_uploaded: false,
-    })?;
-    if scan.prepared.is_some() {
-        return Ok(());
-    }
-    let binding = scan.grant.backend_binding.as_ref().ok_or(CycleError {
-        category: "grant_unbound",
-        health_uploaded: false,
-    })?;
-    let health = if terminal_reached {
-        CloudSessionCollectorHealthV1 {
-            state: "healthy".to_string(),
-            observed_at: timestamp(now),
-            error_category: None,
-        }
-    } else {
-        CloudSessionCollectorHealthV1 {
-            state: "degraded".to_string(),
-            observed_at: timestamp(now),
-            error_category: Some("provider_error".to_string()),
-        }
-    };
-    let observations = scan.observations.values().cloned().collect::<Vec<_>>();
-    let mut chunks = Vec::new();
-    for (chunk_index, chunk_observations) in observations.chunks(MAX_ITEMS).enumerate() {
-        let chunk = CloudSessionObservationChunkV2 {
-            grant_id: binding.grant_id.clone(),
-            grant_version: binding.grant_version,
-            grant_scope_fingerprint: scan.grant.grant_scope_id.clone(),
-            collector_id: COLLECTOR_ID.to_string(),
-            schema_version: CHUNK_SCHEMA_VERSION.to_string(),
-            collector_version: scan.grant.collector_version.clone(),
-            account_fingerprint: scan.grant.account_fingerprint.clone(),
-            scan_id: scan.scan_id.clone(),
-            scan_started_at: scan.scan_started_at.clone(),
-            chunk_index: u8::try_from(chunk_index).map_err(|_| CycleError {
-                category: "chunk_index_invalid",
-                health_uploaded: false,
-            })?,
-            chunk_identity_digest: identity_digest(chunk_observations),
-            chunk_semantic_digest: observation_semantic_digest(chunk_observations).map_err(
-                |_| CycleError {
-                    category: "digest_failed",
-                    health_uploaded: false,
-                },
-            )?,
-            observations: chunk_observations.to_vec(),
-            health: health.clone(),
-        };
-        chunk.validate_wire_contract().map_err(|_| CycleError {
-            category: "chunk_invalid",
-            health_uploaded: false,
-        })?;
-        chunks.push(chunk);
-    }
-    if chunks.len() > MAX_SCAN_CHUNKS {
-        return Err(CycleError {
-            category: "chunk_count_invalid",
-            health_uploaded: false,
+/// Cache isolation: the destination, local identity, grant epoch, scope,
+/// account and contract. Never a Results identity.
+fn cache_scope(
+    destination: &str,
+    grant: &CloudSessionGrant,
+    binding: &CloudSessionBackendGrantBindingV1,
+) -> [u8; 32] {
+    let installation = binding
+        .cache_origin
+        .as_ref()
+        .map_or(grant.installation_fingerprint.as_str(), |origin| {
+            origin.installation_fingerprint.as_str()
         });
+    let grant_scope = binding
+        .cache_origin
+        .as_ref()
+        .map_or(grant.grant_scope_id.as_str(), |origin| {
+            origin.grant_scope_id.as_str()
+        });
+    let mut framed = Vec::new();
+    for part in [
+        b"ottto.cloud-session.cache-scope.v1".as_slice(),
+        destination.as_bytes(),
+        installation.as_bytes(),
+        grant.organization_fingerprint.as_bytes(),
+        grant.effective_user_fingerprint.as_bytes(),
+        binding.grant_id.as_bytes(),
+        &binding.grant_version.to_be_bytes(),
+        grant_scope.as_bytes(),
+        grant.account_fingerprint.as_bytes(),
+        CHANGES_SCHEMA_VERSION.as_bytes(),
+    ] {
+        push_length_framed(&mut framed, part);
     }
-    let finalize = if terminal_reached {
-        let inventory_digest = inventory_digest(observations.iter().map(|row| &row.entity_key));
-        let epoch_digest = epoch_digest(&chunks);
-        let enumeration_consistency =
-            if scan.provider_page_count == 1 && observations.len() <= PAGE_LIMIT {
-                CloudSessionEnumerationConsistencyV2::SingleResponse
-            } else {
-                CloudSessionEnumerationConsistencyV2::UnstableCursor
-            };
-        let finalize = CloudSessionScanFinalizeV2 {
-            grant_id: binding.grant_id.clone(),
-            grant_version: binding.grant_version,
-            grant_scope_fingerprint: scan.grant.grant_scope_id.clone(),
-            collector_id: COLLECTOR_ID.to_string(),
-            schema_version: FINALIZE_SCHEMA_VERSION.to_string(),
-            collector_version: scan.grant.collector_version.clone(),
-            account_fingerprint: scan.grant.account_fingerprint.clone(),
-            scan_id: scan.scan_id.clone(),
-            scan_started_at: scan.scan_started_at.clone(),
-            chunk_count: chunks.len() as u8,
-            unique_entity_count: observations.len() as u32,
-            provider_page_count: scan.provider_page_count as u16,
-            terminal_reached: true,
-            inventory_digest,
-            epoch_digest,
-            enumeration_consistency,
-        };
-        finalize
-            .validate_against_chunks(&chunks)
-            .map_err(|_| CycleError {
-                category: "finalize_invalid",
-                health_uploaded: false,
-            })?;
-        Some(finalize)
-    } else {
-        None
-    };
-    scan.prepared = Some(PreparedCloudSessionScan {
-        chunks,
-        finalize,
-        next_chunk: 0,
-        head_semantic_digest: scan.head_semantic_digest.clone(),
-        mode: scan.mode,
-    });
-    // The raw provider cursor and cursor history are no longer needed once the
-    // immutable upload sequence exists. Drop them before any network upload.
-    scan.cursor = None;
-    scan.seen_cursors.clear();
-    scan.observations.clear();
-    Ok(())
-}
-
-fn upload_prepared_scan(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    runtime: &mut CloudSessionScanRuntime,
-    transport: &dyn CloudSessionTransport,
-    deadline: Instant,
-) -> std::result::Result<CycleResult, CycleError> {
-    loop {
-        let (expected_grant, chunk) = {
-            let scan = runtime.active.as_ref().ok_or(CycleError {
-                category: "scan_unavailable",
-                health_uploaded: false,
-            })?;
-            let prepared = scan.prepared.as_ref().ok_or(CycleError {
-                category: "scan_not_prepared",
-                health_uploaded: false,
-            })?;
-            (
-                scan.grant.clone(),
-                prepared.chunks.get(prepared.next_chunk).cloned(),
-            )
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
-            RevalidationOutcome::Granted(_) => {}
-            RevalidationOutcome::Denied => {
-                runtime.active = None;
-                return Ok(CycleResult::Noop);
-            }
-            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
-        }
-        checkpoints.wait_at_relay_admission_barrier_for_test();
-        let relay_io = checkpoints
-            .begin_collector_io(grants, &expected_grant)
-            .map_err(|_| CycleError {
-                category: "collector_io_fence_unavailable",
-                health_uploaded: false,
-            })?;
-        let Some(relay_io) = relay_io else {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
-        };
-        let Some(timeout) = remaining_relay_budget(deadline) else {
-            return Ok(CycleResult::Deferred);
-        };
-        let send_result = transport.send_scan_chunk_bounded(&chunk, timeout);
-        drop(relay_io);
-        if send_result.is_err() {
-            if remaining_budget(deadline).is_none() {
-                return Ok(CycleResult::Deferred);
-            }
-            return Err(CycleError {
-                category: "transport_unavailable",
-                health_uploaded: false,
-            });
-        }
-        let prepared = runtime
-            .active
-            .as_mut()
-            .and_then(|scan| scan.prepared.as_mut())
-            .ok_or(CycleError {
-                category: "scan_not_prepared",
-                health_uploaded: false,
-            })?;
-        prepared.next_chunk += 1;
-    }
-
-    let (expected_grant, finalize) = {
-        let scan = runtime.active.as_ref().ok_or(CycleError {
-            category: "scan_unavailable",
-            health_uploaded: false,
-        })?;
-        (
-            scan.grant.clone(),
-            scan.prepared
-                .as_ref()
-                .and_then(|prepared| prepared.finalize.clone()),
-        )
-    };
-    if let Some(finalize) = &finalize {
-        match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
-            RevalidationOutcome::Granted(_) => {}
-            RevalidationOutcome::Denied => {
-                runtime.active = None;
-                return Ok(CycleResult::Noop);
-            }
-            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
-        }
-        checkpoints.wait_at_relay_admission_barrier_for_test();
-        let relay_io = checkpoints
-            .begin_collector_io(grants, &expected_grant)
-            .map_err(|_| CycleError {
-                category: "collector_io_fence_unavailable",
-                health_uploaded: false,
-            })?;
-        let Some(relay_io) = relay_io else {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
-        };
-        let Some(timeout) = remaining_relay_budget(deadline) else {
-            return Ok(CycleResult::Deferred);
-        };
-        let send_result = transport.finalize_scan_bounded(finalize, timeout);
-        drop(relay_io);
-        if send_result.is_err() {
-            if remaining_budget(deadline).is_none() {
-                return Ok(CycleResult::Deferred);
-            }
-            return Err(CycleError {
-                category: "transport_unavailable",
-                health_uploaded: false,
-            });
-        }
-    }
-    let finished = runtime.active.take().ok_or(CycleError {
-        category: "scan_unavailable",
-        health_uploaded: false,
-    })?;
-    let prepared = finished.prepared.ok_or(CycleError {
-        category: "scan_not_prepared",
-        health_uploaded: false,
-    })?;
-    let completed_full_scan =
-        prepared.mode == CloudSessionScanMode::Full && prepared.finalize.is_some();
-    Ok(CycleResult::Uploaded {
-        digest: finalize.map(|value| value.epoch_digest),
-        head_semantic_digest: prepared.head_semantic_digest,
-        grant_epoch_digest: completed_full_scan.then(|| grant_epoch_digest(&finished.grant)),
-        completed_full_scan,
-        degraded: prepared.finalize.is_none(),
-    })
-}
-
-fn send_heartbeat_revalidated(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    expected: &CloudSessionGrant,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
-    deadline: Instant,
-) -> std::result::Result<SendOutcome, CycleError> {
-    match revalidate_before_io(grants, transport, expected, deadline)? {
-        RevalidationOutcome::Granted(_) => {}
-        RevalidationOutcome::Denied => return Ok(SendOutcome::NotSent),
-        RevalidationOutcome::BudgetExpired => return Ok(SendOutcome::BudgetExpired),
-    }
-    let batch = heartbeat_batch(
-        expected,
-        now,
-        CloudSessionCollectorHealthV1 {
-            state: "healthy".to_string(),
-            observed_at: timestamp(now),
-            error_category: None,
-        },
-    )?;
-    checkpoints.wait_at_relay_admission_barrier_for_test();
-    let relay_io = checkpoints
-        .begin_collector_io(grants, expected)
-        .map_err(|_| CycleError {
-            category: "collector_io_fence_unavailable",
-            health_uploaded: false,
-        })?;
-    let Some(relay_io) = relay_io else {
-        return Ok(SendOutcome::NotSent);
-    };
-    let Some(timeout) = remaining_relay_budget(deadline) else {
-        return Ok(SendOutcome::BudgetExpired);
-    };
-    let send_result = transport.send_bounded(&batch, timeout);
-    drop(relay_io);
-    match send_result {
-        Ok(()) => Ok(SendOutcome::Sent),
-        Err(_) if remaining_budget(deadline).is_none() => Ok(SendOutcome::BudgetExpired),
-        Err(_) => Err(CycleError {
-            category: "transport_unavailable",
-            health_uploaded: false,
-        }),
-    }
-}
-
-fn report_provider_failure_revalidated(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    expected: &CloudSessionGrant,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
-    deadline: Instant,
-) -> std::result::Result<SendOutcome, CycleError> {
-    match revalidate_before_io(grants, transport, expected, deadline)? {
-        RevalidationOutcome::Granted(_) => {}
-        RevalidationOutcome::Denied => return Ok(SendOutcome::NotSent),
-        RevalidationOutcome::BudgetExpired => return Ok(SendOutcome::BudgetExpired),
-    }
-    checkpoints.wait_at_relay_admission_barrier_for_test();
-    let relay_io = checkpoints
-        .begin_collector_io(grants, expected)
-        .map_err(|_| CycleError {
-            category: "collector_io_fence_unavailable",
-            health_uploaded: false,
-        })?;
-    let Some(relay_io) = relay_io else {
-        return Ok(SendOutcome::NotSent);
-    };
-    let result = report_provider_failure(expected, transport, now, deadline);
-    drop(relay_io);
-    result
+    Sha256::digest(&framed).into()
 }
 
 struct ParsedPage {
-    entities: Vec<CloudSessionObservationEntityV1>,
+    changes: Vec<CloudSessionChangeV1>,
     cursor: CloudPageCursor,
     source_item_count: usize,
-    invalid_required_rows: usize,
-    truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ParsedPage {
+    fn has_nonterminal(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|change| matches!(change.lifecycle.as_str(), "queued" | "running" | "unknown"))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum CloudPageCursor {
     OfficialTerminal,
     Next(String),
     Ambiguous,
+}
+
+impl std::fmt::Debug for CloudPageCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OfficialTerminal => "OfficialTerminal",
+            Self::Next(_) => "Next(redacted)",
+            Self::Ambiguous => "Ambiguous",
+        })
+    }
 }
 
 fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Result<ParsedPage> {
@@ -3368,21 +2937,18 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             .find_map(|name| root.get(*name).and_then(Value::as_array))
             .ok_or_else(|| anyhow!("Codex cloud list tasks are missing"))?
     };
-    let mut entities = Vec::new();
+    // Every returned row is processed, even beyond the requested limit. A
+    // malformed row is skipped alone; its valid siblings still count.
+    let mut changes = Vec::new();
     let source_item_count = items.len();
-    let truncated = source_item_count > PAGE_LIMIT;
-    let mut invalid_required_rows = 0;
-    for item in items.iter().take(PAGE_LIMIT) {
+    for item in items {
         let Some(object) = item.as_object() else {
-            invalid_required_rows += 1;
             continue;
         };
         let Some(provider_id) = string_field(object, &["id", "task_id"]) else {
-            invalid_required_rows += 1;
             continue;
         };
         let Some(provider_status) = string_field(object, &["status", "state"]) else {
-            invalid_required_rows += 1;
             continue;
         };
         let mut coverage = vec!["identity".to_string(), "status".to_string()];
@@ -3434,8 +3000,10 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
         if attempt_count.is_some() {
             coverage.push("attempts".to_string());
         }
-        entities.push(CloudSessionObservationEntityV1 {
+        coverage.sort();
+        changes.push(CloudSessionChangeV1 {
             entity_key: opaque_key(key, provider_id),
+            expected_head_etag: None,
             entity_kind: "task".to_string(),
             lifecycle: lifecycle(Some(provider_status)),
             attempt_count,
@@ -3449,7 +3017,6 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             started_at,
             updated_at,
             completed_at,
-            observed_at: timestamp(observed_at),
         });
     }
     let cursor = if root.is_array() {
@@ -3463,11 +3030,9 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
         ));
     }
     Ok(ParsedPage {
-        entities,
+        changes,
         cursor,
         source_item_count,
-        invalid_required_rows,
-        truncated,
     })
 }
 
@@ -3516,6 +3081,8 @@ fn string_field<'a>(object: &'a serde_json::Map<String, Value>, names: &[&str]) 
         .find_map(|name| object.get(*name).and_then(Value::as_str))
         .filter(|value| !value.is_empty())
 }
+/// A provider time in canonical UTC RFC 3339, or `None` when absent,
+/// unparsable or in the future.
 fn timestamp_field(
     object: &serde_json::Map<String, Value>,
     names: &[&str],
@@ -3523,13 +3090,9 @@ fn timestamp_field(
 ) -> Option<String> {
     string_field(object, names)
         .filter(|value| value.len() <= 64)
-        .and_then(|value| {
-            OffsetDateTime::parse(value, &Rfc3339)
-                .ok()
-                .filter(|parsed| *parsed <= observed_at)
-                .map(|_| value)
-        })
-        .map(str::to_string)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .filter(|parsed| *parsed <= observed_at)
+        .map(|parsed| timestamp(parsed.to_offset(UtcOffset::UTC)))
 }
 fn u64_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<u64> {
     names
@@ -3560,96 +3123,6 @@ fn environment_kind(value: Option<&str>) -> String {
     .to_string()
 }
 
-fn heartbeat_batch(
-    grant: &CloudSessionGrant,
-    now: OffsetDateTime,
-    health: CloudSessionCollectorHealthV1,
-) -> std::result::Result<CloudSessionObservationBatchV1, CycleError> {
-    build_observation_batch(
-        grant,
-        Vec::new(),
-        now,
-        CloudSessionBatchKind::Heartbeat,
-        false,
-        health,
-    )
-}
-
-fn build_observation_batch(
-    grant: &CloudSessionGrant,
-    observations: Vec<CloudSessionObservationEntityV1>,
-    now: OffsetDateTime,
-    batch_kind: CloudSessionBatchKind,
-    snapshot_complete: bool,
-    health: CloudSessionCollectorHealthV1,
-) -> std::result::Result<CloudSessionObservationBatchV1, CycleError> {
-    let binding = grant.backend_binding.as_ref().ok_or(CycleError {
-        category: "grant_unbound",
-        health_uploaded: false,
-    })?;
-    if !is_uuid(&binding.grant_id)
-        || binding.grant_version == 0
-        || binding.backend_revoked
-        || binding.server_policy_state != CloudSessionServerPolicyState::Approved
-        || grant.collector_version != compiled_release_version()
-    {
-        return Err(CycleError {
-            category: "grant_invalid",
-            health_uploaded: false,
-        });
-    }
-    let batch = CloudSessionObservationBatchV1 {
-        grant_id: binding.grant_id.clone(),
-        grant_version: binding.grant_version,
-        grant_scope_fingerprint: grant.grant_scope_id.clone(),
-        collector_id: COLLECTOR_ID.to_string(),
-        schema_version: COLLECTOR_VERSION.to_string(),
-        collector_version: grant.collector_version.clone(),
-        account_fingerprint: grant.account_fingerprint.clone(),
-        batch_kind,
-        snapshot_complete,
-        collected_at: timestamp(now),
-        observations,
-        health,
-    };
-    batch.validate_wire_contract().map_err(|_| CycleError {
-        category: "batch_invalid",
-        health_uploaded: false,
-    })?;
-    Ok(batch)
-}
-
-fn report_provider_failure(
-    grant: &CloudSessionGrant,
-    transport: &dyn CloudSessionTransport,
-    now: OffsetDateTime,
-    deadline: Instant,
-) -> std::result::Result<SendOutcome, CycleError> {
-    let batch = heartbeat_batch(
-        grant,
-        now,
-        CloudSessionCollectorHealthV1 {
-            state: "failing".to_string(),
-            observed_at: timestamp(now),
-            // The strict backend wire intentionally has a coarser enum than
-            // local diagnostics. Detailed provider execution/schema categories
-            // stay in the checkpoint and local grant health only.
-            error_category: Some("provider_error".to_string()),
-        },
-    )?;
-    let Some(timeout) = remaining_relay_budget(deadline) else {
-        return Ok(SendOutcome::BudgetExpired);
-    };
-    match transport.send_bounded(&batch, timeout) {
-        Ok(()) => Ok(SendOutcome::Sent),
-        Err(_) if remaining_budget(deadline).is_none() => Ok(SendOutcome::BudgetExpired),
-        Err(_) => Err(CycleError {
-            category: "transport_unavailable",
-            health_uploaded: false,
-        }),
-    }
-}
-
 fn grant_scope_fingerprint(key: &[u8], setup: &CloudSessionGrantSetup) -> String {
     opaque_key(
         key,
@@ -3663,11 +3136,13 @@ fn grant_scope_fingerprint(key: &[u8], setup: &CloudSessionGrantSetup) -> String
     )
 }
 
+/// Older pending tombstones predate the explicit descriptor and used the
+/// retired observation contract. Reconcile that exact request; never upgrade it.
 fn pending_backend_create(grant: &CloudSessionGrant) -> CloudSessionPendingBackendCreateV1 {
     CloudSessionPendingBackendCreateV1 {
         source: "codex".to_string(),
         collector_id: COLLECTOR_ID.to_string(),
-        schema_version: COLLECTOR_VERSION.to_string(),
+        schema_version: LEGACY_COLLECTION_SCHEMA_VERSION.to_string(),
         collector_version: grant.collector_version.clone(),
         grant_scope_fingerprint: grant.grant_scope_id.clone(),
         account_fingerprint: grant.account_fingerprint.clone(),
@@ -3681,7 +3156,10 @@ fn validate_pending_backend_create(
 ) -> Result<()> {
     if pending.source != "codex"
         || pending.collector_id != COLLECTOR_ID
-        || pending.schema_version != COLLECTOR_VERSION
+        || !matches!(
+            pending.schema_version.as_str(),
+            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
+        )
         || pending.collector_version.trim().is_empty()
         || pending.grant_scope_fingerprint != grant.grant_scope_id
         || pending.account_fingerprint != grant.account_fingerprint
@@ -3726,10 +3204,11 @@ fn validate_local_installation_binding(
     Ok(())
 }
 
+/// Consent binds the installation, scope, account, disclosure and the
+/// `cloud_session_changes.v1` contract, never a binary release.
 fn validate_backend_grant_response(
     state: &PersistedGrant,
     response: &CloudSessionBackendGrantResponseV1,
-    expected_collector_version: &str,
 ) -> Result<()> {
     let key = decode_hex(&state.hmac_key_hex)
         .filter(|key| key.len() == 32)
@@ -3739,10 +3218,11 @@ fn validate_backend_grant_response(
         || opaque_key(&key, &response.installation_id) != state.grant.installation_fingerprint
         || response.source != "codex"
         || response.collector_id != COLLECTOR_ID
-        || response.schema_version != COLLECTOR_VERSION
-        || response.collector_version != expected_collector_version
-        || response.release_lane != "supported"
-        || response.disclosure_version != "cloud_sessions_disclosure.v1"
+        || !matches!(
+            response.schema_version.as_str(),
+            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
+        )
+        || response.disclosure_version != DISCLOSURE_VERSION
         || response.grant_scope_fingerprint != state.grant.grant_scope_id
         || response.account_fingerprint != state.grant.account_fingerprint
         || response.grant_version == 0
@@ -3764,8 +3244,7 @@ fn cloud_grant_preflight_eligible(grant: &CloudSessionGrant) -> bool {
     matches!(
         grant.status,
         CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::PolicyDisabled
-    ) && grant.collector_version == compiled_release_version()
-        && !grant.backend_create_pending
+    ) && !grant.backend_create_pending
         && grant
             .backend_binding
             .as_ref()
@@ -3774,12 +3253,60 @@ fn cloud_grant_preflight_eligible(grant: &CloudSessionGrant) -> bool {
 
 fn cloud_grant_runtime_ready(grant: &CloudSessionGrant) -> bool {
     grant.status == CloudSessionGrantStatus::Enabled
-        && grant.collector_version == compiled_release_version()
         && !grant.backend_create_pending
+        && binding_contract_current(grant)
         && grant.backend_binding.as_ref().is_some_and(|binding| {
             !binding.backend_revoked
                 && binding.server_policy_state == CloudSessionServerPolicyState::Approved
         })
+}
+
+/// The bound epoch was confirmed on the `cloud_session_changes.v1` contract.
+fn binding_contract_current(grant: &CloudSessionGrant) -> bool {
+    grant.backend_binding.as_ref().is_some_and(|binding| {
+        binding.collection_contract.as_deref() == Some(CHANGES_SCHEMA_VERSION)
+    })
+}
+
+/// Collection is approved only for an enabled grant on this contract with
+/// explicit `can_collect`; anything else, including older responses, is
+/// disabled.
+fn authority_policy(
+    response: &CloudSessionBackendGrantResponseV1,
+) -> CloudSessionServerPolicyState {
+    if response.status == "enabled"
+        && response.can_collect == Some(true)
+        && response.schema_version == CHANGES_SCHEMA_VERSION
+    {
+        CloudSessionServerPolicyState::Approved
+    } else {
+        CloudSessionServerPolicyState::Disabled
+    }
+}
+
+fn authority_binding(
+    response: &CloudSessionBackendGrantResponseV1,
+    backend_revoked: bool,
+) -> CloudSessionBackendGrantBindingV1 {
+    CloudSessionBackendGrantBindingV1 {
+        grant_id: response.id.clone(),
+        grant_version: response.grant_version,
+        backend_revoked,
+        server_policy_state: authority_policy(response),
+        collection_contract: (response.schema_version == CHANGES_SCHEMA_VERSION)
+            .then(|| CHANGES_SCHEMA_VERSION.to_string()),
+        collect_not_before: None,
+        cache_origin: None,
+    }
+}
+
+fn preflight_grant_still_current(
+    store: &CloudSessionGrantStore,
+    expected: &CloudSessionGrant,
+) -> bool {
+    store.load().ok().flatten().is_some_and(|current| {
+        cloud_grant_preflight_eligible(&current) && same_runtime_grant_identity(&current, expected)
+    })
 }
 
 fn grant_still_current(store: &CloudSessionGrantStore, expected: &CloudSessionGrant) -> bool {
@@ -3795,8 +3322,6 @@ fn grant_still_current(store: &CloudSessionGrantStore, expected: &CloudSessionGr
 fn same_runtime_grant_identity(current: &CloudSessionGrant, expected: &CloudSessionGrant) -> bool {
     current.schema_version == expected.schema_version
         && current.collector_id == expected.collector_id
-        && current.collector_version == expected.collector_version
-        && current.release_lane == expected.release_lane
         && current.disclosure_version == expected.disclosure_version
         && current.installation_fingerprint == expected.installation_fingerprint
         && current.grant_scope_id == expected.grant_scope_id
@@ -3814,62 +3339,6 @@ fn same_runtime_grant_identity(current: &CloudSessionGrant, expected: &CloudSess
         )
 }
 
-fn health_heartbeat_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
-    match checkpoint
-        .last_health_upload_at
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-    {
-        Some(last) => now >= last + HEALTH_HEARTBEAT_INTERVAL,
-        None => true,
-    }
-}
-
-fn complete_snapshot_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
-    match checkpoint
-        .last_complete_snapshot_at
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-    {
-        Some(last) => last.date() != now.date(),
-        None => true,
-    }
-}
-
-fn circuit_open_for_grant(
-    checkpoint: &CloudSessionCheckpoint,
-    grant: &CloudSessionGrant,
-    now: OffsetDateTime,
-) -> bool {
-    checkpoint.circuit_grant_epoch_digest.as_deref() == Some(grant_epoch_digest(grant).as_str())
-        && checkpoint
-            .circuit_open_until
-            .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .is_some_and(|until| until > now)
-}
-fn reset_stale_circuit_for_grant(
-    checkpoint: &mut CloudSessionCheckpoint,
-    grant: &CloudSessionGrant,
-) {
-    let current_epoch = grant_epoch_digest(grant);
-    let has_circuit_state = checkpoint.consecutive_failures > 0
-        || checkpoint.circuit_open_until.is_some()
-        || checkpoint.circuit_grant_epoch_digest.is_some();
-    if has_circuit_state
-        && checkpoint.circuit_grant_epoch_digest.as_deref() != Some(current_epoch.as_str())
-    {
-        checkpoint.consecutive_failures = 0;
-        checkpoint.circuit_open_until = None;
-        checkpoint.circuit_grant_epoch_digest = None;
-        if checkpoint.last_error_category.as_deref() != Some("scan_incomplete") {
-            checkpoint.last_error_category = None;
-        }
-    }
-}
-fn backoff_seconds(failures: u32) -> u64 {
-    60 * (1_u64 << failures.min(6))
-}
 fn kill_switch_enabled() -> bool {
     truthy_env(KILL_SWITCH_ENV)
 }
@@ -3899,76 +3368,9 @@ fn sha256(bytes: &[u8]) -> String {
     digest.update(bytes);
     format!("sha256:{:x}", digest.finalize())
 }
-fn valid_sha256_digest(value: &str) -> bool {
-    value.len() == 71
-        && value.starts_with("sha256:")
-        && value[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
 fn push_length_framed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
     bytes.extend_from_slice(value);
-}
-fn identity_digest(observations: &[CloudSessionObservationEntityV1]) -> String {
-    let mut keys = observations
-        .iter()
-        .map(|observation| observation.entity_key.as_bytes())
-        .collect::<Vec<_>>();
-    keys.sort_unstable();
-    keys.dedup();
-    let mut framed = Vec::new();
-    for key in keys {
-        push_length_framed(&mut framed, key);
-    }
-    sha256(&framed)
-}
-fn observation_semantic_digest(observations: &[CloudSessionObservationEntityV1]) -> Result<String> {
-    let mut semantics = observations
-        .iter()
-        .map(|observation| {
-            let mut value = serde_json::to_value(observation)?;
-            if let Some(object) = value.as_object_mut() {
-                object.remove("observed_at");
-                object.remove("collected_at");
-            }
-            Ok((observation.entity_key.clone(), value))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    semantics.sort_by(|left, right| left.0.cmp(&right.0));
-    let canonical = semantics
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>();
-    Ok(sha256(&serde_json::to_vec(&canonical)?))
-}
-fn inventory_digest<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
-    let mut keys = keys.into_iter().map(String::as_bytes).collect::<Vec<_>>();
-    keys.sort_unstable();
-    keys.dedup();
-    let mut framed = Vec::new();
-    for key in keys {
-        push_length_framed(&mut framed, key);
-    }
-    sha256(&framed)
-}
-fn epoch_digest(chunks: &[CloudSessionObservationChunkV2]) -> String {
-    let mut framed = Vec::new();
-    for chunk in chunks {
-        framed.extend_from_slice(&(chunk.chunk_index as u64).to_be_bytes());
-        framed.extend_from_slice(&(chunk.observations.len() as u64).to_be_bytes());
-        push_length_framed(&mut framed, chunk.chunk_identity_digest.as_bytes());
-        push_length_framed(&mut framed, chunk.chunk_semantic_digest.as_bytes());
-    }
-    sha256(&framed)
-}
-fn grant_epoch_digest(grant: &CloudSessionGrant) -> String {
-    let mut framed = Vec::new();
-    if let Some(binding) = &grant.backend_binding {
-        push_length_framed(&mut framed, binding.grant_id.as_bytes());
-        framed.extend_from_slice(&binding.grant_version.to_be_bytes());
-    }
-    sha256(&framed)
 }
 fn opaque_key(key: &[u8], raw: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
@@ -3979,18 +3381,6 @@ fn random_key() -> Result<Vec<u8>> {
     let mut key = vec![0_u8; 32];
     random_fill(&mut key).map_err(|_| anyhow!("generate cloud-session HMAC key"))?;
     Ok(key)
-}
-fn random_scan_id() -> Result<String> {
-    let mut bytes = [0_u8; 16];
-    random_fill(&mut bytes).map_err(|_| anyhow!("generate cloud-session scan id"))?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
-        bytes[15]
-    ))
 }
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
@@ -4087,6 +3477,32 @@ fn load_cloud_session_runtime_binding(
     if !grant_preflight_eligible(grants) {
         return Ok(None);
     }
+    let (setup, api_base_url, device) =
+        load_cloud_session_local_identity(accounts, devices, connections)?;
+    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
+        return Ok(None);
+    };
+    let backend = grant
+        .backend_binding
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
+    Ok(Some(CloudSessionRuntimeCandidate {
+        binding: CloudSessionRuntimeBinding {
+            api_base_url,
+            device,
+            grant_id: backend.grant_id.clone(),
+            grant_version: backend.grant_version,
+            grant_scope_id: grant.grant_scope_id.clone(),
+        },
+        grant,
+    }))
+}
+
+fn load_cloud_session_local_identity(
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+) -> Result<(CloudSessionGrantSetup, String, LocalDeviceBinding)> {
     let account = accounts.load()?;
     let user_id = account
         .user
@@ -4128,23 +3544,7 @@ fn load_cloud_session_runtime_binding(
         organization_scope: organization_id.to_string(),
         effective_user_scope: user_id.to_string(),
     };
-    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
-        return Ok(None);
-    };
-    let backend = grant
-        .backend_binding
-        .as_ref()
-        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
-    Ok(Some(CloudSessionRuntimeCandidate {
-        binding: CloudSessionRuntimeBinding {
-            api_base_url,
-            device,
-            grant_id: backend.grant_id.clone(),
-            grant_version: backend.grant_version,
-            grant_scope_id: grant.grant_scope_id.clone(),
-        },
-        grant,
-    }))
+    Ok((setup, api_base_url, device))
 }
 
 fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
@@ -4181,159 +3581,237 @@ fn is_loopback_http_base(value: &str) -> bool {
         })
 }
 
-fn deactivate_composed_runtime(
-    active_transport: &mut ActiveCloudSessionTransport,
-    checkpoints: &CloudSessionCheckpointStore,
-) {
-    active_transport.take();
-    disable_checkpoint_runtime(checkpoints);
+/// The local inputs a composed slice reads before any network call.
+struct ComposedSliceInputs<'a, FLoadCredentials, FComposeTransport> {
+    grants: &'a CloudSessionGrantStore,
+    checkpoints: &'a CloudSessionCheckpointStore,
+    runner: &'a dyn CloudSessionRunner,
+    accounts: &'a FileAccountStore,
+    devices: &'a FileDeviceStore,
+    connections: &'a FileConnectionStore,
+    load_credentials: FLoadCredentials,
+    compose_transport: FComposeTransport,
+    last_activity: Option<Instant>,
 }
 
 fn collect_composed_cloud_sessions_once(
+    collector: &mut CloudCollector,
     grants: &CloudSessionGrantStore,
     checkpoints: &CloudSessionCheckpointStore,
     runner: &dyn CloudSessionRunner,
     active_transport: &mut ActiveCloudSessionTransport,
-    now: OffsetDateTime,
+    now: Instant,
 ) -> CloudSessionCycleOutcome {
     let _stage = StageWindow::begin("codex", "offpass_cloud_sessions");
     let accounts = FileAccountStore::default();
     let devices = FileDeviceStore::default();
     let connections = FileConnectionStore::default();
+    let wall = OffsetDateTime::now_utc();
+    let last_activity = last_local_codex_activity();
+    if collector
+        .next_wake(now, wall, last_activity)
+        .is_some_and(|wake| wake > now)
+    {
+        return CloudSessionCycleOutcome::NotDue;
+    }
+    if !kill_switch_enabled() && grant_preflight_eligible(grants) {
+        let hardware = match grant_rebind::verified_live_hardware() {
+            Ok(hardware) => hardware,
+            Err(reason) => {
+                active_transport.take();
+                collector.schedule.crawl = None;
+                let _ = grants.record_health("unavailable", "unavailable", Some(reason));
+                collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                return CloudSessionCycleOutcome::Disabled;
+            }
+        };
+        let identity = load_cloud_session_local_identity(&accounts, &devices, &connections);
+        if let Ok((setup, api_base_url, device)) = identity {
+            let proposal = grants.prepare_rebind(&setup, hardware);
+            if let Ok(Some(proposal)) = proposal {
+                active_transport.take();
+                collector.schedule.crawl = None;
+                let _ = grants.record_health("unavailable", "unavailable", Some("rebinding"));
+                let lease = checkpoints.begin_io(|| {
+                    grant_still_current(grants, &proposal.expected)
+                        && load_cloud_session_local_identity(&accounts, &devices, &connections)
+                            .is_ok_and(|(current, base, target)| {
+                                current.installation_id == setup.installation_id
+                                    && current.organization_scope == setup.organization_scope
+                                    && current.effective_user_scope == setup.effective_user_scope
+                                    && base == api_base_url
+                                    && target == device
+                            })
+                });
+                let Ok(Some(lease)) = lease else {
+                    collector.reset();
+                    return CloudSessionCycleOutcome::Disabled;
+                };
+                let credentials = crate::snapshot_client::load_snapshot_device_credentials();
+                let result = match credentials {
+                    Ok((credential_device, secret)) if credential_device == device => {
+                        let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url);
+                        let binding = proposal
+                            .expected
+                            .backend_binding
+                            .as_ref()
+                            .expect("bound grant");
+                        grant_rebind::rebind(
+                            &client,
+                            GrantKind::CloudSessions,
+                            &binding.grant_id,
+                            &proposal.request,
+                            &device,
+                            &secret,
+                            COMMAND_TIMEOUT,
+                        )
+                    }
+                    _ => Err(grant_rebind::RebindFailure::unavailable()),
+                };
+                // Bind before releasing the lease: a concurrent local stop
+                // must retain the committed target identity for cleanup.
+                match result {
+                    Ok(value) => {
+                        let response =
+                            serde_json::from_value::<CloudSessionBackendGrantResponseV1>(value);
+                        if response
+                            .ok()
+                            .and_then(|response| {
+                                grants
+                                    .bind_backend_grant_with_rebind(
+                                        &response,
+                                        &setup.installation_id,
+                                        Some(&proposal),
+                                    )
+                                    .ok()
+                            })
+                            .is_none()
+                        {
+                            let _ = grants.record_health(
+                                "unavailable",
+                                "unavailable",
+                                Some("stale_binding"),
+                            );
+                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                            return CloudSessionCycleOutcome::Failed;
+                        }
+                        collector.reset();
+                    }
+                    Err(failure) => {
+                        let _ =
+                            grants.record_health("unavailable", "unavailable", Some(failure.code));
+                        if failure.retryable {
+                            collector.defer_after_local_failure(Instant::now());
+                        } else {
+                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
+                        }
+                        return CloudSessionCycleOutcome::Disabled;
+                    }
+                }
+                drop(lease);
+            }
+        }
+    }
     collect_composed_cloud_sessions_once_with(
-        grants,
-        checkpoints,
-        runner,
+        collector,
         active_transport,
-        &accounts,
-        &devices,
-        &connections,
-        crate::snapshot_client::load_snapshot_device_credentials,
-        |api_base_url, device, device_secret| {
-            Box::new(RelayCloudSessionTransport::new(
-                api_base_url,
-                device,
-                device_secret,
-            ))
+        ComposedSliceInputs {
+            grants,
+            checkpoints,
+            runner,
+            accounts: &accounts,
+            devices: &devices,
+            connections: &connections,
+            load_credentials: crate::snapshot_client::load_snapshot_device_credentials,
+            compose_transport: |api_base_url, device, device_secret| {
+                Box::new(RelayCloudSessionTransport::new(
+                    api_base_url,
+                    device,
+                    device_secret,
+                )) as Box<dyn CloudSessionTransport + Send>
+            },
+            last_activity: last_local_codex_activity(),
         },
         now,
+        OffsetDateTime::now_utc(),
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 fn collect_composed_cloud_sessions_once_with<FLoadCredentials, FComposeTransport>(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    runner: &dyn CloudSessionRunner,
+    collector: &mut CloudCollector,
     active_transport: &mut ActiveCloudSessionTransport,
-    accounts: &FileAccountStore,
-    devices: &FileDeviceStore,
-    connections: &FileConnectionStore,
-    load_credentials: FLoadCredentials,
-    compose_transport: FComposeTransport,
-    now: OffsetDateTime,
+    inputs: ComposedSliceInputs<'_, FLoadCredentials, FComposeTransport>,
+    now: Instant,
+    wall: OffsetDateTime,
 ) -> CloudSessionCycleOutcome
 where
     FLoadCredentials: FnOnce() -> Result<(LocalDeviceBinding, String)>,
     FComposeTransport:
         FnOnce(String, LocalDeviceBinding, String) -> Box<dyn CloudSessionTransport + Send>,
 {
+    let started = Instant::now();
+    let grants = inputs.grants;
     if kill_switch_enabled() {
-        deactivate_composed_runtime(active_transport, checkpoints);
+        active_transport.take();
+        collector.reset();
         return CloudSessionCycleOutcome::Disabled;
     }
-    let candidate = match load_cloud_session_runtime_binding(grants, accounts, devices, connections)
-    {
+    let candidate = match load_cloud_session_runtime_binding(
+        grants,
+        inputs.accounts,
+        inputs.devices,
+        inputs.connections,
+    ) {
         Ok(Some(candidate)) => candidate,
         Ok(None) => {
-            deactivate_composed_runtime(active_transport, checkpoints);
+            active_transport.take();
+            collector.reset();
             return CloudSessionCycleOutcome::Disabled;
         }
         Err(_) => {
-            deactivate_composed_runtime(active_transport, checkpoints);
+            active_transport.take();
             let _ =
                 grants.record_health("unavailable", "unavailable", Some("local_binding_invalid"));
+            collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
-    let mut checkpoint = checkpoints.load();
-    reset_stale_circuit_for_grant(&mut checkpoint, &candidate.grant);
-    if circuit_open_for_grant(&checkpoint, &candidate.grant, now) {
-        return CloudSessionCycleOutcome::CircuitOpen;
-    }
     let binding = candidate.binding;
     // `load_cloud_session_runtime_binding` validates the destination first, so
     // an on-disk URL cannot receive this long-lived secret. Reloading the
     // device with the secret also closes an identity-change race.
-    let (credential_device, device_secret) = match load_credentials() {
+    let (credential_device, device_secret) = match (inputs.load_credentials)() {
         Ok(credentials) => credentials,
         Err(_) => {
-            deactivate_composed_runtime(active_transport, checkpoints);
+            active_transport.take();
             let _ = grants.record_health(
                 "unavailable",
                 "unavailable",
                 Some("relay_credentials_unavailable"),
             );
+            collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
     if credential_device != binding.device || device_secret.trim().is_empty() {
-        deactivate_composed_runtime(active_transport, checkpoints);
+        active_transport.take();
         let _ = grants.record_health("unavailable", "unavailable", Some("local_binding_changed"));
+        collector.defer_after_local_failure(now + started.elapsed());
         return CloudSessionCycleOutcome::Failed;
     }
     let key = CloudSessionRuntimeTransportKey {
         binding: binding.clone(),
         device_secret_digest: sha256(device_secret.as_bytes()),
     };
-    let transport_changed = active_transport
+    if active_transport
         .as_ref()
-        .map_or(true, |(current, _)| current != &key);
-    if transport_changed {
-        // Scan receipt bookkeeping belongs to one transport instance. Restart
-        // the in-memory scan before dropping that instance so a replacement
-        // never resumes with receipts it cannot prove.
-        deactivate_composed_runtime(active_transport, checkpoints);
-        let transport = compose_transport(binding.api_base_url, credential_device, device_secret);
-        // A candidate transport remains local and unretained until the server
-        // confirms this exact grant epoch. This is a one-time activation read
-        // per identity/credential change; normal polling keeps the established
-        // transport and its relay token.
-        let authority = match transport.revalidate_grant_bounded(&candidate.grant, COMMAND_TIMEOUT)
-        {
-            Ok(authority) => authority,
-            Err(_) => {
-                deactivate_composed_runtime(active_transport, checkpoints);
-                record_runtime_activation_failure(
-                    grants,
-                    checkpoints,
-                    &candidate.grant,
-                    now,
-                    "grant_revalidation_unavailable",
-                );
-                return CloudSessionCycleOutcome::Failed;
-            }
-        };
-        let current = match grants.apply_backend_grant_revalidation(&authority) {
-            Ok(current) => current,
-            Err(_) => {
-                deactivate_composed_runtime(active_transport, checkpoints);
-                record_runtime_activation_failure(
-                    grants,
-                    checkpoints,
-                    &candidate.grant,
-                    now,
-                    "grant_revalidation_invalid",
-                );
-                return CloudSessionCycleOutcome::Failed;
-            }
-        };
-        if !cloud_grant_runtime_ready(&current)
-            || !same_runtime_grant_identity(&current, &candidate.grant)
-        {
-            deactivate_composed_runtime(active_transport, checkpoints);
-            return CloudSessionCycleOutcome::Disabled;
-        }
+        .map_or(true, |(current, _)| current != &key)
+    {
+        let transport = (inputs.compose_transport)(
+            binding.api_base_url.clone(),
+            credential_device,
+            device_secret,
+        );
         *active_transport = Some((key, transport));
     }
     let transport = active_transport
@@ -4341,32 +3819,129 @@ where
         .expect("cloud-session transport was just composed")
         .1
         .as_ref();
-    // The collector performs exact backend grant authority revalidation before
-    // its first provider subprocess and at every later provider/upload fence.
-    let outcome = collect_cloud_sessions_once(grants, checkpoints, runner, transport, now);
+    let outcome = collector.run_slice(
+        &SliceInputs {
+            grants,
+            checkpoints: inputs.checkpoints,
+            runner: inputs.runner,
+            transport,
+            destination: &binding.api_base_url,
+            last_activity: inputs.last_activity,
+        },
+        now + started.elapsed(),
+        wall,
+    );
     if kill_switch_enabled() || !grant_preflight_eligible(grants) {
-        deactivate_composed_runtime(active_transport, checkpoints);
+        active_transport.take();
     }
     outcome
 }
 
-fn record_runtime_activation_failure(
-    grants: &CloudSessionGrantStore,
-    checkpoints: &CloudSessionCheckpointStore,
-    grant: &CloudSessionGrant,
-    now: OffsetDateTime,
-    category: &'static str,
-) {
-    let mut checkpoint = checkpoints.load();
-    reset_stale_circuit_for_grant(&mut checkpoint, grant);
-    checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
-    checkpoint.last_error_category = Some(category.to_string());
-    checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(grant));
-    checkpoint.circuit_open_until = Some(timestamp(
-        now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
-    ));
-    let _ = checkpoints.save(&checkpoint);
-    let _ = grants.record_health("failing", "stale", Some(category));
+/// Wakes the supervisor: a local consent change resets its schedule (one
+/// immediate head), local Codex activity only re-evaluates the cadence.
+struct CollectorWake {
+    state: Mutex<WakeCounts>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WakeCounts {
+    consent: u64,
+    activity: u64,
+}
+
+static COLLECTOR_WAKE: CollectorWake = CollectorWake {
+    state: Mutex::new(WakeCounts {
+        consent: 0,
+        activity: 0,
+    }),
+    changed: Condvar::new(),
+};
+static LAST_CODEX_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
+
+impl CollectorWake {
+    fn counts(&self) -> WakeCounts {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn bump(&self, consent: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if consent {
+            state.consent = state.consent.wrapping_add(1);
+        } else {
+            state.activity = state.activity.wrapping_add(1);
+        }
+        self.changed.notify_all();
+    }
+
+    /// Wait until `until` (or the idle fallback) or a wake. True when local
+    /// consent changed since `seen`.
+    fn wait(&self, until: Option<Instant>, seen: &mut WakeCounts) -> bool {
+        let fallback = Instant::now() + IDLE_HEAD_INTERVAL;
+        let until = until.map_or(fallback, |until| until.min(fallback));
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.consent != seen.consent {
+                *seen = *state;
+                return true;
+            }
+            if state.activity != seen.activity {
+                *seen = *state;
+                return false;
+            }
+            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
+/// Local control changed cloud-session consent: run a fresh slice now.
+pub fn wake_cloud_session_collector() {
+    COLLECTOR_WAKE.bump(true);
+}
+
+/// The file watcher saw a real local Codex transcript event. Only the first
+/// event of a warm window wakes the supervisor; later ones keep the window.
+pub(crate) fn note_local_codex_activity() {
+    let now = Instant::now();
+    let was_warm = {
+        let mut last = LAST_CODEX_ACTIVITY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let warm = last.is_some_and(|activity| {
+            now.saturating_duration_since(activity)
+                <= crate::adaptive_collector::CadenceConfig::default().warm_window
+        });
+        *last = Some(now);
+        warm
+    };
+    if !was_warm {
+        COLLECTOR_WAKE.bump(false);
+    }
+}
+
+fn last_local_codex_activity() -> Option<Instant> {
+    *LAST_CODEX_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
@@ -4377,8 +3952,8 @@ fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
 
 pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
     // The supervisor is always available so a newly approved local grant can
-    // activate without restarting the daemon. Each cycle remains inert until
-    // exact local consent and server policy both authorize collection.
+    // activate without restarting the daemon. Each slice stays inert until
+    // exact local consent and server authority both authorize collection.
     if !reserve_collector_supervisor(&COLLECTOR_SUPERVISOR_STARTED) {
         return Ok(CloudSessionCollectorStartup::Started);
     }
@@ -4389,21 +3964,37 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
             let checkpoints = CloudSessionCheckpointStore::default();
             let runner = CodexCloudCliRunner;
             let mut active_transport = None;
+            let mut collector = CloudCollector::default();
+            let mut seen = COLLECTOR_WAKE.counts();
             loop {
                 let outcome = collect_composed_cloud_sessions_once(
+                    &mut collector,
                     &grants,
                     &checkpoints,
                     &runner,
                     &mut active_transport,
-                    OffsetDateTime::now_utc(),
+                    Instant::now(),
                 );
-                if !matches!(
-                    outcome,
-                    CloudSessionCycleOutcome::Disabled | CloudSessionCycleOutcome::Noop
-                ) {
+                if outcome == CloudSessionCycleOutcome::Failed {
                     eprintln!("codex_cloud_session_collector outcome={outcome:?}");
                 }
-                thread::sleep(POLL_INTERVAL + cycle_jitter());
+                let wake_at = collector.next_wake(
+                    Instant::now(),
+                    OffsetDateTime::now_utc(),
+                    last_local_codex_activity(),
+                );
+                let wake_at = wake_at.map(|deadline| {
+                    let mut random = [0_u8; 8];
+                    let seconds = if random_fill(&mut random).is_ok() {
+                        u64::from_ne_bytes(random) % 21
+                    } else {
+                        0
+                    };
+                    deadline + Duration::from_secs(seconds)
+                });
+                if COLLECTOR_WAKE.wait(wake_at, &mut seen) {
+                    collector.reset();
+                }
             }
         });
     if let Err(error) = spawned {
@@ -4411,12 +4002,6 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
         return Err(anyhow!("spawn Codex cloud-session collector: {error}"));
     }
     Ok(CloudSessionCollectorStartup::Started)
-}
-
-fn cycle_jitter() -> Duration {
-    // No persisted schedule/cursor: bounded variation prevents synchronized polls.
-    let nanos = OffsetDateTime::now_utc().nanosecond() as u64;
-    Duration::from_secs(nanos % (MAX_JITTER.as_secs() + 1))
 }
 
 #[cfg(test)]

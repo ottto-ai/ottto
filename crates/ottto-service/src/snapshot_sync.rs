@@ -4147,7 +4147,7 @@ fn uniform_duration(span: Duration) -> Duration {
 ///
 /// The result is capped like a parsed `Retry-After` is, so the upper jitter
 /// cannot push a wait past the longest silence the freshness promise tolerates.
-fn shed_backoff(retry_after: Option<Duration>) -> Duration {
+pub(crate) fn shed_backoff(retry_after: Option<Duration>) -> Duration {
     match retry_after {
         Some(retry_after) => (retry_after + uniform_duration(retry_after.mul_f64(0.2)))
             .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER),
@@ -4156,7 +4156,7 @@ fn shed_backoff(retry_after: Option<Duration>) -> Duration {
 }
 
 /// `random(0, min(cap, base·2^attempt))` — full jitter, capped.
-fn full_jitter_backoff(attempt: u32) -> Duration {
+pub(crate) fn full_jitter_backoff(attempt: u32) -> Duration {
     let ceiling = SHED_BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(6))
         .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER);

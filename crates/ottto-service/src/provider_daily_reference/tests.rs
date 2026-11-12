@@ -873,13 +873,13 @@ fn the_grant_file_persists_only_fingerprints() {
 }
 
 #[test]
-fn a_backend_grant_epoch_must_advance() {
+fn a_backend_grant_epoch_can_repeat_but_cannot_regress() {
     let collector = collector("epoch-advance");
     let grant = enabled(&collector);
     assert!(collector
         .grants()
         .bind_backend_grant(&grant_response(&grant, "enabled", 1), INSTALLATION_ID)
-        .is_err());
+        .is_ok());
     let rebound = collector
         .grants()
         .bind_backend_grant(&grant_response(&grant, "enabled", 2), INSTALLATION_ID)
@@ -1232,7 +1232,7 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
         serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
             .expect("decode");
     persisted["grant"]["disclosure_version"] =
-        serde_json::Value::String(DISCLOSURE_VERSION_V1.to_string());
+        serde_json::Value::String("provider_daily_reference_disclosure.future".to_string());
     fs::write(
         collector.grants().path(),
         serde_json::to_vec_pretty(&persisted).expect("encode"),
@@ -1277,8 +1277,8 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("codex_daily_aggregates_consent_not_runtime_ready")),
-        "a v1 grant must remain blocked pending fresh v2 approval: {lines:?}"
+            .any(|line| line.contains("codex_daily_aggregates_account_mismatch")),
+        "a v1 grant must remain confined to its original account: {lines:?}"
     );
 }
 
@@ -1847,4 +1847,132 @@ fn the_capability_reaches_exactly_one_provider_route() {
             "this module must never reference {forbidden}"
         );
     }
+}
+
+/// [format] Lost ACK/restart recovery preserves key, exclusions, epoch and health.
+#[test]
+fn rebind_recovers_after_server_commit_without_a_local_write() {
+    for disclosure in [DISCLOSURE_VERSION, DISCLOSURE_VERSION_V1] {
+        let collector = collector("rebind-crash");
+        enabled(&collector);
+        let excluded = collector
+            .grants
+            .account_fingerprint_for("excluded-account")
+            .unwrap()
+            .unwrap();
+        collector
+            .grants
+            .set_account_excluded(&excluded, true)
+            .unwrap();
+        collector
+            .grants
+            .record_health(Some(&timestamp(now())), None)
+            .unwrap();
+        let mut original = collector.grants.read().unwrap().unwrap();
+        original.grant.disclosure_version = disclosure.to_owned();
+        atomic_json_write(collector.grants.path(), &original).unwrap();
+        let mut target = setup();
+        target.installation_id = "00000000-0000-4000-8000-000000000082".to_owned();
+        let proposal = collector
+            .grants
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        let mut response = grant_response(&original.grant, "enabled", 1);
+        response.disclosure_version = disclosure.to_owned();
+        response.installation_id = target.installation_id.clone();
+        response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+        // Server commits, process dies before writing grant.json. Reopen old bytes,
+        // repeat the same request, then bind the server's idempotent response.
+        let reopened = GrantStore::new(collector.grants.path());
+        let recovered = reopened
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&proposal.request).unwrap(),
+            serde_json::to_value(&recovered.request).unwrap()
+        );
+        let rebound = reopened
+            .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+            .unwrap();
+        assert_eq!(rebound.backend_binding, original.grant.backend_binding);
+        assert_eq!(
+            rebound.account_fingerprint,
+            original.grant.account_fingerprint
+        );
+        assert_eq!(rebound.disclosure_version, disclosure);
+        assert_eq!(rebound.granted_at, original.grant.granted_at);
+        assert_eq!(rebound.last_success_at, original.grant.last_success_at);
+        let persisted = reopened.read().unwrap().unwrap();
+        assert_eq!(persisted.hmac_key_hex, original.hmac_key_hex);
+        assert_eq!(
+            persisted.excluded_account_fingerprints,
+            original.excluded_account_fingerprints
+        );
+        let bytes = fs::read(reopened.path()).unwrap();
+        reopened
+            .bind_backend_grant(&response, &target.installation_id)
+            .unwrap();
+        assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
+        assert!(reopened
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// [behaviour] A local revoke during the request wins over a committed rebind.
+#[test]
+fn revoked_or_disabled_daily_grants_never_rebind() {
+    let collector = collector("rebind-revoked");
+    let grant = enabled(&collector);
+    let mut target = setup();
+    target.installation_id = "00000000-0000-4000-8000-000000000083".to_owned();
+    let proposal = collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = grant_response(&grant, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    collector.grants.revoke(now()).unwrap();
+    assert!(collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    let retained = collector
+        .grants
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+        .unwrap();
+    assert_eq!(retained.status, GrantStatus::Revoked);
+    assert_eq!(
+        retained.revoked_at.as_deref(),
+        Some(timestamp(now()).as_str())
+    );
+    assert!(!grant_runtime_ready(&retained));
+    let mut deletion = response.clone();
+    deletion.status = "revoked".to_owned();
+    deletion.grant_version = 2;
+    collector
+        .grants
+        .apply_backend_revocation(&deletion, &target.installation_id)
+        .unwrap();
+    assert_eq!(
+        collector.grants.load().unwrap().unwrap().status,
+        GrantStatus::Revoked
+    );
+    let mut state = collector.grants.read().unwrap().unwrap();
+    state.grant.status = GrantStatus::Enabled;
+    let binding = state.grant.backend_binding.as_mut().unwrap();
+    binding.backend_revoked = false;
+    binding.server_policy_state = ServerPolicyState::Disabled;
+    atomic_json_write(collector.grants.path(), &state).unwrap();
+    assert!(collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
 }
