@@ -337,6 +337,13 @@ same-member page fold holds that id and the occurrence's usable provider timesta
 or after 2026-11-05T00:00:00Z. Other requests and idless copies count through the existing
 restoration path; the parent-repeat rule and listed-family behavior remain unchanged.
 
+A forked child's copied first response counts at its root when the same root
+path's page or valid persisted request census holds that id. Census freshness
+does not revoke positive membership. With no witness the child counts it until
+its next fold can prove the copy. A root rewrite replaces the census; the child's
+next fold then follows that replacement. Membership proves local source presence,
+not server acceptance. No extra reads or persisted fields implement this rule.
+
 ## Module map: snapshots/ (target; migration in progress)
 
 `snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
@@ -416,3 +423,93 @@ server capability or the replay directive; the upload filter applies them at sen
 keep the full upload context. A setting or capability flip therefore reads and sends nothing for a
 file whose delivery is fully proven: it owes delivery, paid on the file's next ordinary read, and
 applies to bodies from then on, never retroactively.
+
+## Codex cloud task collection
+
+`cloud_sessions` runs independently of local transcript collection and upload.
+Explicit consent binds one installation/user/organization and the
+`cloud_session_changes.v1` contract. Each due slice reads the exact grant's
+authority once through the source-scoped relay. An older backend leaves the
+collector idle; uploads never fall back to the retired protocol. Backend
+authority is checked again when accepting changes, so a remote pause during a
+slice cannot admit later uploads. Local pause/revoke closes the I/O fence and
+waits for admitted work to finish.
+
+The latest provider page controls head polling: five minutes for queued,
+running or unknown tasks, 30 minutes during recent local Codex filesystem
+activity, six hours otherwise. A daily crawl streams pages and retains only
+its next cursor in memory, continuing five minutes later when its slice
+budget ends. It continues across midnight without a total page/task ceiling.
+Only positive task facts are uploaded; missing tasks never imply deletion.
+
+The existing graph-independent upload-history SQLite connection stores only
+each task's semantic digest and acknowledged head etag, scoped to destination
+and consent epoch. Fixed expiry permits safe re-offering; the server returns
+no-op for an exact repeat even after ACK loss or restart. The cache contains no
+task payloads or raw IDs and never enters local graph load/save or receipt
+settlement. The file stays at `user_version` 1: its cloud tables are created
+if missing at open, and older builds open the file and ignore them. Cloud
+failures and retry deadlines do not change local delivery.
+
+### Collector approval continuity
+
+Daily provider reporting and cloud-session approvals survive daemon updates and
+sign-ins to the same Ottto account on the same physical Mac. An enabled bound
+approval can rebind to the current relay device through its collector-specific
+`grants/{id}/rebind` endpoint, authenticated with that target device's relay token.
+The request sends the stored grant version, new scope fingerprint, live hardware
+hash and original disclosure; the server resolves the previous device. Successful
+rebind preserves the grant epoch, consent-time build, account fingerprint and
+exclusions. The local grant is replaced atomically. It never replays transcripts.
+
+Live hardware must match the saved identity before collection and rebind. Missing
+hardware proof stops collection. A copied saved hardware identity requires an explicit
+forget-installation and new pairing before approval on the new Mac; fresh consent
+alone cannot override the hardware check. A revoked or disabled approval is never rebound.
+Terminal refusals stop retries for that binding until the binding changes or the
+service restarts. HTTP 404 retains the stopped-binding behavior for servers that
+have not deployed rebind yet. Transport, 429 and server errors use normal polling.
+
+Cloud changes report the running build for diagnostics; approval binds the
+collection contract independently of the binary version. Each due slice reads
+`cloud-sessions/grants/{id}/authority?grant_version=N` once. Rebind accepts the
+same-epoch management DTO using `can_collect`, preserving the bound collection
+contract and provider-creation cutoff. It drops transient traversal and transport
+state, retaining the original consent's cache namespace through optional opaque
+origin fingerprints in the binding. The grant file update preserves that namespace
+atomically with the rebound identity, so unchanged tasks stay suppressed after a
+restart. Destination, owner, grant epoch, account and contract still isolate cache
+entries. A lost rebind reply does not require another rebind after revoke: trusted
+local control can reconcile the exact authenticated DELETE response against the
+current same-owner HMAC scope, leaving consent revoked. Every authority, provider,
+send and cache admission validates current local identity; identity changes close admission
+and drain admitted I/O before replacing account or device state. Older daemons
+receive disabled legacy authority and cannot upload through retired routes.
+
+## Codex daily provider reference
+
+With a live approval, `provider_daily_reference` reads the provider's own daily usage for
+every Codex login on the Mac and uploads normalized scalar rows. Each tick reads the default
+home and every accepted slot home once (never a home seen only through a running process),
+keeps one login per opaque account (identified first, then the default home, then the lowest
+slot id) and uses a slot only while its live token proves the pair it was registered with.
+Logins are read most overdue first, each at its own 6 h cadence and breaker; a 429 or a
+grant-wide refusal ends the tick. The attempt time is saved before every request, and a
+request is never made when that save fails. `state.json` (schema 2) keeps one entry per
+account and the latest discovery summary; status reads that summary and never a credential.
+An answer with a `users` count above one anywhere is refused as workspace-wide. A batch counts
+as stored only when its acknowledgement names the expected grant and its row counts add up;
+when every batch of a read is stored as current, the account keeps a proof of that series,
+and another login of the same tick returning the identical series is not uploaded again.
+A login is one secure read and one parse of
+its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
+fingerprint and account identity all come from that parse. Expiry and identity come from the
+live access token; an id token only cross-checks the pair. A token lapsing within five minutes
+is never used, and credentials are never refreshed or written.
+
+Under the current disclosure every batch of one read carries the same optional
+`account_identity` (the account and workspace hashes Codex session evidence uses) and the
+same `collected_at`, empty batches included. The read's last covered day is always the last
+complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
+producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
+cross-language identity vectors.

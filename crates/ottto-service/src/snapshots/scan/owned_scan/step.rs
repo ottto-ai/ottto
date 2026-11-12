@@ -145,7 +145,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             mut forced_claude_family_reparses,
             mut claude_twin_schedule,
-            claude_family_shadow,
             mut identified_candidates,
             active_file: active_frame,
             mut codex_join_inventory,
@@ -3137,18 +3136,6 @@ impl OwnedSourceScan {
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
                 let traversal_healthy = !traversal_snapshot.counts.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
-                // Count-only per-family completion, from the page's
-                // settled state before any terminal effect. Acts on nothing.
-                if source == SnapshotSource::ClaudeCode {
-                    claude_family_census_shadow::observe_page(
-                        index,
-                        &claude_family_shadow,
-                        &pending_finalization,
-                        &census,
-                        &sampling,
-                        audit_now,
-                    );
-                }
                 let reconciliation_complete = if traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -3215,8 +3202,7 @@ impl OwnedSourceScan {
                             .saturating_add(usize::from(reconciliation_pending))
                     })
                     .unwrap_or_default();
-                let skipped_file_count_due_to_limit =
-                    claude_family_census_shadow::skipped_view(index).count();
+                let skipped_file_count_due_to_limit = index.skipped_census_member_count();
                 let restart_after_hints =
                     traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
                 let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
@@ -3928,13 +3914,6 @@ impl OwnedSourceScan {
                     page_selection(source.api_slug(), PageSelection::Skipped, 1);
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
-                    }
-                    // The ordinary equality Skip attests this revision
-                    // for the shadow family census. Counts only.
-                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
-                        claude_family_census_shadow::attest_equality_skip(
-                            index, &candidate, &sampling, audit_now,
-                        );
                     }
                     pending!();
                 }
@@ -4867,7 +4846,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_schedule,
-            claude_family_shadow,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(
                 active_file,

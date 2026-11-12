@@ -27,9 +27,6 @@ const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbeat_ack.v1";
-const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
-const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
 /// A payload rejection carries only validated request-local locations, never
 /// response text. Locations are transient and are not acknowledgement evidence.
@@ -467,6 +464,25 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
+/// The server answered that this cloud-session route or grant epoch is not
+/// available: an older server, or a grant this installation must re-consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionRouteUnsupported {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionRouteUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend does not offer this cloud-session route or grant: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionRouteUnsupported {}
+
 /// The provider-daily-reference ingest route refused the principal or the
 /// build. Kept typed and distinct from a contract rejection because
 /// "this collector version is not admitted yet" is the expected steady state
@@ -516,40 +532,6 @@ impl std::fmt::Display for ProviderDailyReferenceContractRejected {
 }
 
 impl std::error::Error for ProviderDailyReferenceContractRejected {}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionHeartbeatAckV1 {
-    schema_version: String,
-    accepted: bool,
-    observations_written: u32,
-    noop: bool,
-    grant_status: String,
-    fresh_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionScanChunkAckV1 {
-    schema_version: String,
-    accepted: bool,
-    scan_id: String,
-    chunk_index: u8,
-    chunk_identity_digest: String,
-    chunk_semantic_digest: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloudSessionScanFinalizeAckV1 {
-    schema_version: String,
-    accepted: bool,
-    scan_id: String,
-    chunk_count: u8,
-    unique_entity_count: u32,
-    inventory_digest: String,
-    epoch_digest: String,
-}
 
 /// The backend refused to mint a relay token for this local device. Keep this
 /// typed so the daemon can mark canonical local health as an auth/rebind issue
@@ -2078,9 +2060,11 @@ fn relay_token_upload_response(
     }
 }
 
-/// A failed cloud-session request: 401/403 is an authorization rejection,
-/// 400/404/409/422 a contract rejection; any other status or a transport
-/// failure carries upload diagnostics. Response bodies are never kept.
+/// A failed cloud-session request: 401/403 is an authorization rejection;
+/// 404/405/409/410 means this server does not offer the route or this grant
+/// epoch; 400/415/422 a contract rejection; 408/429/503 a shed with its
+/// `Retry-After`; any other status or a transport failure carries upload
+/// diagnostics. Response bodies are never kept.
 fn cloud_session_request_error(
     error: ureq::Error,
     operation: &'static str,
@@ -2090,8 +2074,18 @@ fn cloud_session_request_error(
         ureq::Error::Status(code @ (401 | 403), _response) => {
             anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
         }
-        ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response) => {
+        ureq::Error::Status(code @ (404 | 405 | 409 | 410), _response) => {
+            anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
+        }
+        ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
             anyhow::Error::new(CloudSessionContractRejected { status: code })
+        }
+        ureq::Error::Status(status @ (408 | 429 | 503), response) => {
+            anyhow::Error::new(UploadShed {
+                status,
+                retry_after: response_retry_after(&response),
+                code: None,
+            })
         }
         ureq::Error::Status(code, response) => anyhow::Error::new(UploadFailureDiagnostics::http(
             operation, endpoint, code, &response,
@@ -3017,47 +3011,82 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
     }
-    /// Upload one bounded, content-free cloud-session batch using the same
-    /// source-scoped relay principal as local snapshots. Response bodies are
-    /// never retained on auth/contract failures.
-    pub fn upload_cloud_session_batch_with_timeout(
+    /// Upload one `cloud_session_changes.v1` request with the same
+    /// source-scoped relay principal as local snapshots. Only the parsed ACK
+    /// is returned; response bodies of refusals are never kept.
+    pub fn upload_cloud_session_changes_with_timeout(
         &self,
         relay_token: &str,
         request: &Value,
         timeout: Duration,
+        gzip_enabled: &AtomicBool,
     ) -> Result<Value> {
-        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        match relay_sent(
-            relay_token,
-            agent
-                .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
-                .timeout(request_timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
-                .send_json(request),
-        ) {
-            Ok(response) => {
-                let receipt = require_cloud_session_success(
-                    response,
-                    "cloud-session upload",
-                    "cloud_session_batch",
-                )?
-                .into_json()
-                .map_err(|error| anyhow!("parse cloud-session batch response failed: {error}"))?;
-                validate_cloud_session_heartbeat_receipt(request, &receipt)?;
-                Ok(receipt)
-            }
+        let deadline = Instant::now() + timeout;
+        let body = serde_json::to_vec(request)?;
+        if body.len() > 512 * 1024 {
+            return Err(anyhow!(
+                "cloud-session changes exceed the decoded request budget"
+            ));
+        }
+        let compressed = gzip_enabled
+            .load(Ordering::Relaxed)
+            .then(|| gzip(&body))
+            .flatten();
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+        let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
+        let post = agent
+            .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"));
+        let mut outcome = match compressed.as_ref() {
+            Some(encoded) => relay_sent(
+                relay_token,
+                post.set("Content-Encoding", "gzip").send_bytes(encoded),
+            ),
+            None => relay_sent(relay_token, post.send_bytes(&body)),
+        };
+        // 415 explicitly refuses the encoding. A general semantic 400/422
+        // does not negotiate gzip. Never change local snapshot gzip state.
+        if compressed.is_some() && matches!(&outcome, Err(ureq::Error::Status(415, _))) {
+            gzip_enabled.store(false, Ordering::Relaxed);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+            let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
+            outcome = relay_sent(
+                relay_token,
+                agent
+                    .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+                    .timeout(request_timeout)
+                    .set("Accept", "application/json")
+                    .set("Content-Type", "application/json")
+                    .set("Authorization", &format!("Bearer {relay_token}"))
+                    .send_bytes(&body),
+            );
+        }
+        match outcome {
+            Ok(response) => require_cloud_session_success(
+                response,
+                "cloud-session changes upload",
+                "cloud_session_changes",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse cloud-session changes response failed: {error}")),
             Err(error) => Err(cloud_session_request_error(
                 error,
-                "cloud-session upload",
-                "cloud_session_batch",
+                "cloud-session changes upload",
+                "cloud_session_changes",
             )),
         }
     }
 
-    /// Read one exact, relay-device-bound cloud grant epoch. This endpoint is
-    /// deliberately not a list and never accepts browser authentication.
-    pub fn get_cloud_session_grant_authority_with_timeout(
+    /// Read one exact, relay-device-bound cloud grant epoch on the
+    /// `cloud_session_changes.v1` authority. Not a list; never browser auth.
+    pub fn get_cloud_session_authority_with_timeout(
         &self,
         relay_token: &str,
         grant_id: &str,
@@ -3069,7 +3098,7 @@ impl SnapshotApiClient {
         }
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
         let path = format!(
-            "/api/v1/cloud-session-observations/grants/{grant_id}/authority?grant_version={grant_version}"
+            "/api/v1/cloud-sessions/grants/{grant_id}/authority?grant_version={grant_version}"
         );
         match relay_sent(
             relay_token,
@@ -3095,75 +3124,22 @@ impl SnapshotApiClient {
         }
     }
 
-    /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
-    #[cfg(test)]
-    pub fn upload_cloud_session_scan_chunk(
+    /// Rebind an existing enabled grant using the target relay credential.
+    pub(crate) fn rebind_collector_grant(
         &self,
+        kind: crate::grant_rebind::GrantKind,
+        grant_id: &str,
         relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_chunk_with_timeout(
-            relay_token,
-            scan_id,
-            request,
-            SNAPSHOT_HTTP_READ_TIMEOUT,
-        )
-    }
-
-    pub fn upload_cloud_session_scan_chunk_with_timeout(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
+        request: &crate::grant_rebind::RebindRequest,
         timeout: Duration,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_request(
-            relay_token,
-            scan_id,
-            "chunks",
-            request,
-            "cloud_session_scan_chunk",
-            timeout,
-        )
-    }
-
-    /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
-    pub fn finalize_cloud_session_scan_with_timeout(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        request: &Value,
-        timeout: Duration,
-    ) -> Result<Value> {
-        self.upload_cloud_session_scan_request(
-            relay_token,
-            scan_id,
-            "finalize",
-            request,
-            "cloud_session_scan_finalize",
-            timeout,
-        )
-    }
-
-    fn upload_cloud_session_scan_request(
-        &self,
-        relay_token: &str,
-        scan_id: &str,
-        action: &str,
-        request: &Value,
-        operation: &'static str,
-        timeout: Duration,
-    ) -> Result<Value> {
-        if !crate::hex::is_uuid(scan_id)
-            || request.get("scan_id").and_then(Value::as_str) != Some(scan_id)
-        {
-            return Err(anyhow!(
-                "cloud-session scan path and payload scan_id are invalid or do not match"
-            ));
+    ) -> std::result::Result<Value, crate::grant_rebind::RebindFailure> {
+        use crate::grant_rebind::RebindFailure;
+        if !crate::hex::is_uuid(grant_id) || request.grant_version == 0 {
+            return Err(RebindFailure::http(422, None));
         }
-        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        let path = format!("/api/v1/cloud-sessions/scans/{scan_id}/{action}");
+        let (agent, request_timeout) =
+            cloud_session_deadline_agent(timeout).map_err(|_| RebindFailure::unavailable())?;
+        let path = format!("/api/v1/{}/grants/{grant_id}/rebind", kind.route());
         match relay_sent(
             relay_token,
             agent
@@ -3173,22 +3149,15 @@ impl SnapshotApiClient {
                 .set("Authorization", &format!("Bearer {relay_token}"))
                 .send_json(request),
         ) {
-            Ok(response) => {
-                let receipt = require_cloud_session_success(
-                    response,
-                    "cloud-session scan upload",
-                    operation,
-                )?
+            Ok(response) if response.status() == 200 => response
                 .into_json()
-                .map_err(|error| anyhow!("parse cloud-session scan response failed: {error}"))?;
-                validate_cloud_session_scan_receipt(action, request, &receipt)?;
-                Ok(receipt)
+                .map_err(|_| RebindFailure::http(422, None)),
+            Ok(response) => Err(RebindFailure::http(response.status(), None)),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_json::<Value>().ok();
+                Err(RebindFailure::http(status, body.as_ref()))
             }
-            Err(error) => Err(cloud_session_request_error(
-                error,
-                "cloud-session scan upload",
-                operation,
-            )),
+            Err(_) => Err(RebindFailure::unavailable()),
         }
     }
 
@@ -3378,92 +3347,6 @@ fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
         "pi" => ottto_protocol::SourceKind::Pi,
         _ => ottto_protocol::SourceKind::Codex,
     }
-}
-
-fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {
-    let ack: CloudSessionHeartbeatAckV1 = serde_json::from_value(receipt.clone())
-        .map_err(|error| anyhow!("invalid cloud-session heartbeat receipt: {error}"))?;
-    let collected_at = request
-        .get("collected_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing collected_at"))?;
-    let observed_at = request
-        .pointer("/health/observed_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing health.observed_at"))?;
-    if ack.schema_version != CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION
-        || !ack.accepted
-        || ack.observations_written != 0
-        || !ack.noop
-        || ack.grant_status != "enabled"
-        || ack.fresh_at != collected_at
-        || ack.fresh_at != observed_at
-        || OffsetDateTime::parse(&ack.fresh_at, &Rfc3339).is_err()
-    {
-        return Err(anyhow!(
-            "cloud-session heartbeat receipt does not acknowledge the exact heartbeat"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_cloud_session_scan_receipt(
-    action: &str,
-    request: &Value,
-    receipt: &Value,
-) -> Result<()> {
-    let request_string = |field: &str| {
-        request
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("cloud-session scan request is missing {field}"))
-    };
-    match action {
-        "chunks" => {
-            let ack: CloudSessionScanChunkAckV1 = serde_json::from_value(receipt.clone())
-                .map_err(|error| anyhow!("invalid cloud-session chunk receipt: {error}"))?;
-            let chunk_index = request
-                .get("chunk_index")
-                .and_then(Value::as_u64)
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or_else(|| anyhow!("cloud-session chunk request is missing chunk_index"))?;
-            if ack.schema_version != CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION
-                || !ack.accepted
-                || ack.scan_id != request_string("scan_id")?
-                || ack.chunk_index != chunk_index
-                || ack.chunk_identity_digest != request_string("chunk_identity_digest")?
-                || ack.chunk_semantic_digest != request_string("chunk_semantic_digest")?
-            {
-                return Err(anyhow!(
-                    "cloud-session chunk receipt does not acknowledge the exact request"
-                ));
-            }
-        }
-        "finalize" => {
-            let ack: CloudSessionScanFinalizeAckV1 = serde_json::from_value(receipt.clone())
-                .map_err(|error| anyhow!("invalid cloud-session finalize receipt: {error}"))?;
-            let request_u64 = |field: &str| {
-                request
-                    .get(field)
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("cloud-session finalize request is missing {field}"))
-            };
-            if ack.schema_version != CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION
-                || !ack.accepted
-                || ack.scan_id != request_string("scan_id")?
-                || u64::from(ack.chunk_count) != request_u64("chunk_count")?
-                || u64::from(ack.unique_entity_count) != request_u64("unique_entity_count")?
-                || ack.inventory_digest != request_string("inventory_digest")?
-                || ack.epoch_digest != request_string("epoch_digest")?
-            {
-                return Err(anyhow!(
-                    "cloud-session finalize receipt does not acknowledge the exact request"
-                ));
-            }
-        }
-        _ => return Err(anyhow!("unsupported cloud-session scan action")),
-    }
-    Ok(())
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
@@ -4074,19 +3957,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_scan_path_rejects_mismatched_payload_scan_id_before_io() {
-        let client = SnapshotApiClient::new("http://127.0.0.1:1");
-        let error = client
-            .upload_cloud_session_scan_chunk(
-                "relay-token",
-                "00000000-0000-4000-8000-000000000001",
-                &json!({"scan_id":"00000000-0000-4000-8000-000000000002"}),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("scan_id are invalid"));
-    }
-
-    #[test]
     fn snapshot_rejection_locations_require_a_complete_entity_local_set() {
         for body in [
             r#"{"detail":"synthetic validator text"}"#,
@@ -4241,6 +4111,68 @@ mod tests {
         assert!(headers
             .lines()
             .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
+    /// [behaviour] Cloud gzip refusal affects this cloud client only. A
+    /// semantic 400 is never retried as encoding negotiation.
+    #[test]
+    fn cloud_gzip_fallback_is_separate_from_local_uploads() {
+        for status in [400, 415] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                for attempt in 0..if status == 415 { 3 } else { 1 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    captured.push(read_complete_http_request(&mut stream));
+                    let code = if attempt == 0 { status } else { 200 };
+                    let body = "{}";
+                    write!(stream, "HTTP/1.1 {code} Result\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").unwrap();
+                }
+                captured
+            });
+            let cloud_gzip = AtomicBool::new(true);
+            let local_gzip = snapshot_upload_gzip_enabled();
+            let body = json!({"synthetic": "content-free"});
+            let result = client.upload_cloud_session_changes_with_timeout(
+                "fixture-relay",
+                &body,
+                Duration::from_secs(5),
+                &cloud_gzip,
+            );
+            if status == 415 {
+                result.unwrap();
+                client
+                    .upload_cloud_session_changes_with_timeout(
+                        "fixture-relay",
+                        &body,
+                        Duration::from_secs(5),
+                        &cloud_gzip,
+                    )
+                    .unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .downcast_ref::<CloudSessionContractRejected>()
+                    .is_some());
+            }
+            assert_eq!(snapshot_upload_gzip_enabled(), local_gzip);
+            let captured = server.join().unwrap();
+            for (index, request) in captured.iter().enumerate() {
+                let (headers, bytes) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")),
+                    index == 0
+                );
+                if index > 0 {
+                    assert_eq!(serde_json::from_str::<Value>(bytes).unwrap(), body);
+                }
+            }
+            assert_eq!(cloud_gzip.load(Ordering::Relaxed), status != 415);
+        }
     }
 
     /// [behaviour] Every snapshot POST names the daemon version and its

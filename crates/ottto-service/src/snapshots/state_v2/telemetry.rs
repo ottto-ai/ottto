@@ -204,6 +204,7 @@ impl Stage {
                         peak,
                         cpu_us: cpu,
                         wall_us: Some(self.probe.wall_us()),
+                        disk: self.probe.disk(),
                         ..Default::default()
                     },
                 );
@@ -274,18 +275,7 @@ pub(super) fn baseline(path: &Path) {
 pub(super) fn process_written_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
-        if unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V2,
-                usage.as_mut_ptr().cast(),
-            )
-        } == 0
-        {
-            return Some(unsafe { usage.assume_init() }.ri_diskio_byteswritten);
-        }
-        None
+        crate::local_resource_diagnostics::DiskBytes::now().map(|disk| disk.disk_written_bytes)
     }
     #[cfg(target_os = "linux")]
     {
@@ -512,6 +502,9 @@ struct MemoryWindow {
     cpu_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wall_us: Option<u64>,
+    /// Process-wide disk bytes across the stage (macOS).
+    #[serde(flatten)]
+    disk: Option<crate::local_resource_diagnostics::DiskBytes>,
 }
 /// RAII stage window; fixed label, two bounded shared samplers, no identifiers.
 pub(in super::super) struct Window {
@@ -542,6 +535,7 @@ impl Drop for Window {
                     peak,
                     cpu_us: cpu,
                     wall_us: Some(self.probe.wall_us()),
+                    disk: self.probe.disk(),
                     ..Default::default()
                 },
             );
@@ -957,6 +951,10 @@ mod ops_tests {
             .map(|record| &record["observation"])
             .unwrap();
         assert!(save["wall_us"].is_u64() && cross["wall_elapsed_us"].is_u64());
+        assert_eq!(
+            save["disk_written_bytes"].is_u64(),
+            cfg!(target_os = "macos")
+        );
         if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(save["cpu_us"].is_u64() && cross["shared_process_cpu_delta_us"].is_u64());
         }

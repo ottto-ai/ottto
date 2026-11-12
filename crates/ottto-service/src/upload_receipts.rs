@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
-use crate::snapshots::state_v2::upload_history::{Encoded, Filter, Store};
+use crate::snapshots::state_v2::upload_history::{CloudAck, CloudAckWrite, Encoded, Filter, Store};
 use crate::snapshots::SnapshotBatchRequest;
 
 /// Most receipts one `ottto receipts` page returns.
@@ -926,6 +926,51 @@ fn with_history<T>(
         *history = None;
     }
     result.map(Some)
+}
+
+/// The Codex cloud-task ACK cache shares this owner for short SQL operations
+/// only. Its failures are cloud cache failures: they never count as receipt
+/// rows not written and never affect local delivery.
+pub(crate) fn cloud_read_acks(
+    state_dir: &Path,
+    scope: &[u8; 32],
+    keys: &[&str],
+    now_unix: i64,
+) -> Result<std::collections::HashMap<String, CloudAck>> {
+    Ok(with_history(state_dir, true, |store| {
+        store.cloud_read_acks(scope, keys, now_unix)
+    })?
+    .unwrap_or_default())
+}
+
+pub(crate) fn cloud_commit(
+    state_dir: &Path,
+    scope: &[u8; 32],
+    acks: &[CloudAckWrite<'_>],
+    crawl_completed_date: Option<&str>,
+    now_unix: i64,
+) -> Result<()> {
+    with_history(state_dir, true, |store| {
+        store.cloud_commit(scope, acks, crawl_completed_date, now_unix)
+    })?;
+    Ok(())
+}
+
+pub(crate) fn cloud_crawl_completed_date(
+    state_dir: &Path,
+    scope: &[u8; 32],
+) -> Result<Option<String>> {
+    Ok(with_history(state_dir, true, |store| {
+        store.cloud_crawl_completed_date(scope)
+    })?
+    .flatten())
+}
+
+/// Erase the whole cloud cache after a local revoke. An absent history file
+/// has nothing to erase and is not created.
+pub(crate) fn cloud_erase_all(state_dir: &Path) -> Result<()> {
+    with_history(state_dir, false, Store::cloud_erase_all)?;
+    Ok(())
 }
 
 fn open_history(state_dir: &Path) -> Result<Store> {

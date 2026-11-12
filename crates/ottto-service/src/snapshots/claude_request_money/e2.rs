@@ -2322,9 +2322,9 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
 
 /// A forked subagent's first line repeats the parent's last response: the
 /// subagent's first response counts once, at the root, when the root's
-/// current witness holds its request id. A root not read at its current
-/// revision leaves it counted (no hold, counted as deferred); the
-/// subagent's next page decides again.
+/// page or valid persisted census holds its request id, regardless of
+/// freshness. Without either witness the copy counts (no hold, counted as
+/// deferred); the subagent's next page decides again.
 fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &ScanIndex) {
     let item = &items[at];
     let first = item
@@ -2336,18 +2336,16 @@ fn decide_family(items: &mut [SnapshotItem], at: usize, root_key: &str, index: &
         return;
     };
     let root = claude_snapshot_family_root_ref(item);
-    let copied = match current_witness(items, root, root_key, index) {
-        Some(witness) => witness.holds(&id),
-        None => {
-            let deferred = index
-                .claude_request_census
-                .get(root_key)
-                .is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
-            record_counts(Counts::one(26, u64::from(deferred)));
-            diag("family_copy_deferred", u64::from(deferred));
-            false
-        }
-    };
+    let witness = current_witness(items, root, root_key, index);
+    let census = index
+        .claude_request_census
+        .get(root_key)
+        .filter(|record| record.proves_scan());
+    let copied = witness.as_ref().is_some_and(|witness| witness.holds(&id))
+        || census.is_some_and(|record| record.holds_hash(claude_request_hash(&id)));
+    let deferred = u64::from(witness.is_none() && census.is_none());
+    record_counts(Counts::one(26, deferred));
+    diag("family_copy_deferred", deferred);
     // The proof is this fold's, so the fold is present.
     let SnapshotItem {
         claude_money: Some(fold),
@@ -4705,8 +4703,8 @@ const COUNT_NAMES: [&str; 28] = [
     // Copies and passes waiting for an origin's acceptance.
     "copy_prefix_origin_unaccepted_copies",
     "copy_prefix_origin_unaccepted_passes",
-    // A forked subagent's first-line copy counted because its root was not
-    // read at its current revision; its next page decides again.
+    // A forked subagent's first-line copy counted with no usable root
+    // witness at all; its next page decides again.
     "family_copy_deferred",
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",

@@ -6,6 +6,11 @@
 //! window in the same transaction and always keeps every source's newest row,
 //! so no timer or other owner deletes rows. The file is never VACUUMed:
 //! `secure_delete` zeroes expired rows and later appends reuse their pages.
+//!
+//! The file stays at `user_version` 1. The Codex cloud-task ACK cache
+//! ([`cloud`]) lives in separate tables of the same file and connection,
+//! created if missing at open; older builds ignore them, and receipt rows are
+//! unchanged.
 use super::super::VALUE_BYTES;
 use super::{
     linked_engine, lock_owner, pragmas, private_file, private_parent, same_object, sidecar,
@@ -18,9 +23,15 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+mod cloud;
+#[cfg(test)]
+pub(crate) use cloud::QUERIES_FOR_TEST as CLOUD_QUERIES_FOR_TEST;
+pub(crate) use cloud::{CloudAck, CloudAckWrite};
+
 pub(crate) const FILE_NAME: &str = "upload_history.sqlite";
 /// Rows older than this expire at the next append, except each source's newest.
 pub(crate) const RETENTION_NS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+/// Never raised: released builds refuse any other version.
 const USER_VERSION: i64 = 1;
 const VALUE_VERSION: u32 = 1;
 const SCHEMA: &str = "
@@ -38,8 +49,7 @@ CREATE INDEX upload_history_at ON upload_history(uploaded_at_ns);
 CREATE INDEX upload_history_src ON upload_history(source, seq);
 CREATE TABLE ring_imported(
  value_digest BLOB PRIMARY KEY CHECK(length(value_digest)=16)
-) STRICT, WITHOUT ROWID;
-PRAGMA user_version=1;";
+) STRICT, WITHOUT ROWID;";
 const INSERT: &str = "INSERT INTO upload_history(uploaded_at_ns,source,entity_count,value_version,value_digest,row_checksum,value) VALUES(?1,?2,?3,?4,?5,?6,?7)";
 /// The candidate range comes from the time index; each candidate's
 /// keep-newest check is one seek of the (source, seq) index.
@@ -190,12 +200,20 @@ impl Store {
         }
         pragmas(&conn, false, Checkpoint::Auto(1000))?;
         match version {
-            0 => {
+            // One transaction each: a fresh file gets every table and version
+            // 1; version 1 gains any missing cloud tables; version 2 (written
+            // only by unreleased builds) returns to 1 so released builds open it.
+            0 | USER_VERSION | 2 => {
                 let tx = conn.transaction()?;
-                tx.execute_batch(SCHEMA)?;
+                if version == 0 {
+                    tx.execute_batch(SCHEMA)?;
+                }
+                tx.execute_batch(cloud::SCHEMA)?;
+                if version != USER_VERSION {
+                    tx.execute_batch(&format!("PRAGMA user_version={USER_VERSION};"))?;
+                }
                 tx.commit()?;
             }
-            USER_VERSION => {}
             _ => bail!("upload_history_schema_refused"),
         }
         private_file(path)?;

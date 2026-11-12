@@ -250,7 +250,13 @@ fn reserve_identity_mutation_locked(
     {
         return Err(LocalApiError::IdentityMutationInProgress);
     }
-    Ok(IdentityMutationReservation { id, snapshot })
+    let reservation = IdentityMutationReservation { id, snapshot };
+    // The reservation closes new provider/upload admission. Drain work already
+    // admitted before replacing local identity; consent itself remains intact.
+    crate::cloud_sessions::CloudSessionCheckpointStore::default()
+        .wait_for_collector_io_idle(crate::cloud_sessions::COLLECTOR_IO_STOP_TIMEOUT)
+        .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
+    Ok(reservation)
 }
 
 fn require_identity_mutation_reservation(
@@ -4940,11 +4946,15 @@ fn cloud_sessions_control_with_stores(
         CloudSessionsControlAction::Pause => grants.pause(time::OffsetDateTime::now_utc()),
         CloudSessionsControlAction::Revoke => grants.revoke(time::OffsetDateTime::now_utc()),
         CloudSessionsControlAction::ConfirmRevoked => grants
-            .apply_backend_revocation(
+            .reconcile_backend_revocation(
                 backend_grant
                     .as_ref()
                     .expect("backend grant presence validated"),
-                &device.device_id,
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device.device_id.clone(),
+                    organization_scope: local_organization_id.to_string(),
+                    effective_user_scope: local_user_id.to_string(),
+                },
             )
             .map(|_| ()),
         CloudSessionsControlAction::Status => Ok(()),
@@ -4987,6 +4997,17 @@ fn cloud_sessions_control_with_stores(
                     "cloud-session local control failed".to_string(),
                 )
             })?;
+    }
+    if action == CloudSessionsControlAction::Revoke {
+        // Admission is closed and admitted I/O has drained, so no racing ACK
+        // can recreate a row. The server cutoff, not this cache, prevents
+        // revival; a failed erase remains a retryable cleanup error.
+        checkpoints.erase_cache().map_err(|_| {
+            LocalApiError::LocalOperationFailed("cloud-session cache cleanup failed".to_string())
+        })?;
+    }
+    if action != CloudSessionsControlAction::Status {
+        crate::cloud_sessions::wake_cloud_session_collector();
     }
 
     if action == CloudSessionsControlAction::Revoke {
@@ -5095,10 +5116,11 @@ fn provider_daily_reference_control(
         &FileDeviceStore::default(),
         &crate::provider_daily_reference::GrantStore::default(),
         &crate::provider_daily_reference::control_token_use_store(),
-        // Consent is taken over the provider account that is signed in right
-        // now. Only the account id is read; the token never enters this path.
-        crate::provider_daily_reference::read_codex_credential()
-            .map(|credential| credential.account_scope),
+        // Consent is taken over a Codex account signed in right now. Only the
+        // account id leaves the login read; the token never enters this path.
+        &|prepare_fallback| {
+            crate::provider_daily_reference::control_account_scope(prepare_fallback)
+        },
         crate::provider_daily_reference::network_disabled(),
     )
 }
@@ -5114,7 +5136,10 @@ fn provider_daily_reference_control_with_stores(
     devices: &FileDeviceStore,
     grants: &crate::provider_daily_reference::GrantStore,
     token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
-    provider_account_scope: Option<String>,
+    // Read lazily: only Prepare (`true`, which may fall back to the first
+    // live login) and the account privacy controls (`false`, the default
+    // home's login) call it, after the token is consumed.
+    provider_account_scope: &dyn Fn(bool) -> Option<String>,
     network_disabled: bool,
 ) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
     let CodexControlTokenAuthority {
@@ -5178,7 +5203,8 @@ fn provider_daily_reference_control_with_stores(
     let mut backend_revoke_target = None;
     let result = match action {
         ProviderDailyReferenceControlAction::Prepare => {
-            let Some(provider_account_scope) = provider_account_scope
+            let scope = provider_account_scope(true);
+            let Some(provider_account_scope) = scope
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -5231,7 +5257,8 @@ fn provider_daily_reference_control_with_stores(
         ProviderDailyReferenceControlAction::Status => Ok(()),
         ProviderDailyReferenceControlAction::ExcludeCurrentAccount
         | ProviderDailyReferenceControlAction::IncludeCurrentAccount => {
-            let Some(provider_account_scope) = provider_account_scope
+            let scope = provider_account_scope(false);
+            let Some(provider_account_scope) = scope
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -5300,16 +5327,7 @@ fn provider_daily_reference_control_with_stores(
     }
     drop(identity_lifecycle_lock);
 
-    let live_binding = provider_account_scope.as_deref().and_then(|scope| {
-        devices
-            .load()
-            .ok()
-            .flatten()
-            .map(|device| crate::provider_daily_reference::Runtime {
-                installation_id: device.device_id,
-                provider_account_scope: scope.to_string(),
-            })
-    });
+    let installation_id = devices.load().ok().flatten().map(|device| device.device_id);
 
     Ok(ProviderDailyReferenceControlResult {
         action,
@@ -5320,8 +5338,9 @@ fn provider_daily_reference_control_with_stores(
         status: crate::provider_daily_reference::status_with_live_binding(
             grants,
             crate::provider_daily_reference::collector_status(grants, network_disabled),
-            live_binding.as_ref(),
+            installation_id.as_deref(),
         ),
+
         backend_create_request,
         backend_revoke_target,
     })
@@ -7496,7 +7515,7 @@ fn require_cloud_session_cleanup_before_identity_change(
     else {
         return Ok(());
     };
-    if cloud_session_cleanup_is_confirmed(&grant) {
+    if cloud_session_identity_change_allowed(&grant) {
         return Ok(());
     }
     // A logout/switch/identity-rotation attempt is itself a stop intent. Close
@@ -7518,7 +7537,7 @@ fn require_cloud_session_cleanup_before_identity_change_without_pause(
         .load()
         .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
     if match grant.as_ref() {
-        Some(grant) => cloud_session_cleanup_is_confirmed(grant),
+        Some(grant) => cloud_session_identity_change_allowed(grant),
         None => true,
     } {
         Ok(())
@@ -7527,13 +7546,30 @@ fn require_cloud_session_cleanup_before_identity_change_without_pause(
     }
 }
 
-fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
-    grant.status == crate::cloud_sessions::CloudSessionGrantStatus::Revoked
-        && !grant.backend_create_pending
-        && match grant.backend_binding.as_ref() {
-            Some(binding) => binding.backend_revoked,
-            None => true,
-        }
+fn cloud_session_identity_change_allowed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
+    use crate::cloud_sessions::CloudSessionGrantStatus;
+    if grant.backend_create_pending {
+        return false;
+    }
+    if matches!(
+        grant.status,
+        CloudSessionGrantStatus::Enabled
+            | CloudSessionGrantStatus::Paused
+            | CloudSessionGrantStatus::PolicyDisabled
+    ) && grant
+        .backend_binding
+        .as_ref()
+        .is_some_and(|binding| !binding.backend_revoked)
+    {
+        // A stable approval may become dormant across logout or sign-in.
+        // Current local identity and relay authority are proved at every I/O.
+        return true;
+    }
+    grant.status == CloudSessionGrantStatus::Revoked
+        && grant
+            .backend_binding
+            .as_ref()
+            .is_none_or(|binding| binding.backend_revoked)
 }
 
 fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApiError {
@@ -19730,7 +19766,8 @@ for line in sys.stdin:
             .is_none());
     }
 
-    fn seed_active_default_cloud_session_grant() -> crate::cloud_sessions::CloudSessionGrantStore {
+    fn seed_unconfirmed_default_cloud_session_grant(
+    ) -> crate::cloud_sessions::CloudSessionGrantStore {
         let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
         let device_id = "00000000-0000-4000-8000-000000000001";
         grants
@@ -19751,6 +19788,9 @@ for line in sys.stdin:
         grants
             .bind_backend_grant(&enabled, device_id)
             .expect("bind cleanup grant");
+        grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .expect("unconfirmed cleanup revoke");
         grants
     }
 
@@ -19789,7 +19829,7 @@ for line in sys.stdin:
         FilePendingDeviceCredentialStore::default()
             .save(&pending)
             .expect("save unguarded pending");
-        let grants = seed_active_default_cloud_session_grant();
+        let grants = seed_unconfirmed_default_cloud_session_grant();
         assert_eq!(
             recover_pending_device_credential_at_startup(),
             Err(LocalApiError::CloudSessionCleanupRequired)
@@ -19909,7 +19949,7 @@ for line in sys.stdin:
             })
             .expect("stage account switch")
             .expect("different user switch");
-        let grants = seed_active_default_cloud_session_grant();
+        let grants = seed_unconfirmed_default_cloud_session_grant();
         let authorization = RequestAuthorization::Token("token".to_string());
 
         assert_eq!(
@@ -25240,16 +25280,10 @@ for line in sys.stdin:
         let pending = grants.load().unwrap().unwrap();
         let enabled = cloud_control_backend_grant(&pending, device_id, "enabled", 1);
         grants.bind_backend_grant(&enabled, device_id).unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&grants).unwrap();
 
         grants.pause(time::OffsetDateTime::now_utc()).unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&grants).unwrap();
 
         grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
         assert!(matches!(
@@ -25279,19 +25313,16 @@ for line in sys.stdin:
         policy_grants.grant_create_request(device_id).unwrap();
         let policy_pending = policy_grants.load().unwrap().unwrap();
         let mut disabled = cloud_control_backend_grant(&policy_pending, device_id, "enabled", 1);
-        disabled.server_policy_state = ottto_protocol::CloudSessionServerPolicyState::Disabled;
+        disabled.can_collect = Some(false);
         policy_grants
             .bind_backend_grant(&disabled, device_id)
             .unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_identity_change(&policy_grants),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        require_cloud_session_cleanup_before_identity_change(&policy_grants).unwrap();
     }
 
     #[test]
     #[serial]
-    fn auth_reset_preserves_identity_until_cloud_session_cleanup_is_confirmed() {
+    fn auth_reset_keeps_a_bound_cloud_session_approval() {
         let support_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup");
         let secret_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup-secrets");
         fs::create_dir_all(&secret_root).unwrap();
@@ -25339,40 +25370,14 @@ for line in sys.stdin:
                 forget_installation: false,
             },
         };
-        for local_only in [false, true] {
-            let blocked = handle_request(&daemon, request(local_only));
-            assert!(!blocked.ok);
-            let error = blocked.error.unwrap();
-            assert_eq!(error.code, CliErrorCode::NeedsUserAction);
-            assert_eq!(
-                error.details.get("reason_code"),
-                Some(&RedactedValue::String(
-                    "cloud_session_cleanup_required".to_string()
-                ))
-            );
-        }
-        assert_eq!(FileAccountStore::default().load().unwrap(), account);
-        assert_eq!(
-            FileDeviceStore::default()
-                .load()
-                .unwrap()
-                .unwrap()
-                .device_id,
-            device_id
-        );
-        assert_eq!(
-            grants.load().unwrap().unwrap().status,
-            crate::cloud_sessions::CloudSessionGrantStatus::Paused
-        );
-
-        grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
-        let revoked =
-            cloud_control_backend_grant(&grants.load().unwrap().unwrap(), device_id, "revoked", 2);
-        grants
-            .apply_backend_revocation(&revoked, device_id)
-            .unwrap();
+        let before = grants.load().unwrap().unwrap();
         let allowed = handle_request(&daemon, request(true));
         assert!(allowed.ok, "{allowed:?}");
+        assert_eq!(
+            grants.load().unwrap().unwrap(),
+            before,
+            "logout retains the approval for authenticated rebind after sign-in"
+        );
         assert_eq!(
             FileAccountStore::default().load().unwrap().state,
             LocalAccountState::NotConnected
@@ -25382,7 +25387,7 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn account_and_device_replacement_paths_require_cloud_session_cleanup() {
+    fn account_and_device_replacement_keep_bound_cloud_session_consent() {
         let support_root = telemetry_key_store_root("cloud-session-identity-replacement");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
@@ -25414,39 +25419,27 @@ for line in sys.stdin:
 
         let mut next_account = old_account.clone();
         next_account.organization.as_mut().unwrap().id = "org_new".to_string();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_account_replacement(&next_account),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(require_cloud_session_cleanup_before_account_replacement(&next_account).is_ok());
         let next_device = LocalDeviceBinding {
             device_id: "00000000-0000-4000-8000-000000000003".to_string(),
             machine_id: Some("machine_new".to_string()),
             sources: vec!["codex".to_string()],
         };
-        assert!(matches!(
-            save_relay_device_binding(&next_device),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(save_relay_device_binding(&next_device).is_ok());
         assert_eq!(
             FileDeviceStore::default()
                 .load()
                 .unwrap()
                 .unwrap()
                 .device_id,
-            old_device_id
+            next_device.device_id
         );
 
         FileAccountStore::default().reset().unwrap();
-        assert!(matches!(
-            require_cloud_session_cleanup_before_account_replacement(&next_account),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(require_cloud_session_cleanup_before_account_replacement(&next_account).is_ok());
         FileAccountStore::default().save(&old_account).unwrap();
         FileDeviceStore::default().reset().unwrap();
-        assert!(matches!(
-            save_relay_device_binding(&next_device),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        assert!(save_relay_device_binding(&next_device).is_ok());
         FileDeviceStore::default()
             .save(&LocalDeviceBinding {
                 device_id: old_device_id.to_string(),
@@ -25593,26 +25586,22 @@ for line in sys.stdin:
             }
             drop(lifecycle_lock);
 
-            assert!(matches!(
-                reset.join().unwrap(),
-                Err(LocalApiError::CloudSessionCleanupRequired)
-            ));
-            assert_eq!(FileAccountStore::default().load().unwrap(), account);
-            assert_eq!(
-                FileDeviceStore::default()
-                    .load()
-                    .unwrap()
-                    .unwrap()
-                    .device_id,
-                device_id
-            );
+            let reset_result = reset.join().unwrap();
             let retained = grants.load().unwrap().unwrap();
-            assert!(retained.backend_create_pending || retained.backend_binding.is_some());
             if bind_backend {
+                reset_result.unwrap();
                 assert_eq!(
                     retained.status,
-                    crate::cloud_sessions::CloudSessionGrantStatus::Paused
+                    crate::cloud_sessions::CloudSessionGrantStatus::Enabled
                 );
+                assert!(FileDeviceStore::default().load().unwrap().is_none());
+            } else {
+                assert!(matches!(
+                    reset_result,
+                    Err(LocalApiError::CloudSessionCleanupRequired)
+                ));
+                assert_eq!(FileAccountStore::default().load().unwrap(), account);
+                assert!(retained.backend_create_pending);
             }
         }
     }
@@ -25654,14 +25643,10 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn claim_completion_never_mutates_backend_before_cloud_cleanup() {
+    fn claim_completion_keeps_pending_create_cleanup_authority() {
         let _guard = lock_backend_test_env();
-        for bind_backend in [false, true] {
-            let root = telemetry_key_store_root(if bind_backend {
-                "claim-reservation-active-grant"
-            } else {
-                "claim-reservation-pending-grant"
-            });
+        {
+            let root = telemetry_key_store_root("claim-reservation-pending-grant");
             let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
             let account = connected_account();
             let device = LocalDeviceBinding {
@@ -25672,7 +25657,7 @@ for line in sys.stdin:
             FileAccountStore::default().save(&account).unwrap();
             FileDeviceStore::default().save(&device).unwrap();
             let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
-            let local = grants
+            grants
                 .enable(
                     &crate::cloud_sessions::CloudSessionGrantSetup {
                         installation_id: device.device_id.clone(),
@@ -25683,14 +25668,6 @@ for line in sys.stdin:
                 )
                 .unwrap();
             grants.grant_create_request(&device.device_id).unwrap();
-            if bind_backend {
-                grants
-                    .bind_backend_grant(
-                        &cloud_control_backend_grant(&local, &device.device_id, "enabled", 1),
-                        &device.device_id,
-                    )
-                    .unwrap();
-            }
             let before = grants.load().unwrap().unwrap();
             let (api_base, observed) = observed_cross_account_claim_completion_server();
             let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
@@ -25720,11 +25697,7 @@ for line in sys.stdin:
             let after = grants.load().unwrap().unwrap();
             assert_eq!(
                 after.status,
-                if bind_backend {
-                    crate::cloud_sessions::CloudSessionGrantStatus::Paused
-                } else {
-                    crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired
-                }
+                crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired
             );
             assert_eq!(after.grant_scope_id, before.grant_scope_id);
             assert_eq!(after.account_fingerprint, before.account_fingerprint);
@@ -25867,13 +25840,12 @@ for line in sys.stdin:
         let account_path = root.join("account.json");
         let device_path = root.join("device.json");
         let grant_path = root.join("grant.json");
-        let checkpoint_path = root.join("checkpoint.json");
         let token_path = root.join("control-token-uses.json");
         let accounts = FileAccountStore::new(&account_path);
         let devices = FileDeviceStore::new(&device_path);
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(&grant_path);
         let checkpoints = Arc::new(crate::cloud_sessions::CloudSessionCheckpointStore::new(
-            &checkpoint_path,
+            &root,
         ));
         let device_id = "00000000-0000-4000-8000-000000000001";
         accounts.save(&connected_account()).unwrap();
@@ -25984,8 +25956,7 @@ for line in sys.stdin:
         let accounts = FileAccountStore::new(root.join("account.json"));
         let devices = FileDeviceStore::new(root.join("device.json"));
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
-        let checkpoints =
-            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let checkpoints = crate::cloud_sessions::CloudSessionCheckpointStore::new(&root);
         let token_path = root.join("control-token-uses.json");
         let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(&token_path);
         accounts.save(&connected_account()).unwrap();
@@ -26026,6 +25997,7 @@ for line in sys.stdin:
         let create = prepared.backend_create_request.unwrap();
         assert_eq!(create.installation_id, device_id);
         assert_eq!(create.source, "codex");
+        assert_eq!(create.schema_version, "cloud_session_changes.v1");
         assert!(create.consent);
         let local = grants.load().unwrap().unwrap();
         let enabled_response = cloud_control_backend_grant(&local, device_id, "enabled", 1);
@@ -26189,6 +26161,21 @@ for line in sys.stdin:
                     .unwrap()
                     .unwrap()
             });
+            // Only Prepare and the account privacy controls may read a login.
+            let reads_login = matches!(
+                action,
+                ProviderDailyReferenceControlAction::Prepare
+                    | ProviderDailyReferenceControlAction::ExcludeCurrentAccount
+                    | ProviderDailyReferenceControlAction::IncludeCurrentAccount
+            );
+            let account_scope = move |prepare_fallback: bool| {
+                assert!(reads_login, "this action must not read a Codex login");
+                assert_eq!(
+                    prepare_fallback,
+                    matches!(action_slug, "prepare_provider_daily_reference")
+                );
+                Some("provider-account-scope".to_string())
+            };
             provider_daily_reference_control_with_stores(
                 action,
                 SecretString::new(test_control_token(action_slug, "codex", 240)),
@@ -26200,7 +26187,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &account_scope,
                 network_disabled,
             )
         };
@@ -26264,8 +26251,10 @@ for line in sys.stdin:
             bound.status.runtime_state,
             crate::provider_daily_reference::RuntimeState::Enabled
         );
-        assert_eq!(bound.status.reason_code, "enabled");
+        // No tick has discovered logins under the new binding yet.
+        assert_eq!(bound.status.reason_code, "discovery_pending");
         assert!(bound.status.provider_read_permitted);
+        assert!(bound.status.accounts.is_empty());
         assert!(bound.backend_create_request.is_none());
 
         // Browser status and the privacy mutation must name the same opaque
@@ -26275,6 +26264,40 @@ for line in sys.stdin:
             .account_fingerprint_for("provider-account-scope")
             .unwrap()
             .unwrap();
+        // The collector's latest discovery under this binding: one default
+        // home login. Status reads only this file, never a credential.
+        fs::write(
+            root.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "discovery": {
+                    "binding": {
+                        "grant_id": "00000000-0000-4000-8000-000000000002",
+                        "grant_version": 1
+                    },
+                    "complete": true,
+                    "accounts": ["entry-default"],
+                    "skipped": {},
+                    "default_home": { "state": "ok", "fingerprint": live_fingerprint }
+                },
+                "entries": {
+                    "entry-default": {
+                        "schema_version": 2,
+                        "identity": "entry-default",
+                        "account_fingerprint": live_fingerprint,
+                        "home_kind": "default",
+                        "binding": {
+                            "grant_id": "00000000-0000-4000-8000-000000000002",
+                            "grant_version": 1
+                        },
+                        "last_seen_day": "2026-07-27",
+                        "last_reason": "ok"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mismatch_action = ProviderDailyReferenceControlAction::ExcludeCurrentAccount;
         let mismatch_slug = provider_daily_reference_action_slug(&mismatch_action);
         let mismatch_api = cloud_control_validation_server(
@@ -26294,7 +26317,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &|_| Some("provider-account-scope".to_string()),
                 false,
             ),
             Err(LocalApiError::InvalidRequest(_))
@@ -26330,6 +26353,15 @@ for line in sys.stdin:
         assert_eq!(included.status.reason_code, "enabled");
         assert!(!included.status.current_account_excluded);
         assert!(included.status.provider_read_permitted);
+        assert_eq!(
+            included.status.accounts,
+            vec![crate::provider_daily_reference::CollectorAccountStatusV1 {
+                ordinal: 1,
+                home_kind: "default".to_string(),
+                reason: "ok".to_string(),
+                last_success_at: None,
+            }]
+        );
 
         // The local off-switch outranks a live grant in the served status.
         let switched_off = run(
@@ -26443,7 +26475,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                provider_account_scope,
+                &move |_| provider_account_scope.clone(),
                 false,
             )
         };
@@ -26519,7 +26551,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &|_| Some("provider-account-scope".to_string()),
                 false,
             ),
             Err(LocalApiError::LocalClientNotTrusted)
@@ -26535,8 +26567,7 @@ for line in sys.stdin:
         let accounts = FileAccountStore::new(root.join("account.json"));
         let devices = FileDeviceStore::new(root.join("device.json"));
         let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
-        let checkpoints =
-            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let checkpoints = crate::cloud_sessions::CloudSessionCheckpointStore::new(&root);
         let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
             root.join("control-token-uses.json"),
         );
@@ -32374,15 +32405,14 @@ X-API-Key = "otel_redacted"
             installation_id: device_id.to_string(),
             source: "codex".to_string(),
             collector_id: "cloud_sessions".to_string(),
-            schema_version: "cloud_session_observations.v1".to_string(),
-            collector_version: compiled_release_version(),
-            release_lane: "supported".to_string(),
+            schema_version: "cloud_session_changes.v1".to_string(),
             disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
             grant_scope_fingerprint: local.grant_scope_id.clone(),
             account_fingerprint: local.account_fingerprint.clone(),
             status: status.to_string(),
             grant_version,
-            server_policy_state: ottto_protocol::CloudSessionServerPolicyState::Approved,
+            can_collect: Some(status == "enabled"),
+            ..Default::default()
         }
     }
 

@@ -458,8 +458,7 @@ pub(crate) fn rebind_relay_listener(
 /// file, and closing it would close that file. So the descriptor is closed only
 /// while it still names this listening socket, and abandoned otherwise.
 fn release_relay_listener(listener: TcpListener, bound_addr: Option<SocketAddr>) {
-    let still_ours =
-        bound_addr.is_some() && listener.local_addr().ok() == bound_addr && is_listening(&listener);
+    let still_ours = bound_addr.is_some() && names_bound_listener(&listener, bound_addr);
     if still_ours {
         drop(listener);
         return;
@@ -475,6 +474,12 @@ fn release_relay_listener(listener: TcpListener, bound_addr: Option<SocketAddr>)
     {
         std::mem::forget(listener);
     }
+}
+
+/// Whether the listener's descriptor still names the relay socket bound at
+/// `bound_addr`: same local address and still listening.
+fn names_bound_listener(listener: &TcpListener, bound_addr: Option<SocketAddr>) -> bool {
+    listener.local_addr().ok() == bound_addr && is_listening(listener)
 }
 
 /// Whether the listener's descriptor still names a listening TCP socket.

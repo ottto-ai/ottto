@@ -83,7 +83,7 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 
 | Field | Measurement |
 | --- | --- |
-| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. |
+| `stage_memory.{prepare,acquire,select,save,finish,post_pass_plateau}.current.{rss_bytes,phys_footprint_bytes}` | Current process RSS and macOS physical footprint at the named boundary; never lifetime `ru_maxrss`. Prepare and plateau are endpoint observations. Acquire samples the first acquisition step; select, save and finish also report sampled `peak` memory in the same shape. Hydrate has an additional window. Save and hydrate also report `cpu_us` (process CPU, concurrent work included; absent when unavailable) and `wall_us` across the stage. Windowed stages also report `disk_read_bytes` and `disk_written_bytes`: process disk bytes across the stage, macOS only, concurrent work included, absent when unavailable. |
 | `retained_heap_bytes.{active_graph,cached_graph}.{account_pending,usage_pending,family.requests,census,side_maps,files}` | Requested-layout retained heap estimates by owning graph and class, excluding inline stack slots. Usage excludes the separately charged request-membership maps. Side maps cover remaining index fields, excluding runtime route handles. Cached graph is sampled once before acquisition; active graph at post-pass maintenance before finish releases its inputs. |
 | `retained_heap_bytes.active_graph.{census_hashes,census_occupancy_alarm}` | Request hashes the Claude census holds, and whether they reach 75% of 2,097,152. An alarm only: nothing is capped. |
 | `cpu_per_pass_us.{p50,p95,max}` | Process CPU delta from prepare through finish returning; p50/p95 use the latest 128 samples, max is the observed lifetime maximum. Concurrent daemon work may contribute. |
@@ -375,6 +375,14 @@ lifetime memory high-water mark, not a collection/cycle peak or current RSS.
 `process_lifetime_max_rss_before_bytes` preserves the start sample when both
 samples are available and non-regressing; otherwise it is `null`. A rise
 correlates only with a process-wide time window, not allocation ownership.
+`disk_read_bytes` and `disk_written_bytes` are the self-process disk byte
+deltas (`ri_diskio_bytesread`/`ri_diskio_byteswritten` from `proc_pid_rusage`)
+across the same window, on every windowed stage record: `source_prepare`,
+`native_collection_page`, `source_finish`, the evidence windows and the
+`offpass_*` stages. Like the CPU delta they are process-wide: concurrent stages
+overlap, so never sum overlapping windows. They are macOS only and absent
+elsewhere, after a failed sample or on a regressing counter. Summed windows
+(`evidence_decode`, `evidence_cross_root`) and point records omit them.
 `source_prepare` also reports `observation.malloc_in_use_bytes` sampled at prepare start on macOS; absent when unavailable.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
@@ -426,8 +434,10 @@ The stable stage names and boundaries are:
 These rows add `counts.count` (completed work units), `counts.cpu_user_us` and
 `counts.cpu_sys_us` (summed self-process CPU deltas in microseconds), and
 `counts.wall_max_us` (longest work unit). `observation.wall_elapsed_us` and
-`shared_process_cpu_delta_us` are sums, preserving all completed measurements.
-A CPU sum is `null` if any contributing measurement is unavailable or regressing.
+`shared_process_cpu_delta_us` are sums, preserving all completed measurements;
+so are the macOS `disk_read_bytes` / `disk_written_bytes` deltas.
+A CPU or disk sum is `null` if any contributing measurement is unavailable or
+regressing.
 The timestamp and process endpoints describe the latest completion, with the
 RSS-before endpoint from the first completion; child counters remain cumulative.
 Pending aggregates are in memory only and are lost on process exit.
@@ -1731,64 +1741,6 @@ Retries count again; a cooperative yield does not recount a completed decision.
 Miss keys are fixed, content-free class labels: `no_entry`,
 `ineligible.history_owed`, `missing`, `unavailable`.
 
-## Claude Family Census Shadow (schema 2 additive)
-
-Each Claude Code scan page emits one `local_resources` record with stage
-`claude_family_census_shadow`, under `counts`. It estimates, per session family
-(a root transcript and its subagents), whether the family would be complete in
-the current census window. It is shadow-only: the record changes no read,
-census bit, manifest, upload, retirement or other decision. Other sources emit
-no such record. The row holds counts, ages, fixed reason names and one order-free
-digest; no paths, ids, account hashes or request hashes.
-
-**Units.** A page evaluates the families its selection touched
-(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
-the families its previous page parsed (`followup_families`), and up to 64 others
-from a rotating cursor (`rotation_families`). Family counts are evaluations on
-this page: a family can repeat across pages, so they are neither distinct
-families nor a stock, and rows must not be summed into one.
-
-**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
-one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
-the limit of 64 per page), or one first-match reason in
-`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
-`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
-`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
-`singleton_families_evaluated` is included in `families_evaluated`.
-`families_unevaluated_member_budget` counts families left for a later page, which
-are not in `families_evaluated`.
-
-**Freshness.** `pending_census_members` describes the skipped set: `count`
-(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
-`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
-`skipped_set` holds `digest` and `retained`, the entries the previous page also
-skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
-null when the veto is not latched. These are process-local, and restart, a scope
-change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
-across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
-after a restart members count `evidence/presence_only` until ordinary work attests
-them again. Attestations and vetoes also reset with each new traversal generation.
-
-**Work counters.** These are approximate units, not exact operations.
-`member_keys_visited` is range advances of the member lookups, at most 16,384.
-Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
-at most 8,192, plus one check per parse; the merged loop may also peek up to 2
-keys it does not count. `rotation_keys_visited`, `queue_entries_visited` (two
-passes over the queue, not bounded by a constant) and `history_gates_visited`
-count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
-`families_evaluated`, `attested_keys`, `attestations_evicted` and
-`runtime_heap_bytes` (retained shadow state after the page, excluding page
-transients) are gauges. `root_index_restarted`, `root_index_complete`,
-`root_index_overflowed`, `queued_roots_overflowed` and `history_gates_overflowed`
-are flags. At the top level, `shadow_decision_calls`
-and `shadow_attest_micros` measure this page's equality attestation, and
-`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
-
-**Zero and unavailable.** A zero count is a real zero for that page. An absent
-record means the page had no traversal state or was not Claude. Uniqueness is
-unavailable while `cost.root_index_complete` is false, and families then count
-`path_not_unique`.
-
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
@@ -2225,6 +2177,12 @@ Each save reports `save_dirty_rows` and `save_dirty_bytes` distributions (`p50`,
 on the `claude_state_v2` row. Samples include refused attempts; percentiles use
 the last 128 samples and maximum is process-lifetime. Charges include old/new
 values, chunks, metadata, tombstones, reference updates and restart staging.
+`save_kinds` splits each committed save's charges by kind: record kind name
+(or `meta` for control rows, `shared_set` for shared values) → `[rows, bytes]`,
+only kinds charged in that save. Rows and bytes use the same accounting, so they
+sum to that save's `save_dirty_rows`/`save_dirty_bytes` sample. A row rewritten
+with an identical header is skipped before it is charged. Counts and bytes
+only, never keys.
 `save_page_reduced` and the existing WAL alarm (>64 MiB) flag pressure without
 splitting a save; the complete valid save commits. A row over the 64 MiB decode
 bound refuses that save as `state_v2_db_unavailable` (`db_unavailable_cause` at
@@ -2348,30 +2306,3 @@ no authority-terminal counts, and before this process's first walk end `debt` is
 `null`. Only the walk in progress is process-local, so a walk resumed after a
 restart erases nothing and records no complete discovery. The row carries counts
 only.
-
-### Money freshness (Claude queue and replay)
-
-The Claude shadow and freshness gauges are always on and share one
-`claude_family_census_shadow` emission. Gauges are flattened into
-`counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
-and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
-oldest-skipped or skipped-tracked fields or second queue traversal is added.
-`count` includes queue/replay occurrences, while age thresholds count retained
-unique queued files. `tracked` also includes unresolved files no longer queued.
-All ages are process-local LOWER BOUNDS, never inputs to decisions.
-
-`discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
-`discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
-Indexed or replay work is counted separately. No retained index is not proof a
-physical file has never been read. Queue/replay overlaps are deduplicated among
-retained stamps. `skipped_untracked_entries` and
-`discovered_unread_untracked_entries` disclose lost coverage at the existing
-16,384-stamp bound; they are occurrences, not invented distinct-file counts.
-Directories not yet enumerated and files outside the skipped view are uncovered.
-
-Memory remains bounded by the existing 16,384 stamps (16 bytes each), accounted
-by runtime_heap_bytes and its retained bound. Classification is transient in the
-existing bounded heap/vector; there is no separate gauge dedup allocation or
-scope ledger. Enlarged stamp transients are conservatively bounded by an
-additional 4 MiB. No child-finalize eligibility measurement, dormant
-family-consumer API or money/read/census decision is added.

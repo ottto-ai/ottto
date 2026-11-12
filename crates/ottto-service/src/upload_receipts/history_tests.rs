@@ -1,7 +1,7 @@
 use super::*;
 use crate::snapshots::state_v2::sqlite_sidecar as sidecar;
 use crate::snapshots::state_v2::upload_history::{
-    MMAP_BYTES_FOR_TEST, QUERIES_FOR_TEST, RETENTION_NS,
+    CLOUD_QUERIES_FOR_TEST, MMAP_BYTES_FOR_TEST, QUERIES_FOR_TEST, RETENTION_NS,
 };
 use crate::test_scratch::ScratchDir;
 use std::os::fd::AsRawFd;
@@ -663,5 +663,445 @@ fn query_plans_use_the_rowid_and_named_indexes() {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// The receipt schema released builds (up to 0.1.244) create, verbatim from
+/// history.rs at b10c4e9d2 (lines 26-42).
+const OLD_SCHEMA: &str = "
+CREATE TABLE upload_history(
+ seq INTEGER PRIMARY KEY,
+ uploaded_at_ns INTEGER NOT NULL,
+ source TEXT NOT NULL,
+ entity_count INTEGER NOT NULL CHECK(entity_count >= 0),
+ value_version INTEGER NOT NULL CHECK(value_version BETWEEN 1 AND 4294967295),
+ value_digest BLOB NOT NULL CHECK(length(value_digest)=16),
+ row_checksum BLOB NOT NULL CHECK(length(row_checksum)=16),
+ value BLOB NOT NULL CHECK(length(value) BETWEEN 1 AND 67108864)
+) STRICT;
+CREATE INDEX upload_history_at ON upload_history(uploaded_at_ns);
+CREATE INDEX upload_history_src ON upload_history(source, seq);
+CREATE TABLE ring_imported(
+ value_digest BLOB PRIMARY KEY CHECK(length(value_digest)=16)
+) STRICT, WITHOUT ROWID;
+PRAGMA user_version=1;";
+/// Released builds' append statements, verbatim from history.rs at b10c4e9d2
+/// (lines 43 and 46).
+const OLD_INSERT: &str = "INSERT INTO upload_history(uploaded_at_ns,source,entity_count,value_version,value_digest,row_checksum,value) VALUES(?1,?2,?3,?4,?5,?6,?7)";
+const OLD_EXPIRE: &str = "DELETE FROM upload_history INDEXED BY upload_history_at WHERE uploaded_at_ns < ?1 AND seq < (SELECT MAX(h.seq) FROM upload_history AS h INDEXED BY upload_history_src WHERE h.source = upload_history.source)";
+
+/// Released builds' open predicate, copied from history.rs at b10c4e9d2
+/// (lines 192-200): `match version { 0 => create, USER_VERSION (1) => {},
+/// _ => bail!("upload_history_schema_refused") }`. It never checks tables.
+fn old_build_accepts(version: i64) -> bool {
+    matches!(version, 0 | 1)
+}
+
+fn history_path(dir: &Path) -> PathBuf {
+    Store::path(&dir.join("snapshots"))
+}
+
+fn user_version(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// (type, name, sql) of every schema object, by name.
+fn objects(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+    conn.prepare(
+        "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn receipt_objects(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+    let mut all = objects(conn);
+    all.retain(|(_, name, _)| !name.starts_with("cloud_"));
+    all
+}
+
+/// Every stored receipt column, exactly, in append order.
+fn raw_receipts(conn: &rusqlite::Connection) -> Vec<String> {
+    conn.prepare("SELECT seq||'|'||uploaded_at_ns||'|'||source||'|'||entity_count||'|'||value_version||'|'||hex(value_digest)||'|'||hex(row_checksum)||'|'||hex(value) FROM upload_history ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// [behaviour] A new file is `user_version` 1 with the receipt and cloud tables.
+#[test]
+fn fresh_history_is_version_one_with_every_table() {
+    let dir = temp_dir();
+    let store = open(&dir);
+    assert_eq!(user_version(store.conn_for_test()), 1);
+    let names = objects(store.conn_for_test())
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "cloud_collector_state",
+            "cloud_task_acks",
+            "cloud_task_acks_expiry",
+            "ring_imported",
+            "upload_history",
+            "upload_history_at",
+            "upload_history_src",
+        ]
+    );
+}
+
+/// [regress] A version-1 file a released build wrote (receipt tables only)
+/// gains the cloud tables at open without a version change; its receipt rows
+/// and definitions stay byte-identical, and the cloud cache works on it.
+#[test]
+fn released_version_one_history_gains_cloud_tables_and_keeps_its_version() {
+    let donor = temp_dir();
+    {
+        let mut store = open(&donor);
+        store.append(&row(T0, SourceKind::Codex, 3), T0).unwrap();
+        store
+            .append(&row(T0 + DAY_NS, SourceKind::Pi, 2), T0 + DAY_NS)
+            .unwrap();
+    }
+    let dir = temp_dir();
+    let path = history_path(&dir);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("snapshots"))
+            .unwrap();
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    let (old_rows, old_objects) = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL;")
+            .unwrap();
+        conn.execute_batch(&format!("BEGIN;{OLD_SCHEMA}COMMIT;"))
+            .unwrap();
+        conn.execute(
+            "ATTACH ?1 AS donor",
+            [history_path(&donor).to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO upload_history SELECT * FROM donor.upload_history; DETACH donor;",
+        )
+        .unwrap();
+        assert_eq!(user_version(&conn), 1);
+        (raw_receipts(&conn), objects(&conn))
+    };
+    assert_eq!(old_rows.len(), 2);
+
+    let mut store = open(&dir);
+    let conn = store.conn_for_test();
+    assert_eq!(user_version(conn), 1);
+    assert_eq!(raw_receipts(conn), old_rows);
+    assert_eq!(receipt_objects(conn), old_objects);
+    let fresh = temp_dir();
+    assert_eq!(receipt_objects(open(&fresh).conn_for_test()), old_objects);
+    assert_eq!(objects(conn).len(), old_objects.len() + 3);
+    assert_eq!(all(&store).len(), 2);
+
+    let scope = [7_u8; 32];
+    let other_scope = [8_u8; 32];
+    let key = format!("hmac-sha256:{}", "ab".repeat(32));
+    let etag = "c".repeat(64);
+    let now = 1_800_000_000_i64;
+    store
+        .cloud_commit(
+            &scope,
+            &[CloudAckWrite {
+                entity_key: &key,
+                digest: [1; 32],
+                head_etag: Some(&etag),
+            }],
+            Some("2026-07-21"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        store.cloud_read_acks(&scope, &[key.as_str()], now).unwrap()[&key],
+        CloudAck {
+            digest: [1; 32],
+            head_etag: Some(etag.clone()),
+        }
+    );
+    assert!(store
+        .cloud_read_acks(&other_scope, &[key.as_str()], now)
+        .unwrap()
+        .is_empty());
+    // Entries expire 30 days after their ACK.
+    assert!(store
+        .cloud_read_acks(&scope, &[key.as_str()], now + 30 * 24 * 60 * 60)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.cloud_crawl_completed_date(&scope).unwrap().as_deref(),
+        Some("2026-07-21")
+    );
+    assert_eq!(all(&store).len(), 2);
+    drop(store);
+
+    // A second open is a no-op: same version, rows and ACKs.
+    let mut store = open(&dir);
+    assert_eq!(user_version(store.conn_for_test()), 1);
+    assert_eq!(raw_receipts(store.conn_for_test()), old_rows);
+    assert_eq!(
+        store
+            .cloud_read_acks(&scope, &[key.as_str()], now)
+            .unwrap()
+            .len(),
+        1
+    );
+    store.cloud_erase_all().unwrap();
+    assert!(store
+        .cloud_read_acks(&scope, &[key.as_str()], now)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.cloud_crawl_completed_date(&scope).unwrap(), None);
+    assert_eq!(raw_receipts(store.conn_for_test()), old_rows);
+}
+
+/// [regress] A version-2 file (written only by unreleased builds) opens,
+/// returns to version 1 and keeps its receipt and cloud rows; any other
+/// version is refused and left unchanged.
+#[test]
+fn version_two_history_returns_to_version_one_and_others_are_refused() {
+    let dir = temp_dir();
+    let scope = [5_u8; 32];
+    let key = format!("hmac-sha256:{}", "cd".repeat(32));
+    let now = 1_800_000_000_i64;
+    let rows = {
+        let mut store = open(&dir);
+        store.append(&row(T0, SourceKind::Codex, 3), T0).unwrap();
+        store
+            .cloud_commit(
+                &scope,
+                &[CloudAckWrite {
+                    entity_key: &key,
+                    digest: [4; 32],
+                    head_etag: None,
+                }],
+                Some("2026-11-11"),
+                now,
+            )
+            .unwrap();
+        store
+            .conn_for_test()
+            .execute_batch("PRAGMA user_version=2;")
+            .unwrap();
+        raw_receipts(store.conn_for_test())
+    };
+    let mut store = open(&dir);
+    assert_eq!(user_version(store.conn_for_test()), 1);
+    assert_eq!(raw_receipts(store.conn_for_test()), rows);
+    assert_eq!(all(&store).len(), 1);
+    assert_eq!(
+        store.cloud_read_acks(&scope, &[key.as_str()], now).unwrap()[&key],
+        CloudAck {
+            digest: [4; 32],
+            head_etag: None,
+        }
+    );
+    assert_eq!(
+        store.cloud_crawl_completed_date(&scope).unwrap().as_deref(),
+        Some("2026-11-11")
+    );
+    assert!(old_build_accepts(user_version(store.conn_for_test())));
+
+    store
+        .conn_for_test()
+        .execute_batch("PRAGMA user_version=3;")
+        .unwrap();
+    drop(store);
+    assert!(Store::open(&history_path(&dir)).is_err());
+    let conn = rusqlite::Connection::open(history_path(&dir)).unwrap();
+    assert_eq!(user_version(&conn), 3);
+}
+
+/// [regress] A file this build created passes a released build's open check
+/// and accepts that build's append; the cloud rows stay untouched.
+#[test]
+fn released_builds_open_and_append_to_a_history_this_build_wrote() {
+    let dir = temp_dir();
+    {
+        let mut store = open(&dir);
+        store.append(&row(T0, SourceKind::Codex, 3), T0).unwrap();
+        let key = format!("hmac-sha256:{}", "ef".repeat(32));
+        store
+            .cloud_commit(
+                &[6; 32],
+                &[CloudAckWrite {
+                    entity_key: &key,
+                    digest: [9; 32],
+                    head_etag: None,
+                }],
+                None,
+                1_800_000_000,
+            )
+            .unwrap();
+    }
+    let mut conn = rusqlite::Connection::open(history_path(&dir)).unwrap();
+    assert!(old_build_accepts(user_version(&conn)));
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute(
+        OLD_INSERT,
+        rusqlite::params![
+            T0 + DAY_NS,
+            "codex",
+            1_i64,
+            1_i64,
+            &[1_u8; 16][..],
+            &[2_u8; 16][..],
+            &b"{}"[..]
+        ],
+    )
+    .unwrap();
+    tx.execute(OLD_EXPIRE, [T0 + DAY_NS - RETENTION_NS])
+        .unwrap();
+    tx.commit().unwrap();
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("upload_history"), 2);
+    assert_eq!(count("cloud_task_acks"), 1);
+    assert_eq!(user_version(&conn), 1);
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+}
+
+/// [behaviour] Expired cloud rows are pruned a bounded page per commit.
+#[test]
+fn expired_cloud_acks_are_pruned_in_bounded_pages() {
+    let dir = temp_dir();
+    let mut store = open(&dir);
+    let scope = [3_u8; 32];
+    let keys = (0..450)
+        .map(|index| format!("hmac-sha256:{index:064x}"))
+        .collect::<Vec<_>>();
+    let writes = keys
+        .iter()
+        .map(|key| CloudAckWrite {
+            entity_key: key,
+            digest: [2; 32],
+            head_etag: None,
+        })
+        .collect::<Vec<_>>();
+    store.cloud_commit(&scope, &writes, None, 0).unwrap();
+    let count = |store: &Store| -> i64 {
+        store
+            .conn_for_test()
+            .query_row("SELECT count(*) FROM cloud_task_acks", [], |r| r.get(0))
+            .unwrap()
+    };
+    let later = 31 * 24 * 60 * 60;
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    assert_eq!(count(&store), 250);
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    store.cloud_commit(&scope, &[], None, later).unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[test]
+fn cloud_query_plans_use_the_primary_key_and_expiry_index() {
+    let dir = temp_dir();
+    let store = open(&dir);
+    for (name, sql) in CLOUD_QUERIES_FOR_TEST {
+        let mut statement = store
+            .conn_for_test()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let nulls = vec![rusqlite::types::Null; statement.parameter_count()];
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        eprintln!("cloud_ack_plan {name}: {plan}");
+        assert!(!plan.contains("SCAN cloud_"), "{name} scans: {plan}");
+        assert!(plan.contains("USING PRIMARY KEY"), "{name}: {plan}");
+        if name == "prune" {
+            assert!(plan.contains("cloud_task_acks_expiry"), "{plan}");
+        }
+    }
+}
+
+/// [behaviour] A fixed provider page reads and retains the same ACK working
+/// set at 1x/10x/100x history. Historical cache rows never hydrate a graph.
+#[test]
+fn cloud_cache_history_does_not_expand_the_active_page() {
+    let mut active_heap = None;
+    for history_rows in [200, 2_000, 20_000] {
+        let dir = temp_dir();
+        let mut store = open(&dir);
+        let scope = [9_u8; 32];
+        let keys = (0..history_rows)
+            .map(|index| format!("hmac-sha256:{index:064x}"))
+            .collect::<Vec<_>>();
+        let etag = "e".repeat(64);
+        let writes = keys
+            .iter()
+            .map(|key| CloudAckWrite {
+                entity_key: key,
+                digest: [3; 32],
+                head_etag: Some(&etag),
+            })
+            .collect::<Vec<_>>();
+        store.cloud_commit(&scope, &writes, None, 0).unwrap();
+        let active_keys = keys[..20].to_vec();
+        drop(writes);
+        drop(keys);
+        let page = active_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let probe = crate::local_resource_diagnostics::StateV2Probe::begin();
+        let found = store.cloud_read_acks(&scope, &page, 0).unwrap();
+        let (cpu_us, steady, peak) = probe.finish();
+        assert_eq!(found.len(), page.len());
+        let heap = found.capacity() * std::mem::size_of::<(String, CloudAck)>()
+            + found
+                .iter()
+                .map(|(key, ack)| {
+                    key.capacity() + ack.head_etag.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>();
+        assert_eq!(*active_heap.get_or_insert(heap), heap);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "cloud_cache_resource_receipt": 1,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "seed": 0,
+                "history_rows": history_rows,
+                "active_rows": found.len(),
+                "retained_page_bytes": heap,
+                "parent_cpu_us": cpu_us,
+                "parent_steady_bytes": steady,
+                "parent_peak_bytes": peak,
+                "cli_calls": 0,
+                "scope": "indexed ACK read only; provider and mixed local workload not measured"
+            })
+        );
     }
 }

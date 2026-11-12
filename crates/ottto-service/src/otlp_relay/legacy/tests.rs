@@ -1142,6 +1142,47 @@ fn idle_wait_detects_fd_replacement_preserves_it_and_rebinds_on_reconcile() {
     }
 }
 
+/// [regress] Accept checks identity before touching a reused blocking listener.
+#[test]
+fn accept_fences_a_replaced_blocking_listener_before_serving_its_connection() {
+    let (_dir, mut supervisor) = scratch();
+    let (_reservation, port) = reserve_port();
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    let old = supervisor.open[&port].activity.clone();
+    let fd = supervisor.open[&port]
+        .listener
+        .as_ref()
+        .unwrap()
+        .as_raw_fd();
+    let replacement = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    // Queue one connection so the unfenced implementation returns instead of
+    // hanging the test. Its second accept would block before the health check.
+    let _client = TcpStream::connect(replacement.local_addr().unwrap()).unwrap();
+    // SAFETY: both descriptors are live; replace only this supervisor's fd.
+    assert_eq!(unsafe { libc::dup2(replacement.as_raw_fd(), fd) }, fd);
+    let mut served = false;
+    supervisor.accept_ready(Instant::now(), |_, _| {
+        served = true;
+        // Let a broken implementation finish its accept batch without blocking.
+        replacement.set_nonblocking(true).unwrap();
+    });
+    assert!(
+        !served,
+        "must not accept an unrelated listener's connection"
+    );
+    assert!(!old.live.load(Ordering::SeqCst));
+    assert!(supervisor.open.is_empty());
+    // SAFETY: the supervisor abandoned the replaced fd; this test owns it now.
+    let preserved = TcpListener::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    assert_eq!(
+        preserved.local_addr().unwrap(),
+        replacement.local_addr().unwrap()
+    );
+    let _pending = preserved.accept().unwrap();
+}
+
 /// [behaviour] A healthy connection wakes the idle supervisor before its safety tick.
 #[test]
 fn readiness_serves_a_healthy_connection_promptly() {

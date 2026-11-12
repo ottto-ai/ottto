@@ -3,6 +3,10 @@ use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
+mod accounts;
+mod all_logins;
+mod guards;
+
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
 const ORG_SCOPE: &str = "org-fixture-private";
@@ -40,8 +44,65 @@ fn setup() -> GrantSetup {
 fn runtime() -> Runtime {
     Runtime {
         installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: ACCOUNT_SCOPE.to_string(),
     }
+}
+
+/// A complete discovery that selected exactly `logins`, as
+/// [`logins::discover`] reports it.
+fn discovered(collector: &Collector, logins: Vec<CodexLogin>) -> logins::LoginDiscovery {
+    let default_home = logins
+        .iter()
+        .find(|login| login.home_kind == logins::LoginHomeKind::Default)
+        .map(|login| logins::DefaultHomeState {
+            state: "ok".to_string(),
+            fingerprint: collector
+                .grants()
+                .account_fingerprint_for(&login.credential.account_scope)
+                .expect("derive"),
+        })
+        .unwrap_or_default();
+    logins::LoginDiscovery {
+        logins,
+        complete: true,
+        skipped: BTreeMap::new(),
+        default_home,
+    }
+}
+
+/// One tick over exactly `login`, with a fixed clock.
+fn collect_one(
+    collector: &Collector,
+    runtime: &Runtime,
+    login: &CodexLogin,
+    reader: &dyn ProviderDailyUsageReader,
+    transport: &dyn DailyReferenceTransport,
+    now: OffsetDateTime,
+) -> Cycle {
+    collector.run_tick(
+        runtime,
+        &discovered(collector, vec![login.clone()]),
+        reader,
+        transport,
+        &move || now,
+    )
+}
+
+/// A live, unidentified login whose header and scope are `scope`.
+fn login_with_scope(scope: &str) -> CodexLogin {
+    CodexLogin {
+        home_kind: logins::LoginHomeKind::Default,
+        credential: CodexCredential {
+            access_token: "fixture-access-token".to_string(),
+            account_id: Some(scope.to_string()),
+            account_scope: scope.to_string(),
+        },
+        identity: None,
+        lapses_at: u64::MAX,
+    }
+}
+
+fn login() -> CodexLogin {
+    login_with_scope(ACCOUNT_SCOPE)
 }
 
 fn grant_response(local: &DailyReferenceGrant, status: &str, version: u64) -> GrantResponse {
@@ -188,7 +249,12 @@ impl StaticReader {
 }
 
 impl ProviderDailyUsageReader for StaticReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         self.calls.set(self.calls.get() + 1);
         Ok(self.payload.clone())
     }
@@ -209,7 +275,12 @@ impl FailingReader {
 }
 
 impl ProviderDailyUsageReader for FailingReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         self.calls.set(self.calls.get() + 1);
         Err(self
             .errors
@@ -223,7 +294,12 @@ impl ProviderDailyUsageReader for FailingReader {
 struct ForbiddenReader;
 
 impl ProviderDailyUsageReader for ForbiddenReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         panic!("the provider endpoint was contacted while collection was not permitted");
     }
 }
@@ -420,6 +496,7 @@ fn no_provider_free_text_survives_into_the_uploaded_batch() {
         collected_at: timestamp(now()),
         provider_data_refreshed_at: normalized.provider_data_refreshed_at.clone(),
         rows: normalized.rows.clone(),
+        account_identity: None,
     };
     let encoded = serde_json::to_string(&batch).expect("encode batch");
     for poison in poison_strings() {
@@ -454,6 +531,7 @@ fn wire_key_sets_match_the_contract() {
         collected_at: timestamp(now()),
         provider_data_refreshed_at: None,
         rows: normalized.rows,
+        account_identity: None,
     };
     let payload = serde_json::to_value(&batch).expect("batch value");
     let object = payload.as_object().expect("object");
@@ -873,13 +951,13 @@ fn the_grant_file_persists_only_fingerprints() {
 }
 
 #[test]
-fn a_backend_grant_epoch_must_advance() {
+fn a_backend_grant_epoch_can_repeat_but_cannot_regress() {
     let collector = collector("epoch-advance");
     let grant = enabled(&collector);
     assert!(collector
         .grants()
         .bind_backend_grant(&grant_response(&grant, "enabled", 1), INSTALLATION_ID)
-        .is_err());
+        .is_ok());
     let rebound = collector
         .grants()
         .bind_backend_grant(&grant_response(&grant, "enabled", 2), INSTALLATION_ID)
@@ -1076,7 +1154,14 @@ fn health_never_resurrects_a_revoked_grant() {
 #[test]
 fn absent_consent_is_silent_and_contacts_nothing() {
     let collector = collector("no-consent");
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert!(
         cycle.diagnostics.is_empty(),
@@ -1106,8 +1191,14 @@ fn an_unusable_consent_file_says_why_but_stays_disabled() {
         ),
     ] {
         fs::write(collector.grants().path(), &contents).expect("write");
-        let cycle =
-            collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+        let cycle = collect_one(
+            &collector,
+            &runtime(),
+            &login(),
+            &ForbiddenReader,
+            &ForbiddenTransport,
+            now(),
+        );
         assert_eq!(cycle.outcome, CycleOutcome::Disabled);
         assert_eq!(cycle.diagnostics.len(), 1);
         assert_eq!(
@@ -1137,8 +1228,10 @@ fn revoke_stops_collection_before_the_provider_is_contacted() {
     enabled(&collector);
     collector.grants().revoke(now()).expect("revoke");
 
-    let cycle = collector.collect_once(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::hours(1),
@@ -1157,16 +1250,16 @@ fn the_sentinel_disables_collection_and_retires_local_state() {
     let transport = RecordingTransport::default();
     let reader = StaticReader::new(poisoned_payload());
     assert_eq!(
-        collector
-            .collect_once(&runtime(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     assert!(collector.state_path().is_file());
 
     fs::write(&collector.sentinel, b"disabled\n").expect("write sentinel");
-    let cycle = collector.collect_once(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::days(1),
@@ -1202,7 +1295,7 @@ fn an_upload_from_a_different_admitted_build_is_accepted_when_disclosure_matches
     // running build under its current admission list.
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, now());
 
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     assert_eq!(reader.calls.get(), 1);
@@ -1232,14 +1325,21 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
         serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
             .expect("decode");
     persisted["grant"]["disclosure_version"] =
-        serde_json::Value::String(DISCLOSURE_VERSION_V1.to_string());
+        serde_json::Value::String("provider_daily_reference_disclosure.future".to_string());
     fs::write(
         collector.grants().path(),
         serde_json::to_vec_pretty(&persisted).expect("encode"),
     )
     .expect("write");
 
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let status = collector_status(collector.grants(), false);
     assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
@@ -1264,21 +1364,24 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
         serde_json::to_vec_pretty(&persisted).expect("encode"),
     )
     .expect("write");
-    let other_account = Runtime {
-        installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: "acct-a-completely-different-account".to_string(),
-    };
+    let other_account = login_with_scope("acct-a-completely-different-account");
 
-    let cycle =
-        collector.collect_once(&other_account, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &other_account,
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
 
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let lines = cycle_diagnostic_log_lines(&cycle.diagnostics);
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("codex_daily_aggregates_consent_not_runtime_ready")),
-        "a v1 grant must remain blocked pending fresh v2 approval: {lines:?}"
+            .any(|line| line.contains("codex_daily_aggregates_account_mismatch")),
+        "a v1 grant must remain confined to its original account: {lines:?}"
     );
 }
 
@@ -1286,19 +1389,23 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
 fn v2_uploads_a_different_provider_account_under_its_own_attribution() {
     let collector = collector("account-switch");
     let grant = enabled(&collector);
-    let other_account = Runtime {
-        installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: "acct-a-completely-different-account".to_string(),
-    };
+    let other_account = login_with_scope("acct-a-completely-different-account");
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_once(&other_account, &reader, &transport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &other_account,
+        &reader,
+        &transport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     let batch = &transport.batches.borrow()[0];
     assert_ne!(batch["account_fingerprint"], grant.account_fingerprint);
     let switched_fingerprint = collector
         .grants()
-        .account_fingerprint_for(&other_account.provider_account_scope)
+        .account_fingerprint_for(&other_account.credential.account_scope)
         .expect("derive")
         .expect("grant");
     assert_eq!(batch["account_fingerprint"], switched_fingerprint);
@@ -1316,7 +1423,7 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
     let reader = StaticReader::new(poisoned_payload());
     let rejected = RejectingTransport::new(UploadError::AccountExcluded);
 
-    let refused = collector.collect_once(&runtime(), &reader, &rejected, now());
+    let refused = collect_one(&collector, &runtime(), &login(), &reader, &rejected, now());
     assert_eq!(refused.outcome, CycleOutcome::AccountExcluded);
     assert_eq!(rejected.calls.get(), 1);
     assert!(collector
@@ -1327,7 +1434,7 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
     let status = status_with_live_binding(
         collector.grants(),
         collector_status(collector.grants(), false),
-        Some(&runtime()),
+        Some(INSTALLATION_ID),
     );
     assert_eq!(status.runtime_state, RuntimeState::AccountExcluded);
     assert_eq!(status.reason_code, "account_excluded");
@@ -1337,8 +1444,10 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         Some(current_fingerprint.as_str())
     );
 
-    let blocked = collector.collect_once(
+    let blocked = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::hours(7),
@@ -1350,8 +1459,10 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         .set_account_excluded(&current_fingerprint, false)
         .expect("include");
     let transport = RecordingTransport::default();
-    let restored = collector.collect_once(
+    let restored = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &StaticReader::new(poisoned_payload()),
         &transport,
         now() + TimeDuration::days(1),
@@ -1392,9 +1503,15 @@ fn a_different_installation_can_never_upload_under_this_consent() {
     enabled(&collector);
     let other_device = Runtime {
         installation_id: "00000000-0000-4000-8000-0000000000ff".to_string(),
-        provider_account_scope: ACCOUNT_SCOPE.to_string(),
     };
-    let cycle = collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collect_one(
+        &collector,
+        &other_device,
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert_eq!(
         cycle.diagnostics[0].code,
@@ -1406,7 +1523,14 @@ fn a_different_installation_can_never_upload_under_this_consent() {
 fn an_unconfigured_transport_defers_before_the_provider_is_contacted() {
     let collector = collector("deferred-transport");
     enabled(&collector);
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &DeferredTransport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &DeferredTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Deferred);
     assert_eq!(cycle.diagnostics[0].code, "codex_daily_aggregates_deferred");
     assert!(cycle.diagnostics[0]
@@ -1423,14 +1547,14 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
     assert_eq!(
-        collector
-            .collect_once(&runtime(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     assert_eq!(reader.calls.get(), 1);
-    let cycle = collector.collect_once(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &reader,
         &transport,
         now() + TimeDuration::hours(1),
@@ -1438,8 +1562,10 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     assert_eq!(cycle.outcome, CycleOutcome::Noop);
     assert_eq!(reader.calls.get(), 1, "day-grain data is polled sparsely");
 
-    let cycle = collector.collect_once(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &reader,
         &transport,
         now() + TimeDuration::hours(7),
@@ -1510,40 +1636,26 @@ fn one_clean_answer_clears_the_failure_counters() {
     assert_eq!(state.last_coverage_end.as_deref(), Some("2026-07-26"));
 }
 
+/// [regress] A schema-1 file (today's single-account state) loads as an
+/// empty schema-2 file: every account starts at its first read.
 #[test]
-fn old_state_without_observation_fields_loads_with_defaults() {
+fn a_schema_one_state_file_loads_empty() {
     let state = StateStore::new(temp_dir("old-state").join("state.json"));
     let identity = "compatible-state-identity";
     fs::create_dir_all(state.path().parent().expect("state parent")).expect("create parent");
     fs::write(
         state.path(),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": STATE_FILE_SCHEMA_VERSION,
-            "identity": identity,
-            "last_fetch_epoch_seconds": 42,
-            "last_success_epoch_seconds": 40,
-            "auth_failures": 1,
-            "shape_failures": 0,
-            "rate_limit_failures": 0,
-            "reopen_after_epoch_seconds": 0,
-            "opened_by": "",
-            "last_error_category": "provider_auth_rejected"
-        }))
-        .expect("encode old state"),
+        b"{\n  \"schema_version\": 1,\n  \"identity\": \"compatible-state-identity\",\n  \"last_fetch_epoch_seconds\": 42,\n  \"last_success_epoch_seconds\": 40,\n  \"auth_failures\": 1,\n  \"shape_failures\": 0,\n  \"rate_limit_failures\": 0,\n  \"reopen_after_epoch_seconds\": 0,\n  \"opened_by\": \"\",\n  \"last_error_category\": \"provider_auth_rejected\"\n}",
     )
     .expect("write old state");
-
-    let loaded = state.load(identity);
-    assert_eq!(loaded.last_fetch_epoch_seconds, 42);
-    assert_eq!(loaded.last_success_epoch_seconds, 40);
-    assert_eq!(loaded.auth_failures, 1);
+    assert_eq!(state.load(identity), CollectorState::default());
     assert_eq!(
-        loaded.last_error_category.as_deref(),
-        Some("provider_auth_rejected")
+        state.load_file(),
+        CollectorStateFile {
+            schema_version: STATE_FILE_SCHEMA_VERSION,
+            ..CollectorStateFile::default()
+        }
     );
-    assert_eq!(loaded.last_observed_row_count, None);
-    assert_eq!(loaded.last_coverage_start, None);
-    assert_eq!(loaded.last_coverage_end, None);
 }
 
 #[test]
@@ -1578,7 +1690,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for (consecutive, status) in [(1, 401), (2, 403)] {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         // Below the threshold the category is still named.
         assert_eq!(
@@ -1590,7 +1702,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
         )));
         clock += TimeDuration::hours(7);
     }
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert_eq!(
         cycle.diagnostics[0].code,
@@ -1600,13 +1712,22 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
 
     // While open, no request is made at all.
     clock += TimeDuration::hours(7);
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &transport, clock);
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &transport,
+        clock,
+    );
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert!(transport.batches.borrow().is_empty());
 
     // The cool-down closes it.
-    let cycle = collector.collect_once(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
+        &login(),
         &StaticReader::new(poisoned_payload()),
         &transport,
         clock + TimeDuration::hours(25),
@@ -1627,7 +1748,7 @@ fn a_transient_provider_failure_never_opens_the_breaker() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for _ in 0..4 {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         let message = &cycle.diagnostics[0].message;
         assert!(message.contains("category=provider_unavailable; not counted"));
@@ -1650,7 +1771,7 @@ fn a_not_admitted_answer_is_typed_expected_and_never_trips_the_breaker() {
     let transport = RejectingTransport::new(UploadError::NotAdmitted(403));
     let mut clock = now();
     for _ in 0..5 {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::NotAdmitted);
         // Expected until a reviewed backend change admits this build, so it
         // is reported at info severity, not as a fault.
@@ -1677,7 +1798,7 @@ fn a_stale_consent_epoch_stops_the_cycle_rather_than_retrying() {
     enabled(&collector);
     let reader = StaticReader::new(poisoned_payload());
     let transport = RejectingTransport::new(UploadError::GrantEpochConflict);
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Failed);
     assert_eq!(transport.calls.get(), 1, "only re-consent can fix an epoch");
     let grant = collector.grants().load().expect("load").expect("grant");
@@ -1706,9 +1827,7 @@ fn the_uploaded_batch_declares_the_consented_epoch_and_identity() {
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
     assert_eq!(
-        collector
-            .collect_once(&runtime(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     let batches = transport.batches.borrow();
@@ -1737,42 +1856,113 @@ fn the_uploaded_batch_declares_the_consented_epoch_and_identity() {
     assert_eq!(grant.last_error_category, None);
 }
 
+/// [money] A receipt proves a batch only when it echoes the batch under the
+/// expected grant and its counts add up exactly; nothing is assumed.
 #[test]
-fn an_acknowledgement_that_does_not_echo_the_batch_is_refused() {
-    assert!(validate_ack(
-        &json!({
+fn an_acknowledgement_proves_the_batch_only_when_its_counts_add_up() {
+    let receipt = |grant: &str, accepted: Value, stored: Value, superseded: Value| {
+        json!({
             "schema_version": ACK_SCHEMA_VERSION,
-            "grant_id": GRANT_ID,
-            "accepted_row_count": 3,
+            "grant_id": grant,
+            "accepted_row_count": accepted,
+            "stored_row_count": stored,
+            "superseded_row_count": superseded,
             "coverage_start": "2026-07-01",
             "coverage_end": "2026-07-26",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_ok());
-    assert!(validate_ack(
-        &json!({
-            "schema_version": "something_else.v1",
-            "accepted_row_count": 3,
-            "coverage_start": "2026-07-01",
-            "coverage_end": "2026-07-26",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_err());
-    assert!(validate_ack(
-        &json!({
-            "schema_version": ACK_SCHEMA_VERSION,
-            "accepted_row_count": 3,
-            "coverage_start": "2026-07-01",
-            "coverage_end": "2026-07-20",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_err());
+        })
+    };
+    let check = |receipt: &Value, rows: usize| {
+        validate_ack(receipt, GRANT_ID, "2026-07-01", "2026-07-26", rows)
+            .ok()
+            .map(|proof| proof.current)
+    };
+    for (case, ack, rows, expected) in [
+        (
+            "current",
+            receipt(GRANT_ID, json!(3), json!(3), json!(0)),
+            3,
+            Some(true),
+        ),
+        (
+            "all superseded",
+            receipt(GRANT_ID, json!(3), json!(0), json!(3)),
+            3,
+            Some(false),
+        ),
+        (
+            "partly superseded",
+            receipt(GRANT_ID, json!(3), json!(1), json!(2)),
+            3,
+            Some(false),
+        ),
+        (
+            "valid empty batch",
+            receipt(GRANT_ID, json!(0), json!(0), json!(0)),
+            0,
+            Some(true),
+        ),
+        (
+            "another grant",
+            receipt(
+                "00000000-0000-4000-8000-0000000000ff",
+                json!(3),
+                json!(3),
+                json!(0),
+            ),
+            3,
+            None,
+        ),
+        (
+            "accepted is not the batch",
+            receipt(GRANT_ID, json!(2), json!(2), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "rows but none accepted",
+            receipt(GRANT_ID, json!(0), json!(0), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "stored above accepted",
+            receipt(GRANT_ID, json!(3), json!(4), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "superseded does not add up",
+            receipt(GRANT_ID, json!(3), json!(2), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "superseded is missing",
+            receipt(GRANT_ID, json!(3), json!(3), Value::Null),
+            3,
+            None,
+        ),
+        (
+            "stored is missing",
+            receipt(GRANT_ID, json!(3), Value::Null, json!(0)),
+            3,
+            None,
+        ),
+        (
+            "a negative count",
+            receipt(GRANT_ID, json!(3), json!(3), json!(-1)),
+            3,
+            None,
+        ),
+    ] {
+        assert_eq!(check(&ack, rows), expected, "{case}");
+    }
+    let mut other_schema = receipt(GRANT_ID, json!(3), json!(3), json!(0));
+    other_schema["schema_version"] = json!("something_else.v1");
+    assert_eq!(check(&other_schema, 3), None);
+    let mut other_window = receipt(GRANT_ID, json!(3), json!(3), json!(0));
+    other_window["coverage_end"] = json!("2026-07-20");
+    assert_eq!(check(&other_window, 3), None);
 }
 
 // -- credential --------------------------------------------------------
@@ -1847,4 +2037,132 @@ fn the_capability_reaches_exactly_one_provider_route() {
             "this module must never reference {forbidden}"
         );
     }
+}
+
+/// [format] Lost ACK/restart recovery preserves key, exclusions, epoch and health.
+#[test]
+fn rebind_recovers_after_server_commit_without_a_local_write() {
+    for disclosure in [DISCLOSURE_VERSION, DISCLOSURE_VERSION_V1] {
+        let collector = collector("rebind-crash");
+        enabled(&collector);
+        let excluded = collector
+            .grants
+            .account_fingerprint_for("excluded-account")
+            .unwrap()
+            .unwrap();
+        collector
+            .grants
+            .set_account_excluded(&excluded, true)
+            .unwrap();
+        collector
+            .grants
+            .record_health(Some(&timestamp(now())), None)
+            .unwrap();
+        let mut original = collector.grants.read().unwrap().unwrap();
+        original.grant.disclosure_version = disclosure.to_owned();
+        atomic_json_write(collector.grants.path(), &original).unwrap();
+        let mut target = setup();
+        target.installation_id = "00000000-0000-4000-8000-000000000082".to_owned();
+        let proposal = collector
+            .grants
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        let mut response = grant_response(&original.grant, "enabled", 1);
+        response.disclosure_version = disclosure.to_owned();
+        response.installation_id = target.installation_id.clone();
+        response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+        // Server commits, process dies before writing grant.json. Reopen old bytes,
+        // repeat the same request, then bind the server's idempotent response.
+        let reopened = GrantStore::new(collector.grants.path());
+        let recovered = reopened
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&proposal.request).unwrap(),
+            serde_json::to_value(&recovered.request).unwrap()
+        );
+        let rebound = reopened
+            .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
+            .unwrap();
+        assert_eq!(rebound.backend_binding, original.grant.backend_binding);
+        assert_eq!(
+            rebound.account_fingerprint,
+            original.grant.account_fingerprint
+        );
+        assert_eq!(rebound.disclosure_version, disclosure);
+        assert_eq!(rebound.granted_at, original.grant.granted_at);
+        assert_eq!(rebound.last_success_at, original.grant.last_success_at);
+        let persisted = reopened.read().unwrap().unwrap();
+        assert_eq!(persisted.hmac_key_hex, original.hmac_key_hex);
+        assert_eq!(
+            persisted.excluded_account_fingerprints,
+            original.excluded_account_fingerprints
+        );
+        let bytes = fs::read(reopened.path()).unwrap();
+        reopened
+            .bind_backend_grant(&response, &target.installation_id)
+            .unwrap();
+        assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
+        assert!(reopened
+            .prepare_rebind(&target, "hardware-fixture".to_owned())
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// [behaviour] A local revoke during the request wins over a committed rebind.
+#[test]
+fn revoked_or_disabled_daily_grants_never_rebind() {
+    let collector = collector("rebind-revoked");
+    let grant = enabled(&collector);
+    let mut target = setup();
+    target.installation_id = "00000000-0000-4000-8000-000000000083".to_owned();
+    let proposal = collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .unwrap();
+    let mut response = grant_response(&grant, "enabled", 1);
+    response.installation_id = target.installation_id.clone();
+    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
+    collector.grants.revoke(now()).unwrap();
+    assert!(collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
+    let retained = collector
+        .grants
+        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
+        .unwrap();
+    assert_eq!(retained.status, GrantStatus::Revoked);
+    assert_eq!(
+        retained.revoked_at.as_deref(),
+        Some(timestamp(now()).as_str())
+    );
+    assert!(!grant_runtime_ready(&retained));
+    let mut deletion = response.clone();
+    deletion.status = "revoked".to_owned();
+    deletion.grant_version = 2;
+    collector
+        .grants
+        .apply_backend_revocation(&deletion, &target.installation_id)
+        .unwrap();
+    assert_eq!(
+        collector.grants.load().unwrap().unwrap().status,
+        GrantStatus::Revoked
+    );
+    let mut state = collector.grants.read().unwrap().unwrap();
+    state.grant.status = GrantStatus::Enabled;
+    let binding = state.grant.backend_binding.as_mut().unwrap();
+    binding.backend_revoked = false;
+    binding.server_policy_state = ServerPolicyState::Disabled;
+    atomic_json_write(collector.grants.path(), &state).unwrap();
+    assert!(collector
+        .grants
+        .prepare_rebind(&target, "fixture".to_owned())
+        .unwrap()
+        .is_none());
 }

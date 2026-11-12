@@ -112,7 +112,7 @@ fn only_an_unscanned_file_in_the_copys_folder_waits() {
         let elsewhere = PathBuf::from(format!("{}-elsewhere", dir.display()));
         let queued = if same_folder { &dir } else { &elsewhere };
         let mut index = ScanIndex {
-            traversal: Some(crate::snapshots::claude_family_census_shadow_tests::traversal()),
+            traversal: Some(crate::snapshots::tests::traversal_checkpoint()),
             ..ScanIndex::default()
         };
         index
