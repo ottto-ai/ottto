@@ -545,7 +545,6 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
         first_read_order::sort(
             &mut traversal.pending_candidates,
             first_read_order::order_for(source),
-            index,
         );
     }
     // Path carries run on the restored walk, before its debt is counted.

@@ -155,7 +155,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
     into.withheld_memo = from.withheld_memo.clone();
-    into.first_read_pending = from.first_read_pending;
 }
 
 /// An empty graph holding only `index`'s runtime-only fields.
