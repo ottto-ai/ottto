@@ -1015,7 +1015,10 @@ impl DiskBytes {
                 // the mach2 crate, which this crate does not depend on.
                 static TIMEBASE: std::sync::OnceLock<Option<(u32, u32)>> =
                     std::sync::OnceLock::new();
-                #[allow(deprecated)]
+                #[allow(
+                    deprecated,
+                    reason = "libc mach_timebase_info is the only timebase source without a new crate"
+                )]
                 let timebase = TIMEBASE.get_or_init(|| {
                     let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
                     (unsafe { libc::mach_timebase_info(&mut info) } == 0 && info.denom != 0)
