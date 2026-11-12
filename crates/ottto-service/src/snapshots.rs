@@ -1480,13 +1480,16 @@ use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMP
 
 pub(crate) use claude_reemission_exclusions::note_claude_index_rebuild_stop;
 #[cfg(test)]
+use claude_reemission_exclusions::{
+    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
 pub(crate) fn claude_reemission_stop_reason_for_test() -> &'static str {
     claude_reemission_stop_reason()
 }
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
-    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
 };
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::{

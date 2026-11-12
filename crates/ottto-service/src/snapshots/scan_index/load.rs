@@ -15,8 +15,8 @@ impl ScanIndex {
     }
 
     /// Source-aware daemon load, before replay preparation can save/advance
-    /// the generation. The durable exclusion marker is the active signal:
-    /// there is no separate durable adoption-complete marker. A quarantine
+    /// the generation. Prepare scopes the rebuild stop using this destination's
+    /// history and the durable exclusion marker. A quarantine
     /// rebuild returns the same empty generation-0 index as an absent file.
     /// It also returns what the load found: a missing or
     /// quarantined file is a fresh index whatever it holds.
