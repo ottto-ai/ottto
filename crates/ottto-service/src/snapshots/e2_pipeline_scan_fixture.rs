@@ -260,28 +260,14 @@ fn head_certificate<S: tail_source::TailSource>(
 /// must refuse that physical identity and re-read the file in Full.
 #[cfg(unix)]
 pub(crate) fn renumber_device_for_test(index: &mut ScanIndex, key: &str) {
-    use crate::durable_tail_codec::{Dec, Durable, Enc};
     let route = route_of(index).unwrap();
     let revision = tail_source::reduction_revision(SnapshotSource::ClaudeCode);
     let head = state_v2::load_head(index, key, revision).unwrap().unwrap();
-    let mut decoder = Dec::new(&head.body);
-    let identity = tail_source::HeadIdentity::take(&mut decoder).unwrap();
-    let mut certificate =
-        crate::transcript_acquisition::DurableCertificate::take(&mut decoder).unwrap();
-    certificate.device ^= 1;
-    let mut file = fs::File::open(key).unwrap();
-    assert!(matches!(
-        certificate.restore_grown(&mut file, Scope("e2-pipeline".into()), None),
-        Err(crate::transcript_acquisition::CertificateRefusal::Changed(
-            crate::transcript_acquisition::FullReason::Replaced
-        ))
-    ));
-    let mut body = Enc::count_write(usize::MAX, |encoder| {
-        identity.put(encoder)?;
-        certificate.put(encoder)
-    })
-    .unwrap();
-    body.extend_from_slice(&head.body[head.body.len() - decoder.remaining()..]);
+    let device = tail_source::certified_certificate(&head.body)
+        .unwrap()
+        .device
+        ^ 1;
+    let body = tail_source::renumber_device_for_test(&head.body, key);
     state_v2::stage_tail(
         &route,
         key,
@@ -297,7 +283,7 @@ pub(crate) fn renumber_device_for_test(index: &mut ScanIndex, key: &str) {
         head_certificate::<tail_source::claude::Claude>(index, key)
             .unwrap()
             .device,
-        certificate.device
+        device
     );
 }
 
