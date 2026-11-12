@@ -80,9 +80,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use super::{
     chatgpt_subscription_product, codex_credential_claim_lapses_at,
     codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
-    codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
-    mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
-    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexLoginRefresh, CodexUsageProbe,
+    codex_last_known, codex_probe_failure_stage_and_kind, current_unix_seconds, default_codex_home,
+    empty_codex_accounts_status, mark_quota_meters_stale, read_codex_auth_credentials_at,
+    read_codex_usage_from_provider, unsupported_account, CodexHomeSlot, CodexIdentityHashes,
+    CodexLoginRefresh, CodexUsageProbe,
 };
 
 /// In use on this Mac: one provider read per 5 min.
@@ -520,6 +521,11 @@ pub(super) struct SavedCodexFailure {
     message: String,
     #[serde(default)]
     login: LoginMark,
+    /// A session timed out since the home's last successful read: the probe
+    /// holds forced login refreshes until a read succeeds
+    /// ([`refresh_held`]). Held refreshes only; reads go on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refresh_held: bool,
 }
 
 impl SavedCodexQuota {
@@ -1106,15 +1112,29 @@ fn read_and_save_at(
             next.last_failure = None;
         }
         Err(message) => {
+            let refresh_held = codex_probe_failure_stage_and_kind(message).1 == "timeout"
+                || next
+                    .last_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.refresh_held);
             next.last_failure = Some(SavedCodexFailure {
                 at_epoch_seconds: finished_at,
                 message: message.clone(),
                 login,
+                refresh_held,
             });
         }
     }
     write_saved_at(support_dir, home, &next);
     Some(result)
+}
+
+/// Whether `home`'s forced login refreshes are held: a read timed out since
+/// its last successful one.
+pub(super) fn refresh_held(home: &Path) -> bool {
+    saved_with_attempt(&saved_quota_support_dir(), home)
+        .and_then(|saved| saved.last_failure)
+        .is_some_and(|failure| failure.refresh_held)
 }
 
 /// When a read finished: the wall clock, never before the trigger's clock.

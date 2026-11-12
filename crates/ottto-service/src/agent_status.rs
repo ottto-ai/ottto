@@ -17022,8 +17022,13 @@ fn codex_forced_refresh_log_line(
 /// lapse before the next read. A lapse alone does not bring that read forward.
 const CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS: u64 = codex_saved_quota::UNUSED_REFRESH_SECONDS;
 
+/// The refresh reason of a home whose forced refreshes are held after a
+/// timed-out read ([`codex_saved_quota::refresh_held`]): logged, not sent.
+const CODEX_REFRESH_BACKOFF_REASON: &str = "backoff_after_timeout";
+
 /// Why the probe forces a token refresh in `account/read`, or `None` to leave
-/// the login as it is. Only an Ottto account slot's home
+/// the login as it is. [`CODEX_REFRESH_BACKOFF_REASON`] means it would, but a
+/// read of the home timed out since its last success, so it does not. Only an Ottto account slot's home
 /// ([`CodexLoginRefresh::WhenLapsing`]) is refreshed, and only when its
 /// claimed binding has lapsed, lapses within
 /// [`CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS`] or has no readable expiry:
@@ -17045,15 +17050,19 @@ fn codex_probe_refresh_reason(
         Ok(None) => return None,
         Err(_) => return Some("unreadable"),
     };
-    match codex_credential_claim_lapses_at(&credentials) {
-        None => Some("lapsed_or_unknown"),
+    let reason = match codex_credential_claim_lapses_at(&credentials) {
+        None => "lapsed_or_unknown",
         Some(lapses_at)
             if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
         {
-            Some("lapses_soon")
+            "lapses_soon"
         }
-        Some(_) => None,
+        Some(_) => return None,
+    };
+    if codex_saved_quota::refresh_held(codex_home) {
+        return Some(CODEX_REFRESH_BACKOFF_REASON);
     }
+    Some(reason)
 }
 
 fn run_codex_app_server_rate_limits_for_home(
@@ -17144,7 +17153,9 @@ fn run_codex_app_server_rate_limits_for_home(
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": refresh_reason.is_some()}
+        "params": {
+            "refreshToken": refresh_reason.is_some_and(|reason| reason != CODEX_REFRESH_BACKOFF_REASON)
+        }
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it.

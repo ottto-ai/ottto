@@ -4289,6 +4289,37 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// [regress] A dead login (the provider named no account) outranks a home
+/// that is otherwise still pending (not read yet, background refresh off):
+/// the slot asks for a new sign-in.
+#[test]
+fn codex_dead_login_outranks_a_pending_read() {
+    let mut snapshot = base_snapshot(
+        SourceKind::Codex,
+        AgentStatusState::AuthRequired,
+        AgentStatusCollectionMethod::CommandProbe,
+        "2026-08-26T00:00:00Z".to_string(),
+        "2026-08-26T00:15:00Z".to_string(),
+    );
+    snapshot.account = Some(AgentAccountStatus {
+        login_state: AgentLoginState::SignedOut,
+        ..unsupported_account("openai")
+    });
+    for code in [
+        "codex_quota_not_read_yet",
+        "codex_quota_background_refresh_off",
+    ] {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            code,
+            AgentDiagnosticSeverity::Info,
+            "pending",
+        ));
+    }
+    let status = codex_collection_status_from_snapshot(&snapshot);
+    assert_eq!(status.state, CodexAccountSlotCollectionStateV1::NeedsLogin);
+    assert_eq!(status.diagnostics[0].code, "codex_account_needs_login");
+}
+
 #[test]
 fn codex_forced_refresh_logs_its_outcome_class_and_home_digest_only() {
     assert_eq!(
@@ -4685,6 +4716,92 @@ fn codex_probe_refreshes_only_a_lapsing_registered_slot_login() {
         ["true", "false", "false", "false"],
         "lapsed registered slot, live registered slot, lapsed process-only home, \
              lapsed default home (control)"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// [regress] A forced-refresh read of a registered slot that times out
+/// holds the next forced refresh (`refreshToken: false`, logged as
+/// `backoff_after_timeout`); the read itself still runs. A successful read
+/// lifts the hold, and the next read forces the refresh again.
+#[test]
+#[serial]
+fn codex_probe_holds_forced_refresh_after_a_timeout_until_a_read_succeeds() {
+    let dir = std::env::temp_dir().join(format!("ottto-app-server-backoff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    write_fake_codex_app_server(&dir);
+    // While `dir/hang` exists the fake logs `account/read` and never answers.
+    let helper = dir.join("fake_codex.py");
+    let script = std::fs::read_to_string(&helper).expect("helper");
+    let hang = "            log.write(json.dumps(refresh) + \"\\n\")\n";
+    assert!(script.contains(hang));
+    std::fs::write(
+        &helper,
+        script.replace(
+            hang,
+            &format!(
+                "{hang}        if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), \"hang\")):\n            continue\n"
+            ),
+        ),
+    )
+    .expect("hanging helper");
+    let _guard = EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+
+    let home = crate::test_scratch::ScratchDir::canonical("codex-refresh-backoff");
+    let token = synthetic_codex_jwt(
+        "synthetic-user",
+        "synthetic-workspace",
+        "synthetic-account",
+        "pro",
+        OffsetDateTime::now_utc().unix_timestamp() - 60,
+    );
+    let auth = home.join("auth.json");
+    std::fs::write(
+        &auth,
+        serde_json::json!({"tokens": {"access_token": token, "id_token": token}}).to_string(),
+    )
+    .expect("auth fixture");
+    std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).expect("auth mode");
+    let read = || {
+        with_codex_app_server_test_timeouts(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            || {
+                codex_saved_quota::read_provider_and_save(
+                    &home,
+                    CodexHomeTrust::Managed,
+                    CodexLoginRefresh::WhenLapsing,
+                    |_, _| true,
+                )
+                .expect("admitted")
+            },
+        )
+    };
+
+    std::fs::write(dir.join("hang"), b"").expect("hang");
+    assert!(read().is_err(), "the forced-refresh read times out");
+    assert!(codex_saved_quota::refresh_held(&home));
+    assert_eq!(
+        codex_probe_refresh_reason(
+            &home,
+            CodexHomeTrust::Managed,
+            CodexLoginRefresh::WhenLapsing,
+            current_unix_seconds(),
+        ),
+        Some(CODEX_REFRESH_BACKOFF_REASON)
+    );
+    std::fs::remove_file(dir.join("hang")).expect("answer again");
+    read().expect("held read still reads");
+    assert!(!codex_saved_quota::refresh_held(&home));
+    read().expect("forcing resumed");
+
+    let refreshes = std::fs::read_to_string(dir.join("refresh.log")).expect("refresh log");
+    assert_eq!(
+        refreshes.lines().collect::<Vec<_>>(),
+        ["true", "false", "true"],
+        "timed out, held, resumed"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
