@@ -4,7 +4,8 @@ use super::*;
 use crate::snapshots::state_v2::FirstReadCounts as Counts;
 use sha2::{Digest, Sha256};
 
-const FIXTURE: &str = include_str!("../../../../../../fixtures/collector-status/first-read-v1.json");
+const FIXTURE: &str =
+    include_str!("../../../../../../fixtures/collector-status/first-read-v1.json");
 /// The fixture both sides pin; a change is a wire change on both.
 const FIXTURE_SHA256: &str = "12ca19c08da99e532eb279c061686335229d5199a1f032f52acbbae3ab684699";
 
@@ -26,7 +27,10 @@ fn base_anchor_ms() -> u64 {
 #[test]
 fn fixture_bytes_are_the_pinned_wire_fixture() {
     let digest = Sha256::digest(FIXTURE.as_bytes());
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     assert_eq!(hex, FIXTURE_SHA256);
 }
 
@@ -168,28 +172,45 @@ fn open_block_increases_and_frozen_block_repeats() {
         sources_enabled: bit(SnapshotSource::Pi),
         ..Summary::default()
     };
-    state.summaries.insert(SnapshotSource::ClaudeCode.api_slug(), open);
-    let first = state.block("ns", SnapshotSource::ClaudeCode, anchor_ms + 5).unwrap();
-    let second = state.block("ns", SnapshotSource::ClaudeCode, anchor_ms + 5).unwrap();
+    state
+        .summaries
+        .insert(SnapshotSource::ClaudeCode.api_slug(), open);
+    let first = state
+        .block("ns", SnapshotSource::ClaudeCode, anchor_ms + 5)
+        .unwrap();
+    let second = state
+        .block("ns", SnapshotSource::ClaudeCode, anchor_ms + 5)
+        .unwrap();
     assert!(second.computed_at > first.computed_at);
     assert_eq!(first.sources_enabled, ["claude_code", "codex"]);
     assert!(!first.done && !first.listing_complete && first.complete_since.is_none());
-    assert!(state.block("other", SnapshotSource::ClaudeCode, anchor_ms).is_none());
+    assert!(state
+        .block("other", SnapshotSource::ClaudeCode, anchor_ms)
+        .is_none());
 
     let frozen = Summary {
         certified_at_ms: Some(anchor_ms),
         done_at_ms: Some(anchor_ms + 9),
         ..open
     };
-    state.summaries.insert(SnapshotSource::ClaudeCode.api_slug(), frozen);
-    let terminal = state.block("ns", SnapshotSource::ClaudeCode, anchor_ms + 50).unwrap();
-    let again = state.block("ns", SnapshotSource::ClaudeCode, anchor_ms + 99).unwrap();
+    state
+        .summaries
+        .insert(SnapshotSource::ClaudeCode.api_slug(), frozen);
+    let terminal = state
+        .block("ns", SnapshotSource::ClaudeCode, anchor_ms + 50)
+        .unwrap();
+    let again = state
+        .block("ns", SnapshotSource::ClaudeCode, anchor_ms + 99)
+        .unwrap();
     assert_eq!(terminal, again);
     assert!(terminal.done);
     assert_eq!(terminal.computed_at, instant(anchor_ms + 9));
     // The frozen promise, plus the envelope source.
     assert_eq!(terminal.sources_enabled, ["claude_code", "pi"]);
-    assert_eq!(terminal.complete_since, Some(instant(boundaries(anchor_ms)[0])));
+    assert_eq!(
+        terminal.complete_since,
+        Some(instant(boundaries(anchor_ms)[0]))
+    );
 }
 
 #[test]

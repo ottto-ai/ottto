@@ -73,15 +73,16 @@ pub(in crate::snapshots) use runtime::tail_route::{
     retire_tail, set_aside_tail, stage_tail, staged_first_read_anchor, tail_head_keys,
     tail_route_path, tail_set_aside, tail_stage_discards, take_head_writes, unstage_tail,
 };
-pub(in crate::snapshots) use tail::first_read::{
-    Class as FirstReadClass, Counts as FirstReadCounts, Member as FirstReadMember,
-    Observed as FirstReadObserved, Summary as FirstReadSummary,
-    SummaryEdit as FirstReadEdit, BUCKETS as FIRST_READ_BUCKETS,
-};
-pub(in crate::snapshots) use tail::first_read::resolve as resolve_first_read;
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
+pub(in crate::snapshots) use tail::first_read::resolve as resolve_first_read;
+#[cfg(test)]
+pub(in crate::snapshots) use tail::first_read::Counts as FirstReadCounts;
+pub(in crate::snapshots) use tail::first_read::{
+    Class as FirstReadClass, Member as FirstReadMember, Observed as FirstReadObserved,
+    Summary as FirstReadSummary, SummaryEdit as FirstReadEdit, BUCKETS as FIRST_READ_BUCKETS,
+};
 #[allow(
     unused_imports,
     reason = "the acquisition cutover consumes these staged types"

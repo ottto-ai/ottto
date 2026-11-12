@@ -269,7 +269,9 @@ fn member_row(file: &[u8]) -> Result<RowKey> {
     row(FIRST_READ, file, 0)
 }
 /// The committed summary: `Err` when unreadable, never a default.
-pub(in crate::snapshots::state_v2) fn read_summary(tx: &mut dyn Transaction) -> Result<Option<Summary>> {
+pub(in crate::snapshots::state_v2) fn read_summary(
+    tx: &mut dyn Transaction,
+) -> Result<Option<Summary>> {
     let Some(header) = tx.get(&summary_row()?)? else {
         return Ok(None);
     };
@@ -278,7 +280,10 @@ pub(in crate::snapshots::state_v2) fn read_summary(tx: &mut dyn Transaction) -> 
         .ok_or_else(|| anyhow::anyhow!("state_v2_first_read_summary"))
 }
 /// The committed member row of `file`: `Err` when unreadable.
-pub(in crate::snapshots::state_v2) fn read_member(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<Member>> {
+pub(in crate::snapshots::state_v2) fn read_member(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+) -> Result<Option<Member>> {
     let Some(header) = tx.get(&member_row(file)?)? else {
         return Ok(None);
     };
@@ -435,7 +440,11 @@ impl Commit {
     }
 }
 /// N4: the row is written only when it changes.
-fn write_summary(tx: &mut dyn Transaction, before: Option<Summary>, summary: Summary) -> Result<()> {
+fn write_summary(
+    tx: &mut dyn Transaction,
+    before: Option<Summary>,
+    summary: Summary,
+) -> Result<()> {
     if before != Some(summary) {
         put_inline(tx, &summary_row()?, &summary.encode())?;
     }

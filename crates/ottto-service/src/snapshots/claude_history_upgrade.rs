@@ -47,8 +47,8 @@ use super::claude_reemission_exclusions::{
 use super::{
     claude_family_root_path, claude_family_subagents_dir, claude_history_upgrade,
     claude_index_path_member_ref, claude_request_money, local_index_key,
-    snapshot_file_entity_set_hex, unix_nanos, unix_seconds, CandidateFile, ScanIndex,
-    SnapshotItem, SnapshotSource, MALFORMED_CLAUDE_HISTORY_CUTOFF,
+    snapshot_file_entity_set_hex, unix_nanos, unix_seconds, CandidateFile, ScanIndex, SnapshotItem,
+    SnapshotSource, MALFORMED_CLAUDE_HISTORY_CUTOFF,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

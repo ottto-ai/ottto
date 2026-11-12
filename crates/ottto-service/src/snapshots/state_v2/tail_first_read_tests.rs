@@ -158,7 +158,12 @@ fn rolled_back_new_member_is_failed_and_blocks_the_freeze() {
         Class::Failed
     );
     // The next listing reclassifies it; only then can it freeze.
-    commit(&mut tx, None, &[(b"/h/b.jsonl", observed(Class::Done, 1, 20))], &[]);
+    commit(
+        &mut tx,
+        None,
+        &[(b"/h/b.jsonl", observed(Class::Done, 1, 20))],
+        &[],
+    );
     let frozen = summary(&mut tx);
     assert!(frozen.done_at_ms.is_some());
     assert_eq!((frozen.counts.members, frozen.counts.done), (2, 2));
@@ -182,7 +187,11 @@ fn deletes_keep_done_members_and_exclude_undelivered_ones() {
     let deleted_done = summary(&mut tx);
     assert!(deleted_done.open());
     assert_eq!(
-        (deleted_done.counts.members, deleted_done.counts.done, deleted_done.counts.owed()),
+        (
+            deleted_done.counts.members,
+            deleted_done.counts.done,
+            deleted_done.counts.owed()
+        ),
         (2, 1, 1)
     );
     // The last ACK: B's import debt left.
@@ -209,7 +218,11 @@ fn deletes_keep_done_members_and_exclude_undelivered_ones() {
     commit(&mut tx, None, &[], &[b"/h/b.jsonl"]);
     let excluded = summary(&mut tx);
     assert_eq!(
-        (excluded.counts.members, excluded.counts.done, excluded.counts.excluded),
+        (
+            excluded.counts.members,
+            excluded.counts.done,
+            excluded.counts.excluded
+        ),
         (2, 1, 1)
     );
     // B still obstructs its bucket: done with an exception.
@@ -232,7 +245,12 @@ fn delete_then_discover_counts_all_three() {
         &[],
     );
     commit(&mut tx, None, &[], &[b"/h/b.jsonl"]);
-    commit(&mut tx, None, &[(b"/h/c.jsonl", observed(Class::Owed, 2, 50))], &[]);
+    commit(
+        &mut tx,
+        None,
+        &[(b"/h/c.jsonl", observed(Class::Owed, 2, 50))],
+        &[],
+    );
     let counts = summary(&mut tx).counts;
     assert_eq!(
         (counts.members, counts.done, counts.excluded, counts.owed()),
@@ -259,8 +277,12 @@ fn recount_mismatch_refuses_the_freeze_and_repairs_the_totals() {
     // Damage: the summary claims everything done.
     let mut damaged = summary(&mut tx);
     damaged.counts = Counts::default();
-    damaged.counts.replace(None, observed(Class::Done, 0, 10).member);
-    damaged.counts.replace(None, observed(Class::Done, 0, 10).member);
+    damaged
+        .counts
+        .replace(None, observed(Class::Done, 0, 10).member);
+    damaged
+        .counts
+        .replace(None, observed(Class::Done, 0, 10).member);
     put_inline(&mut tx, &summary_row().unwrap(), &damaged.encode()).unwrap();
     commit(&mut tx, None, &[], &[]);
     let repaired = summary(&mut tx);
