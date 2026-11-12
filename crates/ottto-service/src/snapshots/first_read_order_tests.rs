@@ -392,31 +392,60 @@ fn pi_newest_first_read_matches_fifo_money() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// A Claude history of two project folders. Each holds a resumed copy whose
-/// file name sorts before its earlier-born original (the holder of its
-/// copied requests) and one unrelated session. Request ids are per folder.
+/// A Claude history of two project folders. Each holds a resumed copy of an
+/// earlier-born original (the holder of its copied requests) and one
+/// unrelated session. `copy_first` names the copy so it lists before its
+/// holder. Births are the files' real ones (the parser and the copy order's
+/// holder probe read the same stat), so every line clock is placed against
+/// the wall clock just after its file was created. Request ids are per folder.
 struct ClaudeHistory {
     home: PathBuf,
     root: PathBuf,
     support: PathBuf,
-    births: BTreeMap<PathBuf, i128>,
     /// (folder, holder, copy) paths.
     folders: Vec<(PathBuf, PathBuf, PathBuf)>,
     /// Distinct request ids across the whole history.
     distinct_requests: u64,
 }
 
+/// An RFC 3339 clock `millis` after `at`.
+fn clock_after(at: SystemTime, millis: u64) -> String {
+    let nanos = (at + Duration::from_millis(millis))
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::try_from(nanos).unwrap())
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+fn assistant(session: &str, id: &str, clock: &str, input: u64) -> String {
+    json!({"type":"assistant", "sessionId":session, "version":"2.1.229",
+        "timestamp":clock, "requestId":id, "message":{"id":format!("message-{id}"),
+            "model":"claude-haiku-4-5", "usage":{"input_tokens":input, "output_tokens":1}}})
+    .to_string()
+        + "\n"
+}
+
+/// Creates `path` empty and returns a clock at or after its birth.
+fn born(path: &Path) -> SystemTime {
+    fs::write(path, b"").unwrap();
+    let after = SystemTime::now();
+    std::thread::sleep(Duration::from_millis(50));
+    after
+}
+
 impl ClaudeHistory {
     /// Copied requests per copy.
     const COPIED: u64 = 2;
 
-    fn new(name: &str) -> Self {
+    fn new(name: &str, copy_first: bool) -> Self {
         let home = crate::test_scratch::canonical_private_dir(name);
         let root = home.join("projects");
         let support = home.join("support");
         fs::create_dir_all(&root).unwrap();
         fixture::write_exclusions(&support, &[]);
-        let mut births = BTreeMap::new();
         let mut folders = Vec::new();
         let mut distinct = BTreeSet::new();
         // `a-old` lists first, so the walk (FIFO) reads it first.
@@ -425,58 +454,56 @@ impl ClaudeHistory {
             fs::create_dir_all(&dir).unwrap();
             let session =
                 |tag: char| format!("{tag}{slot}000000-0000-4000-8000-0000000000{slot}{tag}");
-            // Created in birth order: holder, copy, other.
             let holder = dir.join(format!("{}.jsonl", session('b')));
-            let copy = dir.join(format!("{}.jsonl", session('a')));
+            let copy = dir.join(format!(
+                "{}.jsonl",
+                session(if copy_first { 'a' } else { 'd' })
+            ));
             let other = dir.join(format!("{}.jsonl", session('c')));
-            let requests = |range: std::ops::Range<u64>, tag: &str| {
-                range
-                    .map(|n| format!("{folder}-{tag}-{n}"))
-                    .collect::<Vec<_>>()
-            };
-            for (offset, (path, ids)) in [
-                (&holder, requests(0..Self::COPIED, "r")),
-                (&copy, requests(0..Self::COPIED + 1, "r")),
-                (&other, requests(0..2, "o")),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
-                let text = ids
-                    .iter()
-                    .enumerate()
-                    .map(|(n, id)| {
-                        distinct.insert(id.clone());
-                        // A request's clock is its own: a copy repeats the
-                        // holder's lines; its own request follows its birth.
-                        let clock = match (id.contains("-r-"), n as u64) {
-                            (true, n) if n < Self::COPIED => {
-                                format!("2026-06-01T07:00:{:02}Z", 10 + n)
-                            }
-                            (true, _) => "2026-06-02T08:00:00Z".to_owned(),
-                            (false, n) => format!("2026-06-03T08:00:{:02}Z", n),
-                        };
-                        json!({"type":"assistant", "sessionId":stem, "version":"2.1.229",
-                            "timestamp":clock,
-                            "requestId":id, "message":{"id":format!("message-{id}"),
-                                "model":"claude-haiku-4-5",
-                                "usage":{"input_tokens":10 + n, "output_tokens":1}}})
-                        .to_string()
-                            + "\n"
-                    })
-                    .collect::<String>();
+            let stem = |path: &Path| path.file_stem().unwrap().to_str().unwrap().to_owned();
+            // Born in this order: holder, copy, other.
+            let holder_born = born(&holder);
+            let copy_born = born(&copy);
+            let other_born = born(&other);
+            let copied = (0..Self::COPIED)
+                .map(|n| {
+                    (
+                        format!("{folder}-r-{n}"),
+                        clock_after(holder_born, 1 + n),
+                        10 + n,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let own = format!("{folder}-r-{}", Self::COPIED);
+            let mut texts = vec![
+                (&holder, String::new()),
+                (&copy, String::new()),
+                (&other, String::new()),
+            ];
+            for (id, clock, input) in &copied {
+                texts[0].1 += &assistant(&stem(holder.as_path()), id, clock, *input);
+                // The resumed copy repeats the holder's lines first.
+                texts[1].1 += &assistant(&stem(copy.as_path()), id, clock, *input);
+                distinct.insert(id.clone());
+            }
+            texts[1].1 += &assistant(&stem(copy.as_path()), &own, &clock_after(copy_born, 1), 30);
+            distinct.insert(own);
+            for n in 0..2 {
+                let id = format!("{folder}-o-{n}");
+                texts[2].1 += &assistant(
+                    &stem(other.as_path()),
+                    &id,
+                    &clock_after(other_born, 1 + n),
+                    20,
+                );
+                distinct.insert(id);
+            }
+            for (offset, (path, text)) in texts.into_iter().enumerate() {
                 fs::write(path, text).unwrap();
                 set_mtime(
                     path,
                     seconds("2026-06-01T00:00:00Z") + (day + offset as u64) * DAY,
                 );
-                births.insert(
-                    path.clone(),
-                    i128::from(seconds("2026-06-01T07:00:00Z") + offset as u64 * DAY)
-                        * 1_000_000_000,
-                );
-                std::thread::sleep(Duration::from_millis(20));
             }
             folders.push((dir, holder, copy));
         }
@@ -484,7 +511,6 @@ impl ClaudeHistory {
             home,
             root,
             support,
-            births,
             folders,
             distinct_requests: distinct.len() as u64,
         }
@@ -509,7 +535,7 @@ impl ClaudeHistory {
             index,
             limit,
             false,
-            &self.births,
+            &BTreeMap::new(),
             hints,
         );
         let (disposition, _, _) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
@@ -592,7 +618,7 @@ impl ClaudeHistory {
         let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
         let id = format!("{stem}-live-{pass}");
         let line = json!({"type":"assistant", "sessionId":stem, "version":"2.1.229",
-            "timestamp":format!("2026-06-05T08:00:{pass:02}Z"),
+            "timestamp":clock_after(SystemTime::now(), 0),
             "requestId":id, "message":{"id":format!("message-{id}"),
                 "model":"claude-haiku-4-5", "usage":{"input_tokens":50, "output_tokens":1}}});
         let mut file = File::options().append(true).open(path).unwrap();
@@ -644,45 +670,81 @@ fn copy_wait() -> Value {
         .clone()
 }
 
-/// [money] Claude, in-order decisions: a first read one file per page,
-/// newest folder first, emits the same money and placement as the FIFO
-/// first read, and no request id is counted in two bodies. Newest first, the
-/// resumed copy in each folder never waits: its earlier-born holder reads
-/// (and is accepted) first.
+/// Both first reads of `history`, FIFO then newest folder first, with their
+/// copy-wait counters and a report of what each emitted.
+fn claude_both(history: &mut ClaudeHistory, limit: usize) -> (FirstRead, FirstRead, Value, String) {
+    let _ = claude_request_money::e2::take_thread_counts();
+    let fifo = history.first_read(limit, false, None, 0);
+    let fifo_wait = copy_wait();
+    let newest = history.first_read(limit, true, None, 0);
+    let newest_wait = copy_wait();
+    let report = format!(
+        "fifo order {:?}\nfifo bodies {:?}\nfifo wait {fifo_wait}\nnewest order {:?}\nnewest bodies {:?}\nnewest wait {newest_wait}\ndistinct {}",
+        fifo.order,
+        ClaudeHistory::bodies(&fifo),
+        newest.order,
+        ClaudeHistory::bodies(&newest),
+        history.distinct_requests,
+    );
+    eprintln!("{report}");
+    let folder_of = |read: &FirstRead| read.order[0].parent().unwrap().to_owned();
+    assert_eq!(folder_of(&fifo), history.folders[0].0, "walk order: a-old");
+    assert_eq!(
+        folder_of(&newest),
+        history.folders[1].0,
+        "newest folder first: {report}"
+    );
+    (fifo, newest, newest_wait, report)
+}
+
+/// [money] Claude, in-order decisions (each copy named after its holder, the
+/// ordinary case): a first read one file per page, newest folder first,
+/// emits the same money and placement as the FIFO first read, and no request
+/// id is counted in two bodies.
 #[test]
 fn claude_newest_folder_first_read_matches_fifo_money() {
     claude_history_upgrade::with_max_gated_claude_revision(3, || {
-        let mut history = ClaudeHistory::new("first-read-order-claude");
-        let _ = claude_request_money::e2::take_thread_counts();
-        let fifo = history.first_read(1, false, None, 0);
-        let fifo_wait = copy_wait();
-        let newest = history.first_read(1, true, None, 0);
-        let newest_wait = copy_wait();
-        let report = format!(
-            "fifo order {:?}\nfifo bodies {:?}\nfifo wait {fifo_wait}\nnewest order {:?}\nnewest bodies {:?}\nnewest wait {newest_wait}\ndistinct {}",
-            fifo.order,
-            ClaudeHistory::bodies(&fifo),
-            newest.order,
-            ClaudeHistory::bodies(&newest),
-            history.distinct_requests,
-        );
-        eprintln!("{report}");
-        let folder_of = |read: &FirstRead| read.order[0].parent().unwrap().to_owned();
-        assert_eq!(folder_of(&fifo), history.folders[0].0, "walk order: a-old");
-        assert_eq!(
-            folder_of(&newest),
-            history.folders[1].0,
-            "newest folder first"
-        );
-        let (_, holder, copy) = &history.folders[1];
-        if birth(holder) != 0 {
+        let mut history = ClaudeHistory::new("first-read-order-claude", false);
+        let (fifo, newest, newest_wait, report) = claude_both(&mut history, 1);
+        assert_eq!(history.double_counted(&fifo), 0, "{report}");
+        assert_eq!(history.double_counted(&newest), 0, "{report}");
+        assert!(newest_wait.get("expired").is_none(), "{report}");
+        assert_same_money(SnapshotSource::ClaudeCode, &fifo, &newest);
+    });
+}
+
+/// [money] Claude, a resumed copy whose name lists before its earlier-born
+/// holder: newest folder first reads the holder first (oldest birth first),
+/// so the copy's prefix is proven and removed with no wait and no request is
+/// counted twice. FIFO reads the copy first; it is no better (the detector's
+/// count for FIFO is at least newest's).
+#[test]
+fn claude_newest_folder_first_reads_the_holder_before_its_copy() {
+    claude_history_upgrade::with_max_gated_claude_revision(3, || {
+        let mut history = ClaudeHistory::new("first-read-order-claude-named", true);
+        let (fifo, newest, newest_wait, report) = claude_both(&mut history, 1);
+        for (_, holder, copy) in &history.folders {
             let at = |path: &PathBuf| newest.order.iter().position(|p| p == path).unwrap();
-            assert!(at(holder) < at(copy), "holder (earlier birth) reads first");
+            assert!(at(holder) < at(copy), "holder reads first: {report}");
+            let stem = copy.file_stem().unwrap().to_str().unwrap();
+            let body = newest
+                .scan
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == stem)
+                .unwrap();
+            assert_eq!(
+                body.removed_request_count,
+                Some(ClaudeHistory::COPIED),
+                "{report}"
+            );
         }
         assert_eq!(history.double_counted(&newest), 0, "{report}");
         assert!(newest_wait.get("expired").is_none(), "{report}");
-        assert_eq!(history.double_counted(&fifo), 0, "{report}");
-        assert_same_money(SnapshotSource::ClaudeCode, &fifo, &newest);
+        assert!(
+            history.double_counted(&fifo) >= history.double_counted(&newest),
+            "{report}"
+        );
     });
 }
 
@@ -696,7 +758,7 @@ fn claude_newest_folder_first_read_matches_fifo_money() {
 #[test]
 fn claude_hinted_copy_in_a_moved_folder_expires_its_wait() {
     claude_history_upgrade::with_max_gated_claude_revision(3, || {
-        let mut history = ClaudeHistory::new("first-read-order-claude-residual");
+        let mut history = ClaudeHistory::new("first-read-order-claude-residual", true);
         let (_, holder, copy) = history.folders[0].clone();
         let _ = claude_request_money::e2::take_thread_counts();
         // Two files a page: the hint takes one slot, the census the other.
