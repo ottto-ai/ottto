@@ -100,13 +100,14 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
                 false,
                 &[],
             );
-            let key = path.to_string_lossy();
-            let fingerprint = page.index.files[key.as_ref()]
-                .source_file_fingerprint
-                .clone();
+            let location = location_key(&path.to_string_lossy());
             page.scan.snapshots.retain(|item| {
-                item.source_file_fingerprint.as_deref() == Some(fingerprint.as_str())
+                item.claude_money
+                    .as_deref()
+                    .and_then(e2::FileFold::location_key)
+                    == Some(location)
             });
+            assert_eq!(page.scan.snapshots.len(), 1, "one native singleton fold");
             e2::take_diag();
             page.enrich(&c);
             page.finish();
