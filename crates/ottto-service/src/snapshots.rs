@@ -555,6 +555,9 @@ macro_rules! scan_result {
         }
     };
 }
+#[cfg(test)]
+mod first_read_pacing_scan_tests;
+
 scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
