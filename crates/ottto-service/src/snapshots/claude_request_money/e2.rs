@@ -4261,7 +4261,7 @@ pub(crate) fn telemetry_scope(
 }
 
 pub(crate) fn telemetry_request_holders(index: &ScanIndex, wanted: &[u64]) -> BTreeSet<u64> {
-    claude_request_census::positive_holders(&index.claude_request_census, wanted)
+    crate::snapshots::claude_request_census::positive_holders(&index.claude_request_census, wanted)
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {

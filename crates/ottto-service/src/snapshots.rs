@@ -1051,9 +1051,6 @@ use sources::claude::account::evidence::{
     set_session_account_hash, veto_claude_original_identity,
 };
 
-pub(crate) use sources::claude::census::usage_ledger::{
-    claude_api_evidence_fingerprint_is_valid, claude_trace_evidence_fingerprint_is_valid,
-};
 use sources::claude::census::usage_ledger::{
     claude_reported_usage_inputs, rebuild_claude_reported_usage, rebuild_retagged_model_usage,
     rebuild_snapshot_model_usage_with, semantic_attribution, semantic_model_usage,
